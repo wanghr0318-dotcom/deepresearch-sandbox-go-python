@@ -964,7 +964,6 @@ Unmount 幂等，且 EBUSY 时退化为 MNT_DETACH lazy 卸载，
 - Consumes: 无
 - Produces:
   - `rootfs.EnsureTemplate(dir string) error`
-  - `rootfs.ExtractTarGz(tarPath, dstDir string) error`
 
 - [ ] **Step 1: 手工准备模板**
 
@@ -2518,6 +2517,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -2711,29 +2712,18 @@ func (b *box) oomOccurred() bool {
 	if err != nil {
 		return false
 	}
-	for _, line := range splitLines(string(data)) {
-		var key string
-		var n int
-		if _, err := fmt.Sscanf(line, "%s %d", &key, &n); err == nil && key == "oom_kill" && n > 0 {
+	// memory.events 每行形如 "oom_kill 3"。
+	for _, line := range strings.Split(string(data), "
+") {
+		key, count, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok || key != "oom_kill" {
+			continue
+		}
+		if n, err := strconv.Atoi(count); err == nil && n > 0 {
 			return true
 		}
 	}
 	return false
-}
-
-func splitLines(s string) []string {
-	var out []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			out = append(out, s[start:i])
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		out = append(out, s[start:])
-	}
-	return out
 }
 
 func newID() (string, error) {
@@ -3061,6 +3051,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -3377,7 +3369,7 @@ func (p *Provider) List(ctx context.Context, prefix string) ([]*provider.Instanc
 }
 ```
 
-import 块补上 `strings`。
+import 块已在 Task 9 含 `strings`，无需再补。
 
 - [ ] **Step 5: 跑测试确认通过**
 
