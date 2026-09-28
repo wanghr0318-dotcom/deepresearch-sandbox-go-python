@@ -80,6 +80,42 @@ binding:{name} → { sandbox_id, provider, state, created_at, last_active_at, tt
 
 放 Redis 而非 DB：每次工具调用都要 ensure，属热路径。绑定丢失不致命 —— 沙箱变孤儿，provider 侧 TTL 兜底回收，对账任务扫出。DB 作为最终一致的账本用于对账。
 
+### 3.1.1 Store 抽象
+
+管控面的全部外部状态收敛到一个接口，使单机与分布式两种形态可切换：
+
+```go
+type Store interface {
+    // 绑定
+    GetBinding(ctx context.Context, name string) (*Binding, error)
+    PutBinding(ctx context.Context, name string, b *Binding) error
+    DelBinding(ctx context.Context, name string, expectSandboxID string) error // CAS
+    ListBindings(ctx context.Context, prefix string) ([]*Binding, error)
+
+    // 分布式锁
+    Lock(ctx context.Context, key string, ttl time.Duration) (token string, err error)
+    Unlock(ctx context.Context, key, token string) error
+    Renew(ctx context.Context, key, token string, ttl time.Duration) error
+
+    // 延迟队列
+    Enqueue(ctx context.Context, queue string, item []byte, runAt time.Time) error
+    Dequeue(ctx context.Context, queue string, now time.Time, n int) ([][]byte, error)
+
+    // 信号量
+    SemAcquire(ctx context.Context, key, token string, limit int, timeout time.Duration) (bool, error)
+    SemRelease(ctx context.Context, key, token string) error
+}
+```
+
+两个实现：
+
+| 实现 | 用途 | 语义 |
+|---|---|---|
+| `MemStore` | 默认，零外部依赖，`go run . demo` 即可跑 | 单进程内正确；锁与信号量退化为进程内原语 |
+| `RedisStore` | 生产 | 完整分布式语义，Lua 保证原子性 |
+
+`MemStore` 下分布式特性退化为本地语义，因此 `RedisStore` 的正确性必须由 §7 的多进程并发测试单独证明，不能依赖单机测试覆盖。
+
 ### 3.2 ensure 流程
 
 ```
@@ -200,6 +236,15 @@ return 0
 ### 3.7 预热池与快照
 
 **预热池**：后台补水位。池空时必须有并发创建上限，否则流量尖峰会惊群 —— 大量请求同时发现池空并同时 create，打爆 provider。
+
+预热省下的是什么，随 provider 而变，需要分别说清：
+
+| Provider | 建箱耗时主要来自 | 预热省下的部分 |
+|---|---|---|
+| Local | mount overlay + 建 cgroup + fork + pivot_root + init 就绪 | 全部（上述都已完成，仅剩挂 workspace） |
+| Tencent | 云侧实例调度与启动 | 云侧启动延迟 |
+
+注：采用 overlayfs 后已无需预解压 rootfs（见 §4.4），预热池的价值转为省去 mount / cgroup / fork 这一串系统调用与 init 就绪等待，量级从"几十 MB 拷贝"降为"若干毫秒的系统调用"。因此 **Local 侧预热池的收益显著小于云侧**，是否启用应可配置，并以 §7 的冷启动压测数据决定。
 
 **快照**：建箱时恢复 → 执行后限频异步刷新 → 回收时最终快照 → 失败则降级用模板。
 
