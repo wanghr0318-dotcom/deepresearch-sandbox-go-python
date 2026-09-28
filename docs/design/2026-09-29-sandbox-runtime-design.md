@@ -1,7 +1,7 @@
 # go-agentbox 设计稿：Agent 工具沙箱运行时
 
 > 状态：设计稿 · 2026-09-29
-> 范围：沙箱管控面 + Provider 层 + 框架外壳
+> 范围：沙箱管控面 + Provider 层 + ReAct 执行框架
 
 ---
 
@@ -9,47 +9,50 @@
 
 **一句话**：给 Agent 用的工具沙箱运行时 —— 隔离执行、资源限额、自动回收、产物持久化；外挂一层可按场景装配的 ReAct 执行框架。
 
-主体是沙箱运行时（约 70% 工作量与绝大部分技术深度），框架外壳只负责把沙箱放进一个真实的使用场景，并支撑"多场景可迁移"这个命题。
+主体是沙箱运行时（约 70% 工作量与绝大部分技术深度），框架外壳负责把沙箱放进真实使用场景，并支撑"多场景可迁移"这个命题。
 
 ### 1.1 与既有方案的关系
 
 | 方案 | 关系 |
 |---|---|
-| CloudWeGo Eino（字节，Go LLM/Agent 框架） | 对标物。本项目的编排层是薄外壳，不与其竞争通用图编排能力 |
+| CloudWeGo Eino（字节，Go LLM/Agent 框架） | **依赖**。ReAct 主循环采用其 graph 编排（见 §5.1） |
 | 腾讯云 AGS / Cube Sandbox | 对标物。Provider 接口按其能力面定义，并提供一个可选的 AGS provider |
 | E2B | 接口语义参考。沙箱内 daemon + Connect 风格 API 的模型来自这里 |
+| runc | 参考。re-exec init 模式来自这里 |
 
-**参考，不是依赖**。判据：关掉源码能否从头写出来并解释每个决定。
+对 Eino 是依赖，对其余是参考 —— **参考的判据：关掉源码能否从头写出来并解释每个决定**。
 
 ### 1.2 非目标
 
-- 不实现通用 DAG 编排引擎
-- 不实现 microVM 级隔离（见 §6 能力边界）
+- 不实现通用 DAG 编排引擎（用 Eino）
+- 不实现 microVM 级隔离（见 §6）
 - 不实现进程级快照（CRIU）
-- 第一版不支持浏览器沙箱
+- 第一版不支持浏览器沙箱的独立隔离（browser 走沙箱内 CDP）
 
 ---
 
 ## 2. 整体架构
 
 ```
-入口层（按 scenario 装配 workflow）
+入口层（按 scenario 装配 workflow，一次性完成）
    │
    ▼
-Template 节点 ──► General ReAct Agent ──► 流式输出
+Template 节点 ──► ReAct Graph（Eino）──► 流式事件输出
                       │
                       ▼
-                  ToolNode
+                  ToolsNode（自实现）
                       └─ 中间件链（洋葱）
-                           └─ 工具执行
-                                ├─ 纯函数工具 ──► 直接执行
-                                └─ 副作用工具 ──► Sandbox Manager
-                                                      │
-                          ┌───────────────────────────┴──────────┐
-                          │  管控面                               │
-                          │  Naming / Locking / Lifecycle /       │
-                          │  Pool / Reaper / Snapshot / Limiter   │
-                          └───────────────┬───────────────────────┘
+                           └─ 工具执行（按 binding 分流）
+                                ├─ loop      进程内
+                                ├─ 无 sandbox 进程内直调
+                                ├─ service   → sandbox exec service → envd
+                                └─ reception → 沙箱内
+                                                  │
+                          ┌───────────────────────┴──────────┐
+                          │  Sandbox 管控面                   │
+                          │  Naming / Locking / Lifecycle /   │
+                          │  Pool / Reaper / Snapshot / Limiter│
+                          └───────────────┬───────────────────┘
                                           │
                                    Provider 接口
                           ┌───────────────┴───────────────┐
@@ -59,7 +62,7 @@ Template 节点 ──► General ReAct Agent ──► 流式输出
 
 ---
 
-## 3. 管控面
+## 3. 沙箱管控面
 
 ### 3.1 命名与绑定
 
@@ -72,7 +75,7 @@ Template 节点 ──► General ReAct Agent ──► 流式输出
 
 沙箱名的三重身份：**全局复用标识 / 分布式锁键 / 绑定记录键**。
 
-绑定记录（Redis Hash）：
+绑定记录：
 
 ```
 binding:{name} → { sandbox_id, provider, state, created_at, last_active_at, ttl_deadline }
@@ -80,7 +83,9 @@ binding:{name} → { sandbox_id, provider, state, created_at, last_active_at, tt
 
 放 Redis 而非 DB：每次工具调用都要 ensure，属热路径。绑定丢失不致命 —— 沙箱变孤儿，provider 侧 TTL 兜底回收，对账任务扫出。DB 作为最终一致的账本用于对账。
 
-### 3.1.1 Store 抽象
+**sandboxID 不从工具入参传入**，由执行层按 chatID（子 agent 再叠 agentID）自行绑定。工具无从指定要用哪个箱，这是防止越权访问他人沙箱的第一道闸。
+
+### 3.2 Store 抽象
 
 管控面的全部外部状态收敛到一个接口，使单机与分布式两种形态可切换：
 
@@ -107,16 +112,14 @@ type Store interface {
 }
 ```
 
-两个实现：
-
 | 实现 | 用途 | 语义 |
 |---|---|---|
 | `MemStore` | 默认，零外部依赖，`go run . demo` 即可跑 | 单进程内正确；锁与信号量退化为进程内原语 |
 | `RedisStore` | 生产 | 完整分布式语义，Lua 保证原子性 |
 
-`MemStore` 下分布式特性退化为本地语义，因此 `RedisStore` 的正确性必须由 §7 的多进程并发测试单独证明，不能依赖单机测试覆盖。
+`MemStore` 下分布式特性退化为本地语义，因此 `RedisStore` 的正确性必须由 §7 的多进程并发测试单独证明。
 
-### 3.2 ensure 流程
+### 3.3 ensure 流程
 
 ```
 ensure(ctx, chatID, agentID) → Sandbox
@@ -127,7 +130,7 @@ ensure(ctx, chatID, agentID) → Sandbox
      命中 && state ∈ {running, hibernated}
         → 探活
            活 → 续 TTL →（hibernated 则 resume）→ 返回
-           死 → 落慢路径
+           死 → 落慢路径，并标记 recreated=true
      未命中 → 落慢路径
 
 ③ 慢路径：抢分布式锁 lock:{name}（带 token、TTL、watchdog）
@@ -156,11 +159,13 @@ else
 end
 ```
 
-否则：A 持锁超时自动释放 → B 拿锁 → A 完成后删掉了 B 的锁 → C 也拿到锁 → 两个持有者同时在临界区。
+否则：A 持锁超时自动释放 → B 拿锁 → A 完成后删掉 B 的锁 → C 也拿到锁 → 两个持有者同时在临界区。
 
-**watchdog 续期**必须绑定 context，业务结束立即停，避免"业务已完成、续期仍在跑"。
+**watchdog 续期**必须绑定 context，业务结束立即停。
 
-### 3.3 一致性模型
+**重建告知**：探活失败导致重建时（`recreated=true`），该轮**首个工具结果**须附加提示 `sandbox was recreated`，让模型知道沙箱内的临时状态（进程、未落 workspace 的文件）已丢失。不告知会导致模型基于过时假设继续操作。
+
+### 3.4 一致性模型
 
 > **Provider 是真相源，binding 是缓存。**
 
@@ -174,7 +179,7 @@ Provider 才真正持有资源；binding 存在只为避免每次查 provider。
 
 孤儿箱靠 `Provider.List(prefix)` + 统一命名前缀扫出。**命名规范是可对账性的前提，不是美观问题。**
 
-### 3.4 状态机与三层 TTL
+### 3.5 状态机与三层 TTL
 
 ```
 creating → running ⇄ hibernated → closed
@@ -187,13 +192,13 @@ creating → running ⇄ hibernated → closed
 |---|---|---|
 | 锁 TTL | 防持锁者崩溃死锁 | 30s + watchdog |
 | 业务 TTL（binding） | 管控面据此回收 | 按场景，15–60 min idle |
-| Provider TTL | 管控面整体故障时的最终保险 | 严格大于业务 TTL |
+| Provider TTL | 管控面整体故障时的最终保险 | **严格大于**业务 TTL |
 
-**Provider TTL 必须严格大于业务 TTL**。写反的后果是管控面以为箱还在、provider 早已回收，每次 ensure 都要重建，预热池形同虚设 —— 且表现为偶发变慢，极难定位。
+Provider TTL 写反的后果：管控面以为箱还在、provider 早已回收，每次 ensure 都要重建，预热池形同虚设 —— 且表现为偶发变慢，极难定位。
 
 续期时机：ensure 成功后、每次 Exec 完成后。
 
-### 3.5 Reaper：幂等优先于选主
+### 3.6 Reaper：幂等优先于选主
 
 每秒运行的维护任务。多实例部署会撞车：同时扫到同一过期箱、同时打快照、同时 Close。
 
@@ -206,20 +211,37 @@ creating → running ⇄ hibernated → closed
 回收走延迟队列：
 
 ```
-Reaper 扫描 → 标记过期 → Redis ZSET（score = 执行时间）
+Reaper 扫描 → 标记过期 → 延迟队列（score = 执行时间）
                             ↓
-       Worker：ZRANGEBYSCORE 0 now → 最终快照 → Close → 删 binding
+       Worker：取到期项 → 最终快照 → Close → 删 binding
 ```
 
-三个理由：打快照耗时不能阻塞扫描；失败可重新入队带退避；批量过期时削峰，不打爆 provider。
+三个理由：打快照耗时不能阻塞扫描；失败可重新入队带退避；批量过期时削峰，不打爆 provider。多消费者取任务须用 Lua 保证"取出 + 删除"原子。
 
-多消费者从 ZSET 取任务须用 Lua 保证"取出 + 删除"原子。
+### 3.7 并发控制：两级信号量与嵌套顺序
 
-### 3.6 会话信号量
+系统里有**两级**并发限制，两者都必要，但嵌套顺序写反会死锁。
 
-普通计数器的致命问题：持有者崩溃后计数不归零，会话永久卡死。
+| 级别 | 键 | 限什么 | 默认 |
+|---|---|---|---|
+| 会话级 | `sem:{chatID}` | 该会话**总的**在途工具执行数（跨轮、跨 subagent） | 按场景 |
+| 轮内 | 进程内 | 单轮内并行执行的 tool_call 数 | 10 |
 
-改用 ZSET 记录 `持有者 token → 获取时间`，acquire 时先清理超时持有者：
+**强制顺序：先抢会话级，再进轮内并发。**
+
+```
+for each tool_call in round:
+    ① SemAcquire(sem:{chatID})        ← 会话级，可能阻塞
+    ② 提交到轮内并发池（上限 10）
+    ③ 执行（含 sandbox ensure）
+    ④ SemRelease(sem:{chatID})        ← defer，覆盖整个执行
+```
+
+顺序反过来的后果：轮内先放行 10 个，它们再去抢只允许 5 个的会话级信号量 —— 5 个占住轮内槽位却在阻塞，另 5 个拿不到会话级也进不来，若彼此有依赖即死锁。
+
+**会话级信号量的持有必须覆盖整个工具执行（含 sandbox ensure）**，不能只包住调用那一瞬间，否则限的不是并发而是 QPS。
+
+会话信号量用带自动过期的 ZSET 实现，避免持有者崩溃后计数不归零导致会话永久卡死：
 
 ```lua
 -- KEYS[1]=sem:{chatID}   ARGV: now, timeout, limit, token
@@ -231,20 +253,20 @@ end
 return 0
 ```
 
-持有者崩溃自愈，不需要额外清理任务。超限任务在 DB 保持 `pending`，release 时通过 Pub/Sub 唤醒。
+超限任务在 DB 保持 `pending`，release 时通过 Pub/Sub 唤醒。
 
-### 3.7 预热池与快照
+### 3.8 预热池与快照
 
 **预热池**：后台补水位。池空时必须有并发创建上限，否则流量尖峰会惊群 —— 大量请求同时发现池空并同时 create，打爆 provider。
 
-预热省下的是什么，随 provider 而变，需要分别说清：
+预热省下的是什么随 provider 而变：
 
 | Provider | 建箱耗时主要来自 | 预热省下的部分 |
 |---|---|---|
-| Local | mount overlay + 建 cgroup + fork + pivot_root + init 就绪 | 全部（上述都已完成，仅剩挂 workspace） |
+| Local | mount overlay + 建 cgroup + fork + pivot_root + init 就绪 | 全部（仅剩挂 workspace） |
 | Tencent | 云侧实例调度与启动 | 云侧启动延迟 |
 
-注：采用 overlayfs 后已无需预解压 rootfs（见 §4.4），预热池的价值转为省去 mount / cgroup / fork 这一串系统调用与 init 就绪等待，量级从"几十 MB 拷贝"降为"若干毫秒的系统调用"。因此 **Local 侧预热池的收益显著小于云侧**，是否启用应可配置，并以 §7 的冷启动压测数据决定。
+采用 overlayfs 后已无需预解压 rootfs（见 §4.4），预热池的价值转为省去 mount / cgroup / fork 这一串系统调用与 init 就绪等待。因此 **Local 侧预热池收益显著小于云侧**，是否启用应可配置，以 §7 的冷启动压测数据决定。
 
 **快照**：建箱时恢复 → 执行后限频异步刷新 → 回收时最终快照 → 失败则降级用模板。
 
@@ -285,7 +307,7 @@ type ExecRequest struct {
     Env     []string
     WorkDir string             // 沙箱内路径，默认 /workspace
     Stdin   io.Reader
-    Stdout  io.Writer          // 流式直出，接 SSE
+    Stdout  io.Writer          // 流式直出，接事件流
     Stderr  io.Writer
     Timeout time.Duration
 }
@@ -300,7 +322,7 @@ type ExecResult struct {
 
 `Stdout/Stderr` 用 `io.Writer` 而非在结果里返回，因为需要边跑边推给前端。
 
-`OOM` 单列，因为"被内存限额杀掉"与"命令自身失败"对 agent 是不同信号，应触发不同反应。
+`OOM` 单列：被内存限额杀掉与命令自身失败对 agent 是不同信号，应触发不同反应。
 
 ### 4.2 能力差异显式化
 
@@ -339,7 +361,7 @@ func Resolve(scenario string) (Provider, error)  // 未注册 → error，绝不
   └─ snapshots/{sid}.tar.gz
 ```
 
-**overlayfs 是关键**：template 作为 lowerdir 只读共享，每实例仅有空 upper 层。建箱从"拷贝几十 MB"降为"mkdir 三个目录 + 一次 mount"，同时快照只需打包 upper 层。原理同 Docker 镜像分层。
+**overlayfs 是关键**：template 作为 lowerdir 只读共享，每实例仅有空 upper 层。建箱从"拷贝几十 MB"降为"mkdir 三个目录 + 一次 mount"，快照只需打包 upper 层。原理同 Docker 镜像分层。
 
 #### 创建流程
 
@@ -347,8 +369,7 @@ func Resolve(scenario string) (Provider, error)  // 未注册 → error，绝不
 ① mkdir instances/{id}/{upper,work,merged}
 ② mount -t overlay overlay -o lowerdir=templates/default,upperdir=...,workdir=... merged
 ③ bind mount ws/{chatID} → merged/workspace
-④ 建 cgroup /sys/fs/cgroup/agentbox/{id}/
-       cpu.max / memory.max / pids.max
+④ 建 cgroup /sys/fs/cgroup/agentbox/{id}/ ：cpu.max / memory.max / pids.max
 ⑤ fork：Cloneflags = NEWNS|NEWPID|NEWUTS|NEWIPC|NEWNET|NEWUSER, Setpgid
 ⑥ 子进程内：写 cgroup.procs → pivot_root → 挂 /proc /sys /dev → 降权 → exec init
 ⑦ 写 state.json
@@ -376,6 +397,7 @@ func main() {
 #### 沙箱内 mini-envd
 
 1 号进程职责：
+
 1. `wait()` 循环收割孤儿进程 —— 不做则僵尸堆满 `pids.max`，沙箱自我饿死
 2. 通过 unix socket 接收 exec 请求并 fork
 3. 转发信号
@@ -419,78 +441,313 @@ tar czf snapshots/{sid}.tar.gz -C instances/{id}/upper .
 
 ---
 
-## 5. 框架外壳
+## 5. ReAct 执行框架
 
-### 5.1 沙箱接入点
+### 5.1 主循环：Eino Graph
 
-沙箱不是工具，是工具的执行环境。ensure 发生在中间件链内，工具本身只做声明：
+主循环用 Eino 的 graph 编排，独立在 `react.go`。**pipeline 只做装配，不含循环逻辑。**
 
-```go
-type Tool interface {
-    Name() string
-    Schema() json.RawMessage
-    NeedsSandbox() bool
-    Invoke(ctx context.Context, args json.RawMessage) (any, error)
-}
-
-sb := sandbox.FromContext(ctx)   // 由中间件注入
+```
+START
+  │
+  ▼
+ChatModel 节点 ──branch──► 有 tool_calls ──► ToolsNode（并发执行）
+  ▲                    │                            │
+  │                    └──► 无 tool_calls ──► END   │
+  └────────────────────── branch ◄─────────────────┘
 ```
 
-好处：工具实现可单测，单测中注入 fake sandbox，无需真起 namespace。
+每轮：
 
-### 5.2 中间件链
-
-```go
-type Handler func(ctx context.Context, call ToolCall) (ToolResult, error)
-type Middleware func(next Handler) Handler
-func (c *Chain) Use(name string, mw Middleware)   // 同名覆盖，异名追加
+```
+curRound++
+  → 上一轮结果 append 到 state.Messages
+  → 跑 compactor 链（§5.5）
+  → 调 ChatModel
 ```
 
-洋葱模型，执行顺序 = 注册顺序。内置：
+### 5.2 终止条件
 
-| 序 | 中间件 | 职责 |
+命中任一即终止：
+
+| # | 条件 | 处理 |
 |---|---|---|
-| 1 | Trace | 开 span，记录入参出参耗时，**不可关闭** |
-| 2 | Admission | 准入判定，拒绝则直接返回 |
-| 3 | Semaphore | 会话级并发信号量，超限转 pending |
-| 4 | Timeout | 给 ctx 挂 deadline |
-| 5 | SandboxBind | `NeedsSandbox` 的工具在此 ensure 并注入 context |
-| 6 | Retry | 退避重试，**仅对幂等工具生效** |
-| 7 | Truncate | 结果超长截断，防撑爆上下文 |
+| 1 | 模型不再发 tool_call（`finish_reason=stop`） | 正常终止 |
+| 2 | `curRound >= maxRound` | 见下 |
+| 3 | 用户软取消 / 中断 | 收尾并落 trace |
+| 4 | 超时或 fatal 错误 | 报错终止 |
 
-**覆盖语义**：同名中间件后注册者替换先注册者，槽位不变；异名追加至链尾。场景可替换内置实现，但不能打乱链路结构 —— 配置自由，不给编排自由。
+**默认 maxRound：主 agent 50，子 agent 30。** `ScenarioConfig.React.MaxRound` 可覆盖（§5.10 三场景表给的就是覆盖值）。
 
-### 5.3 准入控制
+超上限的收尾有两种模式，由场景配置选择：
 
-强制层，场景无权关闭。
+- **报错终止**
+- **"无工具总结"收尾** —— 再调一次模型，但不带工具目录，强制它产出最终文本
+
+两种模式都须向模型注入 `max_round_tool_hit` 标记，让它知道是被截断而非自然结束。
+
+### 5.3 模型调用层（buildChatModel）
+
+装配期一次性构建，运行期只读。react graph 拿到的只是一个 `ChatModel` 接口，**不感知降级、变体与续写**。
+
+```
+ChatModel（对外接口）
+ └─ Aggregator     tool_call 分桶聚合                  ← 必须在最外层
+     └─ AutoContinue  finish_reason 续写，独立预算
+         └─ Fallback  主模型失败 → 降级链
+             └─ Variant   变体选择
+                 └─ Adapter（原生协议 + SSE 解码 + 归一）
+```
+
+#### 归一化下沉到 Adapter
+
+各厂商 SSE 格式不同，Adapter 解析成统一 chunk，上层不感知协议差异：
+
+```go
+type Chunk struct {
+    TextDelta      string
+    ReasoningDelta string
+    ToolCallDelta  *ToolCallDelta   // {Index, ID, Name, ArgsDelta}
+    FinishReason   FinishReason     // 已归一
+    Usage          *Usage
+}
+```
+
+`finish_reason` 也必须归一（各家用 `stop` / `end_turn` / `max_tokens` / `length` 表达同一含义），否则 auto-continue 的触发条件要在每个 adapter 里重写一遍。
+
+#### tool_call 聚合
+
+按 OpenAI function-calling schema 聚合：
+
+```go
+type ToolCallBucket struct {
+    ID   string          // 首次出现时写入，后续到达一律忽略
+    Name string          // 同上
+    Args strings.Builder // 增量拼接
+}
+```
+
+**Aggregator 必须位于 AutoContinue 之外（更外层）。**
+
+原因：`arguments` 可能在拼到一半时被 `length` 截断，续写后要接着拼进同一个桶。而**续写请求返回的 SSE，其 `tool_call.index` 通常会重新从 0 开始** —— 若直接按 index 分桶，第二段会覆盖第一段而非追加，产出半截 JSON。这个 bug 只在长 arguments 时偶发，极难定位。
+
+解法：Aggregator 以 `(continueSeq 归一后的全局 index)` 为键，Adapter 在续写时提供 index offset 映射。AutoContinue 对上游只暴露一条连续的 chunk 流。
+
+#### auto-continue
+
+触发：`finish_reason ∈ {length, server_interrupt, repeat}`。**与 react 轮次无关**，不消耗 `curRound`。
+
+**必须有独立预算**，否则模型持续返回 `length` 即无限续写：
+
+```go
+type AutoContinueConfig struct {
+    MaxContinues  int            // 默认 3，单次模型调用内最多续写次数
+    TokenBudget   int            // 单次模型调用内累计 token 上限
+    TriggerOn     []FinishReason
+}
+```
+
+超预算时按 `stop` 处理，并在消息上标记截断，让后续逻辑知道这是被迫结束。
+
+#### 超时
+
+| 层 | 值 |
+|---|---|
+| SSE 空闲（两个 chunk 之间） | 5 min |
+| HTTP 总时长 | 1 h |
+
+两者都到期即断开并按 fatal 错误处理。
+
+#### 变体
+
+`Variant` 层第一版留空接口（直通 Primary），分桶依据（scenario / 用户哈希 / 灰度比例）待定，见 §9。
+
+### 5.4 工具层
+
+#### 工具目录
+
+模型可见的 schema 来自 preset yaml：
+
+| 组 | 工具 |
+|---|---|
+| 任务 | `todo_read` / `todo_write` |
+| 执行 | `ipython` |
+| 文件 | `read_file` / `edit_file` / `write_file` |
+| 浏览 | `browser` |
+| 检索 | `web_search` / `web_open_url` / `search_image` |
+
+#### 裁剪
+
+按 `rule.yaml` 依 workflow 裁剪，每个工具声明：
+
+```yaml
+tools:
+  ipython:
+    enabled: true
+    optional: false      # 场景不可关闭
+  browser:
+    enabled: false
+    optional: true       # 场景可开
+```
+
+#### 执行双轨（binding）
+
+| binding | 落点 | 工具 |
+|---|---|---|
+| `loop` | 进程内循环 | `todo_*`、子 agent（`task`） |
+| 无 sandbox | 进程内直调 | `web_search`、`web_open_url`、`search_image` |
+| `service` | tools → sandbox exec service → envd | 文件类 |
+| `reception`（或留空） | 沙箱内 | ssh(user)；legacy：`ipython` → kernel server、`browser` → CDP |
+
+`sandboxID` 不从入参传入（§3.1）。
+
+#### 并发与容错
+
+单轮多个 tool_call 并发执行，并发限制见 §3.7 的两级信号量。
+
+**协议硬约束：每个 `tool_call` 必须有一条 `tool_call_id` 对应的 `role=tool` 消息。** 缺一条，下一轮请求会被模型服务端拒绝（400）。因此所有"容错"都必须是**产出错误内容的 tool 消息**，绝不能是"跳过该 call"：
+
+| 情况 | 处理 |
+|---|---|
+| 工具名未知 | 产出 `role=tool` 提示文本，不中断整体流程 |
+| 单轮 tool_call 数超 `maxToolCall` | 超出部分**仍须补齐** `role=tool` 的"已截断"错误消息 |
+| 工具执行失败 | 转成 `is_error` 结果给模型看，而非向上抛传输失败 |
+| 工具超时 / 被取消 | 同上，按 §5.4 错误分类标注 |
+
+**进下一轮前必须断言**：`len(tool_calls) == len(tool_messages)` 且 id 集合相等。不等即为框架 bug，应 fail fast 而非带病进入下一轮。
+
+#### 错误分类
+
+工具错误统一分类，随 tool 消息回传，便于模型区分该重试还是该换路：
+
+```
+tool_not_found / timeout / cancelled / internal
+```
+
+#### MCP 动态接入
+
+每轮按用户设置动态接入。工具改名避免与内置工具冲突：
+
+```
+mcp_plugin_{name}_{server}_{tool}
+```
+
+连续失败的 MCP 由 Template 节点注入 `plugin_status` 提示，让模型知道该插件当前不可用。
+
+### 5.5 上下文压缩
+
+每次调用模型**之前**跑 compactor 链。
+
+| 规则 | 值 |
+|---|---|
+| 触发阈值 | 达到 `ctx_tools` 的 **0.9** |
+| 单条 replay 截断 | 超 **8000** token 截断 |
+| 截断保底 | 保留 **4000** token |
+
+触发后对历史做总结压缩。压缩发生时推送 `history_compaction` 事件（§5.9），让前端可见。
+
+压缩不得破坏 `tool_call` 与 `tool` 消息的配对关系 —— 压缩粒度以"完整的一轮"为单位，不能把一轮从中间切开。
+
+### 5.6 准入与内容审核
+
+两层，**顺序固定：先准入，后审核**。
+
+| 层 | 管什么 | 时机 | 结果 |
+|---|---|---|---|
+| **Admission** | 权限 —— 该场景允不允许调该工具 | 工具执行前 | `Allow` / `Confirm` / `Deny` |
+| **Moderation（入参）** | 内容 —— 入参是否违规 | 准入通过后、执行前 | 放行 / 拦截 |
+| **Moderation（回传）** | 内容 —— 产出的图片/文件是否违规 | 结果回传前 | 放行 / **替换为 blocked 图** |
+
+顺序不能反：无权调用的工具，其入参根本不该被送去审核。
 
 ```go
 type Decision int
 const (
     Allow Decision = iota
-    Confirm                  // 挂起等用户确认
-    Deny                     // 拒绝，理由回传模型
+    Confirm   // 挂起，等用户确认
+    Deny      // 拒绝，理由作为 tool 消息回传模型
 )
-
-type Admission interface {
-    Check(ctx context.Context, call ToolCall) (Decision, string)
-}
 ```
 
-`Confirm` 与流式协议配合：发出 `tool_confirm_required` 事件挂起循环，等前端回传决定。这是 human-in-the-loop 的落点。
+`Confirm` 推送 `tool_confirm_required` 事件挂起循环，等前端回传决定。**即便是 `Deny`，也必须产出对应的 `role=tool` 消息**（见 §5.4 协议约束）。
 
-### 5.4 场景装配
+Admission 与 Moderation 均为强制层，场景可替换实现但不可关闭。
+
+### 5.7 产出物落地
+
+- 输出目录按约定路径组织
+- portal fs 挂载，TOS 为后端存储
+- 渲染时清洗占位符，**拒绝路径穿越**
+- 凭证经创建请求注入，沙箱内 daemon 仅内存缓存，**不写入日志**
+
+### 5.8 子 agent
+
+`task` 工具在进程内起独立 ReAct 循环，最终文本作为 tool result 回主循环。
+
+| 项 | 规则 |
+|---|---|
+| 嵌套深度 | 主 agent `depth=0`，子 agent `depth=1`；**`depth >= 2` 禁止嵌套** |
+| 沙箱 | 独立沙箱：同 chatID + 不同 agentID（命名见 §3.1） |
+| workspace | **共享同一 chat 的 TOS workspace** |
+| 并发 | 最多 **4** |
+| 回收 | 主循环通过 `wait_for_message` / `check_subagent_status` 收取结果 |
+| maxRound | 默认 30 |
+
+**共享 workspace 的写入隔离**：4 个子 agent 并发写同一 workspace 会互相覆盖。约定：
+
+```
+workspace/               ← 共享只读区，子 agent 可读
+workspace/.agents/{agentID}/   ← 各子 agent 专属写入区
+```
+
+子 agent 默认写入自己的专属目录，主 agent 负责汇总。不做这个约定会出现"报告写了一半被另一个子 agent 覆盖"这类极难复现的问题。
+
+### 5.9 事件流
+
+推送给前端的事件类型：
+
+| 事件 | 含义 |
+|---|---|
+| `start` / `end` | 一次请求的起止 |
+| `model_text` | 模型文本增量 |
+| `reasoning` | 推理内容增量 |
+| `tool_detect` | 检测到 tool_call |
+| `args_delta` | tool_call 参数增量 |
+| `progress` | 工具执行进度 |
+| `agent_start` / `agent_end` | 子 agent 起止 |
+| `tool_confirm_required` | 准入判定为 `Confirm`，等待用户确认 |
+| `history_compaction` | 触发了上下文压缩 |
+| `steer_message` | 用户插话 |
+| `block_revoke` / `message_revoke` | 撤回（§5.11） |
+
+#### steer_message 的排队规则
+
+用户插话**下轮生效，不中断当轮**。但落地受协议约束：当轮若正在执行工具，`assistant(tool_calls)` 之后**必须紧跟全部对应的 tool 消息**，插话不能插在中间。
+
+规则：
+
+```
+插话到达 → 进待定队列
+         → 等当轮所有 tool 消息回填完毕
+         → append 到消息尾部
+         → 进入下一轮
+```
+
+违反此顺序会破坏消息序列，下一轮请求直接被服务端拒绝。
+
+### 5.10 场景装配
 
 ```go
 type ScenarioConfig struct {
     Name        string
-    Model       ModelConfig      // 主模型 + 降级链
+    Model       ModelConfig      // Primary + Fallbacks + Variants + AutoContinue + Timeout
     Prompt      PromptConfig     // system prompt / skill 注入
-    Tools       ToolPolicy       // 白名单 + 风险等级表 + 用户 MCP
-    React       ReactConfig      // MaxRound、压缩阈值、压缩策略
+    Tools       ToolPolicy       // rule.yaml 裁剪结果 + 风险等级表 + 用户 MCP
+    React       ReactConfig      // MaxRound（覆盖默认）、压缩阈值、压缩策略、超限收尾模式
     Sandbox     SandboxPolicy    // 模板、限额、网络策略、TTL
     Memory      MemoryOptions
-    ErrorPolicy ErrorPolicy
+    Concurrency ConcurrencyConfig // 会话级信号量上限、轮内并发上限
+    ErrorPolicy ErrorPolicy      // 撤回档位
 }
 
 func (c *ScenarioConfig) Validate() error   // 启动时对所有 scenario 全量跑一遍
@@ -498,36 +755,40 @@ func (c *ScenarioConfig) Validate() error   // 启动时对所有 scenario 全�
 
 装配在入口层一次性完成，之后链路只读不改。配置错误在装配期暴露，而非第 8 轮才炸。
 
-### 5.5 三场景对照
+#### 三场景对照
 
 | | 代码助手 | 数据分析 | 深度研究 |
 |---|---|---|---|
-| MaxRound | 40 | 15 | 60 |
+| MaxRound（覆盖默认 50） | 40 | 15 | 60 |
+| 会话级并发 | 5 | 3 | 8 |
 | 沙箱模板 | 带 git / 编译器 | 带 python + 科学计算 | 最小 |
 | 内存限额 | 1 GB | 4 GB | 512 MB |
 | 网络策略 | 出站受限（仅包管理源） | 禁止出站 | 出站放开 |
 | 沙箱 idle TTL | 60 min | 30 min | 15 min |
 | 压缩阈值 | 高 | 中 | 低 |
 | 压缩策略 | 保留最近 + 文件摘要 | 保留最近 | 摘要为主 |
-| shell 工具 | Allow | Confirm | Deny |
-| 网络出站工具 | Confirm | Deny | Allow |
+| `ipython`（Admission） | Allow | Confirm | Deny |
+| `web_search`（Admission） | Confirm | Deny | Allow |
+| `browser` | 关 | 关 | 开 |
 | 快照 | 开 | 开 | 关 |
-| 异常策略 | RevokeMessage | RevokeMessage | RevokeBlock |
+| 超限收尾 | 无工具总结 | 报错 | 无工具总结 |
+| 撤回档位 | RevokeMessage | RevokeMessage | RevokeBlock |
 
 三列差异是行为质变而非参数微调：同一个二进制，三种安全模型。
 
-### 5.6 流式协议与撤回语义
+### 5.11 撤回语义
+
+流式输出按内容块推送：
 
 ```
-event: block_start     {block_id, type: "text" | "tool_call"}
+event: block_start     {block_id, type}
 event: block_delta     {block_id, delta}
 event: block_end       {block_id}
 event: block_revoke    {block_id}
 event: message_revoke  {message_id}
-event: tool_confirm_required {call_id, tool, args, reason}
 ```
 
-| 策略 | 行为 |
+| 档位 | 行为 |
 |---|---|
 | `RevokeBlock` | 只撤单块，允许静默恢复；后台重试成功即续推新块 |
 | `RevokeMessage` | 整条作废，用户重发 |
@@ -547,7 +808,8 @@ event: tool_confirm_required {call_id, tool, args, reason}
 | 适用租户模型 | **单租户可信场景** | 多租户不可信 |
 | Hibernate | 冻结进程，不释放内存 | 内存落盘并释放 |
 | Snapshot | 文件系统层 | 含内存与进程状态 |
-| 浏览器沙箱 | 第一版不支持 | 支持 |
+| 浏览器 | 沙箱内 CDP，无独立隔离 | 独立浏览器沙箱 |
+| 沙箱内用户 | 默认 root（rootless 为待定项） | 非特权用户 |
 
 ---
 
@@ -555,14 +817,19 @@ event: tool_confirm_required {call_id, tool, args, reason}
 
 | 验证项 | 方法 | 产出证据 |
 |---|---|---|
-| 分布式正确性 | 8 进程并发对同一 chatID 调 ensure | 断言仅创建 1 个沙箱、无孤儿、无死锁 |
+| 分布式正确性 | 8 进程并发对同一 chatID 调 ensure | 仅创建 1 个沙箱、无孤儿、无死锁 |
+| 两级信号量 | 会话级限 3、轮内限 10，构造 20 个 tool_call | 无死锁，在途数始终 ≤ 3 |
+| 消息配对 | 注入未知工具、超 maxToolCall、工具超时 | `tool_calls` 与 `tool` 消息数恒等，下一轮请求不被拒 |
+| auto-continue 预算 | 构造持续返回 `length` 的 mock 模型 | 达 MaxContinues 后停止，标记截断 |
+| tool_call 跨续写聚合 | 构造在 arguments 中途截断的 mock | 拼接结果为完整 JSON，非半截 |
 | 回收正确性 | 注入 fork 炸弹、OOM、超时 | 限额生效、进程清零、cgroup 与挂载点无残留 |
-| 一致性 | 强杀 provider 侧实例后重新 ensure | 自动解绑重建，workspace 文件完整 |
+| 一致性 | 强杀 provider 侧实例后重新 ensure | 自动解绑重建，workspace 完整，首个工具结果含 `sandbox was recreated` |
+| 子 agent 写隔离 | 4 个子 agent 并发写同名文件 | 各写各的专属目录，无覆盖 |
 | 冷启动 | 压测建箱延迟分布 | P50 / P99，预热池开关对比 |
 | 并发容量 | 逐步加压 | 单机并发沙箱数上限、内存曲线 |
 | 多场景 | 三场景各跑一条完整链路 | 同一二进制，三种安全姿态实测 |
 
-**零外部依赖可演示**是硬要求：`Store` 接口默认内存实现，`go run . demo` 即可跑通，无需 Redis 与云账号。分布式语义由上表第一项的多进程测试保证。
+**零外部依赖可演示**是硬要求：`Store` 默认内存实现，`go run . demo` 即可跑通，无需 Redis 与云账号。分布式语义由上表前两项的多进程测试保证。
 
 ---
 
@@ -571,20 +838,24 @@ event: tool_confirm_required {call_id, tool, args, reason}
 | 阶段 | 内容 | 出口条件 |
 |---|---|---|
 | M1 | LocalProvider 最小可用 | 能建箱、执行命令、正确销毁，无残留 |
-| M2 | 管控面单机版 | 命名复用、状态机、TTL、Reaper，内存 Store |
-| M3 | 管控面分布式版 | Redis Store、分布式锁、延迟队列、信号量；多进程并发测试通过 |
-| M4 | 框架外壳 | ReAct 循环、中间件链、准入控制打通 |
-| M5 | 场景装配 | 三场景配置跑通，对照表实测 |
-| M6 | 压测与文档 | 验证表全部有数据，README 含能力边界 |
+| M2 | 管控面单机版 | 命名复用、状态机、TTL、Reaper，MemStore |
+| M3 | 管控面分布式版 | RedisStore、分布式锁、延迟队列、两级信号量；多进程并发测试通过 |
+| M4 | ReAct 循环 | Eino graph 打通、模型层四层装配、ToolsNode 并发与容错、消息配对断言 |
+| M5 | 工具层与子 agent | 双轨 binding、MCP 接入、准入与审核、子 agent 与写隔离 |
+| M6 | 场景装配 | 三场景配置跑通，对照表实测 |
+| M7 | 压测与文档 | 验证表全部有数据，README 含能力边界 |
 
 ---
 
 ## 9. 待定项
 
-| # | 待定 | 影响 |
-|---|---|---|
-| 1 | 编排层自研 vs 直接用 Eino | 代码量与叙事，M4 前需定 |
-| 2 | Rust 的落点（是否需要） | 目前设计中无必须项，可能不引入 |
-| 3 | 持久化存储后端（本地 FS / 对象存储） | 影响 workspace 与快照实现 |
-| 4 | 维护任务的选主实现（是否必要） | 幂等已保证正确性，选主仅为优化 |
-| 5 | TencentProvider 实现深度（骨架 vs 完整） | 取决于是否有 AGS 账号 |
+| # | 待定 | 影响 | 定夺时点 |
+|---|---|---|---|
+| 1 | ~~编排层自研 vs Eino~~ | **已定：用 Eino graph** | — |
+| 2 | Variant 分桶依据（scenario / 用户哈希 / 灰度比例） | 第一版留空接口直通 Primary | M4 后 |
+| 3 | Rust 的落点 | 目前设计中无必须项，可能不引入 | 按需 |
+| 4 | 持久化存储后端（本地 FS / 对象存储） | 影响 workspace 与快照实现 | M1 |
+| 5 | 维护任务选主实现 | 幂等已保证正确性，选主仅为优化 | M3 |
+| 6 | TencentProvider 实现深度（骨架 vs 完整） | 取决于是否有 AGS 账号 | M5 |
+| 7 | 沙箱内是否改 rootless | 影响隔离强度与兼容性 | M1 |
+| 8 | 超限收尾"无工具总结"的 prompt 设计 | 影响截断时的输出质量 | M4 |
