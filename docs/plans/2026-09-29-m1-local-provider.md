@@ -984,6 +984,11 @@ sudo chroot /var/lib/agentbox/templates/default /bin/sh -c "echo ok"
 
 Expected: `ok`
 
+> 这一步需交互式输入 sudo 密码，只能在 WSL 终端手工执行，代理代跑不了。
+> 注意 `bin/sh` 是指向 `/bin/busybox` 的**绝对**符号链接——在宿主上它是悬空的，
+> 只有 chroot 或 pivot_root 之后才解析正确。这正是 `EnsureTemplate`
+> 不能用 `os.Stat` 的原因。
+
 - [ ] **Step 2: 写失败测试**
 
 `internal/rootfs/template_test.go`:
@@ -1031,6 +1036,44 @@ func TestEnsureTemplateAcceptsCompleteRootfs(t *testing.T) {
 		t.Fatalf("EnsureTemplate 对完整模板应当通过，实际: %v", err)
 	}
 }
+
+// TestEnsureTemplateAcceptsAbsoluteShellSymlink 覆盖 alpine 的真实形态：
+// bin/sh 是指向 /bin/busybox 的绝对符号链接。在宿主上该链接悬空
+// （宿主没有 /bin/busybox），跟随它会把好模板误判为损坏。
+func TestEnsureTemplateAcceptsAbsoluteShellSymlink(t *testing.T) {
+	dir := t.TempDir()
+	for _, d := range requiredTemplateDirs {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bin", "busybox"), []byte("ELF"), 0o755); err != nil {
+		t.Fatalf("写 bin/busybox: %v", err)
+	}
+	if err := os.Symlink("/bin/busybox", filepath.Join(dir, "bin", "sh")); err != nil {
+		t.Fatalf("创建 bin/sh 符号链接: %v", err)
+	}
+	if err := EnsureTemplate(dir); err != nil {
+		t.Fatalf("EnsureTemplate 对含绝对 sh 链接的模板应当通过，实际: %v", err)
+	}
+}
+
+// TestEnsureTemplateRejectsDanglingShellSymlink 确认真正损坏的模板仍被拒：
+// bin/sh 指向模板内并不存在的目标。
+func TestEnsureTemplateRejectsDanglingShellSymlink(t *testing.T) {
+	dir := t.TempDir()
+	for _, d := range requiredTemplateDirs {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	if err := os.Symlink("/bin/busybox", filepath.Join(dir, "bin", "sh")); err != nil {
+		t.Fatalf("创建 bin/sh 符号链接: %v", err)
+	}
+	if err := EnsureTemplate(dir); err == nil {
+		t.Fatal("bin/sh 的目标在模板内不存在时，EnsureTemplate 应当报错")
+	}
+}
 ```
 
 - [ ] **Step 3: 跑测试确认失败**
@@ -1076,9 +1119,36 @@ func EnsureTemplate(dir string) error {
 			return fmt.Errorf("模板 %s 缺少必需目录 %s（模板可能未解包完整）: %w", dir, d, err)
 		}
 	}
+	return checkShell(dir)
+}
+
+// checkShell 校验模板内存在可用的 /bin/sh。
+//
+// 不能直接用 os.Stat：alpine 的 bin/sh 是指向 /bin/busybox 的【绝对】
+// 符号链接。在宿主上 os.Stat 会把它解析成宿主的 /bin/busybox——那个
+// 文件通常不存在，于是一个完全正确的模板会被判为损坏。绝对链接只有
+// 在 pivot_root 之后才解析正确，所以这里必须按模板根重新解析它。
+func checkShell(dir string) error {
 	shell := filepath.Join(dir, "bin", "sh")
-	if _, err := os.Stat(shell); err != nil {
+	fi, err := os.Lstat(shell)
+	if err != nil {
 		return fmt.Errorf("模板 %s 缺少 /bin/sh: %w", dir, err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		return nil // 普通文件，直接可用
+	}
+	target, err := os.Readlink(shell)
+	if err != nil {
+		return fmt.Errorf("读取 %s 的链接目标: %w", shell, err)
+	}
+	// 绝对链接按模板根解析，相对链接按所在目录解析。
+	resolved := filepath.Join(filepath.Dir(shell), target)
+	if filepath.IsAbs(target) {
+		resolved = filepath.Join(dir, target)
+	}
+	if _, err := os.Stat(resolved); err != nil {
+		return fmt.Errorf("模板 %s 的 /bin/sh 指向 %s，该目标在模板内不存在: %w",
+			dir, target, err)
 	}
 	return nil
 }
@@ -1092,7 +1162,7 @@ func EnsureTemplate(dir string) error {
 go test ./internal/rootfs/ -v
 ```
 
-Expected: 六个用例全部 PASS（Task 3 的三个 + 本任务的三个）
+Expected: 八个用例全部 PASS（Task 3 的三个 + 本任务的五个）
 
 - [ ] **Step 6: 提交**
 
