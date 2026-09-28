@@ -13,6 +13,9 @@ import (
 // 调用时机：进程以 `/proc/self/exe init` 启动，且 main 在做任何
 // 其他初始化之前就分流到这里。
 func RunInit() error {
+	// root 目前只做判空校验；它的值本身留给 Task 6 去做 pivot_root
+	// （把这个目录切换成新的根文件系统），这里先不用，避免引入
+	// 一个只声明未使用、又要用 _ 掩盖的半成品变量。
 	root := os.Getenv(envSandboxRoot)
 	if root == "" {
 		return fmt.Errorf("缺少环境变量 %s", envSandboxRoot)
