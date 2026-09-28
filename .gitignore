@@ -29,3 +29,6 @@ go.work.sum
 .vscode/
 .DS_Store
 Thumbs.db
+
+# SDD 执行期的脚手架：任务简报、报告、diff 包、进度 ledger
+.superpowers/
