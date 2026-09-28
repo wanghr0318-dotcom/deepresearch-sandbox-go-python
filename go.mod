@@ -1,3 +1,3 @@
 module github.com/wanghr0318-dotcom/go-agentbox
 
-go 1.27.1
+go 1.23
