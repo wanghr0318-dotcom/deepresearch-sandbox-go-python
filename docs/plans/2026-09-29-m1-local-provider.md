@@ -617,16 +617,28 @@ func New(root, name string) (*Group, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("创建 cgroup 根 %s: %w", root, err)
 	}
-	// 子组要能设 cpu/memory/pids，父组必须先在 subtree_control 里启用它们。
-	// 已启用时重复写不会报错；父组不支持某控制器时才会失败，此处容忍。
-	_ = os.WriteFile(filepath.Join(filepath.Dir(root), "cgroup.subtree_control"),
-		[]byte("+cpu +memory +pids"), 0o644)
-	_ = os.WriteFile(filepath.Join(root, "cgroup.subtree_control"),
-		[]byte("+cpu +memory +pids"), 0o644)
+	// 子组要能设 cpu/memory/pids，祖先组必须逐级在 subtree_control 里启用它们：
+	// /sys/fs/cgroup 启用后 root 才有这些文件，root 启用后子组才有。
+	// 已启用时重复写不报错，故这里容忍写入失败——真正的判据是下面文件是否出现。
+	for _, dir := range []string{filepath.Dir(root), root} {
+		_ = os.WriteFile(filepath.Join(dir, "cgroup.subtree_control"),
+			[]byte("+cpu +memory +pids"), 0o644)
+	}
 
 	path := filepath.Join(root, name)
 	if err := os.Mkdir(path, 0o755); err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("创建 cgroup %s: %w", path, err)
+	}
+	// 控制器未委派时，子组里根本不会出现这几个限额文件（实测：WSL2 的
+	// /sys/fs/cgroup/cgroup.subtree_control 默认为空）。此时若不早报，
+	// 失败会推迟到 Apply 写文件，错误只剩一句 no such file，
+	// 完全看不出病根是控制器没启用。
+	for _, f := range []string{"cpu.max", "memory.max", "pids.max"} {
+		if _, err := os.Stat(filepath.Join(path, f)); err != nil {
+			return nil, fmt.Errorf(
+				"cgroup %s 缺少 %s：控制器未委派，请确认 %s/cgroup.subtree_control 已启用 cpu/memory/pids",
+				path, f, root)
+		}
 	}
 	return &Group{path: path}, nil
 }
