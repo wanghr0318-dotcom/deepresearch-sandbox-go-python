@@ -22,7 +22,8 @@ type Overlay struct {
 	Merged string // 挂载点，即沙箱看到的根
 }
 
-// Mount 执行 overlayfs 挂载。四个目录都必须已存在。
+// validate 检查四个目录是否已存在、是否为目录，以及路径里是否混入了
+// overlayfs 挂载选项本身会用到的分隔符。
 func (o Overlay) validate() error {
 	for name, dir := range map[string]string{
 		"Lower": o.Lower, "Upper": o.Upper, "Work": o.Work, "Merged": o.Merged,
@@ -44,7 +45,8 @@ func (o Overlay) validate() error {
 	return nil
 }
 
-// Mount 把 Lower/Upper/Work 三层联合挂载到 Merged。
+// Mount 执行 overlayfs 挂载。四个目录都必须已存在。
+// 把 Lower/Upper/Work 三层联合挂载到 Merged。
 func Mount(o Overlay) error {
 	if err := o.validate(); err != nil {
 		return err
@@ -66,10 +68,23 @@ func BindMount(src, dst string) error {
 
 // Unmount 卸载 path。它是幂等的：路径本就未挂载时返回 nil。
 //
-// 常规卸载遇到 EBUSY（仍有进程持有该挂载）时，退化为 lazy umount：
-// 先把挂载点从命名空间摘除，等引用归零后由内核自行清理。
+// 常规卸载遇到 EBUSY（仍有进程持有该挂载）时，退化为 lazy umount
+// （MNT_DETACH）：先把挂载点从命名空间摘除，等引用归零后由内核自行清理。
 // 这是清理路径上必须的兜底——否则一个还没退干净的进程就能让整箱卸不掉。
+//
+// 调用方契约（实测数据见下）：
+//  1. MNT_DETACH 确实会递归断开整个子树，不会留下孤儿挂载——对一个带嵌套
+//     子挂载的目录做 mount --rbind 后（挂载条目从 1 增至 3：源的 inner、
+//     目标、目标的 inner），MNT_DETACH 后目标子树在 /proc/self/mountinfo
+//     里的残留条目为 0。
+//  2. 但只要 bind 源下面有嵌套挂载，普通 umount 必然先撞 EBUSY，因此每次
+//     都会走 lazy 路径——调用方永远拿不到"同步卸载完成"的保证：Unmount
+//     返回 nil 只表示挂载点已从当前命名空间摘除，不能假定底层资源
+//     （如源文件系统的引用）已经立即释放。
 func Unmount(path string) error {
+	if path == "" {
+		return fmt.Errorf("Unmount: path 为空")
+	}
 	err := syscall.Unmount(path, 0)
 	switch {
 	case err == nil:
