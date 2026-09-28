@@ -574,17 +574,45 @@ type ToolCallBucket struct {
 
 触发：`finish_reason ∈ {length, server_interrupt, repeat}`。**与 react 轮次无关**，不消耗 `curRound`。
 
-**必须有独立预算**，否则模型持续返回 `length` 即无限续写：
+**必须有硬上限**，否则模型持续返回 `length` 即无限续写：
 
 ```go
 type AutoContinueConfig struct {
-    MaxContinues  int            // 默认 3，单次模型调用内最多续写次数
-    TokenBudget   int            // 单次模型调用内累计 token 上限
-    TriggerOn     []FinishReason
+    MaxContinues int            // 硬上限 3
+    TokenBudget  int            // 单次模型调用内累计 token 上限
+    TriggerOn    []FinishReason
 }
 ```
 
-超预算时按 `stop` 处理，并在消息上标记截断，让后续逻辑知道这是被迫结束。
+达到上限后：**返回已累积的截断内容 + 最后一轮 tool_calls，循环终止**。
+
+**截断的 tool_call 必须转为错误 tool 消息，不得交给 ToolsNode 执行。** 在 `arguments` 拼到一半被截断时，那段 JSON 是不完整的 —— 直接送去执行会在反序列化处炸，而且错误信息毫无指向性。正确处理是：进 ToolsNode 前校验每个 tool_call 的 `arguments` 能否解析，不能解析的按 §5.4 产出 `is_error` 的 tool 消息。这样既满足了"每个 tool_call 必须有对应 tool 消息"的协议约束，又让模型知道自己的输出被截断了。
+
+#### maxTokens 的实际生效值
+
+`MaxTokens` 不是定值，每轮按剩余窗口收缩：
+
+```
+available = ContextLength - input_tokens - tools_tokens
+
+if available <= 0:
+    return 1                        // 兜底，避免完全失败
+if MaxTokens <= available:
+    return MaxTokens                // 配置值够用
+return max(available * 0.9, 1)      // 留 10% buffer
+```
+
+默认 fallback 值 4096。
+
+**配置过小的三个后果**（都不是立即可见的错误，而是缓慢劣化）：
+
+| 后果 | 机理 |
+|---|---|
+| 延迟与成本 × n | 每次回答都要续写数轮，每轮都重传完整上下文 |
+| 加速触顶 | 续写产生的中间内容也进 history，压缩触发得更频繁，形成恶性循环 |
+| tool_call 截断 | 长 `arguments` 更容易被腰斩，落到上面那条错误路径 |
+
+因此 `Validate()` 除 §5.3 已有的检查外，还须加一条：**`available` 低于某个下限时不应发起模型调用**。返回 1 只是防止程序崩溃，一个被要求产出 1 个 token 的请求在业务上必然无用 —— 此时正确的动作是先强制压缩，压缩后 `available` 仍不足则显式报错，而不是发一个注定无意义的请求出去。
 
 #### 超时
 
@@ -678,17 +706,60 @@ mcp_plugin_{name}_{server}_{tool}
 
 ### 5.5 上下文压缩
 
-每次调用模型**之前**跑 compactor 链。
+每次调用模型**之前**跑 compactor 链。阈值一律表达为 `ContextLength` 的比例，不写绝对值 —— 换模型时只改 `ContextLength` 一处。
+
+#### 两种触发模式
+
+**默认模式**：
+
+```
+history_tokens > ContextLength * 0.9
+```
+
+**reserve 模式**（可选开关）—— 按剩余可用空间触发：
+
+```
+available <= clamp(ContextLength * (1 - 0.9), FLOOR, CAP)
+
+FLOOR = MaxSummaryLength(4096) + Instructions(2048) + Margin
+CAP   使 1M 级窗口在约 95% 处才触发
+```
+
+两种模式在中等窗口上等价；差别在两端：
+
+| 窗口 | 默认模式触发点 | reserve 模式 |
+|---|---|---|
+| 小窗口 | `0.9 * L`，剩余空间可能不足以放下 summary + buffer | `FLOOR` 保证剩余空间**至少**够放 summary + instructions + margin |
+| 1M 级 | `0.9 * L` 会白白空出 100k | `CAP` 把触发点推到约 95% |
+
+`FLOOR` 的意义：小窗口下 10% 可能连 summary 都放不下，压缩完立刻又超阈值。`CAP` 的意义：大窗口下 10% 是巨大的浪费。两个 clamp 边界各自解决一端的问题。
+
+#### 压缩后的空间预算
+
+| 项 | 上限 |
+|---|---|
+| summary | 4096 tokens |
+| buffer | 2048 tokens |
+| skill | 单条 ≤ 5000，总计 < 25000 |
+
+**压缩目标**：把 history 压回阈值线以下，**且**留出 summary + buffer 的空间。只满足前者不满足后者，会出现"刚压完就又触发"的抖动。
+
+#### 单条消息截断
 
 | 规则 | 值 |
 |---|---|
-| 触发阈值 | 达到 `ctx_tools` 的 **0.9** |
-| 单条 replay 截断 | 超 **8000** token 截断 |
-| 截断保底 | 保留 **4000** token |
+| 单条 replay 超长即截断 | 8000 tokens |
+| 截断保底保留 | 4000 tokens |
 
-触发后对历史做总结压缩。压缩发生时推送 `history_compaction` 事件（§5.9），让前端可见。
+#### 不变量
 
-压缩不得破坏 `tool_call` 与 `tool` 消息的配对关系 —— 压缩粒度以"完整的一轮"为单位，不能把一轮从中间切开。
+压缩不得破坏 `tool_call` 与 `tool` 消息的配对关系 —— **压缩粒度以"完整的一轮"为单位**，不能把一轮从中间切开。切开的后果见 §5.4 的协议硬约束。
+
+压缩发生时推送 `history_compaction` 事件（§5.9），让前端可见。
+
+#### 待核对
+
+`ContextLength * 0.9` 在 256k 窗口上算得 230.4k，但实测触发点被记为约 239k（相当于 0.934）。两者不一致，实现前需确认：是另有一个常量参与，还是 reserve 模式的 `CAP` 在此生效。**这个数不对齐，压缩会比预期晚触发约 9k tokens**，在接近窗口上限时足以导致请求被拒。
 
 ### 5.6 准入与内容审核
 
