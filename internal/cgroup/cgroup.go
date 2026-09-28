@@ -8,6 +8,7 @@
 package cgroup
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,16 +32,28 @@ type Group struct {
 }
 
 // New 在 root 下创建名为 name 的 cgroup，并确保 root 已委派所需控制器。
+//
+// name 必须是单层名字。调用方会把沙箱 ID 传进来，一旦其中混入 "/" 或 ".."，
+// 拼出的路径就能逃出 cgroup 根——限额会落到别的组上，而且不会有任何报错。
+// 安全边界不能依赖调用方自律，所以在这里挡住。
 func New(root, name string) (*Group, error) {
+	if name == "" || name == "." || name == ".." || name != filepath.Base(name) {
+		return nil, fmt.Errorf("非法 cgroup 名 %q：必须是单层名字，不得含路径分隔符或 . 与 ..", name)
+	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("创建 cgroup 根 %s: %w", root, err)
 	}
 	// 子组要能设 cpu/memory/pids，祖先组必须逐级在 subtree_control 里启用它们：
 	// /sys/fs/cgroup 启用后 root 才有这些文件，root 启用后子组才有。
 	// 已启用时重复写不报错，故这里容忍写入失败——真正的判据是下面文件是否出现。
+	// 写入失败原因可能是权限不足而非未委派。完全吞掉的话，下面的诊断
+	// 会一律说"控制器未委派"，把排查者引向错误方向，所以留作线索。
+	var delegateErrs []string
 	for _, dir := range []string{filepath.Dir(root), root} {
-		_ = os.WriteFile(filepath.Join(dir, "cgroup.subtree_control"),
-			[]byte("+cpu +memory +pids"), 0o644)
+		f := filepath.Join(dir, "cgroup.subtree_control")
+		if err := os.WriteFile(f, []byte("+cpu +memory +pids"), 0o644); err != nil {
+			delegateErrs = append(delegateErrs, fmt.Sprintf("%s: %v", f, err))
+		}
 	}
 
 	path := filepath.Join(root, name)
@@ -53,9 +66,13 @@ func New(root, name string) (*Group, error) {
 	// 完全看不出病根是控制器没启用。
 	for _, f := range []string{"cpu.max", "memory.max", "pids.max"} {
 		if _, err := os.Stat(filepath.Join(path, f)); err != nil {
-			return nil, fmt.Errorf(
+			msg := fmt.Sprintf(
 				"cgroup %s 缺少 %s：控制器未委派，请确认 %s/cgroup.subtree_control 已启用 cpu/memory/pids",
 				path, f, root)
+			if len(delegateErrs) > 0 {
+				msg += "；委派写入报错：" + strings.Join(delegateErrs, "、")
+			}
+			return nil, errors.New(msg)
 		}
 	}
 	return &Group{path: path}, nil
@@ -65,6 +82,11 @@ func New(root, name string) (*Group, error) {
 func (g *Group) Path() string { return g.path }
 
 // Apply 写入资源限额。零值字段被跳过。
+//
+// 非原子：三项限额依次写入，任一步失败即返回，已写入的不回滚。
+// 建组时调用（本项目的唯一用法）是安全的——部分限额总比没有限额安全。
+// 但若将来用它去【降低】运行中沙箱的限额，半途失败会留下状态不一致的组，
+// 调用方需自行处理。
 func (g *Group) Apply(l Limits) error {
 	if l.CPUMax != "" {
 		if err := g.write("cpu.max", l.CPUMax); err != nil {

@@ -3,6 +3,7 @@
 package cgroup
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,38 @@ import (
 )
 
 const testRoot = "/sys/fs/cgroup/agentbox-test"
+
+// TestMain 在测试跑完后收拾 testRoot。
+//
+// 这些组建在真实 sysfs 上，不是 t.TempDir()——不收拾就会把
+// /sys/fs/cgroup/agentbox-test 永久留在宿主机上。
+//
+// 注意：New() 对 /sys/fs/cgroup 根 cgroup.subtree_control 的委派改动
+// 【不】在此撤销——那是产品运行本身就需要的状态，撤销反而会让后续
+// 测试和真实沙箱都建不出限额。
+func TestMain(m *testing.M) {
+	code := m.Run()
+	// 清理失败必须发声。静默忽略的话，泄漏的 cgroup 会一直累积在宿主机上，
+	// 而测试始终显示全绿。
+	if err := os.Remove(testRoot); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "警告：未能清理 %s: %v\n", testRoot, err)
+		if code == 0 {
+			code = 1
+		}
+	}
+	os.Exit(code)
+}
+
+func TestNewRejectsInvalidName(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+
+	// 这些名字一旦拼进路径就能逃出 cgroup 根，限额会静默落到别的组上。
+	for _, name := range []string{"", ".", "..", "../escape", "a/b", "/abs"} {
+		if _, err := New(testRoot, name); err == nil {
+			t.Errorf("New(%q, %q) 应当报错，实际通过", testRoot, name)
+		}
+	}
+}
 
 func TestGroupLifecycle(t *testing.T) {
 	testutil.RequireLinuxRoot(t)
@@ -44,13 +77,22 @@ func TestAddProcAndProcs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer g.Destroy()
 
 	cmd := exec.Command("sleep", "30")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("启动 sleep: %v", err)
 	}
-	defer cmd.Process.Kill()
+	// 顺序要紧：先杀进程并【收尸】，再删 cgroup。
+	// 只 Kill 不 Wait 的话进程会变成僵尸，而僵尸仍计入 cgroup.procs，
+	// rmdir 随即撞 EBUSY——这正是 Destroy 必须由调用方保证前置条件的原因。
+	// Destroy 的错误也必须报出来：静默丢弃会让泄漏的 cgroup 伪装成测试通过。
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		if err := g.Destroy(); err != nil {
+			t.Errorf("清理 cgroup %s 失败: %v", g.Path(), err)
+		}
+	})
 
 	if err := g.AddProc(cmd.Process.Pid); err != nil {
 		t.Fatalf("AddProc: %v", err)
@@ -72,13 +114,22 @@ func TestFreezeAndThaw(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer g.Destroy()
 
 	cmd := exec.Command("sleep", "30")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("启动 sleep: %v", err)
 	}
-	defer cmd.Process.Kill()
+	// 顺序要紧：先杀进程并【收尸】，再删 cgroup。
+	// 只 Kill 不 Wait 的话进程会变成僵尸，而僵尸仍计入 cgroup.procs，
+	// rmdir 随即撞 EBUSY——这正是 Destroy 必须由调用方保证前置条件的原因。
+	// Destroy 的错误也必须报出来：静默丢弃会让泄漏的 cgroup 伪装成测试通过。
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		if err := g.Destroy(); err != nil {
+			t.Errorf("清理 cgroup %s 失败: %v", g.Path(), err)
+		}
+	})
 	if err := g.AddProc(cmd.Process.Pid); err != nil {
 		t.Fatalf("AddProc: %v", err)
 	}
