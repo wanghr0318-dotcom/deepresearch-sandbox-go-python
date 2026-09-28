@@ -488,16 +488,53 @@ curRound++
 
 ### 5.3 模型调用层（buildChatModel）
 
-装配期一次性构建，运行期只读。react graph 拿到的只是一个 `ChatModel` 接口，**不感知降级、变体与续写**。
+装配期一次性构建，运行期只读。react graph 拿到的只是一个 `ChatModel` 接口，**不感知降级与续写**。
+
+#### 配置装配
+
+配置来自 workflow yaml，用 [koanf](https://github.com/knadh/koanf) 分层合并，产出一份最终的 `ModelChainConfig`：
+
+```
+workflow.yaml ──koanf 分层合并──► ModelChainConfig ──► buildChatModel
+   pipelines/config.go                                pipelines/workflow.go
+```
+
+```go
+type ModelChainConfig struct {
+    BaseURL       string
+    APIKey        string
+    Model         string
+    Protocol      string             // 原生协议标识
+    MaxTokens     int
+    ContextLength int
+    Temperature   float64
+    Fallbacks     []ModelRef         // 降级链
+    ExtraHeaders  map[string]string  // 透传给推理网关的上行头，默认空
+}
+```
+
+`pipelines/config.go` 只负责把 yaml 合并成 `ModelChainConfig`；`pipelines/workflow.go` 的 `buildChatModel` 只负责把 config 组装成运行期链路。
+
+**不做 A/B 分桶与灰度变体**。理由：本项目无生产流量，分桶通道没有使用场景；而 koanf 本身即支持分层覆盖，将来若需要变体，是新增一层 yaml 而非改代码，**延迟的成本为零**。同理 `ExtraHeaders` 默认为空，推理网关侧若需要打标，配 yaml 即可。
+
+#### 运行期链路
 
 ```
 ChatModel（对外接口）
- └─ Aggregator     tool_call 分桶聚合                  ← 必须在最外层
+ └─ Aggregator     tool_call 按 index 聚合             ← 必须在最外层
      └─ AutoContinue  finish_reason 续写，独立预算
-         └─ Fallback  主模型失败 → 降级链
-             └─ Variant   变体选择
-                 └─ Adapter（原生协议 + SSE 解码 + 归一）
+         └─ Fallback   主模型故障 → 降级链
+             └─ Adapter（原生协议 + SSE 解码 + 归一）
 ```
+
+**Fallback 与分桶是两回事，只去掉后者**：
+
+| | 触发条件 | 去留 |
+|---|---|---|
+| 分桶 / variant | 实验、灰度 —— 主动按规则分流 | 去掉 |
+| Fallback 降级 | 故障 —— 主模型超时 / 限流 / 5xx 才走 | 保留 |
+
+降级是可用性机制，属运行期行为，无法靠配置分层替代。
 
 #### 归一化下沉到 Adapter
 
@@ -558,9 +595,14 @@ type AutoContinueConfig struct {
 
 两者都到期即断开并按 fatal 错误处理。
 
-#### 变体
+#### 配置一致性校验
 
-`Variant` 层第一版留空接口（直通 Primary），分桶依据（scenario / 用户哈希 / 灰度比例）待定，见 §9。
+`Validate()` 须在启动时检查两处，它们配错都不会立刻报错，而是表现为线上偶发异常：
+
+| 检查 | 原因 |
+|---|---|
+| `ctx_tools` 压缩阈值须由 `ContextLength` 推导，且留足输出预留 | 两者独立配置且不一致时，会出现"压缩没触发、但请求已超长被服务端拒绝" |
+| `MaxTokens` 低于下限时告警，并与 `AutoContinue.MaxContinues` 联合校验 | `finish_reason=length` 正是撞 `MaxTokens` 产生的；配得过于保守会导致每次回答都续写数轮，token 成本与延迟同时翻倍 |
 
 ### 5.4 工具层
 
@@ -852,7 +894,7 @@ event: message_revoke  {message_id}
 | # | 待定 | 影响 | 定夺时点 |
 |---|---|---|---|
 | 1 | ~~编排层自研 vs Eino~~ | **已定：用 Eino graph** | — |
-| 2 | Variant 分桶依据（scenario / 用户哈希 / 灰度比例） | 第一版留空接口直通 Primary | M4 后 |
+| 2 | ~~Variant 分桶依据~~ | **已定：不做分桶**，koanf 分层使其延迟成本为零（§5.3） | — |
 | 3 | Rust 的落点 | 目前设计中无必须项，可能不引入 | 按需 |
 | 4 | 持久化存储后端（本地 FS / 对象存储） | 影响 workspace 与快照实现 | M1 |
 | 5 | 维护任务选主实现 | 幂等已保证正确性，选主仅为优化 | M3 |
