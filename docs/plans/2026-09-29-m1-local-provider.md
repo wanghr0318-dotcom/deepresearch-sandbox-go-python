@@ -15,7 +15,14 @@
 - 仅支持 Linux。开发环境为 WSL2 Ubuntu（内核 6.6.87.2）；Windows 侧无法运行任何本任务的测试
 - **WSL 无外网**：直连超时，经 Windows 代理（`127.0.0.1:7897`）亦不通 —— WSL2 有独立网络栈，其 `127.0.0.1` 并非 Windows 的。所有外部依赖一律在 Windows 侧下载到 `F:\wsl-assets\`，WSL 通过 `/mnt/f/wsl-assets/` 读取。本计划不引入任何第三方 Go 依赖，故无需 `go mod download`
 - 仓库工作副本在 WSL 原生文件系统（`~/go-agentbox`），**不可在 `/mnt/f` 上开发** —— 那是 9p，不支持 overlayfs
-- sudo 需要密码，涉及 root 的命令须在 WSL 终端手工执行
+- **取得 root 的方式**：`wsl -d Ubuntu -u root -- ...` 免密直接以 root 运行，这是代理执行 root 测试的唯一可行途径。
+  交互式 `sudo` 需要密码，代理跑不了；在 WSL 终端里人工操作时才用 `sudo -E env "PATH=$PATH" go test`。
+  从 Windows 侧调用时必须带 `MSYS_NO_PATHCONV=1` 前缀，否则 Git Bash 会把 `/usr/...` 改写成 `D:/Git/usr/...`：
+  ```bash
+  MSYS_NO_PATHCONV=1 wsl -d Ubuntu -u root -- bash -lc "cd /home/wanghr/go-agentbox && /usr/local/go/bin/go test ./... -v"
+  ```
+- `go.mod` 的 `go` 指令写 `go 1.23`，**不要写三段式精确版本**。Go 1.21+ 会按该指令自动切换工具链：
+  写成 `go 1.27.1` 会让任何本地 Go 低于该版本的人被迫下载工具链，而本机 WSL 无外网，直接卡死
 - 必须 cgroup v2（`stat -fc %T /sys/fs/cgroup` 输出 `cgroup2fs`）
 - **M1 以 root 运行**，不启用 `CLONE_NEWUSER`。rootless 是 spec §9 待定项 #7，不在本计划范围
 - 沙箱根目录：`/var/lib/agentbox`
