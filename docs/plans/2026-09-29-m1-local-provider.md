@@ -10,9 +10,12 @@
 
 ## Global Constraints
 
-- Go 版本 ≥ 1.23
-- 模块路径：`github.com/wannagraduate/go-agentbox`
-- 仅支持 Linux。开发环境为 WSL2 Ubuntu；Windows 侧无法运行任何本任务的测试
+- Go 版本 ≥ 1.23（本机使用 go1.27.1）
+- 模块路径：`github.com/wanghr0318-dotcom/go-agentbox`
+- 仅支持 Linux。开发环境为 WSL2 Ubuntu（内核 6.6.87.2）；Windows 侧无法运行任何本任务的测试
+- **WSL 无外网**：直连超时，经 Windows 代理（`127.0.0.1:7897`）亦不通 —— WSL2 有独立网络栈，其 `127.0.0.1` 并非 Windows 的。所有外部依赖一律在 Windows 侧下载到 `F:\wsl-assets\`，WSL 通过 `/mnt/f/wsl-assets/` 读取。本计划不引入任何第三方 Go 依赖，故无需 `go mod download`
+- 仓库工作副本在 WSL 原生文件系统（`~/go-agentbox`），**不可在 `/mnt/f` 上开发** —— 那是 9p，不支持 overlayfs
+- sudo 需要密码，涉及 root 的命令须在 WSL 终端手工执行
 - 必须 cgroup v2（`stat -fc %T /sys/fs/cgroup` 输出 `cgroup2fs`）
 - **M1 以 root 运行**，不启用 `CLONE_NEWUSER`。rootless 是 spec §9 待定项 #7，不在本计划范围
 - 沙箱根目录：`/var/lib/agentbox`
@@ -63,6 +66,9 @@
 
 - [ ] **Step 1: 在 WSL2 Ubuntu 里装 Go 并验证环境**
 
+> **本机 WSL 无外网**：直连与经 Windows 代理均不通（详见 Global Constraints）。
+> 因此安装包一律在 Windows 侧下载好，放在 `F:\wsl-assets\`，WSL 通过 `/mnt/f` 读取。
+
 在 Windows 上打开 WSL：
 
 ```bash
@@ -72,16 +78,14 @@ wsl -d Ubuntu
 装 Go（apt 源里的版本偏旧，用官网 tar 包）：
 
 ```bash
-cd /tmp
-curl -LO https://go.dev/dl/go1.23.4.linux-amd64.tar.gz
 sudo rm -rf /usr/local/go
-sudo tar -C /usr/local -xzf go1.23.4.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf /mnt/f/wsl-assets/go1.27.1.linux-amd64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
 source ~/.bashrc
 go version
 ```
 
-Expected: `go version go1.23.4 linux/amd64`
+Expected: `go version go1.27.1 linux/amd64`
 
 验证 cgroup v2：
 
@@ -106,10 +110,16 @@ Windows 上的 `F:\go-agentbox` 在 WSL 里是 `/mnt/f/go-agentbox`。但 **`/mn
 ```bash
 git clone /mnt/f/go-agentbox ~/go-agentbox
 cd ~/go-agentbox
-go mod init github.com/wannagraduate/go-agentbox
+git remote set-url origin https://github.com/wanghr0318-dotcom/go-agentbox.git
+git config user.name  "wanghr0318-dotcom"
+git config user.email "wanghr0318@163.com"
+go mod init github.com/wanghr0318-dotcom/go-agentbox
 ```
 
-Expected: 生成 `go.mod`，内容含 `module github.com/wannagraduate/go-agentbox` 与 `go 1.23`
+从本地路径克隆而非 GitHub，是因为 WSL 没有外网；remote 随后指回 GitHub，
+但 `git push` 需在 Windows 侧的 `F:\go-agentbox` 完成。
+
+Expected: 生成 `go.mod`，内容含 `module github.com/wanghr0318-dotcom/go-agentbox` 与 `go 1.27`
 
 - [ ] **Step 3: 写失败测试**
 
@@ -315,7 +325,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/wannagraduate/go-agentbox/internal/hostcheck"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/hostcheck"
 )
 
 func main() {
@@ -396,7 +406,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wannagraduate/go-agentbox/internal/testutil"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
 )
 
 const testRoot = "/sys/fs/cgroup/agentbox-test"
@@ -732,7 +742,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/wannagraduate/go-agentbox/internal/testutil"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
 )
 
 func TestOverlayWritesLandInUpper(t *testing.T) {
@@ -958,13 +968,12 @@ Unmount 幂等，且 EBUSY 时退化为 MNT_DETACH lazy 卸载，
 
 - [ ] **Step 1: 手工准备模板**
 
-alpine minirootfs 只有几 MB，手工下载一次即可，不在代码里联网：
+alpine minirootfs 只有几 MB，手工解包一次即可，代码里不联网（WSL 也没有外网）：
 
 ```bash
 sudo mkdir -p /var/lib/agentbox/templates/default
-cd /tmp
-curl -LO https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.0-x86_64.tar.gz
-sudo tar -xzf alpine-minirootfs-3.21.0-x86_64.tar.gz -C /var/lib/agentbox/templates/default
+sudo tar -xzf /mnt/f/wsl-assets/alpine-minirootfs-3.24.2-x86_64.tar.gz \
+     -C /var/lib/agentbox/templates/default
 ls /var/lib/agentbox/templates/default
 ```
 
@@ -1131,7 +1140,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/wannagraduate/go-agentbox/internal/testutil"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
 )
 
 // TestNamespacesAreIsolated 验证 clone flags 确实生效：
@@ -1339,7 +1348,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/wannagraduate/go-agentbox/internal/hostcheck"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/hostcheck"
 )
 
 func main() {
@@ -1375,7 +1384,7 @@ func main() {
 
 package main
 
-import "github.com/wannagraduate/go-agentbox/internal/runtime"
+import "github.com/wanghr0318-dotcom/go-agentbox/internal/runtime"
 
 func runSandboxInit() error { return runtime.RunInit() }
 ```
@@ -1444,8 +1453,8 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/wannagraduate/go-agentbox/internal/rootfs"
-	"github.com/wannagraduate/go-agentbox/internal/testutil"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/rootfs"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
 )
 
 const templateDir = "/var/lib/agentbox/templates/default"
@@ -1694,7 +1703,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wannagraduate/go-agentbox/internal/testutil"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
 )
 
 // TestReapLoopCollectsOrphans 起一个自己不 wait 的子进程，
@@ -1850,8 +1859,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wannagraduate/go-agentbox/internal/rootfs"
-	"github.com/wannagraduate/go-agentbox/internal/testutil"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/rootfs"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
 )
 
 func TestExecInSandbox(t *testing.T) {
@@ -2264,8 +2273,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wannagraduate/go-agentbox/internal/provider"
-	"github.com/wannagraduate/go-agentbox/internal/testutil"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
 )
 
 func newTestProvider(t *testing.T) (*Provider, string) {
@@ -2512,10 +2521,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wannagraduate/go-agentbox/internal/cgroup"
-	"github.com/wannagraduate/go-agentbox/internal/provider"
-	"github.com/wannagraduate/go-agentbox/internal/rootfs"
-	"github.com/wannagraduate/go-agentbox/internal/runtime"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/cgroup"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/rootfs"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/runtime"
 )
 
 // cgroupRoot 是所有沙箱 cgroup 的父目录。
@@ -2810,7 +2819,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wannagraduate/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
 )
 
 // TestCloseLeavesNoResidue 在沙箱里放一个 fork 炸弹，
@@ -3056,10 +3065,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/wannagraduate/go-agentbox/internal/cgroup"
-	"github.com/wannagraduate/go-agentbox/internal/provider"
-	"github.com/wannagraduate/go-agentbox/internal/rootfs"
-	"github.com/wannagraduate/go-agentbox/internal/runtime"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/cgroup"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/rootfs"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/runtime"
 )
 ```
 
@@ -3125,7 +3134,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/wannagraduate/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
 )
 
 func TestGetAndList(t *testing.T) {
