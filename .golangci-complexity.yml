@@ -1,0 +1,28 @@
+# 复杂度信号：CI 只报告，不阻断。超标须在 PR 中说明理由或重构，
+# 不能靠拆成大量无意义小函数通过检查（见 docs/design/2026-10-03-code-organization.md §9）。
+run:
+  timeout: 5m
+  tests: false
+
+linters:
+  disable-all: true
+  enable:
+    - gocognit
+    - nestif
+    - dupl
+    - funlen
+
+linters-settings:
+  gocognit:
+    min-complexity: 20
+  nestif:
+    min-complexity: 4
+  dupl:
+    threshold: 120
+  funlen:
+    lines: 80
+    statements: 50
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

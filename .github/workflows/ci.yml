@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+    branches: [main, "m*-**", "v*-**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOLANGCI_LINT_VERSION: v1.64.8
+
+jobs:
+  # 正确性检查：任何失败都阻断。
+  correctness:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build (linux)
+        run: go build ./...
+      - name: build (windows，开发机平台)
+        run: GOOS=windows go build ./...
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: vet
+        run: go vet ./...
+      - name: unit tests（非 root；需要 root 的用例按设计跳过）
+        run: go test -count=1 ./...
+      - name: golangci-lint（正确性）
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          args: --config .golangci.yml
+
+  # 复杂度报告：只报告，不阻断；工具本身出错仍会失败（--issues-exit-code=0 只放过发现项）。
+  # PR 上只报告本次新增或修改的问题。
+  complexity-report:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: golangci-lint（复杂度信号）
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          only-new-issues: ${{ github.event_name == 'pull_request' }}
+          args: --config .golangci-complexity.yml --issues-exit-code=0
+
+  # Linux 集成测试：以 root 运行；先验证 runner 能力，再要求无任何 skip。
+  linux-integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: 验证 runner 能力（cgroup v2、挂载、namespace）
+        run: sudo bash scripts/ci/check-runner.sh
+      - name: root 测试
+        run: |
+          set -o pipefail
+          sudo -E env "PATH=$PATH" go test -json -count=1 ./... | tee test.json > /dev/null || true
+      - name: 判定（失败或非预期 skip 均为失败）
+        run: go run ./tools/citestjson test.json scripts/ci/allowed-skips.txt
+      - name: 上传测试记录
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-integration-test-json
+          path: test.json

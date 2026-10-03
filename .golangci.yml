@@ -1,0 +1,18 @@
+# 正确性检查：CI 中必须通过（见 docs/design/2026-10-03-code-organization.md §9.1）。
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - gosimple
+    - ineffassign
+    - unused
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
