@@ -42,7 +42,7 @@
 | `internal/sandbox` | 沙箱内 init、启动序列、控制通道、收割、stage-2 降权（由 `internal/runtime` 改名） | 控制面概念 |
 | `internal/cgroup`、`internal/rootfs`、`internal/hostcheck` | 底层原语与宿主自检 | 同上 |
 
-`provider/local` 之上的包不直接导入 `cgroup`、`rootfs`、`sandbox`。
+`provider/local` 之上的控制面业务包不直接导入 `cgroup`、`rootfs`、`sandbox`。**例外**：`cmd/agentbox` 可为装配与 re-exec 入口（`init`、`exec-stage2`）导入这些包的入口函数。
 
 ### 2.2 Python（最低版本 3.11）
 
@@ -72,7 +72,8 @@
 
 ### 3.2 自动检查
 
-- **Go**：`internal/archtest` 中的测试以 `GOOS=linux` 运行 `go list -f '{{.ImportPath}}: {{join .Imports " "}}'`，按**直接依赖边**断言规则 1–5；对规则 1、3 另用 `-deps` 检查**传递依赖**。Linux 专有包在目标构建条件下检查。
+- **Go**：`internal/archtest` 中的测试以 `GOOS=linux` 运行 `go list -f '{{.ImportPath}}: {{join .Imports " "}}'`，按**直接依赖边**断言规则 1–4 的包依赖部分（含第 2.1 节 `cmd` 例外）；对规则 1、3 另用 `-deps` 检查**传递依赖**。Linux 专有包在目标构建条件下检查。
+- **import 图检查不到的内容**：规则 2 中同一包内纯 `Decide` 与 actor 副作用代码的区分、规则 5 的"不从全局变量获取依赖"，由代码评审保证；如反复出现问题再增加 AST 检查，不为此另拆包。
 - **Python**：`import-linter` 检查模块依赖契约；ruff 的 `banned-api`（TID251）禁止 `deepresearch` 调用 `subprocess`、`os.fork`、`os.system`、`os.exec*` 等函数级 API。
 - 两者均在 CI 运行。架构检查约束代码组织，不是安全隔离机制。
 
@@ -139,6 +140,18 @@
 | 启动恢复 | reconcile（生成计划）→ recovery（执行） | resource coordinator、persistence |
 
 ### 6.1 启动恢复的流程
+
+下图只表示恢复**职责拆分**；完整启动顺序遵循 v0.2 规格 §14.1。前置步骤的执行组件：
+
+| §14.1 步骤 | 执行组件 |
+|---|---|
+| 数据目录、`flock`、advisory lock、`install_id` 校验 | `persistence/postgres`（advisory lock、installation）与 `cmd`（只负责按顺序调用） |
+| 迁移 | `persistence/postgres` |
+| 撤销全部 active 访问、账本转换 | `recovery`（经 `RevokeAllActive`、`ConvertLedger` 事务用例） |
+| 扫描、生成计划 | `reconcile` |
+| 停止、提交 `lost`/`evicted`、运行时限补记 | `recovery` |
+| 重建 admission | `admission`（读取 recovery 报告的实际占用） |
+| 启动 cleanup loop、actor、API | `cmd`（只负责顺序） |
 
 ```
 reconcile：扫描事实 → 生成 RecoveryPlan（稳定 ID、预期状态、操作类型；不含进程句柄）
