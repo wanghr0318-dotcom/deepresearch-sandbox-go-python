@@ -48,6 +48,21 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
 
 **文件所有权**：每个任务只修改其 Files 列出的文件。发现需要改动其他任务的文件时，停止并报告主 agent。
 
+## 派发批次
+
+任务之间有产物依赖，**不能八个任务同时开跑**。按以下批次逐批派发，前一批验收后再派发下一批：
+
+| 批次 | 任务 | 依赖 |
+|---|---|---|
+| 1 | Task 1 → Task 2（顺序） | — |
+| 2 | Task 3 | Task 1、2 的 fixtures 与规则 |
+| 3 | Task 4 ‖ Task 5（可并行） | Task 3 |
+| 4 | Task 6 | Task 5 |
+| 5 | Task 7 | Task 2 的场景格式、Task 6 |
+| 6 | Task 8 | Task 7 |
+
+批次 3 若并行执行，Task 4 与 Task 5 **各用独立 worktree**（例如 `../go-agentbox-m1-3-t4`、`../go-agentbox-m1-3-t5`，均从批次 2 完成后的提交建出），由主 agent 依次合入 `m1-3-protocol-worker` 后再开始批次 4。两者不修改同一文件。
+
 ## 错误码与契约约定
 
 **消息级错误码**（Go 与 Python 相同）：`malformed_json`、`unknown_type`、`version_mismatch`、`missing_field`、`invalid_field`、`message_too_large`、`state_too_large`、`too_many_refs`、`path_invalid`。
@@ -72,7 +87,13 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
 | `internal_error` | 应用抛出未预期异常 | true |
 | 应用自定义 | `WorkerFailure(code, ...)` | 由应用决定 |
 
-**SDK 退出码**：0 = 已发出 `result`/`paused`，或被宿主取消（取消不发终态提议，由宿主按其意图裁决，规格 §5.8）；1 = 已发出 `error` 或无法开始；2 = `handshake_error`。stdin 关闭视为取消。
+**SDK 退出码**：0 = 已发出 `result`/`paused`，或被宿主取消（取消不发终态提议，由宿主按其意图裁决，规格 §5.8）；1 = 已发出 `error`、无法开始，或协议输出通道失效；2 = `handshake_error`。stdin 关闭视为取消。
+
+**发送与退出的生命周期**：
+
+- **seq 的提交点**是"校验通过、开始发送"：此后无论发送成功、失败还是被取消，该 seq 都已用掉。发送失败或在途被取消时结果不确定，输出通道进入失效状态（`TransportBroken`），此后不再发送任何事件，绝不以同一 seq 重发；Worker 以 1 退出且无法再发出 `error`。
+- **输入**：读取阶段即按帧长上限（init 上限 1 MiB + 行尾）截断判定，超长帧报 `message_too_large` 并停止读取；读到的行进入有界队列（默认 64 条），队列满时读线程阻塞，对宿主形成背压。
+- **进程入口** `main()` 是 SDK 中唯一调用 `os._exit` 的地方：运行 Worker（任何异常都记录并按失败处理）→ 在期限内等待已提交的输出写完 → `os._exit`。期限由环境变量 `AGENTBOX_WORKER_SHUTDOWN_TIMEOUT` 设置（秒，默认 5）。读写线程可能阻塞在 stdin 或 stdout 上且无法取消，正常的解释器收尾会挂起或崩溃（计划演练中实测复现 `Fatal Python error: _enter_buffered_busy`）。
 
 ---
 
@@ -2365,7 +2386,11 @@ def encode_line(direction: str, msg: dict[str, Any]) -> bytes:
     validator = _validator_for(direction, typ)
     _check_types(typ, msg)
     validator(msg)
-    line = json.dumps(msg, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    try:
+        text = json.dumps(msg, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except ValueError as exc:  # NaN、Infinity 不是合法 JSON
+        raise ProtocolError("invalid_field", f"消息含有 JSON 不支持的数值：{exc}") from exc
+    line = text.encode("utf-8")
     _check_size(direction, typ, len(line))
     return line
 ```
@@ -2843,7 +2868,9 @@ Expected: 收集错误 `FileNotFoundError`（schema 文件不存在）。
 
 `agentbox_worker` 在 `error` 事件中使用：`checkpoint_conflict`、`checkpoint_rejected`（false）、`checkpoint_unresolved`（true）、`artifact_rejected`（false）、`artifact_unresolved`（true）、`unsupported_mode`（false，`ready` 之前）、`control_protocol_error`（false）、`internal_error`（true）；括号内为 `retryable` 建议值。应用可通过 `WorkerFailure` 使用自定义 code。
 
-退出码：0 表示已发出 `result`/`paused`，或被宿主取消（取消不发终态提议，stdin 关闭视为取消）；1 表示已发出 `error` 或无法开始；2 表示 `handshake_error`。
+退出码：0 表示已发出 `result`/`paused`，或被宿主取消（取消不发终态提议，stdin 关闭视为取消）；1 表示已发出 `error`、无法开始，或协议输出通道失效；2 表示 `handshake_error`。
+
+发送与退出：seq 在开始发送时即被占用；发送失败或在途被取消后不再发送任何事件（不会复用 seq）。输入行在读取阶段按帧长上限判定，读到的行进入有界队列以形成背压。进程入口在 `AGENTBOX_WORKER_SHUTDOWN_TIMEOUT` 秒（默认 5）内等待已提交的输出写完后退出。
 
 ## fixtures
 
@@ -2872,7 +2899,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 5：SDK 基础设施——传输、事件发送与等待器
 
-**风险：中（基础设施，行为简单但被所有运行时代码依赖）——双评审。**
+**风险：高（发送提交点、取消语义、输入背压与有界关闭）——双评审。**
 
 **Files:**
 - Create: `worker/agentbox_worker/errors.py`、`worker/agentbox_worker/transport.py`、`worker/agentbox_worker/outbox.py`
@@ -2881,9 +2908,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: Task 3 的 `encode_line`、`WORKER`、`VERSION`、`BOOTSTRAP_VERSION`、`ProtocolError`。
 - Produces：
-  - `errors.WorkerFailure(code: str, message: str, *, retryable: bool = False)`（属性 `code`、`message`、`retryable`；code 为空时 `ValueError`）；子类 `CheckpointRejected(code, message)`、`CheckpointUnresolved(message)`、`ArtifactRejected(message)`
-  - `transport.Transport`（Protocol：`async receive() -> bytes | None`，`None` 表示 EOF；`async send(line: bytes) -> None`）；`StdioTransport(reader: BinaryIO, writer: BinaryIO)`；`MemoryTransport()`（`feed(line: bytes | None)`、`sent: list[bytes]`、`on_send: Callable[[bytes], None] | None`）
-  - `outbox.Outbox(transport)`：`async emit(body: dict) -> None`（补 `v`、`seq`、`ts`，校验失败抛 `ProtocolError` 且不占用 seq）、`async send_handshake_error(code: str) -> None`、属性 `last_seq`
+  - `errors.WorkerFailure(code: str, message: str, *, retryable: bool = False)`（属性 `code`、`message`、`retryable`；code 为空时 `ValueError`）；子类 `CheckpointRejected(code, message)`、`CheckpointUnresolved(message)`、`ArtifactRejected(message)`；`errors.TransportBroken(Exception)`（输出通道失效，不是 `WorkerFailure`）
+  - `transport.Transport`（Protocol：`async receive() -> bytes | None`，`None` 表示 EOF，帧超长时抛 `ProtocolError("message_too_large")`；`async send(line: bytes) -> None`，调用方须串行化，失败时抛 `TransportBroken`）
+  - `transport.StdioTransport(reader: BinaryIO, writer: BinaryIO, *, queue_size: int = 64)`：`receive`、`send`、`close(timeout: float) -> bool`（期限内等待已提交写出完成，返回是否全部成功写出）、属性 `pending_lines`；常量 `MAX_FRAME_BYTES`、`DEFAULT_QUEUE_SIZE`
+  - `transport.MemoryTransport()`：`feed(line: bytes | None)`、`sent: list[bytes]`、`on_send: Callable[[bytes], None] | None`
+  - `outbox.Outbox(transport)`：`async emit(body: dict) -> None`（补 `v`、`seq`、`ts`；校验失败抛 `ProtocolError` 且不占用 seq；seq 在开始发送时提交；发送失败或在途取消后进入失效状态，此后一律抛 `TransportBroken`）、`async send_handshake_error(code: str) -> None`、属性 `last_seq`
   - `outbox.Waiters`：`expect(key: str) -> asyncio.Future[dict]`、`deliver(key: str, message: dict) -> bool`
 
 - [ ] **Step 1：写失败的测试**
@@ -2897,10 +2926,10 @@ import json
 
 import pytest
 
-from agentbox_worker.errors import WorkerFailure
+from agentbox_worker.errors import TransportBroken, WorkerFailure
 from agentbox_worker.outbox import Outbox, Waiters
 from agentbox_worker.protocol import ProtocolError
-from agentbox_worker.transport import MemoryTransport, StdioTransport
+from agentbox_worker.transport import MAX_FRAME_BYTES, MemoryTransport, StdioTransport
 
 
 def sent_json(transport: MemoryTransport) -> list[dict]:
@@ -2995,6 +3024,119 @@ def test_memory_transport_calls_on_send():
 def test_worker_failure_requires_code():
     with pytest.raises(ValueError):
         WorkerFailure("", "x")
+
+
+class BlockingTransport:
+    """send 在 release 之前一直阻塞，用于确定性地模拟"写入中"。"""
+
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+        self.release = asyncio.Event()
+
+    async def receive(self) -> bytes | None:
+        return None
+
+    async def send(self, line: bytes) -> None:
+        self.sent.append(line)
+        await self.release.wait()
+
+
+class FailingTransport:
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    async def receive(self) -> bytes | None:
+        return None
+
+    async def send(self, line: bytes) -> None:
+        self.attempts += 1
+        raise OSError("broken pipe")
+
+
+def test_cancel_during_send_breaks_outbox_without_reusing_seq():
+    async def go():
+        transport = BlockingTransport()
+        outbox = Outbox(transport)
+        task = asyncio.create_task(outbox.emit({"type": "progress", "kind": "k", "message": "a"}))
+        while not transport.sent:
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with pytest.raises(TransportBroken):
+            await outbox.emit({"type": "progress", "kind": "k", "message": "b"})
+        return transport, outbox.last_seq
+
+    transport, last_seq = asyncio.run(go())
+    assert last_seq == 1
+    assert [json.loads(line)["seq"] for line in transport.sent] == [1]
+
+
+def test_send_failure_breaks_outbox():
+    async def go():
+        transport = FailingTransport()
+        outbox = Outbox(transport)
+        for _ in range(2):
+            with pytest.raises(TransportBroken):
+                await outbox.emit({"type": "progress", "kind": "k", "message": "a"})
+        return transport.attempts
+
+    assert asyncio.run(go()) == 1
+
+
+def test_stdio_rejects_oversized_line_at_read_time():
+    async def go():
+        transport = StdioTransport(io.BytesIO(b"a" * (MAX_FRAME_BYTES + 10)), io.BytesIO())
+        with pytest.raises(ProtocolError) as exc:
+            await transport.receive()
+        return exc.value.code, await transport.receive()
+
+    assert asyncio.run(go()) == ("message_too_large", None)
+
+
+def test_stdio_accepts_line_at_frame_limit():
+    line = b"a" * (MAX_FRAME_BYTES - 1)
+
+    async def go():
+        transport = StdioTransport(io.BytesIO(line + b"\n"), io.BytesIO())
+        return await transport.receive()
+
+    assert asyncio.run(go()) == line
+
+
+def test_stdio_reader_applies_backpressure():
+    lines = [f"line-{i}".encode() for i in range(100)]
+
+    async def go():
+        transport = StdioTransport(
+            io.BytesIO(b"\n".join(lines) + b"\n"), io.BytesIO(), queue_size=2
+        )
+        first = await transport.receive()
+        await asyncio.sleep(0.1)
+        pending = transport.pending_lines
+        rest = [await transport.receive() for _ in range(len(lines))]
+        return first, pending, rest
+
+    first, pending, rest = asyncio.run(go())
+    assert pending <= 2
+    assert [first, *rest] == [*lines, None]
+
+
+class BrokenWriter(io.RawIOBase):
+    def write(self, data):
+        raise BrokenPipeError("host closed stdout")
+
+
+def test_stdio_write_failure_marks_transport_failed():
+    transport = StdioTransport(io.BytesIO(), BrokenWriter())
+
+    async def go():
+        for _ in range(2):
+            with pytest.raises(TransportBroken):
+                await transport.send(b"x")
+
+    asyncio.run(go())
+    assert transport.close(0.5) is False
 ```
 
 - [ ] **Step 2：确认测试失败**
@@ -3010,7 +3152,7 @@ Expected: `ModuleNotFoundError: No module named 'agentbox_worker.errors'`。
 `worker/agentbox_worker/errors.py`：
 
 ```python
-"""SDK 与应用共用的失败类型；SDK 把它们转换为 error 事件（规格 §5.4）。"""
+"""SDK 与应用共用的失败类型；SDK 把 WorkerFailure 转换为 error 事件（规格 §5.4）。"""
 
 from __future__ import annotations
 
@@ -3046,6 +3188,13 @@ class ArtifactRejected(WorkerFailure):
 
     def __init__(self, message: str) -> None:
         super().__init__("artifact_rejected", message, retryable=False)
+
+
+class TransportBroken(Exception):
+    """协议输出通道已不可用：某次发送失败或在途被取消，结果不确定。
+
+    此后不再发送任何事件（不会复用 seq），也无法再发出 error 事件；Worker 以失败退出。
+    """
 ```
 
 `worker/agentbox_worker/transport.py`：
@@ -3056,58 +3205,134 @@ class ArtifactRejected(WorkerFailure):
 from __future__ import annotations
 
 import asyncio
+import queue
 import threading
 from collections.abc import Callable
+from concurrent.futures import CancelledError as FutureCancelledError
 from typing import BinaryIO, Protocol
+
+from agentbox_worker.errors import TransportBroken
+from agentbox_worker.protocol import MAX_INIT_BYTES, ProtocolError
+
+# 一行（含行尾 \r\n）的最大字节数：init 的上限是 1 MiB，其他消息更小，由解码器细分。
+MAX_FRAME_BYTES = MAX_INIT_BYTES + 2
+DEFAULT_QUEUE_SIZE = 64
+
+_OVERSIZED = object()  # 读线程放入队列的"超长帧"标记
 
 
 class Transport(Protocol):
     async def receive(self) -> bytes | None:
-        """返回下一行（不含换行符）；None 表示对端已关闭。"""
+        """返回下一行（不含换行符）；None 表示对端已关闭；帧超长时抛出 ProtocolError。"""
 
     async def send(self, line: bytes) -> None:
-        """发送一行（不含换行符）。"""
+        """发送一行（不含换行符）。调用方须串行化；失败时抛出 TransportBroken。"""
+
+
+def _settle(done: asyncio.Future[None], error: BaseException | None) -> None:
+    if done.done():  # 发送方已取消等待
+        return
+    if error is None:
+        done.set_result(None)
+    else:
+        done.set_exception(TransportBroken(f"写出失败：{error!r}"))
 
 
 class StdioTransport:
     """基于二进制文件对象的行传输。
 
-    读取在守护线程中进行：阻塞的 readline 不会阻止进程退出。
+    - 读：守护线程以 readline(上限) 读取，超长帧在读取阶段即判定，之后停止读取；
+      读到的行进入有界队列，队列满时读线程阻塞，对宿主形成背压。读失败按对端关闭处理。
+    - 写：专用守护线程逐行写出并 flush，发送方等待写出完成；写失败后传输进入失败状态。
+    - close(timeout)：在期限内等待已提交的写出完成。阻塞的读写线程不会阻止进程退出。
     """
 
-    def __init__(self, reader: BinaryIO, writer: BinaryIO) -> None:
+    def __init__(
+        self, reader: BinaryIO, writer: BinaryIO, *, queue_size: int = DEFAULT_QUEUE_SIZE
+    ) -> None:
         self._reader = reader
         self._writer = writer
-        self._queue: asyncio.Queue[bytes | None] | None = None
-        self._write_lock = threading.Lock()
+        self._queue_size = queue_size
+        self._inbox: asyncio.Queue[object] | None = None
+        self._writes: queue.SimpleQueue[
+            tuple[bytes, asyncio.AbstractEventLoop, asyncio.Future[None]] | None
+        ] = queue.SimpleQueue()
+        self._write_thread: threading.Thread | None = None
+        self._failed: BaseException | None = None
+
+    @property
+    def pending_lines(self) -> int:
+        """已读入、尚未被 receive 取走的行数（诊断用）。"""
+        return 0 if self._inbox is None else self._inbox.qsize()
 
     async def receive(self) -> bytes | None:
-        if self._queue is None:
-            self._queue = asyncio.Queue()
+        if self._inbox is None:
+            self._inbox = asyncio.Queue(maxsize=self._queue_size)
             loop = asyncio.get_running_loop()
-            reader = threading.Thread(
-                target=self._read_lines, args=(loop, self._queue), daemon=True
-            )
+            reader = threading.Thread(target=self._read_loop, args=(loop, self._inbox), daemon=True)
             reader.start()
-        return await self._queue.get()
+        item = await self._inbox.get()
+        if item is _OVERSIZED:
+            raise ProtocolError("message_too_large", f"输入行超过 {MAX_FRAME_BYTES} 字节")
+        return item  # type: ignore[return-value]
 
-    def _read_lines(
-        self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue[bytes | None]
-    ) -> None:
+    def _read_loop(self, loop: asyncio.AbstractEventLoop, inbox: asyncio.Queue[object]) -> None:
         try:
-            for raw in iter(self._reader.readline, b""):
-                loop.call_soon_threadsafe(queue.put_nowait, raw.rstrip(b"\r\n"))
-            loop.call_soon_threadsafe(queue.put_nowait, None)
-        except RuntimeError:
-            return  # 事件循环已关闭：进程正在退出
+            while raw := self._reader.readline(MAX_FRAME_BYTES + 1):
+                if len(raw) > MAX_FRAME_BYTES:
+                    self._put(loop, inbox, _OVERSIZED)  # 帧边界已丢失，不再继续读取
+                    break
+                self._put(loop, inbox, raw.rstrip(b"\r\n"))
+        except (OSError, ValueError):
+            pass  # 读失败按对端关闭处理
+        finally:
+            self._put(loop, inbox, None)
+
+    @staticmethod
+    def _put(loop: asyncio.AbstractEventLoop, inbox: asyncio.Queue[object], item: object) -> None:
+        """放入有界队列；队列满时阻塞读线程。事件循环已结束时放弃。"""
+        put = inbox.put(item)
+        try:
+            asyncio.run_coroutine_threadsafe(put, loop).result()
+        except RuntimeError:  # 事件循环已关闭：协程未被调度，需手动关闭
+            put.close()
+        except FutureCancelledError:  # 事件循环退出时取消了等待中的放入
+            return
 
     async def send(self, line: bytes) -> None:
-        await asyncio.to_thread(self._write, line)
+        if self._failed is not None:
+            raise TransportBroken(f"输出通道已失败：{self._failed!r}")
+        loop = asyncio.get_running_loop()
+        done: asyncio.Future[None] = loop.create_future()
+        if self._write_thread is None:
+            self._write_thread = threading.Thread(target=self._write_loop, daemon=True)
+            self._write_thread.start()
+        self._writes.put((line, loop, done))
+        await done
 
-    def _write(self, line: bytes) -> None:
-        with self._write_lock:
-            self._writer.write(line + b"\n")
-            self._writer.flush()
+    def _write_loop(self) -> None:
+        while (item := self._writes.get()) is not None:
+            line, loop, done = item
+            error: BaseException | None = None
+            try:
+                self._writer.write(line + b"\n")
+                self._writer.flush()
+            except (OSError, ValueError) as exc:  # 宿主关闭了 stdout，或文件已关闭
+                error = self._failed = exc
+            try:
+                loop.call_soon_threadsafe(_settle, done, error)
+            except RuntimeError:
+                pass  # 事件循环已结束
+            if error is not None:
+                return
+
+    def close(self, timeout: float) -> bool:
+        """在 timeout 秒内等待已提交的写出完成；返回是否全部成功写出。"""
+        if self._write_thread is None:
+            return self._failed is None
+        self._writes.put(None)
+        self._write_thread.join(timeout)
+        return not self._write_thread.is_alive() and self._failed is None
 
 
 class MemoryTransport:
@@ -3142,6 +3367,7 @@ import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
+from agentbox_worker.errors import TransportBroken
 from agentbox_worker.protocol import BOOTSTRAP_VERSION, VERSION, WORKER, encode_line
 from agentbox_worker.transport import Transport
 
@@ -3153,13 +3379,16 @@ def _now() -> str:
 class Outbox:
     """为事件补上 v、严格递增的 seq 与 ts，校验后发出（规格 §5.3）。
 
-    校验失败时抛出 ProtocolError，且不占用 seq。
+    seq 的提交点是"校验通过、开始发送"：此后无论发送成功、失败还是被取消，该 seq 都已用掉。
+    发送失败或在途被取消时结果不确定，Outbox 进入失效状态，此后的发送一律抛出
+    TransportBroken，绝不以同一 seq 重发。校验失败抛出 ProtocolError，且不占用 seq。
     """
 
     def __init__(self, transport: Transport) -> None:
         self._transport = transport
         self._seq = 0
         self._lock = asyncio.Lock()
+        self._broken: str | None = None
 
     @property
     def last_seq(self) -> int:
@@ -3167,16 +3396,34 @@ class Outbox:
 
     async def emit(self, body: dict[str, Any]) -> None:
         async with self._lock:
+            self._check_usable()
             message = {**body, "v": VERSION, "seq": self._seq + 1, "ts": _now()}
             line = encode_line(WORKER, message)
-            await self._transport.send(line)
             self._seq += 1
+            await self._send(line, f"seq={self._seq}")
 
     async def send_handshake_error(self, code: str) -> None:
-        line = encode_line(
-            WORKER, {"type": "handshake_error", "bootstrap": BOOTSTRAP_VERSION, "code": code}
-        )
-        await self._transport.send(line)
+        async with self._lock:
+            self._check_usable()
+            body = {"type": "handshake_error", "bootstrap": BOOTSTRAP_VERSION, "code": code}
+            await self._send(encode_line(WORKER, body), "handshake_error")
+
+    def _check_usable(self) -> None:
+        if self._broken is not None:
+            raise TransportBroken(self._broken)
+
+    async def _send(self, line: bytes, what: str) -> None:
+        try:
+            await self._transport.send(line)
+        except asyncio.CancelledError:
+            self._broken = f"{what} 的发送在途被取消，结果不确定"
+            raise
+        except TransportBroken as exc:
+            self._broken = str(exc)
+            raise
+        except Exception as exc:
+            self._broken = f"{what} 发送失败：{exc!r}"
+            raise TransportBroken(self._broken) from exc
 
 
 class Waiters:
@@ -3230,8 +3477,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Produces（Task 7 与后续计划依赖）：
   - `Result(summary: str, outputs: list[str] = [])`、`Paused(checkpoint_id: str)`、`ResumeInfo(checkpoint_id, step_id, state, state_ref, refs)`、`ArtifactRef(artifact_id, version, sha256)`、`Timing(ack_timeout=10.0, max_ack_attempts=5, retry_backoff=1.0, artifact_timeout=300.0)`
   - `TaskContext`：属性 `task_id`、`attempt_id`、`attempt_no`、`config`、`out_dir: Path`、`resume: ResumeInfo | None`、`cancel_reason: str | None`；方法 `should_pause() -> bool`、`async progress(kind, message, *, step_id=None, data=None)`、`async checkpoint(step_id, *, state=None, state_ref=None, refs=()) -> str`、`async register_artifact(artifact_id, path, *, media_type, visibility="output") -> ArtifactRef`
-  - `async run_worker(app, transport, *, name, version, capabilities=(), timing=Timing(), new_id=None) -> int`；`main(app, *, name, version, capabilities=()) -> NoReturn`（刷新输出后以 `os._exit` 退出：守护读取线程阻塞在 stdin 时，正常的解释器收尾会以 `Fatal Python error: _enter_buffered_busy` 崩溃——计划演练中实测复现，Task 7 的真实进程测试是其回归测试）
-  - 退出码常量 `EXIT_OK = 0`、`EXIT_FAILURE = 1`、`EXIT_HANDSHAKE = 2`
+  - `async run_worker(app, transport, *, name, version, capabilities=(), timing=Timing(), new_id=None) -> int`（输出通道失效时返回 `EXIT_FAILURE`，不再尝试发送）
+  - `main(app, *, name, version, capabilities=()) -> NoReturn`：进程入口策略见"错误码与契约约定"——异常按失败处理、期限内刷新已提交输出、`os._exit`；Task 7 的五个真实进程测试是其回归测试
+  - `checkpoint` 在首次提交前以 JSON 往返生成与调用方对象无关的快照，所有重试复用它；不可序列化（含 NaN）时抛 `WorkerFailure("invalid_field")`
+  - 退出码常量 `EXIT_OK = 0`、`EXIT_FAILURE = 1`、`EXIT_HANDSHAKE = 2`；`SHUTDOWN_TIMEOUT_ENV = "AGENTBOX_WORKER_SHUTDOWN_TIMEOUT"`；包根导出 `TransportBroken`
 
 - [ ] **Step 1：写失败的测试**
 
@@ -3603,6 +3852,59 @@ def test_resume_info_is_exposed(tmp_path):
     code, events = run(app, tmp_path, init={"attempt_no": 2, "resume": resume})
     assert code == 0
     assert json.loads(events[-1]["summary"]) == ["cp-1", {"next_index": 2}]
+
+
+def test_checkpoint_retries_use_snapshot_of_state(tmp_path):
+    state = {"n": 1}
+    replies = iter(["retryable_error", "committed"])
+
+    def respond(msg, transport):
+        if msg["type"] == "checkpoint":
+            state["n"] = 99  # 提交后修改调用方对象，不得影响同一 checkpoint 的重试内容
+            checkpoint_reply(next(replies))(msg, transport)
+
+    async def app(ctx):
+        return Result(await ctx.checkpoint("s1", state=state), [])
+
+    code, events = run(app, tmp_path, responder=respond)
+    sent = [e for e in events if e["type"] == "checkpoint"]
+    assert code == 0
+    assert [e["state"] for e in sent] == [{"n": 1}, {"n": 1}]
+
+
+def test_unserializable_state_fails_without_sending(tmp_path):
+    async def app(ctx):
+        await ctx.checkpoint("s1", state={"x": object()})
+        return Result("never", [])
+
+    code, events = run(app, tmp_path)
+    assert code == 1
+    assert types(events) == ["ready", "error"]
+    assert events[1]["code"] == "invalid_field"
+
+
+class BreaksAfterReady(MemoryTransport):
+    async def send(self, line: bytes) -> None:
+        if self.sent:
+            raise OSError("broken pipe")
+        await super().send(line)
+
+
+def test_broken_transport_ends_worker_with_failure(tmp_path):
+    async def app(ctx):
+        await ctx.progress("step_started", "x")
+        return Result("never", [])
+
+    async def go():
+        transport = BreaksAfterReady()
+        init = {**INIT, "out_dir": str(tmp_path)}
+        transport.feed(json.dumps(init).encode())
+        code = await asyncio.wait_for(
+            run_worker(app, transport, name="w", version="0", timing=FAST), timeout=5
+        )
+        return code, [json.loads(line)["type"] for line in transport.sent]
+
+    assert asyncio.run(go()) == (1, ["ready"])
 ```
 
 - [ ] **Step 2：确认测试失败**
@@ -3630,6 +3932,7 @@ import hashlib
 import json
 import os
 import sys
+import traceback
 import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
@@ -3640,6 +3943,7 @@ from agentbox_worker.errors import (
     ArtifactRejected,
     CheckpointRejected,
     CheckpointUnresolved,
+    TransportBroken,
     WorkerFailure,
 )
 from agentbox_worker.outbox import Outbox, Waiters
@@ -3656,6 +3960,8 @@ from agentbox_worker.transport import StdioTransport, Transport
 EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_HANDSHAKE = 2
+
+SHUTDOWN_TIMEOUT_ENV = "AGENTBOX_WORKER_SHUTDOWN_TIMEOUT"
 
 
 @dataclass(frozen=True)
@@ -3710,6 +4016,14 @@ def _resume_info(raw: dict[str, Any] | None) -> ResumeInfo | None:
         state_ref=raw.get("state_ref") or None,
         refs=list(raw.get("refs") or []),
     )
+
+
+def _snapshot(state: Any) -> Any:
+    """生成与调用方对象无关的状态快照；同一 checkpoint 的所有重试都使用它（规格 §5.5）。"""
+    try:
+        return json.loads(json.dumps(state, ensure_ascii=False, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise WorkerFailure("invalid_field", f"checkpoint state 无法序列化为 JSON：{exc}") from exc
 
 
 def _hash_file(path: Path) -> tuple[str, int]:
@@ -3782,7 +4096,7 @@ class TaskContext:
                 "step_id": step_id,
             }
             if state_ref is None:
-                body["state"] = state
+                body["state"] = _snapshot(state)
             else:
                 body["state_ref"] = state_ref
             body["refs"] = list(refs)
@@ -3885,7 +4199,11 @@ def _supports_protocol(line: bytes) -> bool:
 
 async def _read_init(transport: Transport, outbox: Outbox) -> dict[str, Any] | int:
     """读取并校验 init；无法开始时返回退出码。"""
-    line = await transport.receive()
+    try:
+        line = await transport.receive()
+    except ProtocolError as exc:  # 例如输入帧超长
+        _log(f"读取 init 失败：{exc}")
+        return EXIT_FAILURE
     if line is None:
         _log("未收到 init：stdin 已关闭")
         return EXIT_FAILURE
@@ -3923,7 +4241,26 @@ async def run_worker(
     timing: Timing = Timing(),  # noqa: B008  Timing 不可变
     new_id: Callable[[], str] | None = None,
 ) -> int:
-    """运行一个 task 模式 Worker，返回进程退出码。"""
+    """运行一个 task 模式 Worker，返回进程退出码。
+
+    协议输出通道失效（TransportBroken）时无法再发出任何事件，直接以 EXIT_FAILURE 结束。
+    """
+    try:
+        return await _run_worker(app, transport, name, version, capabilities, timing, new_id)
+    except TransportBroken as exc:
+        _log(f"协议输出通道失效：{exc}")
+        return EXIT_FAILURE
+
+
+async def _run_worker(
+    app: App,
+    transport: Transport,
+    name: str,
+    version: str,
+    capabilities: Iterable[str],
+    timing: Timing,
+    new_id: Callable[[], str] | None,
+) -> int:
     outbox = Outbox(transport)
     init = await _read_init(transport, outbox)
     if isinstance(init, int):
@@ -3943,12 +4280,12 @@ async def run_worker(
 
 async def _control_loop(ctx: TaskContext, transport: Transport, app_task: asyncio.Task) -> None:
     while True:
-        line = await transport.receive()
-        if line is None:
-            ctx.cancel_reason = "stdin_closed"
-            app_task.cancel()
-            return
         try:
+            line = await transport.receive()
+            if line is None:
+                ctx.cancel_reason = "stdin_closed"
+                app_task.cancel()
+                return
             keep_going = ctx._handle_control(decode_line(HOST, line))
         except ProtocolError as exc:
             ctx.control_error = exc
@@ -4008,22 +4345,37 @@ async def _emit_failure(ctx: TaskContext, failure: WorkerFailure) -> int:
     return EXIT_FAILURE
 
 
-def main(app: App, *, name: str, version: str, capabilities: Iterable[str] = ()) -> NoReturn:
-    """进程入口：stdin/stdout 承载协议；应用的 print 被改到 stderr，避免混入协议流。
+def _shutdown_timeout() -> float:
+    try:
+        return float(os.environ.get(SHUTDOWN_TIMEOUT_ENV, "5"))
+    except ValueError:
+        return 5.0
 
-    结束时刷新输出后以 os._exit 退出：守护读取线程可能正阻塞在 stdin 的 readline 中
-    并持有其缓冲区锁，正常的解释器收尾会因无法获取该锁而致命退出
-    （Fatal Python error: _enter_buffered_busy）。
+
+def main(app: App, *, name: str, version: str, capabilities: Iterable[str] = ()) -> NoReturn:
+    """进程入口。stdin/stdout 承载协议；应用的 print 被改到 stderr，避免混入协议流。
+
+    这是 SDK 中唯一调用 os._exit 的地方，退出策略固定为：运行 Worker（任何异常都记录并按
+    失败处理）→ 在期限内等待已提交的协议输出写完 → os._exit。不走正常的解释器收尾：读线程
+    可能阻塞在 stdin 的 readline 中，写线程可能因宿主停止读取 stdout 而阻塞在 write 中，
+    二者都无法取消或 join；正常收尾会挂起，或以 "Fatal Python error: _enter_buffered_busy"
+    崩溃。期限由环境变量 AGENTBOX_WORKER_SHUTDOWN_TIMEOUT 设置（秒，默认 5）。
     """
     protocol_out = sys.stdout.buffer
     sys.stdout = sys.stderr
     transport = StdioTransport(sys.stdin.buffer, protocol_out)
-    code = asyncio.run(
-        run_worker(app, transport, name=name, version=version, capabilities=capabilities)
-    )
-    protocol_out.flush()
-    sys.stderr.flush()
-    os._exit(code)
+    code = EXIT_FAILURE
+    try:
+        code = asyncio.run(
+            run_worker(app, transport, name=name, version=version, capabilities=capabilities)
+        )
+    except BaseException:  # noqa: B036  进程入口：任何异常都必须走有界退出
+        traceback.print_exc()
+    finally:
+        if not transport.close(_shutdown_timeout()):
+            _log("退出时仍有未写出的协议输出（宿主可能已停止读取 stdout）")
+        sys.stderr.flush()
+        os._exit(code)
 ```
 
 `worker/agentbox_worker/__init__.py`（完整替换）：
@@ -4039,6 +4391,7 @@ from agentbox_worker.errors import (
     ArtifactRejected,
     CheckpointRejected,
     CheckpointUnresolved,
+    TransportBroken,
     WorkerFailure,
 )
 from agentbox_worker.runtime import (
@@ -4072,6 +4425,7 @@ __all__ = [
     "TaskContext",
     "Timing",
     "Transport",
+    "TransportBroken",
     "WorkerFailure",
     "main",
     "run_worker",
@@ -4084,7 +4438,7 @@ __all__ = [
 cd F:\go-agentbox-m1-3\worker; uv run ruff format .; uv run ruff check .; uv run pytest -q
 ```
 
-Expected: 全部通过。若 ruff 报告 `B008` 以外的问题，按提示修正后重跑；不得用 `noqa` 掩盖其他规则。
+Expected: 全部通过。代码中只有两处 `noqa`：`B008`（`Timing` 不可变）与 `B036`（进程入口必须捕获所有异常以走有界退出）；其他 ruff 问题按提示修正，不得用 `noqa` 掩盖。
 
 - [ ] **Step 5：提交**
 
@@ -4119,6 +4473,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 | `exit` | `code` | 立即 `os._exit(code)`，模拟崩溃 |
 | `artifact` | `artifact_id`、`path`、`content`、`media_type?`、`visibility?` | 写入 out_dir 后登记 |
 | `print` | `message` | `print()`，验证不会混入协议流 |
+| `flood` | `count`、`size?`（默认 1000）、`step_id?` | 连续发出 `count` 条 progress，用于制造 stdout 背压 |
 
 顶层另有 `summary`（默认 `"done"`）与 `outputs`（默认 `[]`）。恢复时从 `resume.state.next_index` 继续。
 
@@ -4450,18 +4805,25 @@ def test_defaults_without_config(tmp_path):
 `worker/tests/test_process_e2e.py`：
 
 ```python
-"""以真实子进程运行 `python -m sim_worker`：stdin/stdout 协议、退出码、print 改道。
+"""以真实子进程运行 `python -m sim_worker`：协议、退出码、print 改道与有界退出。
 
 进程控制属于必须在 Linux 上验证的部分；Windows 上的结果仅供参考（见计划"平台覆盖"）。
 """
 
 import json
+import os
 import subprocess
 import sys
 import threading
+import time
+
+from agentbox_worker.transport import MAX_FRAME_BYTES
+
+ENV = {**os.environ, "AGENTBOX_WORKER_SHUTDOWN_TIMEOUT": "1"}
+CANCEL = b'{"type":"cancel","v":1,"attempt_id":"a-1","reason":"user","grace_ms":0}\n'
 
 
-def run_process(tmp_path, steps: list[dict], timeout: float = 30) -> tuple[int, list[dict], str]:
+def init_line(tmp_path, steps: list[dict]) -> bytes:
     init = {
         "type": "init",
         "bootstrap": 1,
@@ -4473,48 +4835,112 @@ def run_process(tmp_path, steps: list[dict], timeout: float = 30) -> tuple[int, 
         "out_dir": str(tmp_path),
         "config": {"steps": steps, "summary": "完成", "outputs": []},
     }
-    proc = subprocess.Popen(
+    return json.dumps(init).encode() + b"\n"
+
+
+def start() -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
         [sys.executable, "-m", "sim_worker"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=ENV,
     )
-    killer = threading.Timer(timeout, proc.kill)
-    killer.start()
-    try:
-        proc.stdin.write(json.dumps(init).encode() + b"\n")
-        proc.stdin.flush()
-        events = [json.loads(line) for line in proc.stdout]
-        code = proc.wait()
-        stderr = proc.stderr.read().decode("utf-8", errors="replace")
-    finally:
-        killer.cancel()
-        try:
-            proc.stdin.close()
-        except OSError:
-            pass
-    return code, events, stderr
+
+
+def stop(proc: subprocess.Popen[bytes]) -> None:
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait()
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is not None and not stream.closed:
+            try:
+                stream.close()
+            except OSError:
+                pass
 
 
 def test_process_result_and_print_goes_to_stderr(tmp_path):
-    steps = [
-        {"op": "progress", "step_id": "s1", "kind": "step_started", "message": "start"},
-        {"op": "print", "message": "printed-marker"},
-    ]
-    code, events, stderr = run_process(tmp_path, steps)
+    proc = start()
+    try:
+        steps = [
+            {"op": "progress", "step_id": "s1", "kind": "step_started", "message": "start"},
+            {"op": "print", "message": "printed-marker"},
+        ]
+        proc.stdin.write(init_line(tmp_path, steps))
+        proc.stdin.flush()
+        events = [json.loads(line) for line in proc.stdout]
+        code = proc.wait(timeout=20)
+        stderr = proc.stderr.read().decode("utf-8", errors="replace")
+    finally:
+        stop(proc)
     assert code == 0
     assert [e["type"] for e in events] == ["ready", "progress", "result"]
     assert "printed-marker" in stderr
 
 
-def test_process_exit_op_has_no_terminal_event(tmp_path):
-    steps = [
-        {"op": "progress", "step_id": "s1", "kind": "step_started", "message": "start"},
-        {"op": "exit", "code": 3},
-    ]
-    code, events, _ = run_process(tmp_path, steps)
-    assert code == 3
-    assert [e["type"] for e in events] == ["ready", "progress"]
+def test_process_exits_while_host_keeps_stdin_open(tmp_path):
+    proc = start()
+    try:
+        proc.stdin.write(init_line(tmp_path, []))
+        proc.stdin.flush()  # stdin 保持打开，Worker 仍须在结束后退出
+        events = [json.loads(line) for line in proc.stdout]
+        code = proc.wait(timeout=20)
+    finally:
+        stop(proc)
+    assert code == 0 and events[-1]["type"] == "result"
+
+
+def test_process_exits_after_cancel_when_host_stops_reading_stdout(tmp_path):
+    proc = start()
+    try:
+        proc.stdin.write(init_line(tmp_path, [{"op": "flood", "count": 5000, "size": 1000}]))
+        proc.stdin.flush()
+        time.sleep(1.0)  # 不读取 stdout：Worker 写满管道后阻塞在写出上
+        proc.stdin.write(CANCEL)
+        proc.stdin.flush()
+        started = time.monotonic()
+        code = proc.wait(timeout=20)
+        elapsed = time.monotonic() - started
+        stderr = proc.stderr.read().decode("utf-8", errors="replace")
+    finally:
+        stop(proc)
+    assert code == 0
+    assert elapsed < 10
+    assert "未写出" in stderr
+
+
+def test_process_fails_fast_when_stdout_is_closed(tmp_path):
+    proc = start()
+    proc.stdout.close()
+    try:
+        proc.stdin.write(init_line(tmp_path, [{"op": "flood", "count": 5000, "size": 1000}]))
+        proc.stdin.flush()
+        code = proc.wait(timeout=20)
+    finally:
+        stop(proc)
+    assert code == 1
+
+
+def test_process_rejects_oversized_input_line(tmp_path):
+    proc = start()
+
+    def feed() -> None:
+        try:
+            proc.stdin.write(b"a" * (MAX_FRAME_BYTES + 10))
+            proc.stdin.flush()
+        except OSError:
+            pass  # Worker 已在超限后退出
+
+    writer = threading.Thread(target=feed, daemon=True)
+    writer.start()
+    try:
+        code = proc.wait(timeout=20)
+        out = proc.stdout.read()
+    finally:
+        stop(proc)
+    assert code == 1
+    assert out == b""
 ```
 
 - [ ] **Step 3：确认测试失败**
@@ -4624,6 +5050,12 @@ async def _print(ctx: TaskContext, op: Op, index: int, held: Held) -> None:
     print(op["message"])
 
 
+async def _flood(ctx: TaskContext, op: Op, index: int, held: Held) -> None:
+    message = "x" * op.get("size", 1000)
+    for _ in range(op["count"]):
+        await ctx.progress("flood", message, step_id=op.get("step_id"))
+
+
 _HANDLERS: dict[str, Handler] = {
     "progress": _progress,
     "sleep": _sleep,
@@ -4633,6 +5065,7 @@ _HANDLERS: dict[str, Handler] = {
     "exit": _exit,
     "artifact": _artifact,
     "print": _print,
+    "flood": _flood,
 }
 ```
 
@@ -4753,7 +5186,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
    ```
    Expected: 全部通过。
 3. **跨语言一致性**：Go 的 `TestMessageFixtures`、`TestScenarioFixtures` 与 Python 的 `test_protocol_fixtures`、`test_stream_scenarios`、`test_schemas`、`test_sdk_scenarios` 全部通过，且读取的是同一批 fixtures 文件（`protocol/fixtures/v1/messages.json` 与 18 个场景）。
-4. **CI（Linux，判定依据）**：推送分支并开 Draft PR（`Refs #4`），确认 `correctness`、`complexity-report`、`linux-integration`、`python (3.11)`、`python (3.13)` 全部实际执行并通过；`test_process_e2e.py` 在 Linux 上通过。
+4. **CI（Linux，判定依据）**：推送分支并开 Draft PR（`Refs #4`），确认 `correctness`、`complexity-report`、`linux-integration`、`python (3.11)`、`python (3.13)` 全部实际执行并通过；`test_process_e2e.py` 的五个真实进程测试（保持 stdin 打开时退出、停止读取 stdout 后取消、stdout 被关闭、输入超长、print 改道）在 Linux 上通过。
 5. **范围核对**：`git diff --stat m1-local-provider...HEAD` 只包含本计划 Files 中列出的文件。
 
 计划完成后向项目负责人汇报：实现的接口、测试与 CI 结果、偏离计划之处及原因。合并由项目负责人决定。
@@ -4763,5 +5196,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ## 自查记录
 
 - **规格覆盖**：§5.1 通道（SDK 的 stdin/stdout/stderr 处理、print 改道）；§5.2 引导与 `handshake_error`（Task 6、场景 `handshake_no_common_version`）；§5.3 公共规则与阶段（Task 2、3 的事件流检查）；§5.4 task 模式消息（Task 1、3）；§5.5 第 1、4、5 条（state 二选一、一个在途提交、同 ID 查询与重发）；§5.8 由宿主裁决（SDK 取消时不发终态提议）；§5.9 协作式暂停与取消；§5.10 大小上限；§5.11 fixtures（本计划覆盖协议层与 SDK 层场景，宿主层场景随 Plan 5 加入同一目录）。session 与 sub-run 扩展不在本计划范围。
+- **评审修正（第二轮）**：seq 提交点与取消语义（Task 5，`test_cancel_during_send_breaks_outbox_without_reusing_seq`）；有界关闭（Task 6 `main`，Task 7 三个真实进程场景）；读取阶段限长与有界背压（Task 5，`test_stdio_rejects_oversized_line_at_read_time`、`test_stdio_reader_applies_backpressure`，Task 7 `test_process_rejects_oversized_input_line`）；checkpoint 快照（Task 6，`test_checkpoint_retries_use_snapshot_of_state`）。
+- **演练**：本计划的全部代码已在临时目录按计划文本组装并运行：Go vet/test 与 18 个场景通过；Python ruff、模块依赖契约通过，pytest 在 Windows 3.13 与 3.11 上各 280 项通过（3.11 以 `-W error::RuntimeWarning` 连续三次）；Linux（WSL，Python 3.14）上除 schema 测试外的 147 项通过，含全部真实进程测试。
 - **占位符**：无。
 - **类型一致性**：`run_worker(app, transport, *, name, version, capabilities, timing, new_id)`、`Timing(ack_timeout, max_ack_attempts, retry_backoff, artifact_timeout)`、`TaskContext.checkpoint(step_id, *, state, state_ref, refs)`、`register_artifact(artifact_id, path, *, media_type, visibility)` 在 Task 6、7 的测试与实现中一致；Go 的 `DecodeLine`、`EncodeLine`、`WorkerStream.Observe`、`CodeOf` 在 Task 1、2 中一致。
