@@ -178,7 +178,7 @@ cmd：      装配并按顺序启动 cleanup loop、actor、API
 
 ---
 
-## 8. 第一条纵向切片
+## 8. 首个切片（首次集成验收）
 
 ```
 CLI submit → admission → 创建 task 环境 → StartExec → 握手 → progress
@@ -187,4 +187,39 @@ CLI submit → admission → 创建 task 环境 → StartExec → 握手 → pro
 
 所需的包：`sandbox`、`provider/local`、`protocol`、`runner`、`resource`、`task`、`admission`、`persistence/postgres`、`blob`、`reconcile`、`recovery`、`api`、`cmd`、`archtest`；Python 侧 `sim_worker` 与 SDK 的协议部分；Gateway 用 fake。实现可分小步提交，以这条链路的端到端测试验收。`session`、真实 Gateway、`cache`、`deepresearch` 在各自里程碑开始时创建。
 
+**首个切片 ≠ M1 完成。** M1 完成还要求控制面重启恢复、取消竞争、Store 故障等门槛实验（规格 §16.7，计划索引 Plan 6）。
+
 `internal/runtime` → `internal/sandbox` 作为一次纯重命名提交：只改包名、路径、引用与文档，不改启动、收割或降权逻辑，并重跑适用的编译与测试。
+
+---
+
+## 9. 函数级质量约束
+
+第 1–6 节约束架构层面；本节约束函数内部质量。它们是**每份实施计划的共同验收条件**，在代码评审中逐项检查。
+
+| 约束 | 执行方式 |
+|---|---|
+| 优先提前返回，避免业务分支不断嵌套 | 业务条件超过三层时必须审查能否分解；作为提醒，不机械禁止。连续的 `if err != nil { return … }` 属于正常 Go 错误处理，不在此列 |
+| 同一业务规则只有一个权威实现 | 重点检查状态转换、重试资格、预算判定、权限检查；不同边界上的必要复查（例如 Gateway 对访问的重复校验）保留 |
+| 函数围绕一个操作或决策组织 | 不同时承担协议解析、业务裁决、SQL 与物理资源操作 |
+| 重复代码按语义决定是否提取 | 同一规则被重复维护时合并；仅语法相似不强制抽象 |
+| 生命周期代码显式展示顺序与所有权 | 不为降低复杂度指标而隐藏锁、事务、清理或取消顺序 |
+| 旧实现退出主线时同步处理 | 删除或明确隔离旧实现、测试、配置与注释，不长期维护双轨 |
+| 注释解释约束与原因 | 接口契约（FD 与 Wait 的所有权、调用方责任）留在代码；方案比较、实验背景与经验推断放进设计记录，不写成可靠性契约 |
+| 复杂度指标用于发现问题 | 超标需要在评审中解释或重构；不靠拆成大量无意义小函数通过检查 |
+
+### 9.1 自动检查
+
+- `golangci-lint` 启用 `gocognit`、`nestif`、`dupl`、`funlen`，阈值作为**信号**：CI 中报告，超标须在 PR 描述中说明理由或重构；配合 `errcheck`、`govet`、`staticcheck`、`ineffassign`、`unused` 等正确性检查（这些必须通过）。
+- Python 使用 ruff（含 `C90` 复杂度与 `TID251` 禁用 API）与 `import-linter`。
+- 架构检查见第 3.2 节。所有检查在 GitHub Actions 中运行。
+
+### 9.2 现有代码的处理（随 Plan 2 LocalProvider 重写进行，不做一次性"去 if"重构）
+
+| 位置 | 处理 |
+|---|---|
+| `cgroup.Apply` | 保留：三组"配置存在→写入→返回错误"语义清晰，不引入通用配置执行器 |
+| `cgroup.New` | 扩展时提取"确保控制器可用"私有函数；保留创建与失败处理的主流程 |
+| `hostcheck.Check` | 移除 overlay 作为必需条件，改为检查当前方案的前置条件 |
+| `rootfs/overlay.go` | 将仍需要的 bind/unmount 原语与已退出主线的 Overlay 实现分开；Overlay 实现及其测试删除 |
+| `sandbox/spawn.go` 注释 | 保留 FD、Wait 所有权等契约；Pdeathsig 与线程生命周期的经验推断移入设计记录，并修正为"不作为可靠性依据"（规格已规定不依赖 Pdeathsig） |
