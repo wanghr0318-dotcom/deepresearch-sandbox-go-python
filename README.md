@@ -1,83 +1,71 @@
 # go-agentbox
 
-给 Agent 用的工具沙箱运行时 —— 隔离执行、资源限额、自动回收、产物持久化；外挂一层可按场景装配的 ReAct 执行框架。
+单执行主机上的 Agent Runtime：Go 负责执行与权限边界，Python 负责研究编排。
 
-> 状态：设计阶段。代码尚未开始，设计稿见 [`docs/design/`](docs/design/)。
+> **状态：设计已完成，实现进行中（v0.2 内部里程碑 M1）。** 下文描述的是设计目标，不是已验证的能力；每项保证在对应验收通过前都不成立。
 
 ---
 
+## 当前文档入口
+
+| 文档 | 内容 |
+|---|---|
+| [路线图](docs/design/2026-10-03-roadmap.md) | v0.2 首发 → v0.3 多节点 → v0.4 MicroVM |
+| [v0.2 首发设计规格](docs/design/2026-10-03-v0.2-first-release-design.md) | 架构、协议、数据模型、Gateway、会话、隔离、验证与发布门槛 |
+| [代码组织设计](docs/design/2026-10-03-code-organization.md) | 模块职责、允许依赖、事务用例、所有权 |
+
+历史文档（不可直接执行）：[2026-09-29 设计稿](docs/design/2026-09-29-sandbox-runtime-design.md)、[v0.1 规格](docs/design/2026-10-03-v0.1-reliable-execution-design.md)、[旧 M1 计划](docs/plans/2026-09-29-m1-local-provider.md)。
+
 ## 这是什么
 
-Agent 要真正干活，就得跑 shell、改文件、装依赖。这些操作必须在隔离环境里执行，否则一个失控的 `rm -rf` 就能毁掉宿主机。
-
-本项目做两件事：
-
-1. **沙箱运行时**（主体）—— 会话级沙箱的创建、复用、冻结、回收、快照，以及底层的 Linux 隔离实现
-2. **框架外壳** —— 一个薄的 ReAct 执行循环，让沙箱有真实的使用场景，并支撑"同一个二进制、多个场景、不同安全姿态"
-
-## 架构
-
 ```
-入口层（按 scenario 装配）
-   └─ Template ──► ReAct Agent ──► 流式输出
-                       └─ ToolNode ──► 中间件链 ──► Sandbox Manager
-                                                        │
-                                                 Provider 接口
-                                    ┌───────────────────┴──────────────┐
-                              LocalProvider                    TencentProvider
-                        namespace + cgroup + overlayfs           AGS 控制面
-                            （零外部依赖可跑）
+CLI / Vue ── REST + SSE ──► Go 控制面（任务/会话状态机、准入、事件续传、checkpoint、恢复）
+                              ├─ Gateway：凭据隔离、调用 journal、预算、撤销、出网控制、exec 调度
+                              ├─ PostgreSQL：唯一元数据存储      Redis：仅缓存
+                              └─ Go Runtime：namespace + cgroup + user namespace + seccomp
+                                     │
+                    ┌────────────────┴────────────────┐
+           编排环境：Python Worker（可信）         exec 环境：模型生成的代码
+           经 Unix socket 访问 Gateway             无 Gateway 入口、无网络
 ```
 
-## 设计要点
-
-**管控面**
-- 会话级命名复用，沙箱名同时作为分布式锁键与绑定标识
-- Provider 是真相源，binding 是缓存，执行前必探活
-- 三层 TTL（锁 / 业务 / provider），provider TTL 严格大于业务 TTL
-- 回收任务幂等优先于选主；延迟队列削峰
-- 会话信号量用带自动过期的 ZSET，持有者崩溃自愈
-
-**LocalProvider**
-- overlayfs 分层，建箱 = mkdir + 一次 mount，不拷贝 rootfs
-- re-exec `/proc/self/exe` 规避 Go runtime 与线程级 syscall 的冲突
-- 沙箱内自写 mini-envd，使两个 provider 的 Exec 语义一致
-- cgroup v2 freezer 实现 hibernate
-- Close 八步有序清理，先冻结、必轮询
-
-**框架外壳**
-- 沙箱在中间件中 ensure，工具只声明 `NeedsSandbox`
-- 准入控制为强制层，场景无权关闭
-- 中间件同名覆盖、异名追加 —— 配置自由，不给编排自由
+- 长任务 Worker 故障后，从宿主已提交的 checkpoint 恢复。
+- 供应商 API Key 不进入沙箱；所有外部访问经 Gateway 记录、计费、可撤销。
+- 会话可冻结、驱逐并从已提交状态重建。
+- 同一任务内的受限并行子研究共享预算、可取消。
+- DeepResearch 与 sim-worker 通过同一套版本化协议接入。
 
 ## 能力边界
 
-明确声明，不假装覆盖：
+| 项 | v0.2 |
+|---|---|
+| 隔离强度 | 容器级，共享宿主内核；权限边界测试是回归测试，不是无逃逸证明 |
+| 编排 Worker | 可信平台代码；生成代码在独立 exec 沙箱中运行 |
+| 外部调用 | 不保证 exactly-once；结果未知按全额预留保守计费 |
+| 预算 | 保守估算，可出现赤字，不是严格上限 |
+| 部署 | 单执行主机，无跨主机故障接管 |
+| 冻结 | 保留进程与内存；驱逐才释放 |
+| Workspace | 不随 checkpoint 回滚 |
 
-| 项 | 本项目 | 生产级 |
-|---|---|---|
-| 隔离强度 | 容器级，共享宿主内核 | microVM，独立内核 |
-| 适用租户模型 | 单租户可信场景 | 多租户不可信 |
-| Hibernate | 冻结进程，不释放内存 | 内存落盘并释放 |
-| Snapshot | 文件系统层 | 含内存与进程状态 |
-| 浏览器沙箱 | 第一版不支持 | 支持 |
-
-## 参考与致谢
-
-设计过程中对标了以下项目。**参考其设计，代码自行实现**：
-
-- [CloudWeGo Eino](https://github.com/cloudwego/eino) —— Go LLM/Agent 框架，编排层抽象参考
-- [Tencent Cloud Cube Sandbox](https://github.com/tencentcloud/CubeSandbox) —— Agent 沙箱，Provider 能力面参考
-- [runc](https://github.com/opencontainers/runc) —— 容器运行时，re-exec init 模式参考
-- E2B —— 沙箱内 daemon + Connect 风格 API 的接口语义参考
+完整清单见规格第 1.3 节与第 20 节。
 
 ## 开发环境
 
-需要 Linux（namespace / cgroup v2）。Windows 下用 WSL2。
+- Linux（cgroup v2、user namespace）；Windows 下使用 WSL2。
+- Go 1.23+；Python 3.11+。
+- PostgreSQL 与 Redis：`docker compose -f deploy/docker-compose.yml up`（随 M1 提供）。
 
 ```bash
 stat -fc %T /sys/fs/cgroup    # 应输出 cgroup2fs
 ```
+
+## 参考与致谢
+
+参考其设计，代码自行实现：
+
+- [runc](https://github.com/opencontainers/runc)：re-exec init、降权与 `/proc` 掩蔽
+- [Tencent Cloud Cube Sandbox](https://github.com/tencentcloud/CubeSandbox)：Agent 沙箱能力面
+- E2B：沙箱内 daemon 与接口语义
 
 ## License
 

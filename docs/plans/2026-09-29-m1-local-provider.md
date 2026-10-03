@@ -1,5 +1,7 @@
 # M1: LocalProvider 最小可用 实施计划
 
+> **⚠ 历史计划，不可直接执行。** Task 1–5 已按本计划完成。Task 6–11 的正文与现行设计冲突（阻塞式 `Exec`、`Wait4(-1)` 与 `exec.Cmd.Wait` 并存的收割方式、可写 overlay 主线、未启用 user namespace 等），已被 [v0.2 规格](../design/2026-10-03-v0.2-first-release-design.md) 第 4 节与第 18 节、以及 [代码组织设计](../design/2026-10-03-code-organization.md) 取代。后续工作以新的实施计划为准；本文仅保留为 Task 1–5 的实施记录。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 实现一个能建箱、在箱内执行命令、正确销毁且不留残留的本地沙箱 Provider。
