@@ -68,12 +68,17 @@ jobs:
           go-version-file: go.mod
       - name: 验证 runner 能力（cgroup v2、挂载、namespace）
         run: sudo bash scripts/ci/check-runner.sh
-      - name: root 测试
+      # go test 的退出码是主判据；citestjson 只补充检查 skip、中断与执行数量，不能替代退出码。
+      # 两者都先执行完（以便都留下诊断输出），最后一起判定。
+      - name: root 测试与判定
         run: |
-          set -o pipefail
-          sudo -E env "PATH=$PATH" go test -json -count=1 ./... | tee test.json > /dev/null || true
-      - name: 判定（失败或非预期 skip 均为失败）
-        run: go run ./tools/citestjson test.json scripts/ci/allowed-skips.txt
+          set +e
+          sudo -E env "PATH=$PATH" go test -json -count=1 ./... > test.json
+          test_exit=$?
+          go run ./tools/citestjson test.json scripts/ci/allowed-skips.txt
+          judge_exit=$?
+          echo "go test 退出码=$test_exit，citestjson 退出码=$judge_exit"
+          [ "$test_exit" -eq 0 ] && [ "$judge_exit" -eq 0 ]
       - name: 上传测试记录
         if: always()
         uses: actions/upload-artifact@v4

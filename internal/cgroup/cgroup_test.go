@@ -3,6 +3,7 @@
 package cgroup
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -55,8 +56,7 @@ func TestGroupLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	// 兜底清理：用例自身会断言 Destroy 的结果，这里的失败不改变用例结论。
-	defer func() { _ = g.Destroy() }()
+	cleanupGroup(t, g)
 
 	if _, err := os.Stat(g.Path()); err != nil {
 		t.Fatalf("cgroup 目录未创建: %v", err)
@@ -78,22 +78,8 @@ func TestAddProcAndProcs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-
-	cmd := exec.Command("sleep", "30")
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("启动 sleep: %v", err)
-	}
-	// 顺序要紧：先杀进程并【收尸】，再删 cgroup。
-	// 只 Kill 不 Wait 的话进程会变成僵尸，而僵尸仍计入 cgroup.procs，
-	// rmdir 随即撞 EBUSY——这正是 Destroy 必须由调用方保证前置条件的原因。
-	// Destroy 的错误也必须报出来：静默丢弃会让泄漏的 cgroup 伪装成测试通过。
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-		if err := g.Destroy(); err != nil {
-			t.Errorf("清理 cgroup %s 失败: %v", g.Path(), err)
-		}
-	})
+	cleanupGroup(t, g)
+	cmd := startSleeper(t)
 
 	if err := g.AddProc(cmd.Process.Pid); err != nil {
 		t.Fatalf("AddProc: %v", err)
@@ -115,22 +101,9 @@ func TestFreezeAndThaw(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	cleanupGroup(t, g)
+	cmd := startSleeper(t)
 
-	cmd := exec.Command("sleep", "30")
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("启动 sleep: %v", err)
-	}
-	// 顺序要紧：先杀进程并【收尸】，再删 cgroup。
-	// 只 Kill 不 Wait 的话进程会变成僵尸，而僵尸仍计入 cgroup.procs，
-	// rmdir 随即撞 EBUSY——这正是 Destroy 必须由调用方保证前置条件的原因。
-	// Destroy 的错误也必须报出来：静默丢弃会让泄漏的 cgroup 伪装成测试通过。
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-		if err := g.Destroy(); err != nil {
-			t.Errorf("清理 cgroup %s 失败: %v", g.Path(), err)
-		}
-	})
 	if err := g.AddProc(cmd.Process.Pid); err != nil {
 		t.Fatalf("AddProc: %v", err)
 	}
@@ -153,35 +126,75 @@ func TestDestroyFailsWhileProcsRemain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	cleanupGroup(t, g)
+	cmd := startSleeper(t)
 
+	if err := g.AddProc(cmd.Process.Pid); err != nil {
+		t.Fatalf("AddProc: %v", err)
+	}
+	if err := g.Destroy(); err == nil {
+		t.Fatal("cgroup 内仍有进程时 Destroy 应当失败")
+	}
+
+	killAndReap(t, cmd)
+	if err := destroyWithin(g, 3*time.Second); err != nil {
+		t.Fatalf("进程退出并收割后 Destroy 仍持续失败: %v", err)
+	}
+}
+
+// cleanupGroup 注册 cgroup 的删除，覆盖用例的所有退出路径。
+// 删除失败报告为测试错误：静默丢弃会让泄漏的 cgroup 伪装成测试通过。
+func cleanupGroup(t *testing.T, g *Group) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := destroyWithin(g, 3*time.Second); err != nil {
+			t.Errorf("清理 cgroup %s 失败: %v", g.Path(), err)
+		}
+	})
+}
+
+// startSleeper 启动一个长睡眠进程，并注册"杀死并收割"的清理。
+//
+// 必须在 cleanupGroup 之后调用：t.Cleanup 按注册的逆序执行，
+// 进程先被收割，cgroup 后被删除。只杀不收割的进程会成为僵尸，
+// 僵尸仍计入 cgroup.procs，删除随即失败。
+func startSleeper(t *testing.T) *exec.Cmd {
+	t.Helper()
 	cmd := exec.Command("sleep", "30")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("启动 sleep: %v", err)
 	}
-	if err := g.AddProc(cmd.Process.Pid); err != nil {
-		t.Fatalf("AddProc: %v", err)
-	}
+	t.Cleanup(func() { killAndReap(t, cmd) })
+	return cmd
+}
 
-	if err := g.Destroy(); err == nil {
-		// 已经判定失败，以下只是尽力清理。
-		_ = cmd.Process.Kill()
-		_ = g.Destroy()
-		t.Fatal("cgroup 内仍有进程时 Destroy 应当失败")
+// killAndReap 杀死并收割进程；已收割的进程直接返回。
+func killAndReap(t *testing.T, cmd *exec.Cmd) {
+	t.Helper()
+	if cmd.ProcessState != nil {
+		return
 	}
-
-	if err := cmd.Process.Kill(); err != nil {
-		t.Fatalf("Kill: %v", err)
+	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Errorf("杀死进程 %d: %v", cmd.Process.Pid, err)
 	}
-	// 被 kill 的进程必然返回非 nil 的退出错误；这里只为收割。
+	// 被杀死的进程必然以非 nil 的退出错误结束；这里只为收割。
 	_ = cmd.Wait()
-	// 内核回收是异步的，重试到成功或超时。
-	deadline := time.Now().Add(3 * time.Second)
+}
+
+// destroyWithin 重试 Destroy 直到成功或超时：进程退出后内核异步回收，
+// 删除可能短暂失败。目录已不存在视为成功。
+func destroyWithin(g *Group, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
 	for {
-		if err := g.Destroy(); err == nil {
-			return
+		if _, err := os.Stat(g.Path()); errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		err := g.Destroy()
+		if err == nil {
+			return nil
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("进程退出后 Destroy 仍持续失败")
+			return err
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
