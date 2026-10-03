@@ -19,10 +19,6 @@ const envSandboxRoot = "AGENTBOX_ROOT"
 // envSandboxHostname 把沙箱主机名传给 init 侧。
 const envSandboxHostname = "AGENTBOX_HOSTNAME"
 
-// controlFD 是控制连接在 init 侧的文件描述符号。
-// 0/1/2 是标准流，ExtraFiles 的第一个元素落在 3。
-const controlFD = 3
-
 // CloneFlags 是沙箱进程要进入的命名空间集合。
 //
 // 不含 CLONE_NEWUSER：M1 以 root 运行，rootless 是后续待定项。

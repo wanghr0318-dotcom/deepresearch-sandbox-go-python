@@ -55,7 +55,8 @@ func TestGroupLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer g.Destroy()
+	// 兜底清理：用例自身会断言 Destroy 的结果，这里的失败不改变用例结论。
+	defer func() { _ = g.Destroy() }()
 
 	if _, err := os.Stat(g.Path()); err != nil {
 		t.Fatalf("cgroup 目录未创建: %v", err)
@@ -162,13 +163,17 @@ func TestDestroyFailsWhileProcsRemain(t *testing.T) {
 	}
 
 	if err := g.Destroy(); err == nil {
-		cmd.Process.Kill()
-		g.Destroy()
+		// 已经判定失败，以下只是尽力清理。
+		_ = cmd.Process.Kill()
+		_ = g.Destroy()
 		t.Fatal("cgroup 内仍有进程时 Destroy 应当失败")
 	}
 
-	cmd.Process.Kill()
-	cmd.Wait()
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	// 被 kill 的进程必然返回非 nil 的退出错误；这里只为收割。
+	_ = cmd.Wait()
 	// 内核回收是异步的，重试到成功或超时。
 	deadline := time.Now().Add(3 * time.Second)
 	for {
