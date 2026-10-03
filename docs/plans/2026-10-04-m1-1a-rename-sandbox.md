@@ -178,7 +178,7 @@ cd /f/go-agentbox && perl -pi -e 's/^package runtime(\r?)$/package sandbox$1/' i
 立即断言：
 
 ```bash
-cd /f/go-agentbox && for f in internal/sandbox/init.go internal/sandbox/spawn.go internal/sandbox/spawn_test.go; do grep -c $'^package sandbox\r\\?$' "$f" | grep -qx 1 || { echo "包声明未改: $f"; exit 1; }; done && grep -q '^// Package sandbox 负责' internal/sandbox/spawn.go && grep -q '^// runSandboxInit() -> sandbox.RunInit()' internal/sandbox/spawn_test.go && grep -q '^// （internal/sandbox），' internal/sandbox/spawn_test.go && echo PKG-OK
+cd /f/go-agentbox && for f in internal/sandbox/init.go internal/sandbox/spawn.go internal/sandbox/spawn_test.go; do grep -cE $'^package sandbox\r?$' "$f" | grep -qx 1 || { echo "包声明未改: $f"; exit 1; }; done && grep -q '^// Package sandbox 负责' internal/sandbox/spawn.go && grep -q '^// runSandboxInit() -> sandbox.RunInit()' internal/sandbox/spawn_test.go && grep -q '^// （internal/sandbox），' internal/sandbox/spawn_test.go && echo PKG-OK
 ```
 
 Expected: 输出 `PKG-OK`。
@@ -224,7 +224,7 @@ Expected:
 cd /f/go-agentbox && git diff --cached -M -U0 -- internal cmd | grep -E '^[+-][^+-]'
 ```
 
-Expected: 恰好 14 行（7 删 7 增）：3 处 `package`、1 处包注释、2 处测试注释、`init_linux.go` 的 import 与调用各 1 处。出现其他行即**停止并检查其归属**。
+Expected: 恰好 16 行（8 删 8 增）：3 处 `package`、1 处包注释、2 处测试注释、`init_linux.go` 的 import 与调用各 1 处。出现其他行即**停止并检查其归属**。
 
 - [ ] **Step 10：构建、vet 与格式检查**
 
