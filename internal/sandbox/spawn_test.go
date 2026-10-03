@@ -1,6 +1,6 @@
 //go:build linux
 
-package runtime
+package sandbox
 
 import (
 	"errors"
@@ -152,7 +152,7 @@ func TestSpawnStartsInitProcess(t *testing.T) {
 // TestMainDispatchesInitToRunInit 覆盖 cmd/agentbox/main.go 里的
 // os.Args[1] == "init" 分流：构建真正的 agentbox 二进制，直接
 // `agentbox init` 执行它，证明这条 argv 分流确实通到了
-// runSandboxInit() -> runtime.RunInit()。
+// runSandboxInit() -> sandbox.RunInit()。
 //
 // 不需要 root：RunInit 只有在设置了 AGENTBOX_HOSTNAME 时才会调用
 // Sethostname（需要特权），这里不设置，所以能在普通用户下跑通到
@@ -184,7 +184,7 @@ func TestMainDispatchesInitToRunInit(t *testing.T) {
 }
 
 // repoRootDir 返回仓库根目录。go test 把工作目录设为包所在目录
-// （internal/runtime），仓库根就是它的上两级。
+// （internal/sandbox），仓库根就是它的上两级。
 func repoRootDir(t *testing.T) string {
 	t.Helper()
 	wd, err := os.Getwd()

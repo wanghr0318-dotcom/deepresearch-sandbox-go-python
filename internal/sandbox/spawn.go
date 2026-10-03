@@ -1,7 +1,7 @@
 //go:build linux
 
-// Package runtime 负责沙箱进程的启动与其内部的 1 号进程。
-package runtime
+// Package sandbox 负责沙箱进程的启动与其内部的 1 号进程。
+package sandbox
 
 import (
 	"fmt"

@@ -2,6 +2,6 @@
 
 package main
 
-import "github.com/wanghr0318-dotcom/go-agentbox/internal/runtime"
+import "github.com/wanghr0318-dotcom/go-agentbox/internal/sandbox"
 
-func runSandboxInit() error { return runtime.RunInit() }
+func runSandboxInit() error { return sandbox.RunInit() }
