@@ -59,6 +59,14 @@ type ExitInfo struct {
 	Signal syscall.Signal `json:"signal,omitempty"`
 }
 
+// StartSpec 是 start 消息中 spec 的编码：宿主侧（provider/local）编码、init 侧的 Launcher 解码，
+// 两侧共用这一个定义。exec_id 在消息头中，不重复编码。
+type StartSpec struct {
+	Argv []string `json:"argv"`
+	Env  []string `json:"env,omitempty"`
+	Dir  string   `json:"dir,omitempty"`
+}
+
 // Message 是控制通道上的一条消息。各类型使用的字段：
 //
 //	start      ExecID, Spec（随帧传递 3 个 FD）

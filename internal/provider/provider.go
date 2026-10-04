@@ -135,7 +135,7 @@ var (
 	ErrForeign         = errors.New("provider: 资源不属于本安装或归属无法判定")
 	ErrStopping        = errors.New("provider: 环境已停止接受新的执行")
 	ErrStartFailed     = errors.New("provider: 启动失败，workload 未运行")
-	ErrControlLost     = errors.New("provider: 控制连接在确认前断开")
+	ErrControlLost     = errors.New("provider: 控制连接断开") // ACK 前：启动结果未知；ACK 后（Wait）：退出状态未知
 	ErrStopUnconfirmed = errors.New("provider: 期限内未确认执行树清空")
 	ErrNotStopped      = errors.New("provider: 环境尚未确认停止")
 )

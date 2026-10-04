@@ -55,14 +55,6 @@ func (g *gate) close() {
 	g.mu.Unlock()
 }
 
-// startSpec 是 start 消息中 spec 的编码，由 init 侧的 Launcher 解释。exec_id 在消息头中，
-// 不重复编码。
-type startSpec struct {
-	Argv []string `json:"argv"`
-	Env  []string `json:"env,omitempty"`
-	Dir  string   `json:"dir,omitempty"`
-}
-
 // execState 是一次执行在宿主侧的状态；字段由 execClient.mu 保护。
 type execState struct {
 	resolved chan struct{} // 收到 start_ack 或 start_err 时关闭
@@ -207,7 +199,7 @@ func (c *execClient) start(ctx context.Context, g *gate, spec provider.ExecSpec)
 		c.beforeSend(spec.ExecID)
 	}
 
-	raw, err := json.Marshal(startSpec{Argv: spec.Argv, Env: spec.Env, Dir: spec.Dir})
+	raw, err := json.Marshal(sandbox.StartSpec{Argv: spec.Argv, Env: spec.Env, Dir: spec.Dir})
 	if err != nil {
 		return nil, fmt.Errorf("local: 编码 spec: %w", err)
 	}
@@ -324,7 +316,7 @@ func (h *execHandle) Wait() (provider.ExitStatus, error) {
 	case <-h.c.done:
 		if !isClosed(h.st.exited) {
 			h.c.forget(h.execID)
-			return provider.ExitStatus{}, fmt.Errorf("local: 退出前控制连接断开，退出状态未知: %w", h.c.rerr)
+			return provider.ExitStatus{}, fmt.Errorf("%w: 退出前控制连接断开，退出状态未知（%v）", provider.ErrControlLost, h.c.rerr)
 		}
 	}
 	h.c.mu.Lock()

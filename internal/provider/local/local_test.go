@@ -162,8 +162,8 @@ func TestExecWaitControlLostAfterAck(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 	fake.Close()
-	if _, err := h.Wait(); err == nil {
-		t.Fatal("退出前控制连接断开，Wait 应返回错误")
+	if _, err := h.Wait(); !errors.Is(err, provider.ErrControlLost) {
+		t.Fatalf("退出前控制连接断开，Wait 应返回 ErrControlLost（退出状态未知），得到 %v", err)
 	}
 }
 
