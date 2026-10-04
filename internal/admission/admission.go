@@ -1,7 +1,6 @@
-// Package admission is the in-memory capacity gate: run slots and environment
-// memory are granted to tasks in strict FIFO order. A stopped-but-unconfirmed
-// environment stays occupied; the caller releases only after stopped_at is
-// durable (spec section 14.5). Exec slots belong to M4 and are not modeled.
+// Package admission 是内存中的容量闸门：run slots 与环境内存按严格 FIFO 授予任务。
+// 未确认停止的环境保持占用：调用方在 stopped_at 持久化之后才归还（规格 §14.5）。
+// exec slots 属于 M4，本包不建模。
 package admission
 
 import (
@@ -12,29 +11,29 @@ import (
 	"sync"
 )
 
-// ErrExceedsCapacity is returned when a request can never be satisfied.
+// ErrExceedsCapacity 表示请求永远无法满足（超过总容量）。
 var ErrExceedsCapacity = errors.New("admission: request exceeds total capacity")
 
-// Capacity is the total capacity of the gate.
+// Capacity 是闸门的总容量。
 type Capacity struct {
 	RunSlots    int
 	MemoryBytes int64
 }
 
-// Request asks for one run slot plus MemoryBytes.
+// Request 申请一个 run slot 与 MemoryBytes 内存。
 type Request struct {
 	TaskID      string
 	MemoryBytes int64
 }
 
-// Grant is a held slice of capacity. Release is keyed by ID.
+// Grant 是一份已占用的容量；按 ID 归还。
 type Grant struct {
 	ID          uint64
 	TaskID      string
 	MemoryBytes int64
 }
 
-// Usage is a point-in-time view of the gate.
+// Usage 是闸门某一时刻的用量。
 type Usage struct {
 	Capacity     Capacity
 	RunSlotsUsed int
@@ -44,12 +43,12 @@ type Usage struct {
 
 type waiter struct {
 	req     Request
-	ready   chan struct{} // closed when granted
+	ready   chan struct{} // 授予时关闭
 	granted bool
 	grant   Grant
 }
 
-// Admission grants capacity in strict FIFO order.
+// Admission 按严格 FIFO 授予容量。
 type Admission struct {
 	mu     sync.Mutex
 	cap    Capacity
@@ -59,7 +58,7 @@ type Admission struct {
 	queue  *list.List // of *waiter
 }
 
-// New returns an empty gate with the given capacity.
+// New 返回给定容量的空闸门。
 func New(c Capacity) *Admission {
 	return &Admission{cap: c, held: map[uint64]Grant{}, queue: list.New()}
 }
@@ -76,8 +75,7 @@ func (a *Admission) grantLocked(r Request) Grant {
 	return g
 }
 
-// dispatchLocked grants to queue heads while they fit; a head that does not
-// fit blocks everything behind it.
+// dispatchLocked 依次授予能满足的队首；队首不满足时其后全部等待（避免大请求饥饿）。
 func (a *Admission) dispatchLocked() {
 	for e := a.queue.Front(); e != nil; e = a.queue.Front() {
 		w := e.Value.(*waiter)
@@ -91,9 +89,8 @@ func (a *Admission) dispatchLocked() {
 	}
 }
 
-// Acquire blocks until the request is granted in FIFO order. If ctx ends first
-// it returns the ctx error and holds nothing. A request that can never fit the
-// total capacity fails immediately with ErrExceedsCapacity.
+// Acquire 阻塞直到按 FIFO 授予。ctx 先结束时返回 ctx 错误且不占用任何容量；
+// 永远无法满足的请求立即返回 ErrExceedsCapacity。
 func (a *Admission) Acquire(ctx context.Context, r Request) (Grant, error) {
 	if err := ctx.Err(); err != nil {
 		return Grant{}, err
@@ -117,16 +114,16 @@ func (a *Admission) Acquire(ctx context.Context, r Request) (Grant, error) {
 
 	select {
 	case <-w.ready:
-		return w.grant, nil // w.grant written before close(ready)
+		return w.grant, nil // w.grant 在 close(ready) 之前写入
 	case <-ctx.Done():
 		a.mu.Lock()
 		defer a.mu.Unlock()
-		if w.granted { // lost the race: give the capacity back
+		if w.granted { // 与授予竞争失败：归还刚得到的容量
 			a.releaseLocked(w.grant.ID)
 			a.dispatchLocked()
 		} else {
 			a.queue.Remove(e)
-			a.dispatchLocked() // the head may have changed
+			a.dispatchLocked() // 队首可能已变化
 		}
 		return Grant{}, ctx.Err()
 	}
@@ -141,8 +138,7 @@ func (a *Admission) releaseLocked(id uint64) {
 	a.memory -= g.MemoryBytes
 }
 
-// Release returns a grant's capacity. Idempotent: unknown or already released
-// IDs are ignored. Amounts come from the recorded grant, not the argument.
+// Release 归还一份容量。幂等：未知或已归还的 ID 被忽略；归还量取自记录的授予，不取自参数。
 func (a *Admission) Release(g Grant) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -150,10 +146,8 @@ func (a *Admission) Release(g Grant) {
 	a.dispatchLocked()
 }
 
-// Rebuild replaces the held set with the occupancy reported by recovery.
-// Queued waiters are kept and re-evaluated. Later grants get IDs above every
-// rebuilt ID. Occupancy may exceed capacity; nothing new is granted until it
-// drains.
+// Rebuild 以恢复报告的实际占用替换已占用集合（规格 §14.1 第 9 步）。排队者保留并重新评估；
+// 之后的授予 ID 大于全部重建的 ID。占用可能超过容量，此时在回落之前不授予新的请求。
 func (a *Admission) Rebuild(occupied []Grant) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -172,7 +166,7 @@ func (a *Admission) Rebuild(occupied []Grant) {
 	a.dispatchLocked()
 }
 
-// Snapshot returns the current usage.
+// Snapshot 返回当前用量。
 func (a *Admission) Snapshot() Usage {
 	a.mu.Lock()
 	defer a.mu.Unlock()
