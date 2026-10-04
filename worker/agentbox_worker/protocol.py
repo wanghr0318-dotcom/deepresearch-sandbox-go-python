@@ -540,7 +540,7 @@ def encode_line(direction: str, msg: dict[str, Any]) -> bytes:
     validator(msg)
     try:
         text = json.dumps(msg, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    except ValueError as exc:  # NaN、Infinity 不是合法 JSON
+    except (ValueError, RecursionError) as exc:  # NaN、Infinity 不是合法 JSON；嵌套过深无法序列化
         raise ProtocolError("invalid_field", f"消息含有 JSON 不支持的数值：{exc}") from exc
     try:
         line = text.encode("utf-8")

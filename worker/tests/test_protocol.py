@@ -64,6 +64,9 @@ REF = "a" * 64
 NESTED_70: object = 0
 for _ in range(70):
     NESTED_70 = [NESTED_70]
+NESTED_5000: object = 0
+for _ in range(5000):
+    NESTED_5000 = [NESTED_5000]
 
 
 def checkpoint_line(state_json: str, refs: list[str]) -> bytes:
@@ -190,6 +193,19 @@ def test_decode_limits(direction, line, code):
             {"type": "progress", "v": 1, "seq": 1, "kind": "x", "message": "y", "data": NESTED_70},
             "invalid_field",
             id="nesting_too_deep",
+        ),
+        pytest.param(
+            WORKER,
+            {
+                "type": "progress",
+                "v": 1,
+                "seq": 1,
+                "kind": "x",
+                "message": "y",
+                "data": NESTED_5000,
+            },
+            "invalid_field",
+            id="too_deep_to_serialize",
         ),
     ],
 )

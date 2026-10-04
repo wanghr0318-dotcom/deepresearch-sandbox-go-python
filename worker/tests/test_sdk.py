@@ -226,6 +226,9 @@ from agentbox_worker import Result, TaskContext, Timing, WorkerFailure, run_work
 from agentbox_worker.runtime import MAX_ERROR_MESSAGE_BYTES, SHUTDOWN_TIMEOUT_ENV, _shutdown_timeout
 
 FAST = Timing(ack_timeout=0.05, max_ack_attempts=3, retry_backoff=0.01, artifact_timeout=0.5)
+NESTED_5000: object = 0  # 超过 Python 递归上限，json.dumps 无法序列化
+for _ in range(5000):
+    NESTED_5000 = [NESTED_5000]
 INIT = {
     "type": "init",
     "bootstrap": 1,
@@ -543,6 +546,7 @@ def test_reply_to_last_query_is_awaited(tmp_path):
     [
         pytest.param("x" * (256 << 10), "state_too_large", id="oversized"),
         pytest.param({"x": object()}, "invalid_field", id="unserializable"),
+        pytest.param(NESTED_5000, "invalid_field", id="too_deep_to_serialize"),
     ],
 )
 def test_bad_state_fails_without_sending(tmp_path, state, code):

@@ -110,7 +110,7 @@ def _snapshot(state: Any) -> Any:
     """
     try:
         return json.loads(json.dumps(state, ensure_ascii=False, allow_nan=False))
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise WorkerFailure("invalid_field", f"checkpoint state 无法序列化为 JSON：{exc}") from exc
 
 
