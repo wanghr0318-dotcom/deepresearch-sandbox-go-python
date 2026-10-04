@@ -1936,6 +1936,9 @@ REF = "a" * 64
 NESTED_70: object = 0
 for _ in range(70):
     NESTED_70 = [NESTED_70]
+NESTED_5000: object = 0
+for _ in range(5000):
+    NESTED_5000 = [NESTED_5000]
 
 
 def checkpoint_line(state_json: str, refs: list[str]) -> bytes:
@@ -2062,6 +2065,19 @@ def test_decode_limits(direction, line, code):
             {"type": "progress", "v": 1, "seq": 1, "kind": "x", "message": "y", "data": NESTED_70},
             "invalid_field",
             id="nesting_too_deep",
+        ),
+        pytest.param(
+            WORKER,
+            {
+                "type": "progress",
+                "v": 1,
+                "seq": 1,
+                "kind": "x",
+                "message": "y",
+                "data": NESTED_5000,
+            },
+            "invalid_field",
+            id="too_deep_to_serialize",
         ),
     ],
 )
@@ -2636,7 +2652,7 @@ def encode_line(direction: str, msg: dict[str, Any]) -> bytes:
     validator(msg)
     try:
         text = json.dumps(msg, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    except ValueError as exc:  # NaN、Infinity 不是合法 JSON
+    except (ValueError, RecursionError) as exc:  # NaN、Infinity 不是合法 JSON；嵌套过深无法序列化
         raise ProtocolError("invalid_field", f"消息含有 JSON 不支持的数值：{exc}") from exc
     try:
         line = text.encode("utf-8")
@@ -3800,6 +3816,9 @@ from agentbox_worker import Result, TaskContext, Timing, WorkerFailure, run_work
 from agentbox_worker.runtime import MAX_ERROR_MESSAGE_BYTES, SHUTDOWN_TIMEOUT_ENV, _shutdown_timeout
 
 FAST = Timing(ack_timeout=0.05, max_ack_attempts=3, retry_backoff=0.01, artifact_timeout=0.5)
+NESTED_5000: object = 0  # 超过 Python 递归上限，json.dumps 无法序列化
+for _ in range(5000):
+    NESTED_5000 = [NESTED_5000]
 INIT = {
     "type": "init",
     "bootstrap": 1,
@@ -4117,6 +4136,7 @@ def test_reply_to_last_query_is_awaited(tmp_path):
     [
         pytest.param("x" * (256 << 10), "state_too_large", id="oversized"),
         pytest.param({"x": object()}, "invalid_field", id="unserializable"),
+        pytest.param(NESTED_5000, "invalid_field", id="too_deep_to_serialize"),
     ],
 )
 def test_bad_state_fails_without_sending(tmp_path, state, code):
@@ -4329,7 +4349,7 @@ def _snapshot(state: Any) -> Any:
     """
     try:
         return json.loads(json.dumps(state, ensure_ascii=False, allow_nan=False))
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise WorkerFailure("invalid_field", f"checkpoint state 无法序列化为 JSON：{exc}") from exc
 
 
@@ -5497,7 +5517,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Create: `internal/protocol/syntax.go`
 - Modify: `internal/protocol/limits.go`、`internal/protocol/codec.go`、`internal/protocol/messages.go`、`internal/protocol/validate.go`、`internal/protocol/protocol_test.go`
 - Modify: `protocol/fixtures/v1/messages.json`（新增 5 条合法、27 条非法的 `raw` 边界用例）、`protocol/v1/task.schema.json`、`protocol/v1/control.schema.json`、`protocol/v1/event.schema.json`、`protocol/README.md`
-- Modify: `worker/agentbox_worker/protocol.py`、`worker/agentbox_worker/runtime.py`、`worker/tests/test_protocol.py`
+- Modify: `worker/agentbox_worker/protocol.py`、`worker/agentbox_worker/runtime.py`、`worker/tests/test_protocol.py`、`worker/tests/test_sdk.py`（编码与快照对嵌套过深的 RecursionError 映射为 invalid_field）
 
 **Interfaces:**
 - Consumes: Task 1–8 的全部实现。
@@ -6103,7 +6123,7 @@ index 53c1a20..2308382 100644
      "config_version": {"type": "string"},
      "input_refs": {"type": "array", "items": {"$ref": "#/$defs/sha256"}},
 diff --git a/worker/agentbox_worker/protocol.py b/worker/agentbox_worker/protocol.py
-index 9e02394..cc6e49c 100644
+index 9e02394..ac126b5 100644
 --- a/worker/agentbox_worker/protocol.py
 +++ b/worker/agentbox_worker/protocol.py
 @@ -2,13 +2,15 @@
@@ -6303,7 +6323,14 @@ index 9e02394..cc6e49c 100644
      _check_types(typ, msg)
      validator(msg)
      return msg
-@@ -431,5 +546,9 @@ def encode_line(direction: str, msg: dict[str, Any]) -> bytes:
+@@ -425,11 +540,15 @@ def encode_line(direction: str, msg: dict[str, Any]) -> bytes:
+     validator(msg)
+     try:
+         text = json.dumps(msg, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+-    except ValueError as exc:  # NaN、Infinity 不是合法 JSON
++    except (ValueError, RecursionError) as exc:  # NaN、Infinity 不是合法 JSON；嵌套过深无法序列化
+         raise ProtocolError("invalid_field", f"消息含有 JSON 不支持的数值：{exc}") from exc
+     try:
          line = text.encode("utf-8")
      except UnicodeEncodeError as exc:  # 字符串中含孤立代理项
          raise ProtocolError("invalid_field", "消息含有孤立代理项，无法编码为 UTF-8") from exc
@@ -6314,7 +6341,7 @@ index 9e02394..cc6e49c 100644
      _check_size(direction, typ, len(line))
      return line
 diff --git a/worker/agentbox_worker/runtime.py b/worker/agentbox_worker/runtime.py
-index dab7d03..7aae823 100644
+index dab7d03..e45e9cb 100644
 --- a/worker/agentbox_worker/runtime.py
 +++ b/worker/agentbox_worker/runtime.py
 @@ -31,6 +31,7 @@ from agentbox_worker.protocol import (
@@ -6325,6 +6352,15 @@ index dab7d03..7aae823 100644
      valid_artifact_path,
  )
  from agentbox_worker.transport import StdioTransport, Transport
+@@ -109,7 +110,7 @@ def _snapshot(state: Any) -> Any:
+     """
+     try:
+         return json.loads(json.dumps(state, ensure_ascii=False, allow_nan=False))
+-    except (TypeError, ValueError) as exc:
++    except (TypeError, ValueError, RecursionError) as exc:
+         raise WorkerFailure("invalid_field", f"checkpoint state 无法序列化为 JSON：{exc}") from exc
+ 
+ 
 @@ -283,9 +284,9 @@ class TaskContext:
  
  def _supports_protocol(line: bytes) -> bool:
@@ -6339,7 +6375,7 @@ index dab7d03..7aae823 100644
      if not isinstance(envelope, dict) or envelope.get("type") != "init":
          return True
 diff --git a/worker/tests/test_protocol.py b/worker/tests/test_protocol.py
-index e0d43dd..0ce7754 100644
+index e0d43dd..d9f1041 100644
 --- a/worker/tests/test_protocol.py
 +++ b/worker/tests/test_protocol.py
 @@ -1,6 +1,7 @@
@@ -6350,18 +6386,21 @@ index e0d43dd..0ce7754 100644
  
  import pytest
  from protocol_fixtures import line_bytes, load_messages, load_scenarios
-@@ -60,6 +61,10 @@ def test_scenario_stream(scenario):
+@@ -60,6 +61,13 @@ def test_scenario_stream(scenario):
  
  REF = "a" * 64
  
 +NESTED_70: object = 0
 +for _ in range(70):
 +    NESTED_70 = [NESTED_70]
++NESTED_5000: object = 0
++for _ in range(5000):
++    NESTED_5000 = [NESTED_5000]
 +
  
  def checkpoint_line(state_json: str, refs: list[str]) -> bytes:
      head = '{"type":"checkpoint","v":1,"seq":1,"checkpoint_id":"cp-1","scope":"task","step_id":"s1"'
-@@ -130,24 +135,9 @@ LIMIT_CASES = [
+@@ -130,24 +138,9 @@ LIMIT_CASES = [
          "malformed_json",
          id="invalid_utf8",
      ),
@@ -6386,7 +6425,7 @@ index e0d43dd..0ce7754 100644
  ]
  
  
-@@ -189,6 +179,18 @@ def test_decode_limits(direction, line, code):
+@@ -189,6 +182,31 @@ def test_decode_limits(direction, line, code):
              "invalid_field",
              id="lone_surrogate",
          ),
@@ -6402,10 +6441,23 @@ index e0d43dd..0ce7754 100644
 +            "invalid_field",
 +            id="nesting_too_deep",
 +        ),
++        pytest.param(
++            WORKER,
++            {
++                "type": "progress",
++                "v": 1,
++                "seq": 1,
++                "kind": "x",
++                "message": "y",
++                "data": NESTED_5000,
++            },
++            "invalid_field",
++            id="too_deep_to_serialize",
++        ),
      ],
  )
  def test_encode_rejects(direction, message, code):
-@@ -197,6 +199,16 @@ def test_encode_rejects(direction, message, code):
+@@ -197,6 +215,16 @@ def test_encode_rejects(direction, message, code):
      assert exc.value.code == code
  
  
@@ -6422,7 +6474,7 @@ index e0d43dd..0ce7754 100644
  # ---- JSON Schema：与 fixtures 一致 ----
  
  from typing import Any
-@@ -227,7 +239,8 @@ def test_schemas_are_valid_draft_2020_12():
+@@ -227,7 +255,8 @@ def test_schemas_are_valid_draft_2020_12():
  
  
  def valid_items() -> list[tuple[str, str, dict[str, Any]]]:
@@ -6432,6 +6484,28 @@ index e0d43dd..0ce7754 100644
      for scenario in SCENARIOS:
          bad = scenario["expect"].get("at")
          for index, line in enumerate(scenario["lines"]):
+diff --git a/worker/tests/test_sdk.py b/worker/tests/test_sdk.py
+index 50c9004..676049d 100644
+--- a/worker/tests/test_sdk.py
++++ b/worker/tests/test_sdk.py
+@@ -226,6 +226,9 @@ from agentbox_worker import Result, TaskContext, Timing, WorkerFailure, run_work
+ from agentbox_worker.runtime import MAX_ERROR_MESSAGE_BYTES, SHUTDOWN_TIMEOUT_ENV, _shutdown_timeout
+ 
+ FAST = Timing(ack_timeout=0.05, max_ack_attempts=3, retry_backoff=0.01, artifact_timeout=0.5)
++NESTED_5000: object = 0  # 超过 Python 递归上限，json.dumps 无法序列化
++for _ in range(5000):
++    NESTED_5000 = [NESTED_5000]
+ INIT = {
+     "type": "init",
+     "bootstrap": 1,
+@@ -543,6 +546,7 @@ def test_reply_to_last_query_is_awaited(tmp_path):
+     [
+         pytest.param("x" * (256 << 10), "state_too_large", id="oversized"),
+         pytest.param({"x": object()}, "invalid_field", id="unserializable"),
++        pytest.param(NESTED_5000, "invalid_field", id="too_deep_to_serialize"),
+     ],
+ )
+ def test_bad_state_fails_without_sending(tmp_path, state, code):
 ```
 
 - [ ] **Step 4：运行全部验证**
@@ -6445,12 +6519,12 @@ cd F:\go-agentbox-m1-3\worker; uv sync --locked; uv run ruff check .; uv run ruf
 $env:UV_PROJECT_ENVIRONMENT=".venv311"; uv run --python 3.11 pytest -q --basetemp=.pytest-tmp; Remove-Item Env:UV_PROJECT_ENVIRONMENT
 ```
 
-Expected: gofmt 无输出、vet 通过、Go 测试 `ok`、场景计数 22；Python ruff 与契约检查通过，pytest 在 3.13 与 3.11 上各 332 项通过。另在 Linux（WSL）上用同一批 fixtures 逐条比对 Python 的判定（任何解释器版本都必须与 Go 一致），并运行 `test_sdk.py`、`test_process.py`。
+Expected: gofmt 无输出、vet 通过、Go 测试 `ok`、场景计数 22；Python ruff 与契约检查通过，pytest 在 3.13 与 3.11 上各 334 项通过。另在 Linux（WSL）上用同一批 fixtures 逐条比对 Python 的判定（任何解释器版本都必须与 Go 一致），并运行 `test_sdk.py`、`test_process.py`。
 
 - [ ] **Step 5：提交**
 
 ```bash
-cd /f/go-agentbox-m1-3 && git add internal/protocol protocol worker/agentbox_worker/protocol.py worker/agentbox_worker/runtime.py worker/tests/test_protocol.py && git commit -m "feat(protocol): 收紧协议契约——JSON 结构限制、版本前置、键名区分大小写、整数词法与范围
+cd /f/go-agentbox-m1-3 && git add internal/protocol protocol worker/agentbox_worker/protocol.py worker/agentbox_worker/runtime.py worker/tests/test_protocol.py worker/tests/test_sdk.py && git commit -m "feat(protocol): 收紧协议契约——JSON 结构限制、版本前置、键名区分大小写、整数词法与范围
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -6501,5 +6575,5 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - **本地联合验收**：Go（WSL）gofmt、`go vet ./...` 通过，`internal/protocol` 测试通过，22 个场景通过；Python（Windows）`uv sync --locked`、ruff、格式、import-linter 通过，pytest 在 3.13 与 3.11 上各 299 项通过；Linux（WSL，Python 3.14）SDK 与真实进程测试 56 项连续三次通过；范围核对 53 个文件均在本计划 Files 之内。
 - **未完成的验收项**：第 4 项 CI（Linux 3.11/3.13 与 golangci-lint）需要推送后才能执行。
 - **终审 I1 已关闭（Task 9）**：协议契约收紧为统一规则（规格 §5.10 的 JSON 结构限制、版本前置、键名区分大小写、整数词法与范围），32 条 raw fixtures 固定边界；Task 9 经 Opus 评审两轮（首轮发现正则回溯与孤立代理项重复键两处 Important，均已修正并附回归用例），最终 138 条探针两侧 0 处不一致。提交：`38bc254`、`0753a9f`；计划修正：`90ad395`、`bd3edb2`。
-- **Task 9 遗留 Minor**：嵌套约 1000 层以上的 `data`/`state` 在 `encode_line` 与 `runtime._snapshot` 中抛出未捕获的 `RecursionError`，应与其他编码违规一样为 `invalid_field`（两处 `except` 加 `RecursionError`）；评审判定可后续处理。
+- **Task 9 遗留 Minor 已修正**：嵌套过深无法序列化的 `data`/`state` 在 `encode_line` 与 `runtime._snapshot` 中映射为 `invalid_field`（原先抛出未捕获的 `RecursionError`），附两条回归用例。
 - **遗留 Minor**（终审分诊为可延后）：见执行进度中的 [T1]–[T8] 条目；其中线程异常捕获面、`send()` 在 `close()` 后等待、Waiters 同键覆盖、`Outbox` 未用 `StreamChecker` 守住终态后的发送等，建议在 Plan 5 接入宿主时一并处理。
