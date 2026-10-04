@@ -38,6 +38,8 @@ type Store interface {
 	ListCleanupCandidates(ctx context.Context, now time.Time, limit int) ([]Environment, error)
 	// RecordQuarantine 记录一个隔离资源（规格 §14.1 扫描表）；按路径幂等。
 	RecordQuarantine(ctx context.Context, q Quarantine) error
+	// MarkQuarantineAlerted 记录隔离资源已报警（规格 §16.3 I8）；M1 的报警为结构化错误日志，发出后调用。
+	MarkQuarantineAlerted(ctx context.Context, path string) error
 }
 
 // Quarantine 是一个归属不明或冲突的资源：不自动销毁，报警并计入占用。

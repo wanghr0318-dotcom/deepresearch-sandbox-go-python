@@ -318,6 +318,13 @@ func (s *memStore) RecordQuarantine(_ context.Context, q Quarantine) error {
 	return nil
 }
 
+func (s *memStore) MarkQuarantineAlerted(_ context.Context, path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rec.add("MarkQuarantineAlerted")
+	return nil
+}
+
 // tprov 包装 fake provider：记录调用与结果，并提供 Create 的阻塞钩子与 Destroy 的故障注入。
 type tprov struct {
 	*fake.Provider
