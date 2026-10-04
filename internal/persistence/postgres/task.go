@@ -58,6 +58,13 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
+		var envTaken bool // 否则 INSERT 的 23505 会被当作可重试错误一直重试到期限
+		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM environments WHERE env_id = $1)", a.EnvID).Scan(&envTaken); err != nil {
+			return err
+		}
+		if envTaken {
+			return conflictf("环境 %s 已存在", a.EnvID)
+		}
 		if err := admitAttempt(ctx, tx, a.TaskID, status, desired); err != nil {
 			return err
 		}
@@ -132,8 +139,42 @@ func selectAttempt(ctx context.Context, q queryer, attemptID string, forUpdate b
 	return a, err
 }
 
-// ApplyControl 以 applied_control_version 的 CAS 应用控制意图（实现 task.Store）：
-// 已应用到不低于目标的版本时返回当前状态；目标版本尚未被接受为冲突。
+// controlTransition 是规格 §8.1 中控制意图引起的任务状态转换：cancel 使 queued、paused 直接
+// cancelled，使执行中的任务进入 cancelling；pause 使 queued 进入 paused，使执行中的任务进入
+// pausing；run（resume）使 paused 回到 queued。其余组合不是合法转换。
+func controlTransition(status, desired string) (next string, ok bool) {
+	switch desired {
+	case "cancel":
+		switch status {
+		case "queued", "paused":
+			return "cancelled", true
+		case "running", "pausing", "cancelling":
+			return "cancelling", true
+		}
+	case "pause":
+		switch status {
+		case "queued":
+			return "paused", true
+		case "running", "pausing":
+			return "pausing", true
+		case "paused":
+			return "paused", true
+		}
+	case "run":
+		switch status {
+		case "paused", "queued":
+			return "queued", true
+		case "running":
+			return "running", true
+		}
+	}
+	return "", false
+}
+
+// ApplyControl 以 applied_control_version 的 CAS 应用控制意图（实现 task.Store）。持有任务锁后
+// 依次核对：已应用到不低于目标的版本时返回当前状态（重放）；目标版本尚未被接受为冲突；目标版本
+// 已被更新的控制取代为 control_changed（调用方应用最新版本）；终态任务为 task_ended；调用方给出的
+// 状态必须是 controlTransition 对当前状态与 desired 的结果。写入以来源状态 CAS（规格 §8.1）。
 // 锁顺序：tasks → task_control → task_event_seq。
 func (s *Store) ApplyControl(ctx context.Context, c task.ApplyControl) (task.ControlState, error) {
 	if c.TaskID == "" || c.ControlVersion < 1 || c.Status == "" {
@@ -145,16 +186,27 @@ func (s *Store) ApplyControl(ctx context.Context, c task.ApplyControl) (task.Con
 		if err != nil {
 			return err
 		}
-		if st.AppliedControlVersion >= c.ControlVersion {
+		switch {
+		case st.AppliedControlVersion >= c.ControlVersion:
 			out = st
 			return nil
-		}
-		if c.ControlVersion > st.ControlVersion {
+		case c.ControlVersion > st.ControlVersion:
 			return conflictf("任务 %s 的控制版本 %d 尚未被接受（当前 %d）", c.TaskID, c.ControlVersion, st.ControlVersion)
+		case c.ControlVersion < st.ControlVersion:
+			return rejectf(persistence.CodeControlChanged, "任务 %s 的控制版本 %d 已被 %d 取代", c.TaskID, c.ControlVersion, st.ControlVersion)
+		case st.Status == "succeeded" || st.Status == "failed" || st.Status == "cancelled":
+			return rejectf(persistence.CodeTaskEnded, "任务 %s 已是 %s", c.TaskID, st.Status)
 		}
-		if _, err := tx.Exec(ctx, `UPDATE tasks SET applied_control_version = $2, status = $3, status_reason = $4,
-			row_version = row_version + 1 WHERE task_id = $1`, c.TaskID, c.ControlVersion, c.Status, c.StatusReason); err != nil {
+		if next, ok := controlTransition(st.Status, st.Desired); !ok || c.Status != next {
+			return invalidf("任务 %s 处于 %s、desired = %s 时不能转换为 %s", c.TaskID, st.Status, st.Desired, c.Status)
+		}
+		tag, err := tx.Exec(ctx, `UPDATE tasks SET applied_control_version = $2, status = $3, status_reason = $4,
+			row_version = row_version + 1 WHERE task_id = $1 AND status = $5`, c.TaskID, c.ControlVersion, c.Status, c.StatusReason, st.Status)
+		if err != nil {
 			return err
+		}
+		if tag.RowsAffected() != 1 { // 持有任务行锁时不会发生；保留 CAS 作为最后一道检查
+			return conflictf("任务 %s 已不在 %s", c.TaskID, st.Status)
 		}
 		if err := lockEventSeq(ctx, tx, c.TaskID); err != nil {
 			return err
@@ -228,8 +280,9 @@ func verdictHash(v task.Verdict) ([]byte, error) {
 
 // FinalizeAttempt 提交判决、任务状态与终态 host 事件（实现 task.Store）。完整判决内容一致
 // 才返回原结果；已有不同判决为冲突。新判决在持有任务锁后核对最新事实（规格 §8.1）：
-// 提交者必须仍是当前 attempt（stale_attempt）；判决依据的控制版本必须是最新（control_changed，
-// 调用方按最新控制重算）；任务状态必须与 desired 相符；attempt 必须处于 FromStatus。
+// 提交者必须仍是当前 attempt，且任务仍处于 running、pausing 或 cancelling（stale_attempt）；
+// 判决依据的控制版本必须是最新（control_changed，调用方按最新控制重算）；任务状态必须与 desired
+// 相符；attempt 必须处于 FromStatus。判决同时把 applied_control_version 推进到该控制版本。
 // 锁顺序：tasks → task_control → task_event_seq → attempts。
 func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attempt, error) {
 	if v.AttemptID == "" || v.TaskID == "" || v.ControlVersion < 1 || v.FromStatus == "" || v.AttemptStatus == "" ||
@@ -243,7 +296,8 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 	var out task.Attempt
 	err = s.run(ctx, "FinalizeAttempt", v.AttemptID, func(ctx context.Context, tx pgx.Tx) error {
 		var current *string
-		err := tx.QueryRow(ctx, "SELECT current_attempt_id FROM tasks WHERE task_id = $1 FOR UPDATE", v.TaskID).Scan(&current)
+		var status string
+		err := tx.QueryRow(ctx, "SELECT current_attempt_id, status FROM tasks WHERE task_id = $1 FOR UPDATE", v.TaskID).Scan(&current, &status)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return notFoundf("任务 %s", v.TaskID)
 		}
@@ -276,6 +330,8 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 			return conflictf("attempt %s 已有不同的判决", v.AttemptID)
 		case current == nil || *current != v.AttemptID:
 			return rejectf(persistence.CodeStaleAttempt, "attempt %s 不是任务 %s 的当前 attempt", v.AttemptID, v.TaskID)
+		case status != "running" && status != "pausing" && status != "cancelling":
+			return rejectf(persistence.CodeStaleAttempt, "任务 %s 处于 %s，不接受判决", v.TaskID, status)
 		case controlVersion != v.ControlVersion:
 			return rejectf(persistence.CodeControlChanged, "判决依据控制版本 %d，当前为 %d（desired = %s）",
 				v.ControlVersion, controlVersion, desired)
@@ -289,8 +345,10 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 			v.AttemptID, v.AttemptStatus, v.OutcomeClass, v.ExitCode, v.ExitSignal, v.OOMKillDelta, v.PlatformKilled, hash); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE tasks SET status = $2, status_reason = $3, result_json = $4, row_version = row_version + 1
-			WHERE task_id = $1`, v.TaskID, v.TaskStatus, v.TaskStatusReason, nullJSON(v.Result)); err != nil {
+		// 判决已按 controlVersion 裁决，一并推进 applied_control_version，actor 不再对已裁决的任务应用控制。
+		if _, err := tx.Exec(ctx, `UPDATE tasks SET status = $2, status_reason = $3, result_json = $4,
+			applied_control_version = GREATEST(applied_control_version, $5), row_version = row_version + 1
+			WHERE task_id = $1`, v.TaskID, v.TaskStatus, v.TaskStatusReason, nullJSON(v.Result), controlVersion); err != nil {
 			return err
 		}
 		if _, err := appendHostEvent(ctx, tx, hostEvent{taskID: v.TaskID, key: "attempt_finalized:" + v.AttemptID,

@@ -64,6 +64,13 @@ func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest) (api.
 			res.Replayed = true
 			return json.Unmarshal(stored, &res)
 		}
+		var exists bool // 否则 INSERT 的 23505 会被当作可重试错误一直重试到期限
+		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM tasks WHERE task_id = $1)", req.TaskID).Scan(&exists); err != nil {
+			return err
+		}
+		if exists {
+			return conflictf("任务 %s 已存在", req.TaskID)
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO tasks (task_id, spec_json, config_version, limits_json, status, max_fault_retries)
 			VALUES ($1, $2, $3, $4, 'queued', $5)`,
 			req.TaskID, []byte(req.Spec), req.ConfigVersion, nullJSON(req.Limits), req.MaxFaultRetries); err != nil {
@@ -108,8 +115,14 @@ func (s *Store) AcceptControl(ctx context.Context, req api.ControlRequest) (api.
 			return err
 		}
 		if replayed {
+			if err := json.Unmarshal(stored, &res); err != nil {
+				return err
+			}
+			if res.TaskID != req.TaskID { // body_hash 不含 task_id 时，同一 request_id 可能被另一个任务重用
+				return conflictf("request_conflict: request_id %s 已用于任务 %s", req.RequestID, res.TaskID)
+			}
 			res.Replayed = true
-			return json.Unmarshal(stored, &res)
+			return nil
 		}
 		var status, desired string
 		err = tx.QueryRow(ctx, "SELECT status FROM tasks WHERE task_id = $1 FOR UPDATE", req.TaskID).Scan(&status)

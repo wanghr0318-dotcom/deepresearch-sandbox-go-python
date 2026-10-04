@@ -680,10 +680,16 @@ func snapshot(t *testing.T, s *Store, taskID string) string {
 	t.Helper()
 	var out string
 	if err := s.pool.QueryRow(context.Background(), `SELECT concat_ws('|', t.status, t.current_attempt_id, t.row_version,
-			c.desired, c.control_version, p.latest_checkpoint_id, p.latest_commit_seq,
+			t.applied_control_version, t.status_reason, c.desired, c.control_version, c.reason,
+			p.latest_checkpoint_id, p.latest_commit_seq,
 			(SELECT count(*) FROM events e WHERE e.task_id = t.task_id),
 			(SELECT count(*) FROM attempts a WHERE a.task_id = t.task_id),
 			(SELECT count(*) FROM attempts a WHERE a.task_id = t.task_id AND a.verdict_hash IS NOT NULL),
+			(SELECT string_agg(concat_ws(':', a.attempt_id, a.status, a.outcome_class), ',' ORDER BY a.attempt_no)
+				FROM attempts a WHERE a.task_id = t.task_id),
+			(SELECT string_agg(x.state, ',' ORDER BY x.attempt_id) FROM attempt_access x WHERE x.task_id = t.task_id),
+			(SELECT count(*) FROM environments v JOIN attempts a USING (attempt_id) WHERE a.task_id = t.task_id),
+			(SELECT count(*) FROM api_requests q WHERE q.resource_id = t.task_id),
 			(SELECT count(*) FROM artifacts r WHERE r.task_id = t.task_id))
 		FROM tasks t JOIN task_control c USING (task_id) JOIN task_progress p USING (task_id) WHERE t.task_id = $1`, taskID).Scan(&out); err != nil {
 		t.Fatal(err)
@@ -808,24 +814,219 @@ func TestFinalizeArbitratesControl(t *testing.T) {
 			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
 		}
 	})
+	t.Run("任务已回到 queued 而尚无新 attempt，判决被拒绝", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		// 恢复已把任务交还队列，current_attempt_id 仍是 att-t1：判决不能把 queued 的任务裁决为终态。
+		if _, err := s.pool.Exec(ctx, "UPDATE tasks SET status = 'queued' WHERE task_id = 't1'"); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, s, "t1")
+		_, err := s.FinalizeAttempt(ctx, succeeded(1))
+		expectRejected(t, err, persistence.CodeStaleAttempt)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+	})
 }
 
-// TestControlWriteRules 覆盖规格 §8.1 控制写入：已接受的 cancel 不可被覆盖；resume 要求 paused。
+// TestControlWriteRules 覆盖规格 §8.1 控制写入：已接受的 cancel 不可被覆盖；resume 要求 paused；
+// 被拒绝的请求不留下任何改变与请求记录；request_id 不能被另一个任务重用。
 func TestControlWriteRules(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t, Options{})
 	fixture(t, s, "t1")
-	control := func(id, desired string) error {
-		_, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: id, BodyHash: []byte(desired), TaskID: "t1", Desired: desired})
+	fixture(t, s, "t2")
+	control := func(id, taskID, desired string) error {
+		_, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: id, BodyHash: []byte(desired), TaskID: taskID, Desired: desired})
 		return err
 	}
-	expectRejected(t, control("c1", "run"), persistence.CodeNotPaused)
-	if err := control("c2", "cancel"); err != nil {
+	rejected := func(id, taskID, desired, code string) {
+		t.Helper()
+		before := snapshot(t, s, taskID)
+		expectRejected(t, control(id, taskID, desired), code)
+		if after := snapshot(t, s, taskID); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+		if _, err := s.GetRequest(ctx, id); !errors.Is(err, persistence.ErrNotFound) {
+			t.Fatalf("被拒绝的请求 %s 不应留下记录，得到 %v", id, err)
+		}
+	}
+	rejected("c1", "t1", "run", persistence.CodeNotPaused)
+	if err := control("c2", "t1", "cancel"); err != nil {
 		t.Fatal(err)
 	}
-	expectRejected(t, control("c3", "pause"), persistence.CodeCancelPending)
-	if err := control("c4", "cancel"); err != nil {
+	rejected("c3", "t1", "pause", persistence.CodeCancelPending)
+	if err := control("c4", "t1", "cancel"); err != nil {
 		t.Fatalf("重复 cancel 应被接受：%v", err)
+	}
+
+	// resume：经由用例到达 paused（接受 pause → pausing → 以当前控制版本裁决为 paused），再接受 run 并应用。
+	if err := control("p1", "t2", "pause"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ApplyControl(ctx, task.ApplyControl{TaskID: "t2", ControlVersion: 2, Status: "pausing"}); err != nil {
+		t.Fatalf("应用 pause：%v", err)
+	}
+	v := verdict("t2", 0)
+	v.ControlVersion, v.OutcomeClass, v.TaskStatus, v.TaskStatusReason = 2, "paused", "paused", ""
+	if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+		t.Fatalf("暂停判决：%v", err)
+	}
+	if err := control("p2", "t2", "run"); err != nil {
+		t.Fatalf("paused 的任务应能 resume：%v", err)
+	}
+	st, err := s.ApplyControl(ctx, task.ApplyControl{TaskID: "t2", ControlVersion: 3, Status: "queued"})
+	if err != nil || st.Status != "queued" || st.AppliedControlVersion != 3 {
+		t.Fatalf("应用 resume：%+v %v", st, err)
+	}
+	if got, _ := s.GetTask(ctx, "t2"); got.Status != "queued" || got.Desired != "run" {
+		t.Fatalf("resume 后任务应为 queued：%+v", got)
+	}
+
+	// 同一 request_id 与请求体用于另一个任务：冲突，而不是返回 t1 的结果。
+	before := snapshot(t, s, "t2")
+	if err := control("c2", "t2", "cancel"); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("跨任务重用 request_id 应为冲突，得到 %v", err)
+	}
+	if after := snapshot(t, s, "t2"); after != before {
+		t.Fatalf("冲突后任务不应改变：%s → %s", before, after)
+	}
+}
+
+// TestApplyControlTransitions 覆盖规格 §8.1 控制应用的来源状态：判决后迟到的应用是重放，
+// 被取代的版本为 control_changed，状态机不允许的转换为无效输入；被拒绝时任务不变。
+func TestApplyControlTransitions(t *testing.T) {
+	ctx := context.Background()
+	accept := func(t *testing.T, s *Store, id, desired string) int64 {
+		t.Helper()
+		r, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: id, BodyHash: []byte(desired), TaskID: "t1", Desired: desired})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.ControlVersion
+	}
+	apply := func(s *Store, cv int64, status string) (task.ControlState, error) {
+		return s.ApplyControl(ctx, task.ApplyControl{TaskID: "t1", ControlVersion: cv, Status: status})
+	}
+	t.Run("判决后迟到的应用是重放，终态保持", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		cv := accept(t, s, "c1", "cancel")
+		v := verdict("t1", 1)
+		v.ControlVersion, v.OutcomeClass, v.TaskStatus, v.TaskStatusReason = cv, "cancelled", "cancelled", ""
+		if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := s.GetTask(ctx, "t1"); got.AppliedControlVersion != 2 {
+			t.Fatalf("判决应推进 applied_control_version 到 2：%+v", got)
+		}
+		before := snapshot(t, s, "t1")
+		st, err := apply(s, cv, "cancelling")
+		if err != nil || st.Status != "cancelled" || st.AppliedControlVersion != 2 {
+			t.Fatalf("迟到的应用应返回当前状态：%+v %v", st, err)
+		}
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("重放不应改变任务：%s → %s", before, after)
+		}
+	})
+	t.Run("被取代的版本被拒绝，最新版本可应用", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		pause := accept(t, s, "c1", "pause")
+		cancel := accept(t, s, "c2", "cancel")
+		before := snapshot(t, s, "t1")
+		_, err := apply(s, pause, "pausing")
+		expectRejected(t, err, persistence.CodeControlChanged)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+		st, err := apply(s, cancel, "cancelling")
+		if err != nil || st.Status != "cancelling" || st.AppliedControlVersion != cancel {
+			t.Fatalf("最新版本应能应用：%+v %v", st, err)
+		}
+	})
+	t.Run("状态机不允许的转换是无效输入", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		cv := accept(t, s, "c1", "pause")
+		before := snapshot(t, s, "t1")
+		for _, status := range []string{"paused", "cancelling", "queued"} { // running + pause 只能到 pausing
+			if _, err := apply(s, cv, status); !errors.Is(err, errInvalid) {
+				t.Fatalf("running 在 desired = pause 时不能转换为 %s，得到 %v", status, err)
+			}
+		}
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+	})
+	t.Run("成功判决后按判决版本迟到的应用是重放", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		zero := int64(0)
+		v := verdict("t1", 0)
+		v.ExitCode, v.OutcomeClass, v.TaskStatus, v.TaskStatusReason = &zero, "succeeded", "succeeded", ""
+		if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, s, "t1")
+		st, err := apply(s, 1, "running")
+		if err != nil || st.Status != "succeeded" {
+			t.Fatalf("迟到的应用应返回 succeeded：%+v %v", st, err)
+		}
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("重放不应改变任务：%s → %s", before, after)
+		}
+	})
+	t.Run("终态而控制未应用时被拒绝为 task_ended", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		cv := accept(t, s, "c1", "cancel")
+		// 用例不会产生这种组合（判决会推进 applied_control_version）；直接写入以检查终态防线。
+		if _, err := s.pool.Exec(ctx, "UPDATE tasks SET status = 'cancelled' WHERE task_id = 't1'"); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, s, "t1")
+		_, err := apply(s, cv, "cancelling")
+		expectRejected(t, err, persistence.CodeTaskEnded)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+	})
+}
+
+// TestHostEventIdempotency 直接驱动 appendHostEvent：同一 event_key 同内容返回原 task_seq，
+// 内容不同为冲突；task_seq 从 1 起连续无空洞。
+func TestHostEventIdempotency(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	appendEvent := func(payload string) (int64, error) {
+		var seq int64
+		err := s.run(ctx, "AppendHostEvent", "t1/k1", func(ctx context.Context, tx pgx.Tx) error {
+			if err := lockEventSeq(ctx, tx, "t1"); err != nil {
+				return err
+			}
+			n, err := appendHostEvent(ctx, tx, hostEvent{taskID: "t1", key: "k1", typ: "probe", payload: []byte(payload)})
+			seq = n
+			return err
+		})
+		return seq, err
+	}
+	first, err := appendEvent(`{"n":1}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := appendEvent(`{"n":1}`)
+	if err != nil || again != first {
+		t.Fatalf("同一 event_key 同内容应返回原 task_seq %d，得到 %d %v", first, again, err)
+	}
+	if _, err := appendEvent(`{"n":2}`); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("同一 event_key 不同内容应为冲突，得到 %v", err)
+	}
+	if n, m := count(t, s, "SELECT count(*) FROM events WHERE task_id = 't1'"),
+		count(t, s, "SELECT COALESCE(max(task_seq), 0)::int FROM events WHERE task_id = 't1'"); n != m || n != 3 {
+		t.Fatalf("task_seq 应从 1 起连续：count = %d，max = %d", n, m)
 	}
 }
 
@@ -913,6 +1114,9 @@ func TestAPIAndTaskConflicts(t *testing.T) {
 	if _, err := s.FinalizeAttempt(ctx, verdict("t1", 1)); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.CreateTask(ctx, api.CreateTaskRequest{RequestID: "req-t3", BodyHash: []byte("h"), TaskID: "t3", Spec: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
 	expectConflicts(t, map[string]func() error{
 		"CreateTask 同 request_id 不同内容": func() error {
 			_, err := s.CreateTask(ctx, api.CreateTaskRequest{RequestID: "req-t1", BodyHash: []byte("other"), TaskID: "t9", Spec: json.RawMessage(`{}`)})
@@ -932,6 +1136,23 @@ func TestAPIAndTaskConflicts(t *testing.T) {
 		},
 		"ApplyControl 版本尚未被接受": func() error {
 			_, err := s.ApplyControl(ctx, task.ApplyControl{TaskID: "t1", ControlVersion: 9, Status: "x"})
+			return err
+		},
+		"CreateTask 已存在的 task_id（新 request_id）": func() error {
+			start := time.Now()
+			_, err := s.CreateTask(ctx, api.CreateTaskRequest{RequestID: "req-new", BodyHash: []byte("h"), TaskID: "t1", Spec: json.RawMessage(`{}`)})
+			if d := time.Since(start); d > 500*time.Millisecond { // 不应重试到 OpDeadline
+				return fmt.Errorf("冲突应立即返回，耗时 %v（%v）", d, err)
+			}
+			return err
+		},
+		"CreateAttempt 已存在的 env_id": func() error {
+			start := time.Now()
+			// t3 处于 queued，准入成立；只有 env_id 已被 t1 的环境占用
+			_, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: "t3", AttemptID: "att-t3", AttemptNo: 1, EnvID: "env-t1"})
+			if d := time.Since(start); d > 500*time.Millisecond {
+				return fmt.Errorf("冲突应立即返回，耗时 %v（%v）", d, err)
+			}
 			return err
 		},
 	})
