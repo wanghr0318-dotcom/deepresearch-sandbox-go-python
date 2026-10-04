@@ -263,7 +263,7 @@ components:
         application/octet-stream:
           schema: {type: string, format: binary}
     BadRequest:
-      description: '`invalid_request`: malformed body, missing request_id or invalid parameter'
+      description: '`invalid_request`: malformed body, missing request_id or invalid parameter; `invalid_limits` (POST /tasks): limits that can never fit the configured capacity'
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
