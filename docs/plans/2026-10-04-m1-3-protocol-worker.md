@@ -6568,12 +6568,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-## 验收记录（2026-10-04）——状态：本地实现完成，跨语言契约差异已由 Task 9 关闭；Linux CI 验收待关闭，计划尚未验收
+## 验收记录（2026-10-04）——状态：已验收（本地联合验收 + Linux CI 通过；未合并）
 
 - **分支**：`m1-3-protocol-worker`（worktree `F:\go-agentbox-m1-3`），起点 `ac3ac01`，终点 `3912b97`，共 15 个提交，仅本地。
 - **执行**：八个任务按六个批次由子 agent 实现；Task 4 与 Task 5 在独立 worktree 并行后依次合入。每个任务经规格符合性与代码质量评审（高风险任务由 Opus 评审），最后一次整分支评审（Opus）。评审发现的计划本身的问题均先修正计划、在演练目录验证后再改代码：`c78576b`、`db3d39a`、`7c42172`、`5395384`、`51efb2b`、`180cf1a`、`a2a123b`。
 - **本地联合验收**：Go（WSL）gofmt、`go vet ./...` 通过，`internal/protocol` 测试通过，22 个场景通过；Python（Windows）`uv sync --locked`、ruff、格式、import-linter 通过，pytest 在 3.13 与 3.11 上各 299 项通过；Linux（WSL，Python 3.14）SDK 与真实进程测试 56 项连续三次通过；范围核对 53 个文件均在本计划 Files 之内。
-- **未完成的验收项**：第 4 项 CI（Linux 3.11/3.13 与 golangci-lint）需要推送后才能执行。
+- **CI（Linux，判定依据）**：分支 `m1-3-protocol-worker`（`96e1e8a`）推送后开 Draft PR #9（base `m1-local-provider`，55 个文件，不含 docs）。`correctness`、`complexity-report`、`linux-integration`、`python (3.11)`、`python (3.13)` 全部实际执行并通过：Python 3.11.15 与 3.13.13 各 334 项通过（含 schema 与五个真实进程测试），import-linter 契约保持，`internal/protocol` 测试通过。合并由项目负责人决定。
 - **终审 I1 已关闭（Task 9）**：协议契约收紧为统一规则（规格 §5.10 的 JSON 结构限制、版本前置、键名区分大小写、整数词法与范围），32 条 raw fixtures 固定边界；Task 9 经 Opus 评审两轮（首轮发现正则回溯与孤立代理项重复键两处 Important，均已修正并附回归用例），最终 138 条探针两侧 0 处不一致。提交：`38bc254`、`0753a9f`；计划修正：`90ad395`、`bd3edb2`。
 - **Task 9 遗留 Minor 已修正**：嵌套过深无法序列化的 `data`/`state` 在 `encode_line` 与 `runtime._snapshot` 中映射为 `invalid_field`（原先抛出未捕获的 `RecursionError`），附两条回归用例。
 - **遗留 Minor**（终审分诊为可延后）：见执行进度中的 [T1]–[T8] 条目；其中线程异常捕获面、`send()` 在 `close()` 后等待、Waiters 同键覆盖、`Outbox` 未用 `StreamChecker` 守住终态后的发送等，建议在 Plan 5 接入宿主时一并处理。
