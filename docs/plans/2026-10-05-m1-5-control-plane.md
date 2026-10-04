@@ -57,7 +57,7 @@ type LatestCheckpoint struct { CheckpointID, StepID string; State json.RawMessag
 // 新增方法
 LoadTask(ctx, taskID string) (TaskState, error)
 ListActiveTasks(ctx) ([]string, error)                       // 非终态任务，供 actor 启动
-PersistRunTime(ctx, taskID, attemptID string, addMs int64) (int64, error) // 只累加当前 attempt；返回累计值
+PersistRunTime(ctx, taskID, attemptID string, totalMs int64) (int64, error) // 单调写入累计值（取较大者）；只接受当前 attempt；返回累计值
 RevokeAttemptAccess(ctx, attemptID, reason string) error     // attempt_access → revoked（幂等）
 
 // resource
@@ -66,7 +66,7 @@ RecordQuarantine(ctx, q Quarantine) error                  // 按 (layer, path) 
 type Quarantine struct { Layer, Path, ObservedOwner, Reason string }
 ```
 
-**规则：** `CreateAttempt` 的 `Retry` 只在新建时递增对应计数，重放不重复递增（身份优先）；`FinalizeAttempt` 在 `TaskStatus = queued` 时写 `not_before`，其他状态拒绝非空 `NotBefore`（`errInvalid`）；`LoadTask` 一次读取（单个只读查询或只读事务），`Latest` 读取 `task_progress.latest_checkpoint_id` 指向的完整 checkpoint；`PersistRunTime` 只在 `current_attempt_id = attemptID` 时累加，否则 `stale_attempt`。
+**规则：** `CreateAttempt` 的 `Retry` 只在新建时递增对应计数，重放不重复递增（身份优先）；`FinalizeAttempt` 在 `TaskStatus = queued` 时写 `not_before`，其他状态拒绝非空 `NotBefore`（`errInvalid`）；`LoadTask` 一次读取（单个只读查询或只读事务），`Latest` 读取 `task_progress.latest_checkpoint_id` 指向的完整 checkpoint；`PersistRunTime` 只在 `current_attempt_id = attemptID` 时写入 `GREATEST(run_time_ms, totalMs)`，否则 `stale_attempt`（执行中修订：原设计为累加增量，提交结果未知后的重跑会重复累计；改为由 actor 传入累计值并单调写入）。
 
 **Tests**（真实 PostgreSQL，追加在 `postgres_test.go` 末尾）：故障重试的 `CreateAttempt` 恰好递增一次（含提交结果未知后的重试）；`not_before` 写入与非 queued 时被拒；`LoadTask` 返回最新 checkpoint 的完整内容；`PersistRunTime` 拒绝旧 attempt；`RevokeAttemptAccess` 幂等且使 `CommitCheckpoint` 以 `stale_attempt` 拒绝；`ListCleanupCandidates` 只返回满足四个条件的环境；`RecordQuarantine` 幂等。
 
