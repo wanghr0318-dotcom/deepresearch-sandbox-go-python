@@ -81,20 +81,10 @@ func Spawn(cfg SpawnConfig) (*os.Process, error) {
 		Cloneflags: CloneFlags,
 		// 单独的进程组，便于在 init 尚未就绪时也能整组发信号。
 		Setpgid: true,
-		// 注意 PR_SET_PDEATHSIG 的真实语义是线程级的，不是进程级的：
-		// 内核会在“创建这个子进程的那个 OS 线程”终止时发信号，而不是
-		// 等宿主整个进程退出。Go 标准库文档原话是
-		// "the signal is sent on thread termination, which may happen
-		// before the process terminates"——两者并不等价，一条线程可以
-		// 先于进程整体退出而消失（比如被运行时回收）。
-		// cmd.Start() 内部的 fork/exec 跑在 Go runtime 当前调度到的
-		// 某个 OS 线程上；本调用路径下没有手工 LockOSThread 或提前
-		// 让该线程退出的逻辑，因此该线程的生命周期与宿主进程一致，
-		// Pdeathsig 在这里实践上等效于“父进程退出即 SIGKILL”。
-		// 这是当前调用方式下的经验事实，不是内核保证——后续任务如果
-		// 在 Spawn 附近引入并发（例如把 fork/exec 挪到某个可能提前
-		// 退出的 goroutine/线程上），这个等效关系就可能失效，届时
-		// 需要重新核实。
+		// Pdeathsig 只是尽力而为的兜底，不是可靠性依据：它是线程级的
+		// （信号在“创建子进程的那个 OS 线程”终止时发出，而非宿主进程退出时），
+		// 且该线程可能先于进程消失。宿主崩溃后的回收一律依赖 cgroup.kill
+		// 与启动时的孤儿对账（规格），不得假定 init 会随宿主死亡。
 		Pdeathsig: syscall.SIGKILL,
 	}
 	cmd.Stdout = os.Stderr // init 自身的日志并入宿主 stderr，便于排障

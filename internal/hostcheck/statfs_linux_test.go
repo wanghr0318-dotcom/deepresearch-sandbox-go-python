@@ -5,7 +5,6 @@ package hostcheck
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
@@ -60,28 +59,8 @@ func TestCheckCgroupV2_DefaultCgroupRoot(t *testing.T) {
 	}
 }
 
-// TestCheckOverlayFS 验证 checkOverlayFS 能从 /proc/filesystems 中读出内核是否
-// 提供 overlay 文件系统。现代 Linux 内核（包括 WSL2 默认内核）都编译了 overlay
-// 支持，因此这里断言为 true。
-func TestCheckOverlayFS(t *testing.T) {
-	// 独立读一遍 /proc/filesystems 做环境探测。这里用的是宽松的子串匹配，
-	// 与被测函数按行严格解析的方式不同——两者若不一致，正说明解析逻辑有问题，
-	// 断言因此是有意义的交叉验证。
-	raw, err := os.ReadFile("/proc/filesystems")
-	if err != nil {
-		t.Skipf("读不到 /proc/filesystems，跳过: %v", err)
-	}
-	if !strings.Contains(string(raw), "overlay") {
-		t.Skip("内核未提供 overlay 文件系统，跳过正例验证")
-	}
-
-	if !checkOverlayFS() {
-		t.Fatal("checkOverlayFS() = false，但 /proc/filesystems 中确有 overlay——解析逻辑有误")
-	}
-}
-
 // TestCheck_SuccessPath 验证 Check() 在所有条件都满足时的成功路径：
-// IsLinux/IsRoot/CgroupV2/OverlayFS 均为 true 且 Err() 为 nil。
+// IsLinux/IsRoot/CgroupV2 均为 true 且 Err() 为 nil。
 // 需要 root，非 root 环境下会被跳过。
 func TestCheck_SuccessPath(t *testing.T) {
 	testutil.RequireLinuxRoot(t)
@@ -98,8 +77,5 @@ func TestCheck_SuccessPath(t *testing.T) {
 	}
 	if !r.CgroupV2 {
 		t.Error("Report.CgroupV2 = false, want true")
-	}
-	if !r.OverlayFS {
-		t.Error("Report.OverlayFS = false, want true")
 	}
 }

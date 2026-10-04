@@ -1,62 +1,15 @@
 //go:build linux
 
-// Package rootfs 负责沙箱根文件系统的挂载。
+// Package rootfs 负责沙箱根文件系统的准备：模板落盘与 bind 挂载原语。
 //
-// 采用 overlayfs 分层：模板作为只读 lower 层被所有实例共享，
-// 每个实例只持有一个空的 upper 层。建箱因此不需要拷贝整个 rootfs，
-// 打快照也只需打包 upper 层。
+// 规格不再使用 overlayfs（代码组织 §9.2）；挂载方式的具体方案随 Plan 1B 确定，
+// 这里只保留与方案无关的 bind/unmount 原语。
 package rootfs
 
 import (
 	"fmt"
-	"os"
-	"strings"
 	"syscall"
 )
-
-// Overlay 描述一次 overlayfs 挂载所需的四个目录。
-type Overlay struct {
-	Lower  string // 只读底层，通常是模板 rootfs
-	Upper  string // 可写层，实例的全部改动落在这里
-	Work   string // overlayfs 内部工作目录，必须与 Upper 同一文件系统
-	Merged string // 挂载点，即沙箱看到的根
-}
-
-// validate 检查四个目录是否已存在、是否为目录，以及路径里是否混入了
-// overlayfs 挂载选项本身会用到的分隔符。
-func (o Overlay) validate() error {
-	for name, dir := range map[string]string{
-		"Lower": o.Lower, "Upper": o.Upper, "Work": o.Work, "Merged": o.Merged,
-	} {
-		if dir == "" {
-			return fmt.Errorf("Overlay.%s 为空", name)
-		}
-		if strings.ContainsAny(dir, ",:") {
-			// overlayfs 挂载选项用逗号分隔、冒号分隔多个 lowerdir，
-			// 路径里带这两个字符会把选项串解析坏。
-			return fmt.Errorf("Overlay.%s = %q 含有 overlayfs 选项分隔符（, 或 :）", name, dir)
-		}
-		if fi, err := os.Stat(dir); err != nil {
-			return fmt.Errorf("Overlay.%s = %q: %w", name, dir, err)
-		} else if !fi.IsDir() {
-			return fmt.Errorf("Overlay.%s = %q 不是目录", name, dir)
-		}
-	}
-	return nil
-}
-
-// Mount 执行 overlayfs 挂载。四个目录都必须已存在。
-// 把 Lower/Upper/Work 三层联合挂载到 Merged。
-func Mount(o Overlay) error {
-	if err := o.validate(); err != nil {
-		return err
-	}
-	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", o.Lower, o.Upper, o.Work)
-	if err := syscall.Mount("overlay", o.Merged, "overlay", 0, opts); err != nil {
-		return fmt.Errorf("挂载 overlay 到 %s (%s): %w", o.Merged, opts, err)
-	}
-	return nil
-}
 
 // BindMount 把 src 绑定挂载到 dst，递归包含其下的子挂载。
 func BindMount(src, dst string) error {

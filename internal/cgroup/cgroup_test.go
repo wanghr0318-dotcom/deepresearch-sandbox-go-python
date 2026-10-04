@@ -3,12 +3,15 @@
 package cgroup
 
 import (
+	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -26,6 +29,17 @@ const testRoot = "/sys/fs/cgroup/agentbox-test"
 // 【不】在此撤销——那是产品运行本身就需要的状态，撤销反而会让后续
 // 测试和真实沙箱都建不出限额。
 func TestMain(m *testing.M) {
+	// 内存压力辅助进程：等控制管道上的一行再分配并写满内存，
+	// 保证测试先把它移入 cgroup 再让它吃内存。
+	if os.Getenv("AGENTBOX_TEST_ALLOC") == "1" {
+		_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+		buf := make([]byte, 256<<20)
+		for i := range buf {
+			buf[i] = 1
+		}
+		time.Sleep(time.Second)
+		os.Exit(0)
+	}
 	code := m.Run()
 	// 清理失败必须发声。静默忽略的话，泄漏的 cgroup 会一直累积在宿主机上，
 	// 而测试始终显示全绿。
@@ -69,6 +83,169 @@ func TestGroupLifecycle(t *testing.T) {
 	assertFile(t, filepath.Join(g.Path(), "cpu.max"), "50000 100000")
 	assertFile(t, filepath.Join(g.Path(), "memory.max"), "67108864")
 	assertFile(t, filepath.Join(g.Path(), "pids.max"), "32")
+	// 规格 §4.5：禁止换出，否则 memory.max 会被 swap 悄悄放宽。
+	assertFile(t, filepath.Join(g.Path(), "memory.swap.max"), "0")
+
+	if _, err := g.CPUUsageUsec(); err != nil {
+		t.Fatalf("CPUUsageUsec: %v", err)
+	}
+}
+
+func TestExists(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+
+	g, err := New(testRoot, "exists")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cleanupGroup(t, g)
+
+	if ok, err := Exists(testRoot, "exists"); err != nil || !ok {
+		t.Fatalf("Exists(已建组) = %v, %v; want true, nil", ok, err)
+	}
+	if ok, err := Exists(testRoot, "no-such-group"); err != nil || ok {
+		t.Fatalf("Exists(不存在) = %v, %v; want false, nil", ok, err)
+	}
+	// 存在但不是 cgroup 的目录不算。
+	plain := filepath.Join(t.TempDir(), "plain")
+	if err := os.Mkdir(plain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := Exists(filepath.Dir(plain), "plain"); err != nil || ok {
+		t.Fatalf("Exists(普通目录) = %v, %v; want false, nil", ok, err)
+	}
+}
+
+// 双重 fork + setsid 的后代脱离了进程组与会话，只有 cgroup 能把它们一并杀掉。
+func TestKillTerminatesWholeSubtree(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+
+	g, err := New(testRoot, "kill-tree")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cleanupGroup(t, g)
+
+	// 先把 sh 移入 cgroup、再放行它 fork，避免后代在移入前就逃逸。
+	cmd := exec.Command("sh", "-c", `read x; (setsid sh -c 'setsid sleep 60 & sleep 60' &) ; sleep 60`)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("启动: %v", err)
+	}
+	t.Cleanup(func() { killAndReap(t, cmd) })
+	if err := g.AddProc(cmd.Process.Pid); err != nil {
+		t.Fatalf("AddProc: %v", err)
+	}
+	if _, err := stdin.Write([]byte("go\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		pids, err := g.Procs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pids) >= 5 { // sh、sleep、setsid sh、其 sleep、setsid sleep
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("后代未起齐，当前 %v", pids)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if ok, err := g.Populated(); err != nil || !ok {
+		t.Fatalf("Populated = %v, %v; want true", ok, err)
+	}
+
+	if err := g.Kill(); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	go func() { _ = cmd.Wait() }() // 收割直接子进程，否则僵尸仍使组非空
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := g.WaitEmpty(ctx); err != nil {
+		t.Fatalf("WaitEmpty: %v", err)
+	}
+	if ok, err := g.Populated(); err != nil || ok {
+		t.Fatalf("Kill 后 Populated = %v, %v; want false", ok, err)
+	}
+	if pids, _ := g.Procs(); len(pids) != 0 {
+		t.Fatalf("Kill 后仍有进程 %v", pids)
+	}
+}
+
+func TestWaitEmptyReturnsCtxError(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+
+	g, err := New(testRoot, "wait-ctx")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cleanupGroup(t, g)
+	cmd := startSleeper(t)
+	if err := g.AddProc(cmd.Process.Pid); err != nil {
+		t.Fatalf("AddProc: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := g.WaitEmpty(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitEmpty = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestOOMKillsCountsKilledProcess(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+
+	g, err := New(testRoot, "oom")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	cleanupGroup(t, g)
+	if err := g.Apply(Limits{MemoryMax: 32 << 20}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	before, err := g.OOMKills()
+	if err != nil {
+		t.Fatalf("OOMKills: %v", err)
+	}
+
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(self)
+	cmd.Env = append(os.Environ(), "AGENTBOX_TEST_ALLOC=1")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("启动: %v", err)
+	}
+	t.Cleanup(func() { killAndReap(t, cmd) })
+	if err := g.AddProc(cmd.Process.Pid); err != nil {
+		t.Fatalf("AddProc: %v", err)
+	}
+	if _, err := stdin.Write([]byte("go\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("超出 memory.max 的进程应被杀死")
+	}
+
+	after, err := g.OOMKills()
+	if err != nil {
+		t.Fatalf("OOMKills: %v", err)
+	}
+	if after <= before {
+		t.Fatalf("oom_kill 未增加: before=%d after=%d", before, after)
+	}
 }
 
 func TestAddProcAndProcs(t *testing.T) {
@@ -132,8 +309,8 @@ func TestDestroyFailsWhileProcsRemain(t *testing.T) {
 	if err := g.AddProc(cmd.Process.Pid); err != nil {
 		t.Fatalf("AddProc: %v", err)
 	}
-	if err := g.Destroy(); err == nil {
-		t.Fatal("cgroup 内仍有进程时 Destroy 应当失败")
+	if err := g.Destroy(); !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("cgroup 内仍有进程时 Destroy 应返回 EBUSY，实际 %v", err)
 	}
 
 	killAndReap(t, cmd)

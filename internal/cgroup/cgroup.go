@@ -8,12 +8,14 @@
 package cgroup
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Limits 是一个 cgroup 的资源限额。零值字段表示不设该项限制。
@@ -43,18 +45,7 @@ func New(root, name string) (*Group, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("创建 cgroup 根 %s: %w", root, err)
 	}
-	// 子组要能设 cpu/memory/pids，祖先组必须逐级在 subtree_control 里启用它们：
-	// /sys/fs/cgroup 启用后 root 才有这些文件，root 启用后子组才有。
-	// 已启用时重复写不报错，故这里容忍写入失败——真正的判据是下面文件是否出现。
-	// 写入失败原因可能是权限不足而非未委派。完全吞掉的话，下面的诊断
-	// 会一律说"控制器未委派"，把排查者引向错误方向，所以留作线索。
-	var delegateErrs []string
-	for _, dir := range []string{filepath.Dir(root), root} {
-		f := filepath.Join(dir, "cgroup.subtree_control")
-		if err := os.WriteFile(f, []byte("+cpu +memory +pids"), 0o644); err != nil {
-			delegateErrs = append(delegateErrs, fmt.Sprintf("%s: %v", f, err))
-		}
-	}
+	delegateErrs := ensureControllers(root)
 
 	path := filepath.Join(root, name)
 	if err := os.Mkdir(path, 0o755); err != nil && !os.IsExist(err) {
@@ -78,6 +69,48 @@ func New(root, name string) (*Group, error) {
 	return &Group{path: path}, nil
 }
 
+// ensureControllers 在 root 及其父级的 subtree_control 里启用 cpu/memory/pids，
+// 返回写入失败的线索（可能为空）。
+//
+// 子组要能设 cpu/memory/pids，祖先组必须逐级在 subtree_control 里启用它们：
+// /sys/fs/cgroup 启用后 root 才有这些文件，root 启用后子组才有。
+// 已启用时重复写不报错，故这里容忍写入失败——真正的判据是子组里限额文件是否出现。
+// 写入失败原因可能是权限不足而非未委派。完全吞掉的话，诊断
+// 会一律说"控制器未委派"，把排查者引向错误方向，所以留作线索。
+func ensureControllers(root string) []string {
+	var errs []string
+	for _, dir := range []string{filepath.Dir(root), root} {
+		f := filepath.Join(dir, "cgroup.subtree_control")
+		if err := os.WriteFile(f, []byte("+cpu +memory +pids"), 0o644); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", f, err))
+		}
+	}
+	return errs
+}
+
+// Exists 报告 root/name 是否存在且是一个 cgroup 目录。
+// 判据是目录里有 cgroup.procs——普通目录没有这个内核生成的文件。
+func Exists(root, name string) (bool, error) {
+	dir := filepath.Join(root, name)
+	fi, err := os.Stat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("检查 cgroup %s: %w", dir, err)
+	}
+	if !fi.IsDir() {
+		return false, nil
+	}
+	if _, err := os.Stat(filepath.Join(dir, "cgroup.procs")); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("检查 cgroup %s: %w", dir, err)
+	}
+	return true, nil
+}
+
 // Path 返回该 cgroup 在 sysfs 中的绝对路径。
 func (g *Group) Path() string { return g.path }
 
@@ -95,6 +128,12 @@ func (g *Group) Apply(l Limits) error {
 	}
 	if l.MemoryMax > 0 {
 		if err := g.write("memory.max", strconv.FormatInt(l.MemoryMax, 10)); err != nil {
+			return err
+		}
+	}
+	if l.MemoryMax > 0 {
+		// 规格 §4.5：禁止换出，否则 swap 会悄悄放宽 memory.max。
+		if err := g.write("memory.swap.max", "0"); err != nil {
 			return err
 		}
 	}
@@ -134,7 +173,69 @@ func (g *Group) Freeze() error { return g.write("cgroup.freeze", "1") }
 // Thaw 解冻组内全部进程。
 func (g *Group) Thaw() error { return g.write("cgroup.freeze", "0") }
 
-// Destroy 删除该 cgroup。组内仍有进程时内核会拒绝，调用方需先确认进程已清零。
+// Kill 写 cgroup.kill，向组内全部进程（含已 setsid、双重 fork 脱离的后代）
+// 发 SIGKILL，并阻止其在被杀期间继续 fork。需要内核 ≥ 5.14。
+// 它只发信号；进程是否已清零用 WaitEmpty / Populated 判断。
+func (g *Group) Kill() error { return g.write("cgroup.kill", "1") }
+
+// Populated 读 cgroup.events 的 populated：组内（含子孙组）是否还有进程。
+// 未收割的僵尸仍计入。
+func (g *Group) Populated() (bool, error) {
+	v, err := g.readKey("cgroup.events", "populated")
+	if err != nil {
+		return false, err
+	}
+	return v != 0, nil
+}
+
+// WaitEmpty 轮询等待组内进程清零；ctx 结束时返回 ctx 的错误。
+func (g *Group) WaitEmpty(ctx context.Context) error {
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		ok, err := g.Populated()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+	}
+}
+
+// OOMKills 返回 memory.events 的 oom_kill：组内因超出 memory.max 被杀的进程累计数。
+func (g *Group) OOMKills() (uint64, error) { return g.readKey("memory.events", "oom_kill") }
+
+// CPUUsageUsec 返回 cpu.stat 的 usage_usec：组累计消耗的 CPU 微秒数。
+func (g *Group) CPUUsageUsec() (uint64, error) { return g.readKey("cpu.stat", "usage_usec") }
+
+// readKey 读取 "key value" 行格式的 cgroup 文件中指定键的数值。
+func (g *Group) readKey(file, key string) (uint64, error) {
+	p := filepath.Join(g.path, file)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return 0, fmt.Errorf("读取 %s: %w", p, err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && f[0] == key {
+			v, err := strconv.ParseUint(f[1], 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("解析 %s 的 %s=%q: %w", p, key, f[1], err)
+			}
+			return v, nil
+		}
+	}
+	return 0, fmt.Errorf("%s 中没有 %s", p, key)
+}
+
+// Destroy 删除该 cgroup。只删除空组：组内仍有进程时内核返回 EBUSY，
+// 原样（可用 errors.Is 判断）返回给调用方，由其先 Kill 并 WaitEmpty。
 func (g *Group) Destroy() error {
 	if err := os.Remove(g.path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("删除 cgroup %s: %w", g.path, err)
