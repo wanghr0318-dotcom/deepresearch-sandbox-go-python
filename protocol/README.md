@@ -46,6 +46,8 @@
 
 依次检查：行长超过任何类型上限中的最大值（1 MiB）→ `message_too_large`，不解析；行不是严格的 UTF-8（含 BOM 前缀）、不是 JSON 对象或嵌套过深 → `malformed_json`；`type` 缺失、非字符串或不属于该方向 → `unknown_type`；超过该类型的上限 → `message_too_large`；字段类型错误 → `invalid_field`；然后是各类型的语义规则：`version_mismatch`、`missing_field`、`invalid_field`、`state_too_large`、`too_many_refs`、`path_invalid`。
 
+**两侧已知差异**（尚未统一，是否收紧由协议另行决定）：① 嵌套深度没有协议级上限——Go 在 10000 层报 `malformed_json`，Python 取决于解释器（3.11、3.13 在约 1000–2500 层报 `malformed_json`，3.14 起按 C 栈检查，数万层仍可解析；测试统一用 10 万层，各方都拒绝）；② 键名大小写——Go 按结构体字段不区分大小写匹配（含 Unicode 折叠），Python 只认精确键名；③ 重复键——Go 取后者但 `null` 不覆盖前值、前值的类型错误不被后者纠正，Python 取最后一个；④ 超过 4300 位的整数——Go 在整数字段报 `invalid_field`、在自由格式字段（`state`、`data`、`config`）接受，Python 一律报 `malformed_json`。合规的发送方（本 SDK 与宿主）不会产生这些输入。
+
 ## 事件流顺序（task 模式）
 
 `seq` 从 1 严格递增（`seq_invalid`）；`ready` 之前只允许 `error`，用于启动失败（`before_ready`）；`ready` 只能出现一次（`duplicate_ready`）；终态提议 `result`、`error`、`paused` 至多一个，其后只允许 `checkpoint_query`（`after_terminal`）；`handshake_error` 只能是第一条（`handshake_error_misplaced`）且是唯一一条（`after_handshake_error`）。

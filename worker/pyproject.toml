@@ -49,6 +49,21 @@ max-complexity = 10
 "os.execle".msg = "Worker 不直接替换进程映像"
 "os.execlp".msg = "Worker 不直接替换进程映像"
 "os.execlpe".msg = "Worker 不直接替换进程映像"
+"asyncio.create_subprocess_exec".msg = "Worker 不直接创建子进程"
+"asyncio.create_subprocess_shell".msg = "Worker 不直接创建子进程"
+"os.posix_spawn".msg = "Worker 不直接创建子进程"
+"os.posix_spawnp".msg = "Worker 不直接创建子进程"
+"os.spawnl".msg = "Worker 不直接创建子进程"
+"os.spawnle".msg = "Worker 不直接创建子进程"
+"os.spawnlp".msg = "Worker 不直接创建子进程"
+"os.spawnlpe".msg = "Worker 不直接创建子进程"
+"os.spawnv".msg = "Worker 不直接创建子进程"
+"os.spawnve".msg = "Worker 不直接创建子进程"
+"os.spawnvp".msg = "Worker 不直接创建子进程"
+"os.spawnvpe".msg = "Worker 不直接创建子进程"
+"os.forkpty".msg = "Worker 不直接创建子进程"
+"pty.spawn".msg = "Worker 不直接创建子进程"
+"multiprocessing".msg = "Worker 不直接创建子进程"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["TID251", "E402"]  # 测试文件按关注点分节，各节在节首导入

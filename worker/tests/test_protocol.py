@@ -133,8 +133,8 @@ LIMIT_CASES = [
     pytest.param(
         WORKER,
         b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":'
-        + b"[" * 20000
-        + b"]" * 20000
+        + b"[" * 100_000
+        + b"]" * 100_000
         + b"}",
         "malformed_json",
         id="nesting_too_deep",

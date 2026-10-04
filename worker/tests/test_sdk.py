@@ -339,6 +339,17 @@ def test_ready_checkpoint_artifact_result(tmp_path):
     assert result["summary"] == "cp-1/v2" and result["outputs"] == ["report"]
 
 
+def test_deeply_nested_init_fails_without_crashing(tmp_path):
+    async def go():
+        transport = MemoryTransport()
+        head = json.dumps({**INIT, "out_dir": str(tmp_path)})[:-1]
+        transport.feed(f'{head},"config":{"[" * 100_000}{"]" * 100_000}}}'.encode())
+        code = await run_worker(returns_ok, transport, name="w", version="0", timing=FAST)
+        return code, sent_json(transport)
+
+    assert asyncio.run(go()) == (1, [])
+
+
 def test_unsupported_mode_fails_before_ready(tmp_path):
     code, events = run(returns_ok, tmp_path, init={"mode": "session"})
     assert code == 1

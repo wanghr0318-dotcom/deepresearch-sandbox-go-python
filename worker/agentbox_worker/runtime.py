@@ -283,9 +283,9 @@ class TaskContext:
 
 def _supports_protocol(line: bytes) -> bool:
     """只读引导信封判断是否有共同版本（规格 §5.2）；信封本身不合法时交由完整校验报错。"""
-    try:
-        envelope = json.loads(line)
-    except ValueError:
+    try:  # 与 decode_line 相同：严格 UTF-8，嵌套过深按无法解析处理
+        envelope = json.loads(line.decode("utf-8"))
+    except (ValueError, RecursionError):
         return True
     if not isinstance(envelope, dict) or envelope.get("type") != "init":
         return True

@@ -1,0 +1,12 @@
+{
+  "name": "event_after_paused",
+  "description": "paused 是终态提议，之后不得再有业务事件",
+  "layers": ["protocol"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "task", "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}},
+    {"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "task", "worker": {"name": "sim-worker", "version": "0.1.0"}, "capabilities": []}},
+    {"from": "worker", "message": {"type": "paused", "v": 1, "seq": 2, "checkpoint_id": "cp-1"}},
+    {"from": "worker", "message": {"type": "progress", "v": 1, "seq": 3, "kind": "step_started", "message": "x"}}
+  ],
+  "expect": {"stream": "violation", "violation": "after_terminal", "at": 3}
+}

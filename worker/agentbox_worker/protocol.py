@@ -2,7 +2,8 @@
 
 规则与 Go 侧 internal/protocol 逐条对应，二者共用 protocol/fixtures/v1。
 消息以 dict 表示；未知字段忽略，未知类型是错误（规格 §5.3）。
-判定顺序：非 JSON 对象 → 类型未知 → 超限 → 字段类型错误 → 语义规则。
+判定顺序：行长超过 1 MiB → 非严格 UTF-8 / 非 JSON 对象 / 嵌套过深 → 类型未知 → 超限
+→ 字段类型错误 → 语义规则。
 """
 
 from __future__ import annotations
