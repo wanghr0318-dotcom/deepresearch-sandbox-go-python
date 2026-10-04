@@ -533,6 +533,14 @@ func runSeccompChild() int {
 	}
 	fprog := syscall.SockFprog{Len: uint16(len(kprog)), Filter: &kprog[0]}
 
+	// 对照：安装过滤器之前先以同样的参数调用每个探针，记录未过滤的结果。
+	probes := seccompDenyProbes(native)
+	isRoot := os.Geteuid() == 0
+	control := make([]syscall.Errno, len(probes))
+	for i, p := range probes {
+		control[i] = p.call()
+	}
+
 	const prSetNoNewPrivs = 38 // include/uapi/linux/prctl.h
 	if _, _, e := syscall.RawSyscall6(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0, 0, 0, 0); e != 0 {
 		return fail("PR_SET_NO_NEW_PRIVS: %v", e)
@@ -566,6 +574,147 @@ func runSeccompChild() int {
 	if _, _, e := syscall.RawSyscall(sysClone3, 0, 0, 0); e != syscall.ENOSYS {
 		return fail("clone3 errno = %v, want ENOSYS", e)
 	}
-	fmt.Println("seccomp child: ok (getpid ok, unshare EPERM, socket(AF_INET) EPERM, socket(AF_UNIX) ok, clone3 ENOSYS)")
+
+	// 拒绝列表逐项：过滤后必须是 EPERM；对照必须不是 EPERM（证明 EPERM 来自
+	// 过滤器而不是权限不足），也不能是 ENOSYS（ENOSYS 说明调用号不存在或该功能
+	// 未编入内核，都无法证明调用号正确）。需要特权的探针在非 root 下对照本就是
+	// EPERM，只在 root 下判定对照。唯一例外是 configOptional 的探针：其功能
+	// 可能未编入内核（例如 WSL2 内核未开 CONFIG_KEXEC，kexec_load 走 sys_ni
+	// 返回 ENOSYS），此时只记录“无法区分”，调用号由 TestSeccompSyscallNumbersMatchStdlib
+	// 与 Go 自带的 x/sys/unix 表交叉核对。
+	failed := 0
+	for i, p := range probes {
+		filtered := p.call()
+		verdict := "ok"
+		switch {
+		case filtered != syscall.EPERM:
+			verdict = "FAIL: 过滤后不是 EPERM"
+		case control[i] == syscall.ENOSYS && p.configOptional:
+			verdict = "无法区分：功能未编入本内核（ENOSYS）"
+		case control[i] == syscall.ENOSYS:
+			verdict = "FAIL: 对照为 ENOSYS，无法区分"
+		case control[i] == syscall.EPERM && (isRoot || !p.privileged):
+			verdict = "FAIL: 对照也是 EPERM，无法区分"
+		case control[i] == syscall.EPERM:
+			verdict = "需 root 对照（本次非 root）"
+		}
+		if strings.HasPrefix(verdict, "FAIL") {
+			failed++
+		}
+		fmt.Printf("probe %-28s nr=%-4d filtered=%-8s control=%-8s %s\n",
+			p.name, p.nr, errnoName(filtered), errnoName(control[i]), verdict)
+	}
+	if failed > 0 {
+		return fail("%d 个拒绝列表探针未通过", failed)
+	}
+	fmt.Printf("seccomp child: ok (root=%v; getpid ok, unshare EPERM, socket(AF_INET) EPERM, socket(AF_UNIX) ok, clone3 ENOSYS, %d deny probes)\n", isRoot, len(probes))
 	return 0
+}
+
+// seccompProbe 是拒绝列表中一个系统调用的真实调用，参数故意无效且无害：
+// 未过滤时内核返回 EPERM 以外的错误（EINVAL、EBADF、EFAULT 等），因此
+// 过滤后的 EPERM 只可能来自过滤器。调用号取自 seccomp.go 的生产表，
+// 由此在真实内核上核对这些调用号。
+type seccompProbe struct {
+	name string
+	nr   uint32
+	args [6]uintptr
+	// privileged 表示内核在检查参数之前先检查能力，非 root 时对照必然是 EPERM。
+	privileged bool
+	// configOptional 表示该调用依赖可能未编入内核的配置项（返回 ENOSYS）。
+	configOptional bool
+}
+
+func (p seccompProbe) call() syscall.Errno {
+	r, _, e := syscall.Syscall6(uintptr(p.nr), p.args[0], p.args[1], p.args[2], p.args[3], p.args[4], p.args[5])
+	if e == 0 && strings.HasPrefix(p.name, "socket") {
+		syscall.Close(int(r))
+	}
+	return e
+}
+
+func errnoName(e syscall.Errno) string {
+	switch e {
+	case 0:
+		return "success"
+	case syscall.EPERM:
+		return "EPERM"
+	case syscall.EINVAL:
+		return "EINVAL"
+	case syscall.EBADF:
+		return "EBADF"
+	case syscall.EFAULT:
+		return "EFAULT"
+	case syscall.ESRCH:
+		return "ESRCH"
+	case syscall.ENOSYS:
+		return "ENOSYS"
+	case syscall.ENOEXEC:
+		return "ENOEXEC"
+	case syscall.EOPNOTSUPP:
+		return "EOPNOTSUPP"
+	}
+	return fmt.Sprintf("errno%d", int(e))
+}
+
+// seccompDenyProbes 列出拒绝列表每一项（含 clone 的每个 CLONE_NEW* 与
+// socket 的若干非 AF_UNIX 地址族）的无害无效调用。
+func seccompDenyProbes(arch Arch) []seccompProbe {
+	nrs := map[Arch]map[string]uint32{ArchAMD64: syscallNrAMD64, ArchARM64: syscallNrARM64}[arch]
+	const bad = ^uintptr(0) // -1：无效 fd / 无效 flags
+	pid := uintptr(os.Getpid())
+	mk := func(name, syscallName string, priv bool, args ...uintptr) seccompProbe {
+		p := seccompProbe{name: name, nr: nrs[syscallName], privileged: priv}
+		copy(p.args[:], args)
+		return p
+	}
+	// 先查 CAP_SYS_BOOT；root 下未知 flags → EINVAL。依赖 CONFIG_KEXEC。
+	kexecLoad := mk("kexec_load", "kexec_load", true, 0, 0, 0, 0xFFFFFFFF)
+	kexecLoad.configOptional = true
+	probes := []seccompProbe{
+		mk("mount", "mount", false, 0, 0, 0, 0, 0),                                  // dir_name=NULL → EFAULT（能力检查在路径查找之后）
+		mk("umount2", "umount2", false, 0, 0xFFFFFFFF),                              // 未知 flags → EINVAL
+		mk("pivot_root", "pivot_root", true, 0, 0),                                  // 先查 may_mount；root 下 NULL 路径 → EFAULT
+		mk("unshare", "unshare", false, 0x1),                                        // CSIGNAL 位不是合法的 unshare 标志 → EINVAL
+		mk("setns", "setns", false, bad, 0),                                         // fd=-1 → EBADF
+		mk("ptrace", "ptrace", false, 3, 0, 0, 0),                                   // PTRACE_PEEKUSR, pid=0 → ESRCH
+		mk("process_vm_readv", "process_vm_readv", false, pid, 0, 0, 0, 0, 1),       // flags≠0 → EINVAL
+		mk("process_vm_writev", "process_vm_writev", false, pid, 0, 0, 0, 0, 1),     // flags≠0 → EINVAL
+		mk("bpf", "bpf", false, 1000, 0, 0),                                         // 未知 cmd / NULL attr
+		mk("perf_event_open", "perf_event_open", false, 0, 0, bad, bad, 0xFFFFFFFF), // 未知 flags → EINVAL
+		mk("userfaultfd", "userfaultfd", false, 0x1|0x2),                            // UFFD_USER_MODE_ONLY 通过权限闸门，0x2 未知 → EINVAL
+		mk("io_uring_setup", "io_uring_setup", false, 0, 0),                         // entries=0 / params=NULL
+		mk("io_uring_enter", "io_uring_enter", false, bad, 0, 0, 0, 0, 0),           // fd=-1 → EBADF
+		mk("io_uring_register", "io_uring_register", false, bad, 0, 0, 0),           // fd=-1 → EBADF
+		mk("keyctl", "keyctl", false, 0xFFFF, 0, 0, 0, 0),                           // 未知操作 → EOPNOTSUPP
+		mk("add_key", "add_key", false, 0, 0, 0, 0, 0),                              // type=NULL → EFAULT
+		mk("request_key", "request_key", false, 0, 0, 0, 0),                         // type=NULL → EFAULT
+		mk("open_by_handle_at", "open_by_handle_at", true, bad, 0, 0),               // 先查 CAP_DAC_READ_SEARCH
+		mk("init_module", "init_module", true, 0, 0, 0),                             // 先查 CAP_SYS_MODULE；root 下 len=0
+		mk("finit_module", "finit_module", true, bad, 0, 0),                         // 先查 CAP_SYS_MODULE；root 下 fd=-1
+		mk("delete_module", "delete_module", true, 0, 0),                            // 先查 CAP_SYS_MODULE；root 下 NULL 名字 → EFAULT
+		kexecLoad,
+		mk("kexec_file_load", "kexec_file_load", true, bad, bad, 0, 0, 0xFFFFFFFF), // 先查 CAP_SYS_BOOT；root 下未知 flags → EINVAL
+	}
+	// clone：每个 CLONE_NEW* 搭配 CLONE_THREAD 而不带 CLONE_SIGHAND，内核
+	// 在创建任何东西之前就返回 EINVAL，未过滤时也不会真的 fork。
+	const cloneThread = 0x00010000
+	for _, f := range []struct {
+		name string
+		flag uintptr
+	}{
+		{"NEWNS", 0x00020000}, {"NEWCGROUP", 0x02000000}, {"NEWUTS", 0x04000000},
+		{"NEWIPC", 0x08000000}, {"NEWUSER", 0x10000000}, {"NEWPID", 0x20000000},
+		{"NEWNET", 0x40000000},
+	} {
+		probes = append(probes, mk("clone(CLONE_"+f.name+")", "clone", false, f.flag|cloneThread, 0, 0, 0, 0))
+	}
+	// socket：非 AF_UNIX 地址族配无效 type（99 ≥ SOCK_MAX）→ EINVAL。
+	for _, f := range []struct {
+		name string
+		fam  uintptr
+	}{{"AF_INET", syscall.AF_INET}, {"AF_INET6", syscall.AF_INET6}, {"AF_NETLINK", syscall.AF_NETLINK}} {
+		probes = append(probes, mk("socket("+f.name+")", "socket", false, f.fam, 99, 0))
+	}
+	return probes
 }
