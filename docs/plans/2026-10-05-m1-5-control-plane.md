@@ -311,3 +311,4 @@ type Scheduler struct{ /* 管理 actor 集合；ListActiveTasks 启动；新任�
 - **累计运行时限的来源（规格 §14.4 只定义计量，未给出上限来源与默认值）**：上限取任务 `limits.max_run_time_ms`；缺省时取服务配置的默认值（由 Plan 6 Task 6 的配置定义）。actor 选项 `RunTimeLimit`（0 = 不限）；跨 attempt 累计、不因新 attempt 重置；运行中达到上限 → 以 `context.DeadlineExceeded` 取消 run ctx，runner 分类为 `task_deadline_exceeded`。
 - **恢复的 stop_blocked attempt 的运行时间**：actor 选项 `OnStopRecorded`，由装配接到 `recovery.Store.AccountUnrecordedRunTime`；停止确认（`Recorded`）后、裁决前调用一次，失败退避重试并保留事实。
 - **永远无法满足的 limits**：在 API 创建时拒绝（400），actor 不处理；`Admission` 的非取消错误保持致命并在注释中说明。
+- **超限任务的终止（不改 `Decide`/Store）**：attempt 结束时累计运行时间已达上限且 Outcome 可重试 → actor 在调用 `Decide` 前改为 `task_deadline_exceeded`、不重试；queued 任务启动时已超限（重启记账或配置调低）→ 照常走创建路径，但 run ctx 以 `context.DeadlineExceeded` 预先取消，runner 立即分类为 `task_deadline_exceeded`，经既有裁决路径终止（接受一次环境创建的代价）。`RunTimeLimit` 为 `func(TaskState) time.Duration`，由装配按任务计算。
