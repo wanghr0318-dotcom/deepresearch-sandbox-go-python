@@ -15,6 +15,7 @@
 - 本计划只实现设计文档 §1.3 所列 M1 表与首批事务用例；`recovery.Store` 交给 Plan 6，其所需字段由本计划的 schema 提供。
 - **依赖方向**：消费者包与 `ownership`、`datadir`、`blob`、`persistence` 不依赖 `internal/persistence/postgres` 或 pgx（由 `internal/archtest` 固定）；纯决策代码不做 I/O。
 - **事务**：`READ COMMITTED` + 显式行锁，锁顺序遵循规格 §7.1（`tasks → task_control → task_progress → task_event_seq → attempts → attempt_access → environments → artifact_heads`）；事务内不做网络、文件或沙箱操作。
+- **前置条件**（设计 §2.6）：规格 §5.5、§8.1 要求的前置条件（控制写入规则、attempt 准入、判决对最新控制与当前 attempt 的核对、checkpoint 的 fencing 与引用授权）在同一事务内、持锁后检查；顺序固定为"身份查询 → 前置条件 → 写入"，不满足返回 `*persistence.RejectedError`，不留任何改变。
 - **默认参数**（规格 §19）：操作整体 deadline 2 s；`lock_timeout` 1 s；`statement_timeout` 2 s；迁移超时 5 min；失锁检测周期 1 s、单次超时 1 s。
 - **未知提交**（设计 §2.3）：查不到仍是未知；重跑由事务内的唯一约束与行锁仲裁；deadline 用完返回携带身份的 `*persistence.CommitUnknownError`；调用方在成功前不得启动依赖该写入的外部动作。
 - **测试**：事务语义只在真实 PostgreSQL 上测试，不以 fake 代替；每个 Go 包一个 `*_test.go`（代码组织设计 §9.3）。`AGENTBOX_TEST_DATABASE_URL` 未设置时本地跳过、CI 中失败。
@@ -22,7 +23,7 @@
 - **执行环境**：Go 只在 WSL Ubuntu 中运行（`/usr/local/go/bin`），WSL 无外网：Go 模块经本地文件代理 `F:\go-agentbox\.superpowers\goproxy` 获取（已含 pgx v5.7.6 及其依赖）；PostgreSQL 由 Windows 上的 Docker Desktop 运行，WSL 经 `127.0.0.1:5432` 访问。下文 WSL 命令统一带以下环境（已写在每条命令里）：`export PATH=/usr/local/go/bin:/usr/bin:/bin GOTOOLCHAIN=local GOPROXY=file:///mnt/f/go-agentbox/.superpowers/goproxy GOSUMDB=off AGENTBOX_TEST_DATABASE_URL="postgres://agentbox:agentbox@127.0.0.1:5432/agentbox?sslmode=disable";`
 - **执行工作区**：`git worktree add ../go-agentbox-m1-4 -b m1-4-persistence m1-3-protocol-worker`（叠在 Plan 3 之上，二者都修改 `.github/workflows/ci.yml`）。Windows `F:\go-agentbox-m1-4`，WSL `/mnt/f/go-agentbox-m1-4`，Git Bash `/f/go-agentbox-m1-4`。
 - 工作区为 CRLF：gofmt 检查以暂存内容为准（`scripts/dev/gofmt-staged.sh`，在 linked worktree 中需设置 `GIT_DIR=/mnt/f/go-agentbox/.git/worktrees/go-agentbox-m1-4 GIT_WORK_TREE=/mnt/f/go-agentbox-m1-4`）。新文件用编辑工具写入，不用 shell heredoc（会吞掉反斜杠）。
-- 提交信息结尾：`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`。只暂存本任务列出的文件，禁止 `git add -A`。只在本地提交，不推送。
+- **提交署名按实际参与者填写**：执行者在开始前设置 `COAUTHOR` 为自己的署名行（格式 `Co-Authored-By: <实际模型或作者> <邮箱>`），各任务的提交命令以 `-m "$COAUTHOR"` 追加；未设置时不得提交，也不得照抄他人的署名。只暂存本任务列出的文件，禁止 `git add -A`。只在本地提交，不推送。
 
 ## 子 agent 上下文包
 
@@ -53,8 +54,8 @@
 - Create: `internal/archtest/archtest_test.go`
 
 **Interfaces:**
-- Produces：`persistence.ErrContention`、`ErrUnavailable`、`ErrCommitUnknown`、`ErrConflict`、`ErrNotFound`、`ErrOwnershipLost`；`*persistence.CommitUnknownError{Op, Identity, Err}`（`errors.Is(err, ErrCommitUnknown)` 成立）；`persistence.CountsTowardFailureThreshold(err) bool`。
-- Produces：`api.Store`、`task.Store`、`runner.Store`、`resource.Store` 及其参数与结果类型（见下方代码）。这些包本身没有实现，只声明接口。
+- Produces：`persistence.ErrContention`、`ErrUnavailable`、`ErrCommitUnknown`、`ErrConflict`、`ErrNotFound`、`ErrOwnershipLost`；`*persistence.CommitUnknownError{Op, Identity, Err}`（`errors.Is(err, ErrCommitUnknown)` 成立）；`persistence.CountsTowardFailureThreshold(err) bool`；`persistence.ErrRejected` 与 `*persistence.RejectedError{Code, Detail}`，原因码常量 `CodeTaskEnded`、`CodeCancelPending`、`CodeNotPaused`、`CodeNotRunnable`、`CodePreviousNotStopped`、`CodeStaleAttempt`、`CodeControlChanged`、`CodeRefNotAuthorized`。
+- Produces：`api.Store`、`task.Store`、`runner.Store`、`resource.Store` 及其参数与结果类型（见下方代码）。这些包本身没有实现，只声明接口。`task.Verdict.ControlVersion` 是计算判决时读取的控制版本，提交时用于拒绝过期判决。
 
 - [ ] **Step 1：写入错误契约与接口**
 
@@ -87,7 +88,36 @@ var (
 	ErrNotFound = errors.New("persistence: 不存在")
 	// ErrOwnershipLost 表示已失去数据库所有权（advisory lock），此后不再执行业务操作。
 	ErrOwnershipLost = errors.New("persistence: 已失去所有权")
+	// ErrRejected 表示事务内读取的最新事实不满足用例的前置条件（规格 §5.5、§8.1）。
+	// 具体错误为 *RejectedError，Code 说明原因；不重跑，不计入故障阈值。
+	ErrRejected = errors.New("persistence: 前置条件不满足")
 )
+
+// RejectedError 的原因码。stale_attempt 与 control_changed 表示调用方依据的事实已过期：
+// 提交者不再是当前 attempt 时应停止写入；控制版本变化时应按最新控制重算后再提交。
+const (
+	CodeTaskEnded          = "task_ended"           // 任务已终态，不再接受控制
+	CodeCancelPending      = "cancel_pending"       // 已接受的 cancel 不可被 pause/resume 覆盖
+	CodeNotPaused          = "not_paused"           // resume 要求任务处于 paused
+	CodeNotRunnable        = "not_runnable"         // 创建 attempt 要求 queued 且 desired = run
+	CodePreviousNotStopped = "previous_not_stopped" // 旧执行的环境尚未确认停止
+	CodeStaleAttempt       = "stale_attempt"        // 提交者不是任务的当前 attempt，或其访问已撤销
+	CodeControlChanged     = "control_changed"      // 判决依据的控制版本已不是最新
+	CodeRefNotAuthorized   = "ref_not_authorized"   // 引用的 blob 不存在或未授权到当前 scope
+)
+
+// RejectedError 携带前置条件不满足的原因。
+type RejectedError struct {
+	Code   string
+	Detail string
+}
+
+func (e *RejectedError) Error() string {
+	return fmt.Sprintf("persistence: %s: %s", e.Code, e.Detail)
+}
+
+// Is 使 errors.Is(err, ErrRejected) 成立。
+func (e *RejectedError) Is(target error) bool { return target == ErrRejected }
 
 // CommitUnknownError 携带提交结果未知的操作及其身份，供调用方之后以同一身份核对或重试。
 type CommitUnknownError struct {
@@ -274,6 +304,7 @@ type ControlState struct {
 type Verdict struct {
 	AttemptID        string
 	TaskID           string
+	ControlVersion   int64 // 计算判决时读取的 task_control.control_version；提交时不是最新则拒绝（control_changed）
 	FromStatus       string
 	AttemptStatus    string
 	OutcomeClass     string
@@ -548,9 +579,7 @@ Expected: gofmt 无输出；`ok  .../internal/archtest`。
 - [ ] **Step 4：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add internal/persistence/errors.go internal/api/store.go internal/task/store.go internal/runner/store.go internal/resource/store.go internal/archtest/archtest_test.go && git commit -m "feat(persistence): 错误契约与 api/task/runner/resource 窄接口；依赖方向检查
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+cd /f/go-agentbox-m1-4 && git add internal/persistence/errors.go internal/api/store.go internal/task/store.go internal/runner/store.go internal/resource/store.go internal/archtest/archtest_test.go && git commit -m "feat(persistence): 错误契约与 api/task/runner/resource 窄接口；依赖方向检查" -m "$COAUTHOR"
 ```
 
 ---
@@ -1066,9 +1095,7 @@ Expected: gofmt 无输出；两个包 `ok`。
 - [ ] **Step 5：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add internal/datadir internal/blob && git commit -m "feat(datadir,blob): 数据目录 flock 与 install_id 持久化写入；本地内容寻址 BlobStore
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+cd /f/go-agentbox-m1-4 && git add internal/datadir internal/blob && git commit -m "feat(datadir,blob): 数据目录 flock 与 install_id 持久化写入；本地内容寻址 BlobStore" -m "$COAUTHOR"
 ```
 
 ---
@@ -1379,9 +1406,7 @@ Expected: `ok  .../internal/ownership`。
 - [ ] **Step 5：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add internal/ownership && git commit -m "feat(ownership): 安装身份引导决策表与引导编排（规格 §7.4）
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+cd /f/go-agentbox-m1-4 && git add internal/ownership && git commit -m "feat(ownership): 安装身份引导决策表与引导编排（规格 §7.4）" -m "$COAUTHOR"
 ```
 
 ---
@@ -1400,7 +1425,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes：Task 1 的 `persistence` 错误；Task 3 的 `ownership.InstallStore`、`ownership.Bootstrap`；Task 2 的 `datadir.IDFile`（测试中）。
 - Produces：`postgres.Open(ctx, Options) (*Store, error)`、`(*Store).Close()`；`Options{DSN, OpDeadline, LockTimeout, StatementTimeout, Ownership}`；`(*Store).InspectInstallation`、`InitializeInstallation`、`CompleteInstallation`、`Migrate`；`postgres.AcquireOwnership(ctx, dsn, OwnershipOptions) (*Ownership, error)`、`ErrAlreadyOwned`、`(*Ownership).Lost()`、`IsLost()`、`Context()`、`Close()`。
-- 包内供 Task 5–7 使用：`(*Store).run(ctx, op, identity, txFunc)`（幂等用例的执行框架）、`(*Store).read(ctx, op, func(ctx, queryer) error)`、`lockTask`、`lockTaskShared`、`nullJSON`、`contentHash`、`invalidf`、`conflictf`、`notFoundf`、`errInvalid`；测试钩子 `hooks.beforeCommit`、`hooks.afterCommit`。
+- 包内供 Task 5–7 使用：`(*Store).run(ctx, op, identity, txFunc)`（幂等用例的执行框架）、`(*Store).read(ctx, op, func(ctx, queryer) error)`、`lockTask`、`lockTaskShared`、`nullJSON`、`contentHash`、`invalidf`、`conflictf`、`notFoundf`、`rejectf`、`errInvalid`；测试钩子 `hooks.beforeCommit`、`hooks.afterCommit`。
 
 - [ ] **Step 1：引入依赖并启动 PostgreSQL**
 
@@ -2285,7 +2310,8 @@ func (s *Store) read(ctx context.Context, op string, fn func(ctx context.Context
 }
 
 func isDomain(err error) bool {
-	return errors.Is(err, persistence.ErrConflict) || errors.Is(err, persistence.ErrNotFound) || errors.Is(err, errInvalid)
+	return errors.Is(err, persistence.ErrConflict) || errors.Is(err, persistence.ErrNotFound) ||
+		errors.Is(err, persistence.ErrRejected) || errors.Is(err, errInvalid)
 }
 
 // errInvalid 表示调用方传入了不合法的参数（编程错误），不重跑。
@@ -2297,6 +2323,11 @@ func invalidf(format string, args ...any) error {
 
 func conflictf(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", persistence.ErrConflict, fmt.Sprintf(format, args...))
+}
+
+// rejectf 返回前置条件不满足的错误（code 取 persistence.Code* 常量）。
+func rejectf(code, format string, args ...any) error {
+	return &persistence.RejectedError{Code: code, Detail: fmt.Sprintf(format, args...)}
 }
 
 func notFoundf(format string, args ...any) error {
@@ -2721,9 +2752,7 @@ Expected: 全部 PASS（`TestInstallationBootstrapE46` 的 7 个子测试、`Tes
 - [ ] **Step 6：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add go.mod go.sum deploy/docker-compose.yml internal/persistence/postgres/migrations/0001_init.sql internal/persistence/postgres/postgres.go internal/persistence/postgres/lock.go internal/persistence/postgres/migrate.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): PostgreSQL 迁移、事务辅助、advisory lock 与安装存储（E46、E12/E13 存储部分）
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+cd /f/go-agentbox-m1-4 && git add go.mod go.sum deploy/docker-compose.yml internal/persistence/postgres/migrations/0001_init.sql internal/persistence/postgres/postgres.go internal/persistence/postgres/lock.go internal/persistence/postgres/migrate.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): PostgreSQL 迁移、事务辅助、advisory lock 与安装存储（E46、E12/E13 存储部分）" -m "$COAUTHOR"
 ```
 
 ---
@@ -2738,11 +2767,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes：Task 4 的 `run`、`read`、`lockTask`、`nullJSON`、`contentHash`、错误辅助；Task 1 的 `api.Store`、`task.Store`。
-- Produces：`*Store` 实现 `api.Store`（`CreateTask`、`AcceptControl`、`GetRequest`、`GetTask`、`ListEvents`）与 `task.Store`（`CreateAttempt`、`GetAttempt`、`ApplyControl`、`GetControlState`、`FinalizeAttempt`）；包内事件辅助 `lockEventSeq`、`nextEventSeq`、`appendHostEvent(hostEvent)`。
+- Produces：`*Store` 实现 `api.Store`（`CreateTask`、`AcceptControl`、`GetRequest`、`GetTask`、`ListEvents`）与 `task.Store`（`CreateAttempt`、`GetAttempt`、`ApplyControl`、`GetControlState`、`FinalizeAttempt`），前置条件按设计 §2.6；包内事件辅助 `lockEventSeq`、`nextEventSeq`、`appendHostEvent(hostEvent)`。
 
 - [ ] **Step 1：写失败的测试**
 
-第二节覆盖：五个用例的"提交后回复丢失"（E11a）、"第一次提交尚未完成时查询为空、重跑得到原结果"、同身份不同内容的冲突（包括同为 failed 但判决不同）、请求重放与读取接口。
+第二节覆盖：五个用例的"提交后回复丢失"（E11a）、"第一次提交尚未完成时查询为空、重跑得到原结果"、同身份不同内容的冲突（包括同为 failed 但判决不同）、请求重放与读取接口；以及设计 §2.6 的前置条件——取消后创建 attempt、旧环境未停止时创建、创建后重复请求返回原结果；取消先提交（过期判决以 `control_changed` 拒绝，按最新控制重算后提交）、判决先提交（随后的取消以 `task_ended` 拒绝）、旧 attempt 的迟到判决（`stale_attempt`）；控制写入的 `cancel_pending` 与 `not_paused`。每个拒绝都用 `snapshot` 断言任务状态、指针、事件与产物均未改变。
 
 把 `internal/persistence/postgres/postgres_test.go` 的 import 块**替换**为：
 
@@ -2842,13 +2871,200 @@ func fixture(t *testing.T, s *Store, taskID string) {
 	}
 }
 
+// verdict 是 att-<taskID> 在 control_version 1（desired = run）下的失败判决。
 func verdict(taskID string, exit int64) task.Verdict {
-	return task.Verdict{AttemptID: "att-" + taskID, TaskID: taskID, FromStatus: "starting", AttemptStatus: "ended",
+	return task.Verdict{AttemptID: "att-" + taskID, TaskID: taskID, ControlVersion: 1, FromStatus: "starting", AttemptStatus: "ended",
 		OutcomeClass: "worker_error", ExitCode: &exit, TaskStatus: "failed", TaskStatusReason: "worker_error",
 		EventType: "attempt_ended", EventPayload: json.RawMessage(fmt.Sprintf(`{"exit":%d}`, exit))}
 }
 
 func withFixture(t *testing.T, s *Store) { fixture(t, s, "t1") }
+
+// stopEnv 模拟 Reconciler 确认环境已停止（stopped_at 由 resource 用例写入，Task 7 才实现）。
+func stopEnv(t *testing.T, s *Store, envID string) {
+	t.Helper()
+	if _, err := s.pool.Exec(context.Background(), "UPDATE environments SET stopped_at = now() WHERE env_id = $1", envID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// retryWithNewAttempt 走一次故障重试：att-<taskID> 裁决回到 queued，旧环境停止，创建第 2 个 attempt。
+func retryWithNewAttempt(t *testing.T, s *Store, taskID string) {
+	t.Helper()
+	ctx := context.Background()
+	v := verdict(taskID, 1)
+	v.TaskStatus = "queued"
+	if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+		t.Fatalf("故障重试的判决: %v", err)
+	}
+	stopEnv(t, s, "env-"+taskID)
+	if _, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: taskID, AttemptID: "att2-" + taskID, AttemptNo: 2, EnvID: "env2-" + taskID}); err != nil {
+		t.Fatalf("第 2 个 attempt: %v", err)
+	}
+}
+
+// expectRejected 断言 err 是原因码为 code 的 *persistence.RejectedError。
+func expectRejected(t *testing.T, err error, code string) {
+	t.Helper()
+	var rej *persistence.RejectedError
+	if !errors.As(err, &rej) || rej.Code != code || !errors.Is(err, persistence.ErrRejected) || persistence.CountsTowardFailureThreshold(err) {
+		t.Fatalf("应以 %s 拒绝，得到 %v", code, err)
+	}
+}
+
+// snapshot 记录任务的可观察状态，用于确认被拒绝的写入没有留下任何改变。
+func snapshot(t *testing.T, s *Store, taskID string) string {
+	t.Helper()
+	var out string
+	if err := s.pool.QueryRow(context.Background(), `SELECT concat_ws('|', t.status, t.current_attempt_id, t.row_version,
+			c.desired, c.control_version, p.latest_checkpoint_id, p.latest_commit_seq,
+			(SELECT count(*) FROM events e WHERE e.task_id = t.task_id),
+			(SELECT count(*) FROM attempts a WHERE a.task_id = t.task_id),
+			(SELECT count(*) FROM attempts a WHERE a.task_id = t.task_id AND a.verdict_hash IS NOT NULL),
+			(SELECT count(*) FROM artifacts r WHERE r.task_id = t.task_id))
+		FROM tasks t JOIN task_control c USING (task_id) JOIN task_progress p USING (task_id) WHERE t.task_id = $1`, taskID).Scan(&out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestCreateAttemptAdmission 覆盖规格 §8.1 创建 attempt 的准入：前置条件在同一事务内检查，
+// 被拒绝时任务不变；已创建的 attempt 重复请求时返回原结果（即使前置条件此时已不成立）。
+func TestCreateAttemptAdmission(t *testing.T) {
+	ctx := context.Background()
+	t.Run("取消后创建", func(t *testing.T) {
+		s := newStore(t, Options{})
+		if _, err := s.CreateTask(ctx, api.CreateTaskRequest{RequestID: "r1", BodyHash: []byte("h"), TaskID: "t1", Spec: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "c1", BodyHash: []byte("h"), TaskID: "t1", Desired: "cancel"}); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, s, "t1")
+		_, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: "t1", AttemptID: "a1", AttemptNo: 1, EnvID: "e1"})
+		expectRejected(t, err, persistence.CodeNotRunnable)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+	})
+	t.Run("旧环境未停止时创建，停止后创建，重复请求", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		v := verdict("t1", 1)
+		v.TaskStatus = "queued"
+		if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+			t.Fatal(err)
+		}
+		req := task.NewAttempt{TaskID: "t1", AttemptID: "att2-t1", AttemptNo: 2, EnvID: "env2-t1"}
+		before := snapshot(t, s, "t1")
+		_, err := s.CreateAttempt(ctx, req)
+		expectRejected(t, err, persistence.CodePreviousNotStopped)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+		stopEnv(t, s, "env-t1")
+		first, err := s.CreateAttempt(ctx, req)
+		if err != nil {
+			t.Fatalf("旧环境停止后应能创建：%v", err)
+		}
+		again, err := s.CreateAttempt(ctx, req) // 任务已是 running，准入不再成立，但这是同一请求
+		if err != nil || fmt.Sprintf("%+v", again) != fmt.Sprintf("%+v", first) {
+			t.Fatalf("重复请求应返回原结果：%+v %v，原为 %+v", again, err, first)
+		}
+		if v, _ := s.GetTask(ctx, "t1"); v.Status != "running" || v.CurrentAttemptID != "att2-t1" || v.AttemptsTotal != 2 {
+			t.Fatalf("任务应由第 2 个 attempt 运行：%+v", v)
+		}
+	})
+}
+
+// TestFinalizeArbitratesControl 覆盖规格 §8.1 最终裁决：判决在持有任务锁后核对最新控制与当前 attempt。
+func TestFinalizeArbitratesControl(t *testing.T) {
+	ctx := context.Background()
+	succeeded := func(cv int64) task.Verdict {
+		zero := int64(0)
+		return task.Verdict{AttemptID: "att-t1", TaskID: "t1", ControlVersion: cv, FromStatus: "starting", AttemptStatus: "ended",
+			OutcomeClass: "succeeded", ExitCode: &zero, TaskStatus: "succeeded", Result: json.RawMessage(`{"ok":true}`),
+			EventType: "attempt_ended", EventPayload: json.RawMessage(`{"exit":0}`)}
+	}
+	t.Run("取消先提交，过期的成功判决被拒绝，按最新控制重算", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		c, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "c1", BodyHash: []byte("h"), TaskID: "t1", Desired: "cancel"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, s, "t1")
+		_, err = s.FinalizeAttempt(ctx, succeeded(1))
+		expectRejected(t, err, persistence.CodeControlChanged)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+		if _, err := s.FinalizeAttempt(ctx, succeeded(c.ControlVersion)); !errors.Is(err, errInvalid) {
+			t.Fatalf("desired = cancel 时不能裁决为 succeeded，得到 %v", err)
+		}
+		v := succeeded(c.ControlVersion)
+		v.TaskStatus, v.TaskStatusReason = "cancelled", "completed_during_cancel"
+		if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+			t.Fatalf("按最新控制重算的判决应提交：%v", err)
+		}
+		if got, _ := s.GetTask(ctx, "t1"); got.Status != "cancelled" {
+			t.Fatalf("任务应为 cancelled：%+v", got)
+		}
+	})
+	t.Run("判决先提交，随后的取消被拒绝", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		if _, err := s.FinalizeAttempt(ctx, succeeded(1)); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, s, "t1")
+		_, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "c1", BodyHash: []byte("h"), TaskID: "t1", Desired: "cancel"})
+		expectRejected(t, err, persistence.CodeTaskEnded)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+		if _, err := s.GetRequest(ctx, "c1"); !errors.Is(err, persistence.ErrNotFound) {
+			t.Fatalf("被拒绝的请求不应留下记录，得到 %v", err)
+		}
+	})
+	t.Run("旧 attempt 的迟到判决被拒绝", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		// 模拟恢复（Plan 6）把执行交还队列而旧 attempt 尚无判决：任务回到 queued，旧环境已停止。
+		if _, err := s.pool.Exec(ctx, "UPDATE tasks SET status = 'queued' WHERE task_id = 't1'"); err != nil {
+			t.Fatal(err)
+		}
+		stopEnv(t, s, "env-t1")
+		if _, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: "t1", AttemptID: "att2-t1", AttemptNo: 2, EnvID: "env2-t1"}); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, s, "t1")
+		_, err := s.FinalizeAttempt(ctx, succeeded(1))
+		expectRejected(t, err, persistence.CodeStaleAttempt)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+	})
+}
+
+// TestControlWriteRules 覆盖规格 §8.1 控制写入：已接受的 cancel 不可被覆盖；resume 要求 paused。
+func TestControlWriteRules(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	control := func(id, desired string) error {
+		_, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: id, BodyHash: []byte(desired), TaskID: "t1", Desired: desired})
+		return err
+	}
+	expectRejected(t, control("c1", "run"), persistence.CodeNotPaused)
+	if err := control("c2", "cancel"); err != nil {
+		t.Fatal(err)
+	}
+	expectRejected(t, control("c3", "pause"), persistence.CodeCancelPending)
+	if err := control("c4", "cancel"); err != nil {
+		t.Fatalf("重复 cancel 应被接受：%v", err)
+	}
+}
 
 func TestCommitLostResolvesAPIAndTaskUseCases(t *testing.T) {
 	ctx := context.Background()
@@ -3094,6 +3310,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 )
 
 var _ api.Store = (*Store)(nil)
@@ -3194,7 +3411,18 @@ func (s *Store) AcceptControl(ctx context.Context, req api.ControlRequest) (api.
 			res.Replayed = true
 			return json.Unmarshal(stored, &res)
 		}
-		if err := lockTask(ctx, tx, req.TaskID); err != nil {
+		var status, desired string
+		err = tx.QueryRow(ctx, "SELECT status FROM tasks WHERE task_id = $1 FOR UPDATE", req.TaskID).Scan(&status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("任务 %s", req.TaskID)
+		}
+		if err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, "SELECT desired FROM task_control WHERE task_id = $1 FOR UPDATE", req.TaskID).Scan(&desired); err != nil {
+			return err
+		}
+		if err := admitControl(req.TaskID, status, desired, req.Desired); err != nil {
 			return err
 		}
 		if err := tx.QueryRow(ctx, `UPDATE task_control SET control_version = control_version + 1, desired = $2, reason = $3
@@ -3213,6 +3441,20 @@ func (s *Store) AcceptControl(ctx context.Context, req api.ControlRequest) (api.
 		return finishRequest(ctx, tx, req.RequestID, req.TaskID, res)
 	})
 	return res, err
+}
+
+// admitControl 是规格 §8.1 的控制写入规则：终态任务不再接受控制；已接受的 cancel 不可被
+// pause 或 resume 覆盖；resume（desired = run）要求任务处于 paused。
+func admitControl(taskID, status, current, next string) error {
+	switch {
+	case status == "succeeded" || status == "failed" || status == "cancelled":
+		return rejectf(persistence.CodeTaskEnded, "任务 %s 已是 %s", taskID, status)
+	case current == "cancel" && next != "cancel":
+		return rejectf(persistence.CodeCancelPending, "任务 %s 已接受 cancel", taskID)
+	case next == "run" && status != "paused":
+		return rejectf(persistence.CodeNotPaused, "任务 %s 处于 %s，不能 resume", taskID, status)
+	}
+	return nil
 }
 
 // GetRequest 读取已提交的请求记录（实现 api.Store）。
@@ -3290,20 +3532,31 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
 )
 
 var _ task.Store = (*Store)(nil)
 
-// CreateAttempt 创建 attempt、attempt_access（active）与任务环境记录，并推进任务（实现 task.Store）。
-// 锁顺序：tasks → task_event_seq → attempts → attempt_access → environments。
+// CreateAttempt 创建 attempt、attempt_access（active）与任务环境记录，并把任务从 queued 推进到 running
+// （实现 task.Store）。同一 attempt_id 已存在时只比较内容并返回原结果；新建时在同一事务内检查准入
+// 前置条件（规格 §8.1）：任务处于 queued、desired = run、旧执行的环境均已确认停止。
+// 锁顺序：tasks → task_control → task_event_seq → attempts → attempt_access → environments。
 func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Attempt, error) {
 	if a.TaskID == "" || a.AttemptID == "" || a.EnvID == "" || a.AttemptNo < 1 {
 		return task.Attempt{}, invalidf("CreateAttempt 缺少 task_id、attempt_id、env_id 或 attempt_no")
 	}
 	var out task.Attempt
 	err := s.run(ctx, "CreateAttempt", a.AttemptID, func(ctx context.Context, tx pgx.Tx) error {
-		if err := lockTask(ctx, tx, a.TaskID); err != nil {
+		var status, desired string
+		err := tx.QueryRow(ctx, "SELECT status FROM tasks WHERE task_id = $1 FOR UPDATE", a.TaskID).Scan(&status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("任务 %s", a.TaskID)
+		}
+		if err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, "SELECT desired FROM task_control WHERE task_id = $1 FOR SHARE", a.TaskID).Scan(&desired); err != nil {
 			return err
 		}
 		if err := lockEventSeq(ctx, tx, a.TaskID); err != nil {
@@ -3328,6 +3581,9 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
+		if err := admitAttempt(ctx, tx, a.TaskID, status, desired); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, "INSERT INTO attempts (attempt_id, task_id, attempt_no, env_id, status) VALUES ($1, $2, $3, $4, 'starting')",
 			a.AttemptID, a.TaskID, a.AttemptNo, a.EnvID); err != nil {
 			return err
@@ -3339,9 +3595,13 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 			a.EnvID, a.AttemptID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE tasks SET current_attempt_id = $2, attempts_total = attempts_total + 1, status = 'starting',
-			row_version = row_version + 1 WHERE task_id = $1`, a.TaskID, a.AttemptID); err != nil {
+		tag, err := tx.Exec(ctx, `UPDATE tasks SET current_attempt_id = $2, attempts_total = attempts_total + 1, status = 'running',
+			row_version = row_version + 1 WHERE task_id = $1 AND status = 'queued'`, a.TaskID, a.AttemptID)
+		if err != nil {
 			return err
+		}
+		if tag.RowsAffected() != 1 { // 持有任务行锁时不会发生；保留 CAS 作为最后一道检查
+			return rejectf(persistence.CodeNotRunnable, "任务 %s 已不在 queued", a.TaskID)
 		}
 		payload, _ := json.Marshal(map[string]any{"attempt_no": a.AttemptNo, "env_id": a.EnvID})
 		if _, err := appendHostEvent(ctx, tx, hostEvent{taskID: a.TaskID, key: "attempt_created:" + a.AttemptID,
@@ -3352,6 +3612,23 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 		return nil
 	})
 	return out, err
+}
+
+// admitAttempt 检查创建 attempt 的准入前置条件（规格 §8.1）。旧环境的 stopped_at 只会从空变为
+// 非空，因此不加锁读取至多得到偏保守的"未停止"。
+func admitAttempt(ctx context.Context, tx pgx.Tx, taskID, status, desired string) error {
+	if status != "queued" || desired != "run" {
+		return rejectf(persistence.CodeNotRunnable, "任务 %s 处于 %s、desired = %s", taskID, status, desired)
+	}
+	var running int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM attempts a JOIN environments e ON e.attempt_id = a.attempt_id
+		WHERE a.task_id = $1 AND e.stopped_at IS NULL`, taskID).Scan(&running); err != nil {
+		return err
+	}
+	if running > 0 {
+		return rejectf(persistence.CodePreviousNotStopped, "任务 %s 有 %d 个旧环境尚未确认停止", taskID, running)
+	}
+	return nil
 }
 
 // GetAttempt 读取 attempt（实现 task.Store）。
@@ -3448,6 +3725,19 @@ func selectControlState(ctx context.Context, q queryer, taskID string, forUpdate
 	return st, err
 }
 
+// verdictAllowed 是规格 §8.1 最终裁决对 desired 的约束：cancel → cancelled；pause → paused；
+// run → 按 §5.8 与 §14.3 裁决为 succeeded、failed，或故障重试回到 queued。
+func verdictAllowed(desired, taskStatus string) bool {
+	switch desired {
+	case "cancel":
+		return taskStatus == "cancelled"
+	case "pause":
+		return taskStatus == "paused"
+	default:
+		return taskStatus == "succeeded" || taskStatus == "failed" || taskStatus == "queued"
+	}
+}
+
 // verdictHash 是完整判决内容的哈希；FromStatus 是 CAS 来源，不属于判决内容（设计 §2.4）。
 func verdictHash(v task.Verdict) ([]byte, error) {
 	content := v
@@ -3460,10 +3750,13 @@ func verdictHash(v task.Verdict) ([]byte, error) {
 }
 
 // FinalizeAttempt 提交判决、任务状态与终态 host 事件（实现 task.Store）。完整判决内容一致
-// 才返回原结果；已有不同判决为冲突；attempt 不在 FromStatus 为冲突。
-// 锁顺序：tasks → task_event_seq → attempts。
+// 才返回原结果；已有不同判决为冲突。新判决在持有任务锁后核对最新事实（规格 §8.1）：
+// 提交者必须仍是当前 attempt（stale_attempt）；判决依据的控制版本必须是最新（control_changed，
+// 调用方按最新控制重算）；任务状态必须与 desired 相符；attempt 必须处于 FromStatus。
+// 锁顺序：tasks → task_control → task_event_seq → attempts。
 func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attempt, error) {
-	if v.AttemptID == "" || v.TaskID == "" || v.FromStatus == "" || v.AttemptStatus == "" || v.TaskStatus == "" || v.EventType == "" {
+	if v.AttemptID == "" || v.TaskID == "" || v.ControlVersion < 1 || v.FromStatus == "" || v.AttemptStatus == "" ||
+		v.TaskStatus == "" || v.EventType == "" {
 		return task.Attempt{}, invalidf("FinalizeAttempt 缺少必填字段")
 	}
 	hash, err := verdictHash(v)
@@ -3472,7 +3765,18 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 	}
 	var out task.Attempt
 	err = s.run(ctx, "FinalizeAttempt", v.AttemptID, func(ctx context.Context, tx pgx.Tx) error {
-		if err := lockTask(ctx, tx, v.TaskID); err != nil {
+		var current *string
+		err := tx.QueryRow(ctx, "SELECT current_attempt_id FROM tasks WHERE task_id = $1 FOR UPDATE", v.TaskID).Scan(&current)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("任务 %s", v.TaskID)
+		}
+		if err != nil {
+			return err
+		}
+		var desired string
+		var controlVersion int64
+		if err := tx.QueryRow(ctx, "SELECT desired, control_version FROM task_control WHERE task_id = $1 FOR SHARE",
+			v.TaskID).Scan(&desired, &controlVersion); err != nil {
 			return err
 		}
 		if err := lockEventSeq(ctx, tx, v.TaskID); err != nil {
@@ -3493,6 +3797,13 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 			return nil
 		case a.VerdictHash != nil:
 			return conflictf("attempt %s 已有不同的判决", v.AttemptID)
+		case current == nil || *current != v.AttemptID:
+			return rejectf(persistence.CodeStaleAttempt, "attempt %s 不是任务 %s 的当前 attempt", v.AttemptID, v.TaskID)
+		case controlVersion != v.ControlVersion:
+			return rejectf(persistence.CodeControlChanged, "判决依据控制版本 %d，当前为 %d（desired = %s）",
+				v.ControlVersion, controlVersion, desired)
+		case !verdictAllowed(desired, v.TaskStatus):
+			return invalidf("desired = %s 时任务不能裁决为 %s", desired, v.TaskStatus)
 		case a.Status != v.FromStatus:
 			return conflictf("attempt %s 处于 %s，不是 %s", v.AttemptID, a.Status, v.FromStatus)
 		}
@@ -3528,9 +3839,7 @@ Expected: 两个包 `ok`。
 - [ ] **Step 5：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add internal/persistence/postgres/events.go internal/persistence/postgres/api.go internal/persistence/postgres/task.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): 事件追加与 api、task 事务用例（E11a）
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+cd /f/go-agentbox-m1-4 && git add internal/persistence/postgres/events.go internal/persistence/postgres/api.go internal/persistence/postgres/task.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): 事件追加与 api、task 事务用例（E11a）" -m "$COAUTHOR"
 ```
 
 ---
@@ -3545,11 +3854,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes：Task 4、5 的包内辅助（`run`、`read`、`lockTask`、`lockTaskShared`、`lockEventSeq`、`nextEventSeq`、`appendHostEvent`、`nullJSON`、`contentHash`）；Task 1 的 `runner.Store`。
-- Produces：`*Store` 实现 `runner.Store`（`AppendWorkerEvents`、`WorkerEventWatermark`、`CommitCheckpoint`、`QueryCheckpoint`、`RegisterArtifact`、`GetArtifact`、`RecordTerminalProposal`、`GetTerminalProposal`）。
+- Produces：`*Store` 实现 `runner.Store`（`AppendWorkerEvents`、`WorkerEventWatermark`、`CommitCheckpoint`、`QueryCheckpoint`、`RegisterArtifact`、`GetArtifact`、`RecordTerminalProposal`、`GetTerminalProposal`）；包内 `fenceAttempt`、`authorizeRefs`。
 
 - [ ] **Step 1：写失败的测试**
 
-第三节覆盖：四个用例的"提交后回复丢失"、同身份不同内容的冲突（checkpoint、终态提议、同 sha256 不同大小）、Worker 事件批次（整批重放、部分重叠、同序号不同内容、缺口、非连续）。
+第三节覆盖：四个用例的"提交后回复丢失"、同身份不同内容的冲突（checkpoint、终态提议、同 sha256 不同大小）、Worker 事件批次（整批重放、部分重叠、同序号不同内容、缺口、非连续）；以及 checkpoint 的 fencing 与引用授权——旧 attempt、其他任务的 blob、不存在的 blob、其他任务的 scope 均被拒绝且指针与事件不变，旧 attempt 也不能登记产物，当前 attempt 引用本任务已授权的 blob 正常提交。
 
 把 `internal/persistence/postgres/postgres_test.go` 的 import 块**替换**为：
 
@@ -3686,6 +3995,55 @@ func TestWorkerEventBatches(t *testing.T) {
 		t.Fatalf("task_seq 应从 1 起连续无空洞：%d 条，最大 %d", n, m)
 	}
 }
+
+// TestCheckpointFencingAndRefs 覆盖规格 §5.5 第 2、3 条：新 checkpoint 的 fencing 与引用授权在提交事务内
+// 检查，被拒绝时指针与事件都不改变；旧 attempt 也不能登记产物。
+func TestCheckpointFencingAndRefs(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	fixture(t, s, "t2")
+	own, foreign, missing := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)
+	register := func(taskID, attemptID, sha string) error {
+		_, err := s.RegisterArtifact(ctx, runner.Artifact{TaskID: taskID, AttemptID: attemptID, ArtifactID: "state-" + sha[:1],
+			SHA256: sha, Size: 3, MediaType: "application/json", Visibility: "internal"})
+		return err
+	}
+	if err := register("t2", "att-t2", foreign); err != nil {
+		t.Fatal(err)
+	}
+	retryWithNewAttempt(t, s, "t1")
+	if err := register("t1", "att2-t1", own); err != nil {
+		t.Fatal(err)
+	}
+	cp := func(id, attemptID, stateRef string, refs ...string) runner.Checkpoint {
+		return runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "t1"}, CheckpointID: id, AttemptID: attemptID, StepID: "s1",
+			StateRef: stateRef, Refs: refs}
+	}
+	before := snapshot(t, s, "t1")
+	for name, c := range map[string]struct {
+		cp   runner.Checkpoint
+		code string
+	}{
+		"旧 attempt":   {cp("cp-old", "att-t1", own), persistence.CodeStaleAttempt},
+		"其他任务的 blob":  {cp("cp-foreign", "att2-t1", own, foreign), persistence.CodeRefNotAuthorized},
+		"不存在的 blob":   {cp("cp-missing", "att2-t1", missing), persistence.CodeRefNotAuthorized},
+		"其他任务的 scope": {runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "t2"}, CheckpointID: "cp-x", AttemptID: "att2-t1", StepID: "s1", StateRef: foreign}, persistence.CodeStaleAttempt},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := s.CommitCheckpoint(ctx, c.cp)
+			expectRejected(t, err, c.code)
+		})
+	}
+	expectRejected(t, register("t1", "att-t1", strings.Repeat("d", 64)), persistence.CodeStaleAttempt)
+	if after := snapshot(t, s, "t1"); after != before {
+		t.Fatalf("被拒绝的写入不应改变指针、事件或产物：%s → %s", before, after)
+	}
+	got, err := s.CommitCheckpoint(ctx, cp("cp-ok", "att2-t1", own, own))
+	if err != nil || got.CommitSeq != 1 {
+		t.Fatalf("当前 attempt 引用本任务已授权的 blob 应提交：%+v %v", got, err)
+	}
+}
 ```
 
 - [ ] **Step 2：确认测试失败**
@@ -3713,6 +4071,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
 )
 
@@ -3758,7 +4117,10 @@ func checkpointHash(c runner.Checkpoint) []byte {
 }
 
 // CommitCheckpoint 以 (scope, checkpoint_id) 为身份提交 checkpoint（实现 runner.Store）。
-// commit_seq 来自 task_progress 的行锁（规格 §7.2）。锁顺序：tasks → task_progress → task_event_seq。
+// 已存在的 ID 只比较内容并返回原结果（规格 §5.5 第 3 条）；新 checkpoint 在同一事务内检查
+// fencing（提交者是当前 attempt 且访问有效）与引用授权（refs、state_ref 已保存并授权到当前 scope），
+// 不通过时指针与事件都不改变。commit_seq 来自 task_progress 的行锁（规格 §7.2）。
+// 锁顺序：tasks → task_progress → task_event_seq → attempt_access。
 func (s *Store) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runner.CommittedCheckpoint, error) {
 	if c.Scope.Kind != "task" || c.Scope.ID == "" {
 		return runner.CommittedCheckpoint{}, invalidf("M1 只支持 task 范围的 checkpoint，得到 %+v", c.Scope)
@@ -3786,6 +4148,12 @@ func (s *Store) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runn
 		case !errors.Is(err, pgx.ErrNoRows):
 			return err
 		}
+		if err := fenceAttempt(ctx, tx, c.Scope.ID, c.AttemptID); err != nil {
+			return err
+		}
+		if err := authorizeRefs(ctx, tx, c); err != nil {
+			return err
+		}
 		refs, _ := json.Marshal(nonNil(c.Refs))
 		if _, err := tx.Exec(ctx, `INSERT INTO checkpoints (scope_kind, scope_id, checkpoint_id, commit_seq, attempt_id, step_id,
 				content_hash, state_inline, state_ref, refs_json)
@@ -3811,6 +4179,53 @@ func (s *Store) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runn
 	return out, err
 }
 
+// fenceAttempt 要求 attemptID 是任务的当前 attempt 且其访问仍为 active；调用方已持有任务行锁，
+// 因此检查到提交之间 current_attempt_id 不会改变。
+func fenceAttempt(ctx context.Context, tx pgx.Tx, taskID, attemptID string) error {
+	var current *string
+	var access string
+	err := tx.QueryRow(ctx, `SELECT t.current_attempt_id, COALESCE(aa.state, '') FROM tasks t
+		LEFT JOIN attempt_access aa ON aa.task_id = t.task_id AND aa.attempt_id = $2 WHERE t.task_id = $1`,
+		taskID, attemptID).Scan(&current, &access)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return notFoundf("任务 %s", taskID)
+	}
+	if err != nil {
+		return err
+	}
+	if current == nil || *current != attemptID || access != "active" {
+		return rejectf(persistence.CodeStaleAttempt, "attempt %s 不是任务 %s 的当前 attempt，或访问已撤销", attemptID, taskID)
+	}
+	return nil
+}
+
+// authorizeRefs 要求 checkpoint 引用的每个 sha256 都已保存并授权到当前 scope（规格 §5.5 第 2 条）：
+// scope 由宿主按 attempt → task 推导（session 在 M4 加入），不接受其他任务的 blob。
+func authorizeRefs(ctx context.Context, tx pgx.Tx, c runner.Checkpoint) error {
+	refs := append([]string(nil), c.Refs...)
+	if c.StateRef != "" {
+		refs = append(refs, c.StateRef)
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+	rows, err := tx.Query(ctx, `SELECT r FROM unnest($1::text[]) AS r WHERE NOT EXISTS (
+		SELECT 1 FROM scope_blobs sb WHERE sb.sha256 = r AND
+			((sb.scope_kind = 'attempt' AND sb.scope_id = $2) OR (sb.scope_kind = 'task' AND sb.scope_id = $3)))`,
+		refs, c.AttemptID, c.Scope.ID)
+	if err != nil {
+		return err
+	}
+	missing, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	if len(missing) > 0 {
+		return rejectf(persistence.CodeRefNotAuthorized, "引用 %v 不存在或未授权到任务 %s", missing, c.Scope.ID)
+	}
+	return nil
+}
+
 // QueryCheckpoint 读取已提交的 checkpoint（实现 runner.Store）。
 func (s *Store) QueryCheckpoint(ctx context.Context, scope runner.Scope, checkpointID string) (runner.CommittedCheckpoint, error) {
 	var out runner.CommittedCheckpoint
@@ -3833,7 +4248,8 @@ func selectCheckpoint(ctx context.Context, q queryer, scope runner.Scope, checkp
 }
 
 // RegisterArtifact 登记已写入 BlobStore 的产物（实现 runner.Store）。以 (task, artifact, sha256)
-// 为身份；版本来自 artifact_heads 的行锁（规格 §7.2）。锁顺序：tasks → task_event_seq → artifact_heads。
+// 为身份；新登记要求提交者是当前 attempt 且访问有效（与 checkpoint 相同的 fencing）。版本来自
+// artifact_heads 的行锁（规格 §7.2）。锁顺序：tasks → task_event_seq → attempt_access → artifact_heads。
 func (s *Store) RegisterArtifact(ctx context.Context, a runner.Artifact) (runner.ArtifactVersion, error) {
 	if a.TaskID == "" || a.ArtifactID == "" || a.AttemptID == "" || len(a.SHA256) != 64 || a.Size < 0 || a.MediaType == "" {
 		return runner.ArtifactVersion{}, invalidf("RegisterArtifact 缺少字段或 sha256 不合法")
@@ -3855,6 +4271,9 @@ func (s *Store) RegisterArtifact(ctx context.Context, a runner.Artifact) (runner
 			return nil
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if err := fenceAttempt(ctx, tx, a.TaskID, a.AttemptID); err != nil {
 			return err
 		}
 		if err := recordBlob(ctx, tx, a); err != nil {
@@ -4089,9 +4508,7 @@ Expected: `ok`。
 - [ ] **Step 5：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add internal/persistence/postgres/runner.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): runner 事务用例——Worker 事件逐条内容校验、checkpoint、产物、终态提议
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+cd /f/go-agentbox-m1-4 && git add internal/persistence/postgres/runner.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): runner 事务用例——Worker 事件逐条内容校验、checkpoint、产物、终态提议" -m "$COAUTHOR"
 ```
 
 ---
@@ -4582,9 +4999,7 @@ Expected: 两个包 `ok`。
 - [ ] **Step 5：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add internal/persistence/postgres/resource.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): resource 事务用例——意图、UID 范围分配代次、停止与清理的单调更新
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+cd /f/go-agentbox-m1-4 && git add internal/persistence/postgres/resource.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): resource 事务用例——意图、UID 范围分配代次、停止与清理的单调更新" -m "$COAUTHOR"
 ```
 
 ---
@@ -4635,9 +5050,7 @@ Expected: 全部包 `ok` 或 `[no test files]`。
 - [ ] **Step 3：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add .github/workflows/ci.yml && git commit -m "ci: correctness 与 linux-integration 作业加入 PostgreSQL 服务
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+cd /f/go-agentbox-m1-4 && git add .github/workflows/ci.yml && git commit -m "ci: correctness 与 linux-integration 作业加入 PostgreSQL 服务" -m "$COAUTHOR"
 ```
 
 ---
@@ -4655,8 +5068,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ## 自查记录
 
-- **设计覆盖**：设计 §1.1 依赖规则 → Task 1 archtest；§1.2 所有权三分 → Task 2、3、4；§1.3 表结构 → Task 4 迁移；§1.4 接口批次 → Task 1（接口）与 Task 5–7（实现），`recovery.Store` 明确交给 Plan 6；§2.1–§2.3 事务辅助与未知提交 → Task 4 `run`/`final` 与测试，Task 5 的"第一次提交未完成"；§2.4 每个用例的身份与内容比较 → Task 5–7 的实现与"提交回复丢失""冲突"测试；§3.1 事件 → Task 5、6；§3.2 BlobStore → Task 2；§3.3 E46 → Task 3、4；§3.4 E13 存储部分 → Task 4；§3.5 迁移 → Task 4；§4 测试与环境 → Task 4、8。
+- **设计覆盖**：设计 §1.1 依赖规则 → Task 1 archtest；§1.2 所有权三分 → Task 2、3、4；§1.3 表结构 → Task 4 迁移；§1.4 接口批次 → Task 1（接口）与 Task 5–7（实现），`recovery.Store` 明确交给 Plan 6；§2.1–§2.3 事务辅助与未知提交 → Task 4 `run`/`final` 与测试，Task 5 的"第一次提交未完成"；§2.4 每个用例的身份与内容比较 → Task 5–7 的实现与"提交回复丢失""冲突"测试；§2.6 前置条件 → Task 5（控制写入、准入、判决仲裁）与 Task 6（checkpoint 与产物的 fencing、引用授权）；§3.1 事件 → Task 5、6；§3.2 BlobStore → Task 2；§3.3 E46 → Task 3、4；§3.4 E13 存储部分 → Task 4；§3.5 迁移 → Task 4；§4 测试与环境 → Task 4、8。
 - **验收归属**：E11a（Task 5–7 的提交回复丢失）、E12 存储部分（Task 4 死锁重跑）、E13 存储部分（Task 4 失锁）、E46（Task 3、4）。
-- **演练**：本计划的全部代码已在临时 worktree 中按计划文本组装，并在 WSL + Docker Desktop 的 PostgreSQL 16.15 上运行：全仓库 `go build`（Linux 与 Windows）、`go vet`、`CI=true go test ./...` 通过；`internal/persistence/postgres` 连续三次通过；Task 4、5、6、7 各阶段的代码树分别通过；变异检查——去掉 `CreateAttempt` 的事务内身份仲裁、让终态提议静默忽略不同内容、跳过 Worker 事件的逐条内容比较、不重跑死锁中止——均被对应测试捕获；失锁检测延迟约 100 ms（检测周期 200 ms 时）。
+- **演练**：本计划的全部代码已在临时 worktree 中按计划文本组装，并在 WSL + Docker Desktop 的 PostgreSQL 16.15 上运行：全仓库 `go build`（Linux 与 Windows）、`go vet`、`CI=true go test ./...` 通过；`internal/persistence/postgres` 连续三次通过；Task 4、5、6、7 各阶段的代码树分别通过；变异检查——去掉 `CreateAttempt` 的事务内身份仲裁、让终态提议静默忽略不同内容、跳过 Worker 事件的逐条内容比较、不重跑死锁中止——均被对应测试捕获；评审修订后又逐个去掉 9 条前置条件规则（checkpoint 的 fencing、引用授权，产物的 fencing，判决的当前 attempt、控制版本、desired 约束，attempt 准入、"准入先于幂等查询"的错误顺序，控制写入规则），均被捕获；失锁检测延迟约 100 ms（检测周期 200 ms 时）。
 - **未在本地验证**：golangci-lint（本机未安装，由 CI 判定）。
-- **占位符**：无。
+- **评审修订（第三轮）**：checkpoint 缺少 fencing 与引用授权、最终判决未在锁内仲裁取消与当前 attempt、创建 attempt 缺少准入前置条件——均为规格 §5.5、§8.1 的实现遗漏，已按设计 §2.6 并入 Task 5、6，并补测试。同类遗漏 `AcceptControl` 的控制写入规则（`task_ended` 等）一并补上，"判决先提交"的测试依赖它。设计文档的 pgx 版本已统一为 v5.7.6；提交署名改为执行者按实际参与者填写。
+- **占位符**：无（`$COAUTHOR` 是执行者设置的环境变量，不是计划占位符）。
