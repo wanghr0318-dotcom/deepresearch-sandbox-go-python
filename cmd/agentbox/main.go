@@ -31,6 +31,12 @@ func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "task" || os.Args[1] == "status") {
 		os.Exit(cli.Run(os.Args[1:], os.Stdout, os.Stderr))
 	}
-	fmt.Fprintln(os.Stderr, "用法: agentbox doctor | task ... | status")
+	if len(os.Args) > 1 && os.Args[1] == "server" {
+		os.Exit(runServer(os.Args[2:], os.Stderr))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "verify-invariants" {
+		os.Exit(runVerify(os.Args[2:], os.Stdout, os.Stderr))
+	}
+	fmt.Fprintln(os.Stderr, "用法: agentbox doctor | server ... | verify-invariants [--quiescent] ... | task ... | status")
 	os.Exit(2)
 }

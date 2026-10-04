@@ -443,6 +443,36 @@ func TestCreateTaskIdempotency(t *testing.T) {
 	}
 }
 
+// TestCreateTaskValidateLimits：装配提供的 ValidateLimits 拒绝的 limits → 400 invalid_limits，且不创建任务；
+// 省略 limits 时不调用校验。
+func TestCreateTaskValidateLimits(t *testing.T) {
+	var seen []string
+	ts := newTestServer(t, func(c *Config) {
+		c.ValidateLimits = func(l json.RawMessage) error {
+			seen = append(seen, string(l))
+			var v struct {
+				MemoryMax int64 `json:"memory_max"`
+			}
+			if err := json.Unmarshal(l, &v); err != nil || v.MemoryMax > 1024 {
+				return errors.New("memory_max 超过总内存")
+			}
+			return nil
+		}
+	})
+	st, b, _ := ts.do("POST", "/tasks", `{"request_id":"r1","spec":{},"limits":{"memory_max":4096}}`, nil)
+	expect(t, st, b, 400, "invalid_limits")
+	if n := len(ts.store.order); n != 0 {
+		t.Fatalf("被拒绝的请求创建了任务：共 %d 个", n)
+	}
+	st, b, _ = ts.do("POST", "/tasks", `{"request_id":"r2","spec":{},"limits":{"memory_max":512}}`, nil)
+	expect(t, st, b, 201, "")
+	st, b, _ = ts.do("POST", "/tasks", `{"request_id":"r3","spec":{}}`, nil)
+	expect(t, st, b, 201, "")
+	if want := []string{`{"memory_max":4096}`, `{"memory_max":512}`}; !slices.Equal(seen, want) {
+		t.Fatalf("ValidateLimits 收到 %q，期望 %q", seen, want)
+	}
+}
+
 func TestCreateTaskCommitUnknownResolvedByRequestRecord(t *testing.T) {
 	ts := newTestServer(t, nil)
 	ts.store.commitThenUnknown = true

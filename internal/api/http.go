@@ -71,6 +71,10 @@ type Config struct {
 	PollInterval time.Duration
 	// NewTaskID 生成任务 ID；nil 时使用 128 位随机数。
 	NewTaskID func() string
+	// ValidateLimits 可选：创建任务时校验请求中的 limits（省略 limits 时不调用）；返回错误时以
+	// 400 invalid_limits 拒绝。装配代码据此拒绝永远无法满足容量的限额（例如 memory_max 超过总内存），
+	// 使 actor 申请槽位时不会遇到 admission.ErrExceedsCapacity。
+	ValidateLimits func(limits json.RawMessage) error
 }
 
 // Handler 实现 api/openapi.yaml 描述的 REST 与 SSE 接口。
@@ -496,6 +500,12 @@ func (h *Handler) createTask(w http.ResponseWriter, r *http.Request) {
 	if len(body.Limits) > 0 && !isJSONObject(body.Limits) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "limits 须为 JSON 对象")
 		return
+	}
+	if len(body.Limits) > 0 && h.cfg.ValidateLimits != nil {
+		if err := h.cfg.ValidateLimits(body.Limits); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_limits", err.Error())
+			return
+		}
 	}
 	canon, err := canonicalJSON(body)
 	if err != nil {
