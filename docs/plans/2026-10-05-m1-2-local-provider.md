@@ -185,7 +185,7 @@ func (r *Registry) Reap() error                       // 循环 Wait4(-1, WNOHAN
 
 **Interfaces：** `func Serve(ctx context.Context, conn *Conn, reg *Registry, l Launcher) error`——处理 `start`（经 `Registry.Start`，失败回 `start_err{reason}`）、`terminate{exec_id, grace_ms}`（向进程组发 SIGTERM，计时器到期发 SIGKILL，期间继续服务）、SIGCHLD 触发 `Reap`；控制连接断开时返回（init 随之退出，环境内进程由 cgroup 回收）。
 
-**规则：** 不解析 workload 输出；`terminate` 对未知 `exec_id` 忽略；多个 exec 并行；不依赖 Pdeathsig。
+**规则：** 不解析 workload 输出；`terminate` 对未知 `exec_id` 忽略；多个 exec 并行；不依赖 Pdeathsig。`start` 的 spec 以 `sandbox.StartSpec{Argv, Env, Dir}` 解码（与宿主侧共用的唯一定义，执行中修订）；init 收到 `start`/`terminate` 以外的消息为协议错误。
 
 **Tests**（以测试进程作为 init、`socketpair` 作为控制通道、直接 exec 的 Launcher）：`start` → 收到 `start_ack{pid}` 后收到 `exit{code}`；Launcher 失败 → `start_err`，无 `start_ack`；`terminate` 对忽略 SIGTERM 的进程在 grace 到期后 SIGKILL（`exit.signal = SIGKILL`）；两个并行 exec 各自收到 `exit`；宿主端关闭后 `Serve` 返回。
 

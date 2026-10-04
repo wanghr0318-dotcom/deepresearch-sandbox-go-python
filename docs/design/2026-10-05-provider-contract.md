@@ -129,7 +129,7 @@ ResourceDiag(ctx, envID string) (ResourceDiag, error)
 | `ErrForeign` | 目录存在但 owner.json 缺失、损坏或属于其他安装 | 不自动销毁：写 `quarantined_resources` 并报警（§14.1 表） |
 | `ErrStopping` | 环境的执行闸门已关闭（第 5 节），不再接受新的执行 | attempt 不启动；按停止流程处理 |
 | `*StartError{Reason}`（`ErrStartFailed`） | init 回复 `start_err`：启动序列某步失败，workload 未运行 | attempt 失败（启动失败类）；`Reason` 文本由 Plan 1B 的结论确定，本契约只规定"workload 未运行" |
-| `ErrControlLost` | ACK 前控制连接断开（§4.2） | attempt 失败，停止并拆除环境；不重试 `StartExec` |
+| `ErrControlLost` | 控制连接断开：ACK 前（§4.2，启动结果未知）或 ACK 后由 `Wait` 返回（退出状态未知） | attempt 按 `control_lost` 分类（§14.3），停止并拆除环境；不重试 `StartExec` |
 | `ErrStopUnconfirmed` | 期限内未确认执行树清空 | `stop_blocked`，占用槽位，阻止替代执行（§8.2） |
 | `ErrNotStopped` | `Destroy` 的前置条件不成立 | 先 `Stop` |
 | ctx 错误 | 调用方取消或期限到期 | 按第 3 节各操作的取消语义处理 |
