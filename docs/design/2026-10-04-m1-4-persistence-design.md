@@ -56,6 +56,7 @@
 | `ErrUnavailable` | 连接失败或 deadline 到期，且已确认未提交 | 是 |
 | `ErrCommitUnknown` | 提交结果未知；携带操作身份 | 是 |
 | `ErrConflict` | 同一身份已存在且内容不同，或 CAS 前置条件不成立 | 否 |
+| `ErrRejected`（`*RejectedError{Code}`） | 事务内读取的最新事实不满足用例前置条件（§2.6）；`Code` 为 `task_ended`、`cancel_pending`、`not_paused`、`not_runnable`、`previous_not_stopped`、`stale_attempt`、`control_changed`、`ref_not_authorized` | 否 |
 
 ### 2.3 未知提交结果：查不到不等于没提交
 
@@ -73,7 +74,7 @@
 | `api.CreateTask` / `api.AcceptControl` | `request_id` | `body_hash`；同 ID 不同哈希 → `ErrConflict`（`request_conflict`） | `api.GetRequest(request_id)` |
 | `task.CreateAttempt` | 事务前生成的 `attempt_id`；另有 UNIQUE(`task_id`, `attempt_no`) | `task_id`、`attempt_no`、`env_id` 全部一致 | `task.GetAttempt(attempt_id)` |
 | `task.ApplyControl` | (`task_id`, 目标 `control_version`) | `applied_control_version` 的 CAS：已 ≥ 目标即已应用 | `task.GetControlState(task_id)` |
-| `task.FinalizeAttempt` | `attempt_id` 的判决 | **完整判决内容**的哈希（状态、`outcome_class`、退出码与信号、OOM 诊断、`platform_killed`、任务终态、结果、终态事件）存于 `attempts.verdict_hash`；完全一致才返回原结果，仅"都是 failed"不算一致。取消与正常完成的竞争仍按锁内仲裁规则决定最终判决 | `task.GetAttempt(attempt_id)` 返回 `verdict_hash` |
+| `task.FinalizeAttempt` | `attempt_id` 的判决 | **完整判决内容**的哈希（状态、`outcome_class`、退出码与信号、OOM 诊断、`platform_killed`、任务终态、结果、终态事件）存于 `attempts.verdict_hash`；完全一致才返回原结果，仅"都是 failed"不算一致。另含判决依据的 `control_version`；取消与正常完成的竞争按 §2.6 在锁内仲裁 | `task.GetAttempt(attempt_id)` 返回 `verdict_hash` |
 | `runner.CommitCheckpoint` | (`scope_kind`, `scope_id`, `checkpoint_id`) | `content_hash` | `runner.QueryCheckpoint(scope, checkpoint_id)` |
 | `runner.RegisterArtifact` | (`task_id`, `artifact_id`, `sha256`) | 同一身份即同一内容（sha256 已是内容） | `runner.GetArtifact(task_id, artifact_id, sha256)` |
 | `runner.AppendWorkerEvents` | (`attempt_id`, `worker_seq`)，唯一 | 每条事件的 `content_hash`（类型与原始载荷的哈希）。规则见 §3.1 | `runner.WorkerEventWatermark(attempt_id)`：连续水位，仅用于优化，不替代逐条内容校验 |
@@ -92,6 +93,21 @@
 - **死锁（E12 存储部分）**：两事务经屏障违反锁顺序形成环，断言中止被重跑、两者最终都提交。
 - **争用**：持有行锁使用例得到 `ErrContention`；deadline 用尽返回带身份的 `ErrCommitUnknown`。
 - 各用例的"同身份不同内容"冲突用例；事件"同序号不同内容"与"部分重叠批次"用例。
+- **前置条件（§2.6）**：取消后创建 attempt、旧环境未停止时创建、创建后重复请求返回原结果；取消先提交（过期判决被拒绝、按最新控制重算）、判决先提交（随后的取消被拒绝）、旧 attempt 的迟到判决；旧 attempt、其他任务的 blob、不存在的 blob 提交 checkpoint；每个拒绝都断言任务的状态、指针、事件与产物均未改变。
+
+### 2.6 前置条件在同一事务内检查
+
+身份比较只回答"这次写入是否已经发生过"；写入是否**允许**发生，取决于持有锁后读到的最新事实。规格 §5.5 与 §8.1 的前置条件因此都在同一事务内检查，不留给调用方（actor、runner）在事务外判断——那样检查与提交之间仍有竞争窗口。顺序固定为：**先按身份查询（已存在则比较内容并返回原结果），再检查前置条件，最后写入**。这样提交结果未知后的重跑仍得到原结果，即使前置条件此时已不再成立（例如 attempt 创建后任务已是 `running`）。
+
+| 用例 | 持锁后检查 | 不满足 |
+|---|---|---|
+| `api.AcceptControl` | 任务非终态；已接受的 cancel 不被 pause/resume 覆盖；resume 要求 `paused` | `task_ended`、`cancel_pending`、`not_paused`；请求记录随事务回滚，不留下 |
+| `task.CreateAttempt` | 任务 `queued`；`desired = run`；该任务所有旧环境 `stopped_at` 已记录；然后 CAS `queued → running` | `not_runnable`、`previous_not_stopped` |
+| `task.FinalizeAttempt` | 提交者是 `current_attempt_id`；`Verdict.ControlVersion` 等于当前 `control_version`；任务终态与 `desired` 相符（cancel → `cancelled`，pause → `paused`，run → `succeeded`/`failed`/`queued`） | `stale_attempt`；`control_changed`（调用方按最新控制重算后再提交）；与 desired 不符为调用方编程错误 |
+| `runner.CommitCheckpoint` | 提交者是当前 attempt 且 `attempt_access` 为 `active`；`refs[]` 与 `state_ref` 的每个 sha256 都在 `scope_blobs` 中授权到当前 attempt 或当前 task | `stale_attempt`、`ref_not_authorized`；指针与事件不改变 |
+| `runner.RegisterArtifact` | 与 checkpoint 相同的 fencing | `stale_attempt` |
+
+锁顺序随之为：`tasks → task_control → task_progress → task_event_seq → attempts → attempt_access → environments`（规格 §7.1）。`AppendWorkerEvents` 与 `RecordTerminalProposal` 只写该 attempt 自己的行，不影响任务级指针与输出，本计划不加 fencing；它们迟到的写入由 runner 停止读取与访问撤销约束（Plan 5）。
 
 ## 3. 事件、BlobStore、安装引导与失锁
 
@@ -130,6 +146,6 @@
 
 - 测试布局遵循代码组织设计 §9.3：每个 Go 包一个 `*_test.go`。
 - 数据库测试读取 `AGENTBOX_TEST_DATABASE_URL`，每个测试建立独立的临时数据库并在结束时删除。本地未设置时跳过并明确提示；CI 中（`CI=true`）未设置则失败，不允许静默跳过。
-- 本地：Docker Desktop 上的 `postgres:16-alpine`，WSL 经 `127.0.0.1:5432` 访问；Go 依赖（pgx v5.11.0 及其依赖）经本地文件代理离线获取。
+- 本地：Docker Desktop 上的 `postgres:16-alpine`，WSL 经 `127.0.0.1:5432` 访问；Go 依赖（pgx v5.7.6 及其依赖；v5.8 起要求 Go ≥ 1.24，与项目的 Go 1.23 下限不符）经本地文件代理离线获取。
 - CI：Go 作业增加 `postgres:16-alpine` 服务容器并设置上述环境变量。
 - 不以 fake 代替数据库验收；fake 只用于消费者的决策逻辑测试（Plan 5 起）。
