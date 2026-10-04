@@ -161,6 +161,7 @@ func (x envAdapter) CreateEnv(ctx context.Context, s task.EnvSpec) (*task.Outcom
 		return classifyCreate(ctx, err), err
 	}
 	ws := workspaceDir(x.dataDir, s.TaskID)
+	// 已知的 M1 缺口：任务 workspace 没有清理所有者，任务结束后不会删除。
 	if err := os.MkdirAll(ws, 0o700); err != nil {
 		err = fmt.Errorf("app: 建立任务 workspace: %w", err)
 		return classifyCreate(ctx, err), err

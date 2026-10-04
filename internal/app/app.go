@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -571,11 +572,24 @@ func (s *server) startExecution(r recovery.Report) error {
 	}()
 	s.step("cleanup_loop")
 
+	h := stopBlockedHandoff(r)
 	sched := task.NewScheduler(s.workCtx, s.taskDeps)
-	if err := sched.Start(stopBlockedHandoff(r)); err != nil {
+	if err := sched.Start(h.opts); err != nil {
 		return fmt.Errorf("app: 启动 actor: %w", err)
 	}
 	s.sched.Store(sched)
+	// 交给 actor 的任务若没有建立 actor（任务已终态，ListActiveTasks 不返回），其环境同样由后台重试停止。
+	// stop_blocked 的 actor 在确认停止并归还槽位之前不会退出，因此此时没有 actor 即未建立。
+	orphans := h.orphans
+	for taskID, env := range h.actorEnv {
+		if sched.Actor(taskID) == nil {
+			orphans = append(orphans, orphanStop{EnvID: env, Grant: h.grants[taskID], HasGrant: true})
+		}
+	}
+	for _, o := range orphans {
+		s.bg.Add(1)
+		go s.stopRetrier(o)
+	}
 	s.step("scheduler")
 	return nil
 }
@@ -583,27 +597,113 @@ func (s *server) startExecution(r recovery.Report) error {
 // stopBlockedHandoff 把恢复报告转换为 Scheduler 的启动选项：Excluded 的任务不建立 actor；当前 attempt
 // 的环境未确认停止（步骤状态 stop_blocked）的任务以 stop_blocked 启动 actor，并以恢复为它重建的占用
 // （Occupied 中同一任务的授予）作为已持有的槽位。
-func stopBlockedHandoff(r recovery.Report) task.StartOptions {
-	opts := task.StartOptions{StopBlocked: map[string]task.SlotGrant{}, Excluded: r.Excluded}
+//
+// 其余 stop_blocked 的环境（所属任务已终态、被排除，或不是任务当前 attempt 的环境）没有 actor 负责：
+// 作为 orphans 返回，由后台重试停止（stopRetrier）。每个环境取一份 Occupied 中的授予（同一任务的，
+// 否则无任务的），确认停止后归还。recovery 的占用是每个环境一份、按任务计内存，报告没有环境到授予的
+// 映射；同一任务（或同为无任务）的授予在计数与内存上等价，取哪一份不影响 admission 的账。
+func stopBlockedHandoff(r recovery.Report) handoff {
+	h := handoff{opts: task.StartOptions{StopBlocked: map[string]task.SlotGrant{}, Excluded: r.Excluded},
+		actorEnv: map[string]string{}, grants: map[string]admission.Grant{}}
 	excluded := map[string]bool{}
 	for _, id := range r.Excluded {
 		excluded[id] = true
 	}
-	grants := map[string]admission.Grant{}
+	pool := map[string][]admission.Grant{}
 	for _, g := range r.Occupied {
-		if _, ok := grants[g.TaskID]; !ok && g.TaskID != "" {
-			grants[g.TaskID] = g
-		}
+		pool[g.TaskID] = append(pool[g.TaskID], g)
 	}
+	take := func(keys ...string) (admission.Grant, bool) {
+		for _, k := range keys {
+			if gs := pool[k]; len(gs) > 0 {
+				pool[k] = gs[1:]
+				return gs[0], true
+			}
+		}
+		return admission.Grant{}, false
+	}
+	envTask := map[string]string{}
 	for _, st := range r.Steps {
-		if st.Status != recovery.StepStopBlocked || st.TaskID == "" || excluded[st.TaskID] {
+		if st.EnvID != "" && st.TaskID != "" {
+			envTask[st.EnvID] = st.TaskID
+		}
+		// 当前 attempt 的环境未确认停止（settle 步骤 stop_blocked）：交给该任务的 actor。
+		settle := st.Kind == reconcile.MarkAttemptLost || st.Kind == reconcile.CancelTask || st.Kind == reconcile.PauseTask
+		if !settle || st.Status != recovery.StepStopBlocked || st.TaskID == "" || st.EnvID == "" || excluded[st.TaskID] {
 			continue
 		}
-		if g, ok := grants[st.TaskID]; ok {
-			opts.StopBlocked[st.TaskID] = slotGrant(g)
+		if _, done := h.actorEnv[st.TaskID]; done {
+			continue
+		}
+		if g, ok := take(st.TaskID); ok {
+			h.opts.StopBlocked[st.TaskID] = slotGrant(g)
+			h.actorEnv[st.TaskID] = st.EnvID
+			h.grants[st.TaskID] = g
 		}
 	}
-	return opts
+	handled := map[string]bool{}
+	for _, env := range h.actorEnv {
+		handled[env] = true
+	}
+	for _, env := range r.StopBlocked {
+		if handled[env] {
+			continue
+		}
+		handled[env] = true
+		g, ok := take(envTask[env], "")
+		h.orphans = append(h.orphans, orphanStop{EnvID: env, Grant: g, HasGrant: ok})
+	}
+	return h
+}
+
+// handoff 是恢复报告交给执行的部分。
+type handoff struct {
+	opts     task.StartOptions
+	actorEnv map[string]string          // 任务 → 交给其 actor 的环境
+	grants   map[string]admission.Grant // 任务 → 交给其 actor 的授予
+	orphans  []orphanStop
+}
+
+// orphanStop 是没有 actor 负责的 stop_blocked 环境及其占用。
+type orphanStop struct {
+	EnvID    string
+	Grant    admission.Grant
+	HasGrant bool
+}
+
+// stopRetrier 停止没有 actor 负责的 stop_blocked 环境（§14.1"停止失败"：占用容量、退避重试）：按
+// task.RetryBackoff 的退避（基数 2 s、上限 60 s、抖动）调用 Coordinator.StopEnv，直到结果为 Recorded，
+// 然后经 admission 归还其授予，清理交给 cleanup loop。Blocked、Stopped 而未 Recorded（Store 不可用）
+// 与错误都继续占用并重试。在 Run 的生命周期内运行，停止时随 workCtx 结束。
+func (s *server) stopRetrier(o orphanStop) {
+	defer s.bg.Done()
+	for try := int64(0); ; try++ {
+		r, err := s.coord.StopEnv(s.workCtx, o.EnvID)
+		if s.workCtx.Err() != nil {
+			return
+		}
+		if err == nil && r.Recorded {
+			if o.HasGrant {
+				s.adm.Release(o.Grant)
+			}
+			s.log.Info("stop_blocked 环境已确认停止，归还占用", "env_id", o.EnvID, "grant_id", o.Grant.ID, "tries", try+1)
+			return
+		}
+		if errors.Is(err, persistence.ErrOwnershipLost) {
+			s.fail(err)
+			return
+		}
+		detail := "停止无法确认"
+		if err != nil {
+			detail = err.Error()
+		} else if r.Stopped {
+			detail = "停止已确认，stopped_at 尚未持久化"
+		}
+		s.log.Warn("stop_blocked 环境停止未完成，退避重试", "env_id", o.EnvID, "detail", detail, "try", try)
+		if !s.sleep(s.workCtx, task.RetryBackoff(try, mrand.Float64())) {
+			return
+		}
+	}
 }
 
 // alert 以结构化错误日志发出报警（M1 的报警出口），再记录已报警（I8）；标记失败时在后台按退避重试。

@@ -183,9 +183,11 @@ type harness struct {
 	logs       bytes.Buffer
 	addr       chan string
 	recovered  chan recovery.Report
-	scanGate   chan struct{} // 非 nil 时 Scan 等待它关闭
-	panicTask  atomic.Value  // string：该任务（"*" 为任何任务）的 CreateAttempt panic
-	failMarks  atomic.Int32  // 接下来这么多次 MarkQuarantineAlerted 返回 ErrUnavailable
+	scanGate   chan struct{}  // 非 nil 时 Scan 等待它关闭
+	stopFails  map[string]int // 环境 → 接下来这么多次 Stop 返回 ErrStopUnconfirmed（mu 保护）
+	stopCalls  map[string]int // 环境 → Stop 调用次数（mu 保护）
+	panicTask  atomic.Value   // string：该任务（"*" 为任何任务）的 CreateAttempt panic
+	failMarks  atomic.Int32   // 接下来这么多次 MarkQuarantineAlerted 返回 ErrUnavailable
 	cancel     context.CancelFunc
 	result     chan error
 	resultSeen bool
@@ -445,6 +447,30 @@ func (p recProvider) Scan(ctx context.Context) (provider.ScanReport, error) {
 		}
 	}
 	return p.Provider.Scan(ctx)
+}
+
+// Stop 记录每个环境的调用次数；stopFails 中的环境在剩余次数内返回 ErrStopUnconfirmed。
+func (p recProvider) Stop(ctx context.Context, envID string) error {
+	p.h.mu.Lock()
+	if p.h.stopCalls == nil {
+		p.h.stopCalls = map[string]int{}
+	}
+	p.h.stopCalls[envID]++
+	fail := p.h.stopFails[envID] > 0
+	if fail {
+		p.h.stopFails[envID]--
+	}
+	p.h.mu.Unlock()
+	if fail {
+		return provider.ErrStopUnconfirmed
+	}
+	return p.Provider.Stop(ctx, envID)
+}
+
+func (h *harness) stops(envID string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.stopCalls[envID]
 }
 
 // ---- HTTP ----
@@ -743,9 +769,9 @@ func TestRecoveryHandoff(t *testing.T) {
 	if !slices.Equal(rep.Excluded, []string{"task-x"}) || !slices.Contains(rep.StopBlocked, "env-y1") {
 		t.Fatalf("恢复报告 Excluded=%q StopBlocked=%q", rep.Excluded, rep.StopBlocked)
 	}
-	opts := stopBlockedHandoff(rep)
-	if g, ok := opts.StopBlocked["task-y"]; len(opts.StopBlocked) != 1 || !ok || g.TaskID != "task-y" || g.ID == 0 {
-		t.Fatalf("stop_blocked 交接 %+v", opts.StopBlocked)
+	ho := stopBlockedHandoff(rep)
+	if g, ok := ho.opts.StopBlocked["task-y"]; len(ho.opts.StopBlocked) != 1 || !ok || g.TaskID != "task-y" || g.ID == 0 || len(ho.orphans) != 0 {
+		t.Fatalf("stop_blocked 交接 %+v，无 actor 的环境 %+v", ho.opts.StopBlocked, ho.orphans)
 	}
 	// 报警：两个隔离项都已标记（其中第一次标记失败、在后台重试）。
 	eventually(t, "隔离项都已标记报警", nil, func() bool {
@@ -795,6 +821,83 @@ func TestRecoveryHandoff(t *testing.T) {
 	if s, n := h.taskStatus("task-x"); s != "running" || n != 0 {
 		t.Fatalf("被排除的 task-x 为 %s/%d：不应有 actor", s, n)
 	}
+	h.cancel()
+	if err := h.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
+}
+
+// TestOrphanStopBlockedRetried：任务已终态、环境未确认停止（没有 actor 负责）→ 装配的后台重试按退避
+// 调用 StopEnv，直到 Recorded 才归还其占用（唯一的 run slot），之后 cleanup loop 清理该环境。
+func TestOrphanStopBlockedRetried(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	st, err := postgres.Open(ctx, postgres.Options{DSN: h.dsn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	installID, err := ownership.Bootstrap(ctx, st, datadir.NewIDFile(h.dir), datadir.NewTokenFile(h.dir),
+		func() string { return "inst-orphan" }, func() ([]byte, error) { return make([]byte, datadir.TokenSize), nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateTask(ctx, api.CreateTaskRequest{RequestID: "req-t", BodyHash: []byte{1}, TaskID: "task-t",
+		Spec: json.RawMessage(`{}`), MaxFaultRetries: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateAttempt(ctx, task.NewAttempt{TaskID: "task-t", AttemptID: "att-t1", AttemptNo: 1, EnvID: "env-t1"}); err != nil {
+		t.Fatal(err)
+	}
+	// 判决已提交（任务终态），但环境的 stopped_at 尚未记录：重启后没有 actor 负责它。
+	if _, err := st.FinalizeAttempt(ctx, task.Verdict{AttemptID: "att-t1", TaskID: "task-t", ControlVersion: 1,
+		FromStatus: "starting", AttemptStatus: "ended", OutcomeClass: "succeeded", TaskStatus: "succeeded",
+		TaskStatusReason: "succeeded", Result: json.RawMessage(`{"summary":"x","outputs":[]}`), EventType: "task_terminal"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.prov.Create(ctx, provider.EnvSpec{EnvID: "env-t1", InstallID: installID, Kind: provider.KindTask,
+		Template: "default", UIDSize: 4096}); err != nil {
+		t.Fatal(err)
+	}
+	const fails = 3 // 第 1 次由恢复执行，其余由后台重试
+	h.stopFails = map[string]int{"env-t1": fails}
+
+	clock := newFakeClock()
+	cfg := testConfig()
+	cfg.Capacity = admission.Capacity{RunSlots: 1, MemoryBytes: 8 << 30}
+	h.start(cfg, clock)
+	rep := h.waitRecovered()
+	base := h.waitAddr()
+	ho := stopBlockedHandoff(rep)
+	if !slices.Contains(rep.StopBlocked, "env-t1") || len(ho.orphans) != 1 || ho.orphans[0].EnvID != "env-t1" ||
+		!ho.orphans[0].HasGrant || len(ho.opts.StopBlocked) != 0 {
+		t.Fatalf("StopBlocked=%q 交接 %+v 无 actor 的环境 %+v", rep.StopBlocked, ho.opts.StopBlocked, ho.orphans)
+	}
+	z := submit(t, base, "rz", `{}`)
+
+	// 每次推进 60 s（不小于任何一次退避）只触发一次重试；停止仍未确认时槽位一直被占用。
+	advance := func() { clock.Advance(time.Minute) }
+	for n := 2; n <= fails; n++ {
+		eventually(t, fmt.Sprintf("第 %d 次停止", n), advance, func() bool { return h.stops("env-t1") >= n })
+		if _, a := h.taskStatus(z); a != 0 {
+			t.Fatalf("第 %d 次停止仍未确认时新任务已创建 %d 个 attempt：占用被提前归还", n, a)
+		}
+	}
+	eventually(t, "确认停止后新任务完成", advance, func() bool { s, _ := h.taskStatus(z); return s == "succeeded" })
+	if n := h.stops("env-t1"); n != fails+1 {
+		t.Fatalf("env-t1 的 Stop 调用 %d 次，期望 %d", n, fails+1)
+	}
+	var before bool
+	h.queryRow(`SELECT e.stopped_at <= a.created_at FROM environments e, attempts a
+		WHERE e.env_id = 'env-t1' AND a.task_id = $1`, []any{z}, &before)
+	if !before {
+		t.Fatal("新任务的 attempt 早于 env-t1 的 stopped_at：占用在 Recorded 之前被归还")
+	}
+	eventually(t, "cleanup loop 清理 env-t1", nil, func() bool {
+		var state string
+		h.queryRow("SELECT cleanup_state FROM environments WHERE env_id = 'env-t1'", nil, &state)
+		return state == "done"
+	})
 	h.cancel()
 	if err := h.wait(); err != nil {
 		t.Fatalf("Run 返回 %v", err)
