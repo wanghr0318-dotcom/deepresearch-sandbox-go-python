@@ -902,15 +902,25 @@ type pinnedRef struct {
 }
 
 // recordProposal 在终态提议到达时保存其内容（BlobStore，Ref 为内容 sha256）并记录提议（规格 §5.7）。
-// result 的 outputs 固定为本 attempt 最近一次保存的 (artifact_id, version, sha256)（规格 §5.6）；
-// 本 attempt 未保存的 artifact_id 只记录 ID。
+// result 的 outputs 固定为本 attempt 最近一次保存的 (artifact_id, version, sha256)（规格 §5.6）；本 attempt
+// 未保存的（恢复后的 attempt 不会重新登记之前保存的产物）固定为该任务中的最新版本；任务中不存在或
+// 查询失败时只记录 ID。
 func (at *attemptRun) recordProposal(ctx context.Context, m protocol.Message) {
 	var content any
 	switch m := m.(type) {
 	case *protocol.Result:
 		outputs := make([]pinnedRef, 0, len(m.Outputs))
 		for _, id := range m.Outputs {
-			p := at.saved[id]
+			p, ok := at.saved[id]
+			if !ok {
+				v, err := at.r.store.LatestArtifact(ctx, at.a.TaskID, id)
+				if !errors.Is(err, persistence.ErrNotFound) {
+					at.noteStore(err)
+				}
+				if err == nil {
+					p = pinnedOutput{Version: v.Version, SHA256: v.SHA256}
+				}
+			}
 			outputs = append(outputs, pinnedRef{ArtifactID: id, Version: p.Version, SHA256: p.SHA256})
 		}
 		content = struct {

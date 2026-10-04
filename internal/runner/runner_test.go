@@ -1002,6 +1002,28 @@ func TestRunnerCases(t *testing.T) {
 		}
 	})
 
+	t.Run("output_saved_by_earlier_attempt_pinned", func(t *testing.T) {
+		c := e.newCase(t, "earlier")
+		old, err := e.blobs.Put(ctx, strings.NewReader("from attempt 1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// 之前的 attempt 保存的产物（同一任务）：本 attempt 不重新登记
+		if _, err := e.store.RegisterArtifact(ctx, runner.Artifact{TaskID: c.taskID, AttemptID: c.att, ArtifactID: "notes",
+			SHA256: old.SHA256, Size: old.Size, MediaType: "text/plain", Visibility: "output"}); err != nil {
+			t.Fatal(err)
+		}
+		out, _ := c.run(t, 0, w(ready(1)), w(result(2, "notes", "absent")))
+		noViolation(t, out)
+		outs := pinned(t, out)
+		if len(outs) != 2 || outs[0]["version"] != float64(1) || outs[0]["sha256"] != old.SHA256 {
+			t.Fatalf("固定的输出 = %v，期望 notes@1", outs)
+		}
+		if _, ok := outs[1]["version"]; ok {
+			t.Fatalf("任务中不存在的产物不应固定版本：%v", outs[1])
+		}
+	})
+
 	t.Run("historical_output_version_pinned", func(t *testing.T) {
 		c := e.newCase(t, "pinned")
 		v1 := c.write(t, "report.md", "v1")
