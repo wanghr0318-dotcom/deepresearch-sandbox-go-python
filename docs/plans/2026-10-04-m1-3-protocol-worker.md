@@ -17,6 +17,7 @@
 - Python **最低版本 3.11**：不使用 3.12+ 语法；CI 必须在 3.11 上实际运行。
 - `agentbox_worker` 只提供运行协议与执行能力，不含研究策略、提示词或 planner；不导入 `sim_worker`（import-linter 检查）。Worker 代码不直接创建子进程（ruff TID251 禁用 `subprocess`、`os.system`、`os.fork`、`os.popen`、`os.exec*`；测试目录除外）。
 - 函数级质量约束见代码组织设计 §9；复杂度检查（Go 的 gocognit 等、Python 的 ruff C90）只报告、不阻断。
+- **测试布局**（代码组织设计 §9.3）：协议契约以 `protocol/fixtures/` 数据为唯一来源，两侧回放；Go 只有 `internal/protocol/protocol_test.go`；Python 只有 `worker/tests/` 下的 `test_protocol.py`、`test_sdk.py`、`test_process.py` 与辅助模块 `protocol_fixtures.py`。后续任务向已有测试文件**末尾追加**一节（以 `# ---- <关注点> ----` 开头，节首导入本节新增的名字），不新建测试文件。只为契约规则与风险路径写测试。
 - **执行环境**：Go 只在 WSL Ubuntu 中运行（`/usr/local/go/bin`）；WSL 无外网，Python 依赖装不进去，因此 **Python 工具链在 Windows 上通过 uv 运行**（uv 0.11、Python 3.13 已就绪），并由 CI 在 Linux 上以 3.11 与 3.13 复核。git 操作在 Git Bash 中进行。工作区为 CRLF：Go 格式检查针对暂存内容；编辑新文件后先 `gofmt -w` / `ruff format`。
 - **执行工作区**：`git worktree add ../go-agentbox-m1-3 -b m1-3-protocol-worker m1-local-provider`。下文路径均以此为准：Windows `F:\go-agentbox-m1-3`，WSL `/mnt/f/go-agentbox-m1-3`，Git Bash `/f/go-agentbox-m1-3`。
 - 提交信息结尾：`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`。只暂存本任务列出的文件，禁止 `git add -A`。
@@ -105,7 +106,7 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
 
 **Files:**
 - Create: `internal/protocol/doc.go`、`limits.go`、`errors.go`、`messages.go`、`validate.go`、`codec.go`
-- Create: `internal/protocol/codec_test.go`、`fixtures_test.go`、`imports_test.go`
+- Create: `internal/protocol/protocol_test.go`（本包唯一的测试文件；Task 2 在末尾追加场景回放）
 - Create: `protocol/fixtures/v1/messages.json`
 - Create: `scripts/dev/gofmt-staged.sh`
 
@@ -198,15 +199,19 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
 
 - [ ] **Step 2：写失败的测试**
 
-`internal/protocol/fixtures_test.go`：
+`internal/protocol/protocol_test.go`：
 
 ```go
 package protocol
 
 import (
 	"encoding/json"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -286,73 +291,45 @@ func TestMessageFixtures(t *testing.T) {
 		})
 	}
 }
-```
-
-`internal/protocol/codec_test.go`：
-
-```go
-package protocol
-
-import (
-	"encoding/json"
-	"strings"
-	"testing"
-)
 
 func checkpointLine(state string, refs []string) []byte {
 	r, _ := json.Marshal(refs)
 	return []byte(`{"type":"checkpoint","v":1,"seq":1,"checkpoint_id":"cp-1","scope":"task","step_id":"s1","state":` + state + `,"refs":` + string(r) + `}`)
 }
 
-func TestDecodeRejectsOversizedEvent(t *testing.T) {
-	line := []byte(`{"type":"progress","v":1,"seq":1,"kind":"x","message":"` + strings.Repeat("a", MaxEventBytes) + `"}`)
-	if _, err := DecodeLine(WorkerToHost, line); CodeOf(err) != CodeMessageTooLarge {
-		t.Fatalf("超长事件应为 %s，得到 %v", CodeMessageTooLarge, err)
-	}
-}
-
-func TestDecodeControlLimitAppliesToNonInit(t *testing.T) {
-	cancel := []byte(`{"type":"cancel","v":1,"attempt_id":"a-1","grace_ms":0,"reason":"` + strings.Repeat("a", MaxControlBytes) + `"}`)
-	if _, err := DecodeLine(HostToWorker, cancel); CodeOf(err) != CodeMessageTooLarge {
-		t.Fatalf("超过 16 KiB 的 cancel 应为 %s，得到 %v", CodeMessageTooLarge, err)
-	}
-	init := []byte(`{"type":"init","bootstrap":1,"protocol_versions":[1],"mode":"task","task_id":"t","attempt_id":"a","attempt_no":1,"out_dir":"/o","config":"` + strings.Repeat("a", 100<<10) + `"}`)
-	if _, err := DecodeLine(HostToWorker, init); err != nil {
-		t.Fatalf("init 的上限是 1 MiB，100 KiB 应当合法：%v", err)
-	}
-}
-
-func TestInlineStateLimitCountsCompactJSON(t *testing.T) {
-	atLimit := `"` + strings.Repeat("a", MaxInlineStateBytes-2) + `"`
-	if _, err := DecodeLine(WorkerToHost, checkpointLine(atLimit, []string{})); err != nil {
-		t.Fatalf("恰好 %d 字节的 state 应当合法：%v", MaxInlineStateBytes, err)
-	}
-	over := `"` + strings.Repeat("a", MaxInlineStateBytes-1) + `"`
-	if _, err := DecodeLine(WorkerToHost, checkpointLine(over, []string{})); CodeOf(err) != CodeStateTooLarge {
-		t.Fatalf("超过上限应为 %s，得到 %v", CodeStateTooLarge, err)
-	}
-	spaced := `{ "k" :  "` + strings.Repeat("a", 10) + `" }`
-	if _, err := DecodeLine(WorkerToHost, checkpointLine(spaced, []string{})); err != nil {
-		t.Fatalf("空白不计入 state 大小：%v", err)
-	}
-}
-
-func TestRefsLimit(t *testing.T) {
+// TestDecodeLimits 覆盖 §5.10 的大小上限：fixtures 不适合存放这些按常量生成的大消息。
+func TestDecodeLimits(t *testing.T) {
 	ref := strings.Repeat("a", 64)
 	refs := make([]string, MaxRefsPerCheckpoint)
 	for i := range refs {
 		refs[i] = ref
 	}
-	if _, err := DecodeLine(WorkerToHost, checkpointLine(`{}`, refs)); err != nil {
-		t.Fatalf("%d 个 refs 应当合法：%v", MaxRefsPerCheckpoint, err)
+	cases := []struct {
+		name string
+		dir  Direction
+		line string
+		want string // 空表示应当合法
+	}{
+		{"超长事件", WorkerToHost, `{"type":"progress","v":1,"seq":1,"kind":"x","message":"` + strings.Repeat("a", MaxEventBytes) + `"}`, CodeMessageTooLarge},
+		{"非 init 控制消息按 16 KiB 计", HostToWorker, `{"type":"cancel","v":1,"attempt_id":"a-1","grace_ms":0,"reason":"` + strings.Repeat("a", MaxControlBytes) + `"}`, CodeMessageTooLarge},
+		{"init 上限是 1 MiB", HostToWorker, `{"type":"init","bootstrap":1,"protocol_versions":[1],"mode":"task","task_id":"t","attempt_id":"a","attempt_no":1,"out_dir":"/o","config":"` + strings.Repeat("a", 100<<10) + `"}`, ""},
+		{"state 恰好到上限", WorkerToHost, string(checkpointLine(`"`+strings.Repeat("a", MaxInlineStateBytes-2)+`"`, []string{})), ""},
+		{"state 超过上限", WorkerToHost, string(checkpointLine(`"`+strings.Repeat("a", MaxInlineStateBytes-1)+`"`, []string{})), CodeStateTooLarge},
+		{"state 的空白不计入", WorkerToHost, string(checkpointLine(`{ "k" :  "aaaaaaaaaa" }`, []string{})), ""},
+		{"refs 恰好到上限", WorkerToHost, string(checkpointLine(`{}`, refs)), ""},
+		{"refs 超过上限", WorkerToHost, string(checkpointLine(`{}`, append(refs, ref))), CodeTooManyRefs},
 	}
-	if _, err := DecodeLine(WorkerToHost, checkpointLine(`{}`, append(refs, ref))); CodeOf(err) != CodeTooManyRefs {
-		t.Fatalf("超过上限应为 %s，得到 %v", CodeTooManyRefs, err)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := DecodeLine(c.dir, []byte(c.line)); CodeOf(err) != c.want {
+				t.Fatalf("错误码 = %q，期望 %q（err = %v）", CodeOf(err), c.want, err)
+			}
+		})
 	}
 }
 
-func TestEncodeLineRoundTrip(t *testing.T) {
-	m := &Checkpoint{
+func TestEncodeLine(t *testing.T) {
+	cp := &Checkpoint{
 		EventHeader:  EventHeader{Type: TypeCheckpoint, V: Version, Seq: 3},
 		CheckpointID: "cp-1",
 		Scope:        ScopeTask,
@@ -360,56 +337,33 @@ func TestEncodeLineRoundTrip(t *testing.T) {
 		State:        json.RawMessage(`{"next_index":1}`),
 		Refs:         []string{},
 	}
-	b, err := EncodeLine(WorkerToHost, m)
+	b, err := EncodeLine(WorkerToHost, cp)
 	if err != nil {
 		t.Fatalf("EncodeLine: %v", err)
 	}
 	got, err := DecodeLine(WorkerToHost, b)
-	if err != nil {
-		t.Fatalf("DecodeLine: %v", err)
+	if back, ok := got.(*Checkpoint); err != nil || !ok || back.Seq != 3 || string(back.State) != `{"next_index":1}` {
+		t.Fatalf("往返结果不一致：%#v（err = %v）", got, err)
 	}
-	cp, ok := got.(*Checkpoint)
-	if !ok || cp.CheckpointID != "cp-1" || cp.Seq != 3 || string(cp.State) != `{"next_index":1}` {
-		t.Fatalf("往返结果不一致：%#v", got)
-	}
-}
 
-func TestEncodeLineRejectsWrongDirection(t *testing.T) {
-	m := &Paused{EventHeader: EventHeader{Type: TypePaused, V: Version, Seq: 1}, CheckpointID: "cp-1"}
-	if _, err := EncodeLine(HostToWorker, m); CodeOf(err) != CodeUnknownType {
-		t.Fatalf("Worker 事件不能按宿主方向编码，得到 %v", err)
+	rejects := []struct {
+		name string
+		dir  Direction
+		m    Message
+		want string
+	}{
+		{"Worker 事件按宿主方向编码", HostToWorker, &Paused{EventHeader: EventHeader{Type: TypePaused, V: Version, Seq: 1}, CheckpointID: "cp-1"}, CodeUnknownType},
+		{"type 字段与消息类型不一致", WorkerToHost, &Paused{EventHeader: EventHeader{Type: TypeResult, V: Version, Seq: 1}, CheckpointID: "cp-1"}, CodeInvalidField},
+		{"缺少 state 与 state_ref", WorkerToHost, &Checkpoint{EventHeader: EventHeader{Type: TypeCheckpoint, V: Version, Seq: 1}, CheckpointID: "cp-1", Scope: ScopeTask, StepID: "s1"}, CodeInvalidField},
 	}
-}
-
-func TestEncodeLineRejectsMismatchedType(t *testing.T) {
-	m := &Paused{EventHeader: EventHeader{Type: TypeResult, V: Version, Seq: 1}, CheckpointID: "cp-1"}
-	if _, err := EncodeLine(WorkerToHost, m); CodeOf(err) != CodeInvalidField {
-		t.Fatalf("type 字段与消息类型不一致应为 %s，得到 %v", CodeInvalidField, err)
-	}
-}
-
-func TestEncodeLineValidates(t *testing.T) {
-	m := &Checkpoint{EventHeader: EventHeader{Type: TypeCheckpoint, V: Version, Seq: 1}, CheckpointID: "cp-1", Scope: ScopeTask, StepID: "s1"}
-	if _, err := EncodeLine(WorkerToHost, m); CodeOf(err) != CodeInvalidField {
-		t.Fatalf("缺少 state 与 state_ref 应为 %s，得到 %v", CodeInvalidField, err)
+	for _, c := range rejects {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := EncodeLine(c.dir, c.m); CodeOf(err) != c.want {
+				t.Fatalf("错误码 = %q，期望 %q（err = %v）", CodeOf(err), c.want, err)
+			}
+		})
 	}
 }
-```
-
-`internal/protocol/imports_test.go`：
-
-```go
-package protocol
-
-import (
-	"go/parser"
-	"go/token"
-	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
-	"testing"
-)
 
 // TestImportsOnlyStandardLibrary 保证本包只依赖标准库（代码组织设计 §3.1 规则 3）：
 // 标准库导入路径的第一段不含 "."。
@@ -1223,9 +1177,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **风险：高（协议语义）——双评审。**
 
 **Files:**
-- Create: `internal/protocol/stream.go`、`internal/protocol/stream_test.go`
-- Modify: `internal/protocol/fixtures_test.go`（追加场景测试，下方给出完整追加内容）
-- Create: `protocol/fixtures/v1/scenarios/` 下 9 个文件（下方给出）
+- Create: `internal/protocol/stream.go`
+- Modify: `internal/protocol/protocol_test.go`（末尾追加场景回放，下方给出完整追加内容）
+- Create: `protocol/fixtures/v1/scenarios/` 下 12 个文件（下方给出）
 
 **Interfaces:**
 - Consumes: Task 1 的 `DecodeLine`、`Message`、`event`、`CodeOf`、`Type*`。
@@ -1244,7 +1198,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 }
 ```
 
-- [ ] **Step 1：写入 9 个协议层场景**
+- [ ] **Step 1：写入 12 个协议层场景**
 
 `protocol/fixtures/v1/scenarios/seq_gap.json`：
 
@@ -1393,74 +1347,58 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 }
 ```
 
-- [ ] **Step 2：写失败的测试**
+`protocol/fixtures/v1/scenarios/seq_duplicate.json`：
 
-`internal/protocol/stream_test.go`：
-
-```go
-package protocol
-
-import "testing"
-
-func readyEvent(seq int64) *Ready {
-	return &Ready{EventHeader: EventHeader{Type: TypeReady, V: Version, Seq: seq}, ProtocolVersion: Version, Mode: ModeTask, Worker: WorkerInfo{Name: "w"}}
-}
-
-func progressEvent(seq int64) *Progress {
-	return &Progress{EventHeader: EventHeader{Type: TypeProgress, V: Version, Seq: seq}, Kind: "step_started"}
-}
-
-func resultEvent(seq int64) *Result {
-	return &Result{EventHeader: EventHeader{Type: TypeResult, V: Version, Seq: seq}}
-}
-
-func observeAll(t *testing.T, msgs ...Message) (int, string) {
-	t.Helper()
-	var s WorkerStream
-	for i, m := range msgs {
-		if err := s.Observe(m); err != nil {
-			return i, CodeOf(err)
-		}
-	}
-	return -1, ""
-}
-
-func TestWorkerStreamAcceptsNormalFlow(t *testing.T) {
-	q := &CheckpointQuery{EventHeader: EventHeader{Type: TypeCheckpointQuery, V: Version, Seq: 4}, CheckpointID: "cp-1", Scope: ScopeTask}
-	if i, code := observeAll(t, readyEvent(1), progressEvent(2), resultEvent(3), q); code != "" {
-		t.Fatalf("第 %d 条违规 %s，期望无违规", i, code)
-	}
-}
-
-func TestWorkerStreamRules(t *testing.T) {
-	hs := &HandshakeError{Type: TypeHandshakeError, Bootstrap: BootstrapVersion, Code: "no_common_version"}
-	errEvent := &ErrorEvent{EventHeader: EventHeader{Type: TypeError, V: Version, Seq: 1}, Code: "x"}
-	cases := []struct {
-		name   string
-		msgs   []Message
-		wantAt int
-		want   string
-	}{
-		{"seq 重复", []Message{readyEvent(1), progressEvent(1)}, 1, CodeSeqInvalid},
-		{"seq 不从 1 开始", []Message{readyEvent(2)}, 0, CodeSeqInvalid},
-		{"ready 之前的业务事件", []Message{progressEvent(1)}, 0, CodeBeforeReady},
-		{"重复 ready", []Message{readyEvent(1), readyEvent(2)}, 1, CodeDuplicateReady},
-		{"终态后的业务事件", []Message{readyEvent(1), resultEvent(2), progressEvent(3)}, 2, CodeAfterTerminal},
-		{"handshake_error 不是第一条", []Message{readyEvent(1), hs}, 1, CodeHandshakeMisplaced},
-		{"handshake_error 之后还有消息", []Message{hs, readyEvent(1)}, 1, CodeAfterHandshakeError},
-		{"ready 之前允许 error", []Message{errEvent}, -1, ""},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if i, code := observeAll(t, c.msgs...); i != c.wantAt || code != c.want {
-				t.Fatalf("得到 (%d, %q)，期望 (%d, %q)", i, code, c.wantAt, c.want)
-			}
-		})
-	}
+```json
+{
+  "name": "seq_duplicate",
+  "description": "seq 重复是协议错误",
+  "layers": ["protocol"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "task", "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}},
+    {"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "task", "worker": {"name": "sim-worker", "version": "0.1.0"}, "capabilities": []}},
+    {"from": "worker", "message": {"type": "progress", "v": 1, "seq": 1, "kind": "step_started", "message": "x"}}
+  ],
+  "expect": {"stream": "violation", "violation": "seq_invalid", "at": 2}
 }
 ```
 
-在 `internal/protocol/fixtures_test.go` **末尾追加**：
+`protocol/fixtures/v1/scenarios/seq_not_from_one.json`：
+
+```json
+{
+  "name": "seq_not_from_one",
+  "description": "第一条事件的 seq 必须是 1",
+  "layers": ["protocol"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "task", "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}},
+    {"from": "worker", "message": {"type": "ready", "v": 1, "seq": 2, "protocol_version": 1, "mode": "task", "worker": {"name": "sim-worker", "version": "0.1.0"}, "capabilities": []}}
+  ],
+  "expect": {"stream": "violation", "violation": "seq_invalid", "at": 1}
+}
+```
+
+`protocol/fixtures/v1/scenarios/handshake_error_after_ready.json`：
+
+```json
+{
+  "name": "handshake_error_after_ready",
+  "description": "handshake_error 只能作为第一条 Worker 消息",
+  "layers": ["protocol"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "task", "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}},
+    {"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "task", "worker": {"name": "sim-worker", "version": "0.1.0"}, "capabilities": []}},
+    {"from": "worker", "message": {"type": "handshake_error", "bootstrap": 1, "code": "no_common_version"}}
+  ],
+  "expect": {"stream": "violation", "violation": "handshake_error_misplaced", "at": 2}
+}
+```
+
+- [ ] **Step 2：写失败的测试**
+
+事件流规则全部以场景 fixtures 表达，Go 与 Python 回放同一份，不另写 Go 专用的规则表。
+
+在 `internal/protocol/protocol_test.go` **末尾追加**：
 
 ```go
 type scenarioLine struct {
@@ -1635,12 +1573,12 @@ func isTerminal(typ string) bool {
 wsl -d Ubuntu -- bash -c 'export PATH=$PATH:/usr/local/go/bin; cd /mnt/f/go-agentbox-m1-3 && gofmt -w internal/protocol && go vet ./internal/protocol/ && go test -count=1 -v ./internal/protocol/ 2>&1 | grep -E "^(--- FAIL|ok|FAIL)|TestScenarioFixtures/"'
 ```
 
-Expected: 9 个 `TestScenarioFixtures/<场景名>` 均为 PASS，最后一行 `ok`。
+Expected: 12 个 `TestScenarioFixtures/<场景名>` 均为 PASS，最后一行 `ok`。
 
 - [ ] **Step 6：提交**
 
 ```bash
-cd /f/go-agentbox-m1-3 && git add internal/protocol/stream.go internal/protocol/stream_test.go internal/protocol/fixtures_test.go protocol/fixtures/v1/scenarios
+cd /f/go-agentbox-m1-3 && git add internal/protocol/stream.go internal/protocol/protocol_test.go protocol/fixtures/v1/scenarios
 ```
 
 ```powershell
@@ -1662,7 +1600,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Files:**
 - Create: `worker/pyproject.toml`、`worker/uv.lock`（由 `uv lock` 生成）
 - Create: `worker/agentbox_worker/__init__.py`、`worker/agentbox_worker/protocol.py`、`worker/agentbox_worker/stream.py`
-- Create: `worker/tests/protocol_fixtures.py`、`worker/tests/test_protocol_fixtures.py`、`worker/tests/test_protocol_limits.py`、`worker/tests/test_stream_scenarios.py`
+- Create: `worker/tests/protocol_fixtures.py`（fixtures 读取辅助）、`worker/tests/test_protocol.py`（协议层测试；Task 4 在末尾追加 schema 一致性测试）
 - Modify: `.gitignore`（追加 Python 产物）
 
 **Interfaces:**
@@ -1728,7 +1666,7 @@ max-complexity = 10
 "os.execlpe".msg = "Worker 不直接替换进程映像"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["TID251"]
+"tests/**" = ["TID251", "E402"]  # 测试文件按关注点分节，各节在节首导入
 
 [tool.importlinter]
 root_packages = ["agentbox_worker", "sim_worker"]
@@ -1799,19 +1737,32 @@ def line_bytes(item: dict[str, Any]) -> bytes:
     return json.dumps(item["message"], ensure_ascii=False).encode("utf-8")
 ```
 
-`worker/tests/test_protocol_fixtures.py`：
+`worker/tests/test_protocol.py`：
 
 ```python
-import pytest
-from protocol_fixtures import line_bytes, load_messages
+"""协议层：跨语言 fixtures 回放与按常量生成的大小上限（规格 §5.10、§5.11）。"""
 
-from agentbox_worker.protocol import ProtocolError, decode_line, encode_line
+import json
+
+import pytest
+from protocol_fixtures import line_bytes, load_messages, load_scenarios
+
+from agentbox_worker.protocol import (
+    HOST,
+    MAX_CONTROL_BYTES,
+    MAX_EVENT_BYTES,
+    MAX_INLINE_STATE_BYTES,
+    MAX_REFS_PER_CHECKPOINT,
+    WORKER,
+    ProtocolError,
+    decode_line,
+    encode_line,
+)
+from agentbox_worker.stream import StreamChecker
 
 MESSAGES = load_messages()
-
-
-def test_fixtures_not_empty():
-    assert MESSAGES["valid"] and MESSAGES["invalid"]
+SCENARIOS = load_scenarios()
+assert MESSAGES["valid"] and MESSAGES["invalid"] and SCENARIOS, "fixtures 为空"
 
 
 @pytest.mark.parametrize("case", MESSAGES["valid"], ids=lambda c: c["name"])
@@ -1826,117 +1777,6 @@ def test_invalid_message_has_expected_code(case):
     with pytest.raises(ProtocolError) as exc:
         decode_line(case["direction"], line_bytes(case))
     assert exc.value.code == case["code"]
-```
-
-`worker/tests/test_protocol_limits.py`：
-
-```python
-import json
-
-import pytest
-
-from agentbox_worker.protocol import (
-    HOST,
-    MAX_CONTROL_BYTES,
-    MAX_EVENT_BYTES,
-    MAX_INLINE_STATE_BYTES,
-    MAX_REFS_PER_CHECKPOINT,
-    WORKER,
-    ProtocolError,
-    decode_line,
-    encode_line,
-)
-
-REF = "a" * 64
-
-
-def checkpoint_line(state_json: str, refs: list[str]) -> bytes:
-    head = '{"type":"checkpoint","v":1,"seq":1,"checkpoint_id":"cp-1","scope":"task","step_id":"s1"'
-    return f'{head},"state":{state_json},"refs":{json.dumps(refs)}}}'.encode()
-
-
-def code_of(direction: str, line: bytes) -> str:
-    with pytest.raises(ProtocolError) as exc:
-        decode_line(direction, line)
-    return exc.value.code
-
-
-def test_oversized_event():
-    body = "a" * MAX_EVENT_BYTES
-    line = f'{{"type":"progress","v":1,"seq":1,"kind":"x","message":"{body}"}}'.encode()
-    assert code_of(WORKER, line) == "message_too_large"
-
-
-def test_control_limit_applies_to_non_init():
-    reason = "a" * MAX_CONTROL_BYTES
-    cancel = f'{{"type":"cancel","v":1,"attempt_id":"a-1","grace_ms":0,"reason":"{reason}"}}'
-    assert code_of(HOST, cancel.encode()) == "message_too_large"
-    init = {
-        "type": "init",
-        "bootstrap": 1,
-        "protocol_versions": [1],
-        "mode": "task",
-        "task_id": "t",
-        "attempt_id": "a",
-        "attempt_no": 1,
-        "out_dir": "/o",
-        "config": "a" * (100 << 10),
-    }
-    decode_line(HOST, json.dumps(init).encode())
-
-
-def test_inline_state_limit_counts_compact_json():
-    at_limit = '"' + "a" * (MAX_INLINE_STATE_BYTES - 2) + '"'
-    decode_line(WORKER, checkpoint_line(at_limit, []))
-    over = '"' + "a" * (MAX_INLINE_STATE_BYTES - 1) + '"'
-    assert code_of(WORKER, checkpoint_line(over, [])) == "state_too_large"
-    spaced = '{ "k" :  "' + "a" * 10 + '" }'
-    decode_line(WORKER, checkpoint_line(spaced, []))
-
-
-def test_refs_limit():
-    decode_line(WORKER, checkpoint_line("{}", [REF] * MAX_REFS_PER_CHECKPOINT))
-    too_many = checkpoint_line("{}", [REF] * (MAX_REFS_PER_CHECKPOINT + 1))
-    assert code_of(WORKER, too_many) == "too_many_refs"
-
-
-def test_encode_validates():
-    with pytest.raises(ProtocolError) as exc:
-        encode_line(
-            WORKER,
-            {
-                "type": "checkpoint",
-                "v": 1,
-                "seq": 1,
-                "checkpoint_id": "c",
-                "scope": "task",
-                "step_id": "s",
-            },
-        )
-    assert exc.value.code == "invalid_field"
-
-
-def test_encode_rejects_wrong_direction():
-    with pytest.raises(ProtocolError) as exc:
-        encode_line(HOST, {"type": "paused", "v": 1, "seq": 1, "checkpoint_id": "cp-1"})
-    assert exc.value.code == "unknown_type"
-
-
-def test_nan_is_malformed():
-    line = b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":NaN}'
-    assert code_of(WORKER, line) == "malformed_json"
-```
-
-`worker/tests/test_stream_scenarios.py`：
-
-```python
-import pytest
-from protocol_fixtures import line_bytes, load_scenarios
-
-from agentbox_worker.protocol import ProtocolError, decode_line
-from agentbox_worker.stream import StreamChecker
-
-SCENARIOS = load_scenarios()
 
 
 def replay_protocol(scenario: dict) -> tuple[int, str]:
@@ -1952,18 +1792,123 @@ def replay_protocol(scenario: dict) -> tuple[int, str]:
     return -1, ""
 
 
-def test_scenarios_not_empty():
-    assert SCENARIOS
-
-
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=lambda s: s["name"])
 def test_scenario_stream(scenario):
     expect = scenario["expect"]
-    got = replay_protocol(scenario)
-    if expect["stream"] == "ok":
-        assert got == (-1, "")
-    else:
-        assert got == (expect["at"], expect["violation"])
+    want = (-1, "") if expect["stream"] == "ok" else (expect["at"], expect["violation"])
+    assert replay_protocol(scenario) == want
+
+
+REF = "a" * 64
+
+
+def checkpoint_line(state_json: str, refs: list[str]) -> bytes:
+    head = '{"type":"checkpoint","v":1,"seq":1,"checkpoint_id":"cp-1","scope":"task","step_id":"s1"'
+    return f'{head},"state":{state_json},"refs":{json.dumps(refs)}}}'.encode()
+
+
+def init_line(config: str) -> bytes:
+    init = {
+        "type": "init",
+        "bootstrap": 1,
+        "protocol_versions": [1],
+        "mode": "task",
+        "task_id": "t",
+        "attempt_id": "a",
+        "attempt_no": 1,
+        "out_dir": "/o",
+        "config": config,
+    }
+    return json.dumps(init).encode()
+
+
+def progress_line(message: str) -> bytes:
+    return f'{{"type":"progress","v":1,"seq":1,"kind":"x","message":"{message}"}}'.encode()
+
+
+def cancel_line(reason: str) -> bytes:
+    return f'{{"type":"cancel","v":1,"attempt_id":"a-1","grace_ms":0,"reason":"{reason}"}}'.encode()
+
+
+LIMIT_CASES = [
+    pytest.param(
+        WORKER, progress_line("a" * MAX_EVENT_BYTES), "message_too_large", id="event_over_limit"
+    ),
+    pytest.param(
+        HOST, cancel_line("a" * MAX_CONTROL_BYTES), "message_too_large", id="control_over_limit"
+    ),
+    pytest.param(HOST, init_line("a" * (100 << 10)), None, id="init_limit_is_1mib"),
+    pytest.param(
+        WORKER,
+        checkpoint_line('"' + "a" * (MAX_INLINE_STATE_BYTES - 2) + '"', []),
+        None,
+        id="state_at_limit",
+    ),
+    pytest.param(
+        WORKER,
+        checkpoint_line('"' + "a" * (MAX_INLINE_STATE_BYTES - 1) + '"', []),
+        "state_too_large",
+        id="state_over_limit",
+    ),
+    pytest.param(
+        WORKER, checkpoint_line('{ "k" :  "aaaaaaaaaa" }', []), None, id="state_whitespace_ignored"
+    ),
+    pytest.param(
+        WORKER, checkpoint_line("{}", [REF] * MAX_REFS_PER_CHECKPOINT), None, id="refs_at_limit"
+    ),
+    pytest.param(
+        WORKER,
+        checkpoint_line("{}", [REF] * (MAX_REFS_PER_CHECKPOINT + 1)),
+        "too_many_refs",
+        id="refs_over_limit",
+    ),
+    pytest.param(
+        WORKER,
+        b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":NaN}',
+        "malformed_json",
+        id="nan_is_malformed",
+    ),
+]
+
+
+@pytest.mark.parametrize(("direction", "line", "code"), LIMIT_CASES)
+def test_decode_limits(direction, line, code):
+    if code is None:
+        decode_line(direction, line)
+        return
+    with pytest.raises(ProtocolError) as exc:
+        decode_line(direction, line)
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
+    ("direction", "message", "code"),
+    [
+        pytest.param(
+            WORKER,
+            {
+                "type": "checkpoint",
+                "v": 1,
+                "seq": 1,
+                "checkpoint_id": "c",
+                "scope": "task",
+                "step_id": "s",
+            },
+            "invalid_field",
+            id="checkpoint_without_state",
+        ),
+        pytest.param(
+            HOST,
+            {"type": "paused", "v": 1, "seq": 1, "checkpoint_id": "cp-1"},
+            "unknown_type",
+            id="wrong_direction",
+        ),
+    ],
+)
+def test_encode_rejects(direction, message, code):
+    with pytest.raises(ProtocolError) as exc:
+        encode_line(direction, message)
+    assert exc.value.code == code
 ```
 
 - [ ] **Step 3：确认测试失败**
@@ -2458,12 +2403,12 @@ class StreamChecker:
 cd F:\go-agentbox-m1-3\worker; uv run ruff format .; uv run ruff check .; uv run pytest -q
 ```
 
-Expected: `ruff check` 无问题；pytest 全部通过（消息 fixtures 66 项 + 限制 7 项 + 场景 10 项，数量以实际为准，0 failed）。
+Expected: `ruff check` 无问题；pytest 全部通过，0 failed（消息 fixtures、协议层场景、大小上限与编码拒绝用例，数量以实际为准）。
 
 - [ ] **Step 6：提交**
 
 ```bash
-cd /f/go-agentbox-m1-3 && git add .gitignore worker/pyproject.toml worker/uv.lock worker/agentbox_worker/__init__.py worker/agentbox_worker/protocol.py worker/agentbox_worker/stream.py worker/tests/protocol_fixtures.py worker/tests/test_protocol_fixtures.py worker/tests/test_protocol_limits.py worker/tests/test_stream_scenarios.py && git commit -m "feat(worker): Python 协议编解码与事件流检查，与 Go 共用 fixtures
+cd /f/go-agentbox-m1-3 && git add .gitignore worker/pyproject.toml worker/uv.lock worker/agentbox_worker/__init__.py worker/agentbox_worker/protocol.py worker/agentbox_worker/stream.py worker/tests/protocol_fixtures.py worker/tests/test_protocol.py && git commit -m "feat(worker): Python 协议编解码与事件流检查，与 Go 共用 fixtures
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2477,7 +2422,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Files:**
 - Create: `protocol/v1/task.schema.json`、`protocol/v1/control.schema.json`、`protocol/v1/event.schema.json`
 - Create: `protocol/README.md`
-- Create: `worker/tests/test_schemas.py`
+- Modify: `worker/tests/test_protocol.py`（末尾追加 schema 一致性测试）
 
 **Interfaces:**
 - Consumes: Task 1–3 的 fixtures 与规则。
@@ -2487,25 +2432,25 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 - [ ] **Step 1：写失败的测试**
 
-`worker/tests/test_schemas.py`：
+在 `worker/tests/test_protocol.py` **末尾追加**（与上文空两行）：
 
 ```python
-import json
+# ---- JSON Schema：与 fixtures 一致 ----
+
 from typing import Any
 
-import pytest
 from jsonschema import Draft202012Validator
-from protocol_fixtures import FIXTURES, load_messages, load_scenarios
+from protocol_fixtures import FIXTURES
 
-SCHEMA_DIR = FIXTURES.parents[1] / "v1"
-NAMES = ("task", "control", "event")
+SCHEMA_NAMES = ("task", "control", "event")
 
 
 def load_schema(name: str) -> dict[str, Any]:
-    return json.loads((SCHEMA_DIR / f"{name}.schema.json").read_text(encoding="utf-8"))
+    path = FIXTURES.parents[1] / "v1" / f"{name}.schema.json"
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-VALIDATORS = {name: Draft202012Validator(load_schema(name)) for name in NAMES}
+VALIDATORS = {name: Draft202012Validator(load_schema(name)) for name in SCHEMA_NAMES}
 
 
 def validator_for(direction: str, msg: dict[str, Any]) -> Draft202012Validator:
@@ -2514,14 +2459,14 @@ def validator_for(direction: str, msg: dict[str, Any]) -> Draft202012Validator:
     return VALIDATORS["task"] if msg.get("type") == "init" else VALIDATORS["control"]
 
 
-@pytest.mark.parametrize("name", NAMES)
-def test_schema_is_valid_draft_2020_12(name):
-    Draft202012Validator.check_schema(load_schema(name))
+def test_schemas_are_valid_draft_2020_12():
+    for name in SCHEMA_NAMES:
+        Draft202012Validator.check_schema(load_schema(name))
 
 
 def valid_items() -> list[tuple[str, str, dict[str, Any]]]:
-    items = [(c["name"], c["direction"], c["message"]) for c in load_messages()["valid"]]
-    for scenario in load_scenarios():
+    items = [(c["name"], c["direction"], c["message"]) for c in MESSAGES["valid"]]
+    for scenario in SCENARIOS:
         bad = scenario["expect"].get("at")
         for index, line in enumerate(scenario["lines"]):
             if index != bad and "message" in line:
@@ -2536,10 +2481,9 @@ def test_schema_accepts_valid(item):
     assert not errors, [e.message for e in errors]
 
 
-INVALID = [c for c in load_messages()["invalid"] if "message" in c]
-
-
-@pytest.mark.parametrize("case", INVALID, ids=lambda c: c["name"])
+@pytest.mark.parametrize(
+    "case", [c for c in MESSAGES["invalid"] if "message" in c], ids=lambda c: c["name"]
+)
 def test_schema_rejects_invalid(case):
     assert not validator_for(case["direction"], case["message"]).is_valid(case["message"])
 ```
@@ -2547,7 +2491,7 @@ def test_schema_rejects_invalid(case):
 - [ ] **Step 2：确认测试失败**
 
 ```powershell
-cd F:\go-agentbox-m1-3\worker; uv run pytest -q tests/test_schemas.py
+cd F:\go-agentbox-m1-3\worker; uv run pytest -q tests/test_protocol.py
 ```
 
 Expected: 收集错误 `FileNotFoundError`（schema 文件不存在）。
@@ -2892,7 +2836,7 @@ Expected: 全部通过，0 failed。
 - [ ] **Step 6：提交**
 
 ```bash
-cd /f/go-agentbox-m1-3 && git add protocol/v1 protocol/README.md worker/tests/test_schemas.py && git commit -m "docs(protocol): v1 JSON Schema 与协议说明，schema 与 fixtures 一致性测试
+cd /f/go-agentbox-m1-3 && git add protocol/v1 protocol/README.md worker/tests/test_protocol.py && git commit -m "docs(protocol): v1 JSON Schema 与协议说明，schema 与 fixtures 一致性测试
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2905,7 +2849,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `worker/agentbox_worker/errors.py`、`worker/agentbox_worker/transport.py`、`worker/agentbox_worker/outbox.py`
-- Create: `worker/tests/test_outbox_transport.py`
+- Create: `worker/tests/test_sdk.py`（SDK 测试；Task 6、7 在末尾追加）
 
 **Interfaces:**
 - Consumes: Task 3 的 `encode_line`、`WORKER`、`VERSION`、`BOOTSTRAP_VERSION`、`ProtocolError`。
@@ -2919,9 +2863,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 - [ ] **Step 1：写失败的测试**
 
-`worker/tests/test_outbox_transport.py`：
+`worker/tests/test_sdk.py`：
 
 ```python
+"""Worker SDK：传输与事件发送、运行时、SDK 层场景回放与 sim-worker（规格 §5.3–§5.9）。"""
+
 import asyncio
 import io
 import json
@@ -2929,10 +2875,12 @@ import threading
 
 import pytest
 
-from agentbox_worker.errors import TransportBroken, WorkerFailure
+from agentbox_worker.errors import TransportBroken
 from agentbox_worker.outbox import Outbox, Waiters
 from agentbox_worker.protocol import ProtocolError
 from agentbox_worker.transport import MAX_FRAME_BYTES, MemoryTransport, StdioTransport
+
+# ---- 传输与事件发送 ----
 
 
 def sent_json(transport: MemoryTransport) -> list[dict]:
@@ -2967,18 +2915,7 @@ def test_outbox_invalid_event_does_not_consume_seq():
     assert [e["seq"] for e in sent_json(asyncio.run(go()))] == [1]
 
 
-def test_handshake_error_has_fixed_shape():
-    async def go():
-        transport = MemoryTransport()
-        await Outbox(transport).send_handshake_error("no_common_version")
-        return transport
-
-    assert sent_json(asyncio.run(go())) == [
-        {"type": "handshake_error", "bootstrap": 1, "code": "no_common_version"}
-    ]
-
-
-def test_waiters_deliver_only_expected_keys():
+def test_waiters_drop_late_and_unexpected_replies():
     async def go():
         waiters = Waiters()
         future = waiters.expect("cp-1")
@@ -2990,43 +2927,17 @@ def test_waiters_deliver_only_expected_keys():
     assert asyncio.run(go()) == {"x": 1}
 
 
-def test_stdio_transport_reads_lines_until_eof():
-    async def go():
-        transport = StdioTransport(io.BytesIO(b"first\nsecond\r\n"), io.BytesIO())
-        return [await transport.receive() for _ in range(3)]
-
-    assert asyncio.run(go()) == [b"first", b"second", None]
-
-
-def test_stdio_transport_writes_one_line_per_send():
+def test_stdio_transport_round_trip():
     out = io.BytesIO()
 
     async def go():
-        transport = StdioTransport(io.BytesIO(), out)
+        transport = StdioTransport(io.BytesIO(b"first\nsecond\r\n"), out)
         await transport.send(b'{"a":1}')
         await transport.send(b'{"b":2}')
+        return [await transport.receive() for _ in range(3)]
 
-    asyncio.run(go())
+    assert asyncio.run(go()) == [b"first", b"second", None]
     assert out.getvalue() == b'{"a":1}\n{"b":2}\n'
-
-
-def test_memory_transport_calls_on_send():
-    seen: list[bytes] = []
-
-    async def go():
-        transport = MemoryTransport()
-        transport.on_send = seen.append
-        transport.feed(b"host-line")
-        await transport.send(b"worker-line")
-        return await transport.receive()
-
-    assert asyncio.run(go()) == b"host-line"
-    assert seen == [b"worker-line"]
-
-
-def test_worker_failure_requires_code():
-    with pytest.raises(ValueError):
-        WorkerFailure("", "x")
 
 
 class BlockingTransport:
@@ -3087,24 +2998,25 @@ def test_send_failure_breaks_outbox():
     assert asyncio.run(go()) == 1
 
 
-def test_stdio_rejects_oversized_line_at_read_time():
-    async def go():
-        transport = StdioTransport(io.BytesIO(b"a" * (MAX_FRAME_BYTES + 10)), io.BytesIO())
-        with pytest.raises(ProtocolError) as exc:
-            await transport.receive()
-        return exc.value.code, await transport.receive()
-
-    assert asyncio.run(go()) == ("message_too_large", None)
-
-
-def test_stdio_accepts_line_at_frame_limit():
-    line = b"a" * (MAX_FRAME_BYTES - 1)
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [
+        pytest.param(MAX_FRAME_BYTES - 1, "accepted", id="at_limit"),
+        pytest.param(MAX_FRAME_BYTES + 10, "message_too_large", id="over_limit"),
+    ],
+)
+def test_stdio_frame_limit_is_checked_at_read_time(size, expected):
+    line = b"a" * size
 
     async def go():
         transport = StdioTransport(io.BytesIO(line + b"\n"), io.BytesIO())
-        return await transport.receive()
+        try:
+            got = await transport.receive()
+        except ProtocolError as exc:
+            return exc.code, await transport.receive()
+        return ("accepted" if got == line else "wrong_line"), await transport.receive()
 
-    assert asyncio.run(go()) == line
+    assert asyncio.run(go()) == (expected, None)
 
 
 class TrackingReader:
@@ -3167,29 +3079,12 @@ def test_stdio_reader_stops_consuming_after_event_loop_closes():
     assert asyncio.run(go()) == LINES[0]
     assert transport.wait_reader_stopped(5)
     assert (reader.calls, reader.tell()) == (READ_LIMIT, READ_LIMIT_BYTES)
-
-
-class BrokenWriter(io.RawIOBase):
-    def write(self, data):
-        raise BrokenPipeError("host closed stdout")
-
-
-def test_stdio_write_failure_marks_transport_failed():
-    transport = StdioTransport(io.BytesIO(), BrokenWriter())
-
-    async def go():
-        for _ in range(2):
-            with pytest.raises(TransportBroken):
-                await transport.send(b"x")
-
-    asyncio.run(go())
-    assert transport.close(0.5) is False
 ```
 
 - [ ] **Step 2：确认测试失败**
 
 ```powershell
-cd F:\go-agentbox-m1-3\worker; uv run pytest -q tests/test_outbox_transport.py
+cd F:\go-agentbox-m1-3\worker; uv run pytest -q tests/test_sdk.py
 ```
 
 Expected: `ModuleNotFoundError: No module named 'agentbox_worker.errors'`。
@@ -3528,7 +3423,7 @@ Expected: 全部通过。
 - [ ] **Step 5：提交**
 
 ```bash
-cd /f/go-agentbox-m1-3 && git add worker/agentbox_worker/errors.py worker/agentbox_worker/transport.py worker/agentbox_worker/outbox.py worker/tests/test_outbox_transport.py && git commit -m "feat(worker): SDK 传输层、事件发送与答复等待
+cd /f/go-agentbox-m1-3 && git add worker/agentbox_worker/errors.py worker/agentbox_worker/transport.py worker/agentbox_worker/outbox.py worker/tests/test_sdk.py && git commit -m "feat(worker): SDK 传输层、事件发送与答复等待
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3542,7 +3437,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Files:**
 - Create: `worker/agentbox_worker/runtime.py`
 - Modify: `worker/agentbox_worker/__init__.py`（替换为下方完整内容）
-- Create: `worker/tests/test_runtime.py`
+- Modify: `worker/tests/test_sdk.py`（末尾追加运行时测试）
 
 **Interfaces:**
 - Consumes: Task 3 的 `decode_line`、`HOST`、`VERSION`、`BOOTSTRAP_VERSION`、`ProtocolError`、`valid_artifact_path`；Task 5 的 `Outbox`、`Waiters`、`Transport`、`StdioTransport`、`WorkerFailure` 及其子类。
@@ -3557,26 +3452,19 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 - [ ] **Step 1：写失败的测试**
 
-`worker/tests/test_runtime.py`：
+在 `worker/tests/test_sdk.py` **末尾追加**（与上文空两行）：
 
 ```python
-import asyncio
+# ---- 运行时：握手、控制消息、checkpoint、产物 ----
+# 正常路径、查询、重发、冲突、暂停、取消与恢复由 SDK 层场景逐条回放（见下一节），此处不重复。
+
 import hashlib
 import itertools
-import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from agentbox_worker import (
-    MemoryTransport,
-    Paused,
-    Result,
-    TaskContext,
-    Timing,
-    WorkerFailure,
-    run_worker,
-)
+from agentbox_worker import Result, TaskContext, Timing, WorkerFailure, run_worker
 
 FAST = Timing(ack_timeout=0.05, max_ack_attempts=3, retry_backoff=0.01, artifact_timeout=0.5)
 INIT = {
@@ -3619,7 +3507,7 @@ def run(
             ),
             timeout=5,
         )
-        return code, [json.loads(line) for line in transport.sent]
+        return code, sent_json(transport)
 
     return asyncio.run(go())
 
@@ -3628,7 +3516,7 @@ def reply(transport: MemoryTransport, message: dict[str, Any]) -> None:
     transport.feed(json.dumps({"v": 1, **message}).encode())
 
 
-def checkpoint_reply(status: str, **extra: Any) -> Responder:
+def checkpoint_reply(status: str) -> Responder:
     def respond(msg: dict[str, Any], transport: MemoryTransport) -> None:
         if msg["type"] == "checkpoint":
             reply(
@@ -3638,7 +3526,6 @@ def checkpoint_reply(status: str, **extra: Any) -> Responder:
                     "checkpoint_id": msg["checkpoint_id"],
                     "scope": "task",
                     "status": status,
-                    **extra,
                 },
             )
 
@@ -3658,18 +3545,39 @@ async def sleeps(ctx: TaskContext) -> Result:
     return Result("never", [])
 
 
-def test_ready_then_result(tmp_path):
-    code, events = run(returns_ok, tmp_path)
+def test_ready_checkpoint_artifact_result(tmp_path):
+    content = "# 报告".encode() + b"\n"
+    (tmp_path / "report.md").write_bytes(content)
+
+    def respond(msg, transport):
+        checkpoint_reply("committed")(msg, transport)
+        if msg["type"] == "artifact":
+            reply(
+                transport,
+                {
+                    "type": "artifact_result",
+                    "artifact_id": msg["artifact_id"],
+                    "status": "saved",
+                    "version": 2,
+                    "sha256": msg["declared_sha256"],
+                },
+            )
+
+    async def app(ctx):
+        checkpoint_id = await ctx.checkpoint("s1", state={"n": 1})
+        ref = await ctx.register_artifact("report", "report.md", media_type="text/markdown")
+        return Result(f"{checkpoint_id}/v{ref.version}", [ref.artifact_id])
+
+    code, events = run(app, tmp_path, responder=respond)
     assert code == 0
-    assert types(events) == ["ready", "result"]
-    assert events[0]["worker"] == {"name": "test-worker", "version": "0"}
-    assert events[1]["summary"] == "ok" and events[1]["outputs"] == []
-
-
-def test_handshake_error_without_common_version(tmp_path):
-    code, events = run(returns_ok, tmp_path, init={"protocol_versions": [2]})
-    assert code == 2
-    assert events == [{"type": "handshake_error", "bootstrap": 1, "code": "no_common_version"}]
+    assert types(events) == ["ready", "checkpoint", "artifact", "result"]
+    ready, checkpoint, artifact, result = events
+    assert ready["worker"] == {"name": "test-worker", "version": "0"}
+    assert checkpoint["checkpoint_id"] == "cp-1" and checkpoint["state"] == {"n": 1}
+    assert checkpoint["refs"] == [] and "state_ref" not in checkpoint
+    assert artifact["declared_sha256"] == hashlib.sha256(content).hexdigest()
+    assert artifact["declared_size"] == len(content) and artifact["visibility"] == "output"
+    assert result["summary"] == "cp-1/v2" and result["outputs"] == ["report"]
 
 
 def test_unsupported_mode_fails_before_ready(tmp_path):
@@ -3679,32 +3587,23 @@ def test_unsupported_mode_fails_before_ready(tmp_path):
     assert events[0]["code"] == "unsupported_mode" and events[0]["retryable"] is False
 
 
-def test_worker_failure_becomes_error_event(tmp_path):
+@pytest.mark.parametrize(
+    ("raised", "code", "retryable"),
+    [
+        pytest.param(
+            WorkerFailure("bad_input", "输入缺少字段"), "bad_input", False, id="worker_failure"
+        ),
+        pytest.param(KeyError("boom"), "internal_error", True, id="unexpected_exception"),
+    ],
+)
+def test_app_failure_becomes_error_event(tmp_path, raised, code, retryable):
     async def app(ctx):
-        raise WorkerFailure("bad_input", "输入缺少字段")
+        raise raised
 
-    code, events = run(app, tmp_path)
-    assert code == 1
+    exit_code, events = run(app, tmp_path)
+    assert exit_code == 1
     assert types(events) == ["ready", "error"]
-    assert events[1]["code"] == "bad_input" and events[1]["retryable"] is False
-
-
-def test_unexpected_exception_is_retryable_internal_error(tmp_path):
-    async def app(ctx):
-        raise KeyError("boom")
-
-    code, events = run(app, tmp_path)
-    assert code == 1
-    assert events[-1]["code"] == "internal_error" and events[-1]["retryable"] is True
-
-
-def test_cancel_stops_app_without_terminal_event(tmp_path):
-    cancel = json.dumps(
-        {"type": "cancel", "v": 1, "attempt_id": "a-1", "reason": "user", "grace_ms": 0}
-    ).encode()
-    code, events = run(sleeps, tmp_path, host_lines=[cancel])
-    assert code == 0
-    assert types(events) == ["ready"]
+    assert events[1]["code"] == code and events[1]["retryable"] is retryable
 
 
 def test_stdin_eof_is_treated_as_cancel(tmp_path):
@@ -3718,19 +3617,6 @@ def test_invalid_control_message_fails_task(tmp_path):
     assert code == 1
     assert types(events) == ["ready", "error"]
     assert events[1]["code"] == "control_protocol_error"
-
-
-def test_checkpoint_committed(tmp_path):
-    async def app(ctx):
-        checkpoint_id = await ctx.checkpoint("s1", state={"n": 1})
-        return Result(checkpoint_id, [])
-
-    code, events = run(app, tmp_path, responder=checkpoint_reply("committed"))
-    assert code == 0
-    assert types(events) == ["ready", "checkpoint", "result"]
-    assert events[1]["checkpoint_id"] == "cp-1" and events[1]["state"] == {"n": 1}
-    assert events[1]["refs"] == [] and "state_ref" not in events[1]
-    assert events[2]["summary"] == "cp-1"
 
 
 def test_only_one_checkpoint_in_flight(tmp_path):
@@ -3763,56 +3649,6 @@ def test_only_one_checkpoint_in_flight(tmp_path):
     assert [e["checkpoint_id"] for e in events if e["type"] == "checkpoint"] == ["cp-1", "cp-2"]
 
 
-def test_lost_result_is_queried_with_same_id(tmp_path):
-    def respond(msg, transport):
-        if msg["type"] == "checkpoint_query":
-            reply(
-                transport,
-                {
-                    "type": "checkpoint_result",
-                    "checkpoint_id": msg["checkpoint_id"],
-                    "scope": "task",
-                    "status": "committed",
-                },
-            )
-
-    async def app(ctx):
-        return Result(await ctx.checkpoint("s1", state={}), [])
-
-    code, events = run(app, tmp_path, responder=respond)
-    assert code == 0
-    assert types(events) == ["ready", "checkpoint", "checkpoint_query", "result"]
-    assert events[2]["checkpoint_id"] == events[1]["checkpoint_id"] == "cp-1"
-
-
-def test_retryable_error_resends_same_id_with_new_seq(tmp_path):
-    replies = iter(["retryable_error", "committed"])
-
-    def respond(msg, transport):
-        if msg["type"] == "checkpoint":
-            checkpoint_reply(next(replies))(msg, transport)
-
-    async def app(ctx):
-        return Result(await ctx.checkpoint("s1", state={}), [])
-
-    code, events = run(app, tmp_path, responder=respond)
-    sent = [e for e in events if e["type"] == "checkpoint"]
-    assert code == 0
-    assert [e["checkpoint_id"] for e in sent] == ["cp-1", "cp-1"]
-    assert sent[0]["seq"] != sent[1]["seq"]
-
-
-def test_conflict_fails_task(tmp_path):
-    async def app(ctx):
-        await ctx.checkpoint("s1", state={})
-        return Result("never", [])
-
-    code, events = run(app, tmp_path, responder=checkpoint_reply("conflict"))
-    assert code == 1
-    assert events[-1] == {**events[-1], "code": "checkpoint_conflict", "retryable": False}
-    assert events[-1]["message"] == "checkpoint cp-1: conflict"
-
-
 def test_unresolved_after_max_attempts(tmp_path):
     async def app(ctx):
         await ctx.checkpoint("s1", state={})
@@ -3824,107 +3660,22 @@ def test_unresolved_after_max_attempts(tmp_path):
     assert events[-1]["code"] == "checkpoint_unresolved" and events[-1]["retryable"] is True
 
 
-def test_oversized_state_fails_without_sending(tmp_path):
+@pytest.mark.parametrize(
+    ("state", "code"),
+    [
+        pytest.param("x" * (256 << 10), "state_too_large", id="oversized"),
+        pytest.param({"x": object()}, "invalid_field", id="unserializable"),
+    ],
+)
+def test_bad_state_fails_without_sending(tmp_path, state, code):
     async def app(ctx):
-        await ctx.checkpoint("s1", state="x" * (256 << 10))
+        await ctx.checkpoint("s1", state=state)
         return Result("never", [])
 
-    code, events = run(app, tmp_path)
-    assert code == 1
+    exit_code, events = run(app, tmp_path)
+    assert exit_code == 1
     assert types(events) == ["ready", "error"]
-    assert events[1]["code"] == "state_too_large"
-
-
-def test_artifact_saved_returns_version(tmp_path):
-    content = "# 报告\n".encode()
-    (tmp_path / "report.md").write_bytes(content)
-    digest = hashlib.sha256(content).hexdigest()
-
-    def respond(msg, transport):
-        if msg["type"] == "artifact":
-            reply(
-                transport,
-                {
-                    "type": "artifact_result",
-                    "artifact_id": msg["artifact_id"],
-                    "status": "saved",
-                    "version": 2,
-                    "sha256": msg["declared_sha256"],
-                },
-            )
-
-    async def app(ctx):
-        ref = await ctx.register_artifact("report", "report.md", media_type="text/markdown")
-        return Result(str(ref.version), [ref.artifact_id])
-
-    code, events = run(app, tmp_path, responder=respond)
-    artifact = events[1]
-    assert code == 0
-    assert artifact["declared_sha256"] == digest and artifact["declared_size"] == len(content)
-    assert artifact["visibility"] == "output"
-    assert events[2]["summary"] == "2" and events[2]["outputs"] == ["report"]
-
-
-def test_artifact_rejected_fails_task(tmp_path):
-    (tmp_path / "x.txt").write_bytes(b"x")
-
-    def respond(msg, transport):
-        if msg["type"] == "artifact":
-            reply(
-                transport,
-                {
-                    "type": "artifact_result",
-                    "artifact_id": msg["artifact_id"],
-                    "status": "rejected",
-                    "code": "hash_mismatch",
-                },
-            )
-
-    async def app(ctx):
-        await ctx.register_artifact("x", "x.txt", media_type="text/plain")
-        return Result("never", [])
-
-    code, events = run(app, tmp_path, responder=respond)
-    assert code == 1
-    assert events[-1]["code"] == "artifact_rejected"
-
-
-def test_invalid_artifact_path_is_rejected_locally(tmp_path):
-    async def app(ctx):
-        await ctx.register_artifact("x", "../in/x", media_type="text/plain")
-        return Result("never", [])
-
-    code, events = run(app, tmp_path)
-    assert code == 1
-    assert types(events) == ["ready", "error"]
-    assert events[1]["code"] == "path_invalid"
-
-
-def test_pause_at_commit_boundary(tmp_path):
-    pause = json.dumps(
-        {"type": "pause", "v": 1, "attempt_id": "a-1", "reason": "user", "grace_ms": 5000}
-    ).encode()
-
-    async def app(ctx):
-        while not ctx.should_pause():
-            await asyncio.sleep(0.01)
-        return Paused(await ctx.checkpoint("s1", state={}))
-
-    code, events = run(app, tmp_path, host_lines=[pause], responder=checkpoint_reply("committed"))
-    assert code == 0
-    assert types(events) == ["ready", "checkpoint", "paused"]
-    assert events[2]["checkpoint_id"] == "cp-1"
-
-
-def test_resume_info_is_exposed(tmp_path):
-    resume = {"checkpoint_id": "cp-1", "step_id": "s1", "state": {"next_index": 2}}
-
-    async def app(ctx):
-        return Result(json.dumps([ctx.resume.checkpoint_id, ctx.resume.state]), [])
-
-    code, events = run(app, tmp_path, init={"attempt_no": 2, "resume": resume})
-    assert code == 0
-    assert json.loads(events[-1]["summary"]) == ["cp-1", {"next_index": 2}]
+    assert events[1]["code"] == code
 
 
 def test_checkpoint_retries_use_snapshot_of_state(tmp_path):
@@ -3945,15 +3696,37 @@ def test_checkpoint_retries_use_snapshot_of_state(tmp_path):
     assert [e["state"] for e in sent] == [{"n": 1}, {"n": 1}]
 
 
-def test_unserializable_state_fails_without_sending(tmp_path):
+@pytest.mark.parametrize(
+    ("path", "code", "sent"),
+    [
+        pytest.param(
+            "x.txt", "artifact_rejected", ["ready", "artifact", "error"], id="host_rejects"
+        ),
+        pytest.param("../in/x", "path_invalid", ["ready", "error"], id="invalid_path_local"),
+    ],
+)
+def test_artifact_failure_fails_task(tmp_path, path, code, sent):
+    (tmp_path / "x.txt").write_bytes(b"x")
+
+    def respond(msg, transport):
+        if msg["type"] == "artifact":
+            reply(
+                transport,
+                {
+                    "type": "artifact_result",
+                    "artifact_id": msg["artifact_id"],
+                    "status": "rejected",
+                    "code": "hash_mismatch",
+                },
+            )
+
     async def app(ctx):
-        await ctx.checkpoint("s1", state={"x": object()})
+        await ctx.register_artifact("x", path, media_type="text/plain")
         return Result("never", [])
 
-    code, events = run(app, tmp_path)
-    assert code == 1
-    assert types(events) == ["ready", "error"]
-    assert events[1]["code"] == "invalid_field"
+    exit_code, events = run(app, tmp_path, responder=respond)
+    assert exit_code == 1
+    assert types(events) == sent and events[-1]["code"] == code
 
 
 class BreaksAfterReady(MemoryTransport):
@@ -3970,12 +3743,11 @@ def test_broken_transport_ends_worker_with_failure(tmp_path):
 
     async def go():
         transport = BreaksAfterReady()
-        init = {**INIT, "out_dir": str(tmp_path)}
-        transport.feed(json.dumps(init).encode())
+        transport.feed(json.dumps({**INIT, "out_dir": str(tmp_path)}).encode())
         code = await asyncio.wait_for(
             run_worker(app, transport, name="w", version="0", timing=FAST), timeout=5
         )
-        return code, [json.loads(line)["type"] for line in transport.sent]
+        return code, types(sent_json(transport))
 
     assert asyncio.run(go()) == (1, ["ready"])
 ```
@@ -3983,10 +3755,10 @@ def test_broken_transport_ends_worker_with_failure(tmp_path):
 - [ ] **Step 2：确认测试失败**
 
 ```powershell
-cd F:\go-agentbox-m1-3\worker; uv run pytest -q tests/test_runtime.py
+cd F:\go-agentbox-m1-3\worker; uv run pytest -q tests/test_sdk.py
 ```
 
-Expected: `ImportError: cannot import name 'MemoryTransport' from 'agentbox_worker'`。
+Expected: 收集错误 `ImportError: cannot import name 'Result' from 'agentbox_worker'`。
 
 - [ ] **Step 3：实现**
 
@@ -4530,7 +4302,7 @@ Expected: 全部通过。代码中只有两处 `noqa`：`B008`（`Timing` 不可
 - [ ] **Step 5：提交**
 
 ```bash
-cd /f/go-agentbox-m1-3 && git add worker/agentbox_worker/runtime.py worker/agentbox_worker/__init__.py worker/tests/test_runtime.py && git commit -m "feat(worker): SDK 运行时——握手、控制消息、checkpoint、产物、暂停与取消
+cd /f/go-agentbox-m1-3 && git add worker/agentbox_worker/runtime.py worker/agentbox_worker/__init__.py worker/tests/test_sdk.py && git commit -m "feat(worker): SDK 运行时——握手、控制消息、checkpoint、产物、暂停与取消
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4544,7 +4316,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Files:**
 - Create: `worker/sim_worker/__init__.py`、`worker/sim_worker/app.py`、`worker/sim_worker/__main__.py`
 - Create: `protocol/fixtures/v1/scenarios/` 下 9 个 SDK 层场景（下方给出）
-- Create: `worker/tests/test_sdk_scenarios.py`、`worker/tests/test_sim_worker.py`、`worker/tests/test_process_e2e.py`
+- Modify: `worker/tests/test_sdk.py`（末尾追加 SDK 层场景回放与 sim-worker 测试）
+- Create: `worker/tests/test_process.py`（真实子进程测试）
 
 **Interfaces:**
 - Consumes: Task 6 的 SDK 全部导出；Task 2 的场景格式。
@@ -4740,30 +4513,25 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 - [ ] **Step 2：写失败的测试**
 
-`worker/tests/test_sdk_scenarios.py`：
+在 `worker/tests/test_sdk.py` **末尾追加**（与上文空两行）：
 
 ```python
-"""用 SDK 驱动 sim-worker 逐条复现 layers 含 "sdk" 的场景。
+# ---- SDK 层场景回放与 sim-worker ----
+# 用 SDK 驱动 sim-worker 逐条复现 layers 含 "sdk" 的场景：宿主行按顺序送入内存传输；每当
+# Worker 发出一行，就与场景中下一条 Worker 行比较（忽略 ts），再送入其后连续的宿主行。
+# init.out_dir 替换为临时目录。
 
-回放方式：宿主行按顺序送入内存传输；每当 Worker 发出一行，就与场景中下一条 Worker 行比较
-（忽略 ts），然后送入其后连续的宿主行。init.out_dir 替换为临时目录。
-"""
-
-import asyncio
-import itertools
-import json
-from typing import Any
-
-import pytest
 from protocol_fixtures import load_scenarios
 
-from agentbox_worker import MemoryTransport, Timing, run_worker
 from agentbox_worker.stream import StreamChecker
 from sim_worker import NAME, VERSION
 from sim_worker.app import run as sim_app
 
-FAST = Timing(ack_timeout=0.05, max_ack_attempts=5, retry_backoff=0.01, artifact_timeout=1.0)
+SCENARIO_TIMING = Timing(
+    ack_timeout=0.05, max_ack_attempts=5, retry_backoff=0.01, artifact_timeout=1.0
+)
 SDK_SCENARIOS = [s for s in load_scenarios() if "sdk" in s["layers"]]
+assert len(SDK_SCENARIOS) >= 9, "SDK 层场景缺失"
 
 
 def replay_sdk(scenario: dict[str, Any], out_dir: str) -> tuple[int, list[str], int]:
@@ -4806,7 +4574,7 @@ def replay_sdk(scenario: dict[str, Any], out_dir: str) -> tuple[int, list[str], 
                 transport,
                 name=NAME,
                 version=VERSION,
-                timing=FAST,
+                timing=SCENARIO_TIMING,
                 new_id=lambda: f"cp-{next(counter)}",
             ),
             timeout=10,
@@ -4820,76 +4588,42 @@ def replay_sdk(scenario: dict[str, Any], out_dir: str) -> tuple[int, list[str], 
     return code, problems, cursor
 
 
-def test_sdk_scenarios_exist():
-    assert len(SDK_SCENARIOS) >= 9
-
-
 @pytest.mark.parametrize("scenario", SDK_SCENARIOS, ids=lambda s: s["name"])
 def test_sdk_reproduces_scenario(scenario, tmp_path):
     code, problems, cursor = replay_sdk(scenario, str(tmp_path))
     assert problems == []
     assert cursor == len(scenario["lines"]), "场景中仍有未出现的行"
     assert code == scenario["sdk"]["exit_code"]
+
+
+@pytest.mark.parametrize(
+    ("steps", "config", "code", "last"),
+    [
+        pytest.param(
+            [{"op": "fail", "code": "sim_failure", "message": "x", "retryable": True}],
+            {},
+            1,
+            {"code": "sim_failure", "retryable": True},
+            id="fail",
+        ),
+        pytest.param(
+            [{"op": "allocate_mb", "mb": 4}],
+            {"summary": "分配完成"},
+            0,
+            {"summary": "分配完成"},
+            id="allocate_mb",
+        ),
+        pytest.param([{"op": "teleport"}], {}, 1, {"code": "sim_bad_config"}, id="unknown_op"),
+        pytest.param([], {}, 0, {"summary": "done", "outputs": []}, id="defaults"),
+    ],
+)
+def test_sim_worker_ops(tmp_path, steps, config, code, last):
+    exit_code, events = run(sim_app, tmp_path, init={"config": {"steps": steps, **config}})
+    assert exit_code == code
+    assert events[-1] == {**events[-1], **last}
 ```
 
-`worker/tests/test_sim_worker.py`：
-
-```python
-import asyncio
-import json
-
-from agentbox_worker import MemoryTransport, run_worker
-from sim_worker import NAME, VERSION
-from sim_worker.app import run as sim_app
-
-
-def run_sim(steps: list[dict], tmp_path, **config) -> tuple[int, list[dict]]:
-    async def go():
-        transport = MemoryTransport()
-        init = {
-            "type": "init",
-            "bootstrap": 1,
-            "protocol_versions": [1],
-            "mode": "task",
-            "task_id": "t-1",
-            "attempt_id": "a-1",
-            "attempt_no": 1,
-            "out_dir": str(tmp_path),
-            "config": {"steps": steps, **config},
-        }
-        transport.feed(json.dumps(init).encode())
-        code = await asyncio.wait_for(
-            run_worker(sim_app, transport, name=NAME, version=VERSION), timeout=10
-        )
-        return code, [json.loads(line) for line in transport.sent]
-
-    return asyncio.run(go())
-
-
-def test_fail_op_becomes_error(tmp_path):
-    code, events = run_sim(
-        [{"op": "fail", "code": "sim_failure", "message": "x", "retryable": True}], tmp_path
-    )
-    assert code == 1
-    assert events[-1]["code"] == "sim_failure" and events[-1]["retryable"] is True
-
-
-def test_allocate_op_holds_memory(tmp_path):
-    code, events = run_sim([{"op": "allocate_mb", "mb": 4}], tmp_path, summary="分配完成")
-    assert code == 0 and events[-1]["summary"] == "分配完成"
-
-
-def test_unknown_op_is_config_error(tmp_path):
-    code, events = run_sim([{"op": "teleport"}], tmp_path)
-    assert code == 1 and events[-1]["code"] == "sim_bad_config"
-
-
-def test_defaults_without_config(tmp_path):
-    code, events = run_sim([], tmp_path)
-    assert code == 0 and events[-1]["summary"] == "done" and events[-1]["outputs"] == []
-```
-
-`worker/tests/test_process_e2e.py`：
+`worker/tests/test_process.py`：
 
 ```python
 """以真实子进程运行 `python -m sim_worker`：协议、退出码、print 改道与有界退出。
@@ -5034,7 +4768,7 @@ def test_process_rejects_oversized_input_line(tmp_path):
 - [ ] **Step 3：确认测试失败**
 
 ```powershell
-cd F:\go-agentbox-m1-3\worker; uv run pytest -q tests/test_sdk_scenarios.py tests/test_sim_worker.py tests/test_process_e2e.py
+cd F:\go-agentbox-m1-3\worker; uv run pytest -q tests/test_sdk.py tests/test_process.py
 ```
 
 Expected: `ModuleNotFoundError: No module named 'sim_worker'`。
@@ -5181,12 +4915,12 @@ Expected: ruff 无问题；`lint-imports` 报告 1 个契约 KEPT；pytest 全�
 wsl -d Ubuntu -- bash -c 'export PATH=$PATH:/usr/local/go/bin; cd /mnt/f/go-agentbox-m1-3 && go test -count=1 -v ./internal/protocol/ 2>&1 | grep -cE "^    --- PASS: TestScenarioFixtures/"; go test -count=1 ./internal/protocol/'
 ```
 
-Expected: 计数为 18（9 个协议层 + 9 个 SDK 层场景）；最后一行 `ok`。
+Expected: 计数为 21（12 个协议层 + 9 个 SDK 层场景）；最后一行 `ok`。
 
 - [ ] **Step 7：提交**
 
 ```bash
-cd /f/go-agentbox-m1-3 && git add worker/sim_worker protocol/fixtures/v1/scenarios worker/tests/test_sdk_scenarios.py worker/tests/test_sim_worker.py worker/tests/test_process_e2e.py && git commit -m "feat(worker): sim-worker、SDK 层场景回放与真实进程端到端测试
+cd /f/go-agentbox-m1-3 && git add worker/sim_worker protocol/fixtures/v1/scenarios worker/tests/test_sdk.py worker/tests/test_process.py && git commit -m "feat(worker): sim-worker、SDK 层场景回放与真实进程端到端测试
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -5273,8 +5007,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
    cd F:\go-agentbox-m1-3\worker; uv sync --locked; uv run ruff check .; uv run ruff format --check .; uv run lint-imports; uv run pytest -q
    ```
    Expected: 全部通过。
-3. **跨语言一致性**：Go 的 `TestMessageFixtures`、`TestScenarioFixtures` 与 Python 的 `test_protocol_fixtures`、`test_stream_scenarios`、`test_schemas`、`test_sdk_scenarios` 全部通过，且读取的是同一批 fixtures 文件（`protocol/fixtures/v1/messages.json` 与 18 个场景）。
-4. **CI（Linux，判定依据）**：推送分支并开 Draft PR（`Refs #4`），确认 `correctness`、`complexity-report`、`linux-integration`、`python (3.11)`、`python (3.13)` 全部实际执行并通过；`test_process_e2e.py` 的五个真实进程测试（保持 stdin 打开时退出、停止读取 stdout 后取消、stdout 被关闭、输入超长、print 改道）在 Linux 上通过。
+3. **跨语言一致性**：Go 的 `TestMessageFixtures`、`TestScenarioFixtures` 与 Python 的 `test_valid_message_round_trips`、`test_invalid_message_has_expected_code`、`test_scenario_stream`、`test_schema_*`、`test_sdk_reproduces_scenario` 全部通过，且读取的是同一批 fixtures 文件（`protocol/fixtures/v1/messages.json` 与 21 个场景）。
+4. **CI（Linux，判定依据）**：推送分支并开 Draft PR（`Refs #4`），确认 `correctness`、`complexity-report`、`linux-integration`、`python (3.11)`、`python (3.13)` 全部实际执行并通过；`test_process.py` 的五个真实进程测试（保持 stdin 打开时退出、停止读取 stdout 后取消、stdout 被关闭、输入超长、print 改道）在 Linux 上通过。
 5. **范围核对**：`git diff --stat m1-local-provider...HEAD` 只包含本计划 Files 中列出的文件。
 
 计划完成后向项目负责人汇报：实现的接口、测试与 CI 结果、偏离计划之处及原因。合并由项目负责人决定。
@@ -5284,8 +5018,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ## 自查记录
 
 - **规格覆盖**：§5.1 通道（SDK 的 stdin/stdout/stderr 处理、print 改道）；§5.2 引导与 `handshake_error`（Task 6、场景 `handshake_no_common_version`）；§5.3 公共规则与阶段（Task 2、3 的事件流检查）；§5.4 task 模式消息（Task 1、3）；§5.5 第 1、4、5 条（state 二选一、一个在途提交、同 ID 查询与重发）；§5.8 由宿主裁决（SDK 取消时不发终态提议）；§5.9 协作式暂停与取消；§5.10 大小上限；§5.11 fixtures（本计划覆盖协议层与 SDK 层场景，宿主层场景随 Plan 5 加入同一目录）。session 与 sub-run 扩展不在本计划范围。
-- **评审修正（第二轮）**：seq 提交点与取消语义（Task 5，`test_cancel_during_send_breaks_outbox_without_reusing_seq`）；有界关闭（Task 6 `main`，Task 7 三个真实进程场景）；读取阶段限长与有界背压（Task 5，`test_stdio_rejects_oversized_line_at_read_time`、`test_stdio_reader_applies_backpressure`，Task 7 `test_process_rejects_oversized_input_line`）；checkpoint 快照（Task 6，`test_checkpoint_retries_use_snapshot_of_state`）。
+- **评审修正（第二轮）**：seq 提交点与取消语义（Task 5，`test_cancel_during_send_breaks_outbox_without_reusing_seq`）；有界关闭（Task 6 `main`，Task 7 三个真实进程场景）；读取阶段限长与有界背压（Task 5，`test_stdio_frame_limit_is_checked_at_read_time`、`test_stdio_reader_applies_backpressure`，Task 7 `test_process_rejects_oversized_input_line`）；checkpoint 快照（Task 6，`test_checkpoint_retries_use_snapshot_of_state`）。
 - **评审修正（第三轮）**：读线程改用线程安全的有界队列，不再从读线程创建协程；`_put` 返回是否交付，事件循环关闭后读线程立即停止读取（`test_stdio_reader_stops_consuming_after_event_loop_closes`，已做变异验证：忽略返回值时读线程在循环关闭后读完全部 100 行，测试失败）；背压测试以同步屏障断言输入读取位置，不再依赖固定 sleep；缓冲上限、快照 JSON 归一化与关闭期限的范围写清；e2e 测试固定子进程 `PYTHONIOENCODING=utf-8`（Windows 默认代码页下断言中文日志会失败）。
-- **演练**：本计划的全部代码已在临时目录按计划文本组装并运行：Go vet/test 与 18 个场景通过；Python ruff、模块依赖契约通过，pytest 在 Windows 3.13 与 3.11 上各 281 项通过（`-W error::RuntimeWarning`，3.11 连续三次）；Linux（WSL，Python 3.14）上除 schema 测试外的 148 项通过（连续三次），含全部真实进程测试。
+- **测试布局（第四轮，按代码组织设计 §9.3）**：Go 由 4 个测试文件、13 个函数合并为 `protocol_test.go` 的 5 个函数；Go 专用的事件流规则表删除，其中场景未覆盖的三条（seq 重复、seq 不从 1 开始、handshake_error 不在首位）改为协议层场景 fixtures，Python 侧随之获得同样覆盖。Python 由 9 个测试文件、64 个函数合并为 `test_protocol.py`（8）、`test_sdk.py`（22）、`test_process.py`（5）共 35 个函数：已由 SDK 层场景逐条回放的运行时用例（正常路径、握手失败、取消、查询、重发、冲突、产物、暂停、恢复）合并为一个正常路径测试；同类错误码改为参数化；删除测试辅助类与简单取值的用例。三轮评审的回归测试全部保留。各任务完成时的中间状态（Task 1、3、5、6）均单独通过 ruff 与 pytest。
+- **演练**：本计划的全部代码已在临时目录按计划文本组装并运行，组装结果与验证目录逐文件一致：Go vet/test 通过，21 个场景通过；Python ruff、格式、模块依赖契约通过，pytest 在 Windows 3.13 与 3.11 上各 274 项通过（`-W error::RuntimeWarning`，3.11 连续三次）；Linux（WSL 离线，Python 3.14）上 `test_sdk.py` 与 `test_process.py` 共 42 项通过（连续三次），含全部真实进程测试；`test_protocol.py` 依赖已编译的 jsonschema 依赖，离线 WSL 无法安装，由 Windows 与 CI 覆盖。
 - **占位符**：无。
 - **类型一致性**：`run_worker(app, transport, *, name, version, capabilities, timing, new_id)`、`Timing(ack_timeout, max_ack_attempts, retry_backoff, artifact_timeout)`、`TaskContext.checkpoint(step_id, *, state, state_ref, refs)`、`register_artifact(artifact_id, path, *, media_type, visibility)` 在 Task 6、7 的测试与实现中一致；Go 的 `DecodeLine`、`EncodeLine`、`WorkerStream.Observe`、`CodeOf` 在 Task 1、2 中一致。
