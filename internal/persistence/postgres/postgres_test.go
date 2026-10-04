@@ -1621,3 +1621,186 @@ func TestReleaseDoesNotFreeLaterAllocation(t *testing.T) {
 		t.Fatalf("后来的分配应保持不变：%+v %v", got, err)
 	}
 }
+
+// ---- 控制面补齐（Plan 5 Task 1）：重试计数、not_before、LoadTask、运行时间、访问撤销、清理候选、隔离 ----
+
+// TestRetryCountersAndNotBefore：重试计数只在新建 attempt 的事务中递增一次（含提交回复丢失后的重跑）；
+// not_before 只用于回到 queued 的判决。
+func TestRetryCountersAndNotBefore(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	notBefore := time.Now().Add(time.Minute).UTC().Truncate(time.Microsecond)
+	v := verdict("t1", 1)
+	v.TaskStatus, v.NotBefore = "queued", &notBefore
+	if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := s.LoadTask(ctx, "t1"); err != nil || st.NotBefore == nil || !st.NotBefore.Equal(notBefore) {
+		t.Fatalf("not_before 应被写入：%+v %v", st.NotBefore, err)
+	}
+	stopEnv(t, s, "env-t1")
+	var lost atomic.Bool
+	s.hooks.afterCommit = func(op string) error {
+		if op == "CreateAttempt" && lost.CompareAndSwap(false, true) {
+			return errors.New("模拟：COMMIT 已执行但回复丢失")
+		}
+		return nil
+	}
+	if _, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: "t1", AttemptID: "att2-t1", AttemptNo: 2, EnvID: "env2-t1", Retry: task.RetryFault}); err != nil || !lost.Load() {
+		t.Fatalf("故障重试的 attempt：%v（钩子触发 %v）", err, lost.Load())
+	}
+	s.hooks.afterCommit = nil
+	v2 := verdict("t1", 137)
+	v2.AttemptID, v2.TaskStatus = "att2-t1", "queued"
+	if _, err := s.FinalizeAttempt(ctx, v2); err != nil {
+		t.Fatal(err)
+	}
+	stopEnv(t, s, "env2-t1")
+	if _, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: "t1", AttemptID: "att3-t1", AttemptNo: 3, EnvID: "env3-t1", Retry: task.RetryOOM}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := s.LoadTask(ctx, "t1")
+	if err != nil || st.FaultRetriesUsed != 1 || st.OOMRetriesUsed != 1 || st.AttemptsTotal != 3 {
+		t.Fatalf("计数应为故障 1、OOM 1、共 3 次：%+v %v", st, err)
+	}
+	fixture(t, s, "t2")
+	bad := verdict("t2", 1)
+	bad.NotBefore = &notBefore // TaskStatus = failed
+	if _, err := s.FinalizeAttempt(ctx, bad); !errors.Is(err, errInvalid) {
+		t.Fatalf("非 queued 的判决带 not_before 应为 errInvalid，得到 %v", err)
+	}
+	if _, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: "t2", AttemptID: "x", AttemptNo: 2, EnvID: "x", Retry: "maybe"}); !errors.Is(err, errInvalid) {
+		t.Fatalf("未定义的重试类别应为 errInvalid，得到 %v", err)
+	}
+}
+
+// TestLoadTaskReturnsLatestCheckpoint：LoadTask 返回控制与计数事实，以及最新已提交 checkpoint 的完整内容。
+func TestLoadTaskReturnsLatestCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	fixture(t, s, "t2")
+	for i, id := range []string{"cp1", "cp2"} {
+		if _, err := s.CommitCheckpoint(ctx, runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "t1"}, CheckpointID: id,
+			AttemptID: "att-t1", StepID: "s" + id, State: json.RawMessage(fmt.Sprintf(`{"n":%d}`, i+1))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := s.LoadTask(ctx, "t1")
+	if err != nil || st.Status != "running" || st.CurrentAttemptID != "att-t1" || st.Desired != "run" || st.ControlVersion != 1 ||
+		st.AttemptsTotal != 1 || st.MaxFaultRetries != 3 {
+		t.Fatalf("任务事实：%+v %v", st, err)
+	}
+	if st.Latest == nil || st.Latest.CheckpointID != "cp2" || st.Latest.StepID != "scp2" || string(st.Latest.State) != `{"n": 2}` || len(st.Latest.Refs) != 0 {
+		t.Fatalf("应返回最新 checkpoint 的完整内容：%+v", st.Latest)
+	}
+	if st2, err := s.LoadTask(ctx, "t2"); err != nil || st2.Latest != nil {
+		t.Fatalf("无 checkpoint 时 Latest 应为 nil：%+v %v", st2.Latest, err)
+	}
+	if _, err := s.LoadTask(ctx, "missing"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("不存在的任务应为 ErrNotFound，得到 %v", err)
+	}
+	if _, err := s.FinalizeAttempt(ctx, verdict("t2", 1)); err != nil {
+		t.Fatal(err)
+	}
+	if ids, err := s.ListActiveTasks(ctx); err != nil || strings.Join(ids, ",") != "t1" {
+		t.Fatalf("只有 t1 是非终态：%v %v", ids, err)
+	}
+}
+
+// TestPersistRunTime：累计运行时间单调（取较大者），提交回复丢失后不重复累计，旧 attempt 被拒绝。
+func TestPersistRunTime(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	if got, err := s.PersistRunTime(ctx, "t1", "att-t1", 500); err != nil || got != 500 {
+		t.Fatalf("得到 (%d, %v)", got, err)
+	}
+	if got, err := s.PersistRunTime(ctx, "t1", "att-t1", 300); err != nil || got != 500 {
+		t.Fatalf("较小的值不应回退：(%d, %v)", got, err)
+	}
+	var lost atomic.Bool
+	s.hooks.afterCommit = func(op string) error {
+		if op == "PersistRunTime" && lost.CompareAndSwap(false, true) {
+			return errors.New("模拟：COMMIT 已执行但回复丢失")
+		}
+		return nil
+	}
+	if got, err := s.PersistRunTime(ctx, "t1", "att-t1", 800); err != nil || got != 800 || !lost.Load() {
+		t.Fatalf("提交回复丢失后应得到 800：(%d, %v)", got, err)
+	}
+	s.hooks.afterCommit = nil
+	retryWithNewAttempt(t, s, "t1")
+	_, err := s.PersistRunTime(ctx, "t1", "att-t1", 900)
+	expectRejected(t, err, persistence.CodeStaleAttempt)
+	if st, _ := s.LoadTask(ctx, "t1"); st.RunTimeMs != 800 {
+		t.Fatalf("旧 attempt 不应改变运行时间：%d", st.RunTimeMs)
+	}
+}
+
+// TestRevokeAttemptAccess：撤销幂等，撤销后该 attempt 的提交被拒绝。
+func TestRevokeAttemptAccess(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	for i := 0; i < 2; i++ {
+		if err := s.RevokeAttemptAccess(ctx, "att-t1", "stopping"); err != nil {
+			t.Fatalf("第 %d 次撤销：%v", i+1, err)
+		}
+	}
+	_, err := s.CommitCheckpoint(ctx, runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "t1"}, CheckpointID: "cp1",
+		AttemptID: "att-t1", StepID: "s1", State: json.RawMessage(`{}`)})
+	expectRejected(t, err, persistence.CodeStaleAttempt)
+	if err := s.RevokeAttemptAccess(ctx, "missing", "x"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("不存在的 attempt 应为 ErrNotFound，得到 %v", err)
+	}
+}
+
+// TestListCleanupCandidates：只返回已停止、未清理完成、attempt 已有判决、退避已到的环境。
+func TestListCleanupCandidates(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	now := time.Now()
+	later := now.Add(time.Hour)
+	for _, id := range []string{"t1", "t2", "t3", "t4", "t5"} {
+		fixture(t, s, id)
+	}
+	for _, id := range []string{"t1", "t2", "t4", "t5"} { // t3 无判决
+		if _, err := s.FinalizeAttempt(ctx, verdict(id, 1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{"t1", "t3", "t4", "t5"} { // t2 未停止
+		if _, err := s.MarkStopped(ctx, "env-"+id, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.UpdateCleanup(ctx, resource.CleanupUpdate{EnvID: "env-t4", State: resource.CleanupDone}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateCleanup(ctx, resource.CleanupUpdate{EnvID: "env-t5", State: resource.CleanupPending, Error: "busy", NextRetryAt: &later}); err != nil {
+		t.Fatal(err)
+	}
+	envs, err := s.ListCleanupCandidates(ctx, now.Add(time.Second), 10)
+	if err != nil || len(envs) != 1 || envs[0].EnvID != "env-t1" {
+		t.Fatalf("只应返回 env-t1：%+v %v", envs, err)
+	}
+	if envs, _ := s.ListCleanupCandidates(ctx, later.Add(time.Second), 10); len(envs) != 2 {
+		t.Fatalf("退避到期后 env-t5 也应返回：%+v", envs)
+	}
+}
+
+// TestRecordQuarantine：按路径幂等，不覆盖已有记录。
+func TestRecordQuarantine(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	for _, reason := range []string{"无 owner.json", "第二次"} {
+		if err := s.RecordQuarantine(ctx, resource.Quarantine{Layer: "env_dir", Path: "/data/envs/x", Reason: reason}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := count(t, s, "SELECT count(*) FROM quarantined_resources WHERE resource_path = '/data/envs/x' AND reason = '无 owner.json'"); n != 1 {
+		t.Fatalf("应只有首次记录，得到 %d", n)
+	}
+}

@@ -33,6 +33,19 @@ type Store interface {
 	UpdateCleanup(ctx context.Context, u CleanupUpdate) (Environment, error)
 	// GetEnvironment 读取环境记录。
 	GetEnvironment(ctx context.Context, envID string) (Environment, error)
+	// ListCleanupCandidates 返回待清理的环境：stopped_at 已记录、清理未完成、所属 attempt 已有判决、
+	// next_retry_at 已到（或为空）；按停止时间排序，至多 limit 个。
+	ListCleanupCandidates(ctx context.Context, now time.Time, limit int) ([]Environment, error)
+	// RecordQuarantine 记录一个隔离资源（规格 §14.1 扫描表）；按路径幂等。
+	RecordQuarantine(ctx context.Context, q Quarantine) error
+}
+
+// Quarantine 是一个归属不明或冲突的资源：不自动销毁，报警并计入占用。
+type Quarantine struct {
+	Layer         string // 与 provider.ScanItem.Layer 相同的取值
+	Path          string
+	ObservedOwner string
+	Reason        string
 }
 
 // 资源意图状态。

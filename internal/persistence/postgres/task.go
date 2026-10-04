@@ -23,6 +23,11 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 	if a.TaskID == "" || a.AttemptID == "" || a.EnvID == "" || a.AttemptNo < 1 {
 		return task.Attempt{}, invalidf("CreateAttempt 缺少 task_id、attempt_id、env_id 或 attempt_no")
 	}
+	switch a.Retry {
+	case task.RetryNone, task.RetryFault, task.RetryOOM:
+	default:
+		return task.Attempt{}, invalidf("CreateAttempt 的重试类别 %q 未定义", a.Retry)
+	}
 	var out task.Attempt
 	err := s.run(ctx, "CreateAttempt", a.AttemptID, func(ctx context.Context, tx pgx.Tx) error {
 		var status, desired string
@@ -79,8 +84,11 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 			a.EnvID, a.AttemptID); err != nil {
 			return err
 		}
+		// 重试计数只在新建 attempt 的同一事务中递增；重放走上面的身份分支，不重复递增（规格 §14.2）。
 		tag, err := tx.Exec(ctx, `UPDATE tasks SET current_attempt_id = $2, attempts_total = attempts_total + 1, status = 'running',
-			row_version = row_version + 1 WHERE task_id = $1 AND status = 'queued'`, a.TaskID, a.AttemptID)
+			fault_retries_used = fault_retries_used + CASE WHEN $3 = 'fault' THEN 1 ELSE 0 END,
+			oom_retries_used = oom_retries_used + CASE WHEN $3 = 'oom' THEN 1 ELSE 0 END,
+			row_version = row_version + 1 WHERE task_id = $1 AND status = 'queued'`, a.TaskID, a.AttemptID, string(a.Retry))
 		if err != nil {
 			return err
 		}
@@ -289,6 +297,9 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 		v.TaskStatus == "" || v.EventType == "" {
 		return task.Attempt{}, invalidf("FinalizeAttempt 缺少必填字段")
 	}
+	if v.NotBefore != nil && v.TaskStatus != "queued" {
+		return task.Attempt{}, invalidf("not_before 只用于回到 queued 的故障重试，任务状态为 %s", v.TaskStatus)
+	}
 	hash, err := verdictHash(v)
 	if err != nil {
 		return task.Attempt{}, err
@@ -347,8 +358,8 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 		}
 		// 判决已按 controlVersion 裁决，一并推进 applied_control_version，actor 不再对已裁决的任务应用控制。
 		if _, err := tx.Exec(ctx, `UPDATE tasks SET status = $2, status_reason = $3, result_json = $4,
-			applied_control_version = GREATEST(applied_control_version, $5), row_version = row_version + 1
-			WHERE task_id = $1`, v.TaskID, v.TaskStatus, v.TaskStatusReason, nullJSON(v.Result), controlVersion); err != nil {
+			applied_control_version = GREATEST(applied_control_version, $5), not_before = $6, row_version = row_version + 1
+			WHERE task_id = $1`, v.TaskID, v.TaskStatus, v.TaskStatusReason, nullJSON(v.Result), controlVersion, v.NotBefore); err != nil {
 			return err
 		}
 		if _, err := appendHostEvent(ctx, tx, hostEvent{taskID: v.TaskID, key: "attempt_finalized:" + v.AttemptID,
