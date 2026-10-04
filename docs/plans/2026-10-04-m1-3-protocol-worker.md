@@ -61,6 +61,7 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
 | 4 | Task 6 | Task 5 |
 | 5 | Task 7 | Task 2 的场景格式、Task 6 |
 | 6 | Task 8 | Task 7 |
+| 7 | Task 9（契约收紧，终审 I1） | Task 1–8 |
 
 批次 3 若并行执行，Task 4 与 Task 5 **各用独立 worktree**（例如 `../go-agentbox-m1-3-t4`、`../go-agentbox-m1-3-t5`，均从批次 2 完成后的提交建出），由主 agent 依次合入 `m1-3-protocol-worker` 后再开始批次 4。两者不修改同一文件。
 
@@ -70,7 +71,7 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
 
 **事件流错误码**：`seq_invalid`、`before_ready`、`duplicate_ready`、`after_terminal`、`handshake_error_misplaced`、`after_handshake_error`。
 
-**判定优先级**（两侧一致）：行不是 JSON 对象 → `malformed_json`；`type` 缺失、非字符串或不属于该方向 → `unknown_type`；超过该类型的大小上限 → `message_too_large`；字段类型错误 → `invalid_field`；然后按各类型的语义规则依次检查。
+**判定优先级**（两侧一致）：行长超过任何类型上限中的最大值（1 MiB）→ `message_too_large`，不解析；行不是严格的 UTF-8（含 BOM 前缀）、不是 JSON 对象，或违反 JSON 结构限制（嵌套超过 64 层；任意层级的重复键，按解码后的键名比较，孤立代理项转义按 U+FFFD 计；数字字面量超过 32 个字符；浮点字面量上溢为无穷或非零值下溢为零）→ `malformed_json`；`type` 缺失（键名区分大小写）、非字符串或不属于该方向 → `unknown_type`；超过该类型的大小上限 → `message_too_large`；`v` 不是整数形式的 1 → `version_mismatch`；与已定义字段只差大小写的键（按消息类型逐层检查，含 `resume`、`worker`）→ `invalid_field`；字段类型错误（整数字段只接受整数形式且在 int64 范围内）→ `invalid_field`；然后按各类型的语义规则依次检查。
 
 **事件流规则**（task 模式）：`seq` 从 1 严格递增；`ready` 之前只允许 `error`（启动失败）；`ready` 只能出现一次；终态提议（`result`、`error`、`paused`）至多一个，其后只允许 `checkpoint_query`；`handshake_error` 只能是第一条且是唯一一条 Worker 消息。
 
@@ -94,8 +95,9 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
 
 - **seq 的提交点**是"校验通过、开始发送"：此后无论发送成功、失败还是被取消，该 seq 都已用掉。发送失败或在途被取消时结果不确定，输出通道进入失效状态（`TransportBroken`），此后不再发送任何事件，绝不以同一 seq 重发；Worker 以 1 退出且无法再发出 `error`。
 - **输入**：读取阶段即按帧长上限（init 上限 1 MiB + 行尾）截断判定，超长帧报 `message_too_large` 并停止读取；读到的行进入线程安全的有界队列（默认 64 条），队列满时读线程阻塞，对宿主形成背压。读线程绑定首次 `receive` 所在的事件循环，该循环关闭后不再读取输入并退出。输入缓冲约为 (64 + 1) 帧：队列中的 64 帧，加上读线程正在读取或等待入队的一帧，另有对象与底层文件缓冲的开销；这是估算，**不是**总内存的硬上限（不能写成"最多 64 MiB"）。
-- **进程入口** `main()` 是 SDK 中唯一调用 `os._exit` 的地方：运行 Worker（任何异常都记录并按失败处理）→ 在期限内等待已提交的输出写完 → `os._exit`。期限由环境变量 `AGENTBOX_WORKER_SHUTDOWN_TIMEOUT` 设置（秒，默认 5）。读写线程可能阻塞在 stdin 或 stdout 上且无法取消，正常的解释器收尾会挂起或崩溃（计划演练中实测复现 `Fatal Python error: _enter_buffered_busy`）。
+- **进程入口** `main()` 是 SDK 中唯一调用 `os._exit` 的地方：运行 Worker（任何异常都记录并按失败处理）→ 在期限内等待已提交的输出写完 → `os._exit`。期限由环境变量 `AGENTBOX_WORKER_SHUTDOWN_TIMEOUT` 设置（秒，默认 5；不在 0–3600 内时用默认值），收尾步骤本身失败也必须执行 `os._exit`。读写线程可能阻塞在 stdin 或 stdout 上且无法取消，正常的解释器收尾会挂起或崩溃（计划演练中实测复现 `Fatal Python error: _enter_buffered_busy`）。
 - **该期限只约束协议输出的收尾，不是整个 Worker 的退出期限。** `register_artifact` 在线程池中计算哈希，不能保证有限时间内完成（路径是 FIFO 或读操作阻塞时线程会一直等待且无法取消）；`asyncio.run` 返回前会等待线程池中的线程（演练中在 3.11 与 3.13 上实测），这段等待发生在进入输出收尾之前，不受该期限约束。**最终强制终止由宿主负责。**
+- **JSON 结构限制与键名**：上述规则两侧逐条一致，由共享 fixtures 的边界用例固定（深度 64 / 65、数字字面量 32 / 33 个字符、`1e999`、`1e-999` 与 `5e-324`、各层重复键与转义写法的重复键、顶层与嵌套对象的大小写变体、缺少正确字段同时存在变体、`1.0` 与 `1e0` 形式的整数字段、版本先于字段类型）。结构限制在构建对象之前检查：Go 用 `json.Decoder.Token` 逐记号读取（不递归，读到第 65 层即停止），Python 先按原始文本计算深度再解析，结果不依赖解释器的递归上限。JSON Schema 不能表达的原始文本约束由编解码器负责；整数字段的类型与 int64 范围同时写入 schema。Go 的协议整数字段使用固定宽度的 `int64`。JSON 中的孤立代理项转义（如 `\ud800`）在解码时接受（Go 替换为 U+FFFD，Python 保留并按 surrogatepass 计长），Python 编码含孤立代理项的消息 → `invalid_field`。inline state 的大小由宿主（Go）按原始文本的紧凑形式判定，为准；SDK 按重新序列化计，作为发送前预检——对 SDK 生成的消息两者一致，手写的非规范写法（`\u` 转义、数字拼写）以宿主为准。
 - **checkpoint 快照**：`state` 在首次提交前经 JSON 往返生成快照，所有重试复用它。往返会归一化：tuple 变为 list，非字符串键变为字符串；NaN 与 Infinity 被拒绝（`invalid_field`）。
 
 ---
@@ -151,7 +153,12 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
     {"name": "paused", "direction": "worker", "message": {"type": "paused", "v": 1, "seq": 6, "checkpoint_id": "cp-1"}},
     {"name": "result", "direction": "worker", "message": {"type": "result", "v": 1, "seq": 7, "summary": "完成", "outputs": ["report"]}},
     {"name": "error", "direction": "worker", "message": {"type": "error", "v": 1, "seq": 2, "code": "internal_error", "message": "boom", "retryable": true}},
-    {"name": "handshake_error", "direction": "worker", "message": {"type": "handshake_error", "bootstrap": 1, "code": "no_common_version"}}
+    {"name": "handshake_error", "direction": "worker", "message": {"type": "handshake_error", "bootstrap": 1, "code": "no_common_version"}},
+    {"name": "progress_depth_64", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}"},
+    {"name": "progress_number_literal_32_chars", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":-1.111111111111111111111111e-100}"},
+    {"name": "progress_subnormal_number", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":5e-324}"},
+    {"name": "progress_big_integer_in_free_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":12345678901234567890123}"},
+    {"name": "progress_seq_int64_max", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":9223372036854775807,\"kind\":\"x\",\"message\":\"y\"}"}
   ],
   "invalid": [
     {"name": "malformed_json_truncated", "direction": "worker", "raw": "{\"type\":\"ready\"", "code": "malformed_json"},
@@ -192,7 +199,36 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
     {"name": "cancel_negative_grace", "direction": "host", "message": {"type": "cancel", "v": 1, "attempt_id": "a-1", "reason": "user", "grace_ms": -1}, "code": "invalid_field"},
     {"name": "error_missing_code", "direction": "worker", "message": {"type": "error", "v": 1, "seq": 2, "message": "boom", "retryable": false}, "code": "missing_field"},
     {"name": "error_retryable_not_bool", "direction": "worker", "message": {"type": "error", "v": 1, "seq": 2, "code": "x", "message": "boom", "retryable": "yes"}, "code": "invalid_field"},
-    {"name": "handshake_error_bad_bootstrap", "direction": "worker", "message": {"type": "handshake_error", "bootstrap": 2, "code": "no_common_version"}, "code": "invalid_field"}
+    {"name": "handshake_error_bad_bootstrap", "direction": "worker", "message": {"type": "handshake_error", "bootstrap": 2, "code": "no_common_version"}, "code": "invalid_field"},
+    {"name": "utf8_bom_prefix", "direction": "worker", "raw": "\ufeff{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "malformed_json"},
+    {"name": "seq_out_of_int64_range", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":99999999999999999999,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
+    {"name": "progress_depth_65", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}", "code": "malformed_json"},
+    {"name": "progress_number_literal_33_chars", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":-1.1111111111111111111111111e-100}", "code": "malformed_json"},
+    {"name": "progress_float_overflow", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":1e999}", "code": "malformed_json"},
+    {"name": "progress_float_underflow", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":1e-999}", "code": "malformed_json"},
+    {"name": "progress_nan", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":NaN}", "code": "malformed_json"},
+    {"name": "progress_duplicate_key", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"seq\":1}", "code": "malformed_json"},
+    {"name": "progress_duplicate_key_escaped", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"\\u0073eq\":1}", "code": "malformed_json"},
+    {"name": "progress_duplicate_key_in_free_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":{\"a\":1,\"a\":2}}", "code": "malformed_json"},
+    {"name": "progress_case_variant_key", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"Seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
+    {"name": "progress_case_variant_alongside_correct", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"SEQ\":1}", "code": "invalid_field"},
+    {"name": "progress_case_variant_kelvin", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"Kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
+    {"name": "ready_case_variant_nested", "direction": "worker", "raw": "{\"type\":\"ready\",\"v\":1,\"seq\":1,\"protocol_version\":1,\"mode\":\"task\",\"capabilities\":[],\"worker\":{\"Name\":\"w\",\"version\":\"1\"}}", "code": "invalid_field"},
+    {"name": "progress_seq_float_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1.0,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
+    {"name": "progress_seq_exponent_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1e0,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
+    {"name": "progress_v_float_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1.0,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "version_mismatch"},
+    {"name": "progress_version_checked_before_field_types", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":2,\"seq\":\"x\",\"kind\":\"x\",\"message\":\"y\"}", "code": "version_mismatch"},
+    {"name": "progress_type_case_variant", "direction": "worker", "raw": "{\"TYPE\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "unknown_type"},
+    {"name": "progress_duplicate_key_lone_surrogates", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":{\"\\ud800\":1,\"\\udc00\":2}}", "code": "malformed_json"},
+    {"name": "progress_duplicate_key_lone_surrogate_vs_fffd", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":{\"\\ud800\":1,\"\\ufffd\":2}}", "code": "malformed_json"},
+    {"name": "progress_float_underflow_min_boundary", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":2e-324}", "code": "malformed_json"},
+    {"name": "progress_seq_bool", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":true,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
+    {"name": "progress_seq_int64_overflow", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":9223372036854775808,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
+    {"name": "progress_v_missing", "direction": "worker", "raw": "{\"type\":\"progress\",\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "version_mismatch"},
+    {"name": "progress_v_bool", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":true,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "version_mismatch"},
+    {"name": "init_case_variant_key", "direction": "host", "raw": "{\"type\":\"init\",\"bootstrap\":1,\"protocol_versions\":[1],\"Mode\":\"task\",\"task_id\":\"t-1\",\"attempt_id\":\"a-1\",\"attempt_no\":1,\"out_dir\":\"/workspace/out/a-1\"}", "code": "invalid_field"},
+    {"name": "init_resume_case_variant_key", "direction": "host", "raw": "{\"type\":\"init\",\"bootstrap\":1,\"protocol_versions\":[1],\"mode\":\"task\",\"task_id\":\"t-1\",\"attempt_id\":\"a-1\",\"attempt_no\":1,\"out_dir\":\"/workspace/out/a-1\",\"resume\":{\"checkpoint_id\":\"cp-1\",\"Step_Id\":\"s1\",\"state\":{}}}", "code": "invalid_field"},
+    {"name": "handshake_error_case_variant_key", "direction": "worker", "raw": "{\"type\":\"handshake_error\",\"bootstrap\":1,\"Code\":\"no_common_version\"}", "code": "invalid_field"}
   ]
 }
 ```
@@ -318,6 +354,9 @@ func TestDecodeLimits(t *testing.T) {
 		{"state 的空白不计入", WorkerToHost, string(checkpointLine(`{ "k" :  "aaaaaaaaaa" }`, []string{})), ""},
 		{"refs 恰好到上限", WorkerToHost, string(checkpointLine(`{}`, refs)), ""},
 		{"refs 超过上限", WorkerToHost, string(checkpointLine(`{}`, append(refs, ref))), CodeTooManyRefs},
+		{"超过所有上限的行不解析", HostToWorker, strings.Repeat("x", MaxInitBytes+1), CodeMessageTooLarge},
+		{"非法 UTF-8", WorkerToHost, "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"\xff\"}", CodeMalformedJSON},
+		{"孤立代理项转义可以解码", WorkerToHost, string(checkpointLine(`"\ud800"`, []string{})), ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -355,6 +394,7 @@ func TestEncodeLine(t *testing.T) {
 		{"Worker 事件按宿主方向编码", HostToWorker, &Paused{EventHeader: EventHeader{Type: TypePaused, V: Version, Seq: 1}, CheckpointID: "cp-1"}, CodeUnknownType},
 		{"type 字段与消息类型不一致", WorkerToHost, &Paused{EventHeader: EventHeader{Type: TypeResult, V: Version, Seq: 1}, CheckpointID: "cp-1"}, CodeInvalidField},
 		{"缺少 state 与 state_ref", WorkerToHost, &Checkpoint{EventHeader: EventHeader{Type: TypeCheckpoint, V: Version, Seq: 1}, CheckpointID: "cp-1", Scope: ScopeTask, StepID: "s1"}, CodeInvalidField},
+		{"编码结果违反 JSON 结构限制", WorkerToHost, &Progress{EventHeader: EventHeader{Type: TypeProgress, V: Version, Seq: 1}, Kind: "x", Message: "y", Data: json.RawMessage(`1e999`)}, CodeInvalidField},
 	}
 	for _, c := range rejects {
 		t.Run(c.name, func(t *testing.T) {
@@ -436,6 +476,17 @@ const (
 	MaxRefsPerCheckpoint = 1024
 	MaxArtifactPathBytes = 4096
 )
+
+// JSON 结构限制（规格 §5.10）：对整行生效，自由格式字段同样受限；违反时为 malformed_json。
+const (
+	// MaxNestingDepth 是对象与数组的最大嵌套层数，消息顶层对象计 1。
+	MaxNestingDepth = 64
+	// MaxNumberLiteralBytes 是数字字面量的最大字符数，含负号、小数点、指数符号与指数正负号。
+	MaxNumberLiteralBytes = 32
+)
+
+// maxLineBytes 是任何消息类型上限中的最大值；超过它的行不解析，直接判为过大。
+const maxLineBytes = max(MaxEventBytes, MaxInitBytes)
 ```
 
 `internal/protocol/errors.go`：
@@ -547,7 +598,7 @@ type event interface {
 // HostHeader 是宿主控制消息（init 除外）的公共字段。
 type HostHeader struct {
 	Type string `json:"type"`
-	V    int    `json:"v"`
+	V    int64  `json:"v"`
 }
 
 func (h HostHeader) declaredType() string { return h.Type }
@@ -555,7 +606,7 @@ func (h HostHeader) declaredType() string { return h.Type }
 // EventHeader 是 Worker 事件的公共字段。ts 仅用于诊断（规格 §5.3）。
 type EventHeader struct {
 	Type string `json:"type"`
-	V    int    `json:"v"`
+	V    int64  `json:"v"`
 	Seq  int64  `json:"seq"`
 	TS   string `json:"ts,omitempty"`
 }
@@ -567,12 +618,12 @@ func (h EventHeader) header() EventHeader  { return h }
 // 组成引导信封，永不改变（规格 §5.2）；init 本身不带 v。
 type Init struct {
 	Type             string          `json:"type"`
-	Bootstrap        int             `json:"bootstrap"`
-	ProtocolVersions []int           `json:"protocol_versions"`
+	Bootstrap        int64           `json:"bootstrap"`
+	ProtocolVersions []int64         `json:"protocol_versions"`
 	Mode             string          `json:"mode"`
 	TaskID           string          `json:"task_id"`
 	AttemptID        string          `json:"attempt_id"`
-	AttemptNo        int             `json:"attempt_no"`
+	AttemptNo        int64           `json:"attempt_no"`
 	Traceparent      string          `json:"traceparent,omitempty"`
 	Config           json.RawMessage `json:"config,omitempty"`
 	ConfigVersion    string          `json:"config_version,omitempty"`
@@ -605,7 +656,7 @@ type ArtifactResult struct {
 	HostHeader
 	ArtifactID string `json:"artifact_id"`
 	Status     string `json:"status"`
-	Version    int    `json:"version,omitempty"`
+	Version    int64  `json:"version,omitempty"`
 	SHA256     string `json:"sha256,omitempty"`
 	Code       string `json:"code,omitempty"`
 }
@@ -635,7 +686,7 @@ type WorkerInfo struct {
 // Ready 是 Worker 完成握手后的第一条事件。
 type Ready struct {
 	EventHeader
-	ProtocolVersion int        `json:"protocol_version"`
+	ProtocolVersion int64      `json:"protocol_version"`
 	Mode            string     `json:"mode"`
 	Worker          WorkerInfo `json:"worker"`
 	Capabilities    []string   `json:"capabilities"`
@@ -703,7 +754,7 @@ type ErrorEvent struct {
 // HandshakeError 在没有共同协议版本时发出，格式固定（规格 §5.2）。
 type HandshakeError struct {
 	Type      string `json:"type"`
-	Bootstrap int    `json:"bootstrap"`
+	Bootstrap int64  `json:"bootstrap"`
 	Code      string `json:"code"`
 }
 
@@ -802,7 +853,7 @@ func (m *ArtifactResult) validate() error {
 func (m *Cancel) validate() error { return validateStop(m.V, m.AttemptID, m.GraceMS) }
 func (m *Pause) validate() error  { return validateStop(m.V, m.AttemptID, m.GraceMS) }
 
-func validateStop(v int, attemptID string, graceMS int64) error {
+func validateStop(v int64, attemptID string, graceMS int64) error {
 	if err := firstErr(checkVersion(v), required("attempt_id", attemptID)); err != nil {
 		return err
 	}
@@ -888,7 +939,7 @@ func (m *HandshakeError) validate() error {
 	return required("code", m.Code)
 }
 
-func checkVersion(v int) error {
+func checkVersion(v int64) error {
 	if v != Version {
 		return newError(CodeVersionMismatch, "v=%d，期望 %d", v, Version)
 	}
@@ -1009,6 +1060,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"reflect"
+	"unicode/utf8"
 )
 
 // Direction 是消息的传输方向。
@@ -1043,32 +1096,46 @@ var registry = map[Direction]map[string]func() Message{
 }
 
 // DecodeLine 解析并校验一行消息（不含行尾换行符）。
-// 未知字段忽略；未知类型、超限、字段类型错误与语义违规均返回 *Error。
+// 判定顺序：行长 → UTF-8 → JSON 结构限制 → 消息类型 → 类型上限 → 版本 → 键名大小写 → 字段类型 → 语义规则。
+// 未知字段忽略；违规均返回 *Error。
 func DecodeLine(dir Direction, line []byte) (Message, error) {
-	if len(line) > MaxEventBytes {
-		return nil, newError(CodeMessageTooLarge, "%d 字节，上限 %d", len(line), MaxEventBytes)
+	if len(line) > maxLineBytes {
+		return nil, newError(CodeMessageTooLarge, "%d 字节，上限 %d", len(line), maxLineBytes)
+	}
+	if !utf8.Valid(line) {
+		return nil, newError(CodeMalformedJSON, "行不是合法的 UTF-8")
 	}
 	if t := bytes.TrimSpace(line); len(t) == 0 || t[0] != '{' {
 		return nil, newError(CodeMalformedJSON, "消息必须是 JSON 对象")
 	}
-	var peek struct {
-		Type string `json:"type"`
+	if err := checkSyntax(line); err != nil {
+		return nil, err
 	}
-	if err := json.Unmarshal(line, &peek); err != nil {
-		var te *json.UnmarshalTypeError
-		if errors.As(err, &te) && te.Field == "type" {
-			return nil, newError(CodeUnknownType, "type 不是字符串")
-		}
+	var top map[string]json.RawMessage // 键名精确匹配；重复键已被拒绝
+	if err := json.Unmarshal(line, &top); err != nil {
 		return nil, newError(CodeMalformedJSON, "%v", err)
 	}
-	newMsg, ok := registry[dir][peek.Type]
-	if !ok {
-		return nil, newError(CodeUnknownType, "%q", peek.Type)
+	typ, err := messageType(top)
+	if err != nil {
+		return nil, err
 	}
-	if err := checkSize(dir, peek.Type, len(line)); err != nil {
+	newMsg, ok := registry[dir][typ]
+	if !ok {
+		return nil, newError(CodeUnknownType, "%q", typ)
+	}
+	if err := checkSize(dir, typ, len(line)); err != nil {
 		return nil, err
 	}
 	m := newMsg()
+	t := reflect.TypeOf(m).Elem()
+	if _, versioned := structFields(t)["v"]; versioned {
+		if err := checkVersionField(top["v"]); err != nil {
+			return nil, err
+		}
+	}
+	if err := checkKeyCase(line, t); err != nil {
+		return nil, err
+	}
 	if err := json.Unmarshal(line, m); err != nil {
 		var te *json.UnmarshalTypeError
 		if errors.As(err, &te) {
@@ -1097,16 +1164,45 @@ func EncodeLine(dir Direction, m Message) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := checkSyntax(b); err != nil { // 编码结果必须能通过对端的 JSON 结构限制
+		return nil, newError(CodeInvalidField, "消息违反 JSON 结构限制：%v", err)
+	}
 	if err := checkSize(dir, m.MessageType(), len(b)); err != nil {
 		return nil, err
 	}
 	return b, nil
 }
 
-// checkSize 按方向与类型检查上限：宿主控制消息（init 除外）16 KiB，其余 1 MiB。
+// messageType 读取精确键名 type 的值；缺失或不是字符串为 unknown_type。
+func messageType(top map[string]json.RawMessage) (string, error) {
+	raw, ok := top["type"]
+	if !ok {
+		return "", newError(CodeUnknownType, "缺少 type")
+	}
+	var typ string
+	if err := json.Unmarshal(raw, &typ); err != nil {
+		return "", newError(CodeUnknownType, "type 不是字符串")
+	}
+	return typ, nil
+}
+
+// checkVersionField 在字段校验之前检查 v：必须是整数形式的 1，否则为 version_mismatch。
+func checkVersionField(raw json.RawMessage) error {
+	var v int64
+	if raw == nil || json.Unmarshal(raw, &v) != nil {
+		return newError(CodeVersionMismatch, "v 缺失或不是整数")
+	}
+	return checkVersion(v)
+}
+
+// checkSize 按方向与类型检查上限：Worker 事件 MaxEventBytes，init MaxInitBytes，
+// 其他宿主控制消息 MaxControlBytes。
 func checkSize(dir Direction, typ string, n int) error {
 	limit := MaxEventBytes
-	if dir == HostToWorker && typ != TypeInit {
+	switch {
+	case dir == HostToWorker && typ == TypeInit:
+		limit = MaxInitBytes
+	case dir == HostToWorker:
 		limit = MaxControlBytes
 	}
 	if n > limit {
@@ -1179,7 +1275,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Files:**
 - Create: `internal/protocol/stream.go`
 - Modify: `internal/protocol/protocol_test.go`（末尾追加场景回放，下方给出完整追加内容）
-- Create: `protocol/fixtures/v1/scenarios/` 下 12 个文件（下方给出）
+- Create: `protocol/fixtures/v1/scenarios/` 下 13 个文件（下方给出）
 
 **Interfaces:**
 - Consumes: Task 1 的 `DecodeLine`、`Message`、`event`、`CodeOf`、`Type*`。
@@ -1198,7 +1294,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 }
 ```
 
-- [ ] **Step 1：写入 12 个协议层场景**
+- [ ] **Step 1：写入 13 个协议层场景**
 
 `protocol/fixtures/v1/scenarios/seq_gap.json`：
 
@@ -1344,6 +1440,23 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
     {"from": "worker", "message": {"type": "error", "v": 1, "seq": 1, "code": "unsupported_mode", "message": "不支持的模式：session", "retryable": false}}
   ],
   "expect": {"stream": "ok"}
+}
+```
+
+`protocol/fixtures/v1/scenarios/event_after_paused.json`：
+
+```json
+{
+  "name": "event_after_paused",
+  "description": "paused 是终态提议，之后不得再有业务事件",
+  "layers": ["protocol"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "task", "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}},
+    {"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "task", "worker": {"name": "sim-worker", "version": "0.1.0"}, "capabilities": []}},
+    {"from": "worker", "message": {"type": "paused", "v": 1, "seq": 2, "checkpoint_id": "cp-1"}},
+    {"from": "worker", "message": {"type": "progress", "v": 1, "seq": 3, "kind": "step_started", "message": "x"}}
+  ],
+  "expect": {"stream": "violation", "violation": "after_terminal", "at": 3}
 }
 ```
 
@@ -1573,7 +1686,7 @@ func isTerminal(typ string) bool {
 wsl -d Ubuntu -- bash -c 'export PATH=$PATH:/usr/local/go/bin; cd /mnt/f/go-agentbox-m1-3 && gofmt -w internal/protocol && go vet ./internal/protocol/ && go test -count=1 -v ./internal/protocol/ 2>&1 | grep -E "^(--- FAIL|ok|FAIL)|TestScenarioFixtures/"'
 ```
 
-Expected: 12 个 `TestScenarioFixtures/<场景名>` 均为 PASS，最后一行 `ok`。
+Expected: 13 个 `TestScenarioFixtures/<场景名>` 均为 PASS，最后一行 `ok`。
 
 - [ ] **Step 6：提交**
 
@@ -1639,6 +1752,8 @@ packages = ["agentbox_worker", "sim_worker"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 协程未被等待等 RuntimeWarning 一律视为失败：本地演练与 CI 判定一致
+filterwarnings = ["error::RuntimeWarning"]
 
 [tool.ruff]
 target-version = "py311"
@@ -1664,6 +1779,21 @@ max-complexity = 10
 "os.execle".msg = "Worker 不直接替换进程映像"
 "os.execlp".msg = "Worker 不直接替换进程映像"
 "os.execlpe".msg = "Worker 不直接替换进程映像"
+"asyncio.create_subprocess_exec".msg = "Worker 不直接创建子进程"
+"asyncio.create_subprocess_shell".msg = "Worker 不直接创建子进程"
+"os.posix_spawn".msg = "Worker 不直接创建子进程"
+"os.posix_spawnp".msg = "Worker 不直接创建子进程"
+"os.spawnl".msg = "Worker 不直接创建子进程"
+"os.spawnle".msg = "Worker 不直接创建子进程"
+"os.spawnlp".msg = "Worker 不直接创建子进程"
+"os.spawnlpe".msg = "Worker 不直接创建子进程"
+"os.spawnv".msg = "Worker 不直接创建子进程"
+"os.spawnve".msg = "Worker 不直接创建子进程"
+"os.spawnvp".msg = "Worker 不直接创建子进程"
+"os.spawnvpe".msg = "Worker 不直接创建子进程"
+"os.forkpty".msg = "Worker 不直接创建子进程"
+"pty.spawn".msg = "Worker 不直接创建子进程"
+"multiprocessing".msg = "Worker 不直接创建子进程"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["TID251", "E402"]  # 测试文件按关注点分节，各节在节首导入
@@ -1743,6 +1873,7 @@ def line_bytes(item: dict[str, Any]) -> bytes:
 """协议层：跨语言 fixtures 回放与按常量生成的大小上限（规格 §5.10、§5.11）。"""
 
 import json
+import time
 
 import pytest
 from protocol_fixtures import line_bytes, load_messages, load_scenarios
@@ -1751,6 +1882,7 @@ from agentbox_worker.protocol import (
     HOST,
     MAX_CONTROL_BYTES,
     MAX_EVENT_BYTES,
+    MAX_INIT_BYTES,
     MAX_INLINE_STATE_BYTES,
     MAX_REFS_PER_CHECKPOINT,
     WORKER,
@@ -1800,6 +1932,13 @@ def test_scenario_stream(scenario):
 
 
 REF = "a" * 64
+
+NESTED_70: object = 0
+for _ in range(70):
+    NESTED_70 = [NESTED_70]
+NESTED_5000: object = 0
+for _ in range(5000):
+    NESTED_5000 = [NESTED_5000]
 
 
 def checkpoint_line(state_json: str, refs: list[str]) -> bytes:
@@ -1863,10 +2002,16 @@ LIMIT_CASES = [
         id="refs_over_limit",
     ),
     pytest.param(
+        HOST, b"x" * (MAX_INIT_BYTES + 1), "message_too_large", id="oversized_line_not_parsed"
+    ),
+    pytest.param(
         WORKER,
-        b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":NaN}',
+        b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"\xff"}',
         "malformed_json",
-        id="nan_is_malformed",
+        id="invalid_utf8",
+    ),
+    pytest.param(
+        WORKER, checkpoint_line('"\\ud800"', []), None, id="lone_surrogate_escape_accepted"
     ),
 ]
 
@@ -1903,12 +2048,53 @@ def test_decode_limits(direction, line, code):
             "unknown_type",
             id="wrong_direction",
         ),
+        pytest.param(
+            WORKER,
+            {"type": "progress", "v": 1, "seq": 1, "kind": "x", "message": "\ud800"},
+            "invalid_field",
+            id="lone_surrogate",
+        ),
+        pytest.param(
+            WORKER,
+            {"type": "progress", "v": 1, "seq": 1, "kind": "x", "message": "y", "data": 10**40},
+            "invalid_field",
+            id="number_literal_too_long",
+        ),
+        pytest.param(
+            WORKER,
+            {"type": "progress", "v": 1, "seq": 1, "kind": "x", "message": "y", "data": NESTED_70},
+            "invalid_field",
+            id="nesting_too_deep",
+        ),
+        pytest.param(
+            WORKER,
+            {
+                "type": "progress",
+                "v": 1,
+                "seq": 1,
+                "kind": "x",
+                "message": "y",
+                "data": NESTED_5000,
+            },
+            "invalid_field",
+            id="too_deep_to_serialize",
+        ),
     ],
 )
 def test_encode_rejects(direction, message, code):
     with pytest.raises(ProtocolError) as exc:
         encode_line(direction, message)
     assert exc.value.code == code
+
+
+def test_unterminated_string_is_rejected_in_linear_time():
+    """深度预扫描的正则不得回溯爆炸：被截断的行（例如宿主写到一半退出）应立即被拒绝。"""
+    line = b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"' + b"a b" * 10
+    started = time.monotonic()
+    with pytest.raises(ProtocolError) as exc:
+        decode_line(WORKER, line)
+    assert exc.value.code == "malformed_json"
+    assert time.monotonic() - started < 1.0
 ```
 
 - [ ] **Step 3：确认测试失败**
@@ -1928,12 +2114,15 @@ Expected: 收集错误 `ModuleNotFoundError: No module named 'agentbox_worker.pr
 
 规则与 Go 侧 internal/protocol 逐条对应，二者共用 protocol/fixtures/v1。
 消息以 dict 表示；未知字段忽略，未知类型是错误（规格 §5.3）。
-判定顺序：非 JSON 对象 → 类型未知 → 超限 → 字段类型错误 → 语义规则。
+判定顺序：行长 → UTF-8 → JSON 结构限制 → 消息类型 → 类型上限 → 版本 → 键名大小写
+→ 字段类型 → 语义规则。
 """
 
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -1949,6 +2138,12 @@ MAX_CONTROL_BYTES = 16 << 10
 MAX_INLINE_STATE_BYTES = 256 << 10
 MAX_REFS_PER_CHECKPOINT = 1024
 MAX_ARTIFACT_PATH_BYTES = 4096
+# 任何消息类型上限中的最大值；超过它的行不解析，直接判为过大。
+MAX_LINE_BYTES = max(MAX_EVENT_BYTES, MAX_INIT_BYTES)
+
+# JSON 结构限制（规格 §5.10）：对整行生效，自由格式字段同样受限；违反时为 malformed_json。
+MAX_NESTING_DEPTH = 64  # 对象与数组的最大嵌套层数，消息顶层对象计 1
+MAX_NUMBER_LITERAL_BYTES = 32  # 数字字面量的最大字符数，含负号、小数点、指数符号与指数正负号
 
 MODE_TASK = "task"
 MODE_SESSION = "session"
@@ -1973,8 +2168,12 @@ def _is_str(v: Any) -> bool:
     return isinstance(v, str)
 
 
+_INT64_MIN, _INT64_MAX = -(1 << 63), (1 << 63) - 1
+
+
 def _is_int(v: Any) -> bool:
-    return isinstance(v, int) and not isinstance(v, bool)
+    """与 Go 一致：整数字段必须落在 int64 范围内。"""
+    return isinstance(v, int) and not isinstance(v, bool) and _INT64_MIN <= v <= _INT64_MAX
 
 
 def _is_bool(v: Any) -> bool:
@@ -1989,10 +2188,20 @@ def _list_of(pred: Pred) -> Pred:
     return lambda v: isinstance(v, list) and all(x is None or pred(x) for x in v)
 
 
+class _Obj:
+    """嵌套对象字段的类型谓词；保留字段定义，供键名大小写检查逐层使用。"""
+
+    def __init__(self, spec: dict[str, Pred]) -> None:
+        self.spec = spec
+
+    def __call__(self, v: Any) -> bool:
+        return isinstance(v, dict) and all(
+            v.get(k) is None or pred(v[k]) for k, pred in self.spec.items()
+        )
+
+
 def _obj(spec: dict[str, Pred]) -> Pred:
-    return lambda v: (
-        isinstance(v, dict) and all(v.get(k) is None or pred(v[k]) for k, pred in spec.items())
-    )
+    return _Obj(spec)
 
 
 _STRS = _list_of(_is_str)
@@ -2098,8 +2307,10 @@ def _one_of(field: str, value: str, *allowed: str) -> None:
 
 
 def _check_version(msg: dict[str, Any]) -> None:
-    if _n(msg, "v") != VERSION:
-        raise ProtocolError("version_mismatch", f"v={_n(msg, 'v')}，期望 {VERSION}")
+    """v 必须是整数形式的 1（不接受 1.0、布尔值或缺失），否则为 version_mismatch。"""
+    v = msg.get("v")
+    if not (_is_int(v) and v == VERSION):
+        raise ProtocolError("version_mismatch", f"v={v!r}，期望 {VERSION}")
 
 
 def _check_event(msg: dict[str, Any]) -> None:
@@ -2114,7 +2325,7 @@ def valid_sha256(s: str) -> bool:
 
 def valid_artifact_path(path: str) -> bool:
     """相对、非空、无 NUL、不超过上限、不含空、. 或 .. 分量（规格 §5.6）。"""
-    if not path or len(path.encode("utf-8")) > MAX_ARTIFACT_PATH_BYTES:
+    if not path or len(path.encode("utf-8", "surrogatepass")) > MAX_ARTIFACT_PATH_BYTES:
         return False
     if "\x00" in path or path.startswith("/"):
         return False
@@ -2131,7 +2342,8 @@ def _check_state(msg: dict[str, Any]) -> None:
             raise ProtocolError("invalid_field", "state_ref 不是合法的 sha256")
         return
     compact = json.dumps(msg["state"], ensure_ascii=False, separators=(",", ":"))
-    size = len(compact.encode("utf-8"))
+    # 孤立代理项按 3 字节计，与 Go 替换成的 U+FFFD 相同
+    size = len(compact.encode("utf-8", "surrogatepass"))
     if size > MAX_INLINE_STATE_BYTES:
         raise ProtocolError(
             "state_too_large", f"inline state {size} 字节，上限 {MAX_INLINE_STATE_BYTES}"
@@ -2288,8 +2500,87 @@ def _reject_constant(name: str) -> Any:
     raise ValueError(f"不允许的 JSON 常量 {name}")
 
 
+# 展开写法加占有量词（Python ≥ 3.11）：对未闭合的字符串也是线性时间，不会回溯爆炸
+_JSON_STRING = re.compile(r'"[^"\\]*+(?:\\.[^"\\]*+)*+"')
+_BRACKET = re.compile(r"[\[\]{}]")
+
+
+def _check_depth(text: str) -> None:
+    """在构建任何对象之前，按原始文本计算对象与数组的嵌套层数（字符串内的括号不计）。"""
+    depth = 0
+    for bracket in _BRACKET.finditer(_JSON_STRING.sub('""', text)):
+        if bracket.group() in "[{":
+            depth += 1
+            if depth > MAX_NESTING_DEPTH:
+                raise ValueError(f"嵌套超过 {MAX_NESTING_DEPTH} 层")
+        else:
+            depth -= 1
+
+
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """按解码后的键名比较：seq 与其转义写法 \\u0073eq 是同一个键。
+
+    json 已把成对的代理项合并为一个字符，剩下的都是孤立代理项；与 Go 一致，每个按 U+FFFD 比较。
+    """
+    obj: dict[str, Any] = {}
+    seen: set[str] = set()
+    for key, value in pairs:
+        normalized = _LONE_SURROGATE.sub("\ufffd", key)
+        if normalized in seen:
+            raise ValueError(f"重复的键 {key!r}")
+        seen.add(normalized)
+        obj[key] = value
+    return obj
+
+
+def _check_literal(lit: str) -> None:
+    if len(lit) > MAX_NUMBER_LITERAL_BYTES:
+        raise ValueError(f"数字字面量 {len(lit)} 个字符，上限 {MAX_NUMBER_LITERAL_BYTES}")
+
+
+def _parse_int(lit: str) -> int:
+    _check_literal(lit)
+    return int(lit)
+
+
+def _parse_float(lit: str) -> float:
+    """浮点字面量不得上溢为无穷，非零值不得下溢为零（与 Go 的 strconv.ParseFloat 结果一致）。"""
+    _check_literal(lit)
+    value = float(lit)
+    if math.isinf(value):
+        raise ValueError(f"数字 {lit} 超出 float64 范围")
+    mantissa = re.split("[eE]", lit)[0]
+    if value == 0.0 and re.search("[1-9]", mantissa):
+        raise ValueError(f"数字 {lit} 下溢为零")
+    return value
+
+
+def parse_json(raw: bytes) -> Any:
+    """按协议的 JSON 结构限制解析一行：严格 UTF-8，深度、重复键与数字字面量受限。"""
+    try:
+        text = raw.decode("utf-8")
+        _check_depth(text)
+        return json.loads(
+            text,
+            object_pairs_hook=_no_duplicate_keys,
+            parse_int=_parse_int,
+            parse_float=_parse_float,
+            parse_constant=_reject_constant,
+        )
+    except (ValueError, RecursionError) as exc:  # 含非法 UTF-8、BOM 与语法错误
+        raise ProtocolError("malformed_json", str(exc)) from exc
+
+
 def _check_size(direction: str, typ: str, size: int) -> None:
-    limit = MAX_CONTROL_BYTES if direction == HOST and typ != "init" else MAX_EVENT_BYTES
+    if direction == WORKER:
+        limit = MAX_EVENT_BYTES
+    elif typ == "init":
+        limit = MAX_INIT_BYTES
+    else:
+        limit = MAX_CONTROL_BYTES
     if size > limit:
         raise ProtocolError("message_too_large", f"{typ} {size} 字节，上限 {limit}")
 
@@ -2301,6 +2592,28 @@ def _check_types(typ: str, msg: dict[str, Any]) -> None:
             raise ProtocolError("invalid_field", f"{key} 类型不正确")
 
 
+_FOLD = str.maketrans({"\u212a": "k", "\u017f": "s"})
+
+
+def _fold(key: str) -> str:
+    """与 Go 的 strings.EqualFold 对 ASCII 字段名的判定一致：ASCII 大小写，加 U+212A 与 U+017F。"""
+    return "".join(c.lower() if c.isascii() else c for c in key.translate(_FOLD))
+
+
+def _check_key_case(spec: dict[str, Pred], obj: dict[str, Any]) -> None:
+    """拒绝与已定义字段只差大小写的键；按消息类型逐层检查，键按字典序检查。"""
+    for key in sorted(obj):
+        pred = spec.get(key)
+        if pred is not None:
+            if isinstance(pred, _Obj) and isinstance(obj[key], dict):
+                _check_key_case(pred.spec, obj[key])
+            continue
+        folded = _fold(key)
+        for name in spec:
+            if folded == name:
+                raise ProtocolError("invalid_field", f"键 {key!r} 与字段 {name!r} 只差大小写")
+
+
 def _validator_for(direction: str, typ: Any) -> Callable[[dict[str, Any]], None]:
     validator = _VALIDATORS[direction].get(typ) if isinstance(typ, str) else None
     if validator is None:
@@ -2309,19 +2622,23 @@ def _validator_for(direction: str, typ: Any) -> Callable[[dict[str, Any]], None]
 
 
 def decode_line(direction: str, line: bytes | str) -> dict[str, Any]:
-    """解析并校验一行消息（不含行尾换行符）。"""
-    raw = line.encode("utf-8") if isinstance(line, str) else line
-    if len(raw) > MAX_EVENT_BYTES:
-        raise ProtocolError("message_too_large", f"{len(raw)} 字节，上限 {MAX_EVENT_BYTES}")
+    """解析并校验一行消息（不含行尾换行符）。行必须是严格的 UTF-8，不含 BOM。"""
     try:
-        msg = json.loads(raw, parse_constant=_reject_constant)
-    except ValueError as exc:  # JSONDecodeError 与 UnicodeDecodeError 都是 ValueError
-        raise ProtocolError("malformed_json", str(exc)) from exc
+        raw = line.encode("utf-8") if isinstance(line, str) else line
+    except UnicodeEncodeError as exc:  # str 中含孤立代理项字符
+        raise ProtocolError("malformed_json", "行不是合法的 UTF-8") from exc
+    if len(raw) > MAX_LINE_BYTES:
+        raise ProtocolError("message_too_large", f"{len(raw)} 字节，上限 {MAX_LINE_BYTES}")
+    msg = parse_json(raw)
     if not isinstance(msg, dict):
         raise ProtocolError("malformed_json", "消息必须是 JSON 对象")
     typ = msg.get("type")
     validator = _validator_for(direction, typ)
     _check_size(direction, typ, len(raw))
+    spec = _FIELD_TYPES[typ]
+    if "v" in spec:
+        _check_version(msg)
+    _check_key_case(spec, msg)
     _check_types(typ, msg)
     validator(msg)
     return msg
@@ -2335,9 +2652,16 @@ def encode_line(direction: str, msg: dict[str, Any]) -> bytes:
     validator(msg)
     try:
         text = json.dumps(msg, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    except ValueError as exc:  # NaN、Infinity 不是合法 JSON
+    except (ValueError, RecursionError) as exc:  # NaN、Infinity 不是合法 JSON；嵌套过深无法序列化
         raise ProtocolError("invalid_field", f"消息含有 JSON 不支持的数值：{exc}") from exc
-    line = text.encode("utf-8")
+    try:
+        line = text.encode("utf-8")
+    except UnicodeEncodeError as exc:  # 字符串中含孤立代理项
+        raise ProtocolError("invalid_field", "消息含有孤立代理项，无法编码为 UTF-8") from exc
+    try:  # 编码结果必须能通过对端的 JSON 结构限制（深度、数字字面量等）
+        parse_json(line)
+    except ProtocolError as exc:
+        raise ProtocolError("invalid_field", f"消息违反 JSON 结构限制：{exc.detail}") from exc
     _check_size(direction, typ, len(line))
     return line
 ```
@@ -2465,7 +2789,8 @@ def test_schemas_are_valid_draft_2020_12():
 
 
 def valid_items() -> list[tuple[str, str, dict[str, Any]]]:
-    items = [(c["name"], c["direction"], c["message"]) for c in MESSAGES["valid"]]
+    # raw 行表达的是 schema 无法描述的原始文本约束，由编解码器负责
+    items = [(c["name"], c["direction"], c["message"]) for c in MESSAGES["valid"] if "message" in c]
     for scenario in SCENARIOS:
         bad = scenario["expect"].get("at")
         for index, line in enumerate(scenario["lines"]):
@@ -2511,11 +2836,11 @@ Expected: 收集错误 `FileNotFoundError`（schema 文件不存在）。
   "properties": {
     "type": {"const": "init"},
     "bootstrap": {"const": 1},
-    "protocol_versions": {"type": "array", "minItems": 1, "items": {"type": "integer"}},
+    "protocol_versions": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807}},
     "mode": {"enum": ["task", "session"]},
     "task_id": {"$ref": "#/$defs/nonEmpty"},
     "attempt_id": {"$ref": "#/$defs/nonEmpty"},
-    "attempt_no": {"type": "integer", "minimum": 1},
+    "attempt_no": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
     "traceparent": {"type": "string"},
     "config_version": {"type": "string"},
     "input_refs": {"type": "array", "items": {"$ref": "#/$defs/sha256"}},
@@ -2581,7 +2906,7 @@ Expected: 收集错误 `FileNotFoundError`（schema 文件不存在）。
         "v": {"const": 1},
         "artifact_id": {"$ref": "#/$defs/nonEmpty"},
         "status": {"enum": ["saved", "rejected"]},
-        "version": {"type": "integer"},
+        "version": {"type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807},
         "sha256": {"type": "string"},
         "code": {"type": "string"}
       },
@@ -2603,7 +2928,7 @@ Expected: 收集错误 `FileNotFoundError`（schema 文件不存在）。
         "v": {"const": 1},
         "attempt_id": {"$ref": "#/$defs/nonEmpty"},
         "reason": {"type": "string"},
-        "grace_ms": {"type": "integer", "minimum": 0}
+        "grace_ms": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807}
       }
     },
     "cancel": {"allOf": [{"$ref": "#/$defs/stop"}, {"properties": {"type": {"const": "cancel"}}}]},
@@ -2635,14 +2960,14 @@ Expected: 收集错误 `FileNotFoundError`（schema 文件不存在）。
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "artifactPath": {
       "type": "string",
-      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*/$)[^\\u0000]{1,4096}$"
+      "pattern": "^(?!/)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))(?![\\s\\S]*//)(?![\\s\\S]*/$)[^\\u0000]+$"
     },
     "event": {
       "type": "object",
       "required": ["type", "v", "seq"],
       "properties": {
         "v": {"const": 1},
-        "seq": {"type": "integer", "minimum": 1},
+        "seq": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
         "ts": {"type": "string"}
       }
     },
@@ -2679,7 +3004,7 @@ Expected: 收集错误 `FileNotFoundError`（schema 文件不存在）。
         "artifact_id": {"$ref": "#/$defs/nonEmpty"},
         "path": {"$ref": "#/$defs/artifactPath"},
         "declared_sha256": {"$ref": "#/$defs/sha256"},
-        "declared_size": {"type": "integer", "minimum": 0},
+        "declared_size": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
         "media_type": {"$ref": "#/$defs/nonEmpty"},
         "visibility": {"enum": ["output", "internal"]}
       }
@@ -2788,7 +3113,7 @@ Expected: 收集错误 `FileNotFoundError`（schema 文件不存在）。
 | Worker→宿主 | `error` | `code` |
 | Worker→宿主 | `handshake_error` | `bootstrap = 1`、`code`（不带 `v` 与 `seq`） |
 
-**产物路径**：相对、非空、无 NUL、≤ 4096 字节、不含空、`.` 或 `..` 分量。**sha256**：64 个小写十六进制字符。
+**产物路径**：相对、非空、无 NUL、≤ 4096 字节、不含空、`.` 或 `..` 分量。JSON Schema 只能按字符计长，不表达 4096 字节上限，该上限由编解码器检查（`path_invalid`）。**sha256**：64 个小写十六进制字符。
 
 ## 大小上限（UTF-8 字节）
 
@@ -2796,7 +3121,16 @@ Expected: 收集错误 `FileNotFoundError`（schema 文件不存在）。
 
 ## 判定顺序与错误码
 
-依次检查：非 JSON 对象 → `malformed_json`；`type` 缺失、非字符串或不属于该方向 → `unknown_type`；超限 → `message_too_large`；字段类型错误 → `invalid_field`；然后是各类型的语义规则：`version_mismatch`、`missing_field`、`invalid_field`、`state_too_large`、`too_many_refs`、`path_invalid`。
+依次检查：行长超过任何类型上限中的最大值（1 MiB）→ `message_too_large`，不解析；行不是严格的 UTF-8（含 BOM 前缀）、不是 JSON 对象，或违反 JSON 结构限制（嵌套超过 64 层；任意层级的重复键，按解码后的键名比较，孤立代理项转义按 U+FFFD 计；数字字面量超过 32 个字符；浮点字面量上溢为无穷或非零值下溢为零）→ `malformed_json`；`type` 缺失（键名区分大小写）、非字符串或不属于该方向 → `unknown_type`；超过该类型的大小上限 → `message_too_large`；`v` 不是整数形式的 1 → `version_mismatch`；与已定义字段只差大小写的键（按消息类型逐层检查，含 `resume`、`worker`）→ `invalid_field`；字段类型错误（整数字段只接受整数形式且在 int64 范围内）→ `invalid_field`；然后按各类型的语义规则依次检查。
+
+| JSON 结构限制（对整行生效，自由格式字段同样受限） | 上限 |
+|---|---|
+| 对象与数组的嵌套层数（消息顶层对象计 1） | 64 |
+| 数字字面量的字符数（含负号、小数点、指数符号与指数正负号） | 32 |
+| 重复键（任意层级，按解码后的键名比较；孤立代理项转义按 U+FFFD 计） | 不允许 |
+| 浮点字面量 | 不得上溢为无穷；非零值不得下溢为零 |
+
+违反上述限制为 `malformed_json`，在消息类型判定之前检查；编码时同样检查，违反为 `invalid_field`（不发出对端会拒绝的行）。键名区分大小写：在已定义字段的对象中（消息顶层及其结构化子对象），与已定义字段只差大小写的键为 `invalid_field`（按 Unicode 简单大小写折叠比较），其余未知键忽略。整数类型字段只接受整数形式（拒绝 `1.0`、`1e0` 与布尔值），取值在 int64 范围内。
 
 ## 事件流顺序（task 模式）
 
@@ -2860,6 +3194,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `transport.MemoryTransport()`：`feed(line: bytes | None)`、`sent: list[bytes]`、`on_send: Callable[[bytes], None] | None`
   - `outbox.Outbox(transport)`：`async emit(body: dict) -> None`（补 `v`、`seq`、`ts`；校验失败抛 `ProtocolError` 且不占用 seq；seq 在开始发送时提交；发送失败或在途取消后进入失效状态，此后一律抛 `TransportBroken`）、`async send_handshake_error(code: str) -> None`、属性 `last_seq`
   - `outbox.Waiters`：`expect(key: str) -> asyncio.Future[dict]`、`deliver(key: str, message: dict) -> bool`
+  - `Outbox.cancel_when_idle(task) -> None`（async）：等在途发送结束后取消 task，供运行时在控制协议错误时使用，避免取消落在发送中途而令通道失效
 
 - [ ] **Step 1：写失败的测试**
 
@@ -3375,6 +3710,15 @@ class Outbox:
             body = {"type": "handshake_error", "bootstrap": BOOTSTRAP_VERSION, "code": code}
             await self._send(encode_line(WORKER, body), "handshake_error")
 
+    async def cancel_when_idle(self, task: asyncio.Task[Any]) -> None:
+        """等当前在途发送结束后取消 task，使取消不会落在发送中途而令通道失效。
+
+        task 的取消在它下一次恢复执行时生效；若它正等待发送锁，会在取得锁之前收到取消。
+        在途发送若永久阻塞（宿主停止读取 stdout），本调用随之等待，最终由宿主强制终止。
+        """
+        async with self._lock:
+            task.cancel()
+
     def _check_usable(self) -> None:
         if self._broken is not None:
             raise TransportBroken(self._broken)
@@ -3448,6 +3792,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `main(app, *, name, version, capabilities=()) -> NoReturn`：进程入口策略见"错误码与契约约定"——异常按失败处理、期限内刷新已提交输出、`os._exit`；Task 7 的五个真实进程测试是其回归测试
   - `checkpoint` 在首次提交前以 JSON 往返生成与调用方对象无关的快照，所有重试复用它；快照按 JSON 归一化（tuple 变为 list，非字符串键变为字符串）；不可序列化（含 NaN、Infinity）时抛 `WorkerFailure("invalid_field")`
   - `register_artifact` 的哈希在线程池中计算，等待不保证有限；关闭期限不覆盖它，最终强制终止由宿主负责
+  - checkpoint 的查询与重发共用 `max_ack_attempts` 次上限，每次发送之后都等待一次结果（最后一次查询的答复同样有效）
+  - error 事件的 `code`、`message` 先转为字符串、替换孤立代理项并按 UTF-8 字节截断（`MAX_ERROR_CODE_BYTES = 256`、`MAX_ERROR_MESSAGE_BYTES = 8 KiB`），`retryable` 转为布尔，保证一定可以编码
+  - 控制协议错误即使发生在应用最后一次发送期间（应用随后正常返回），也以 `control_protocol_error` 结束，不发终态 `result`
+  - `main()` 的收尾放在内层 `try/finally` 中，`os._exit` 无条件执行；收尾期限取值不在 `[0, 3600]` 秒内（含非数值、NaN、无穷大）时使用默认 5 秒
   - 退出码常量 `EXIT_OK = 0`、`EXIT_FAILURE = 1`、`EXIT_HANDSHAKE = 2`；`SHUTDOWN_TIMEOUT_ENV = "AGENTBOX_WORKER_SHUTDOWN_TIMEOUT"`；包根导出 `TransportBroken`
 
 - [ ] **Step 1：写失败的测试**
@@ -3465,8 +3813,12 @@ from pathlib import Path
 from typing import Any
 
 from agentbox_worker import Result, TaskContext, Timing, WorkerFailure, run_worker
+from agentbox_worker.runtime import MAX_ERROR_MESSAGE_BYTES, SHUTDOWN_TIMEOUT_ENV, _shutdown_timeout
 
 FAST = Timing(ack_timeout=0.05, max_ack_attempts=3, retry_backoff=0.01, artifact_timeout=0.5)
+NESTED_5000: object = 0  # 超过 Python 递归上限，json.dumps 无法序列化
+for _ in range(5000):
+    NESTED_5000 = [NESTED_5000]
 INIT = {
     "type": "init",
     "bootstrap": 1,
@@ -3580,6 +3932,17 @@ def test_ready_checkpoint_artifact_result(tmp_path):
     assert result["summary"] == "cp-1/v2" and result["outputs"] == ["report"]
 
 
+def test_deeply_nested_init_fails_without_crashing(tmp_path):
+    async def go():
+        transport = MemoryTransport()
+        head = json.dumps({**INIT, "out_dir": str(tmp_path)})[:-1]
+        transport.feed(f'{head},"config":{"[" * 100_000}{"]" * 100_000}}}'.encode())
+        code = await run_worker(returns_ok, transport, name="w", version="0", timing=FAST)
+        return code, sent_json(transport)
+
+    assert asyncio.run(go()) == (1, [])
+
+
 def test_unsupported_mode_fails_before_ready(tmp_path):
     code, events = run(returns_ok, tmp_path, init={"mode": "session"})
     assert code == 1
@@ -3617,6 +3980,86 @@ def test_invalid_control_message_fails_task(tmp_path):
     assert code == 1
     assert types(events) == ["ready", "error"]
     assert events[1]["code"] == "control_protocol_error"
+
+
+class HoldsProgress(MemoryTransport):
+    """progress 的发送要等宿主的第二条消息（第一条是 init）被读出之后才完成。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+        self.received = 0
+
+    async def receive(self) -> bytes | None:
+        line = await super().receive()
+        self.received += 1
+        if self.received == 2:
+            asyncio.get_running_loop().call_soon(self.release.set)
+        return line
+
+    async def send(self, line: bytes) -> None:
+        await super().send(line)
+        if json.loads(line)["type"] == "progress":
+            await self.release.wait()
+
+
+async def progress_then_sleep(ctx: TaskContext) -> Result:
+    await ctx.progress("step_started", "x")
+    await asyncio.sleep(10)
+    return Result("never", [])
+
+
+async def progress_then_return(ctx: TaskContext) -> Result:
+    await ctx.progress("step_started", "x")
+    return Result("done", [])
+
+
+@pytest.mark.parametrize("app", [progress_then_sleep, progress_then_return])
+def test_control_error_waits_for_inflight_send(tmp_path, app):
+    async def go():
+        transport = HoldsProgress()
+        transport.feed(json.dumps({**INIT, "out_dir": str(tmp_path)}).encode())
+        transport.feed(b'{"type":"bogus","v":1}')
+        code = await asyncio.wait_for(
+            run_worker(app, transport, name="w", version="0", timing=FAST), timeout=5
+        )
+        return code, sent_json(transport)
+
+    code, events = asyncio.run(go())
+    assert code == 1
+    assert types(events) == ["ready", "progress", "error"]
+    assert events[-1]["code"] == "control_protocol_error"
+
+
+@pytest.mark.parametrize(
+    ("raised", "message"),
+    [
+        pytest.param(
+            WorkerFailure("bad_input", "x" * (1 << 20)),
+            "x" * MAX_ERROR_MESSAGE_BYTES,
+            id="oversized_message",
+        ),
+        pytest.param(ValueError("坏文件名 \udcff"), "ValueError: 坏文件名 ?", id="lone_surrogate"),
+        pytest.param(WorkerFailure("bad_input", 42, retryable=1), "42", id="non_string_fields"),
+    ],
+)
+def test_failure_message_is_made_encodable(tmp_path, raised, message):
+    async def app(ctx):
+        raise raised
+
+    code, events = run(app, tmp_path)
+    assert code == 1
+    assert types(events) == ["ready", "error"]
+    assert events[1]["message"] == message
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("2.5", 2.5), ("0", 0.0), ("inf", 5.0), ("nan", 5.0), ("-1", 5.0), ("1e300", 5.0), ("x", 5.0)],
+)
+def test_shutdown_timeout_falls_back_on_unusable_values(monkeypatch, raw, expected):
+    monkeypatch.setenv(SHUTDOWN_TIMEOUT_ENV, raw)
+    assert _shutdown_timeout() == expected
 
 
 def test_only_one_checkpoint_in_flight(tmp_path):
@@ -3660,11 +4103,40 @@ def test_unresolved_after_max_attempts(tmp_path):
     assert events[-1]["code"] == "checkpoint_unresolved" and events[-1]["retryable"] is True
 
 
+def test_reply_to_last_query_is_awaited(tmp_path):
+    queries = 0
+
+    def respond(msg, transport):
+        nonlocal queries
+        if msg["type"] != "checkpoint_query":
+            return
+        queries += 1
+        if queries == FAST.max_ack_attempts:
+            reply(
+                transport,
+                {
+                    "type": "checkpoint_result",
+                    "checkpoint_id": msg["checkpoint_id"],
+                    "scope": "task",
+                    "status": "committed",
+                },
+            )
+
+    async def app(ctx):
+        return Result(await ctx.checkpoint("s1", state={}), [])
+
+    code, events = run(app, tmp_path, responder=respond)
+    assert code == 0
+    assert types(events).count("checkpoint_query") == FAST.max_ack_attempts
+    assert events[-1]["type"] == "result"
+
+
 @pytest.mark.parametrize(
     ("state", "code"),
     [
         pytest.param("x" * (256 << 10), "state_too_large", id="oversized"),
         pytest.param({"x": object()}, "invalid_field", id="unserializable"),
+        pytest.param(NESTED_5000, "invalid_field", id="too_deep_to_serialize"),
     ],
 )
 def test_bad_state_fails_without_sending(tmp_path, state, code):
@@ -3798,6 +4270,7 @@ from agentbox_worker.protocol import (
     VERSION,
     ProtocolError,
     decode_line,
+    parse_json,
     valid_artifact_path,
 )
 from agentbox_worker.transport import StdioTransport, Transport
@@ -3807,6 +4280,12 @@ EXIT_FAILURE = 1
 EXIT_HANDSHAKE = 2
 
 SHUTDOWN_TIMEOUT_ENV = "AGENTBOX_WORKER_SHUTDOWN_TIMEOUT"
+DEFAULT_SHUTDOWN_TIMEOUT = 5.0
+MAX_SHUTDOWN_TIMEOUT = 3600.0  # 超过线程等待的可表示范围会抛异常，取一个足够大的上限
+
+# error 事件中 code 与 message 的上限（UTF-8 字节），保证事件远小于 1 MiB 的事件上限
+MAX_ERROR_CODE_BYTES = 256
+MAX_ERROR_MESSAGE_BYTES = 8 << 10
 
 
 @dataclass(frozen=True)
@@ -3870,7 +4349,7 @@ def _snapshot(state: Any) -> Any:
     """
     try:
         return json.loads(json.dumps(state, ensure_ascii=False, allow_nan=False))
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise WorkerFailure("invalid_field", f"checkpoint state 无法序列化为 JSON：{exc}") from exc
 
 
@@ -3960,26 +4439,30 @@ class TaskContext:
     async def _submit_checkpoint(
         self, checkpoint_id: str, body: dict[str, Any]
     ) -> tuple[str, str | None]:
+        query = {"type": "checkpoint_query", "checkpoint_id": checkpoint_id, "scope": "task"}
+        limit = self._timing.max_ack_attempts
+        retries = 0  # 查询与重发共用上限；每次发送之后都等待一次结果
         pending = self._checkpoint_results.expect(checkpoint_id)
         await self._emit(body)
-        for _ in range(self._timing.max_ack_attempts):
+        while True:
             try:
                 result = await asyncio.wait_for(asyncio.shield(pending), self._timing.ack_timeout)
             except TimeoutError:
-                query = {
-                    "type": "checkpoint_query",
-                    "checkpoint_id": checkpoint_id,
-                    "scope": "task",
-                }
+                if retries == limit:
+                    break
+                retries += 1
                 await self._emit(query)
                 continue
             if result["status"] not in ("retryable_error", "not_found"):
                 return result["status"], result.get("code")
+            if retries == limit:
+                break
+            retries += 1
             await asyncio.sleep(self._timing.retry_backoff)
             pending = self._checkpoint_results.expect(checkpoint_id)
             await self._emit(body)
         raise CheckpointUnresolved(
-            f"checkpoint {checkpoint_id}: {self._timing.max_ack_attempts} 次后仍无确定结果"
+            f"checkpoint {checkpoint_id}: {limit} 次查询或重发后仍无确定结果"
         )
 
     async def register_artifact(
@@ -4040,9 +4523,9 @@ class TaskContext:
 
 def _supports_protocol(line: bytes) -> bool:
     """只读引导信封判断是否有共同版本（规格 §5.2）；信封本身不合法时交由完整校验报错。"""
-    try:
-        envelope = json.loads(line)
-    except ValueError:
+    try:  # 与 decode_line 使用同一套 JSON 结构限制
+        envelope = parse_json(line)
+    except ProtocolError:
         return True
     if not isinstance(envelope, dict) or envelope.get("type") != "init":
         return True
@@ -4144,7 +4627,8 @@ async def _control_loop(ctx: TaskContext, transport: Transport, app_task: asynci
             keep_going = ctx._handle_control(decode_line(HOST, line))
         except ProtocolError as exc:
             ctx.control_error = exc
-            app_task.cancel()
+            # 等在途发送结束再取消：取消落在发送中途会使输出通道失效，error 事件就发不出去
+            await ctx._outbox.cancel_when_idle(app_task)
             return
         if not keep_going:
             app_task.cancel()
@@ -4170,6 +4654,9 @@ async def _run_task(app: App, ctx: TaskContext, transport: Transport) -> int:
         return await _emit_failure(ctx, failure)
     finally:
         control_task.cancel()
+    if ctx.control_error is not None:  # 控制错误发生在应用最后一次发送期间：同样以错误结束
+        failure = WorkerFailure("control_protocol_error", str(ctx.control_error))
+        return await _emit_failure(ctx, failure)
     return await _emit_outcome(ctx, outcome)
 
 
@@ -4188,23 +4675,33 @@ async def _emit_outcome(ctx: TaskContext, outcome: Any) -> int:
     return await _emit_failure(ctx, failure)
 
 
+def _safe_text(value: object, limit: int) -> str:
+    """转为字符串、替换孤立代理项并按 UTF-8 字节截断，保证 error 事件一定可以编码。"""
+    return str(value).encode("utf-8", "replace")[:limit].decode("utf-8", "ignore")
+
+
 async def _emit_failure(ctx: TaskContext, failure: WorkerFailure) -> int:
+    # 应用可能传入非字符串的 code/message 或非布尔的 retryable：一律规范化后再发送
     await ctx._outbox.emit(
         {
             "type": "error",
-            "code": failure.code,
-            "message": failure.message,
-            "retryable": failure.retryable,
+            "code": _safe_text(failure.code, MAX_ERROR_CODE_BYTES),
+            "message": _safe_text(failure.message, MAX_ERROR_MESSAGE_BYTES),
+            "retryable": bool(failure.retryable),
         }
     )
     return EXIT_FAILURE
 
 
 def _shutdown_timeout() -> float:
+    """读取收尾期限；非数值、负数、NaN 或超过上限时使用默认值。"""
     try:
-        return float(os.environ.get(SHUTDOWN_TIMEOUT_ENV, "5"))
+        value = float(os.environ.get(SHUTDOWN_TIMEOUT_ENV, DEFAULT_SHUTDOWN_TIMEOUT))
     except ValueError:
-        return 5.0
+        return DEFAULT_SHUTDOWN_TIMEOUT
+    if 0 <= value <= MAX_SHUTDOWN_TIMEOUT:  # NaN 的比较为假
+        return value
+    return DEFAULT_SHUTDOWN_TIMEOUT
 
 
 def main(app: App, *, name: str, version: str, capabilities: Iterable[str] = ()) -> NoReturn:
@@ -4231,10 +4728,12 @@ def main(app: App, *, name: str, version: str, capabilities: Iterable[str] = ())
     except BaseException:  # noqa: B036  进程入口：任何异常都必须走有界退出
         traceback.print_exc()
     finally:
-        if not transport.close(_shutdown_timeout()):
-            _log("退出时仍有未写出的协议输出（宿主可能已停止读取 stdout）")
-        sys.stderr.flush()
-        os._exit(code)
+        try:
+            if not transport.close(_shutdown_timeout()):
+                _log("退出时仍有未写出的协议输出（宿主可能已停止读取 stdout）")
+            sys.stderr.flush()
+        finally:  # 收尾本身失败（如 stderr 已关闭）也必须以既定退出码退出
+            os._exit(code)
 ```
 
 `worker/agentbox_worker/__init__.py`（完整替换）：
@@ -4691,8 +5190,8 @@ def test_process_result_and_print_goes_to_stderr(tmp_path):
         ]
         proc.stdin.write(init_line(tmp_path, steps))
         proc.stdin.flush()
+        code = proc.wait(timeout=20)  # 先等待退出再读输出：Worker 若不退出，测试超时失败而不是挂起
         events = [json.loads(line) for line in proc.stdout]
-        code = proc.wait(timeout=20)
         stderr = proc.stderr.read().decode("utf-8", errors="replace")
     finally:
         stop(proc)
@@ -4706,8 +5205,8 @@ def test_process_exits_while_host_keeps_stdin_open(tmp_path):
     try:
         proc.stdin.write(init_line(tmp_path, []))
         proc.stdin.flush()  # stdin 保持打开，Worker 仍须在结束后退出
-        events = [json.loads(line) for line in proc.stdout]
         code = proc.wait(timeout=20)
+        events = [json.loads(line) for line in proc.stdout]
     finally:
         stop(proc)
     assert code == 0 and events[-1]["type"] == "result"
@@ -4738,10 +5237,13 @@ def test_process_fails_fast_when_stdout_is_closed(tmp_path):
     try:
         proc.stdin.write(init_line(tmp_path, [{"op": "flood", "count": 5000, "size": 1000}]))
         proc.stdin.flush()
+        started = time.monotonic()
         code = proc.wait(timeout=20)
+        elapsed = time.monotonic() - started
     finally:
         stop(proc)
     assert code == 1
+    assert elapsed < 10
 
 
 def test_process_rejects_oversized_input_line(tmp_path):
@@ -4751,8 +5253,8 @@ def test_process_rejects_oversized_input_line(tmp_path):
         try:
             proc.stdin.write(b"a" * (MAX_FRAME_BYTES + 10))
             proc.stdin.flush()
-        except OSError:
-            pass  # Worker 已在超限后退出
+        except (OSError, ValueError):
+            pass  # Worker 已在超限后退出，或管道已被关闭
 
     writer = threading.Thread(target=feed, daemon=True)
     writer.start()
@@ -4915,7 +5417,7 @@ Expected: ruff 无问题；`lint-imports` 报告 1 个契约 KEPT；pytest 全�
 wsl -d Ubuntu -- bash -c 'export PATH=$PATH:/usr/local/go/bin; cd /mnt/f/go-agentbox-m1-3 && go test -count=1 -v ./internal/protocol/ 2>&1 | grep -cE "^    --- PASS: TestScenarioFixtures/"; go test -count=1 ./internal/protocol/'
 ```
 
-Expected: 计数为 21（12 个协议层 + 9 个 SDK 层场景）；最后一行 `ok`。
+Expected: 计数为 22（13 个协议层 + 9 个 SDK 层场景）；最后一行 `ok`。
 
 - [ ] **Step 7：提交**
 
@@ -4946,6 +5448,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   # Python Worker SDK：最低支持版本 3.11 必须实际覆盖。
   python:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -4990,6 +5493,1044 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
+### Task 9：协议契约收紧——JSON 结构限制、版本前置、键名区分大小写、整数词法与范围
+
+**风险：高（跨语言契约变更）——双评审。**
+
+**背景**：终审 I1 发现两侧在嵌套深度、键名大小写、重复键与超长数值上行为不一致。项目负责人决定收紧为统一的协议规则（规格 §5.10），而不是记录为已知差异；"当前发送方不会生成"不能替代接收端契约。
+
+**规则（实现与评审都以此为准）**：
+
+1. **判定顺序固定**：行长（读取阶段的保护）→ UTF-8 → JSON 结构限制 → 消息类型（`type` 键名精确）→ 该类型的大小上限 → 版本 → 字段校验（键名大小写 → 字段类型 → 语义规则）。错误码只取决于输入，不取决于字段声明或反射的顺序（键按字典序检查）。
+2. **JSON 结构限制在构建完整对象之前检查**，对整行生效，自由格式字段（`config`、`budget_limits`、`state`、`data`）同样受限，违反为 `malformed_json`：
+   - 嵌套深度：对象与数组合计不超过 `MaxNestingDepth = 64` 层，消息顶层对象计 1。Go 用 `json.Decoder.Token` 逐记号读取（不递归，读到第 65 层即停止）；Python 先按原始文本计算深度（正则剔除字符串后数括号，正确处理转义），再解析。不得用"加大测试深度直到某个解释器失败"来定义上限。
+   - 重复键：任意层级都拒绝，按**解码后的键名**比较（`"seq"` 与 `"\u0073eq"` 是同一个键）；孤立代理项转义（如 `\ud800`）按 U+FFFD 计——Go 的解码本来如此，Python 在比较前把剩余的孤立代理项替换为 U+FFFD。
+   - Python 的深度预扫描用展开写法加占有量词的正则剔除字符串，对未闭合的字符串（例如宿主写到一半退出时的截断行）也是线性时间。
+   - 编码端同样检查：`EncodeLine`/`encode_line` 对编码结果做结构检查，违反为 `invalid_field`，不发出对端会拒绝的行。
+   - 数字字面量：不超过 `MaxNumberLiteralBytes = 32` 个字符，计数包含负号、小数点、指数符号与指数正负号。这是协议取舍：int64 最多需要 20 个字符，32 个字符覆盖常规浮点写法，同时限定解析成本。
+   - 浮点字面量：上溢为无穷（如 `1e999`）拒绝；非零值下溢为零（如 `1e-999`、`2e-324`）拒绝；次正规数（如 `5e-324`）接受。两侧的判定以 `strconv.ParseFloat` 与 Python `float` 的结果为准（二者一致）：结果为 ±Inf，或结果为 0 而尾数含非零数字。
+3. **整数字段同时有词法规则与范围**：只接受整数形式（拒绝 `1.0`、`1e0` 与布尔值），取值在 int64 范围内。Go 的协议整数字段一律使用固定宽度的 `int64`。schema 写入整数类型与 int64 的 `minimum`/`maximum`（schema 不能表达词法形式，由编解码器负责）。`v` 在版本阶段检查：必须是整数形式的 1，否则为 `version_mismatch`（缺失、`1.0`、字符串都是）。
+4. **键名区分大小写**：按消息类型及其结构化子对象（`resume`、`worker`）逐层检查，与已定义字段只差大小写的键为 `invalid_field`（按 Unicode 简单大小写折叠比较：ASCII 大小写，加 U+212A→k、U+017F→s；Go 用 `strings.EqualFold`，Python 用等价的折叠函数）；其余未知键照旧忽略；自由格式字段的键不受此规则约束（只受重复键约束）。包含"缺少正确字段、同时存在大小写变体"的交叉用例。
+5. schema 不能表达的原始文本约束（深度、重复键、数字字面量、键名大小写）由编解码器负责；共享 fixtures 用 `raw` 行固定每条规则的边界，schema 一致性测试跳过 `raw` 行。
+
+**Files:**
+- Create: `internal/protocol/syntax.go`
+- Modify: `internal/protocol/limits.go`、`internal/protocol/codec.go`、`internal/protocol/messages.go`、`internal/protocol/validate.go`、`internal/protocol/protocol_test.go`
+- Modify: `protocol/fixtures/v1/messages.json`（新增 5 条合法、27 条非法的 `raw` 边界用例）、`protocol/v1/task.schema.json`、`protocol/v1/control.schema.json`、`protocol/v1/event.schema.json`、`protocol/README.md`
+- Modify: `worker/agentbox_worker/protocol.py`、`worker/agentbox_worker/runtime.py`、`worker/tests/test_protocol.py`、`worker/tests/test_sdk.py`（编码与快照对嵌套过深的 RecursionError 映射为 invalid_field）
+
+**Interfaces:**
+- Consumes: Task 1–8 的全部实现。
+- Produces：Go 常量 `MaxNestingDepth = 64`、`MaxNumberLiteralBytes = 32`；Python 常量 `MAX_NESTING_DEPTH`、`MAX_NUMBER_LITERAL_BYTES` 与公开函数 `parse_json(raw: bytes) -> Any`（按结构限制解析一行；`runtime._supports_protocol` 读取引导信封时也用它，两处不再各自解析）。错误码不变，只是判定更严格。
+
+- [ ] **Step 1：写入共享 fixtures**
+
+按下方补丁中 `protocol/fixtures/v1/messages.json` 的部分追加 32 条 `raw` 用例。5 条合法：深度 64、32 字符数字、次正规数、自由格式字段中的大整数、int64 最大值的 seq。27 条非法：深度 65、33 字符数字、上溢、两种下溢、NaN；五种重复键（同名、转义写法、自由格式字段中、两个孤立代理项、孤立代理项与 U+FFFD）；七种大小写变体（顶层、与正确字段并存、Kelvin 符号、`worker`、`init`、`resume`、`handshake_error`）；seq 的四种错误（`1.0`、`1e0`、布尔值、超出 int64）；v 的三种错误（`1.0`、缺失、布尔值）；版本先于字段类型；大小写变体的 type。
+
+- [ ] **Step 2：确认测试失败**
+
+```bash
+MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -e bash -c 'export PATH=/usr/local/go/bin:/usr/bin:/bin; cd /mnt/f/go-agentbox-m1-3 && go test -count=1 ./internal/protocol/ 2>&1 | tail -5'
+```
+
+```powershell
+cd F:\go-agentbox-m1-3\worker; uv run pytest -q --basetemp=.pytest-tmp tests/test_protocol.py
+```
+
+Expected: Go 的 `TestMessageFixtures` 有子测试失败（例如 `progress_depth_65`、`progress_duplicate_key`）；Python 收集错误 `KeyError: 'message'`（schema 测试尚未跳过 `raw` 行）或 fixtures 子测试失败。
+
+- [ ] **Step 3：实现**
+
+`internal/protocol/syntax.go`：
+
+```go
+package protocol
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io"
+	"math"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+// checkSyntax 在构建任何对象之前逐个读取记号，检查 JSON 结构限制（规格 §5.10）：
+// 嵌套深度、重复键（按解码后的键名比较）与数字字面量。违反时为 malformed_json。
+// json.Decoder.Token 不递归，读到第 MaxNestingDepth+1 层即停止，不会先解析整个输入。
+func checkSyntax(line []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(line))
+	dec.UseNumber()
+	var s syntaxScan
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return newError(CodeMalformedJSON, "%v", err)
+		}
+		if err := s.token(tok); err != nil {
+			return err
+		}
+	}
+	if !s.done {
+		return newError(CodeMalformedJSON, "JSON 不完整")
+	}
+	return nil
+}
+
+type syntaxFrame struct {
+	object    bool
+	keys      map[string]struct{}
+	expectKey bool
+}
+
+type syntaxScan struct {
+	stack []syntaxFrame
+	done  bool // 顶层值已结束
+}
+
+func (s *syntaxScan) token(tok json.Token) error {
+	if s.done {
+		return newError(CodeMalformedJSON, "顶层值之后还有内容")
+	}
+	if n := len(s.stack); n > 0 && s.stack[n-1].object && s.stack[n-1].expectKey {
+		if tok == json.Delim('}') {
+			s.close()
+			return nil
+		}
+		return s.key(tok.(string)) // Decoder 保证对象中这一位置是字符串键
+	}
+	switch v := tok.(type) {
+	case json.Delim:
+		if v == '{' || v == '[' {
+			return s.open(v == '{')
+		}
+		s.close()
+		return nil
+	case json.Number:
+		if err := checkNumberLiteral(string(v)); err != nil {
+			return err
+		}
+	}
+	s.valueDone()
+	return nil
+}
+
+func (s *syntaxScan) open(object bool) error {
+	if len(s.stack) == MaxNestingDepth {
+		return newError(CodeMalformedJSON, "嵌套超过 %d 层", MaxNestingDepth)
+	}
+	f := syntaxFrame{object: object, expectKey: object}
+	if object {
+		f.keys = map[string]struct{}{}
+	}
+	s.stack = append(s.stack, f)
+	return nil
+}
+
+func (s *syntaxScan) close() {
+	s.stack = s.stack[:len(s.stack)-1]
+	s.valueDone()
+}
+
+func (s *syntaxScan) key(k string) error {
+	f := &s.stack[len(s.stack)-1]
+	if _, dup := f.keys[k]; dup {
+		return newError(CodeMalformedJSON, "重复的键 %q", k)
+	}
+	f.keys[k] = struct{}{}
+	f.expectKey = false
+	return nil
+}
+
+func (s *syntaxScan) valueDone() {
+	n := len(s.stack)
+	if n == 0 {
+		s.done = true
+		return
+	}
+	if s.stack[n-1].object {
+		s.stack[n-1].expectKey = true
+	}
+}
+
+// checkNumberLiteral 检查数字字面量的长度（含负号、小数点、指数符号与指数正负号），
+// 以及浮点字面量不上溢为无穷、非零值不下溢为零。整数字面量在自由格式字段中可以超出 int64。
+func checkNumberLiteral(lit string) error {
+	if len(lit) > MaxNumberLiteralBytes {
+		return newError(CodeMalformedJSON, "数字字面量 %d 个字符，上限 %d", len(lit), MaxNumberLiteralBytes)
+	}
+	if !strings.ContainsAny(lit, ".eE") {
+		return nil
+	}
+	f, err := strconv.ParseFloat(lit, 64)
+	if err != nil || math.IsInf(f, 0) {
+		return newError(CodeMalformedJSON, "数字 %s 超出 float64 范围", lit)
+	}
+	mantissa, _, _ := strings.Cut(strings.ToLower(lit), "e")
+	if f == 0 && strings.ContainsAny(mantissa, "123456789") {
+		return newError(CodeMalformedJSON, "数字 %s 下溢为零", lit)
+	}
+	return nil
+}
+
+// checkKeyCase 拒绝与已定义字段只差大小写的键（键名区分大小写）。按消息类型逐层检查：
+// 顶层消息与其中的结构体字段；自由格式字段（json.RawMessage）不检查。键按字典序检查，
+// 错误与字段声明顺序无关。比较采用 Unicode 简单大小写折叠（含 U+212A、U+017F）。
+func checkKeyCase(raw json.RawMessage, t reflect.Type) error {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return nil // 不是对象：交给字段类型检查
+	}
+	fields := structFields(t)
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		nested, exact := fields[k]
+		if exact {
+			if nested != nil {
+				if err := checkKeyCase(obj[k], nested); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		for name := range fields {
+			if strings.EqualFold(k, name) {
+				return newError(CodeInvalidField, "键 %q 与字段 %q 只差大小写", k, name)
+			}
+		}
+	}
+	return nil
+}
+
+var fieldCache sync.Map // reflect.Type -> map[string]reflect.Type
+
+// structFields 返回结构体（含嵌入结构体）的 JSON 字段名；值为该字段的结构体类型，
+// 非结构体字段为 nil。
+func structFields(t reflect.Type) map[string]reflect.Type {
+	if cached, ok := fieldCache.Load(t); ok {
+		return cached.(map[string]reflect.Type)
+	}
+	fields := map[string]reflect.Type{}
+	collectFields(t, fields)
+	fieldCache.Store(t, fields)
+	return fields
+}
+
+func collectFields(t reflect.Type, fields map[string]reflect.Type) {
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.Anonymous {
+			collectFields(f.Type, fields)
+			continue
+		}
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if name == "" || name == "-" {
+			continue
+		}
+		ft := f.Type
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if ft.Kind() == reflect.Struct {
+			fields[name] = ft
+		} else {
+			fields[name] = nil
+		}
+	}
+}
+```
+
+其余文件按下面的补丁修改（在 `F:\go-agentbox-m1-3` 根目录 `git apply --whitespace=nowarn` 即可；补丁已在演练目录验证）：
+
+```diff
+diff --git a/internal/protocol/codec.go b/internal/protocol/codec.go
+index e4ab796..5c6477e 100644
+--- a/internal/protocol/codec.go
++++ b/internal/protocol/codec.go
+@@ -4,6 +4,7 @@ import (
+ 	"bytes"
+ 	"encoding/json"
+ 	"errors"
++	"reflect"
+ 	"unicode/utf8"
+ )
+ 
+@@ -39,7 +40,8 @@ var registry = map[Direction]map[string]func() Message{
+ }
+ 
+ // DecodeLine 解析并校验一行消息（不含行尾换行符）。
+-// 未知字段忽略；未知类型、超限、字段类型错误与语义违规均返回 *Error。
++// 判定顺序：行长 → UTF-8 → JSON 结构限制 → 消息类型 → 类型上限 → 版本 → 键名大小写 → 字段类型 → 语义规则。
++// 未知字段忽略；违规均返回 *Error。
+ func DecodeLine(dir Direction, line []byte) (Message, error) {
+ 	if len(line) > maxLineBytes {
+ 		return nil, newError(CodeMessageTooLarge, "%d 字节，上限 %d", len(line), maxLineBytes)
+@@ -50,24 +52,34 @@ func DecodeLine(dir Direction, line []byte) (Message, error) {
+ 	if t := bytes.TrimSpace(line); len(t) == 0 || t[0] != '{' {
+ 		return nil, newError(CodeMalformedJSON, "消息必须是 JSON 对象")
+ 	}
+-	var peek struct {
+-		Type string `json:"type"`
++	if err := checkSyntax(line); err != nil {
++		return nil, err
+ 	}
+-	if err := json.Unmarshal(line, &peek); err != nil {
+-		var te *json.UnmarshalTypeError
+-		if errors.As(err, &te) && te.Field == "type" {
+-			return nil, newError(CodeUnknownType, "type 不是字符串")
+-		}
++	var top map[string]json.RawMessage // 键名精确匹配；重复键已被拒绝
++	if err := json.Unmarshal(line, &top); err != nil {
+ 		return nil, newError(CodeMalformedJSON, "%v", err)
+ 	}
+-	newMsg, ok := registry[dir][peek.Type]
++	typ, err := messageType(top)
++	if err != nil {
++		return nil, err
++	}
++	newMsg, ok := registry[dir][typ]
+ 	if !ok {
+-		return nil, newError(CodeUnknownType, "%q", peek.Type)
++		return nil, newError(CodeUnknownType, "%q", typ)
+ 	}
+-	if err := checkSize(dir, peek.Type, len(line)); err != nil {
++	if err := checkSize(dir, typ, len(line)); err != nil {
+ 		return nil, err
+ 	}
+ 	m := newMsg()
++	t := reflect.TypeOf(m).Elem()
++	if _, versioned := structFields(t)["v"]; versioned {
++		if err := checkVersionField(top["v"]); err != nil {
++			return nil, err
++		}
++	}
++	if err := checkKeyCase(line, t); err != nil {
++		return nil, err
++	}
+ 	if err := json.Unmarshal(line, m); err != nil {
+ 		var te *json.UnmarshalTypeError
+ 		if errors.As(err, &te) {
+@@ -96,12 +108,37 @@ func EncodeLine(dir Direction, m Message) ([]byte, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if err := checkSyntax(b); err != nil { // 编码结果必须能通过对端的 JSON 结构限制
++		return nil, newError(CodeInvalidField, "消息违反 JSON 结构限制：%v", err)
++	}
+ 	if err := checkSize(dir, m.MessageType(), len(b)); err != nil {
+ 		return nil, err
+ 	}
+ 	return b, nil
+ }
+ 
++// messageType 读取精确键名 type 的值；缺失或不是字符串为 unknown_type。
++func messageType(top map[string]json.RawMessage) (string, error) {
++	raw, ok := top["type"]
++	if !ok {
++		return "", newError(CodeUnknownType, "缺少 type")
++	}
++	var typ string
++	if err := json.Unmarshal(raw, &typ); err != nil {
++		return "", newError(CodeUnknownType, "type 不是字符串")
++	}
++	return typ, nil
++}
++
++// checkVersionField 在字段校验之前检查 v：必须是整数形式的 1，否则为 version_mismatch。
++func checkVersionField(raw json.RawMessage) error {
++	var v int64
++	if raw == nil || json.Unmarshal(raw, &v) != nil {
++		return newError(CodeVersionMismatch, "v 缺失或不是整数")
++	}
++	return checkVersion(v)
++}
++
+ // checkSize 按方向与类型检查上限：Worker 事件 MaxEventBytes，init MaxInitBytes，
+ // 其他宿主控制消息 MaxControlBytes。
+ func checkSize(dir Direction, typ string, n int) error {
+diff --git a/internal/protocol/limits.go b/internal/protocol/limits.go
+index 5ae7fe2..2814a2f 100644
+--- a/internal/protocol/limits.go
++++ b/internal/protocol/limits.go
+@@ -18,5 +18,13 @@ const (
+ 	MaxArtifactPathBytes = 4096
+ )
+ 
++// JSON 结构限制（规格 §5.10）：对整行生效，自由格式字段同样受限；违反时为 malformed_json。
++const (
++	// MaxNestingDepth 是对象与数组的最大嵌套层数，消息顶层对象计 1。
++	MaxNestingDepth = 64
++	// MaxNumberLiteralBytes 是数字字面量的最大字符数，含负号、小数点、指数符号与指数正负号。
++	MaxNumberLiteralBytes = 32
++)
++
+ // maxLineBytes 是任何消息类型上限中的最大值；超过它的行不解析，直接判为过大。
+ const maxLineBytes = max(MaxEventBytes, MaxInitBytes)
+diff --git a/internal/protocol/messages.go b/internal/protocol/messages.go
+index fa6f916..fc65313 100644
+--- a/internal/protocol/messages.go
++++ b/internal/protocol/messages.go
+@@ -59,7 +59,7 @@ type event interface {
+ // HostHeader 是宿主控制消息（init 除外）的公共字段。
+ type HostHeader struct {
+ 	Type string `json:"type"`
+-	V    int    `json:"v"`
++	V    int64  `json:"v"`
+ }
+ 
+ func (h HostHeader) declaredType() string { return h.Type }
+@@ -67,7 +67,7 @@ func (h HostHeader) declaredType() string { return h.Type }
+ // EventHeader 是 Worker 事件的公共字段。ts 仅用于诊断（规格 §5.3）。
+ type EventHeader struct {
+ 	Type string `json:"type"`
+-	V    int    `json:"v"`
++	V    int64  `json:"v"`
+ 	Seq  int64  `json:"seq"`
+ 	TS   string `json:"ts,omitempty"`
+ }
+@@ -79,12 +79,12 @@ func (h EventHeader) header() EventHeader  { return h }
+ // 组成引导信封，永不改变（规格 §5.2）；init 本身不带 v。
+ type Init struct {
+ 	Type             string          `json:"type"`
+-	Bootstrap        int             `json:"bootstrap"`
+-	ProtocolVersions []int           `json:"protocol_versions"`
++	Bootstrap        int64           `json:"bootstrap"`
++	ProtocolVersions []int64         `json:"protocol_versions"`
+ 	Mode             string          `json:"mode"`
+ 	TaskID           string          `json:"task_id"`
+ 	AttemptID        string          `json:"attempt_id"`
+-	AttemptNo        int             `json:"attempt_no"`
++	AttemptNo        int64           `json:"attempt_no"`
+ 	Traceparent      string          `json:"traceparent,omitempty"`
+ 	Config           json.RawMessage `json:"config,omitempty"`
+ 	ConfigVersion    string          `json:"config_version,omitempty"`
+@@ -117,7 +117,7 @@ type ArtifactResult struct {
+ 	HostHeader
+ 	ArtifactID string `json:"artifact_id"`
+ 	Status     string `json:"status"`
+-	Version    int    `json:"version,omitempty"`
++	Version    int64  `json:"version,omitempty"`
+ 	SHA256     string `json:"sha256,omitempty"`
+ 	Code       string `json:"code,omitempty"`
+ }
+@@ -147,7 +147,7 @@ type WorkerInfo struct {
+ // Ready 是 Worker 完成握手后的第一条事件。
+ type Ready struct {
+ 	EventHeader
+-	ProtocolVersion int        `json:"protocol_version"`
++	ProtocolVersion int64      `json:"protocol_version"`
+ 	Mode            string     `json:"mode"`
+ 	Worker          WorkerInfo `json:"worker"`
+ 	Capabilities    []string   `json:"capabilities"`
+@@ -215,7 +215,7 @@ type ErrorEvent struct {
+ // HandshakeError 在没有共同协议版本时发出，格式固定（规格 §5.2）。
+ type HandshakeError struct {
+ 	Type      string `json:"type"`
+-	Bootstrap int    `json:"bootstrap"`
++	Bootstrap int64  `json:"bootstrap"`
+ 	Code      string `json:"code"`
+ }
+ 
+diff --git a/internal/protocol/protocol_test.go b/internal/protocol/protocol_test.go
+index 8c98d8c..6a01070 100644
+--- a/internal/protocol/protocol_test.go
++++ b/internal/protocol/protocol_test.go
+@@ -116,7 +116,6 @@ func TestDecodeLimits(t *testing.T) {
+ 		{"refs 超过上限", WorkerToHost, string(checkpointLine(`{}`, append(refs, ref))), CodeTooManyRefs},
+ 		{"超过所有上限的行不解析", HostToWorker, strings.Repeat("x", MaxInitBytes+1), CodeMessageTooLarge},
+ 		{"非法 UTF-8", WorkerToHost, "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"\xff\"}", CodeMalformedJSON},
+-		{"嵌套过深", WorkerToHost, `{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":` + strings.Repeat("[", 100000) + strings.Repeat("]", 100000) + `}`, CodeMalformedJSON},
+ 		{"孤立代理项转义可以解码", WorkerToHost, string(checkpointLine(`"\ud800"`, []string{})), ""},
+ 	}
+ 	for _, c := range cases {
+@@ -155,6 +154,7 @@ func TestEncodeLine(t *testing.T) {
+ 		{"Worker 事件按宿主方向编码", HostToWorker, &Paused{EventHeader: EventHeader{Type: TypePaused, V: Version, Seq: 1}, CheckpointID: "cp-1"}, CodeUnknownType},
+ 		{"type 字段与消息类型不一致", WorkerToHost, &Paused{EventHeader: EventHeader{Type: TypeResult, V: Version, Seq: 1}, CheckpointID: "cp-1"}, CodeInvalidField},
+ 		{"缺少 state 与 state_ref", WorkerToHost, &Checkpoint{EventHeader: EventHeader{Type: TypeCheckpoint, V: Version, Seq: 1}, CheckpointID: "cp-1", Scope: ScopeTask, StepID: "s1"}, CodeInvalidField},
++		{"编码结果违反 JSON 结构限制", WorkerToHost, &Progress{EventHeader: EventHeader{Type: TypeProgress, V: Version, Seq: 1}, Kind: "x", Message: "y", Data: json.RawMessage(`1e999`)}, CodeInvalidField},
+ 	}
+ 	for _, c := range rejects {
+ 		t.Run(c.name, func(t *testing.T) {
+diff --git a/internal/protocol/validate.go b/internal/protocol/validate.go
+index 668be7b..dec13e3 100644
+--- a/internal/protocol/validate.go
++++ b/internal/protocol/validate.go
+@@ -72,7 +72,7 @@ func (m *ArtifactResult) validate() error {
+ func (m *Cancel) validate() error { return validateStop(m.V, m.AttemptID, m.GraceMS) }
+ func (m *Pause) validate() error  { return validateStop(m.V, m.AttemptID, m.GraceMS) }
+ 
+-func validateStop(v int, attemptID string, graceMS int64) error {
++func validateStop(v int64, attemptID string, graceMS int64) error {
+ 	if err := firstErr(checkVersion(v), required("attempt_id", attemptID)); err != nil {
+ 		return err
+ 	}
+@@ -158,7 +158,7 @@ func (m *HandshakeError) validate() error {
+ 	return required("code", m.Code)
+ }
+ 
+-func checkVersion(v int) error {
++func checkVersion(v int64) error {
+ 	if v != Version {
+ 		return newError(CodeVersionMismatch, "v=%d，期望 %d", v, Version)
+ 	}
+diff --git a/protocol/README.md b/protocol/README.md
+index 6a1c828..9b9cd04 100644
+--- a/protocol/README.md
++++ b/protocol/README.md
+@@ -44,9 +44,16 @@
+ 
+ ## 判定顺序与错误码
+ 
+-依次检查：行长超过任何类型上限中的最大值（1 MiB）→ `message_too_large`，不解析；行不是严格的 UTF-8（含 BOM 前缀）、不是 JSON 对象或嵌套过深 → `malformed_json`；`type` 缺失、非字符串或不属于该方向 → `unknown_type`；超过该类型的上限 → `message_too_large`；字段类型错误 → `invalid_field`；然后是各类型的语义规则：`version_mismatch`、`missing_field`、`invalid_field`、`state_too_large`、`too_many_refs`、`path_invalid`。
++依次检查：行长超过任何类型上限中的最大值（1 MiB）→ `message_too_large`，不解析；行不是严格的 UTF-8（含 BOM 前缀）、不是 JSON 对象，或违反 JSON 结构限制（嵌套超过 64 层；任意层级的重复键，按解码后的键名比较，孤立代理项转义按 U+FFFD 计；数字字面量超过 32 个字符；浮点字面量上溢为无穷或非零值下溢为零）→ `malformed_json`；`type` 缺失（键名区分大小写）、非字符串或不属于该方向 → `unknown_type`；超过该类型的大小上限 → `message_too_large`；`v` 不是整数形式的 1 → `version_mismatch`；与已定义字段只差大小写的键（按消息类型逐层检查，含 `resume`、`worker`）→ `invalid_field`；字段类型错误（整数字段只接受整数形式且在 int64 范围内）→ `invalid_field`；然后按各类型的语义规则依次检查。
+ 
+-**两侧已知差异**（尚未统一，是否收紧由协议另行决定）：① 嵌套深度没有协议级上限——Go 在 10000 层报 `malformed_json`，Python 取决于解释器（3.11、3.13 在约 1000–2500 层报 `malformed_json`，3.14 起按 C 栈检查，数万层仍可解析；测试统一用 10 万层，各方都拒绝）；② 键名大小写——Go 按结构体字段不区分大小写匹配（含 Unicode 折叠），Python 只认精确键名；③ 重复键——Go 取后者但 `null` 不覆盖前值、前值的类型错误不被后者纠正，Python 取最后一个；④ 超过 4300 位的整数——Go 在整数字段报 `invalid_field`、在自由格式字段（`state`、`data`、`config`）接受，Python 一律报 `malformed_json`。合规的发送方（本 SDK 与宿主）不会产生这些输入。
++| JSON 结构限制（对整行生效，自由格式字段同样受限） | 上限 |
++|---|---|
++| 对象与数组的嵌套层数（消息顶层对象计 1） | 64 |
++| 数字字面量的字符数（含负号、小数点、指数符号与指数正负号） | 32 |
++| 重复键（任意层级，按解码后的键名比较；孤立代理项转义按 U+FFFD 计） | 不允许 |
++| 浮点字面量 | 不得上溢为无穷；非零值不得下溢为零 |
++
++违反上述限制为 `malformed_json`，在消息类型判定之前检查；编码时同样检查，违反为 `invalid_field`（不发出对端会拒绝的行）。键名区分大小写：在已定义字段的对象中（消息顶层及其结构化子对象），与已定义字段只差大小写的键为 `invalid_field`（按 Unicode 简单大小写折叠比较），其余未知键忽略。整数类型字段只接受整数形式（拒绝 `1.0`、`1e0` 与布尔值），取值在 int64 范围内。
+ 
+ ## 事件流顺序（task 模式）
+ 
+diff --git a/protocol/fixtures/v1/messages.json b/protocol/fixtures/v1/messages.json
+index 666f487..7b687b7 100644
+--- a/protocol/fixtures/v1/messages.json
++++ b/protocol/fixtures/v1/messages.json
+@@ -24,7 +24,12 @@
+     {"name": "paused", "direction": "worker", "message": {"type": "paused", "v": 1, "seq": 6, "checkpoint_id": "cp-1"}},
+     {"name": "result", "direction": "worker", "message": {"type": "result", "v": 1, "seq": 7, "summary": "完成", "outputs": ["report"]}},
+     {"name": "error", "direction": "worker", "message": {"type": "error", "v": 1, "seq": 2, "code": "internal_error", "message": "boom", "retryable": true}},
+-    {"name": "handshake_error", "direction": "worker", "message": {"type": "handshake_error", "bootstrap": 1, "code": "no_common_version"}}
++    {"name": "handshake_error", "direction": "worker", "message": {"type": "handshake_error", "bootstrap": 1, "code": "no_common_version"}},
++    {"name": "progress_depth_64", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}"},
++    {"name": "progress_number_literal_32_chars", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":-1.111111111111111111111111e-100}"},
++    {"name": "progress_subnormal_number", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":5e-324}"},
++    {"name": "progress_big_integer_in_free_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":12345678901234567890123}"},
++    {"name": "progress_seq_int64_max", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":9223372036854775807,\"kind\":\"x\",\"message\":\"y\"}"}
+   ],
+   "invalid": [
+     {"name": "malformed_json_truncated", "direction": "worker", "raw": "{\"type\":\"ready\"", "code": "malformed_json"},
+@@ -67,6 +72,33 @@
+     {"name": "error_retryable_not_bool", "direction": "worker", "message": {"type": "error", "v": 1, "seq": 2, "code": "x", "message": "boom", "retryable": "yes"}, "code": "invalid_field"},
+     {"name": "handshake_error_bad_bootstrap", "direction": "worker", "message": {"type": "handshake_error", "bootstrap": 2, "code": "no_common_version"}, "code": "invalid_field"},
+     {"name": "utf8_bom_prefix", "direction": "worker", "raw": "\ufeff{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "malformed_json"},
+-    {"name": "seq_out_of_int64_range", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":99999999999999999999,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"}
++    {"name": "seq_out_of_int64_range", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":99999999999999999999,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
++    {"name": "progress_depth_65", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}", "code": "malformed_json"},
++    {"name": "progress_number_literal_33_chars", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":-1.1111111111111111111111111e-100}", "code": "malformed_json"},
++    {"name": "progress_float_overflow", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":1e999}", "code": "malformed_json"},
++    {"name": "progress_float_underflow", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":1e-999}", "code": "malformed_json"},
++    {"name": "progress_nan", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":NaN}", "code": "malformed_json"},
++    {"name": "progress_duplicate_key", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"seq\":1}", "code": "malformed_json"},
++    {"name": "progress_duplicate_key_escaped", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"\\u0073eq\":1}", "code": "malformed_json"},
++    {"name": "progress_duplicate_key_in_free_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":{\"a\":1,\"a\":2}}", "code": "malformed_json"},
++    {"name": "progress_case_variant_key", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"Seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
++    {"name": "progress_case_variant_alongside_correct", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"SEQ\":1}", "code": "invalid_field"},
++    {"name": "progress_case_variant_kelvin", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"Kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
++    {"name": "ready_case_variant_nested", "direction": "worker", "raw": "{\"type\":\"ready\",\"v\":1,\"seq\":1,\"protocol_version\":1,\"mode\":\"task\",\"capabilities\":[],\"worker\":{\"Name\":\"w\",\"version\":\"1\"}}", "code": "invalid_field"},
++    {"name": "progress_seq_float_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1.0,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
++    {"name": "progress_seq_exponent_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1e0,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
++    {"name": "progress_v_float_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1.0,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "version_mismatch"},
++    {"name": "progress_version_checked_before_field_types", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":2,\"seq\":\"x\",\"kind\":\"x\",\"message\":\"y\"}", "code": "version_mismatch"},
++    {"name": "progress_type_case_variant", "direction": "worker", "raw": "{\"TYPE\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "unknown_type"},
++    {"name": "progress_duplicate_key_lone_surrogates", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":{\"\\ud800\":1,\"\\udc00\":2}}", "code": "malformed_json"},
++    {"name": "progress_duplicate_key_lone_surrogate_vs_fffd", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":{\"\\ud800\":1,\"\\ufffd\":2}}", "code": "malformed_json"},
++    {"name": "progress_float_underflow_min_boundary", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":2e-324}", "code": "malformed_json"},
++    {"name": "progress_seq_bool", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":true,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
++    {"name": "progress_seq_int64_overflow", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":9223372036854775808,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
++    {"name": "progress_v_missing", "direction": "worker", "raw": "{\"type\":\"progress\",\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "version_mismatch"},
++    {"name": "progress_v_bool", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":true,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "version_mismatch"},
++    {"name": "init_case_variant_key", "direction": "host", "raw": "{\"type\":\"init\",\"bootstrap\":1,\"protocol_versions\":[1],\"Mode\":\"task\",\"task_id\":\"t-1\",\"attempt_id\":\"a-1\",\"attempt_no\":1,\"out_dir\":\"/workspace/out/a-1\"}", "code": "invalid_field"},
++    {"name": "init_resume_case_variant_key", "direction": "host", "raw": "{\"type\":\"init\",\"bootstrap\":1,\"protocol_versions\":[1],\"mode\":\"task\",\"task_id\":\"t-1\",\"attempt_id\":\"a-1\",\"attempt_no\":1,\"out_dir\":\"/workspace/out/a-1\",\"resume\":{\"checkpoint_id\":\"cp-1\",\"Step_Id\":\"s1\",\"state\":{}}}", "code": "invalid_field"},
++    {"name": "handshake_error_case_variant_key", "direction": "worker", "raw": "{\"type\":\"handshake_error\",\"bootstrap\":1,\"Code\":\"no_common_version\"}", "code": "invalid_field"}
+   ]
+ }
+diff --git a/protocol/v1/control.schema.json b/protocol/v1/control.schema.json
+index be8beac..1213588 100644
+--- a/protocol/v1/control.schema.json
++++ b/protocol/v1/control.schema.json
+@@ -31,7 +31,7 @@
+         "v": {"const": 1},
+         "artifact_id": {"$ref": "#/$defs/nonEmpty"},
+         "status": {"enum": ["saved", "rejected"]},
+-        "version": {"type": "integer"},
++        "version": {"type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807},
+         "sha256": {"type": "string"},
+         "code": {"type": "string"}
+       },
+@@ -53,7 +53,7 @@
+         "v": {"const": 1},
+         "attempt_id": {"$ref": "#/$defs/nonEmpty"},
+         "reason": {"type": "string"},
+-        "grace_ms": {"type": "integer", "minimum": 0}
++        "grace_ms": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807}
+       }
+     },
+     "cancel": {"allOf": [{"$ref": "#/$defs/stop"}, {"properties": {"type": {"const": "cancel"}}}]},
+diff --git a/protocol/v1/event.schema.json b/protocol/v1/event.schema.json
+index 5f337a0..454998e 100644
+--- a/protocol/v1/event.schema.json
++++ b/protocol/v1/event.schema.json
+@@ -25,7 +25,7 @@
+       "required": ["type", "v", "seq"],
+       "properties": {
+         "v": {"const": 1},
+-        "seq": {"type": "integer", "minimum": 1},
++        "seq": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
+         "ts": {"type": "string"}
+       }
+     },
+@@ -62,7 +62,7 @@
+         "artifact_id": {"$ref": "#/$defs/nonEmpty"},
+         "path": {"$ref": "#/$defs/artifactPath"},
+         "declared_sha256": {"$ref": "#/$defs/sha256"},
+-        "declared_size": {"type": "integer", "minimum": 0},
++        "declared_size": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+         "media_type": {"$ref": "#/$defs/nonEmpty"},
+         "visibility": {"enum": ["output", "internal"]}
+       }
+diff --git a/protocol/v1/task.schema.json b/protocol/v1/task.schema.json
+index 53c1a20..2308382 100644
+--- a/protocol/v1/task.schema.json
++++ b/protocol/v1/task.schema.json
+@@ -8,11 +8,11 @@
+   "properties": {
+     "type": {"const": "init"},
+     "bootstrap": {"const": 1},
+-    "protocol_versions": {"type": "array", "minItems": 1, "items": {"type": "integer"}},
++    "protocol_versions": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807}},
+     "mode": {"enum": ["task", "session"]},
+     "task_id": {"$ref": "#/$defs/nonEmpty"},
+     "attempt_id": {"$ref": "#/$defs/nonEmpty"},
+-    "attempt_no": {"type": "integer", "minimum": 1},
++    "attempt_no": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
+     "traceparent": {"type": "string"},
+     "config_version": {"type": "string"},
+     "input_refs": {"type": "array", "items": {"$ref": "#/$defs/sha256"}},
+diff --git a/worker/agentbox_worker/protocol.py b/worker/agentbox_worker/protocol.py
+index 9e02394..ac126b5 100644
+--- a/worker/agentbox_worker/protocol.py
++++ b/worker/agentbox_worker/protocol.py
+@@ -2,13 +2,15 @@
+ 
+ 规则与 Go 侧 internal/protocol 逐条对应，二者共用 protocol/fixtures/v1。
+ 消息以 dict 表示；未知字段忽略，未知类型是错误（规格 §5.3）。
+-判定顺序：行长超过 1 MiB → 非严格 UTF-8 / 非 JSON 对象 / 嵌套过深 → 类型未知 → 超限
+-→ 字段类型错误 → 语义规则。
++判定顺序：行长 → UTF-8 → JSON 结构限制 → 消息类型 → 类型上限 → 版本 → 键名大小写
++→ 字段类型 → 语义规则。
+ """
+ 
+ from __future__ import annotations
+ 
+ import json
++import math
++import re
+ from collections.abc import Callable
+ from typing import Any
+ 
+@@ -27,6 +29,10 @@ MAX_ARTIFACT_PATH_BYTES = 4096
+ # 任何消息类型上限中的最大值；超过它的行不解析，直接判为过大。
+ MAX_LINE_BYTES = max(MAX_EVENT_BYTES, MAX_INIT_BYTES)
+ 
++# JSON 结构限制（规格 §5.10）：对整行生效，自由格式字段同样受限；违反时为 malformed_json。
++MAX_NESTING_DEPTH = 64  # 对象与数组的最大嵌套层数，消息顶层对象计 1
++MAX_NUMBER_LITERAL_BYTES = 32  # 数字字面量的最大字符数，含负号、小数点、指数符号与指数正负号
++
+ MODE_TASK = "task"
+ MODE_SESSION = "session"
+ SCOPE_TASK = "task"
+@@ -70,10 +76,20 @@ def _list_of(pred: Pred) -> Pred:
+     return lambda v: isinstance(v, list) and all(x is None or pred(x) for x in v)
+ 
+ 
++class _Obj:
++    """嵌套对象字段的类型谓词；保留字段定义，供键名大小写检查逐层使用。"""
++
++    def __init__(self, spec: dict[str, Pred]) -> None:
++        self.spec = spec
++
++    def __call__(self, v: Any) -> bool:
++        return isinstance(v, dict) and all(
++            v.get(k) is None or pred(v[k]) for k, pred in self.spec.items()
++        )
++
++
+ def _obj(spec: dict[str, Pred]) -> Pred:
+-    return lambda v: (
+-        isinstance(v, dict) and all(v.get(k) is None or pred(v[k]) for k, pred in spec.items())
+-    )
++    return _Obj(spec)
+ 
+ 
+ _STRS = _list_of(_is_str)
+@@ -179,8 +195,10 @@ def _one_of(field: str, value: str, *allowed: str) -> None:
+ 
+ 
+ def _check_version(msg: dict[str, Any]) -> None:
+-    if _n(msg, "v") != VERSION:
+-        raise ProtocolError("version_mismatch", f"v={_n(msg, 'v')}，期望 {VERSION}")
++    """v 必须是整数形式的 1（不接受 1.0、布尔值或缺失），否则为 version_mismatch。"""
++    v = msg.get("v")
++    if not (_is_int(v) and v == VERSION):
++        raise ProtocolError("version_mismatch", f"v={v!r}，期望 {VERSION}")
+ 
+ 
+ def _check_event(msg: dict[str, Any]) -> None:
+@@ -370,6 +388,80 @@ def _reject_constant(name: str) -> Any:
+     raise ValueError(f"不允许的 JSON 常量 {name}")
+ 
+ 
++# 展开写法加占有量词（Python ≥ 3.11）：对未闭合的字符串也是线性时间，不会回溯爆炸
++_JSON_STRING = re.compile(r'"[^"\\]*+(?:\\.[^"\\]*+)*+"')
++_BRACKET = re.compile(r"[\[\]{}]")
++
++
++def _check_depth(text: str) -> None:
++    """在构建任何对象之前，按原始文本计算对象与数组的嵌套层数（字符串内的括号不计）。"""
++    depth = 0
++    for bracket in _BRACKET.finditer(_JSON_STRING.sub('""', text)):
++        if bracket.group() in "[{":
++            depth += 1
++            if depth > MAX_NESTING_DEPTH:
++                raise ValueError(f"嵌套超过 {MAX_NESTING_DEPTH} 层")
++        else:
++            depth -= 1
++
++
++_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
++
++
++def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
++    """按解码后的键名比较：seq 与其转义写法 \\u0073eq 是同一个键。
++
++    json 已把成对的代理项合并为一个字符，剩下的都是孤立代理项；与 Go 一致，每个按 U+FFFD 比较。
++    """
++    obj: dict[str, Any] = {}
++    seen: set[str] = set()
++    for key, value in pairs:
++        normalized = _LONE_SURROGATE.sub("\ufffd", key)
++        if normalized in seen:
++            raise ValueError(f"重复的键 {key!r}")
++        seen.add(normalized)
++        obj[key] = value
++    return obj
++
++
++def _check_literal(lit: str) -> None:
++    if len(lit) > MAX_NUMBER_LITERAL_BYTES:
++        raise ValueError(f"数字字面量 {len(lit)} 个字符，上限 {MAX_NUMBER_LITERAL_BYTES}")
++
++
++def _parse_int(lit: str) -> int:
++    _check_literal(lit)
++    return int(lit)
++
++
++def _parse_float(lit: str) -> float:
++    """浮点字面量不得上溢为无穷，非零值不得下溢为零（与 Go 的 strconv.ParseFloat 结果一致）。"""
++    _check_literal(lit)
++    value = float(lit)
++    if math.isinf(value):
++        raise ValueError(f"数字 {lit} 超出 float64 范围")
++    mantissa = re.split("[eE]", lit)[0]
++    if value == 0.0 and re.search("[1-9]", mantissa):
++        raise ValueError(f"数字 {lit} 下溢为零")
++    return value
++
++
++def parse_json(raw: bytes) -> Any:
++    """按协议的 JSON 结构限制解析一行：严格 UTF-8，深度、重复键与数字字面量受限。"""
++    try:
++        text = raw.decode("utf-8")
++        _check_depth(text)
++        return json.loads(
++            text,
++            object_pairs_hook=_no_duplicate_keys,
++            parse_int=_parse_int,
++            parse_float=_parse_float,
++            parse_constant=_reject_constant,
++        )
++    except (ValueError, RecursionError) as exc:  # 含非法 UTF-8、BOM 与语法错误
++        raise ProtocolError("malformed_json", str(exc)) from exc
++
++
+ def _check_size(direction: str, typ: str, size: int) -> None:
+     if direction == WORKER:
+         limit = MAX_EVENT_BYTES
+@@ -388,6 +480,28 @@ def _check_types(typ: str, msg: dict[str, Any]) -> None:
+             raise ProtocolError("invalid_field", f"{key} 类型不正确")
+ 
+ 
++_FOLD = str.maketrans({"\u212a": "k", "\u017f": "s"})
++
++
++def _fold(key: str) -> str:
++    """与 Go 的 strings.EqualFold 对 ASCII 字段名的判定一致：ASCII 大小写，加 U+212A 与 U+017F。"""
++    return "".join(c.lower() if c.isascii() else c for c in key.translate(_FOLD))
++
++
++def _check_key_case(spec: dict[str, Pred], obj: dict[str, Any]) -> None:
++    """拒绝与已定义字段只差大小写的键；按消息类型逐层检查，键按字典序检查。"""
++    for key in sorted(obj):
++        pred = spec.get(key)
++        if pred is not None:
++            if isinstance(pred, _Obj) and isinstance(obj[key], dict):
++                _check_key_case(pred.spec, obj[key])
++            continue
++        folded = _fold(key)
++        for name in spec:
++            if folded == name:
++                raise ProtocolError("invalid_field", f"键 {key!r} 与字段 {name!r} 只差大小写")
++
++
+ def _validator_for(direction: str, typ: Any) -> Callable[[dict[str, Any]], None]:
+     validator = _VALIDATORS[direction].get(typ) if isinstance(typ, str) else None
+     if validator is None:
+@@ -403,15 +517,16 @@ def decode_line(direction: str, line: bytes | str) -> dict[str, Any]:
+         raise ProtocolError("malformed_json", "行不是合法的 UTF-8") from exc
+     if len(raw) > MAX_LINE_BYTES:
+         raise ProtocolError("message_too_large", f"{len(raw)} 字节，上限 {MAX_LINE_BYTES}")
+-    try:
+-        msg = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+-    except (ValueError, RecursionError) as exc:  # 非法 UTF-8、BOM、语法错误、嵌套过深
+-        raise ProtocolError("malformed_json", str(exc)) from exc
++    msg = parse_json(raw)
+     if not isinstance(msg, dict):
+         raise ProtocolError("malformed_json", "消息必须是 JSON 对象")
+     typ = msg.get("type")
+     validator = _validator_for(direction, typ)
+     _check_size(direction, typ, len(raw))
++    spec = _FIELD_TYPES[typ]
++    if "v" in spec:
++        _check_version(msg)
++    _check_key_case(spec, msg)
+     _check_types(typ, msg)
+     validator(msg)
+     return msg
+@@ -425,11 +540,15 @@ def encode_line(direction: str, msg: dict[str, Any]) -> bytes:
+     validator(msg)
+     try:
+         text = json.dumps(msg, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+-    except ValueError as exc:  # NaN、Infinity 不是合法 JSON
++    except (ValueError, RecursionError) as exc:  # NaN、Infinity 不是合法 JSON；嵌套过深无法序列化
+         raise ProtocolError("invalid_field", f"消息含有 JSON 不支持的数值：{exc}") from exc
+     try:
+         line = text.encode("utf-8")
+     except UnicodeEncodeError as exc:  # 字符串中含孤立代理项
+         raise ProtocolError("invalid_field", "消息含有孤立代理项，无法编码为 UTF-8") from exc
++    try:  # 编码结果必须能通过对端的 JSON 结构限制（深度、数字字面量等）
++        parse_json(line)
++    except ProtocolError as exc:
++        raise ProtocolError("invalid_field", f"消息违反 JSON 结构限制：{exc.detail}") from exc
+     _check_size(direction, typ, len(line))
+     return line
+diff --git a/worker/agentbox_worker/runtime.py b/worker/agentbox_worker/runtime.py
+index dab7d03..e45e9cb 100644
+--- a/worker/agentbox_worker/runtime.py
++++ b/worker/agentbox_worker/runtime.py
+@@ -31,6 +31,7 @@ from agentbox_worker.protocol import (
+     VERSION,
+     ProtocolError,
+     decode_line,
++    parse_json,
+     valid_artifact_path,
+ )
+ from agentbox_worker.transport import StdioTransport, Transport
+@@ -109,7 +110,7 @@ def _snapshot(state: Any) -> Any:
+     """
+     try:
+         return json.loads(json.dumps(state, ensure_ascii=False, allow_nan=False))
+-    except (TypeError, ValueError) as exc:
++    except (TypeError, ValueError, RecursionError) as exc:
+         raise WorkerFailure("invalid_field", f"checkpoint state 无法序列化为 JSON：{exc}") from exc
+ 
+ 
+@@ -283,9 +284,9 @@ class TaskContext:
+ 
+ def _supports_protocol(line: bytes) -> bool:
+     """只读引导信封判断是否有共同版本（规格 §5.2）；信封本身不合法时交由完整校验报错。"""
+-    try:  # 与 decode_line 相同：严格 UTF-8，嵌套过深按无法解析处理
+-        envelope = json.loads(line.decode("utf-8"))
+-    except (ValueError, RecursionError):
++    try:  # 与 decode_line 使用同一套 JSON 结构限制
++        envelope = parse_json(line)
++    except ProtocolError:
+         return True
+     if not isinstance(envelope, dict) or envelope.get("type") != "init":
+         return True
+diff --git a/worker/tests/test_protocol.py b/worker/tests/test_protocol.py
+index e0d43dd..d9f1041 100644
+--- a/worker/tests/test_protocol.py
++++ b/worker/tests/test_protocol.py
+@@ -1,6 +1,7 @@
+ """协议层：跨语言 fixtures 回放与按常量生成的大小上限（规格 §5.10、§5.11）。"""
+ 
+ import json
++import time
+ 
+ import pytest
+ from protocol_fixtures import line_bytes, load_messages, load_scenarios
+@@ -60,6 +61,13 @@ def test_scenario_stream(scenario):
+ 
+ REF = "a" * 64
+ 
++NESTED_70: object = 0
++for _ in range(70):
++    NESTED_70 = [NESTED_70]
++NESTED_5000: object = 0
++for _ in range(5000):
++    NESTED_5000 = [NESTED_5000]
++
+ 
+ def checkpoint_line(state_json: str, refs: list[str]) -> bytes:
+     head = '{"type":"checkpoint","v":1,"seq":1,"checkpoint_id":"cp-1","scope":"task","step_id":"s1"'
+@@ -130,24 +138,9 @@ LIMIT_CASES = [
+         "malformed_json",
+         id="invalid_utf8",
+     ),
+-    pytest.param(
+-        WORKER,
+-        b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":'
+-        + b"[" * 100_000
+-        + b"]" * 100_000
+-        + b"}",
+-        "malformed_json",
+-        id="nesting_too_deep",
+-    ),
+     pytest.param(
+         WORKER, checkpoint_line('"\\ud800"', []), None, id="lone_surrogate_escape_accepted"
+     ),
+-    pytest.param(
+-        WORKER,
+-        b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":NaN}',
+-        "malformed_json",
+-        id="nan_is_malformed",
+-    ),
+ ]
+ 
+ 
+@@ -189,6 +182,31 @@ def test_decode_limits(direction, line, code):
+             "invalid_field",
+             id="lone_surrogate",
+         ),
++        pytest.param(
++            WORKER,
++            {"type": "progress", "v": 1, "seq": 1, "kind": "x", "message": "y", "data": 10**40},
++            "invalid_field",
++            id="number_literal_too_long",
++        ),
++        pytest.param(
++            WORKER,
++            {"type": "progress", "v": 1, "seq": 1, "kind": "x", "message": "y", "data": NESTED_70},
++            "invalid_field",
++            id="nesting_too_deep",
++        ),
++        pytest.param(
++            WORKER,
++            {
++                "type": "progress",
++                "v": 1,
++                "seq": 1,
++                "kind": "x",
++                "message": "y",
++                "data": NESTED_5000,
++            },
++            "invalid_field",
++            id="too_deep_to_serialize",
++        ),
+     ],
+ )
+ def test_encode_rejects(direction, message, code):
+@@ -197,6 +215,16 @@ def test_encode_rejects(direction, message, code):
+     assert exc.value.code == code
+ 
+ 
++def test_unterminated_string_is_rejected_in_linear_time():
++    """深度预扫描的正则不得回溯爆炸：被截断的行（例如宿主写到一半退出）应立即被拒绝。"""
++    line = b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"' + b"a b" * 10
++    started = time.monotonic()
++    with pytest.raises(ProtocolError) as exc:
++        decode_line(WORKER, line)
++    assert exc.value.code == "malformed_json"
++    assert time.monotonic() - started < 1.0
++
++
+ # ---- JSON Schema：与 fixtures 一致 ----
+ 
+ from typing import Any
+@@ -227,7 +255,8 @@ def test_schemas_are_valid_draft_2020_12():
+ 
+ 
+ def valid_items() -> list[tuple[str, str, dict[str, Any]]]:
+-    items = [(c["name"], c["direction"], c["message"]) for c in MESSAGES["valid"]]
++    # raw 行表达的是 schema 无法描述的原始文本约束，由编解码器负责
++    items = [(c["name"], c["direction"], c["message"]) for c in MESSAGES["valid"] if "message" in c]
+     for scenario in SCENARIOS:
+         bad = scenario["expect"].get("at")
+         for index, line in enumerate(scenario["lines"]):
+diff --git a/worker/tests/test_sdk.py b/worker/tests/test_sdk.py
+index 50c9004..676049d 100644
+--- a/worker/tests/test_sdk.py
++++ b/worker/tests/test_sdk.py
+@@ -226,6 +226,9 @@ from agentbox_worker import Result, TaskContext, Timing, WorkerFailure, run_work
+ from agentbox_worker.runtime import MAX_ERROR_MESSAGE_BYTES, SHUTDOWN_TIMEOUT_ENV, _shutdown_timeout
+ 
+ FAST = Timing(ack_timeout=0.05, max_ack_attempts=3, retry_backoff=0.01, artifact_timeout=0.5)
++NESTED_5000: object = 0  # 超过 Python 递归上限，json.dumps 无法序列化
++for _ in range(5000):
++    NESTED_5000 = [NESTED_5000]
+ INIT = {
+     "type": "init",
+     "bootstrap": 1,
+@@ -543,6 +546,7 @@ def test_reply_to_last_query_is_awaited(tmp_path):
+     [
+         pytest.param("x" * (256 << 10), "state_too_large", id="oversized"),
+         pytest.param({"x": object()}, "invalid_field", id="unserializable"),
++        pytest.param(NESTED_5000, "invalid_field", id="too_deep_to_serialize"),
+     ],
+ )
+ def test_bad_state_fails_without_sending(tmp_path, state, code):
+```
+
+- [ ] **Step 4：运行全部验证**
+
+```bash
+MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -e bash -c 'export PATH=/usr/local/go/bin:/usr/bin:/bin; cd /mnt/f/go-agentbox-m1-3 && gofmt -l internal/protocol; go vet ./... && go test -count=1 ./internal/protocol/ && go test -count=1 -v ./internal/protocol/ 2>&1 | grep -cE "^    --- PASS: TestScenarioFixtures/"'
+```
+
+```powershell
+cd F:\go-agentbox-m1-3\worker; uv sync --locked; uv run ruff check .; uv run ruff format --check .; uv run lint-imports; uv run pytest -q --basetemp=.pytest-tmp
+$env:UV_PROJECT_ENVIRONMENT=".venv311"; uv run --python 3.11 pytest -q --basetemp=.pytest-tmp; Remove-Item Env:UV_PROJECT_ENVIRONMENT
+```
+
+Expected: gofmt 无输出、vet 通过、Go 测试 `ok`、场景计数 22；Python ruff 与契约检查通过，pytest 在 3.13 与 3.11 上各 334 项通过。另在 Linux（WSL）上用同一批 fixtures 逐条比对 Python 的判定（任何解释器版本都必须与 Go 一致），并运行 `test_sdk.py`、`test_process.py`。
+
+- [ ] **Step 5：提交**
+
+```bash
+cd /f/go-agentbox-m1-3 && git add internal/protocol protocol worker/agentbox_worker/protocol.py worker/agentbox_worker/runtime.py worker/tests/test_protocol.py worker/tests/test_sdk.py && git commit -m "feat(protocol): 收紧协议契约——JSON 结构限制、版本前置、键名区分大小写、整数词法与范围
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
 ## 联合验收（计划完成的判定）
 
 全部任务完成后，主 agent 依次执行：
@@ -5007,7 +6548,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
    cd F:\go-agentbox-m1-3\worker; uv sync --locked; uv run ruff check .; uv run ruff format --check .; uv run lint-imports; uv run pytest -q
    ```
    Expected: 全部通过。
-3. **跨语言一致性**：Go 的 `TestMessageFixtures`、`TestScenarioFixtures` 与 Python 的 `test_valid_message_round_trips`、`test_invalid_message_has_expected_code`、`test_scenario_stream`、`test_schema_*`、`test_sdk_reproduces_scenario` 全部通过，且读取的是同一批 fixtures 文件（`protocol/fixtures/v1/messages.json` 与 21 个场景）。
+3. **跨语言一致性**：Go 的 `TestMessageFixtures`、`TestScenarioFixtures` 与 Python 的 `test_valid_message_round_trips`、`test_invalid_message_has_expected_code`、`test_scenario_stream`、`test_schema_*`、`test_sdk_reproduces_scenario` 全部通过，且读取的是同一批 fixtures 文件（`protocol/fixtures/v1/messages.json` 与 22 个场景）。
 4. **CI（Linux，判定依据）**：推送分支并开 Draft PR（`Refs #4`），确认 `correctness`、`complexity-report`、`linux-integration`、`python (3.11)`、`python (3.13)` 全部实际执行并通过；`test_process.py` 的五个真实进程测试（保持 stdin 打开时退出、停止读取 stdout 后取消、stdout 被关闭、输入超长、print 改道）在 Linux 上通过。
 5. **范围核对**：`git diff --stat m1-local-provider...HEAD` 只包含本计划 Files 中列出的文件。
 
@@ -5021,6 +6562,18 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - **评审修正（第二轮）**：seq 提交点与取消语义（Task 5，`test_cancel_during_send_breaks_outbox_without_reusing_seq`）；有界关闭（Task 6 `main`，Task 7 三个真实进程场景）；读取阶段限长与有界背压（Task 5，`test_stdio_frame_limit_is_checked_at_read_time`、`test_stdio_reader_applies_backpressure`，Task 7 `test_process_rejects_oversized_input_line`）；checkpoint 快照（Task 6，`test_checkpoint_retries_use_snapshot_of_state`）。
 - **评审修正（第三轮）**：读线程改用线程安全的有界队列，不再从读线程创建协程；`_put` 返回是否交付，事件循环关闭后读线程立即停止读取（`test_stdio_reader_stops_consuming_after_event_loop_closes`，已做变异验证：忽略返回值时读线程在循环关闭后读完全部 100 行，测试失败）；背压测试以同步屏障断言输入读取位置，不再依赖固定 sleep；缓冲上限、快照 JSON 归一化与关闭期限的范围写清；e2e 测试固定子进程 `PYTHONIOENCODING=utf-8`（Windows 默认代码页下断言中文日志会失败）。
 - **测试布局（第四轮，按代码组织设计 §9.3）**：Go 由 4 个测试文件、13 个函数合并为 `protocol_test.go` 的 5 个函数；Go 专用的事件流规则表删除，其中场景未覆盖的三条（seq 重复、seq 不从 1 开始、handshake_error 不在首位）改为协议层场景 fixtures，Python 侧随之获得同样覆盖。Python 由 9 个测试文件、64 个函数合并为 `test_protocol.py`（8）、`test_sdk.py`（22）、`test_process.py`（5）共 35 个函数：已由 SDK 层场景逐条回放的运行时用例（正常路径、握手失败、取消、查询、重发、冲突、产物、暂停、恢复）合并为一个正常路径测试；同类错误码改为参数化；删除测试辅助类与简单取值的用例。三轮评审的回归测试全部保留。各任务完成时的中间状态（Task 1、3、5、6）均单独通过 ruff 与 pytest。
-- **演练**：本计划的全部代码已在临时目录按计划文本组装并运行，组装结果与验证目录逐文件一致：Go vet/test 通过，21 个场景通过；Python ruff、格式、模块依赖契约通过，pytest 在 Windows 3.13 与 3.11 上各 274 项通过（`-W error::RuntimeWarning`，3.11 连续三次）；Linux（WSL 离线，Python 3.14）上 `test_sdk.py` 与 `test_process.py` 共 42 项通过（连续三次），含全部真实进程测试；`test_protocol.py` 依赖已编译的 jsonschema 依赖，离线 WSL 无法安装，由 Windows 与 CI 覆盖。
+- **演练**：本计划的全部代码（含 Task 9）已在临时目录按计划文本组装并运行，组装结果与验证目录逐文件一致：Go vet/test 通过，22 个场景通过；Python ruff、格式、模块依赖契约通过，pytest 在 Windows 3.13 与 3.11 上各 332 项通过（RuntimeWarning 视为错误）；Linux（WSL 离线，Python 3.14）上 98 条消息 fixtures 与 Go 逐条一致，`test_sdk.py` 与 `test_process.py` 共 56 项通过；Task 9 评审另以 138 条探针对比两侧解码结果，0 处不一致。
 - **占位符**：无。
 - **类型一致性**：`run_worker(app, transport, *, name, version, capabilities, timing, new_id)`、`Timing(ack_timeout, max_ack_attempts, retry_backoff, artifact_timeout)`、`TaskContext.checkpoint(step_id, *, state, state_ref, refs)`、`register_artifact(artifact_id, path, *, media_type, visibility)` 在 Task 6、7 的测试与实现中一致；Go 的 `DecodeLine`、`EncodeLine`、`WorkerStream.Observe`、`CodeOf` 在 Task 1、2 中一致。
+
+---
+
+## 验收记录（2026-10-04）——状态：已验收（本地联合验收 + Linux CI 通过；未合并）
+
+- **分支**：`m1-3-protocol-worker`（worktree `F:\go-agentbox-m1-3`），起点 `ac3ac01`，终点 `3912b97`，共 15 个提交，仅本地。
+- **执行**：八个任务按六个批次由子 agent 实现；Task 4 与 Task 5 在独立 worktree 并行后依次合入。每个任务经规格符合性与代码质量评审（高风险任务由 Opus 评审），最后一次整分支评审（Opus）。评审发现的计划本身的问题均先修正计划、在演练目录验证后再改代码：`c78576b`、`db3d39a`、`7c42172`、`5395384`、`51efb2b`、`180cf1a`、`a2a123b`。
+- **本地联合验收**：Go（WSL）gofmt、`go vet ./...` 通过，`internal/protocol` 测试通过，22 个场景通过；Python（Windows）`uv sync --locked`、ruff、格式、import-linter 通过，pytest 在 3.13 与 3.11 上各 299 项通过；Linux（WSL，Python 3.14）SDK 与真实进程测试 56 项连续三次通过；范围核对 53 个文件均在本计划 Files 之内。
+- **CI（Linux，判定依据）**：分支 `m1-3-protocol-worker`（`96e1e8a`）推送后开 Draft PR #9（base `m1-local-provider`，55 个文件，不含 docs）。`correctness`、`complexity-report`、`linux-integration`、`python (3.11)`、`python (3.13)` 全部实际执行并通过：Python 3.11.15 与 3.13.13 各 334 项通过（含 schema 与五个真实进程测试），import-linter 契约保持，`internal/protocol` 测试通过。合并由项目负责人决定。
+- **终审 I1 已关闭（Task 9）**：协议契约收紧为统一规则（规格 §5.10 的 JSON 结构限制、版本前置、键名区分大小写、整数词法与范围），32 条 raw fixtures 固定边界；Task 9 经 Opus 评审两轮（首轮发现正则回溯与孤立代理项重复键两处 Important，均已修正并附回归用例），最终 138 条探针两侧 0 处不一致。提交：`38bc254`、`0753a9f`；计划修正：`90ad395`、`bd3edb2`。
+- **Task 9 遗留 Minor 已修正**：嵌套过深无法序列化的 `data`/`state` 在 `encode_line` 与 `runtime._snapshot` 中映射为 `invalid_field`（原先抛出未捕获的 `RecursionError`），附两条回归用例。
+- **遗留 Minor**（终审分诊为可延后）：见执行进度中的 [T1]–[T8] 条目；其中线程异常捕获面、`send()` 在 `close()` 后等待、Waiters 同键覆盖、`Outbox` 未用 `StreamChecker` 守住终态后的发送等，建议在 Plan 5 接入宿主时一并处理。

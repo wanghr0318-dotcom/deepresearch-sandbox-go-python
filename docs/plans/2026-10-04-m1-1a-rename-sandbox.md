@@ -371,3 +371,14 @@ Expected: 两次运行都已完成且三个 job 均实际执行通过；输出 `
 - **评审修正**：退出码以 `go test` 真实值为主并复用 `citestjson`（Step 3、4、11）；比较 `(Package, Test, 最终 Action)` 与包级结束事件（`summarize.py`，含子测试）；`perl -pi` 匹配 `\r?` 并立即断言（Step 6、7）；gofmt 累计失败并检查 `git show`，以普通用户运行（Step 10）；先发布计划提交、检查相对最新远程 base 的实际差异（Task 2 Step 1–2）；不使用固定用例数（Task 2 Step 4）；只暂存四个目标，预期外差异停止并检查归属。
 - **占位符**：无。
 - **一致性**：Produces 中的导出标识符与现有 `spawn.go`、`init.go` 一致。
+
+---
+
+## 验收记录（2026-10-05）
+
+**状态：已验收**（Draft PR #8，未合并；合并另行决定）。
+
+- **diff 范围**：PR #8 恰为 4 个文件（与 Task 1 Step 9 一致），单个提交 44beee9。
+- **CI**：PR #8 的 push 运行 37197137662 与 pull_request 运行 37197161890 中 correctness、linux-integration、complexity-report 全部通过。
+- **测试集合（Task 2 Step 4）**：取 base 分支 `m1-local-provider` 最近一次 CI（运行 37215913082；自 PR #8 分出后 base 只有文档提交）与 PR #8 最近一次 CI（运行 37197161890）的 `linux-integration-test-json` 产物，按 `summarize.py` 归一化包路径后比较 `(Package, Test, 最终 Action)` 与包级结束事件：两侧各 50 项，`diff` 无差异，输出 `CI-SAME`。
+
