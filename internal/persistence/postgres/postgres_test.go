@@ -21,6 +21,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/datadir"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
 )
 
@@ -1195,5 +1196,191 @@ func TestRequestReplayAndReads(t *testing.T) {
 	}
 	if _, err := s.GetTask(ctx, "missing"); !errors.Is(err, persistence.ErrNotFound) {
 		t.Fatalf("不存在的任务应为 ErrNotFound，得到 %v", err)
+	}
+}
+
+// ---- runner 用例：未知提交、同身份不同内容、Worker 事件批次 ----
+
+func TestCommitLostResolvesRunnerUseCases(t *testing.T) {
+	ctx := context.Background()
+	checkCommitLost(t, []useCase{
+		{"CommitCheckpoint", withFixture, func(s *Store) (any, error) {
+			return s.CommitCheckpoint(ctx, runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "t1"}, CheckpointID: "cp1",
+				AttemptID: "att-t1", StepID: "s1", State: json.RawMessage(`{"n":1}`)})
+		}, "SELECT count(*) FROM checkpoints"},
+		{"RegisterArtifact", withFixture, func(s *Store) (any, error) {
+			return s.RegisterArtifact(ctx, runner.Artifact{TaskID: "t1", AttemptID: "att-t1", ArtifactID: "report",
+				SHA256: strings.Repeat("a", 64), Size: 9, MediaType: "text/markdown", Visibility: "output"})
+		}, "SELECT count(*) FROM artifacts"},
+		{"AppendWorkerEvents", withFixture, func(s *Store) (any, error) {
+			return s.AppendWorkerEvents(ctx, "att-t1", []runner.WorkerEvent{{Seq: 1, Type: "ready", Payload: json.RawMessage(`{}`)}})
+		}, "SELECT count(*) FROM events WHERE source = 'worker'"},
+		{"RecordTerminalProposal", withFixture, func(s *Store) (any, error) {
+			return s.RecordTerminalProposal(ctx, runner.TerminalProposal{AttemptID: "att-t1", Kind: "result", Ref: "seq:9"})
+		}, "SELECT count(*) FROM attempts WHERE terminal_proposal = 'result'"},
+	})
+}
+
+func TestRunnerConflicts(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	cp := runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "t1"}, CheckpointID: "cp1", AttemptID: "att-t1", StepID: "s1", State: json.RawMessage(`{"n":1}`)}
+	if _, err := s.CommitCheckpoint(ctx, cp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordTerminalProposal(ctx, runner.TerminalProposal{AttemptID: "att-t1", Kind: "error", Ref: "seq:3"}); err != nil {
+		t.Fatal(err)
+	}
+	art := runner.Artifact{TaskID: "t1", AttemptID: "att-t1", ArtifactID: "report", SHA256: strings.Repeat("b", 64), Size: 9,
+		MediaType: "text/markdown", Visibility: "output"}
+	if _, err := s.RegisterArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	cp2 := cp
+	cp2.State = json.RawMessage(`{"n":2}`)
+	art2 := art
+	art2.ArtifactID, art2.Size = "other", 10
+	expectConflicts(t, map[string]func() error{
+		"CommitCheckpoint 同 ID 不同 state": func() error { _, err := s.CommitCheckpoint(ctx, cp2); return err },
+		"RecordTerminalProposal 不同内容": func() error {
+			_, err := s.RecordTerminalProposal(ctx, runner.TerminalProposal{AttemptID: "att-t1", Kind: "result", Ref: "seq:3"})
+			return err
+		},
+		"RegisterArtifact 同 sha256 不同大小": func() error { _, err := s.RegisterArtifact(ctx, art2); return err },
+	})
+}
+
+// TestWorkerEventBatches：重放、部分重叠、同序号不同内容、缺口与非连续批次。
+func TestWorkerEventBatches(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	ev := func(seq int64, body string) runner.WorkerEvent {
+		return runner.WorkerEvent{Seq: seq, Type: "progress", Payload: json.RawMessage(`{"m":"` + body + `"}`)}
+	}
+	batch := func(from, to int64, body string) []runner.WorkerEvent {
+		var out []runner.WorkerEvent
+		for i := from; i <= to; i++ {
+			out = append(out, ev(i, fmt.Sprintf("%s%d", body, i)))
+		}
+		return out
+	}
+	steps := []struct {
+		name  string
+		batch []runner.WorkerEvent
+		want  int64
+		err   error
+	}{
+		{"首批 1–3", batch(1, 3, "x"), 3, nil},
+		{"整批重放", batch(1, 3, "x"), 3, nil},
+		{"部分重叠 2–5", batch(2, 5, "x"), 5, nil},
+		{"同序号不同内容", batch(5, 6, "y"), 0, persistence.ErrConflict},
+		{"缺口 8–9", batch(8, 9, "x"), 0, persistence.ErrConflict},
+		{"非连续批次", []runner.WorkerEvent{ev(6, "a"), ev(8, "b")}, 0, errInvalid},
+	}
+	for _, st := range steps {
+		w, err := s.AppendWorkerEvents(ctx, "att-t1", st.batch)
+		if st.err != nil {
+			if !errors.Is(err, st.err) {
+				t.Fatalf("%s：应为 %v，得到 %v", st.name, st.err, err)
+			}
+			continue
+		}
+		if err != nil || w.WorkerSeq != st.want {
+			t.Fatalf("%s：得到 (%d, %v)，期望水位 %d", st.name, w.WorkerSeq, err, st.want)
+		}
+	}
+	if n := count(t, s, "SELECT count(*) FROM events WHERE source = 'worker'"); n != 5 {
+		t.Fatalf("应只有 5 条 Worker 事件，得到 %d", n)
+	}
+	if w, err := s.WorkerEventWatermark(ctx, "att-t1"); err != nil || w.WorkerSeq != 5 {
+		t.Fatalf("水位：%+v %v", w, err)
+	}
+	if n, m := count(t, s, "SELECT count(*) FROM events WHERE task_id = 't1'"),
+		count(t, s, "SELECT max(task_seq)::int FROM events WHERE task_id = 't1'"); n != m {
+		t.Fatalf("task_seq 应从 1 起连续无空洞：%d 条，最大 %d", n, m)
+	}
+}
+
+// TestCheckpointFencingAndRefs 覆盖规格 §5.5 第 2、3 条：新 checkpoint 的 fencing 与引用授权在提交事务内
+// 检查，被拒绝时指针与事件都不改变；旧 attempt 也不能登记产物。
+func TestCheckpointFencingAndRefs(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	fixture(t, s, "t2")
+	own, foreign, missing := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)
+	register := func(taskID, attemptID, sha string) error {
+		_, err := s.RegisterArtifact(ctx, runner.Artifact{TaskID: taskID, AttemptID: attemptID, ArtifactID: "state-" + sha[:1],
+			SHA256: sha, Size: 3, MediaType: "application/json", Visibility: "internal"})
+		return err
+	}
+	if err := register("t2", "att-t2", foreign); err != nil {
+		t.Fatal(err)
+	}
+	retryWithNewAttempt(t, s, "t1")
+	if err := register("t1", "att2-t1", own); err != nil {
+		t.Fatal(err)
+	}
+	cp := func(id, attemptID, stateRef string, refs ...string) runner.Checkpoint {
+		return runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "t1"}, CheckpointID: id, AttemptID: attemptID, StepID: "s1",
+			StateRef: stateRef, Refs: refs}
+	}
+	before := snapshot(t, s, "t1")
+	for name, c := range map[string]struct {
+		cp   runner.Checkpoint
+		code string
+	}{
+		"旧 attempt":   {cp("cp-old", "att-t1", own), persistence.CodeStaleAttempt},
+		"其他任务的 blob":  {cp("cp-foreign", "att2-t1", own, foreign), persistence.CodeRefNotAuthorized},
+		"不存在的 blob":   {cp("cp-missing", "att2-t1", missing), persistence.CodeRefNotAuthorized},
+		"其他任务的 scope": {runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "t2"}, CheckpointID: "cp-x", AttemptID: "att2-t1", StepID: "s1", StateRef: foreign}, persistence.CodeStaleAttempt},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := s.CommitCheckpoint(ctx, c.cp)
+			expectRejected(t, err, c.code)
+		})
+	}
+	expectRejected(t, register("t1", "att-t1", strings.Repeat("d", 64)), persistence.CodeStaleAttempt)
+	if after := snapshot(t, s, "t1"); after != before {
+		t.Fatalf("被拒绝的写入不应改变指针、事件或产物：%s → %s", before, after)
+	}
+	got, err := s.CommitCheckpoint(ctx, cp("cp-ok", "att2-t1", own, own))
+	if err != nil || got.CommitSeq != 1 {
+		t.Fatalf("当前 attempt 引用本任务已授权的 blob 应提交：%+v %v", got, err)
+	}
+}
+
+// TestNoWritesAfterVerdict 覆盖规格 §5.8：判决提交后，同一 attempt 迟到的 checkpoint、产物与终态提议都被拒绝，
+// 任务的指针、事件与产物不变；判决前已完成的写入重放时仍返回原结果。
+func TestNoWritesAfterVerdict(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	art := runner.Artifact{TaskID: "t1", AttemptID: "att-t1", ArtifactID: "report", SHA256: strings.Repeat("a", 64), Size: 9,
+		MediaType: "text/markdown", Visibility: "output"}
+	first, err := s.RegisterArtifact(ctx, art)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.FinalizeAttempt(ctx, verdict("t1", 1)); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshot(t, s, "t1")
+	_, err = s.CommitCheckpoint(ctx, runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "t1"}, CheckpointID: "cp-late",
+		AttemptID: "att-t1", StepID: "s1", State: json.RawMessage(`{"n":1}`)})
+	expectRejected(t, err, persistence.CodeStaleAttempt)
+	late := art
+	late.SHA256 = strings.Repeat("b", 64)
+	_, err = s.RegisterArtifact(ctx, late)
+	expectRejected(t, err, persistence.CodeStaleAttempt)
+	_, err = s.RecordTerminalProposal(ctx, runner.TerminalProposal{AttemptID: "att-t1", Kind: "result", Ref: "seq:9"})
+	expectRejected(t, err, persistence.CodeStaleAttempt)
+	if after := snapshot(t, s, "t1"); after != before {
+		t.Fatalf("判决后迟到的写入不应改变任务：%s → %s", before, after)
+	}
+	if again, err := s.RegisterArtifact(ctx, art); err != nil || again != first {
+		t.Fatalf("判决前已登记的产物重放应返回原结果：%+v %v", again, err)
 	}
 }
