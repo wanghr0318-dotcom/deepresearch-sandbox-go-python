@@ -47,8 +47,10 @@ jobs:
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - name: vet
         run: go vet ./...
-      - name: unit tests（非 root；需要 root 的用例按设计跳过）
-        run: go test -count=1 ./...
+      # -race 覆盖 actor、runner、coordinator 的并发（Plan 5/6 联合验收）；本地 WSL 无 gcc，只在 CI 运行。
+      # tests/e2e 需要 python3（runner 镜像自带）与上面的 PostgreSQL。
+      - name: unit tests（非 root，-race；需要 root 的用例按设计跳过）
+        run: go test -race -count=1 -timeout 20m ./...
       - name: golangci-lint（正确性）
         uses: golangci/golangci-lint-action@v6
         with:
