@@ -74,7 +74,7 @@ type RecoveryPlan struct { Steps []Step }
 func Plan(f recovery.Facts, scan provider.ScanReport, installID string) RecoveryPlan // 纯函数；步骤 ID 稳定（由对象 ID 与种类派生）
 ```
 
-**规则：** §14.2 每一行一类步骤（cancel 已接受 → 停止 → cancelled 不重试；pause → 停止并清理 → paused 保留恢复点；run 无未完成 attempt → 保持排队；run 有丢失 attempt → 确认停止后按故障恢复排队；已完成分类并安排重试 → 不再计数；裁决已提交 → 只处理残留）；§14.1 扫描表（属于本安装无记录 → 回收孤立资源；归属不明或冲突 → 隔离、报警、不销毁、计入占用）；未结束的 intent 按 §8.3 规则处理；计划不含进程句柄。
+**规则：** §14.2 每一行一类步骤（cancel 已接受 → 停止 → cancelled 不重试；pause → 停止并清理 → paused 保留恢复点；run 无未完成 attempt → 保持排队；run 有丢失 attempt → 确认停止后按故障恢复排队；已完成分类并安排重试 → 不再计数；裁决已提交 → 只处理残留）；§14.1 扫描表（属于本安装无记录 → 回收孤立资源；归属不明或冲突 → 隔离、报警、不销毁、计入占用）；未结束的 intent 按 §8.3 规则处理；计划不含进程句柄。清理已完成但 UID 范围仍为 assigned 的环境生成归还步骤（执行中修订：coordinator 归还失败后的重试只在内存中，重启由恢复补齐）。
 
 **Tests：** 表驱动覆盖 §14.2 每行与扫描表每行；同一事实两次生成的计划相同（稳定 ID）；无效组合（例如裁决已提交但当前 attempt 未结束）生成隔离与报警而不是猜测。
 
