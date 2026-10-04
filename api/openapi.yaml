@@ -1,0 +1,419 @@
+openapi: 3.0.3
+info:
+  title: agentbox API
+  version: 0.2.0-m1
+  description: |
+    The single contract for the agentbox HTTP API (design spec §15). M1 scope: tasks and status.
+    Sessions endpoints belong to M4 and are not part of this version.
+
+    Access (§15.3): the server binds 127.0.0.1 by default. Any other address requires the static
+    Bearer token from `<data>/api.token` (0600) on every request. The `Host` header and, when present,
+    the `Origin` header must match explicit allowlists; there is no wildcard CORS. The token never
+    appears in URLs or logs.
+
+    Modes (`GET /status`): `normal` serves everything; `diagnostic` serves only `/status` and
+    `/tasks/{id}/inspect` (other operations return 503 `diagnostic_mode`); `ownership_lost` refuses
+    write operations with 503 `ownership_lost`.
+
+    Idempotency: every write carries `request_id`. `body_hash` is the SHA-256 of the canonical JSON
+    request body (sorted keys, no whitespace; control requests also include the task id and the
+    action). The same `request_id` with the same content returns the first result; different content
+    returns 409 `request_conflict`.
+servers:
+  - url: http://127.0.0.1:8080
+security:
+  - bearerAuth: []
+paths:
+  /status:
+    get:
+      operationId: getStatus
+      summary: Health and service mode
+      responses:
+        '200':
+          description: Current mode
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Status'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+  /tasks:
+    get:
+      operationId: listTasks
+      summary: List tasks, newest first (keyset pagination)
+      parameters:
+        - name: after
+          in: query
+          description: The `next` cursor of the previous page; omit for the first page.
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: One page of tasks
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TaskList'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: createTask
+      summary: Create a task (idempotent by request_id)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateTaskRequest'}
+      responses:
+        '201':
+          description: Task created, or the first result of the same request replayed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CreateTaskResult'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+    get:
+      operationId: getTask
+      summary: Current view of a task
+      responses:
+        '200':
+          description: The task
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Task'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/cancel:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+    post:
+      operationId: cancelTask
+      summary: Request cancellation (idempotent by request_id)
+      requestBody: {$ref: '#/components/requestBodies/Control'}
+      responses:
+        '200': {$ref: '#/components/responses/ControlAccepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/ControlRejected'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/pause:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+    post:
+      operationId: pauseTask
+      summary: Request a pause (idempotent by request_id)
+      requestBody: {$ref: '#/components/requestBodies/Control'}
+      responses:
+        '200': {$ref: '#/components/responses/ControlAccepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/ControlRejected'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/resume:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+    post:
+      operationId: resumeTask
+      summary: Resume a paused task (idempotent by request_id)
+      requestBody: {$ref: '#/components/requestBodies/Control'}
+      responses:
+        '200': {$ref: '#/components/responses/ControlAccepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/ControlRejected'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/events:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+    get:
+      operationId: streamTaskEvents
+      summary: Server-sent event stream of a task (§15.2)
+      description: |
+        Each event has `id` = task_seq, `event` = the event type and `data` = an Event JSON object.
+        Resume with `Last-Event-ID`; all events are kept in v0.2, so cursors never expire. A heartbeat
+        comment line (`: heartbeat`) is sent every 15 s and takes no sequence number. The server closes
+        the stream after `task_terminal`; clients stop reconnecting once they receive it.
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          description: Resume after this task_seq. Must be a non-negative integer not beyond the latest event.
+          schema: {type: integer, format: int64, minimum: 0}
+      responses:
+        '200':
+          description: Event stream
+          content:
+            text/event-stream:
+              schema: {type: string}
+        '400':
+          description: Malformed request or `invalid_cursor` (malformed, or beyond the latest event)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/result:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+    get:
+      operationId: getTaskResult
+      summary: Download the pinned result of a task
+      description: Not implemented in this build (501); the pinned-output query arrives with the runner integration.
+      responses:
+        '200': {$ref: '#/components/responses/Blob'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '501': {$ref: '#/components/responses/NotImplemented'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/artifacts/{artifact_id}/versions/{v}:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+      - name: artifact_id
+        in: path
+        required: true
+        schema: {type: string}
+      - name: v
+        in: path
+        required: true
+        schema: {type: integer, minimum: 1}
+    get:
+      operationId: getArtifactVersion
+      summary: Download one pinned artifact version
+      description: Not implemented in this build (501); the pinned-output query arrives with the runner integration.
+      responses:
+        '200': {$ref: '#/components/responses/Blob'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '501': {$ref: '#/components/responses/NotImplemented'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/inspect:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+    get:
+      operationId: inspectTask
+      summary: Diagnostic timeline (§14.6); also served in diagnostic mode
+      responses:
+        '200':
+          description: Attempts with outcome, exit and OOM diagnosis, environment and cleanup state, checkpoints
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Inspection'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Required when the server binds a non-loopback address. Never put the token in a URL.
+  parameters:
+    TaskID:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+  requestBodies:
+    Control:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ControlRequest'}
+  responses:
+    ControlAccepted:
+      description: Control intent accepted, or the first result of the same request replayed
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ControlResult'}
+    Blob:
+      description: The pinned content
+      headers:
+        ETag:
+          description: The quoted SHA-256 of the content
+          schema: {type: string}
+      content:
+        application/octet-stream:
+          schema: {type: string, format: binary}
+    BadRequest:
+      description: '`invalid_request`: malformed body, missing request_id or invalid parameter'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unauthorized:
+      description: '`unauthorized`: missing or wrong Bearer token'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Forbidden:
+      description: '`forbidden_host` or `forbidden_origin`: Host or Origin is not in the allowlist'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    NotFound:
+      description: '`task_not_found`'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Conflict:
+      description: '`request_conflict`: request_id already used with different content'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    ControlRejected:
+      description: |
+        `request_conflict`; or the control is rejected by the latest task facts:
+        `task_ended` (task is terminal), `cancel_pending` (an accepted cancel cannot be overridden),
+        `not_paused` (resume requires a paused task)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Internal:
+      description: '`internal`'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    NotImplemented:
+      description: '`not_implemented`'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unavailable:
+      description: |
+        `diagnostic_mode`, `ownership_lost`, `store_unavailable`, `contention`, or `commit_unknown`
+        (retry with the same request_id)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: {type: string}
+        message: {type: string}
+    Status:
+      type: object
+      required: [mode]
+      properties:
+        mode: {type: string, enum: [normal, diagnostic, ownership_lost]}
+    CreateTaskRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id, spec]
+      properties:
+        request_id: {type: string, minLength: 1, maxLength: 128}
+        spec: {type: object, description: Task specification passed to the worker}
+        limits: {type: object, description: Resource limits for the task}
+    CreateTaskResult:
+      type: object
+      required: [task_id]
+      properties:
+        task_id: {type: string}
+    ControlRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id]
+      properties:
+        request_id: {type: string, minLength: 1, maxLength: 128}
+        reason: {type: string}
+    ControlResult:
+      type: object
+      required: [task_id, control_version]
+      properties:
+        task_id: {type: string}
+        control_version: {type: integer, format: int64}
+    Task:
+      type: object
+      required: [task_id, status, desired, control_version, applied_control_version, attempts_total]
+      properties:
+        task_id: {type: string}
+        status: {type: string}
+        status_reason: {type: string}
+        current_attempt_id: {type: string}
+        desired: {type: string, enum: [run, pause, cancel]}
+        control_version: {type: integer, format: int64}
+        applied_control_version: {type: integer, format: int64}
+        attempts_total: {type: integer, format: int64}
+    TaskList:
+      type: object
+      required: [tasks]
+      properties:
+        tasks:
+          type: array
+          items: {$ref: '#/components/schemas/Task'}
+        next: {type: string, description: Cursor for the next page; absent on the last page}
+    Event:
+      type: object
+      required: [task_seq, source, type, ts]
+      properties:
+        task_seq: {type: integer, format: int64}
+        attempt_id: {type: string}
+        source: {type: string}
+        type: {type: string}
+        worker_seq: {type: integer, format: int64}
+        payload: {type: object}
+        ts: {type: string, format: date-time}
+    Attempt:
+      type: object
+      properties:
+        attempt_id: {type: string}
+        attempt_no: {type: integer, format: int64}
+        status: {type: string}
+        outcome_class: {type: string}
+        exit_code: {type: integer, format: int64}
+        exit_signal: {type: integer, format: int64}
+        oom_kill_delta: {type: integer, format: int64}
+        platform_killed: {type: boolean}
+        env_id: {type: string}
+        env_status: {type: string}
+        cleanup_state: {type: string}
+        stopped_at: {type: string, format: date-time}
+        cleanup_tries: {type: integer, format: int64}
+        cleanup_error: {type: string}
+    Checkpoint:
+      type: object
+      properties:
+        checkpoint_id: {type: string}
+        step_id: {type: string}
+        attempt_id: {type: string}
+        commit_seq: {type: integer, format: int64}
+        committed_at: {type: string, format: date-time}
+    Inspection:
+      type: object
+      required: [task, attempts, checkpoints]
+      properties:
+        task: {$ref: '#/components/schemas/Task'}
+        attempts:
+          type: array
+          items: {$ref: '#/components/schemas/Attempt'}
+        checkpoints:
+          type: array
+          items: {$ref: '#/components/schemas/Checkpoint'}
