@@ -6488,17 +6488,18 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - **评审修正（第二轮）**：seq 提交点与取消语义（Task 5，`test_cancel_during_send_breaks_outbox_without_reusing_seq`）；有界关闭（Task 6 `main`，Task 7 三个真实进程场景）；读取阶段限长与有界背压（Task 5，`test_stdio_frame_limit_is_checked_at_read_time`、`test_stdio_reader_applies_backpressure`，Task 7 `test_process_rejects_oversized_input_line`）；checkpoint 快照（Task 6，`test_checkpoint_retries_use_snapshot_of_state`）。
 - **评审修正（第三轮）**：读线程改用线程安全的有界队列，不再从读线程创建协程；`_put` 返回是否交付，事件循环关闭后读线程立即停止读取（`test_stdio_reader_stops_consuming_after_event_loop_closes`，已做变异验证：忽略返回值时读线程在循环关闭后读完全部 100 行，测试失败）；背压测试以同步屏障断言输入读取位置，不再依赖固定 sleep；缓冲上限、快照 JSON 归一化与关闭期限的范围写清；e2e 测试固定子进程 `PYTHONIOENCODING=utf-8`（Windows 默认代码页下断言中文日志会失败）。
 - **测试布局（第四轮，按代码组织设计 §9.3）**：Go 由 4 个测试文件、13 个函数合并为 `protocol_test.go` 的 5 个函数；Go 专用的事件流规则表删除，其中场景未覆盖的三条（seq 重复、seq 不从 1 开始、handshake_error 不在首位）改为协议层场景 fixtures，Python 侧随之获得同样覆盖。Python 由 9 个测试文件、64 个函数合并为 `test_protocol.py`（8）、`test_sdk.py`（22）、`test_process.py`（5）共 35 个函数：已由 SDK 层场景逐条回放的运行时用例（正常路径、握手失败、取消、查询、重发、冲突、产物、暂停、恢复）合并为一个正常路径测试；同类错误码改为参数化；删除测试辅助类与简单取值的用例。三轮评审的回归测试全部保留。各任务完成时的中间状态（Task 1、3、5、6）均单独通过 ruff 与 pytest。
-- **演练**：本计划的全部代码已在临时目录按计划文本组装并运行，组装结果与验证目录逐文件一致：Go vet/test 通过，22 个场景通过；Python ruff、格式、模块依赖契约通过，pytest 在 Windows 3.13 与 3.11 上各 299 项通过（RuntimeWarning 视为错误）；Linux（WSL 离线，Python 3.14）上 `test_sdk.py` 与 `test_process.py` 共 56 项通过（连续三次），含全部真实进程测试；`test_protocol.py` 依赖已编译的 jsonschema 依赖，离线 WSL 无法安装，由 Windows 与 CI 覆盖。
+- **演练**：本计划的全部代码（含 Task 9）已在临时目录按计划文本组装并运行，组装结果与验证目录逐文件一致：Go vet/test 通过，22 个场景通过；Python ruff、格式、模块依赖契约通过，pytest 在 Windows 3.13 与 3.11 上各 332 项通过（RuntimeWarning 视为错误）；Linux（WSL 离线，Python 3.14）上 98 条消息 fixtures 与 Go 逐条一致，`test_sdk.py` 与 `test_process.py` 共 56 项通过；Task 9 评审另以 138 条探针对比两侧解码结果，0 处不一致。
 - **占位符**：无。
 - **类型一致性**：`run_worker(app, transport, *, name, version, capabilities, timing, new_id)`、`Timing(ack_timeout, max_ack_attempts, retry_backoff, artifact_timeout)`、`TaskContext.checkpoint(step_id, *, state, state_ref, refs)`、`register_artifact(artifact_id, path, *, media_type, visibility)` 在 Task 6、7 的测试与实现中一致；Go 的 `DecodeLine`、`EncodeLine`、`WorkerStream.Observe`、`CodeOf` 在 Task 1、2 中一致。
 
 ---
 
-## 验收记录（2026-10-04）——状态：本地实现完成；跨语言契约差异与 Linux CI 验收待关闭，计划尚未验收
+## 验收记录（2026-10-04）——状态：本地实现完成，跨语言契约差异已由 Task 9 关闭；Linux CI 验收待关闭，计划尚未验收
 
 - **分支**：`m1-3-protocol-worker`（worktree `F:\go-agentbox-m1-3`），起点 `ac3ac01`，终点 `3912b97`，共 15 个提交，仅本地。
 - **执行**：八个任务按六个批次由子 agent 实现；Task 4 与 Task 5 在独立 worktree 并行后依次合入。每个任务经规格符合性与代码质量评审（高风险任务由 Opus 评审），最后一次整分支评审（Opus）。评审发现的计划本身的问题均先修正计划、在演练目录验证后再改代码：`c78576b`、`db3d39a`、`7c42172`、`5395384`、`51efb2b`、`180cf1a`、`a2a123b`。
 - **本地联合验收**：Go（WSL）gofmt、`go vet ./...` 通过，`internal/protocol` 测试通过，22 个场景通过；Python（Windows）`uv sync --locked`、ruff、格式、import-linter 通过，pytest 在 3.13 与 3.11 上各 299 项通过；Linux（WSL，Python 3.14）SDK 与真实进程测试 56 项连续三次通过；范围核对 53 个文件均在本计划 Files 之内。
 - **未完成的验收项**：第 4 项 CI（Linux 3.11/3.13 与 golangci-lint）需要推送后才能执行。
-- **未关闭的 Important（终审 I1）**：两侧在嵌套深度、键名大小写、重复键、超长数值上的行为不一致。README 中的"已知差异"只是如实记录，不算关闭；项目负责人已决定收紧为统一的协议规则（规格 §5.10），关闭后才能验收本计划。
+- **终审 I1 已关闭（Task 9）**：协议契约收紧为统一规则（规格 §5.10 的 JSON 结构限制、版本前置、键名区分大小写、整数词法与范围），32 条 raw fixtures 固定边界；Task 9 经 Opus 评审两轮（首轮发现正则回溯与孤立代理项重复键两处 Important，均已修正并附回归用例），最终 138 条探针两侧 0 处不一致。提交：`38bc254`、`0753a9f`；计划修正：`90ad395`、`bd3edb2`。
+- **Task 9 遗留 Minor**：嵌套约 1000 层以上的 `data`/`state` 在 `encode_line` 与 `runtime._snapshot` 中抛出未捕获的 `RecursionError`，应与其他编码违规一样为 `invalid_field`（两处 `except` 加 `RecursionError`）；评审判定可后续处理。
 - **遗留 Minor**（终审分诊为可延后）：见执行进度中的 [T1]–[T8] 条目；其中线程异常捕获面、`send()` 在 `close()` 后等待、Waiters 同键覆盖、`Outbox` 未用 `StreamChecker` 守住终态后的发送等，建议在 Plan 5 接入宿主时一并处理。
