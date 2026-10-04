@@ -468,7 +468,7 @@ func (f *fixture) createStopped(t *testing.T, envID string, ended bool) {
 	if _, err := f.c.CreateEnv(ctx, req(envID)); err != nil {
 		t.Fatal(err)
 	}
-	if res, err := f.c.StopEnv(ctx, envID); err != nil || !res.Stopped {
+	if res, err := f.c.StopEnv(ctx, envID); err != nil || !res.Stopped || !res.Recorded {
 		t.Fatalf("StopEnv = %+v, %v", res, err)
 	}
 	f.rec.mu.Lock()
@@ -518,8 +518,24 @@ func TestCreateEnvForeignQuarantines(t *testing.T) {
 		t.Fatalf("err = %v, want ErrForeign", err)
 	}
 	assertLog(t, f.rec, "RecordIntent", "AssignUIDRange", "Create:ErrForeign", "RecordQuarantine")
-	if q, ok := f.store.quarantine["envs/e1"]; !ok || q.Layer != "env_dir" {
-		t.Fatalf("quarantine = %+v", f.store.quarantine)
+	// 隔离记录与 provider 扫描报告的资源逐项一致（Layer、Path 原样），coordinator 不构造路径。
+	rep, err := f.prov.Scan(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var scanned []Quarantine
+	for _, it := range rep.Items {
+		if it.EnvID == "e1" {
+			scanned = append(scanned, Quarantine{Layer: it.Layer, Path: it.Path})
+		}
+	}
+	if len(scanned) == 0 || len(scanned) != len(f.store.quarantine) {
+		t.Fatalf("扫描 %+v，隔离 %+v", scanned, f.store.quarantine)
+	}
+	for _, s := range scanned {
+		if q, ok := f.store.quarantine[s.Path]; !ok || q.Layer != s.Layer || q.Path != s.Path {
+			t.Fatalf("扫描项 %+v 的隔离记录 = %+v", s, q)
+		}
 	}
 	if s := f.store.intentState("e1"); s != IntentPending {
 		t.Fatalf("intent = %s, want pending", s)
@@ -587,7 +603,7 @@ func TestStopEnvUnconfirmedBlocks(t *testing.T) {
 	}
 	f.prov.FailStop("e1", provider.ErrStopUnconfirmed)
 	res, err := f.c.StopEnv(context.Background(), "e1")
-	if err != nil || !res.Blocked || res.Stopped {
+	if err != nil || !res.Blocked || res.Stopped || res.Recorded {
 		t.Fatalf("StopEnv = %+v, %v", res, err)
 	}
 	if f.rec.count("MarkStopped") != 0 || f.store.env("e1").StoppedAt != nil {
@@ -611,11 +627,11 @@ func TestStopEnvStoreFailureCompensates(t *testing.T) {
 	// 暂时性失败：同一次调用内重试成功。
 	f.store.failNext("MarkStopped", 2)
 	res, err := f.c.StopEnv(ctx, "e1")
-	if err != nil || !res.Stopped || f.store.env("e1").StoppedAt == nil {
+	if err != nil || !res.Stopped || !res.Recorded || f.store.env("e1").StoppedAt == nil {
 		t.Fatalf("StopEnv = %+v, %v", res, err)
 	}
 
-	// 持续失败直到 ctx 结束：报告已停止但未提交；恢复后补提交原时间。
+	// 持续失败直到 ctx 结束：停止本身已确认，不是错误；报告 Recorded=false；恢复后补提交原时间。
 	f.store.failNext("MarkStopped", 1000)
 	cctx, cancel := context.WithCancel(ctx)
 	fails := 0
@@ -625,7 +641,7 @@ func TestStopEnvStoreFailureCompensates(t *testing.T) {
 		}
 	}
 	res, err = f.c.StopEnv(cctx, "e2")
-	if err == nil || !res.Stopped || f.store.env("e2").StoppedAt != nil {
+	if err != nil || !res.Stopped || res.Recorded || f.store.env("e2").StoppedAt != nil {
 		t.Fatalf("StopEnv = %+v, %v；want 已停止且未提交", res, err)
 	}
 	at := res.At
@@ -635,7 +651,7 @@ func TestStopEnvStoreFailureCompensates(t *testing.T) {
 	f.store.failNext("MarkStopped", 0)
 	f.clock.advance(time.Minute)
 	res, err = f.c.StopEnv(ctx, "e2")
-	if err != nil || !res.Stopped || !res.At.Equal(at) {
+	if err != nil || !res.Stopped || !res.Recorded || !res.At.Equal(at) {
 		t.Fatalf("补提交 StopEnv = %+v, %v；want At = %v", res, err, at)
 	}
 	if got := f.store.env("e2").StoppedAt; got == nil || !got.Equal(at) {

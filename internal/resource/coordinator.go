@@ -36,16 +36,19 @@ type EnvRequest struct {
 
 // StopResult 是 StopEnv 报告的事实。
 //
-//   - Stopped：provider.Stop 已确认执行树不存在；At 是持久化的 stopped_at。
+//   - Stopped：provider.Stop 已确认执行树不存在；At 是停止时间（已记录时为持久化的 stopped_at）。
+//   - Recorded：stopped_at 已持久化。Stopped 为真而 Recorded 为假表示停止已确认但 Store 写入
+//     失败（规格 §14.5）：事实保留在 coordinator 中，再次调用 StopEnv 以原时间补提交，不再调用
+//     provider。**调用方只在 Recorded 为真时归还 admission 容量**。
 //   - Blocked：期限内未确认停止（ErrStopUnconfirmed，即 stop_blocked）；不写 stopped_at，
 //     调用方继续占用容量并阻止替代执行（规格 §8.2）。
 //
-// Stopped 为真而 error 非空表示停止已确认但 stopped_at 尚未提交（Store 故障，规格 §14.5）：
-// 事实保留在 coordinator 中，再次调用 StopEnv 以原时间补提交，不再调用 provider。
+// StopEnv 只在停止本身不确定时返回错误（provider 错误，或确认前 ctx 结束）。
 type StopResult struct {
-	Stopped bool
-	At      time.Time
-	Blocked bool
+	Stopped  bool
+	Recorded bool
+	At       time.Time
+	Blocked  bool
 }
 
 // Options 配置 coordinator。零值字段取规格 §19 的默认值。
@@ -252,8 +255,7 @@ func (c *Coordinator) create(ctx context.Context, r EnvRequest) (provider.EnvInf
 		return info, nil
 	case errors.Is(err, provider.ErrForeign):
 		// 不自动销毁；记录隔离并计入占用（规格 §14.1 扫描表）。intent 保留 pending。
-		q := Quarantine{Layer: "env_dir", Path: "envs/" + r.EnvID, Reason: "create: 同名环境不属于本安装或归属无法判定"}
-		if qerr := c.persist(ctx, func(ctx context.Context) error { return c.store.RecordQuarantine(ctx, q) }); qerr != nil {
+		if qerr := c.quarantine(ctx, r.EnvID, "create: 同名环境不属于本安装或归属无法判定"); qerr != nil {
 			return provider.EnvInfo{}, errors.Join(err, fmt.Errorf("记录隔离: %w", qerr))
 		}
 		return provider.EnvInfo{}, err
@@ -262,6 +264,30 @@ func (c *Coordinator) create(ctx context.Context, r EnvRequest) (provider.EnvInf
 	}
 	c.failIntentIfNoResidue(ctx, r.EnvID)
 	return provider.EnvInfo{}, err
+}
+
+// quarantine 以独立原始扫描报告的资源记录隔离：每个 EnvID 匹配的扫描项按其 Layer 与 Path
+// 原样记录，coordinator 不构造路径（资源归属以 provider 的报告为准）。
+func (c *Coordinator) quarantine(ctx context.Context, envID, reason string) error {
+	rep, err := c.p.Scan(ctx)
+	if err != nil {
+		return fmt.Errorf("扫描: %w", err)
+	}
+	found := false
+	for _, it := range rep.Items {
+		if it.EnvID != envID {
+			continue
+		}
+		found = true
+		q := Quarantine{Layer: it.Layer, Path: it.Path, Reason: reason}
+		if err := c.persist(ctx, func(ctx context.Context) error { return c.store.RecordQuarantine(ctx, q) }); err != nil {
+			return err
+		}
+	}
+	if !found {
+		return fmt.Errorf("扫描未报告环境 %s 的任何资源", envID)
+	}
+	return nil
 }
 
 // failIntentIfNoResidue 只在独立原始扫描确认 envID 没有任何一层残留时把 intent 置为 failed
@@ -302,7 +328,8 @@ func (c *Coordinator) seed(ctx context.Context) error {
 
 // StopEnv 停止环境并报告事实：provider.Stop 成功 → MarkStopped → Stopped；ErrStopUnconfirmed →
 // Blocked，不写 stopped_at。停止不等待 Store：先完成物理停止，再以退避重试提交 stopped_at，
-// 直到成功或 ctx 结束；未提交的"已停止"事实保留在 coordinator 中，下次调用补提交（规格 §14.5）。
+// 直到成功（Recorded）或 ctx 结束；未提交的"已停止"事实以 Recorded=false 报告（不是错误），
+// 保留在 coordinator 中，下次调用以原时间补提交（规格 §14.5）。
 func (c *Coordinator) StopEnv(ctx context.Context, envID string) (StopResult, error) {
 	unlock, err := c.lock(ctx, envID)
 	if err != nil {
@@ -333,7 +360,8 @@ func (c *Coordinator) StopEnv(ctx context.Context, envID string) (StopResult, er
 		return err
 	})
 	if err != nil {
-		return StopResult{Stopped: true, At: at}, fmt.Errorf("resource: 记录环境 %s 的 stopped_at: %w", envID, err)
+		// 停止已确认，只是事实尚未持久化：不是错误，以 Recorded=false 报告，事实保留待补提交。
+		return StopResult{Stopped: true, At: at}, nil
 	}
 	c.mu.Lock()
 	delete(c.pendingStop, envID)
@@ -341,7 +369,7 @@ func (c *Coordinator) StopEnv(ctx context.Context, envID string) (StopResult, er
 	if env.StoppedAt != nil {
 		at = *env.StoppedAt // 已记录时保持原值，重试不倒退
 	}
-	return StopResult{Stopped: true, At: at}, nil
+	return StopResult{Stopped: true, Recorded: true, At: at}, nil
 }
 
 func (c *Coordinator) stopPending(envID string) bool {
