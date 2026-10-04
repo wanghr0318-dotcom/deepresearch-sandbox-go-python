@@ -1,6 +1,7 @@
 """协议层：跨语言 fixtures 回放与按常量生成的大小上限（规格 §5.10、§5.11）。"""
 
 import json
+import time
 
 import pytest
 from protocol_fixtures import line_bytes, load_messages, load_scenarios
@@ -59,6 +60,10 @@ def test_scenario_stream(scenario):
 
 
 REF = "a" * 64
+
+NESTED_70: object = 0
+for _ in range(70):
+    NESTED_70 = [NESTED_70]
 
 
 def checkpoint_line(state_json: str, refs: list[str]) -> bytes:
@@ -174,12 +179,34 @@ def test_decode_limits(direction, line, code):
             "invalid_field",
             id="lone_surrogate",
         ),
+        pytest.param(
+            WORKER,
+            {"type": "progress", "v": 1, "seq": 1, "kind": "x", "message": "y", "data": 10**40},
+            "invalid_field",
+            id="number_literal_too_long",
+        ),
+        pytest.param(
+            WORKER,
+            {"type": "progress", "v": 1, "seq": 1, "kind": "x", "message": "y", "data": NESTED_70},
+            "invalid_field",
+            id="nesting_too_deep",
+        ),
     ],
 )
 def test_encode_rejects(direction, message, code):
     with pytest.raises(ProtocolError) as exc:
         encode_line(direction, message)
     assert exc.value.code == code
+
+
+def test_unterminated_string_is_rejected_in_linear_time():
+    """深度预扫描的正则不得回溯爆炸：被截断的行（例如宿主写到一半退出）应立即被拒绝。"""
+    line = b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"' + b"a b" * 10
+    started = time.monotonic()
+    with pytest.raises(ProtocolError) as exc:
+        decode_line(WORKER, line)
+    assert exc.value.code == "malformed_json"
+    assert time.monotonic() - started < 1.0
 
 
 # ---- JSON Schema：与 fixtures 一致 ----

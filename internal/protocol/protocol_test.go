@@ -154,6 +154,7 @@ func TestEncodeLine(t *testing.T) {
 		{"Worker 事件按宿主方向编码", HostToWorker, &Paused{EventHeader: EventHeader{Type: TypePaused, V: Version, Seq: 1}, CheckpointID: "cp-1"}, CodeUnknownType},
 		{"type 字段与消息类型不一致", WorkerToHost, &Paused{EventHeader: EventHeader{Type: TypeResult, V: Version, Seq: 1}, CheckpointID: "cp-1"}, CodeInvalidField},
 		{"缺少 state 与 state_ref", WorkerToHost, &Checkpoint{EventHeader: EventHeader{Type: TypeCheckpoint, V: Version, Seq: 1}, CheckpointID: "cp-1", Scope: ScopeTask, StepID: "s1"}, CodeInvalidField},
+		{"编码结果违反 JSON 结构限制", WorkerToHost, &Progress{EventHeader: EventHeader{Type: TypeProgress, V: Version, Seq: 1}, Kind: "x", Message: "y", Data: json.RawMessage(`1e999`)}, CodeInvalidField},
 	}
 	for _, c := range rejects {
 		t.Run(c.name, func(t *testing.T) {

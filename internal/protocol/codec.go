@@ -108,6 +108,9 @@ func EncodeLine(dir Direction, m Message) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := checkSyntax(b); err != nil { // 编码结果必须能通过对端的 JSON 结构限制
+		return nil, newError(CodeInvalidField, "消息违反 JSON 结构限制：%v", err)
+	}
 	if err := checkSize(dir, m.MessageType(), len(b)); err != nil {
 		return nil, err
 	}

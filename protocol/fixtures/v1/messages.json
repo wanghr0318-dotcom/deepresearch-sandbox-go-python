@@ -28,7 +28,8 @@
     {"name": "progress_depth_64", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}"},
     {"name": "progress_number_literal_32_chars", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":-1.111111111111111111111111e-100}"},
     {"name": "progress_subnormal_number", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":5e-324}"},
-    {"name": "progress_big_integer_in_free_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":12345678901234567890123}"}
+    {"name": "progress_big_integer_in_free_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":12345678901234567890123}"},
+    {"name": "progress_seq_int64_max", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":9223372036854775807,\"kind\":\"x\",\"message\":\"y\"}"}
   ],
   "invalid": [
     {"name": "malformed_json_truncated", "direction": "worker", "raw": "{\"type\":\"ready\"", "code": "malformed_json"},
@@ -88,6 +89,16 @@
     {"name": "progress_seq_exponent_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1e0,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
     {"name": "progress_v_float_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1.0,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "version_mismatch"},
     {"name": "progress_version_checked_before_field_types", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":2,\"seq\":\"x\",\"kind\":\"x\",\"message\":\"y\"}", "code": "version_mismatch"},
-    {"name": "progress_type_case_variant", "direction": "worker", "raw": "{\"TYPE\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "unknown_type"}
+    {"name": "progress_type_case_variant", "direction": "worker", "raw": "{\"TYPE\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "unknown_type"},
+    {"name": "progress_duplicate_key_lone_surrogates", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":{\"\\ud800\":1,\"\\udc00\":2}}", "code": "malformed_json"},
+    {"name": "progress_duplicate_key_lone_surrogate_vs_fffd", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":{\"\\ud800\":1,\"\\ufffd\":2}}", "code": "malformed_json"},
+    {"name": "progress_float_underflow_min_boundary", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":2e-324}", "code": "malformed_json"},
+    {"name": "progress_seq_bool", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":true,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
+    {"name": "progress_seq_int64_overflow", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":9223372036854775808,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
+    {"name": "progress_v_missing", "direction": "worker", "raw": "{\"type\":\"progress\",\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "version_mismatch"},
+    {"name": "progress_v_bool", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":true,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "version_mismatch"},
+    {"name": "init_case_variant_key", "direction": "host", "raw": "{\"type\":\"init\",\"bootstrap\":1,\"protocol_versions\":[1],\"Mode\":\"task\",\"task_id\":\"t-1\",\"attempt_id\":\"a-1\",\"attempt_no\":1,\"out_dir\":\"/workspace/out/a-1\"}", "code": "invalid_field"},
+    {"name": "init_resume_case_variant_key", "direction": "host", "raw": "{\"type\":\"init\",\"bootstrap\":1,\"protocol_versions\":[1],\"mode\":\"task\",\"task_id\":\"t-1\",\"attempt_id\":\"a-1\",\"attempt_no\":1,\"out_dir\":\"/workspace/out/a-1\",\"resume\":{\"checkpoint_id\":\"cp-1\",\"Step_Id\":\"s1\",\"state\":{}}}", "code": "invalid_field"},
+    {"name": "handshake_error_case_variant_key", "direction": "worker", "raw": "{\"type\":\"handshake_error\",\"bootstrap\":1,\"Code\":\"no_common_version\"}", "code": "invalid_field"}
   ]
 }

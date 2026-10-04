@@ -388,7 +388,8 @@ def _reject_constant(name: str) -> Any:
     raise ValueError(f"不允许的 JSON 常量 {name}")
 
 
-_JSON_STRING = re.compile(r'"(?:[^"\\]+|\\.)*"')
+# 展开写法加占有量词（Python ≥ 3.11）：对未闭合的字符串也是线性时间，不会回溯爆炸
+_JSON_STRING = re.compile(r'"[^"\\]*+(?:\\.[^"\\]*+)*+"')
 _BRACKET = re.compile(r"[\[\]{}]")
 
 
@@ -404,12 +405,21 @@ def _check_depth(text: str) -> None:
             depth -= 1
 
 
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
 def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """按解码后的键名比较：seq 与其转义写法 \\u0073eq 是同一个键。"""
+    """按解码后的键名比较：seq 与其转义写法 \\u0073eq 是同一个键。
+
+    json 已把成对的代理项合并为一个字符，剩下的都是孤立代理项；与 Go 一致，每个按 U+FFFD 比较。
+    """
     obj: dict[str, Any] = {}
+    seen: set[str] = set()
     for key, value in pairs:
-        if key in obj:
+        normalized = _LONE_SURROGATE.sub("\ufffd", key)
+        if normalized in seen:
             raise ValueError(f"重复的键 {key!r}")
+        seen.add(normalized)
         obj[key] = value
     return obj
 
@@ -536,5 +546,9 @@ def encode_line(direction: str, msg: dict[str, Any]) -> bytes:
         line = text.encode("utf-8")
     except UnicodeEncodeError as exc:  # 字符串中含孤立代理项
         raise ProtocolError("invalid_field", "消息含有孤立代理项，无法编码为 UTF-8") from exc
+    try:  # 编码结果必须能通过对端的 JSON 结构限制（深度、数字字面量等）
+        parse_json(line)
+    except ProtocolError as exc:
+        raise ProtocolError("invalid_field", f"消息违反 JSON 结构限制：{exc.detail}") from exc
     _check_size(direction, typ, len(line))
     return line
