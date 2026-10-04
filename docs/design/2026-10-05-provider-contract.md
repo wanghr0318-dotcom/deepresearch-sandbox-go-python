@@ -1,6 +1,6 @@
 # 提案：Provider 的 Go 接口契约（M1）
 
-> 状态：**待审阅**，未实现。审阅通过后据此编写 Plan 2、5、6 中不依赖 Plan 1B 的任务。
+> 状态：**已审阅（第一轮三条更正已并入：第 3 节 Create 只返回完整环境、第 4 节按操作的后置条件判断、第 5 节执行与停止的并发边界）**，未实现。据此编写 Plan 2、5、6 中不依赖 Plan 1B 的任务。
 > 依据：规格 §4.1（已固定 `StartExec`/`ExecHandle`/`ExitStatus`/`ResourceDiag`）、§4.2–§4.5、§8.3、§14.1 第 5 步与"资源归属"、§16.2；代码组织设计 §2（`provider/local` 的六个操作）、§4（消费者定义窄接口）。
 > 只补齐规格未写明的部分：参数、返回值、取消、错误分类、幂等与资源所有权。不改变规格已定内容。
 
@@ -72,9 +72,10 @@ type ExecHandle interface { // §4.1，原样
 
 // EnvInfo 是 List 返回的一个完整环境（owner.json 属于本安装）。
 type EnvInfo struct {
-	EnvID   string
-	Kind    EnvKind
-	Running bool // cgroup 的 populated 为 1
+	EnvID    string
+	Kind     EnvKind
+	Complete bool // 各层齐全且 init 就绪；false 即 Create 会返回 ErrIncomplete 的残留
+	Running  bool // 环境 cgroup 存在且 populated 为 1
 }
 
 // ScanReport 是独立原始扫描的结果（§14.1 第 5 步），逐层报告。
@@ -104,46 +105,64 @@ Scan(ctx) (ScanReport, error)
 ResourceDiag(ctx, envID string) (ResourceDiag, error)
 ```
 
-| 操作 | 语义 | 幂等 | 取消 |
+| 操作 | 语义与成功的后置条件 | 幂等 | 取消 |
 |---|---|---|---|
-| `Create` | 建目录 `<data>/envs/<env_id>` → **任何挂载前**写 `owner.json{install_id, env_id, spec_hash}` → cgroup → rootfs 与挂载 → 启动 init。返回时环境处于 running（init 就绪），可 `StartExec` | 按 `env_id`：已存在且 owner 与 `spec_hash` 一致 → 返回现状；`spec_hash` 不同 → `ErrConflict`；owner 不属于本安装 → `ErrForeign` | 有界；ctx 结束时停止推进并返回 ctx 错误，已创建的部分**保留为可识别的残留**（owner.json 已在），由调用方随后 `Stop`+`Destroy` 补偿；返回后不留后台操作 |
-| `StartExec` | 经控制通道启动一次 workload（§4.2–§4.3）；成功即 `start_ack` 已收到 | **不幂等**：每次调用启动一个新进程。调用方以 attempt 状态保证至多一次；结果不明（`ErrControlLost`）时不重试，按 §4.2 拆除环境 | ctx 在 ACK 前结束 → 返回 ctx 错误，并视同控制连接不可信：调用方拆除环境 |
-| `Stop` | `cgroup.kill` → 等待 `populated 0`（覆盖整个子树）；不卸载、不删除（§4.4 停止与清理分离） | 是：已停止或从未创建 → 成功 | 有界；ctx 结束前未确认清空 → `ErrStopUnconfirmed`（调用方据此进入 `stop_blocked`），不报告成功 |
-| `Destroy` | 卸载 → 删除 cgroup → 删除目录（§4.4）；前置条件：已确认停止 | 是：缺失的部分视为已完成 | 有界；中断后可重做 |
-| `List` | 本安装的完整环境（owner.json 的 install_id 等于本安装） | 只读 | 有界 |
+| `Create` | 建目录 `<data>/envs/<env_id>` → 写 `owner.json{install_id, env_id, spec_hash}`（在任何挂载之前）→ cgroup → rootfs 与挂载 → 在环境 cgroup 内启动 init。**成功的后置条件：环境完整、init 就绪，可 `StartExec`** | 按 `env_id`：已存在、owner 属于本安装、`spec_hash` 一致**且完整、init 就绪** → 返回现状；owner 属于本安装但不完整或 init 未就绪（中断的创建、已停止的环境）→ `ErrIncomplete`，**不补完、不认领**；`spec_hash` 不同 → `ErrConflict`；目录存在但 owner.json 缺失、损坏或属于其他安装 → `ErrForeign` | 有界；ctx 结束时停止推进并返回 ctx 错误，返回后不留后台操作；已建的部分留在原处，由 coordinator 按第 5 节清理后重建 |
+| `StartExec` | 经控制通道启动一次 workload（§4.2–§4.3）。成功的后置条件：`start_ack` 已收到，进程在环境 cgroup 内运行 | **不幂等**：每次调用启动一个新进程。调用方以 attempt 状态保证至多一次；结果不明（`ErrControlLost`、ACK 前 ctx 结束）时不重试，按 §4.2 停止并拆除环境 | ctx 在 ACK 前结束 → 返回 ctx 错误；控制连接视为不可信 |
+| `Stop` | 关闭执行闸门（第 5 节）→ `cgroup.kill` → 等待 `populated 0`。不卸载、不删除（§4.4 停止与清理分离）。**成功的后置条件由权威检查确认：环境 cgroup 不存在，或存在且 `populated 0`**（init 与全部 workload 都在环境 cgroup 内启动，进程不能离开该 cgroup，因此这两种情况都证明执行树不存在） | 是 | 有界；期限内未确认 → `ErrStopUnconfirmed`（`stop_blocked`），不报告成功 |
+| `Destroy` | 前置条件：`Stop` 的权威检查成立（否则 `ErrNotStopped`）。逐层清理它负责的资源：数据目录下属于该环境的挂载 → 环境 cgroup → 环境目录（含 owner.json）。**成功的后置条件：逐层核对，三层都已不存在** | 是：重做时已不存在的层跳过，但成功前仍逐层核对 | 有界；中断后可重做 |
+| `List` | 本安装的环境（owner.json 的 install_id 等于本安装），附完整性 | 只读 | 有界 |
 | `Scan` | 独立原始扫描：环境目录（含无 owner.json 的）、数据目录下的挂载、`agentbox-*` cgroup（含其他 install_id 的）、listener socket、UID 范围文件属主；逐项分类 | 只读 | 有界 |
 | `ResourceDiag` | 读取环境 cgroup 的 OOM 与 CPU 统计（§4.1） | 只读 | 有界 |
 
-所有操作：不写 Store、不解析 JSONL（§4.1）；同一 `env_id` 的物理操作由 resource coordinator 串行化（§3.2），provider 不另加跨调用的锁。
+所有操作：不写 Store、不解析 JSONL（§4.1）。
+
+**残留与认领**：`mkdir` 与写入 owner.json 之间存在失败窗口，因此残留目录**可能没有 owner.json**。provider 不认领任何不能证明属于本安装的资源：无 owner.json、owner.json 损坏或属于其他安装的目录由 `Scan` 报告为 `Unknown`/`Foreign`，进入 §14.1 的隔离流程（写 `quarantined_resources`、报警、不自动销毁）。owner.json 属于本安装的不完整环境（`ErrIncomplete`）由 coordinator `Stop` → `Destroy` 后以新的创建重建，不在原环境上继续——与"不接管存活环境"一致。
 
 ## 4. 错误分类（`internal/provider`）
 
 | 错误 | 含义 | 调用方处理 |
 |---|---|---|
-| `ErrNotFound` | 环境不存在（`StartExec`、`ResourceDiag`） | 视为已停止/已清理 |
+| `ErrNotFound` | 本次操作需要的那一层资源不存在：`StartExec` 找不到可用的 init 或控制连接；`ResourceDiag` 找不到环境 cgroup | **只说明本操作无法进行，不说明其他层是否已清理**。是否停止由 `Stop` 的权威检查判断，是否清理完成由 `Destroy` 的逐层核对判断 |
+| `ErrIncomplete` | 同名环境属于本安装，但不完整或 init 未就绪 | coordinator `Stop` → `Destroy` 后以新的创建重建；不补完 |
 | `ErrConflict` | 同一 `env_id` 已存在且 `spec_hash` 不同 | 编程错误或身份复用；不重试 |
-| `ErrForeign` | owner.json 缺失、损坏或属于其他安装 | 不自动销毁：写 `quarantined_resources` 并报警（§14.1 表） |
+| `ErrForeign` | 目录存在但 owner.json 缺失、损坏或属于其他安装 | 不自动销毁：写 `quarantined_resources` 并报警（§14.1 表） |
+| `ErrStopping` | 环境的执行闸门已关闭（第 5 节），不再接受新的执行 | attempt 不启动；按停止流程处理 |
 | `*StartError{Reason}`（`ErrStartFailed`） | init 回复 `start_err`：启动序列某步失败，workload 未运行 | attempt 失败（启动失败类）；`Reason` 文本由 Plan 1B 的结论确定，本契约只规定"workload 未运行" |
-| `ErrControlLost` | ACK 前控制连接断开（§4.2） | attempt 失败并拆除环境；不重试 `StartExec` |
+| `ErrControlLost` | ACK 前控制连接断开（§4.2） | attempt 失败，停止并拆除环境；不重试 `StartExec` |
 | `ErrStopUnconfirmed` | 期限内未确认执行树清空 | `stop_blocked`，占用槽位，阻止替代执行（§8.2） |
 | `ErrNotStopped` | `Destroy` 的前置条件不成立 | 先 `Stop` |
-| ctx 错误 | 调用方取消或期限到期 | 按上表各操作的取消语义补偿 |
+| ctx 错误 | 调用方取消或期限到期 | 按第 3 节各操作的取消语义处理 |
 | 其他（包装的宿主错误） | 暂时性宿主故障（EBUSY、ENOSPC 等） | coordinator 退避重试；cleanup 记 `cleanup_error` |
 
-## 5. 资源所有权
+恢复代码不得把"某一层不存在"当作"全部不存在"：停止与清理完成只能分别来自 `Stop` 与 `Destroy` 的成功返回。
 
-- **命名即归属**：目录 `<data>/envs/<env_id>`、cgroup `agentbox-<install_id>/env-<env_id>`、listener `<data>/envs/<env_id>/gw.sock`；owner.json 在任何挂载前写入。清理不猜测路径（§14.1"资源归属"）。
+## 5. 执行与停止的并发边界
+
+`Create`、`Stop`、`Destroy` 由 resource coordinator 按环境串行调用；`StartExec` 由 runner 直接调用，不经 coordinator。两条路径的约束由 **provider 内每个环境的执行闸门** 统一执行，而不依赖调用方之间的约定：
+
+- 闸门状态：`open`（`Create` 成功后）→ `closed`（`Stop` 开始时，不可逆）。闸门是 provider 进程内状态；进程重启后不重建为 `open`，因此重启前创建的环境不能再 `StartExec`（与"不接管存活环境"一致）。
+- **仲裁顺序**：`StartExec` 在闸门锁内检查 `open` 并登记一个在途启动，再在锁外发送 `start`；`Stop` 在闸门锁内把闸门置为 `closed`，此后到达的 `StartExec` 立即返回 `ErrStopping`。`Stop` **不等待**在途启动：它在关闭闸门之后执行 `cgroup.kill`，在途启动所创建的进程（由环境 cgroup 内的 init 创建，必然在该 cgroup 内）随之被终止，在途的 `StartExec` 以 `ErrControlLost` 或 `StartError` 返回。
+- **停止成功后没有迟到的进程**：环境内唯一能创建进程的是 init；`Stop` 成功意味着 cgroup 已空，init 已不存在，控制连接已断开。`cgroup.kill` 对与之并发的 fork 同样生效。之后到达的 `StartExec` 被闸门拒绝，不触碰任何资源。
+- **未确认停止不能清理或归还**：`Destroy` 以 `Stop` 的权威检查为前置条件；coordinator 只在 `Stop` 成功后写 `stopped_at`；UID 范围归还要求 `stopped_at` 已记录且 `cleanup_state = done`（Plan 4 已在事务内强制）。
+- **测试**（Plan 2，确定性）："start 在途时 stop"——用测试钩子让 `StartExec` 在登记在途启动之后、发送 `start` 之前阻塞；执行 `Stop` 并确认成功；放行 `StartExec`：它必须返回 `ErrControlLost`/`ErrStopping`/`StartError` 之一，且环境 cgroup 中没有任何进程；之后的 `StartExec` 返回 `ErrStopping`。
+- **契约一致性测试**：`internal/provider/providertest` 提供一组按本契约编写的行为测试（第 3 节的后置条件、第 4 节的错误、本节的闸门语义），同时运行在 Plan 5/6 使用的内存 fake 与 Plan 2 的 `provider/local` 上（后者需要 Linux 与 root），使两侧对契约的理解由同一组测试固定。
+
+## 6. 资源所有权
+
+- **命名即归属**：目录 `<data>/envs/<env_id>`、cgroup `agentbox-<install_id>/env-<env_id>`、listener `<data>/envs/<env_id>/gw.sock`；owner.json 在任何挂载之前写入（但不早于 `mkdir`，见第 3 节"残留与认领"）。清理不猜测路径（§14.1"资源归属"）。
 - **intent 先于物理操作**：coordinator 在调用 `Create` 前以 `resource.RecordIntent` 持久化 intent，调用后 `ResolveIntent`；provider 不知道 intent。
 - **UID 范围由控制面分配**（`resource.AssignUIDRange`），经 `EnvSpec` 传入；归还的前置条件由 Plan 4 的 `ReleaseUIDRange` 与 coordinator 的文件/挂载核对共同保证（§4.5）。
 - **不接管存活环境**：重启后 `List`/`Scan` 只用于核对与停止（§14.1 第 6 步）。
 
-## 6. 依赖 Plan 1B 的部分（不在本契约中固定）
+## 7. 依赖 Plan 1B 的部分（不在本契约中固定）
 
 本契约不暴露降权、挂载方式、附加组、securebits、seccomp 安装的任何参数；它们是 `provider/local` 与 `sandbox` 的内部实现，由 Plan 1B 的结论决定（B1–B5）。契约中唯一与 1B 相关的点是 `StartError.Reason` 的取值（B6），已约定为不透明文本。因此 Plan 5、6 可按本契约以内存 fake 实现 `Provider`/`Starter` 编写与测试；Plan 2 中启动序列以外的部分可按本契约实现。
 
-## 7. 审阅要点
+## 8. 审阅记录
 
-1. 新增 `internal/provider` 契约包（第 1 节）。
-2. `Create` 被取消时保留残留、由调用方补偿，而不是在 `Create` 内部回滚（第 3 节）——理由：owner.json 先写，残留总能被识别与清理；内部回滚本身也可能被中断。
-3. `StartExec` 不幂等、结果不明即拆除环境（与 §4.2 一致）。
-4. `Stop` 只在确认清空时成功，否则 `ErrStopUnconfirmed`。
+第一轮（2026-10-05）保留了 `internal/provider` 共享类型与错误、消费者声明窄接口的划分，并要求三处更正，均已并入：
+
+1. `Create` 只把完整且 init 就绪的环境作为成功返回；同名残留为 `ErrIncomplete`，由 coordinator 清理后重建；无 owner.json 的目录不认领，进入扫描与隔离流程（第 3 节）。
+2. 删除"`ErrNotFound` 视为已停止/已清理"；停止与清理完成只由 `Stop` 的权威检查与 `Destroy` 的逐层核对确认（第 3、4 节）。
+3. 固定执行与停止的并发边界：provider 内的执行闸门、仲裁顺序、停止后无迟到进程、未确认停止不能清理或归还，以及确定性的"start 在途时 stop"测试（第 5 节）。
