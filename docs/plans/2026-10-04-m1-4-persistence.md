@@ -42,6 +42,7 @@
 | 5 | Task 6 | Task 5 |
 | 6 | Task 7 | Task 6 |
 | 7 | Task 8 | Task 2–7 |
+| 8 | Task 9（安装身份修订，审阅后加入） | Task 2–8 |
 
 ---
 ### Task 1：错误契约、消费者窄接口与依赖方向检查
@@ -5854,6 +5855,1270 @@ Expected: 全部包 `ok` 或 `[no test files]`。
 
 ```bash
 cd /f/go-agentbox-m1-4 && git add .github/workflows/ci.yml && git commit -m "ci: correctness 与 linux-integration 作业加入 PostgreSQL 服务" ${COAUTHOR:+-m "$COAUTHOR"}
+```
+
+---
+
+### Task 9：安装身份引导令牌（规格 §7.4 修订）
+
+**风险：高（启动安全）——修订提案经项目负责人审阅（两条更正已并入）后执行。**
+
+依据：[修订提案](../design/2026-10-05-installation-identity-amendment.md)。本任务修改 Task 2、3、4 已提交的文件；下列整文件代码块取代那些任务中同名文件的内容。
+
+**Files:**
+- Modify: `internal/datadir/datadir.go`、`internal/datadir/datadir_test.go`（令牌文件：严格解析、不覆盖）
+- Modify: `internal/ownership/ownership.go`、`internal/ownership/ownership_test.go`（决策表、令牌先于初始化事务、Bootstrap 新签名）
+- Create: `internal/persistence/postgres/migrations/0002_bootstrap_token.sql`
+- Modify: `internal/persistence/postgres/migrate.go`（读取令牌哈希并兼容旧库；初始化事务执行全部迁移并写入哈希；提交结果未知归类，不重试）
+- Modify: `internal/persistence/postgres/postgres_test.go`（`newStore` 与 `TestInstallationBootstrapE46`）
+
+**Interfaces:**
+- Produces：`datadir.NewTokenFile(dir)`、`TokenFile.Read() ([]byte, bool, error)`、`TokenFile.Write([]byte) error`、`datadir.ErrTokenCorrupt`、`datadir.ErrTokenExists`、`datadir.TokenSize`。
+- Changes：`ownership.Installation.TokenHash`、`ownership.FileState.TokenHash`、`ownership.TokenFile` 接口、`ownership.TokenSize`；`ownership.Bootstrap(ctx, store, idFile, tokenFile, newID, newToken)`；`InstallStore.InitializeInstallation(ctx, installID, tokenHash)`。
+
+- [ ] **Step 1：写入代码与测试**
+
+`internal/datadir/datadir.go`：
+
+```go
+// Package datadir 管理本机数据目录的所有权与安装身份文件（规格 §7.4）。
+//
+// 它只负责本机文件：`<data>/agentbox.lock` 上的 flock、`<data>/install_id` 与
+// `<data>/bootstrap_token` 的读取与持久化写入。数据库侧的所有权（advisory lock）由
+// internal/persistence/postgres 负责。
+package datadir
+
+import (
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+const (
+	lockName  = "agentbox.lock"
+	idName    = "install_id"
+	tokenName = "bootstrap_token"
+
+	// TokenSize 是引导令牌的字节数。
+	TokenSize = 32
+)
+
+var (
+	// ErrLocked 表示另一个进程正持有数据目录锁。
+	ErrLocked = errors.New("datadir: 数据目录已被另一个进程锁定")
+	// ErrTokenCorrupt 表示 bootstrap_token 存在但不是 32 字节的小写十六进制编码。
+	ErrTokenCorrupt = errors.New("datadir: bootstrap_token 损坏")
+	// ErrTokenExists 表示 bootstrap_token 已存在：有效令牌只能复用，不能覆盖。
+	ErrTokenExists = errors.New("datadir: bootstrap_token 已存在")
+)
+
+// Lock 是 `<data>/agentbox.lock` 上的独占 flock，持有至 Release 或进程退出。
+// 锁文件本身不删除、不重建（规格 §7.4）。
+type Lock struct {
+	f *os.File
+}
+
+// Acquire 以非阻塞方式取得数据目录锁；已被占用时返回 ErrLocked。
+func Acquire(dir string) (*Lock, error) {
+	f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("datadir: 打开锁文件: %w", err)
+	}
+	if err := lockFile(f); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return &Lock{f: f}, nil
+}
+
+// Release 释放锁并关闭锁文件。
+func (l *Lock) Release() error {
+	return l.f.Close() // 关闭文件描述符即释放 flock
+}
+
+// IDFile 读写 `<data>/install_id`。
+type IDFile struct {
+	dir string
+}
+
+// NewIDFile 返回 dir 下的安装身份文件。
+func NewIDFile(dir string) IDFile { return IDFile{dir: dir} }
+
+// Read 读取安装身份；文件不存在时 exists 为 false。
+func (f IDFile) Read() (id string, exists bool, err error) {
+	b, err := os.ReadFile(filepath.Join(f.dir, idName))
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("datadir: 读取 install_id: %w", err)
+	}
+	id = strings.TrimSpace(string(b))
+	if id == "" {
+		return "", false, fmt.Errorf("datadir: install_id 文件为空")
+	}
+	return id, true, nil
+}
+
+// Write 持久化写入安装身份。
+func (f IDFile) Write(id string) error {
+	return writeDurable(f.dir, idName, id+"\n")
+}
+
+// TokenFile 读写 `<data>/bootstrap_token`：本数据目录的引导令牌（规格 §7.4）。
+// 三种状态严格区分：文件不存在（exists 为 false）、读取失败（返回错误）、内容不是 32 字节的
+// 小写十六进制编码（ErrTokenCorrupt）。后两者都不能当作"不存在"，否则一次读错误会被误判为
+// 首次安装而生成新身份。
+type TokenFile struct {
+	dir string
+}
+
+// NewTokenFile 返回 dir 下的引导令牌文件。
+func NewTokenFile(dir string) TokenFile { return TokenFile{dir: dir} }
+
+// Read 读取引导令牌。
+func (f TokenFile) Read() (token []byte, exists bool, err error) {
+	b, err := os.ReadFile(filepath.Join(f.dir, tokenName))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("datadir: 读取 bootstrap_token: %w", err)
+	}
+	text := strings.TrimSuffix(string(b), "\n")
+	token, err = hex.DecodeString(text)
+	if err != nil || len(token) != TokenSize || hex.EncodeToString(token) != text {
+		return nil, false, fmt.Errorf("%w：需要 %d 字节的小写十六进制编码", ErrTokenCorrupt, TokenSize)
+	}
+	return token, true, nil
+}
+
+// Write 持久化写入引导令牌。令牌已存在时返回 ErrTokenExists，不覆盖（调用方持有数据目录锁，
+// 检查与写入之间没有其他写者）。
+func (f TokenFile) Write(token []byte) error {
+	if len(token) != TokenSize {
+		return fmt.Errorf("datadir: bootstrap_token 必须是 %d 字节，得到 %d", TokenSize, len(token))
+	}
+	if _, err := os.Lstat(filepath.Join(f.dir, tokenName)); err == nil {
+		return ErrTokenExists
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("datadir: 检查 bootstrap_token: %w", err)
+	}
+	return writeDurable(f.dir, tokenName, hex.EncodeToString(token)+"\n")
+}
+
+// writeDurable 持久化写入 dir/name：临时文件 → 写入并 fsync → rename → fsync 父目录。
+// rename 保证原子替换（读者看到旧值或新值），父目录 fsync 保证断电后新目录项仍在。
+func writeDurable(dir, name, content string) error {
+	tmp, err := os.CreateTemp(dir, name+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("datadir: 创建临时文件: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }() // rename 成功后此处无文件可删
+	if _, err := tmp.WriteString(content); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("datadir: 写入临时文件: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("datadir: fsync 临时文件: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("datadir: 关闭临时文件: %w", err)
+	}
+	if err := os.Rename(tmpPath, filepath.Join(dir, name)); err != nil {
+		return fmt.Errorf("datadir: rename: %w", err)
+	}
+	return syncDir(dir)
+}
+```
+
+`internal/datadir/datadir_test.go`：
+
+```go
+//go:build unix
+
+package datadir
+
+import (
+	"encoding/hex"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestLockIsExclusiveAndReleasable(t *testing.T) {
+	dir := t.TempDir()
+	first, err := Acquire(dir)
+	if err != nil {
+		t.Fatalf("首次取锁: %v", err)
+	}
+	if _, err := Acquire(dir); !errors.Is(err, ErrLocked) {
+		t.Fatalf("锁被持有时应返回 ErrLocked，得到 %v", err)
+	}
+	if err := first.Release(); err != nil {
+		t.Fatalf("释放: %v", err)
+	}
+	again, err := Acquire(dir)
+	if err != nil {
+		t.Fatalf("释放后重新取锁: %v", err)
+	}
+	_ = again.Release()
+}
+
+func TestIDFileWriteReadReplace(t *testing.T) {
+	dir := t.TempDir()
+	f := NewIDFile(dir)
+	if _, exists, err := f.Read(); err != nil || exists {
+		t.Fatalf("初始应不存在：exists=%v err=%v", exists, err)
+	}
+	for _, id := range []string{"install-a", "install-b"} {
+		if err := f.Write(id); err != nil {
+			t.Fatalf("写入 %s: %v", id, err)
+		}
+		got, exists, err := f.Read()
+		if err != nil || !exists || got != id {
+			t.Fatalf("读取得到 (%q, %v, %v)，期望 %q", got, exists, err, id)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(idName) {
+		t.Fatalf("目录中应只剩 install_id，得到 %v", entries)
+	}
+}
+
+// TestTokenFileStates：不存在、读取失败、损坏是三种不同状态；有效令牌只能复用，不能覆盖。
+func TestTokenFileStates(t *testing.T) {
+	token := make([]byte, TokenSize)
+	for i := range token {
+		token[i] = byte(i)
+	}
+	t.Run("不存在后写入再读取", func(t *testing.T) {
+		f := NewTokenFile(t.TempDir())
+		if got, exists, err := f.Read(); err != nil || exists || got != nil {
+			t.Fatalf("初始应不存在：(%x, %v, %v)", got, exists, err)
+		}
+		if err := f.Write(token); err != nil {
+			t.Fatal(err)
+		}
+		if got, exists, err := f.Read(); err != nil || !exists || string(got) != string(token) {
+			t.Fatalf("读回 (%x, %v, %v)", got, exists, err)
+		}
+		if err := f.Write(make([]byte, TokenSize)); !errors.Is(err, ErrTokenExists) {
+			t.Fatalf("已存在的令牌不应被覆盖，得到 %v", err)
+		}
+		if got, _, _ := f.Read(); string(got) != string(token) {
+			t.Fatalf("令牌内容被改变：%x", got)
+		}
+	})
+	t.Run("长度不对的令牌不写入", func(t *testing.T) {
+		f := NewTokenFile(t.TempDir())
+		if err := f.Write(token[:16]); err == nil {
+			t.Fatal("16 字节的令牌应被拒绝")
+		}
+	})
+	t.Run("损坏", func(t *testing.T) {
+		for name, content := range map[string]string{
+			"空":     "",
+			"非十六进制": "zz" + hex.EncodeToString(token)[2:],
+			"过短":    hex.EncodeToString(token[:31]),
+			"过长":    hex.EncodeToString(append(token, 0)),
+			"大写":    strings.ToUpper(hex.EncodeToString(token)),
+		} {
+			t.Run(name, func(t *testing.T) {
+				dir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, tokenName), []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if _, exists, err := NewTokenFile(dir).Read(); !errors.Is(err, ErrTokenCorrupt) || exists {
+					t.Fatalf("应为 ErrTokenCorrupt，得到 exists=%v err=%v", exists, err)
+				}
+			})
+		}
+	})
+	t.Run("读取失败", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(dir, tokenName), 0o700); err != nil { // 读目录必然失败
+			t.Fatal(err)
+		}
+		_, exists, err := NewTokenFile(dir).Read()
+		if err == nil || exists || errors.Is(err, ErrTokenCorrupt) {
+			t.Fatalf("读取失败应返回错误而不是不存在或损坏，得到 exists=%v err=%v", exists, err)
+		}
+	})
+}
+```
+
+`internal/ownership/ownership.go`：
+
+```go
+// Package ownership 实现安装身份引导与校验（规格 §7.4；设计 §3.3；修订提案
+// docs/design/2026-10-05-installation-identity-amendment.md）。
+//
+// Decide 是纯函数，覆盖 §7.4 决策表的全部情况；Bootstrap 经三个窄接口编排引导步骤：
+// InstallStore（数据库侧，由 internal/persistence/postgres 实现）、IDFile 与 TokenFile
+// （数据目录侧，由 internal/datadir 实现）。本包不直接做 I/O。
+package ownership
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+)
+
+// TokenSize 是数据目录引导令牌的字节数；令牌哈希为其 SHA-256，同为 32 字节。
+const TokenSize = 32
+
+// DBState 是数据库侧与安装身份有关的事实。
+type DBState struct {
+	HasMigrations     bool          // 存在 schema_migrations 表
+	HasAgentboxTables bool          // 存在任何 agentbox 业务表
+	Installation      *Installation // installation 记录；nil 表示无记录
+}
+
+// Installation 是 installation 表中的单行。
+type Installation struct {
+	InstallID string
+	Complete  bool
+	TokenHash []byte // 发起引导的数据目录令牌的 SHA-256；修订前创建的旧记录为 nil
+}
+
+// FileState 是数据目录中身份文件与引导令牌的状态。
+type FileState struct {
+	Exists    bool   // install_id 存在
+	InstallID string // install_id 内容
+	TokenHash []byte // bootstrap_token 的 SHA-256；令牌不存在时为 nil
+}
+
+// Action 是引导决策的动作。
+type Action int
+
+const (
+	// Initialize：全新安装。持久化令牌（已有则复用）→ 全部迁移与 installation(新 ID, pending,
+	// 令牌哈希) 同一事务提交 → 写身份文件 → 置 complete。
+	Initialize Action = iota + 1
+	// WriteFileAndComplete：继续本数据目录发起、中断了的引导，写身份文件后置 complete。
+	WriteFileAndComplete
+	// Complete：身份文件已一致，只需置 complete。
+	Complete
+	// Proceed：已完成且一致，正常启动。
+	Proceed
+	// Refuse：拒绝启动，需要人工处理。
+	Refuse
+)
+
+// Decision 是一次决策的结果；Refuse 时 Reason 说明原因。
+type Decision struct {
+	Action Action
+	Reason string
+}
+
+// Decide 按规格 §7.4 的决策表（含引导令牌修订）判定下一步。"表不存在"本身不被当作全新安装：
+// 只有整个库为空且数据目录无身份时才初始化。pending 记录只能由持有对应令牌的数据目录继续。
+func Decide(db DBState, file FileState) Decision {
+	empty := !db.HasMigrations && !db.HasAgentboxTables && db.Installation == nil
+	inst := db.Installation
+	switch {
+	case empty && !file.Exists:
+		return Decision{Action: Initialize}
+	case empty:
+		return refuse("数据库为空但数据目录已有 install_id：数据库丢失或被替换")
+	case !db.HasMigrations:
+		return refuse("存在 agentbox 表但没有 schema_migrations：未知 schema")
+	case inst == nil:
+		return refuse("有 schema_migrations 但无 installation 记录：初始迁移与记录原子提交，只能来自外部改动、损坏，或该库属于另一个使用 schema_migrations 的应用")
+	case file.Exists && file.InstallID != inst.InstallID:
+		return refuse(fmt.Sprintf("安装身份不一致：数据库 %q，数据目录 %q", inst.InstallID, file.InstallID))
+	case !inst.Complete && file.Exists:
+		return Decision{Action: Complete} // 身份文件只由发起者或通过令牌校验的继续路径写入
+	case !inst.Complete && inst.TokenHash == nil:
+		return refuse("pending 安装记录早于引导令牌，无法证明由本数据目录发起：确认没有其他数据目录使用该库后，需人工清空数据库并重新引导")
+	case !inst.Complete && !bytes.Equal(file.TokenHash, inst.TokenHash):
+		return refuse("pending 安装由另一个数据目录发起，或本数据目录的 bootstrap_token 已丢失：若确认原数据目录已永久丢失，需人工处理")
+	case !inst.Complete:
+		return Decision{Action: WriteFileAndComplete}
+	case !file.Exists:
+		return refuse("installation 已完成但数据目录没有 install_id：数据目录丢失或被替换")
+	default:
+		return Decision{Action: Proceed}
+	}
+}
+
+func refuse(reason string) Decision { return Decision{Action: Refuse, Reason: reason} }
+
+// InstallStore 是引导所需的数据库操作；调用方须已持有 advisory lock。
+type InstallStore interface {
+	InspectInstallation(ctx context.Context) (DBState, error)
+	// InitializeInstallation 在同一事务中执行全部迁移并插入 installation(installID, pending,
+	// tokenHash)。提交结果未知时返回错误，不在进程内重试。
+	InitializeInstallation(ctx context.Context, installID string, tokenHash []byte) error
+	// CompleteInstallation 把 installation 置为 complete。
+	CompleteInstallation(ctx context.Context, installID string) error
+}
+
+// IDFile 是数据目录中的安装身份文件；Write 必须持久化（含父目录 fsync）。
+type IDFile interface {
+	Read() (id string, exists bool, err error)
+	Write(id string) error
+}
+
+// TokenFile 是数据目录中的引导令牌。Read 区分不存在（exists 为 false）与读取失败或损坏
+// （返回错误）；Write 必须持久化，且令牌已存在时失败而不覆盖。
+type TokenFile interface {
+	Read() (token []byte, exists bool, err error)
+	Write(token []byte) error
+}
+
+// ErrRefused 表示引导决策为拒绝启动；具体错误为 *RefusedError。
+var ErrRefused = errors.New("ownership: 拒绝启动")
+
+// RefusedError 携带拒绝启动的原因。
+type RefusedError struct{ Reason string }
+
+func (e *RefusedError) Error() string        { return "ownership: 拒绝启动: " + e.Reason }
+func (e *RefusedError) Is(target error) bool { return target == ErrRefused }
+
+// Bootstrap 执行安装身份引导与校验，返回本安装的 install_id。任何一步中断后重新调用，
+// 都会按当时的事实继续或明确拒绝。newID 与 newToken 只在全新安装且需要时调用。
+//
+// 前置条件（规格 §7.4 的顺序）：调用方已持有数据目录的 flock，然后已持有数据库 advisory lock；
+// 两把锁共同保证同一时刻只有一个进程对同一数据目录与同一数据库执行引导。返回错误时 install_id
+// 为空，调用方不得使用，并结束本次启动：初始化事务的提交结果未知时同样如此——第一次事务可能
+// 尚未结束，同进程内查询为空不能证明未提交；下次启动重新取得所有权后按决策表恢复。拒绝原因
+// 不含数据目录与数据库位置，由装配层包装后报告给运维。
+func Bootstrap(ctx context.Context, store InstallStore, idFile IDFile, tokenFile TokenFile,
+	newID func() string, newToken func() ([]byte, error)) (string, error) {
+	id, err := bootstrap(ctx, store, idFile, tokenFile, newID, newToken)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func bootstrap(ctx context.Context, store InstallStore, idFile IDFile, tokenFile TokenFile,
+	newID func() string, newToken func() ([]byte, error)) (string, error) {
+	db, err := store.InspectInstallation(ctx)
+	if err != nil {
+		return "", fmt.Errorf("ownership: 读取数据库状态: %w", err)
+	}
+	if inst := db.Installation; inst != nil && inst.TokenHash != nil && len(inst.TokenHash) != sha256.Size {
+		return "", fmt.Errorf("ownership: installation 的令牌哈希长度为 %d，不是 %d：记录损坏", len(inst.TokenHash), sha256.Size)
+	}
+	id, exists, err := idFile.Read()
+	if err != nil {
+		return "", fmt.Errorf("ownership: 读取 install_id: %w", err)
+	}
+	token, hasToken, err := tokenFile.Read() // 读取失败或损坏直接失败，不当作"不存在"
+	if err != nil {
+		return "", fmt.Errorf("ownership: 读取 bootstrap_token: %w", err)
+	}
+	file := FileState{Exists: exists, InstallID: id}
+	if hasToken {
+		file.TokenHash = tokenHash(token)
+	}
+	d := Decide(db, file)
+	switch d.Action {
+	case Initialize:
+		hash, err := ensureToken(tokenFile, token, hasToken, newToken)
+		if err != nil {
+			return "", err
+		}
+		id = newID()
+		if id == "" {
+			return "", errors.New("ownership: 生成的 install_id 为空")
+		}
+		if err := store.InitializeInstallation(ctx, id, hash); err != nil {
+			return "", fmt.Errorf("ownership: 初始化安装: %w", err)
+		}
+		return id, writeAndComplete(ctx, store, idFile, id)
+	case WriteFileAndComplete:
+		return db.Installation.InstallID, writeAndComplete(ctx, store, idFile, db.Installation.InstallID)
+	case Complete:
+		return id, complete(ctx, store, id)
+	case Proceed:
+		return id, nil
+	default:
+		return "", &RefusedError{Reason: d.Reason}
+	}
+}
+
+// ensureToken 返回本数据目录令牌的哈希：已有有效令牌则复用，否则生成并在初始化事务之前持久化。
+func ensureToken(tokenFile TokenFile, token []byte, hasToken bool, newToken func() ([]byte, error)) ([]byte, error) {
+	if !hasToken {
+		var err error
+		if token, err = newToken(); err != nil {
+			return nil, fmt.Errorf("ownership: 生成 bootstrap_token: %w", err)
+		}
+		if len(token) != TokenSize {
+			return nil, fmt.Errorf("ownership: 生成的 bootstrap_token 为 %d 字节，不是 %d", len(token), TokenSize)
+		}
+		if err := tokenFile.Write(token); err != nil {
+			return nil, fmt.Errorf("ownership: 写入 bootstrap_token: %w", err)
+		}
+	}
+	return tokenHash(token), nil
+}
+
+func tokenHash(token []byte) []byte {
+	h := sha256.Sum256(token)
+	return h[:]
+}
+
+func writeAndComplete(ctx context.Context, store InstallStore, idFile IDFile, id string) error {
+	if err := idFile.Write(id); err != nil {
+		return fmt.Errorf("ownership: 写入 install_id: %w", err)
+	}
+	return complete(ctx, store, id)
+}
+
+func complete(ctx context.Context, store InstallStore, id string) error {
+	if err := store.CompleteInstallation(ctx, id); err != nil {
+		return fmt.Errorf("ownership: 置 complete: %w", err)
+	}
+	return nil
+}
+```
+
+`internal/ownership/ownership_test.go`：
+
+```go
+package ownership
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"testing"
+)
+
+var (
+	tokA = bytes.Repeat([]byte{0xA}, TokenSize)
+	tokB = bytes.Repeat([]byte{0xB}, TokenSize)
+)
+
+// TestDecideCoversSpecTable 逐行对应规格 §7.4 的决策表（含引导令牌修订）。
+func TestDecideCoversSpecTable(t *testing.T) {
+	hashA := tokenHash(tokA)
+	empty := DBState{}
+	noRecord := DBState{HasMigrations: true, HasAgentboxTables: true}
+	unknown := DBState{HasAgentboxTables: true}
+	pending := DBState{HasMigrations: true, HasAgentboxTables: true, Installation: &Installation{InstallID: "a", TokenHash: hashA}}
+	legacy := DBState{HasMigrations: true, HasAgentboxTables: true, Installation: &Installation{InstallID: "a"}}
+	done := DBState{HasMigrations: true, HasAgentboxTables: true, Installation: &Installation{InstallID: "a", Complete: true, TokenHash: hashA}}
+	none, same, other := FileState{}, FileState{Exists: true, InstallID: "a"}, FileState{Exists: true, InstallID: "b"}
+	tokenOnly := FileState{TokenHash: hashA}
+	otherToken := FileState{TokenHash: tokenHash(tokB)}
+
+	cases := []struct {
+		name string
+		db   DBState
+		file FileState
+		want Action
+	}{
+		{"空库，无身份文件：全新安装", empty, none, Initialize},
+		{"空库，无身份文件但有令牌：全新安装（复用令牌）", empty, tokenOnly, Initialize},
+		{"有 schema_migrations 无记录", noRecord, none, Refuse},
+		{"有 schema_migrations 无记录（有文件）", noRecord, same, Refuse},
+		{"空库但有身份文件", empty, same, Refuse},
+		{"未知 schema", unknown, none, Refuse},
+		{"未知 schema（有文件）", unknown, same, Refuse},
+		{"pending，无身份文件，令牌一致：继续引导", pending, tokenOnly, WriteFileAndComplete},
+		{"pending，无身份文件，无令牌：拒绝", pending, none, Refuse},
+		{"pending，无身份文件，令牌不同：拒绝（另一个数据目录）", pending, otherToken, Refuse},
+		{"旧 pending（无哈希），无身份文件：拒绝", legacy, tokenOnly, Refuse},
+		{"旧 pending（无哈希），身份一致：置 complete", legacy, same, Complete},
+		{"pending，身份一致", pending, same, Complete},
+		{"pending，身份不一致", pending, other, Refuse},
+		{"complete，身份不一致", done, other, Refuse},
+		{"complete，无身份文件", done, none, Refuse},
+		{"complete，无身份文件但令牌一致", done, tokenOnly, Refuse},
+		{"complete，身份一致", done, same, Proceed},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			d := Decide(c.db, c.file)
+			if d.Action != c.want {
+				t.Fatalf("得到 %v（%s），期望 %v", d.Action, d.Reason, c.want)
+			}
+			if (d.Action == Refuse) != (d.Reason != "") {
+				t.Fatalf("只有拒绝时才有原因：%+v", d)
+			}
+		})
+	}
+}
+
+type fakeStore struct {
+	db        DBState
+	failAfter string    // 在该步骤成功后模拟进程中断
+	tokens    *fakeFile // 若设置，InitializeInstallation 断言令牌已先持久化
+}
+
+var errCrash = errors.New("模拟中断")
+
+func (s *fakeStore) InspectInstallation(context.Context) (DBState, error) { return s.db, nil }
+
+func (s *fakeStore) InitializeInstallation(_ context.Context, id string, hash []byte) error {
+	if s.tokens != nil && (!s.tokens.exists || !bytes.Equal(tokenHash(s.tokens.token), hash)) {
+		return errors.New("初始化事务之前令牌必须已持久化，且哈希与之一致")
+	}
+	s.db = DBState{HasMigrations: true, HasAgentboxTables: true, Installation: &Installation{InstallID: id, TokenHash: hash}}
+	if s.failAfter == "initialize" {
+		return errCrash
+	}
+	return nil
+}
+
+func (s *fakeStore) CompleteInstallation(_ context.Context, id string) error {
+	if s.db.Installation == nil || s.db.Installation.InstallID != id {
+		return errors.New("CompleteInstallation 的 install_id 与 pending 记录不一致")
+	}
+	s.db.Installation.Complete = true
+	return nil
+}
+
+// fakeFile 同时充当 IDFile 与 TokenFile（各用一个实例）。
+type fakeFile struct {
+	id        string
+	token     []byte
+	exists    bool
+	failAfter bool  // 写入成功后模拟中断
+	readErr   error // 读取失败或损坏
+	writes    int
+}
+
+func (f *fakeFile) Read() (string, bool, error) { return f.id, f.exists, f.readErr }
+
+func (f *fakeFile) Write(id string) error {
+	f.id, f.exists = id, true
+	f.writes++
+	if f.failAfter {
+		return errCrash
+	}
+	return nil
+}
+
+type fakeToken struct{ *fakeFile }
+
+func (f fakeToken) Read() ([]byte, bool, error) { return f.token, f.exists, f.readErr }
+
+func (f fakeToken) Write(token []byte) error {
+	if f.exists {
+		return errors.New("令牌已存在，不能覆盖")
+	}
+	f.token, f.exists = token, true
+	f.writes++
+	return nil
+}
+
+func newTok(tok []byte) func() ([]byte, error) { return func() ([]byte, error) { return tok, nil } }
+
+// TestBootstrapResumesAfterEachInterruption 覆盖 E46 中初始化事务提交之后的两个中断点：每次中断后
+// 重新引导都能完成（令牌一致），且中断时不返回 install_id。提交前中断与提交结果未知由 postgres 包的
+// TestInstallationBootstrapE46 在真实事务上覆盖。
+func TestBootstrapResumesAfterEachInterruption(t *testing.T) {
+	for _, point := range []string{"initialize", "write"} {
+		t.Run(point, func(t *testing.T) {
+			tokens := &fakeFile{}
+			store := &fakeStore{failAfter: point, tokens: tokens}
+			file := &fakeFile{failAfter: point == "write"}
+			if id, err := Bootstrap(context.Background(), store, file, fakeToken{tokens}, func() string { return "new" }, newTok(tokA)); !errors.Is(err, errCrash) || id != "" {
+				t.Fatalf("第一次引导应中断且不返回 install_id，得到 (%q, %v)", id, err)
+			}
+			store.failAfter, file.failAfter = "", false
+			id, err := Bootstrap(context.Background(), store, file, fakeToken{tokens},
+				func() string { t.Fatal("不应再生成新 ID"); return "" }, func() ([]byte, error) { t.Fatal("不应再生成令牌"); return nil, nil })
+			if err != nil || id != "new" || !store.db.Installation.Complete || file.id != "new" {
+				t.Fatalf("重新引导得到 (%q, %v)，状态 %+v 文件 %+v", id, err, store.db.Installation, file)
+			}
+			if tokens.writes != 1 {
+				t.Fatalf("令牌应只写入一次，得到 %d 次", tokens.writes)
+			}
+		})
+	}
+}
+
+// TestBootstrapReusesExistingToken：令牌已持久、初始化事务未提交时崩溃，重启复用同一令牌。
+func TestBootstrapReusesExistingToken(t *testing.T) {
+	tokens := &fakeFile{token: tokA, exists: true}
+	store := &fakeStore{tokens: tokens}
+	if _, err := Bootstrap(context.Background(), store, &fakeFile{}, fakeToken{tokens}, func() string { return "new" },
+		func() ([]byte, error) { t.Fatal("已有令牌时不应生成新令牌"); return nil, nil }); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(store.db.Installation.TokenHash, tokenHash(tokA)) || tokens.writes != 0 {
+		t.Fatalf("应复用已有令牌：哈希 %x，写入 %d 次", store.db.Installation.TokenHash, tokens.writes)
+	}
+}
+
+// TestBootstrapTokenFailuresStopStartup：令牌读取失败或损坏、生成的令牌长度不对、数据库中的哈希
+// 长度不对——都在初始化之前失败，不生成新身份。
+func TestBootstrapTokenFailuresStopStartup(t *testing.T) {
+	cases := map[string]struct {
+		store  *fakeStore
+		tokens *fakeFile
+		gen    func() ([]byte, error)
+	}{
+		"令牌读取失败":      {&fakeStore{}, &fakeFile{readErr: errors.New("EIO")}, newTok(tokA)},
+		"令牌损坏":        {&fakeStore{}, &fakeFile{readErr: errors.New("损坏")}, newTok(tokA)},
+		"生成的令牌长度不对":   {&fakeStore{}, &fakeFile{}, newTok(tokA[:16])},
+		"数据库令牌哈希长度不对": {&fakeStore{db: DBState{HasMigrations: true, HasAgentboxTables: true, Installation: &Installation{InstallID: "a", TokenHash: []byte{1, 2, 3}}}}, &fakeFile{token: tokA, exists: true}, newTok(tokA)},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			before := c.store.db
+			id, err := Bootstrap(context.Background(), c.store, &fakeFile{}, fakeToken{c.tokens}, func() string { return "new" }, c.gen)
+			if err == nil || id != "" {
+				t.Fatalf("应失败而不是继续引导，得到 (%q, %v)", id, err)
+			}
+			if c.store.db.Installation != before.Installation {
+				t.Fatal("失败时不应初始化数据库")
+			}
+		})
+	}
+}
+
+// TestBootstrapRefusesOtherDataDirectory：pending 记录由数据目录 A 发起，数据目录 B（不同令牌或无令牌）被拒绝。
+func TestBootstrapRefusesOtherDataDirectory(t *testing.T) {
+	for name, tokens := range map[string]*fakeFile{"不同令牌": {token: tokB, exists: true}, "无令牌": {}} {
+		t.Run(name, func(t *testing.T) {
+			store := &fakeStore{db: DBState{HasMigrations: true, HasAgentboxTables: true, Installation: &Installation{InstallID: "a", TokenHash: tokenHash(tokA)}}}
+			file := &fakeFile{}
+			_, err := Bootstrap(context.Background(), store, file, fakeToken{tokens}, func() string { return "x" }, newTok(tokB))
+			if !errors.Is(err, ErrRefused) || store.db.Installation.Complete || file.exists || tokens.writes != 0 {
+				t.Fatalf("应拒绝且不改变任何状态：err %v，记录 %+v，身份文件 %v，令牌写入 %d", err, store.db.Installation, file.exists, tokens.writes)
+			}
+		})
+	}
+}
+
+func TestBootstrapRejectsEmptyNewID(t *testing.T) {
+	store := &fakeStore{}
+	if id, err := Bootstrap(context.Background(), store, &fakeFile{}, fakeToken{&fakeFile{}}, func() string { return "" }, newTok(tokA)); err == nil || id != "" {
+		t.Fatalf("空的 install_id 应被拒绝，得到 (%q, %v)", id, err)
+	}
+	if store.db.Installation != nil {
+		t.Fatal("拒绝空 install_id 时不应初始化数据库")
+	}
+}
+
+func TestBootstrapRefusesWithReason(t *testing.T) {
+	store := &fakeStore{db: DBState{HasMigrations: true}}
+	_, err := Bootstrap(context.Background(), store, &fakeFile{}, fakeToken{&fakeFile{}}, func() string { return "x" }, newTok(tokA))
+	var refused *RefusedError
+	if !errors.As(err, &refused) || !errors.Is(err, ErrRefused) || refused.Reason == "" {
+		t.Fatalf("应拒绝并给出原因，得到 %v", err)
+	}
+}
+```
+
+`internal/persistence/postgres/migrations/0002_bootstrap_token.sql`：
+
+```sql
+-- 安装身份引导令牌（规格 §7.4 修订）：发起引导的数据目录令牌的 SHA-256。
+-- 修订前创建的记录为 NULL；非空时必须为 32 字节。
+ALTER TABLE installation ADD COLUMN bootstrap_token_hash bytea
+    CHECK (bootstrap_token_hash IS NULL OR octet_length(bootstrap_token_hash) = 32);
+```
+
+`internal/persistence/postgres/migrate.go`：
+
+```go
+package postgres
+
+import (
+	"context"
+	"embed"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+)
+
+var _ ownership.InstallStore = (*Store)(nil)
+
+//go:embed migrations/*.sql
+var migrationFS embed.FS
+
+// agentboxTables 是本项目的业务表；任何一个存在而 schema_migrations 不存在即为未知 schema。
+var agentboxTables = []string{
+	"installation", "api_requests", "tasks", "task_control", "task_progress", "task_event_seq",
+	"attempts", "attempt_access", "events", "environments", "uid_ranges", "resource_intents",
+	"quarantined_resources", "checkpoints", "blobs", "scope_blobs", "blob_provenance",
+	"artifact_heads", "artifacts",
+}
+
+// inspectTablesSQL 在同一份目录中查三组表名是否存在：pg_catalog 限定 current_schema()。
+// pg_class 对所有角色可见，不像 information_schema 那样只列出角色有权限的表；只看表类关系
+// （普通表、分区表、视图、物化视图、外部表）。
+const inspectTablesSQL = `WITH rel AS (
+	SELECT c.relname::text AS name
+	FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+	WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'v', 'm', 'f'))
+SELECT EXISTS (SELECT 1 FROM rel WHERE name = ANY($1::text[])),
+       EXISTS (SELECT 1 FROM rel WHERE name = ANY($2::text[])),
+       EXISTS (SELECT 1 FROM rel WHERE name = ANY($3::text[]))`
+
+type migration struct {
+	version int
+	name    string
+	sql     string
+}
+
+func loadMigrations() ([]migration, error) {
+	entries, err := migrationFS.ReadDir("migrations")
+	if err != nil {
+		return nil, err
+	}
+	var ms []migration
+	for _, e := range entries {
+		prefix, _, ok := strings.Cut(e.Name(), "_")
+		v, err := strconv.Atoi(prefix)
+		if !ok || err != nil {
+			return nil, fmt.Errorf("postgres: 迁移文件名不合法: %s", e.Name())
+		}
+		b, err := migrationFS.ReadFile("migrations/" + e.Name())
+		if err != nil {
+			return nil, err
+		}
+		ms = append(ms, migration{version: v, name: e.Name(), sql: string(b)})
+	}
+	sort.Slice(ms, func(i, j int) bool { return ms[i].version < ms[j].version })
+	if len(ms) == 0 || ms[0].version != 1 {
+		return nil, errors.New("postgres: 缺少初始迁移 0001")
+	}
+	return ms, nil
+}
+
+// InspectInstallation 读取与安装身份有关的数据库事实（实现 ownership.InstallStore）。
+func (s *Store) InspectInstallation(ctx context.Context) (ownership.DBState, error) {
+	var st ownership.DBState
+	err := s.read(ctx, "InspectInstallation", func(ctx context.Context, q queryer) error {
+		var hasInstallation bool
+		if err := q.QueryRow(ctx, inspectTablesSQL, []string{"schema_migrations"}, agentboxTables, []string{"installation"}).
+			Scan(&st.HasMigrations, &st.HasAgentboxTables, &hasInstallation); err != nil {
+			return err
+		}
+		if !hasInstallation {
+			return nil
+		}
+		// 引导先于迁移执行：只应用了 0001 的旧库没有令牌哈希列，按"无哈希"读取。
+		var hasTokenColumn bool
+		if err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+			WHERE attrelid = to_regclass(quote_ident(current_schema()) || '.installation')
+				AND attname = 'bootstrap_token_hash' AND NOT attisdropped)`).Scan(&hasTokenColumn); err != nil {
+			return err
+		}
+		sql := "SELECT install_id, state, NULL::bytea FROM installation"
+		if hasTokenColumn {
+			sql = "SELECT install_id, state, bootstrap_token_hash FROM installation"
+		}
+		var inst ownership.Installation
+		var state string
+		err := q.QueryRow(ctx, sql).Scan(&inst.InstallID, &state, &inst.TokenHash)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		inst.Complete = state == "complete"
+		st.Installation = &inst
+		return nil
+	})
+	return st, err
+}
+
+// InitializeInstallation 在同一事务中执行全部内嵌迁移并插入 installation(installID, pending,
+// tokenHash)（规格 §7.4）。事务未提交则库仍为空，重启后重新引导；提交结果未知时返回
+// *persistence.CommitUnknownError 且不重试——同进程内查询为空不能证明未提交，由调用方结束本次启动。
+func (s *Store) InitializeInstallation(ctx context.Context, installID string, tokenHash []byte) error {
+	if installID == "" || len(tokenHash) != ownership.TokenSize {
+		return invalidf("InitializeInstallation 需要 install_id 与 %d 字节的令牌哈希", ownership.TokenSize)
+	}
+	ms, err := loadMigrations()
+	if err != nil {
+		return err
+	}
+	return s.migrationTx(ctx, "InitializeInstallation", func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `CREATE TABLE schema_migrations (
+			version    integer PRIMARY KEY,
+			name       text NOT NULL,
+			applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
+			return err
+		}
+		for _, m := range ms {
+			if err := applyMigration(ctx, tx, m); err != nil {
+				return err
+			}
+		}
+		_, err := tx.Exec(ctx, "INSERT INTO installation (install_id, state, bootstrap_token_hash) VALUES ($1, 'pending', $2)",
+			installID, tokenHash)
+		return err
+	})
+}
+
+// CompleteInstallation 把 installation 置为 complete（实现 ownership.InstallStore）。
+func (s *Store) CompleteInstallation(ctx context.Context, installID string) error {
+	return s.run(ctx, "CompleteInstallation", installID, func(ctx context.Context, tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, "UPDATE installation SET state = 'complete' WHERE install_id = $1", installID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return conflictf("installation 中没有 install_id %q", installID)
+		}
+		return nil
+	})
+}
+
+// Migrate 依次执行尚未应用的迁移，每个迁移一个事务。必须在安装引导完成之后调用。
+func (s *Store) Migrate(ctx context.Context) error {
+	ms, err := loadMigrations()
+	if err != nil {
+		return err
+	}
+	applied, err := s.appliedVersion(ctx)
+	if err != nil {
+		return err
+	}
+	for _, m := range ms {
+		if m.version <= applied {
+			continue
+		}
+		if err := s.migrationTx(ctx, "Migrate", func(ctx context.Context, tx pgx.Tx) error {
+			return applyMigration(ctx, tx, m)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applyMigration(ctx context.Context, tx pgx.Tx, m migration) error {
+	if _, err := tx.Exec(ctx, m.sql); err != nil {
+		return fmt.Errorf("postgres: 迁移 %s: %w", m.name, err)
+	}
+	_, err := tx.Exec(ctx, "INSERT INTO schema_migrations (version, name) VALUES ($1, $2)", m.version, m.name)
+	return err
+}
+
+// appliedVersion 在迁移超时内读取已应用的最高迁移版本；失去所有权时返回 ErrOwnershipLost。
+func (s *Store) appliedVersion(ctx context.Context) (int, error) {
+	ctx, cancel, err := s.boundContext(ctx, migrationTimeout)
+	if err != nil {
+		return 0, err
+	}
+	defer cancel()
+	var applied int
+	if err := s.pool.QueryRow(ctx, "SELECT COALESCE(max(version), 0) FROM schema_migrations").Scan(&applied); err != nil {
+		if s.lost() {
+			return 0, persistence.ErrOwnershipLost
+		}
+		return 0, fmt.Errorf("postgres: 读取迁移版本: %w", err)
+	}
+	return applied, nil
+}
+
+// migrationTx 以独立的迁移超时（规格 §7.3：5 min）执行一个事务；不重跑。context 同时由调用方
+// 与所有权派生：失去所有权时取消并返回 ErrOwnershipLost。
+func (s *Store) migrationTx(ctx context.Context, op string, fn txFunc) error {
+	ctx, cancel, err := s.boundContext(ctx, migrationTimeout)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	if err := s.migrationTxOnce(ctx, op, fn); err != nil {
+		if s.lost() {
+			return persistence.ErrOwnershipLost
+		}
+		var cu *commitUnknown
+		if errors.As(err, &cu) {
+			return &persistence.CommitUnknownError{Op: op, Err: cu.err}
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Store) migrationTxOnce(ctx context.Context, op string, fn txFunc) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: %s: %w", op, err)
+	}
+	defer rollback(tx)
+	if err := fn(ctx, tx); err != nil {
+		return err
+	}
+	if s.hooks.beforeCommit != nil {
+		if err := s.hooks.beforeCommit(op); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return commitError(err) // 与事务辅助相同的归类：可能已到达服务端即为未知
+	}
+	if s.hooks.afterCommit != nil {
+		if err := s.hooks.afterCommit(op); err != nil {
+			return &commitUnknown{err: err}
+		}
+	}
+	return nil
+}
+```
+
+在 `internal/persistence/postgres/postgres_test.go` 中把 `newStore` **替换**为：
+
+```go
+func newStore(t *testing.T, opt Options) *Store {
+	t.Helper()
+	if opt.DSN == "" {
+		opt.DSN = newDatabase(t)
+	}
+	s, err := Open(context.Background(), opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	if err := s.InitializeInstallation(context.Background(), "install-test", make([]byte, ownership.TokenSize)); err != nil {
+		t.Fatalf("初始化: %v", err)
+	}
+	if err := s.CompleteInstallation(context.Background(), "install-test"); err != nil {
+		t.Fatalf("完成安装: %v", err)
+	}
+	return s
+}
+```
+
+并把 `TestInstallationBootstrapE46` **替换**为：
+
+```go
+// TestInstallationBootstrapE46 覆盖规格 E46（含引导令牌修订）：空库首启、每个崩溃窗口、提交结果未知时
+// 本次启动失败而下次启动恢复、另一个数据目录不能接管 pending、令牌丢失与损坏、旧 pending 记录，以及
+// 三种拒绝启动的情况。
+func TestInstallationBootstrapE46(t *testing.T) {
+	ctx := context.Background()
+	open := func(t *testing.T) (*Store, string) {
+		s, err := Open(ctx, Options{DSN: newDatabase(t)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(s.Close)
+		return s, t.TempDir()
+	}
+	var seq atomic.Int64
+	newID := func() string { return fmt.Sprintf("install-%d", seq.Add(1)) }
+	newToken := func() ([]byte, error) {
+		b := make([]byte, ownership.TokenSize)
+		_, err := rand.Read(b)
+		return b, err
+	}
+	boot := func(s *Store, dir string) (string, error) {
+		return ownership.Bootstrap(ctx, s, datadir.NewIDFile(dir), datadir.NewTokenFile(dir), newID, newToken)
+	}
+	finish := func(t *testing.T, s *Store, dir, want string) {
+		t.Helper()
+		id, err := boot(s, dir)
+		if err != nil || (want != "" && id != want) {
+			t.Fatalf("重新引导得到 (%q, %v)，期望 %q", id, err, want)
+		}
+		st, _ := s.InspectInstallation(ctx)
+		fid, _, _ := datadir.NewIDFile(dir).Read()
+		if st.Installation == nil || !st.Installation.Complete || st.Installation.InstallID != id || fid != id {
+			t.Fatalf("引导后状态不一致：%+v 文件 %q", st.Installation, fid)
+		}
+	}
+	refused := func(t *testing.T, s *Store, dir string) {
+		t.Helper()
+		if _, err := boot(s, dir); !errors.Is(err, ownership.ErrRefused) {
+			t.Fatalf("应拒绝启动，得到 %v", err)
+		}
+	}
+	token := func(t *testing.T, dir string) string {
+		t.Helper()
+		b, exists, err := datadir.NewTokenFile(dir).Read()
+		if err != nil || !exists {
+			t.Fatalf("令牌应已持久化：exists=%v err=%v", exists, err)
+		}
+		return string(b)
+	}
+	// pendingUnknown 让初始化事务真正提交而回复丢失：本次引导必须失败（结束本次启动），库中留下 pending。
+	pendingUnknown := func(t *testing.T, s *Store, dir string) string {
+		t.Helper()
+		s.hooks.afterCommit = func(op string) error {
+			if op == "InitializeInstallation" {
+				return errors.New("模拟：COMMIT 已执行但回复丢失")
+			}
+			return nil
+		}
+		defer func() { s.hooks.afterCommit = nil }()
+		if id, err := boot(s, dir); !errors.Is(err, persistence.ErrCommitUnknown) || id != "" {
+			t.Fatalf("初始化提交结果未知时本次启动应失败且不返回 install_id，得到 (%q, %v)", id, err)
+		}
+		st, _ := s.InspectInstallation(ctx)
+		if st.Installation == nil || st.Installation.Complete {
+			t.Fatalf("库中应留下 pending 记录：%+v", st.Installation)
+		}
+		return st.Installation.InstallID
+	}
+
+	t.Run("空库首启", func(t *testing.T) {
+		s, dir := open(t)
+		finish(t, s, dir, "")
+	})
+	t.Run("令牌已持久、初始化事务提交前中断：重启复用同一令牌", func(t *testing.T) {
+		s, dir := open(t)
+		fired := false
+		s.hooks.beforeCommit = func(string) error { fired = true; return errors.New("模拟中断") }
+		if _, err := boot(s, dir); err == nil || !fired {
+			t.Fatalf("中断应使引导失败（钩子触发 %v），得到 %v", fired, err)
+		}
+		s.hooks.beforeCommit = nil
+		if st, _ := s.InspectInstallation(ctx); st.HasMigrations || st.HasAgentboxTables {
+			t.Fatalf("事务未提交时库应仍为空：%+v", st)
+		}
+		before := token(t, dir)
+		finish(t, s, dir, "")
+		if token(t, dir) != before {
+			t.Fatal("重启应复用已持久化的令牌，而不是生成新令牌")
+		}
+	})
+	t.Run("初始化提交结果未知：本次启动失败，下次启动恢复", func(t *testing.T) {
+		s, dir := open(t)
+		id := pendingUnknown(t, s, dir)
+		finish(t, s, dir, id)
+	})
+	t.Run("另一个数据目录不能接管 pending 安装", func(t *testing.T) {
+		s, dirA := open(t)
+		id := pendingUnknown(t, s, dirA)
+		dirB := t.TempDir()
+		refused(t, s, dirB)
+		if st, _ := s.InspectInstallation(ctx); st.Installation == nil || st.Installation.Complete || st.Installation.InstallID != id {
+			t.Fatalf("被拒绝后库不应改变：%+v", st.Installation)
+		}
+		if _, exists, _ := datadir.NewIDFile(dirB).Read(); exists {
+			t.Fatal("被拒绝的数据目录不应写入 install_id")
+		}
+		if _, exists, _ := datadir.NewTokenFile(dirB).Read(); exists {
+			t.Fatal("被拒绝的数据目录不应生成令牌")
+		}
+		finish(t, s, dirA, id)
+	})
+	t.Run("本数据目录的令牌丢失：拒绝", func(t *testing.T) {
+		s, dir := open(t)
+		pendingUnknown(t, s, dir)
+		if err := os.Remove(dir + "/bootstrap_token"); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, s, dir)
+	})
+	t.Run("令牌损坏：启动失败而不是当作首次安装", func(t *testing.T) {
+		s, dir := open(t)
+		if err := os.WriteFile(dir+"/bootstrap_token", []byte("not-a-token\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if id, err := boot(s, dir); !errors.Is(err, datadir.ErrTokenCorrupt) || id != "" {
+			t.Fatalf("应因令牌损坏失败，得到 (%q, %v)", id, err)
+		}
+		if st, _ := s.InspectInstallation(ctx); st.HasMigrations || st.HasAgentboxTables {
+			t.Fatalf("令牌损坏时不应初始化数据库：%+v", st)
+		}
+	})
+	t.Run("写身份文件后、置 complete 前中断", func(t *testing.T) {
+		s, dir := open(t)
+		id := pendingUnknown(t, s, dir)
+		if err := datadir.NewIDFile(dir).Write(id); err != nil {
+			t.Fatal(err)
+		}
+		finish(t, s, dir, id)
+	})
+	t.Run("旧 pending 记录（修订前，无令牌哈希列）", func(t *testing.T) {
+		s, dir := open(t)
+		if err := s.InitializeInstallation(ctx, "install-legacy", make([]byte, ownership.TokenSize)); err != nil {
+			t.Fatal(err)
+		}
+		// 还原为只应用了 0001 的旧库
+		if _, err := s.pool.Exec(ctx, "ALTER TABLE installation DROP COLUMN bootstrap_token_hash; DELETE FROM schema_migrations WHERE version = 2"); err != nil {
+			t.Fatal(err)
+		}
+		if st, err := s.InspectInstallation(ctx); err != nil || st.Installation == nil || st.Installation.TokenHash != nil {
+			t.Fatalf("旧库应读作无令牌哈希：%+v %v", st.Installation, err)
+		}
+		refused(t, s, dir) // 无身份文件：无法证明由本目录发起
+		if err := datadir.NewIDFile(dir).Write("install-legacy"); err != nil {
+			t.Fatal(err)
+		}
+		finish(t, s, dir, "install-legacy") // 身份文件一致：置 complete
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if n := count(t, s, "SELECT count(*) FROM schema_migrations WHERE version = 2"); n != 1 {
+			t.Fatalf("引导完成后应应用 0002，得到 %d", n)
+		}
+	})
+	t.Run("库中的令牌哈希必须为 32 字节", func(t *testing.T) {
+		s, dir := open(t)
+		finish(t, s, dir, "")
+		if _, err := s.pool.Exec(ctx, `UPDATE installation SET bootstrap_token_hash = '\x0102'`); sqlState(err) != "23514" {
+			t.Fatalf("长度不对的令牌哈希应违反检查约束，得到 %v", err)
+		}
+	})
+	t.Run("有 schema 无 installation 记录", func(t *testing.T) {
+		s, dir := open(t)
+		if err := s.InitializeInstallation(ctx, "install-c", make([]byte, ownership.TokenSize)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.pool.Exec(ctx, "DELETE FROM installation"); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, s, dir)
+	})
+	t.Run("身份不一致", func(t *testing.T) {
+		s, dir := open(t)
+		finish(t, s, dir, "")
+		if err := datadir.NewIDFile(dir).Write("install-other"); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, s, dir)
+	})
+	t.Run("未知 schema", func(t *testing.T) {
+		s, dir := open(t)
+		if _, err := s.pool.Exec(ctx, "CREATE TABLE tasks (task_id text)"); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, s, dir)
+	})
+}
+```
+
+- [ ] **Step 2：验证（含回退检查）**
+
+```bash
+MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -e bash -c 'export PATH=/usr/local/go/bin:/usr/bin:/bin GOTOOLCHAIN=local GOPROXY=file:///mnt/f/go-agentbox/.superpowers/goproxy GOSUMDB=off AGENTBOX_TEST_DATABASE_URL="postgres://agentbox:agentbox@127.0.0.1:5432/agentbox?sslmode=disable"; cd /mnt/f/go-agentbox-m1-4 && go vet ./... && GOOS=windows go build ./... && CI=true go test -count=1 ./...'
+```
+
+Expected: 全部 `ok`。回退检查：把 `Decide` 中令牌比较的分支改为 `case false && …` 时，`另一个数据目录不能接管_pending_安装` 与 `本数据目录的令牌丢失：拒绝` 失败；把 `TokenFile.Read` 的损坏分支改为返回"不存在"时，`令牌损坏：启动失败而不是当作首次安装` 失败。
+
+- [ ] **Step 3：提交**
+
+```bash
+cd /f/go-agentbox-m1-4 && git add internal/datadir internal/ownership internal/persistence/postgres/migrate.go internal/persistence/postgres/migrations/0002_bootstrap_token.sql internal/persistence/postgres/postgres_test.go && git commit -m "feat(ownership): 安装身份引导令牌——pending 记录只能由发起的数据目录继续" ${COAUTHOR:+-m "$COAUTHOR"}
 ```
 
 ---
