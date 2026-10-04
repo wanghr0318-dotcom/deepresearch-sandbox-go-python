@@ -17,3 +17,6 @@ const (
 	MaxRefsPerCheckpoint = 1024
 	MaxArtifactPathBytes = 4096
 )
+
+// maxLineBytes 是任何消息类型上限中的最大值；超过它的行不解析，直接判为过大。
+const maxLineBytes = max(MaxEventBytes, MaxInitBytes)

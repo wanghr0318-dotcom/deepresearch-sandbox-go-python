@@ -40,8 +40,8 @@ var registry = map[Direction]map[string]func() Message{
 // DecodeLine 解析并校验一行消息（不含行尾换行符）。
 // 未知字段忽略；未知类型、超限、字段类型错误与语义违规均返回 *Error。
 func DecodeLine(dir Direction, line []byte) (Message, error) {
-	if len(line) > MaxEventBytes {
-		return nil, newError(CodeMessageTooLarge, "%d 字节，上限 %d", len(line), MaxEventBytes)
+	if len(line) > maxLineBytes {
+		return nil, newError(CodeMessageTooLarge, "%d 字节，上限 %d", len(line), maxLineBytes)
 	}
 	if t := bytes.TrimSpace(line); len(t) == 0 || t[0] != '{' {
 		return nil, newError(CodeMalformedJSON, "消息必须是 JSON 对象")
@@ -98,10 +98,14 @@ func EncodeLine(dir Direction, m Message) ([]byte, error) {
 	return b, nil
 }
 
-// checkSize 按方向与类型检查上限：宿主控制消息（init 除外）16 KiB，其余 1 MiB。
+// checkSize 按方向与类型检查上限：Worker 事件 MaxEventBytes，init MaxInitBytes，
+// 其他宿主控制消息 MaxControlBytes。
 func checkSize(dir Direction, typ string, n int) error {
 	limit := MaxEventBytes
-	if dir == HostToWorker && typ != TypeInit {
+	switch {
+	case dir == HostToWorker && typ == TypeInit:
+		limit = MaxInitBytes
+	case dir == HostToWorker:
 		limit = MaxControlBytes
 	}
 	if n > limit {
