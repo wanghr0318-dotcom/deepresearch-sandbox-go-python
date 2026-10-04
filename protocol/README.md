@@ -36,7 +36,7 @@
 | Worker→宿主 | `error` | `code` |
 | Worker→宿主 | `handshake_error` | `bootstrap = 1`、`code`（不带 `v` 与 `seq`） |
 
-**产物路径**：相对、非空、无 NUL、≤ 4096 字节、不含空、`.` 或 `..` 分量。**sha256**：64 个小写十六进制字符。
+**产物路径**：相对、非空、无 NUL、≤ 4096 字节、不含空、`.` 或 `..` 分量。JSON Schema 只能按字符计长，不表达 4096 字节上限，该上限由编解码器检查（`path_invalid`）。**sha256**：64 个小写十六进制字符。
 
 ## 大小上限（UTF-8 字节）
 
@@ -44,7 +44,7 @@
 
 ## 判定顺序与错误码
 
-依次检查：非 JSON 对象 → `malformed_json`；`type` 缺失、非字符串或不属于该方向 → `unknown_type`；超限 → `message_too_large`；字段类型错误 → `invalid_field`；然后是各类型的语义规则：`version_mismatch`、`missing_field`、`invalid_field`、`state_too_large`、`too_many_refs`、`path_invalid`。
+依次检查：行长超过任何类型上限中的最大值（1 MiB）→ `message_too_large`，不解析；行不是严格的 UTF-8（含 BOM 前缀）、不是 JSON 对象或嵌套过深 → `malformed_json`；`type` 缺失、非字符串或不属于该方向 → `unknown_type`；超过该类型的上限 → `message_too_large`；字段类型错误 → `invalid_field`；然后是各类型的语义规则：`version_mismatch`、`missing_field`、`invalid_field`、`state_too_large`、`too_many_refs`、`path_invalid`。
 
 ## 事件流顺序（task 模式）
 
