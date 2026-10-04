@@ -223,6 +223,7 @@ from pathlib import Path
 from typing import Any
 
 from agentbox_worker import Result, TaskContext, Timing, WorkerFailure, run_worker
+from agentbox_worker.runtime import MAX_ERROR_MESSAGE_BYTES, SHUTDOWN_TIMEOUT_ENV, _shutdown_timeout
 
 FAST = Timing(ack_timeout=0.05, max_ack_attempts=3, retry_backoff=0.01, artifact_timeout=0.5)
 INIT = {
@@ -377,6 +378,78 @@ def test_invalid_control_message_fails_task(tmp_path):
     assert events[1]["code"] == "control_protocol_error"
 
 
+class HoldsProgress(MemoryTransport):
+    """progress 的发送要等宿主的第二条消息（第一条是 init）被读出之后才完成。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+        self.received = 0
+
+    async def receive(self) -> bytes | None:
+        line = await super().receive()
+        self.received += 1
+        if self.received == 2:
+            asyncio.get_running_loop().call_soon(self.release.set)
+        return line
+
+    async def send(self, line: bytes) -> None:
+        await super().send(line)
+        if json.loads(line)["type"] == "progress":
+            await self.release.wait()
+
+
+def test_control_error_waits_for_inflight_send(tmp_path):
+    async def app(ctx):
+        await ctx.progress("step_started", "x")
+        await asyncio.sleep(10)
+        return Result("never", [])
+
+    async def go():
+        transport = HoldsProgress()
+        transport.feed(json.dumps({**INIT, "out_dir": str(tmp_path)}).encode())
+        transport.feed(b'{"type":"bogus","v":1}')
+        code = await asyncio.wait_for(
+            run_worker(app, transport, name="w", version="0", timing=FAST), timeout=5
+        )
+        return code, sent_json(transport)
+
+    code, events = asyncio.run(go())
+    assert code == 1
+    assert types(events) == ["ready", "progress", "error"]
+    assert events[-1]["code"] == "control_protocol_error"
+
+
+@pytest.mark.parametrize(
+    ("raised", "message"),
+    [
+        pytest.param(
+            WorkerFailure("bad_input", "x" * (1 << 20)),
+            "x" * MAX_ERROR_MESSAGE_BYTES,
+            id="oversized_message",
+        ),
+        pytest.param(ValueError("坏文件名 \udcff"), "ValueError: 坏文件名 ?", id="lone_surrogate"),
+    ],
+)
+def test_failure_message_is_made_encodable(tmp_path, raised, message):
+    async def app(ctx):
+        raise raised
+
+    code, events = run(app, tmp_path)
+    assert code == 1
+    assert types(events) == ["ready", "error"]
+    assert events[1]["message"] == message
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("2.5", 2.5), ("0", 0.0), ("inf", 5.0), ("nan", 5.0), ("-1", 5.0), ("1e300", 5.0), ("x", 5.0)],
+)
+def test_shutdown_timeout_falls_back_on_unusable_values(monkeypatch, raw, expected):
+    monkeypatch.setenv(SHUTDOWN_TIMEOUT_ENV, raw)
+    assert _shutdown_timeout() == expected
+
+
 def test_only_one_checkpoint_in_flight(tmp_path):
     in_flight = 0
     overlaps: list[str] = []
@@ -416,6 +489,34 @@ def test_unresolved_after_max_attempts(tmp_path):
     assert code == 1
     assert types(events).count("checkpoint_query") == FAST.max_ack_attempts
     assert events[-1]["code"] == "checkpoint_unresolved" and events[-1]["retryable"] is True
+
+
+def test_reply_to_last_query_is_awaited(tmp_path):
+    queries = 0
+
+    def respond(msg, transport):
+        nonlocal queries
+        if msg["type"] != "checkpoint_query":
+            return
+        queries += 1
+        if queries == FAST.max_ack_attempts:
+            reply(
+                transport,
+                {
+                    "type": "checkpoint_result",
+                    "checkpoint_id": msg["checkpoint_id"],
+                    "scope": "task",
+                    "status": "committed",
+                },
+            )
+
+    async def app(ctx):
+        return Result(await ctx.checkpoint("s1", state={}), [])
+
+    code, events = run(app, tmp_path, responder=respond)
+    assert code == 0
+    assert types(events).count("checkpoint_query") == FAST.max_ack_attempts
+    assert events[-1]["type"] == "result"
 
 
 @pytest.mark.parametrize(

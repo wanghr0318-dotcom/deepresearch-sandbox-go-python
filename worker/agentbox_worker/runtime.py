@@ -40,6 +40,12 @@ EXIT_FAILURE = 1
 EXIT_HANDSHAKE = 2
 
 SHUTDOWN_TIMEOUT_ENV = "AGENTBOX_WORKER_SHUTDOWN_TIMEOUT"
+DEFAULT_SHUTDOWN_TIMEOUT = 5.0
+MAX_SHUTDOWN_TIMEOUT = 3600.0  # 超过线程等待的可表示范围会抛异常，取一个足够大的上限
+
+# error 事件中 code 与 message 的上限（UTF-8 字节），保证事件远小于 1 MiB 的事件上限
+MAX_ERROR_CODE_BYTES = 256
+MAX_ERROR_MESSAGE_BYTES = 8 << 10
 
 
 @dataclass(frozen=True)
@@ -193,26 +199,30 @@ class TaskContext:
     async def _submit_checkpoint(
         self, checkpoint_id: str, body: dict[str, Any]
     ) -> tuple[str, str | None]:
+        query = {"type": "checkpoint_query", "checkpoint_id": checkpoint_id, "scope": "task"}
+        limit = self._timing.max_ack_attempts
+        retries = 0  # 查询与重发共用上限；每次发送之后都等待一次结果
         pending = self._checkpoint_results.expect(checkpoint_id)
         await self._emit(body)
-        for _ in range(self._timing.max_ack_attempts):
+        while True:
             try:
                 result = await asyncio.wait_for(asyncio.shield(pending), self._timing.ack_timeout)
             except TimeoutError:
-                query = {
-                    "type": "checkpoint_query",
-                    "checkpoint_id": checkpoint_id,
-                    "scope": "task",
-                }
+                if retries == limit:
+                    break
+                retries += 1
                 await self._emit(query)
                 continue
             if result["status"] not in ("retryable_error", "not_found"):
                 return result["status"], result.get("code")
+            if retries == limit:
+                break
+            retries += 1
             await asyncio.sleep(self._timing.retry_backoff)
             pending = self._checkpoint_results.expect(checkpoint_id)
             await self._emit(body)
         raise CheckpointUnresolved(
-            f"checkpoint {checkpoint_id}: {self._timing.max_ack_attempts} 次后仍无确定结果"
+            f"checkpoint {checkpoint_id}: {limit} 次查询或重发后仍无确定结果"
         )
 
     async def register_artifact(
@@ -377,7 +387,8 @@ async def _control_loop(ctx: TaskContext, transport: Transport, app_task: asynci
             keep_going = ctx._handle_control(decode_line(HOST, line))
         except ProtocolError as exc:
             ctx.control_error = exc
-            app_task.cancel()
+            # 等在途发送结束再取消：取消落在发送中途会使输出通道失效，error 事件就发不出去
+            await ctx._outbox.cancel_when_idle(app_task)
             return
         if not keep_going:
             app_task.cancel()
@@ -421,23 +432,35 @@ async def _emit_outcome(ctx: TaskContext, outcome: Any) -> int:
     return await _emit_failure(ctx, failure)
 
 
+def _safe_text(text: str, limit: int) -> str:
+    """替换孤立代理项并按 UTF-8 字节截断，保证 error 事件一定可以编码。"""
+    return text.encode("utf-8", "replace")[:limit].decode("utf-8", "ignore")
+
+
 async def _emit_failure(ctx: TaskContext, failure: WorkerFailure) -> int:
-    await ctx._outbox.emit(
-        {
-            "type": "error",
-            "code": failure.code,
-            "message": failure.message,
-            "retryable": failure.retryable,
-        }
-    )
+    body = {
+        "type": "error",
+        "code": _safe_text(failure.code, MAX_ERROR_CODE_BYTES),
+        "message": _safe_text(failure.message, MAX_ERROR_MESSAGE_BYTES),
+        "retryable": failure.retryable,
+    }
+    try:
+        await ctx._outbox.emit(body)
+    except ProtocolError:  # 清理后仍无法编码：退回固定内容的 internal_error
+        fallback = {"type": "error", "code": "internal_error", "message": "错误事件无法编码"}
+        await ctx._outbox.emit({**fallback, "retryable": failure.retryable})
     return EXIT_FAILURE
 
 
 def _shutdown_timeout() -> float:
+    """读取收尾期限；非数值、负数、NaN 或超过上限时使用默认值。"""
     try:
-        return float(os.environ.get(SHUTDOWN_TIMEOUT_ENV, "5"))
+        value = float(os.environ.get(SHUTDOWN_TIMEOUT_ENV, DEFAULT_SHUTDOWN_TIMEOUT))
     except ValueError:
-        return 5.0
+        return DEFAULT_SHUTDOWN_TIMEOUT
+    if 0 <= value <= MAX_SHUTDOWN_TIMEOUT:  # NaN 的比较为假
+        return value
+    return DEFAULT_SHUTDOWN_TIMEOUT
 
 
 def main(app: App, *, name: str, version: str, capabilities: Iterable[str] = ()) -> NoReturn:
@@ -464,7 +487,9 @@ def main(app: App, *, name: str, version: str, capabilities: Iterable[str] = ())
     except BaseException:  # noqa: B036  进程入口：任何异常都必须走有界退出
         traceback.print_exc()
     finally:
-        if not transport.close(_shutdown_timeout()):
-            _log("退出时仍有未写出的协议输出（宿主可能已停止读取 stdout）")
-        sys.stderr.flush()
-        os._exit(code)
+        try:
+            if not transport.close(_shutdown_timeout()):
+                _log("退出时仍有未写出的协议输出（宿主可能已停止读取 stdout）")
+            sys.stderr.flush()
+        finally:  # 收尾本身失败（如 stderr 已关闭）也必须以既定退出码退出
+            os._exit(code)

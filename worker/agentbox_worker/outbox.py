@@ -47,6 +47,14 @@ class Outbox:
             body = {"type": "handshake_error", "bootstrap": BOOTSTRAP_VERSION, "code": code}
             await self._send(encode_line(WORKER, body), "handshake_error")
 
+    async def cancel_when_idle(self, task: asyncio.Task[Any]) -> None:
+        """等当前在途发送结束后取消 task，使取消不会落在发送中途而令通道失效。
+
+        task 的取消在它下一次恢复执行时生效；若它正等待发送锁，会在取得锁之前收到取消。
+        """
+        async with self._lock:
+            task.cancel()
+
     def _check_usable(self) -> None:
         if self._broken is not None:
             raise TransportBroken(self._broken)
