@@ -25,7 +25,7 @@
       "required": ["type", "v", "seq"],
       "properties": {
         "v": {"const": 1},
-        "seq": {"type": "integer", "minimum": 1},
+        "seq": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
         "ts": {"type": "string"}
       }
     },
@@ -62,7 +62,7 @@
         "artifact_id": {"$ref": "#/$defs/nonEmpty"},
         "path": {"$ref": "#/$defs/artifactPath"},
         "declared_sha256": {"$ref": "#/$defs/sha256"},
-        "declared_size": {"type": "integer", "minimum": 0},
+        "declared_size": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
         "media_type": {"$ref": "#/$defs/nonEmpty"},
         "visibility": {"enum": ["output", "internal"]}
       }

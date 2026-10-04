@@ -116,7 +116,6 @@ func TestDecodeLimits(t *testing.T) {
 		{"refs 超过上限", WorkerToHost, string(checkpointLine(`{}`, append(refs, ref))), CodeTooManyRefs},
 		{"超过所有上限的行不解析", HostToWorker, strings.Repeat("x", MaxInitBytes+1), CodeMessageTooLarge},
 		{"非法 UTF-8", WorkerToHost, "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"\xff\"}", CodeMalformedJSON},
-		{"嵌套过深", WorkerToHost, `{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":` + strings.Repeat("[", 100000) + strings.Repeat("]", 100000) + `}`, CodeMalformedJSON},
 		{"孤立代理项转义可以解码", WorkerToHost, string(checkpointLine(`"\ud800"`, []string{})), ""},
 	}
 	for _, c := range cases {

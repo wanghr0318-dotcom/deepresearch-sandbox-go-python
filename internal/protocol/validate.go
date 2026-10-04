@@ -72,7 +72,7 @@ func (m *ArtifactResult) validate() error {
 func (m *Cancel) validate() error { return validateStop(m.V, m.AttemptID, m.GraceMS) }
 func (m *Pause) validate() error  { return validateStop(m.V, m.AttemptID, m.GraceMS) }
 
-func validateStop(v int, attemptID string, graceMS int64) error {
+func validateStop(v int64, attemptID string, graceMS int64) error {
 	if err := firstErr(checkVersion(v), required("attempt_id", attemptID)); err != nil {
 		return err
 	}
@@ -158,7 +158,7 @@ func (m *HandshakeError) validate() error {
 	return required("code", m.Code)
 }
 
-func checkVersion(v int) error {
+func checkVersion(v int64) error {
 	if v != Version {
 		return newError(CodeVersionMismatch, "v=%d，期望 %d", v, Version)
 	}

@@ -31,7 +31,7 @@
         "v": {"const": 1},
         "artifact_id": {"$ref": "#/$defs/nonEmpty"},
         "status": {"enum": ["saved", "rejected"]},
-        "version": {"type": "integer"},
+        "version": {"type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807},
         "sha256": {"type": "string"},
         "code": {"type": "string"}
       },
@@ -53,7 +53,7 @@
         "v": {"const": 1},
         "attempt_id": {"$ref": "#/$defs/nonEmpty"},
         "reason": {"type": "string"},
-        "grace_ms": {"type": "integer", "minimum": 0}
+        "grace_ms": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807}
       }
     },
     "cancel": {"allOf": [{"$ref": "#/$defs/stop"}, {"properties": {"type": {"const": "cancel"}}}]},

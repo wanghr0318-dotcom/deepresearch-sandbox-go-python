@@ -24,7 +24,11 @@
     {"name": "paused", "direction": "worker", "message": {"type": "paused", "v": 1, "seq": 6, "checkpoint_id": "cp-1"}},
     {"name": "result", "direction": "worker", "message": {"type": "result", "v": 1, "seq": 7, "summary": "完成", "outputs": ["report"]}},
     {"name": "error", "direction": "worker", "message": {"type": "error", "v": 1, "seq": 2, "code": "internal_error", "message": "boom", "retryable": true}},
-    {"name": "handshake_error", "direction": "worker", "message": {"type": "handshake_error", "bootstrap": 1, "code": "no_common_version"}}
+    {"name": "handshake_error", "direction": "worker", "message": {"type": "handshake_error", "bootstrap": 1, "code": "no_common_version"}},
+    {"name": "progress_depth_64", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}"},
+    {"name": "progress_number_literal_32_chars", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":-1.111111111111111111111111e-100}"},
+    {"name": "progress_subnormal_number", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":5e-324}"},
+    {"name": "progress_big_integer_in_free_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":12345678901234567890123}"}
   ],
   "invalid": [
     {"name": "malformed_json_truncated", "direction": "worker", "raw": "{\"type\":\"ready\"", "code": "malformed_json"},
@@ -67,6 +71,23 @@
     {"name": "error_retryable_not_bool", "direction": "worker", "message": {"type": "error", "v": 1, "seq": 2, "code": "x", "message": "boom", "retryable": "yes"}, "code": "invalid_field"},
     {"name": "handshake_error_bad_bootstrap", "direction": "worker", "message": {"type": "handshake_error", "bootstrap": 2, "code": "no_common_version"}, "code": "invalid_field"},
     {"name": "utf8_bom_prefix", "direction": "worker", "raw": "\ufeff{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "malformed_json"},
-    {"name": "seq_out_of_int64_range", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":99999999999999999999,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"}
+    {"name": "seq_out_of_int64_range", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":99999999999999999999,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
+    {"name": "progress_depth_65", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}", "code": "malformed_json"},
+    {"name": "progress_number_literal_33_chars", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":-1.1111111111111111111111111e-100}", "code": "malformed_json"},
+    {"name": "progress_float_overflow", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":1e999}", "code": "malformed_json"},
+    {"name": "progress_float_underflow", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":1e-999}", "code": "malformed_json"},
+    {"name": "progress_nan", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":NaN}", "code": "malformed_json"},
+    {"name": "progress_duplicate_key", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"seq\":1}", "code": "malformed_json"},
+    {"name": "progress_duplicate_key_escaped", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"\\u0073eq\":1}", "code": "malformed_json"},
+    {"name": "progress_duplicate_key_in_free_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"data\":{\"a\":1,\"a\":2}}", "code": "malformed_json"},
+    {"name": "progress_case_variant_key", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"Seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
+    {"name": "progress_case_variant_alongside_correct", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\",\"SEQ\":1}", "code": "invalid_field"},
+    {"name": "progress_case_variant_kelvin", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"Kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
+    {"name": "ready_case_variant_nested", "direction": "worker", "raw": "{\"type\":\"ready\",\"v\":1,\"seq\":1,\"protocol_version\":1,\"mode\":\"task\",\"capabilities\":[],\"worker\":{\"Name\":\"w\",\"version\":\"1\"}}", "code": "invalid_field"},
+    {"name": "progress_seq_float_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1.0,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
+    {"name": "progress_seq_exponent_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":1e0,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"},
+    {"name": "progress_v_float_form", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1.0,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "version_mismatch"},
+    {"name": "progress_version_checked_before_field_types", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":2,\"seq\":\"x\",\"kind\":\"x\",\"message\":\"y\"}", "code": "version_mismatch"},
+    {"name": "progress_type_case_variant", "direction": "worker", "raw": "{\"TYPE\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "unknown_type"}
   ]
 }

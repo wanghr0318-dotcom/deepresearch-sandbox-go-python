@@ -44,9 +44,16 @@
 
 ## 判定顺序与错误码
 
-依次检查：行长超过任何类型上限中的最大值（1 MiB）→ `message_too_large`，不解析；行不是严格的 UTF-8（含 BOM 前缀）、不是 JSON 对象或嵌套过深 → `malformed_json`；`type` 缺失、非字符串或不属于该方向 → `unknown_type`；超过该类型的上限 → `message_too_large`；字段类型错误 → `invalid_field`；然后是各类型的语义规则：`version_mismatch`、`missing_field`、`invalid_field`、`state_too_large`、`too_many_refs`、`path_invalid`。
+依次检查：行长超过任何类型上限中的最大值（1 MiB）→ `message_too_large`，不解析；行不是严格的 UTF-8（含 BOM 前缀）、不是 JSON 对象，或违反 JSON 结构限制（嵌套超过 64 层；任意层级的重复键，按解码后的键名比较；数字字面量超过 32 个字符；浮点字面量上溢为无穷或非零值下溢为零）→ `malformed_json`；`type` 缺失（键名区分大小写）、非字符串或不属于该方向 → `unknown_type`；超过该类型的大小上限 → `message_too_large`；`v` 不是整数形式的 1 → `version_mismatch`；与已定义字段只差大小写的键（按消息类型逐层检查，含 `resume`、`worker`）→ `invalid_field`；字段类型错误（整数字段只接受整数形式且在 int64 范围内）→ `invalid_field`；然后按各类型的语义规则依次检查。
 
-**两侧已知差异**（尚未统一，是否收紧由协议另行决定）：① 嵌套深度没有协议级上限——Go 在 10000 层报 `malformed_json`，Python 取决于解释器（3.11、3.13 在约 1000–2500 层报 `malformed_json`，3.14 起按 C 栈检查，数万层仍可解析；测试统一用 10 万层，各方都拒绝）；② 键名大小写——Go 按结构体字段不区分大小写匹配（含 Unicode 折叠），Python 只认精确键名；③ 重复键——Go 取后者但 `null` 不覆盖前值、前值的类型错误不被后者纠正，Python 取最后一个；④ 超过 4300 位的整数——Go 在整数字段报 `invalid_field`、在自由格式字段（`state`、`data`、`config`）接受，Python 一律报 `malformed_json`。合规的发送方（本 SDK 与宿主）不会产生这些输入。
+| JSON 结构限制（对整行生效，自由格式字段同样受限） | 上限 |
+|---|---|
+| 对象与数组的嵌套层数（消息顶层对象计 1） | 64 |
+| 数字字面量的字符数（含负号、小数点、指数符号与指数正负号） | 32 |
+| 重复键（任意层级，按解码后的键名比较） | 不允许 |
+| 浮点字面量 | 不得上溢为无穷；非零值不得下溢为零 |
+
+违反上述限制为 `malformed_json`，在消息类型判定之前检查。键名区分大小写：在已定义字段的对象中（消息顶层及其结构化子对象），与已定义字段只差大小写的键为 `invalid_field`（按 Unicode 简单大小写折叠比较），其余未知键忽略。整数类型字段只接受整数形式（拒绝 `1.0`、`1e0` 与布尔值），取值在 int64 范围内。
 
 ## 事件流顺序（task 模式）
 

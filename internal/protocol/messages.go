@@ -59,7 +59,7 @@ type event interface {
 // HostHeader 是宿主控制消息（init 除外）的公共字段。
 type HostHeader struct {
 	Type string `json:"type"`
-	V    int    `json:"v"`
+	V    int64  `json:"v"`
 }
 
 func (h HostHeader) declaredType() string { return h.Type }
@@ -67,7 +67,7 @@ func (h HostHeader) declaredType() string { return h.Type }
 // EventHeader 是 Worker 事件的公共字段。ts 仅用于诊断（规格 §5.3）。
 type EventHeader struct {
 	Type string `json:"type"`
-	V    int    `json:"v"`
+	V    int64  `json:"v"`
 	Seq  int64  `json:"seq"`
 	TS   string `json:"ts,omitempty"`
 }
@@ -79,12 +79,12 @@ func (h EventHeader) header() EventHeader  { return h }
 // 组成引导信封，永不改变（规格 §5.2）；init 本身不带 v。
 type Init struct {
 	Type             string          `json:"type"`
-	Bootstrap        int             `json:"bootstrap"`
-	ProtocolVersions []int           `json:"protocol_versions"`
+	Bootstrap        int64           `json:"bootstrap"`
+	ProtocolVersions []int64         `json:"protocol_versions"`
 	Mode             string          `json:"mode"`
 	TaskID           string          `json:"task_id"`
 	AttemptID        string          `json:"attempt_id"`
-	AttemptNo        int             `json:"attempt_no"`
+	AttemptNo        int64           `json:"attempt_no"`
 	Traceparent      string          `json:"traceparent,omitempty"`
 	Config           json.RawMessage `json:"config,omitempty"`
 	ConfigVersion    string          `json:"config_version,omitempty"`
@@ -117,7 +117,7 @@ type ArtifactResult struct {
 	HostHeader
 	ArtifactID string `json:"artifact_id"`
 	Status     string `json:"status"`
-	Version    int    `json:"version,omitempty"`
+	Version    int64  `json:"version,omitempty"`
 	SHA256     string `json:"sha256,omitempty"`
 	Code       string `json:"code,omitempty"`
 }
@@ -147,7 +147,7 @@ type WorkerInfo struct {
 // Ready 是 Worker 完成握手后的第一条事件。
 type Ready struct {
 	EventHeader
-	ProtocolVersion int        `json:"protocol_version"`
+	ProtocolVersion int64      `json:"protocol_version"`
 	Mode            string     `json:"mode"`
 	Worker          WorkerInfo `json:"worker"`
 	Capabilities    []string   `json:"capabilities"`
@@ -215,7 +215,7 @@ type ErrorEvent struct {
 // HandshakeError 在没有共同协议版本时发出，格式固定（规格 §5.2）。
 type HandshakeError struct {
 	Type      string `json:"type"`
-	Bootstrap int    `json:"bootstrap"`
+	Bootstrap int64  `json:"bootstrap"`
 	Code      string `json:"code"`
 }
 

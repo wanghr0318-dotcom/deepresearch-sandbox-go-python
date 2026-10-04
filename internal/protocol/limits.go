@@ -18,5 +18,13 @@ const (
 	MaxArtifactPathBytes = 4096
 )
 
+// JSON 结构限制（规格 §5.10）：对整行生效，自由格式字段同样受限；违反时为 malformed_json。
+const (
+	// MaxNestingDepth 是对象与数组的最大嵌套层数，消息顶层对象计 1。
+	MaxNestingDepth = 64
+	// MaxNumberLiteralBytes 是数字字面量的最大字符数，含负号、小数点、指数符号与指数正负号。
+	MaxNumberLiteralBytes = 32
+)
+
 // maxLineBytes 是任何消息类型上限中的最大值；超过它的行不解析，直接判为过大。
 const maxLineBytes = max(MaxEventBytes, MaxInitBytes)

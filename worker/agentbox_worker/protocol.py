@@ -2,13 +2,15 @@
 
 规则与 Go 侧 internal/protocol 逐条对应，二者共用 protocol/fixtures/v1。
 消息以 dict 表示；未知字段忽略，未知类型是错误（规格 §5.3）。
-判定顺序：行长超过 1 MiB → 非严格 UTF-8 / 非 JSON 对象 / 嵌套过深 → 类型未知 → 超限
-→ 字段类型错误 → 语义规则。
+判定顺序：行长 → UTF-8 → JSON 结构限制 → 消息类型 → 类型上限 → 版本 → 键名大小写
+→ 字段类型 → 语义规则。
 """
 
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -26,6 +28,10 @@ MAX_REFS_PER_CHECKPOINT = 1024
 MAX_ARTIFACT_PATH_BYTES = 4096
 # 任何消息类型上限中的最大值；超过它的行不解析，直接判为过大。
 MAX_LINE_BYTES = max(MAX_EVENT_BYTES, MAX_INIT_BYTES)
+
+# JSON 结构限制（规格 §5.10）：对整行生效，自由格式字段同样受限；违反时为 malformed_json。
+MAX_NESTING_DEPTH = 64  # 对象与数组的最大嵌套层数，消息顶层对象计 1
+MAX_NUMBER_LITERAL_BYTES = 32  # 数字字面量的最大字符数，含负号、小数点、指数符号与指数正负号
 
 MODE_TASK = "task"
 MODE_SESSION = "session"
@@ -70,10 +76,20 @@ def _list_of(pred: Pred) -> Pred:
     return lambda v: isinstance(v, list) and all(x is None or pred(x) for x in v)
 
 
+class _Obj:
+    """嵌套对象字段的类型谓词；保留字段定义，供键名大小写检查逐层使用。"""
+
+    def __init__(self, spec: dict[str, Pred]) -> None:
+        self.spec = spec
+
+    def __call__(self, v: Any) -> bool:
+        return isinstance(v, dict) and all(
+            v.get(k) is None or pred(v[k]) for k, pred in self.spec.items()
+        )
+
+
 def _obj(spec: dict[str, Pred]) -> Pred:
-    return lambda v: (
-        isinstance(v, dict) and all(v.get(k) is None or pred(v[k]) for k, pred in spec.items())
-    )
+    return _Obj(spec)
 
 
 _STRS = _list_of(_is_str)
@@ -179,8 +195,10 @@ def _one_of(field: str, value: str, *allowed: str) -> None:
 
 
 def _check_version(msg: dict[str, Any]) -> None:
-    if _n(msg, "v") != VERSION:
-        raise ProtocolError("version_mismatch", f"v={_n(msg, 'v')}，期望 {VERSION}")
+    """v 必须是整数形式的 1（不接受 1.0、布尔值或缺失），否则为 version_mismatch。"""
+    v = msg.get("v")
+    if not (_is_int(v) and v == VERSION):
+        raise ProtocolError("version_mismatch", f"v={v!r}，期望 {VERSION}")
 
 
 def _check_event(msg: dict[str, Any]) -> None:
@@ -370,6 +388,70 @@ def _reject_constant(name: str) -> Any:
     raise ValueError(f"不允许的 JSON 常量 {name}")
 
 
+_JSON_STRING = re.compile(r'"(?:[^"\\]+|\\.)*"')
+_BRACKET = re.compile(r"[\[\]{}]")
+
+
+def _check_depth(text: str) -> None:
+    """在构建任何对象之前，按原始文本计算对象与数组的嵌套层数（字符串内的括号不计）。"""
+    depth = 0
+    for bracket in _BRACKET.finditer(_JSON_STRING.sub('""', text)):
+        if bracket.group() in "[{":
+            depth += 1
+            if depth > MAX_NESTING_DEPTH:
+                raise ValueError(f"嵌套超过 {MAX_NESTING_DEPTH} 层")
+        else:
+            depth -= 1
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """按解码后的键名比较：seq 与其转义写法 \\u0073eq 是同一个键。"""
+    obj: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError(f"重复的键 {key!r}")
+        obj[key] = value
+    return obj
+
+
+def _check_literal(lit: str) -> None:
+    if len(lit) > MAX_NUMBER_LITERAL_BYTES:
+        raise ValueError(f"数字字面量 {len(lit)} 个字符，上限 {MAX_NUMBER_LITERAL_BYTES}")
+
+
+def _parse_int(lit: str) -> int:
+    _check_literal(lit)
+    return int(lit)
+
+
+def _parse_float(lit: str) -> float:
+    """浮点字面量不得上溢为无穷，非零值不得下溢为零（与 Go 的 strconv.ParseFloat 结果一致）。"""
+    _check_literal(lit)
+    value = float(lit)
+    if math.isinf(value):
+        raise ValueError(f"数字 {lit} 超出 float64 范围")
+    mantissa = re.split("[eE]", lit)[0]
+    if value == 0.0 and re.search("[1-9]", mantissa):
+        raise ValueError(f"数字 {lit} 下溢为零")
+    return value
+
+
+def parse_json(raw: bytes) -> Any:
+    """按协议的 JSON 结构限制解析一行：严格 UTF-8，深度、重复键与数字字面量受限。"""
+    try:
+        text = raw.decode("utf-8")
+        _check_depth(text)
+        return json.loads(
+            text,
+            object_pairs_hook=_no_duplicate_keys,
+            parse_int=_parse_int,
+            parse_float=_parse_float,
+            parse_constant=_reject_constant,
+        )
+    except (ValueError, RecursionError) as exc:  # 含非法 UTF-8、BOM 与语法错误
+        raise ProtocolError("malformed_json", str(exc)) from exc
+
+
 def _check_size(direction: str, typ: str, size: int) -> None:
     if direction == WORKER:
         limit = MAX_EVENT_BYTES
@@ -388,6 +470,28 @@ def _check_types(typ: str, msg: dict[str, Any]) -> None:
             raise ProtocolError("invalid_field", f"{key} 类型不正确")
 
 
+_FOLD = str.maketrans({"\u212a": "k", "\u017f": "s"})
+
+
+def _fold(key: str) -> str:
+    """与 Go 的 strings.EqualFold 对 ASCII 字段名的判定一致：ASCII 大小写，加 U+212A 与 U+017F。"""
+    return "".join(c.lower() if c.isascii() else c for c in key.translate(_FOLD))
+
+
+def _check_key_case(spec: dict[str, Pred], obj: dict[str, Any]) -> None:
+    """拒绝与已定义字段只差大小写的键；按消息类型逐层检查，键按字典序检查。"""
+    for key in sorted(obj):
+        pred = spec.get(key)
+        if pred is not None:
+            if isinstance(pred, _Obj) and isinstance(obj[key], dict):
+                _check_key_case(pred.spec, obj[key])
+            continue
+        folded = _fold(key)
+        for name in spec:
+            if folded == name:
+                raise ProtocolError("invalid_field", f"键 {key!r} 与字段 {name!r} 只差大小写")
+
+
 def _validator_for(direction: str, typ: Any) -> Callable[[dict[str, Any]], None]:
     validator = _VALIDATORS[direction].get(typ) if isinstance(typ, str) else None
     if validator is None:
@@ -403,15 +507,16 @@ def decode_line(direction: str, line: bytes | str) -> dict[str, Any]:
         raise ProtocolError("malformed_json", "行不是合法的 UTF-8") from exc
     if len(raw) > MAX_LINE_BYTES:
         raise ProtocolError("message_too_large", f"{len(raw)} 字节，上限 {MAX_LINE_BYTES}")
-    try:
-        msg = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
-    except (ValueError, RecursionError) as exc:  # 非法 UTF-8、BOM、语法错误、嵌套过深
-        raise ProtocolError("malformed_json", str(exc)) from exc
+    msg = parse_json(raw)
     if not isinstance(msg, dict):
         raise ProtocolError("malformed_json", "消息必须是 JSON 对象")
     typ = msg.get("type")
     validator = _validator_for(direction, typ)
     _check_size(direction, typ, len(raw))
+    spec = _FIELD_TYPES[typ]
+    if "v" in spec:
+        _check_version(msg)
+    _check_key_case(spec, msg)
     _check_types(typ, msg)
     validator(msg)
     return msg

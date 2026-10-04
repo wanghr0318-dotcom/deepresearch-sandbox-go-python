@@ -131,22 +131,7 @@ LIMIT_CASES = [
         id="invalid_utf8",
     ),
     pytest.param(
-        WORKER,
-        b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":'
-        + b"[" * 100_000
-        + b"]" * 100_000
-        + b"}",
-        "malformed_json",
-        id="nesting_too_deep",
-    ),
-    pytest.param(
         WORKER, checkpoint_line('"\\ud800"', []), None, id="lone_surrogate_escape_accepted"
-    ),
-    pytest.param(
-        WORKER,
-        b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":NaN}',
-        "malformed_json",
-        id="nan_is_malformed",
     ),
 ]
 
@@ -227,7 +212,8 @@ def test_schemas_are_valid_draft_2020_12():
 
 
 def valid_items() -> list[tuple[str, str, dict[str, Any]]]:
-    items = [(c["name"], c["direction"], c["message"]) for c in MESSAGES["valid"]]
+    # raw 行表达的是 schema 无法描述的原始文本约束，由编解码器负责
+    items = [(c["name"], c["direction"], c["message"]) for c in MESSAGES["valid"] if "message" in c]
     for scenario in SCENARIOS:
         bad = scenario["expect"].get("at")
         for index, line in enumerate(scenario["lines"]):
