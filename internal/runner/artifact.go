@@ -102,7 +102,7 @@ func (d *outDir) open(rel string) (*os.File, int64, error) {
 	var st syscall.Stat_t
 	if err := syscall.Fstat(fd, &st); err != nil {
 		_ = syscall.Close(fd)
-		return nil, 0, &artifactError{code: codeStoreUnavailable, err: err}
+		return nil, 0, &artifactError{code: codeSaveTimeout, err: err} // 暂时故障：Worker 可重试
 	}
 	if st.Mode&syscall.S_IFMT != syscall.S_IFREG {
 		_ = syscall.Close(fd)

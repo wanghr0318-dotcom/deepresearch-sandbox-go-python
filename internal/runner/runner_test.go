@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -122,6 +123,43 @@ type faultStore struct {
 	runner.Store
 	commits     int
 	commitFault func(n int) (commitFirst bool, err error)
+
+	mu            sync.Mutex
+	appends       int
+	appendFault   func(n int) error // 非 nil 错误：AppendWorkerEvents 不写入并返回该错误
+	registerFault error             // RegisterArtifact 不写入并返回该错误
+	recordDelay   time.Duration     // RecordTerminalProposal 先等待（受 ctx 约束）
+}
+
+func (f *faultStore) AppendWorkerEvents(ctx context.Context, attemptID string, events []runner.WorkerEvent) (runner.Watermark, error) {
+	f.mu.Lock()
+	f.appends++
+	n := f.appends
+	f.mu.Unlock()
+	if f.appendFault != nil {
+		if err := f.appendFault(n); err != nil {
+			return runner.Watermark{}, err
+		}
+	}
+	return f.Store.AppendWorkerEvents(ctx, attemptID, events)
+}
+
+func (f *faultStore) RegisterArtifact(ctx context.Context, a runner.Artifact) (runner.ArtifactVersion, error) {
+	if f.registerFault != nil {
+		return runner.ArtifactVersion{}, f.registerFault
+	}
+	return f.Store.RegisterArtifact(ctx, a)
+}
+
+func (f *faultStore) RecordTerminalProposal(ctx context.Context, p runner.TerminalProposal) (runner.TerminalProposal, error) {
+	if f.recordDelay > 0 {
+		select {
+		case <-time.After(f.recordDelay):
+		case <-ctx.Done():
+			return runner.TerminalProposal{}, ctx.Err()
+		}
+	}
+	return f.Store.RecordTerminalProposal(ctx, p)
 }
 
 func (f *faultStore) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runner.CommittedCheckpoint, error) {
@@ -178,11 +216,65 @@ func h() step {
 // do 在脚本中执行一个动作（例如改写文件）。
 func do(f func() error) step { return func(*fakeProc) error { return f() } }
 
+// raw 原样写出 s（不追加换行），用于构造末尾半行。
+func raw(s string) step {
+	return func(p *fakeProc) error {
+		_, err := io.WriteString(p.outW, s)
+		return err
+	}
+}
+
+// ctl 以宿主 actor 的身份把控制请求交给 runner（Run 的 controls 通道）。与 actor 一样，只在
+// OnReady 之后发送。
+func ctl(kind string, graceMs int64) step {
+	return func(p *fakeProc) error {
+		select {
+		case <-p.readied:
+		case <-time.After(10 * time.Second):
+			return errors.New("Worker 未就绪")
+		}
+		return ctlNow(kind, graceMs)(p)
+	}
+}
+
+// ctlNow 立即发送控制请求（不等待就绪）。
+func ctlNow(kind string, graceMs int64) step {
+	return func(p *fakeProc) error {
+		select {
+		case p.controls <- runner.Control{Kind: kind, GraceMs: graceMs}:
+			return nil
+		case <-time.After(10 * time.Second):
+			return errors.New("runner 未接收控制请求")
+		}
+	}
+}
+
+// untilKilled 一直挂起，直到 runner 终止本进程（模拟不理会期限的 Worker）。
+func untilKilled() step {
+	return func(p *fakeProc) error {
+		select {
+		case <-p.kill:
+			return nil
+		case <-time.After(10 * time.Second):
+			return errors.New("未被终止")
+		}
+	}
+}
+
+// pause 暂停脚本 d（给处理器时间处理已写出的行）。
+func pause(d time.Duration) step {
+	return func(*fakeProc) error { time.Sleep(d); return nil }
+}
+
 // fakeProc 是一个回放脚本的执行句柄：stdout 由脚本写出，stdin 全部读出并记录。
 type fakeProc struct {
 	script   []step
 	exitCode int
 	drop     func(m map[string]any) bool // 返回 true 的宿主消息视为在传输中丢失
+	// holdStdout：退出时不关闭 stdout 写端（模拟仍持有管道的子进程），用于屏障 A。
+	holdStdout bool
+	controls   chan runner.Control
+	readied    chan struct{} // runner 调用 OnReady 后关闭
 
 	stdinR, outR, errR *io.PipeReader
 	stdinW, outW, errW *io.PipeWriter
@@ -252,7 +344,9 @@ func (p *fakeProc) run() {
 	p.mu.Lock()
 	p.scriptErr = err
 	p.mu.Unlock()
-	_ = p.outW.Close()
+	if !p.holdStdout {
+		_ = p.outW.Close()
+	}
 	_ = p.errW.Close()
 	select {
 	case <-p.kill:
@@ -292,6 +386,8 @@ type tcase struct {
 	drop    func(map[string]any) bool
 	init    *protocol.Init
 	onReady func()
+	hold    bool
+	cancel  context.CancelCauseFunc // 本次 Run 的 ctx 的取消函数（run 开始时设置）
 }
 
 func (e *env) newCase(t *testing.T, taskID string) *tcase {
@@ -311,12 +407,23 @@ func (c *tcase) run(t *testing.T, exitCode int, script ...step) (runner.Outcome,
 		init = &protocol.Init{Type: protocol.TypeInit, Bootstrap: 1, ProtocolVersions: []int64{1}, Mode: protocol.ModeTask,
 			TaskID: c.taskID, AttemptID: c.att, AttemptNo: 1, OutDir: "/workspace/out/" + c.att}
 	}
-	p := &fakeProc{script: script, exitCode: exitCode, drop: c.drop}
+	controls := make(chan runner.Control)
+	p := &fakeProc{script: script, exitCode: exitCode, drop: c.drop, holdStdout: c.hold, controls: controls,
+		readied: make(chan struct{})}
+	onReady := func() {
+		if c.onReady != nil {
+			c.onReady()
+		}
+		close(p.readied)
+	}
 	r := runner.New(c.fs, c.e.blobs, &fakeStarter{proc: p}, nil, c.opt)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+	base, cancelBase := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancelBase()
+	ctx, cancel := context.WithCancelCause(base)
+	defer cancel(nil)
+	c.cancel = cancel
 	out := r.Run(ctx, runner.Attempt{TaskID: c.taskID, AttemptID: c.att, AttemptNo: init.AttemptNo, EnvID: "env-" + c.taskID,
-		Init: *init, OutDir: c.outDir, OnReady: c.onReady}, nil)
+		Init: *init, OutDir: c.outDir, OnReady: onReady}, controls)
 	<-p.stdinDone // Run 返回前已关闭 stdin；等记录完它写出的全部消息
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -470,7 +577,7 @@ func decodeMap(t *testing.T, raw []byte) map[string]any {
 
 // TestScenarioFixtures 以 protocol/fixtures 的 task 模式场景驱动 AttemptRunner：Worker 行按转录写出，
 // 宿主行处等待 runner 的回复并逐字段比较；再核对违规、已持久化的事件水位、终态提议与退出码。
-// 含控制消息（cancel、pause）的场景属于 Task 6。
+// 转录中的宿主 cancel/pause 由测试以 actor 身份经 controls 交给 runner，再核对 runner 发出的协议消息。
 func TestScenarioFixtures(t *testing.T) {
 	e := newEnv(t)
 	dir := filepath.Join("..", "..", "protocol", "fixtures", "v1", "scenarios")
@@ -488,20 +595,10 @@ func TestScenarioFixtures(t *testing.T) {
 		if err := json.Unmarshal(raw, &sc); err != nil {
 			t.Fatalf("%s: %v", ent.Name(), err)
 		}
-		control := false
-		for _, l := range sc.Lines {
-			if typ := decodeMap(t, l.Message)["type"]; l.From == "host" && (typ == "cancel" || typ == "pause") {
-				control = true
-			}
-		}
-		if control {
-			t.Logf("%s 含控制消息，由 Task 6 覆盖", sc.Name)
-			continue
-		}
 		ran++
 		t.Run(sc.Name, func(t *testing.T) { replay(t, e, sc) })
 	}
-	if ran < 15 {
+	if ran < 22 {
 		t.Fatalf("只回放了 %d 个场景", ran)
 	}
 }
@@ -533,6 +630,11 @@ func replay(t *testing.T, e *env, sc scenario) {
 		}
 	case "artifact_registered":
 		c.write(t, "report.md", "# 报告\n")
+	case "event_after_paused": // runner 另检查 paused 指向最新已提交的 checkpoint（§5.9）；本场景只测流规则
+		if _, err := e.store.CommitCheckpoint(ctx, runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: c.taskID},
+			CheckpointID: "cp-1", AttemptID: c.att, StepID: "s1", State: json.RawMessage(`{"n":1}`)}); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	var init protocol.Init
@@ -544,7 +646,7 @@ func replay(t *testing.T, e *env, sc scenario) {
 
 	var script []step
 	var wantHost []map[string]any
-	var accepted, terminal string
+	var accepted, terminal, wantControl string
 	acceptedSeq := 0
 	for i, l := range sc.Lines[1:] {
 		idx := i + 1
@@ -553,8 +655,16 @@ func replay(t *testing.T, e *env, sc scenario) {
 			t.Fatal(err)
 		}
 		if l.From == "host" {
+			m := decodeMap(t, l.Message)
+			if typ := m["type"]; typ == "cancel" || typ == "pause" {
+				// 宿主控制：actor 在此处把请求交给 runner，runner 发出协议消息
+				grace, _ := m["grace_ms"].(float64)
+				script = append(script, ctl(typ.(string), int64(grace)))
+				m["attempt_id"] = c.att
+				wantControl = typ.(string)
+			}
 			script = append(script, h())
-			wantHost = append(wantHost, decodeMap(t, l.Message))
+			wantHost = append(wantHost, m)
 			continue
 		}
 		script = append(script, w(compact.String()))
@@ -580,8 +690,28 @@ func replay(t *testing.T, e *env, sc scenario) {
 	if !reflect.DeepEqual(p.init, wantInit) {
 		t.Fatalf("init = %v，期望 %v", p.init, wantInit)
 	}
-	if !reflect.DeepEqual(p.got, wantHost) {
+	// 控制消息由主循环发出，与处理器的回复之间没有确定的先后；分别比较两者各自的顺序
+	split := func(ms []map[string]any) (ctl, rest []map[string]any) {
+		for _, m := range ms {
+			if m["type"] == "cancel" || m["type"] == "pause" {
+				ctl = append(ctl, m)
+			} else {
+				rest = append(rest, m)
+			}
+		}
+		return ctl, rest
+	}
+	gotCtl, gotRest := split(p.got)
+	wantCtl, wantRest := split(wantHost)
+	if !reflect.DeepEqual(gotCtl, wantCtl) || !reflect.DeepEqual(gotRest, wantRest) {
 		t.Fatalf("宿主回复 = %v，期望 %v", p.got, wantHost)
+	}
+	if wantControl != "" {
+		// 宿主意图生效后在 grace 内正常结束：按意图分类，不是平台终止，不重试（§5.8、§5.9）
+		want := map[string]string{"cancel": runner.ClassCancelled, "pause": runner.ClassPaused}[wantControl]
+		if out.Class != want || out.Retry != "" || out.PlatformKilled || out.Control != wantControl {
+			t.Fatalf("分类 = %s/%q killed=%v control=%q，期望 %s", out.Class, out.Retry, out.PlatformKilled, out.Control, want)
+		}
 	}
 	wantViolation := ""
 	switch {
@@ -592,6 +722,9 @@ func replay(t *testing.T, e *env, sc scenario) {
 	}
 	if out.Violation != wantViolation {
 		t.Fatalf("violation = %q，期望 %q", out.Violation, wantViolation)
+	}
+	if wantViolation != "" && (out.Retry != "" || out.Class == runner.ClassSucceeded) { // §5.8：协议违规不重试
+		t.Fatalf("违规的分类 = %s/%q", out.Class, out.Retry)
 	}
 	if got := c.watermark(t); got != int64(acceptedSeq) {
 		t.Fatalf("已持久化事件水位 = %d，期望 %d", got, acceptedSeq)
@@ -964,5 +1097,292 @@ func TestRunnerCases(t *testing.T) {
 		if wm := c.watermark(t); wm != 21 {
 			t.Fatalf("水位 %d，期望 21", wm)
 		}
+	})
+}
+
+// ---- 规格 §5.8 与 §14.3：Classify 是裁决分类的唯一实现 ----
+
+func TestClassify(t *testing.T) {
+	result := &runner.TerminalProposal{Kind: "result"}
+	errProp := &runner.TerminalProposal{Kind: "error"}
+	paused := &runner.TerminalProposal{Kind: "paused"}
+	werr := func(code string, retryable bool) json.RawMessage {
+		b, _ := json.Marshal(map[string]any{"code": code, "message": "m", "retryable": retryable})
+		return b
+	}
+	sig := func(s syscall.Signal) provider.ExitStatus { return provider.ExitStatus{Code: -1, Signal: s} }
+	code := func(c int) provider.ExitStatus { return provider.ExitStatus{Code: c} }
+	oom := provider.ResourceDiag{OOMKillDelta: 1, OOMObserved: true}
+
+	cases := []struct {
+		name         string
+		in           runner.ClassifyInput
+		class, retry string
+	}{
+		// §5.8
+		{"result_exit0_succeeded", runner.ClassifyInput{Proposal: result}, "succeeded", ""},
+		{"result_nonzero_exit_after_result", runner.ClassifyInput{Proposal: result, Exit: code(3)}, "exit_after_result", ""},
+		{"business_event_after_result", runner.ClassifyInput{Proposal: result, Violation: "after_terminal"}, "protocol_violation", ""},
+		{"exit_grace_after_result", runner.ClassifyInput{Proposal: result, Exit: sig(syscall.SIGKILL), PlatformKill: runner.KillExitGrace}, "exit_after_result", ""},
+		{"exit_grace_after_error", runner.ClassifyInput{Proposal: errProp, Payload: werr("tool_failed", true), Exit: sig(syscall.SIGKILL), PlatformKill: runner.KillExitGrace}, "worker_error", "fault"},
+		{"paused_with_request", runner.ClassifyInput{Proposal: paused, Control: "pause"}, "paused", ""},
+		{"paused_without_request", runner.ClassifyInput{Proposal: paused}, "protocol_violation", ""},
+		{"paused_not_latest", runner.ClassifyInput{Proposal: paused, Control: "pause", Violation: runner.ViolationPausedNotLatest}, "protocol_violation", ""},
+		{"cancel_effective_exit", runner.ClassifyInput{Control: "cancel"}, "cancelled", ""},
+		{"cancel_effective_crash_not_crashed", runner.ClassifyInput{Control: "cancel", Exit: sig(syscall.SIGSEGV)}, "cancelled", ""},
+		{"cancel_grace_expired", runner.ClassifyInput{Control: "cancel", PlatformKill: runner.KillCancel, Exit: sig(syscall.SIGKILL), Diag: oom}, "cancelled", ""},
+		{"pause_grace_expired", runner.ClassifyInput{Control: "pause", PlatformKill: runner.KillPause, Exit: sig(syscall.SIGKILL)}, "paused", ""},
+		{"error_during_cancel", runner.ClassifyInput{Control: "cancel", Proposal: errProp, Payload: werr("x", true), Exit: code(1)}, "cancelled", ""},
+		{"valid_result_during_cancel", runner.ClassifyInput{Proposal: result, Control: "cancel"}, "succeeded", ""},
+		{"valid_result_during_pause_oom", runner.ClassifyInput{Proposal: result, Control: "pause", Diag: oom}, "oom_observed_in_attempt", ""},
+		{"no_proposal_exit0", runner.ClassifyInput{}, "exited_without_proposal", ""},
+		{"no_proposal_exit1", runner.ClassifyInput{Exit: code(1)}, "exited_without_proposal", ""},
+		{"stdout_closed_no_exit", runner.ClassifyInput{PlatformKill: runner.KillExitGrace, Exit: sig(syscall.SIGKILL)}, "exited_without_proposal", ""},
+		{"result_output_incomplete", runner.ClassifyInput{Proposal: result, OutputIncomplete: true}, "output_incomplete", ""},
+		{"stdin_partial_write", runner.ClassifyInput{Proposal: result, PlatformKill: runner.KillStdinBroken}, "protocol_violation", ""},
+		// §14.3
+		{"crashed_signal", runner.ClassifyInput{Exit: sig(syscall.SIGSEGV)}, "crashed_signal", "fault"},
+		{"sigkill_without_oom", runner.ClassifyInput{Exit: sig(syscall.SIGKILL)}, "crashed_signal", "fault"},
+		{"control_lost", runner.ClassifyInput{ControlLost: true, ExitErr: provider.ErrControlLost}, "control_lost", "fault"},
+		{"control_lost_after_result", runner.ClassifyInput{Proposal: result, ControlLost: true, ExitErr: provider.ErrControlLost}, "control_lost", "fault"},
+		{"control_lost_at_start", runner.ClassifyInput{StartErr: provider.ErrControlLost}, "control_lost", "fault"},
+		{"ready_timeout", runner.ClassifyInput{PlatformKill: runner.KillReadyTimeout, Exit: sig(syscall.SIGKILL)}, "ready_timeout", "fault"},
+		{"lost_on_restart", runner.ClassifyInput{PlatformKill: runner.KillShutdown, Exit: sig(syscall.SIGKILL)}, "lost_on_restart", "fault"},
+		{"start_err_env", runner.ClassifyInput{StartErr: &provider.StartError{Reason: "exec"}}, "create_failed_env", ""},
+		{"start_cancelled_by_deadline", runner.ClassifyInput{StartErr: context.DeadlineExceeded, PlatformKill: runner.KillTimeout}, "task_deadline_exceeded", ""},
+		{"store_unavailable", runner.ClassifyInput{PlatformKill: runner.KillStoreUnavailable, Exit: sig(syscall.SIGKILL)}, "store_unavailable", "fault"},
+		{"worker_oom_likely", runner.ClassifyInput{Exit: sig(syscall.SIGKILL), Diag: oom}, "worker_oom_likely", "oom"},
+		{"oom_observed_normal_end", runner.ClassifyInput{Proposal: result, Diag: oom}, "oom_observed_in_attempt", ""},
+		{"oom_observed_error_by_worker", runner.ClassifyInput{Proposal: errProp, Payload: werr("x", false), Exit: code(1), Diag: oom}, "worker_error", ""},
+		{"worker_error_retryable", runner.ClassifyInput{Proposal: errProp, Payload: werr("tool_failed", true), Exit: code(1)}, "worker_error", "fault"},
+		{"worker_error_budget_exhausted", runner.ClassifyInput{Proposal: errProp, Payload: werr("budget_exhausted", true), Exit: code(1)}, "worker_error", ""},
+		{"worker_error_protocol_prefix", runner.ClassifyInput{Proposal: errProp, Payload: werr("protocol_error", true), Exit: code(1)}, "worker_error", ""},
+		{"worker_error_not_retryable", runner.ClassifyInput{Proposal: errProp, Payload: werr("bad_input", false), Exit: code(1)}, "worker_error", ""},
+		{"protocol_mismatch_handshake", runner.ClassifyInput{Violation: runner.ViolationHandshakeError, Exit: code(1)}, "protocol_mismatch", ""},
+		{"protocol_mismatch_mode", runner.ClassifyInput{Violation: runner.ViolationModeMismatch}, "protocol_mismatch", ""},
+		{"protocol_violation", runner.ClassifyInput{Violation: "seq_invalid", Exit: sig(syscall.SIGKILL), Diag: oom}, "protocol_violation", ""},
+		{"output_limit_exceeded", runner.ClassifyInput{Violation: runner.ViolationOutputLimit}, "output_limit_exceeded", ""},
+		{"task_deadline_exceeded", runner.ClassifyInput{Proposal: result, PlatformKill: runner.KillTimeout, Exit: sig(syscall.SIGKILL)}, "task_deadline_exceeded", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			class, retry := runner.Classify(tc.in)
+			if class != tc.class || retry != tc.retry {
+				t.Fatalf("Classify = %s/%q，期望 %s/%q", class, retry, tc.class, tc.retry)
+			}
+		})
+	}
+
+	// §14.3 中由其他组件给出、只由类别决定重试资格的行
+	for class, want := range map[string]string{
+		"crashed_signal": "fault", "control_lost": "fault", "ready_timeout": "fault", "lost_on_restart": "fault",
+		"subrun_cancel_timeout": "fault", "create_failed_transient": "fault", "store_unavailable": "fault",
+		"worker_oom_likely": "oom", "release_timeout": "", "create_failed_env": "", "create_outcome_unknown": "",
+		"protocol_mismatch": "", "protocol_violation": "", "output_limit_exceeded": "", "exit_after_result": "",
+		"task_deadline_exceeded": "", "cancelled": "", "paused": "",
+	} {
+		if got := runner.RetryOf(class); got != want {
+			t.Errorf("RetryOf(%s) = %q，期望 %q", class, got, want)
+		}
+	}
+}
+
+// ---- 完成屏障、期限、控制与 Store 故障阈值（规格 §5.7–§5.9、§14.5） ----
+
+func TestRunnerDeadlinesAndControls(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	fast := runner.Options{ReadyTimeout: 5 * time.Second, ExitGrace: 5 * time.Second}
+
+	expect := func(t *testing.T, out runner.Outcome, class, retry, kill string, killed bool) {
+		t.Helper()
+		if out.Class != class || out.Retry != retry || out.PlatformKill != kill || out.PlatformKilled != killed {
+			t.Fatalf("结果 = %s/%q kill=%q killed=%v（violation %q），期望 %s/%q kill=%q killed=%v",
+				out.Class, out.Retry, out.PlatformKill, out.PlatformKilled, out.Violation, class, retry, kill, killed)
+		}
+	}
+
+	t.Run("ready_timeout", func(t *testing.T) {
+		c := e.newCase(t, "ready-timeout")
+		c.opt = runner.Options{ReadyTimeout: 50 * time.Millisecond}
+		out, _ := c.run(t, 0, untilKilled())
+		expect(t, out, "ready_timeout", "fault", runner.KillReadyTimeout, true)
+	})
+
+	t.Run("exit_grace_after_result", func(t *testing.T) {
+		c := e.newCase(t, "exit-grace")
+		c.opt = runner.Options{ExitGrace: 50 * time.Millisecond}
+		out, _ := c.run(t, 0, w(ready(1)), w(result(2)), untilKilled())
+		expect(t, out, "exit_after_result", "", runner.KillExitGrace, true)
+		if out.Proposal == nil || out.Proposal.Kind != "result" {
+			t.Fatalf("提议 %+v", out.Proposal)
+		}
+	})
+
+	t.Run("barrier_a_timeout_output_incomplete", func(t *testing.T) {
+		c := e.newCase(t, "barrier-a")
+		c.opt = runner.Options{DrainTimeout: 50 * time.Millisecond}
+		c.hold = true // 进程退出，但执行树中仍有进程持有 stdout
+		out, _ := c.run(t, 0, w(ready(1)), w(result(2)), raw(`{"type":"progress","v":1,"seq":3`))
+		if !out.OutputIncomplete || out.Violation != "" {
+			t.Fatalf("output_incomplete = %v violation = %q", out.OutputIncomplete, out.Violation)
+		}
+		expect(t, out, "output_incomplete", "", "", false) // 退出之后终止执行树不是对 Worker 的终止
+		if wm := c.watermark(t); wm != 2 {                 // 末尾半行被丢弃
+			t.Fatalf("水位 %d", wm)
+		}
+	})
+
+	t.Run("barrier_b_timeout_output_incomplete", func(t *testing.T) {
+		c := e.newCase(t, "barrier-b")
+		c.opt = runner.Options{FinalizeTimeout: 50 * time.Millisecond}
+		c.fs.recordDelay = time.Minute // 记录终态提议的 Store 调用挂住
+		out, _ := c.run(t, 0, w(ready(1)), w(result(2)))
+		if !out.OutputIncomplete {
+			t.Fatal("屏障 B 超时未标记 output_incomplete")
+		}
+		expect(t, out, "output_incomplete", "", "", false)
+	})
+
+	t.Run("exit_before_result_processed", func(t *testing.T) {
+		c := e.newCase(t, "exit-before-processed")
+		c.opt = fast
+		c.fs.recordDelay = 200 * time.Millisecond // 进程退出时 result 尚在处理
+		out, _ := c.run(t, 0, w(ready(1)), w(result(2)))
+		expect(t, out, "succeeded", "", "", false)
+		if stored, err := e.store.GetTerminalProposal(ctx, c.att); err != nil || out.Proposal == nil || stored != *out.Proposal {
+			t.Fatalf("屏障 B 之后提议应已记录: %+v %v", stored, err)
+		}
+	})
+
+	t.Run("result_then_nonzero_exit", func(t *testing.T) {
+		c := e.newCase(t, "result-nonzero")
+		out, _ := c.run(t, 3, w(ready(1)), w(result(2)))
+		expect(t, out, "exit_after_result", "", "", false)
+	})
+
+	t.Run("cancel_grace_expired", func(t *testing.T) {
+		c := e.newCase(t, "cancel-expired")
+		out, p := c.run(t, 0, w(ready(1)), ctl("cancel", 50), h(), untilKilled())
+		if p.got[0]["type"] != "cancel" {
+			t.Fatalf("宿主消息 %v", p.got)
+		}
+		if p.got[0]["grace_ms"] != float64(50) || p.got[0]["attempt_id"] != c.att {
+			t.Fatalf("cancel = %v", p.got[0])
+		}
+		expect(t, out, "cancelled", "", runner.KillCancel, true)
+	})
+
+	t.Run("exit_after_cancel_no_restart", func(t *testing.T) {
+		c := e.newCase(t, "exit-after-cancel")
+		out, _ := c.run(t, 1, w(ready(1)), w(ev("progress", 2, "kind", "step_started", "message", "x")),
+			ctl("cancel", 5000), h())
+		// 宿主取消后以非零码退出：按宿主意图，不判崩溃、不重试
+		expect(t, out, "cancelled", "", "", false)
+	})
+
+	t.Run("pause_deadline_expired", func(t *testing.T) {
+		c := e.newCase(t, "pause-expired")
+		out, p := c.run(t, 0, w(ready(1)), w(checkpoint(2, "cp-1")), h(), ctl("pause", 50), h(), untilKilled())
+		if p.got[1]["type"] != "pause" {
+			t.Fatalf("宿主消息 %v", p.got)
+		}
+		expect(t, out, "paused", "", runner.KillPause, true)
+		if l := c.latest(t); l != "cp-1" { // 停在已提交的 checkpoint
+			t.Fatalf("指针 = %q", l)
+		}
+	})
+
+	t.Run("paused_not_latest_checkpoint", func(t *testing.T) {
+		c := e.newCase(t, "paused-stale")
+		out, _ := c.run(t, 0, w(ready(1)), w(checkpoint(2, "cp-1")), h(), w(checkpoint(3, "cp-2")), h(),
+			ctl("pause", 5000), h(), w(ev("paused", 4, "checkpoint_id", "cp-1")))
+		if out.Violation != runner.ViolationPausedNotLatest {
+			t.Fatalf("violation = %q", out.Violation)
+		}
+		expect(t, out, "protocol_violation", "", "", false)
+	})
+
+	t.Run("paused_at_resume_checkpoint", func(t *testing.T) {
+		c := e.newCase(t, "paused-resume")
+		if _, err := e.store.CommitCheckpoint(ctx, runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: c.taskID},
+			CheckpointID: "cp-0", AttemptID: c.att, StepID: "s0", State: json.RawMessage(`{"n":0}`)}); err != nil {
+			t.Fatal(err)
+		}
+		c.init = &protocol.Init{Type: protocol.TypeInit, Bootstrap: 1, ProtocolVersions: []int64{1}, Mode: protocol.ModeTask,
+			TaskID: c.taskID, AttemptID: c.att, AttemptNo: 1, OutDir: "/workspace/out/" + c.att,
+			Resume: &protocol.Resume{CheckpointID: "cp-0", StepID: "s0", State: json.RawMessage(`{"n":0}`)}}
+		out, _ := c.run(t, 0, w(ready(1)), ctl("pause", 5000), h(), w(ev("paused", 2, "checkpoint_id", "cp-0")))
+		noViolation(t, out)
+		expect(t, out, "paused", "", "", false)
+	})
+
+	t.Run("control_before_ready_kills", func(t *testing.T) {
+		c := e.newCase(t, "ctl-before-ready")
+		out, p := c.run(t, 0, ctlNow("cancel", 5000), untilKilled())
+		if len(p.all) != 0 {
+			t.Fatalf("就绪前发送了控制消息 %v", p.all)
+		}
+		expect(t, out, "cancelled", "", runner.KillCancel, true)
+	})
+
+	t.Run("run_time_exceeded", func(t *testing.T) {
+		c := e.newCase(t, "run-time")
+		out, _ := c.run(t, 0, w(ready(1)), do(func() error { c.cancel(runner.ErrRunTimeExceeded); return nil }), untilKilled())
+		expect(t, out, "task_deadline_exceeded", "", runner.KillTimeout, true)
+	})
+
+	t.Run("store_unavailable_after_5_failures", func(t *testing.T) {
+		c := e.newCase(t, "store-down")
+		c.fs.appendFault = func(int) error { return persistence.ErrUnavailable }
+		script := []step{w(ready(1))}
+		for i := 2; i <= 12; i++ { // 每条事件单独一次持久化尝试
+			script = append(script, w(ev("progress", i, "kind", "x", "message", "m")), pause(10*time.Millisecond))
+		}
+		script = append(script, untilKilled())
+		out, _ := c.run(t, 0, script...)
+		expect(t, out, "store_unavailable", "fault", runner.KillStoreUnavailable, true)
+		c.fs.mu.Lock()
+		n := c.fs.appends
+		c.fs.mu.Unlock()
+		if n < 5 {
+			t.Fatalf("终止前持久化尝试 %d 次，期望阈值 5 附近", n)
+		}
+	})
+
+	t.Run("store_unavailable_after_window", func(t *testing.T) {
+		c := e.newCase(t, "store-window")
+		c.opt = runner.Options{StoreFailureCount: 1000, StoreFailureWindow: 20 * time.Millisecond}
+		c.fs.appendFault = func(int) error { return persistence.ErrUnavailable }
+		out, _ := c.run(t, 0, w(ready(1)), pause(40*time.Millisecond), w(ev("progress", 2, "kind", "x", "message", "m")), untilKilled())
+		expect(t, out, "store_unavailable", "fault", runner.KillStoreUnavailable, true)
+	})
+
+	t.Run("store_failures_reset_by_success", func(t *testing.T) {
+		c := e.newCase(t, "store-flaky")
+		c.fs.appendFault = func(n int) error { // 每 4 次失败后一次成功：从不连续 5 次
+			if n%5 == 0 {
+				return nil
+			}
+			return persistence.ErrUnavailable
+		}
+		script := []step{w(ready(1))}
+		for i := 2; i <= 12; i++ {
+			script = append(script, w(ev("progress", i, "kind", "x", "message", "m")), pause(5*time.Millisecond))
+		}
+		script = append(script, w(result(13)))
+		out, _ := c.run(t, 0, script...)
+		if out.PlatformKill != "" {
+			t.Fatalf("未达阈值却终止: %q", out.PlatformKill)
+		}
+	})
+
+	t.Run("artifact_transient_failure_save_timeout", func(t *testing.T) {
+		c := e.newCase(t, "artifact-transient")
+		sha := c.write(t, "a.txt", "content")
+		c.fs.registerFault = persistence.ErrUnavailable
+		out, p := c.run(t, 0, w(ready(1)), w(artifact(2, "a", "a.txt", sha, len("content"))), h(), w(result(3)))
+		noViolation(t, out)
+		reply(t, p.got[0], "artifact_result", "rejected", "save_timeout") // §5.4 的稳定码，Worker 可重试
 	})
 }
