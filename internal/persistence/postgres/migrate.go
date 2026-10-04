@@ -82,9 +82,20 @@ func (s *Store) InspectInstallation(ctx context.Context) (ownership.DBState, err
 		if !hasInstallation {
 			return nil
 		}
+		// 引导先于迁移执行：只应用了 0001 的旧库没有令牌哈希列，按"无哈希"读取。
+		var hasTokenColumn bool
+		if err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+			WHERE attrelid = to_regclass(quote_ident(current_schema()) || '.installation')
+				AND attname = 'bootstrap_token_hash' AND NOT attisdropped)`).Scan(&hasTokenColumn); err != nil {
+			return err
+		}
+		sql := "SELECT install_id, state, NULL::bytea FROM installation"
+		if hasTokenColumn {
+			sql = "SELECT install_id, state, bootstrap_token_hash FROM installation"
+		}
 		var inst ownership.Installation
 		var state string
-		err := q.QueryRow(ctx, "SELECT install_id, state FROM installation").Scan(&inst.InstallID, &state)
+		err := q.QueryRow(ctx, sql).Scan(&inst.InstallID, &state, &inst.TokenHash)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -98,9 +109,13 @@ func (s *Store) InspectInstallation(ctx context.Context) (ownership.DBState, err
 	return st, err
 }
 
-// InitializeInstallation 在同一事务中执行初始迁移并插入 installation(installID, pending)
-// （规格 §7.4）。事务未提交则库仍为空，重启后重新引导。
-func (s *Store) InitializeInstallation(ctx context.Context, installID string) error {
+// InitializeInstallation 在同一事务中执行全部内嵌迁移并插入 installation(installID, pending,
+// tokenHash)（规格 §7.4）。事务未提交则库仍为空，重启后重新引导；提交结果未知时返回
+// *persistence.CommitUnknownError 且不重试——同进程内查询为空不能证明未提交，由调用方结束本次启动。
+func (s *Store) InitializeInstallation(ctx context.Context, installID string, tokenHash []byte) error {
+	if installID == "" || len(tokenHash) != ownership.TokenSize {
+		return invalidf("InitializeInstallation 需要 install_id 与 %d 字节的令牌哈希", ownership.TokenSize)
+	}
 	ms, err := loadMigrations()
 	if err != nil {
 		return err
@@ -112,10 +127,13 @@ func (s *Store) InitializeInstallation(ctx context.Context, installID string) er
 			applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
 			return err
 		}
-		if err := applyMigration(ctx, tx, ms[0]); err != nil {
-			return err
+		for _, m := range ms {
+			if err := applyMigration(ctx, tx, m); err != nil {
+				return err
+			}
 		}
-		_, err := tx.Exec(ctx, "INSERT INTO installation (install_id, state) VALUES ($1, 'pending')", installID)
+		_, err := tx.Exec(ctx, "INSERT INTO installation (install_id, state, bootstrap_token_hash) VALUES ($1, 'pending', $2)",
+			installID, tokenHash)
 		return err
 	})
 }
@@ -194,6 +212,10 @@ func (s *Store) migrationTx(ctx context.Context, op string, fn txFunc) error {
 		if s.lost() {
 			return persistence.ErrOwnershipLost
 		}
+		var cu *commitUnknown
+		if errors.As(err, &cu) {
+			return &persistence.CommitUnknownError{Op: op, Err: cu.err}
+		}
 		return err
 	}
 	return nil
@@ -213,5 +235,13 @@ func (s *Store) migrationTxOnce(ctx context.Context, op string, fn txFunc) error
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return commitError(err) // 与事务辅助相同的归类：可能已到达服务端即为未知
+	}
+	if s.hooks.afterCommit != nil {
+		if err := s.hooks.afterCommit(op); err != nil {
+			return &commitUnknown{err: err}
+		}
+	}
+	return nil
 }

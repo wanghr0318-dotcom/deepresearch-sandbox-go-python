@@ -87,7 +87,7 @@ func newStore(t *testing.T, opt Options) *Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(s.Close)
-	if err := s.InitializeInstallation(context.Background(), "install-test"); err != nil {
+	if err := s.InitializeInstallation(context.Background(), "install-test", make([]byte, ownership.TokenSize)); err != nil {
 		t.Fatalf("初始化: %v", err)
 	}
 	if err := s.CompleteInstallation(context.Background(), "install-test"); err != nil {
@@ -105,96 +105,200 @@ func count(t *testing.T, s *Store, sql string, args ...any) int {
 	return n
 }
 
-// TestInstallationBootstrapE46 覆盖规格 E46：空库首启、三个中断点、以及三种拒绝启动的情况。
+// TestInstallationBootstrapE46 覆盖规格 E46（含引导令牌修订）：空库首启、每个崩溃窗口、提交结果未知时
+// 本次启动失败而下次启动恢复、另一个数据目录不能接管 pending、令牌丢失与损坏、旧 pending 记录，以及
+// 三种拒绝启动的情况。
 func TestInstallationBootstrapE46(t *testing.T) {
 	ctx := context.Background()
-	open := func(t *testing.T) (*Store, datadir.IDFile) {
+	open := func(t *testing.T) (*Store, string) {
 		s, err := Open(ctx, Options{DSN: newDatabase(t)})
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(s.Close)
-		return s, datadir.NewIDFile(t.TempDir())
+		return s, t.TempDir()
 	}
 	var seq atomic.Int64
 	newID := func() string { return fmt.Sprintf("install-%d", seq.Add(1)) }
-	finish := func(t *testing.T, s *Store, f datadir.IDFile, want string) {
+	newToken := func() ([]byte, error) {
+		b := make([]byte, ownership.TokenSize)
+		_, err := rand.Read(b)
+		return b, err
+	}
+	boot := func(s *Store, dir string) (string, error) {
+		return ownership.Bootstrap(ctx, s, datadir.NewIDFile(dir), datadir.NewTokenFile(dir), newID, newToken)
+	}
+	finish := func(t *testing.T, s *Store, dir, want string) {
 		t.Helper()
-		id, err := ownership.Bootstrap(ctx, s, f, newID)
+		id, err := boot(s, dir)
 		if err != nil || (want != "" && id != want) {
 			t.Fatalf("重新引导得到 (%q, %v)，期望 %q", id, err, want)
 		}
 		st, _ := s.InspectInstallation(ctx)
-		fid, _, _ := f.Read()
+		fid, _, _ := datadir.NewIDFile(dir).Read()
 		if st.Installation == nil || !st.Installation.Complete || st.Installation.InstallID != id || fid != id {
 			t.Fatalf("引导后状态不一致：%+v 文件 %q", st.Installation, fid)
 		}
 	}
-	refused := func(t *testing.T, s *Store, f datadir.IDFile) {
+	refused := func(t *testing.T, s *Store, dir string) {
 		t.Helper()
-		if _, err := ownership.Bootstrap(ctx, s, f, newID); !errors.Is(err, ownership.ErrRefused) {
+		if _, err := boot(s, dir); !errors.Is(err, ownership.ErrRefused) {
 			t.Fatalf("应拒绝启动，得到 %v", err)
 		}
 	}
+	token := func(t *testing.T, dir string) string {
+		t.Helper()
+		b, exists, err := datadir.NewTokenFile(dir).Read()
+		if err != nil || !exists {
+			t.Fatalf("令牌应已持久化：exists=%v err=%v", exists, err)
+		}
+		return string(b)
+	}
+	// pendingUnknown 让初始化事务真正提交而回复丢失：本次引导必须失败（结束本次启动），库中留下 pending。
+	pendingUnknown := func(t *testing.T, s *Store, dir string) string {
+		t.Helper()
+		s.hooks.afterCommit = func(op string) error {
+			if op == "InitializeInstallation" {
+				return errors.New("模拟：COMMIT 已执行但回复丢失")
+			}
+			return nil
+		}
+		defer func() { s.hooks.afterCommit = nil }()
+		if id, err := boot(s, dir); !errors.Is(err, persistence.ErrCommitUnknown) || id != "" {
+			t.Fatalf("初始化提交结果未知时本次启动应失败且不返回 install_id，得到 (%q, %v)", id, err)
+		}
+		st, _ := s.InspectInstallation(ctx)
+		if st.Installation == nil || st.Installation.Complete {
+			t.Fatalf("库中应留下 pending 记录：%+v", st.Installation)
+		}
+		return st.Installation.InstallID
+	}
 
 	t.Run("空库首启", func(t *testing.T) {
-		s, f := open(t)
-		finish(t, s, f, "")
+		s, dir := open(t)
+		finish(t, s, dir, "")
 	})
-	t.Run("初始迁移提交前中断", func(t *testing.T) {
-		s, f := open(t)
+	t.Run("令牌已持久、初始化事务提交前中断：重启复用同一令牌", func(t *testing.T) {
+		s, dir := open(t)
 		fired := false
 		s.hooks.beforeCommit = func(string) error { fired = true; return errors.New("模拟中断") }
-		if _, err := ownership.Bootstrap(ctx, s, f, newID); err == nil || !fired {
+		if _, err := boot(s, dir); err == nil || !fired {
 			t.Fatalf("中断应使引导失败（钩子触发 %v），得到 %v", fired, err)
 		}
 		s.hooks.beforeCommit = nil
 		if st, _ := s.InspectInstallation(ctx); st.HasMigrations || st.HasAgentboxTables {
 			t.Fatalf("事务未提交时库应仍为空：%+v", st)
 		}
-		finish(t, s, f, "")
+		before := token(t, dir)
+		finish(t, s, dir, "")
+		if token(t, dir) != before {
+			t.Fatal("重启应复用已持久化的令牌，而不是生成新令牌")
+		}
 	})
-	t.Run("提交后、写身份文件前中断", func(t *testing.T) {
-		s, f := open(t)
-		if err := s.InitializeInstallation(ctx, "install-a"); err != nil {
+	t.Run("初始化提交结果未知：本次启动失败，下次启动恢复", func(t *testing.T) {
+		s, dir := open(t)
+		id := pendingUnknown(t, s, dir)
+		finish(t, s, dir, id)
+	})
+	t.Run("另一个数据目录不能接管 pending 安装", func(t *testing.T) {
+		s, dirA := open(t)
+		id := pendingUnknown(t, s, dirA)
+		dirB := t.TempDir()
+		refused(t, s, dirB)
+		if st, _ := s.InspectInstallation(ctx); st.Installation == nil || st.Installation.Complete || st.Installation.InstallID != id {
+			t.Fatalf("被拒绝后库不应改变：%+v", st.Installation)
+		}
+		if _, exists, _ := datadir.NewIDFile(dirB).Read(); exists {
+			t.Fatal("被拒绝的数据目录不应写入 install_id")
+		}
+		if _, exists, _ := datadir.NewTokenFile(dirB).Read(); exists {
+			t.Fatal("被拒绝的数据目录不应生成令牌")
+		}
+		finish(t, s, dirA, id)
+	})
+	t.Run("本数据目录的令牌丢失：拒绝", func(t *testing.T) {
+		s, dir := open(t)
+		pendingUnknown(t, s, dir)
+		if err := os.Remove(dir + "/bootstrap_token"); err != nil {
 			t.Fatal(err)
 		}
-		finish(t, s, f, "install-a")
+		refused(t, s, dir)
+	})
+	t.Run("令牌损坏：启动失败而不是当作首次安装", func(t *testing.T) {
+		s, dir := open(t)
+		if err := os.WriteFile(dir+"/bootstrap_token", []byte("not-a-token\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if id, err := boot(s, dir); !errors.Is(err, datadir.ErrTokenCorrupt) || id != "" {
+			t.Fatalf("应因令牌损坏失败，得到 (%q, %v)", id, err)
+		}
+		if st, _ := s.InspectInstallation(ctx); st.HasMigrations || st.HasAgentboxTables {
+			t.Fatalf("令牌损坏时不应初始化数据库：%+v", st)
+		}
 	})
 	t.Run("写身份文件后、置 complete 前中断", func(t *testing.T) {
-		s, f := open(t)
-		if err := s.InitializeInstallation(ctx, "install-b"); err != nil {
+		s, dir := open(t)
+		id := pendingUnknown(t, s, dir)
+		if err := datadir.NewIDFile(dir).Write(id); err != nil {
 			t.Fatal(err)
 		}
-		if err := f.Write("install-b"); err != nil {
+		finish(t, s, dir, id)
+	})
+	t.Run("旧 pending 记录（修订前，无令牌哈希列）", func(t *testing.T) {
+		s, dir := open(t)
+		if err := s.InitializeInstallation(ctx, "install-legacy", make([]byte, ownership.TokenSize)); err != nil {
 			t.Fatal(err)
 		}
-		finish(t, s, f, "install-b")
+		// 还原为只应用了 0001 的旧库
+		if _, err := s.pool.Exec(ctx, "ALTER TABLE installation DROP COLUMN bootstrap_token_hash; DELETE FROM schema_migrations WHERE version = 2"); err != nil {
+			t.Fatal(err)
+		}
+		if st, err := s.InspectInstallation(ctx); err != nil || st.Installation == nil || st.Installation.TokenHash != nil {
+			t.Fatalf("旧库应读作无令牌哈希：%+v %v", st.Installation, err)
+		}
+		refused(t, s, dir) // 无身份文件：无法证明由本目录发起
+		if err := datadir.NewIDFile(dir).Write("install-legacy"); err != nil {
+			t.Fatal(err)
+		}
+		finish(t, s, dir, "install-legacy") // 身份文件一致：置 complete
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if n := count(t, s, "SELECT count(*) FROM schema_migrations WHERE version = 2"); n != 1 {
+			t.Fatalf("引导完成后应应用 0002，得到 %d", n)
+		}
+	})
+	t.Run("库中的令牌哈希必须为 32 字节", func(t *testing.T) {
+		s, dir := open(t)
+		finish(t, s, dir, "")
+		if _, err := s.pool.Exec(ctx, `UPDATE installation SET bootstrap_token_hash = '\x0102'`); sqlState(err) != "23514" {
+			t.Fatalf("长度不对的令牌哈希应违反检查约束，得到 %v", err)
+		}
 	})
 	t.Run("有 schema 无 installation 记录", func(t *testing.T) {
-		s, f := open(t)
-		if err := s.InitializeInstallation(ctx, "install-c"); err != nil {
+		s, dir := open(t)
+		if err := s.InitializeInstallation(ctx, "install-c", make([]byte, ownership.TokenSize)); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := s.pool.Exec(ctx, "DELETE FROM installation"); err != nil {
 			t.Fatal(err)
 		}
-		refused(t, s, f)
+		refused(t, s, dir)
 	})
 	t.Run("身份不一致", func(t *testing.T) {
-		s, f := open(t)
-		finish(t, s, f, "")
-		if err := f.Write("install-other"); err != nil {
+		s, dir := open(t)
+		finish(t, s, dir, "")
+		if err := datadir.NewIDFile(dir).Write("install-other"); err != nil {
 			t.Fatal(err)
 		}
-		refused(t, s, f)
+		refused(t, s, dir)
 	})
 	t.Run("未知 schema", func(t *testing.T) {
-		s, f := open(t)
+		s, dir := open(t)
 		if _, err := s.pool.Exec(ctx, "CREATE TABLE tasks (task_id text)"); err != nil {
 			t.Fatal(err)
 		}
-		refused(t, s, f)
+		refused(t, s, dir)
 	})
 }
 
