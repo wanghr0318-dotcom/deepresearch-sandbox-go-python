@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -18,16 +20,44 @@ Handler = Callable[[TaskContext, Op, int, Held], Awaitable["Paused | None"]]
 async def run(ctx: TaskContext) -> Result | Paused:
     config = ctx.config if isinstance(ctx.config, dict) else {}
     steps: list[Op] = config.get("steps", [])
+    exec_log = config.get("exec_log")
     held: Held = []
     for index in range(_start_index(ctx), len(steps)):
         op = steps[index]
         handler = _HANDLERS.get(op.get("op", ""))
         if handler is None:
             raise WorkerFailure("sim_bad_config", f"第 {index} 步：未知操作 {op.get('op')!r}")
+        _record(exec_log, ctx, index, op["op"])
         outcome = await handler(ctx, op, index, held)
         if outcome is not None:
             return outcome
+    _record(exec_log, ctx, len(steps), "result")
     return Result(summary=config.get("summary", "done"), outputs=list(config.get("outputs", [])))
+
+
+def _record(path: str | None, ctx: TaskContext, index: int, op: str) -> None:
+    """执行计数（故障实验用）：config.exec_log 设置时，每步执行前与产生结果前向该文件追加一行 JSON。
+
+    以 O_APPEND 单次写入整行，多个进程同时追加也不会交错；由测试据此判断步骤是否被重复执行。
+    """
+    if not path:
+        return
+    line = json.dumps(
+        {
+            "task_id": ctx.task_id,
+            "attempt_id": ctx.attempt_id,
+            "attempt_no": ctx.attempt_no,
+            "index": index,
+            "op": op,
+            "pid": os.getpid(),
+            "t_ns": time.time_ns(),
+        }
+    )
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, (line + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
 
 
 def _start_index(ctx: TaskContext) -> int:

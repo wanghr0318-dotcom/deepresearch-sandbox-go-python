@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/faultinject"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 )
 
@@ -810,9 +811,13 @@ func (a *Actor) pumpStore() {
 		var r storeDone
 		switch cp.kind {
 		case opCreateAttempt:
+			faultinject.Point(faultinject.AttemptCreateBefore)
 			r.attempt, r.err = a.d.Store.CreateAttempt(ctx, cp.attempt)
+			faultinject.Point(faultinject.AttemptCreateAfter)
 		case opFinalize:
+			faultinject.Point(faultinject.VerdictBefore)
 			_, r.err = a.d.Store.FinalizeAttempt(ctx, cp.verdict)
+			faultinject.Point(faultinject.VerdictAfter)
 		case opApplyControl:
 			_, r.err = a.d.Store.ApplyControl(ctx, cp.control)
 		case opPersistRunTime:

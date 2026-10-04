@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/faultinject"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 )
 
@@ -77,6 +78,7 @@ func (c *Coordinator) cleanupEnv(ctx context.Context, e Environment) error {
 		})
 		return err
 	}
+	faultinject.Point(faultinject.CleanupDestroyed)
 	// Destroy 已逐层核对三层都不存在：创建意图可以结束。
 	if err := c.finishIntent(ctx, e.EnvID); err != nil {
 		return err

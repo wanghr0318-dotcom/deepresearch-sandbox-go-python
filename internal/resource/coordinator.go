@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/faultinject"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
 )
@@ -282,7 +283,9 @@ func (c *Coordinator) create(ctx context.Context, r EnvRequest) (provider.EnvInf
 		Template: r.Template, Limits: r.Limits, Mounts: r.Mounts,
 	}
 
+	faultinject.Point(faultinject.EnvCreateBefore)
 	info, err := c.p.Create(ctx, spec)
+	faultinject.Point(faultinject.EnvCreateAfter)
 	if errors.Is(err, provider.ErrIncomplete) {
 		// 本安装的残留：不补完、不认领，停止并拆除后以新的创建重建一次（契约第 3 节）。
 		if err = c.p.Stop(ctx, r.EnvID); err == nil {
@@ -389,12 +392,14 @@ func (c *Coordinator) StopEnv(ctx context.Context, envID string) (StopResult, er
 	at, pending := c.pendingStop[envID]
 	c.mu.Unlock()
 	if !pending {
+		faultinject.Point(faultinject.EnvStopBefore)
 		switch err := c.p.Stop(ctx, envID); {
 		case errors.Is(err, provider.ErrStopUnconfirmed):
 			return StopResult{Blocked: true}, nil
 		case err != nil:
 			return StopResult{}, fmt.Errorf("resource: 停止环境 %s: %w", envID, err)
 		}
+		faultinject.Point(faultinject.EnvStopAfter)
 		at = c.opt.Now()
 		c.mu.Lock()
 		c.pendingStop[envID] = at

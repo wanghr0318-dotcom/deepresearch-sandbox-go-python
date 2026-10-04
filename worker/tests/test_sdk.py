@@ -739,3 +739,28 @@ def test_sim_worker_ops(tmp_path, steps, config, code, last):
     exit_code, events = run(sim_app, tmp_path, init={"config": {"steps": steps, **config}})
     assert exit_code == code
     assert events[-1] == {**events[-1], **last}
+
+
+def test_sim_worker_exec_log_records_each_executed_step(tmp_path):
+    # 恢复时只记录从 next_index 起实际执行的步骤，最后记录 result；未设置 exec_log 时不写文件。
+    log = tmp_path / "exec.log"
+    steps = [{"op": "progress", "message": "a"}, {"op": "progress", "message": "b"}]
+    resume = {"checkpoint_id": "cp-0", "step_id": "s0", "state": {"next_index": 1}}
+    for attempt_no, init_resume in ((1, None), (2, resume)):
+        init = {
+            "attempt_id": f"a-{attempt_no}",
+            "attempt_no": attempt_no,
+            "resume": init_resume,
+            "config": {"steps": steps, "exec_log": str(log)},
+        }
+        code, _ = run(sim_app, tmp_path, init=init)
+        assert code == 0
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [(r["attempt_no"], r["index"], r["op"]) for r in records] == [
+        (1, 0, "progress"),
+        (1, 1, "progress"),
+        (1, 2, "result"),
+        (2, 1, "progress"),
+        (2, 2, "result"),
+    ]
+    assert all(r["task_id"] == "t-1" and r["pid"] > 0 for r in records)

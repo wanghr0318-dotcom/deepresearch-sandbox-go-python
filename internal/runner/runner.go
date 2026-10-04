@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/blob"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/faultinject"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
@@ -205,6 +206,7 @@ func (r *Runner) Run(ctx context.Context, a Attempt, controls <-chan Control) Ou
 	if err != nil {
 		return fail(err)
 	}
+	faultinject.Point(faultinject.WorkerStarted)
 	at := &attemptRun{r: r, a: a, h: h, dir: dir, stdin: h.Stdin(), saved: map[string]pinnedOutput{},
 		committed: map[string]int64{}, stderr: &tailBuffer{max: r.opt.StderrTail},
 		readyCh: make(chan struct{}), finishing: make(chan struct{}), storeDown: make(chan struct{})}
@@ -718,6 +720,7 @@ func (at *attemptRun) commitCheckpoint(ctx context.Context, m *protocol.Checkpoi
 		res.Status, res.Code = status, code
 		return res
 	}
+	faultinject.Point(faultinject.CheckpointCommitBefore)
 	cc, err := at.r.store.CommitCheckpoint(ctx, Checkpoint{
 		Scope:        Scope{Kind: protocol.ScopeTask, ID: at.a.TaskID},
 		CheckpointID: m.CheckpointID,
@@ -727,6 +730,7 @@ func (at *attemptRun) commitCheckpoint(ctx context.Context, m *protocol.Checkpoi
 		StateRef:     m.StateRef,
 		Refs:         m.Refs,
 	})
+	faultinject.Point(faultinject.CheckpointCommitAfter)
 	at.noteStore(err)
 	var rej *persistence.RejectedError
 	switch {

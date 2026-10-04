@@ -4,7 +4,11 @@
 package archtest
 
 import (
+	"io/fs"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -92,13 +96,66 @@ func TestTestOnlyPackagesNotInProduction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("go list: %v", err)
 	}
-	testOnly := []string{module + "/internal/provider/fake", module + "/internal/provider/providertest"}
+	// tests/ 下的包（进程型测试 provider procprov、只供测试的 main agentbox-e2e）同样只供测试。
+	testOnly := []string{module + "/internal/provider/fake", module + "/internal/provider/providertest", module + "/tests"}
 	for _, pkg := range strings.Fields(string(out)) {
 		rel := strings.TrimPrefix(pkg, module+"/")
 		if rel == "internal/provider/fake" || rel == "internal/provider/providertest" || strings.HasPrefix(rel, "tests/") {
 			continue
 		}
 		forbid(t, rel, testOnly)
+	}
+}
+
+// TestFaultInjectEnabledOnlyByE2E：故障注入只能由只供测试的 tests/e2e/... 开启（faultinject.Enable）；
+// 生产入口 cmd/agentbox 与其他任何包都不调用它，因此生产二进制中的钩子点恒为空操作。调用关系无法用
+// 导入边表达（钩子点所在的包本身导入 faultinject），以源码检查：除 internal/faultinject 自身与 tests/e2e
+// 之外，任何 .go 文件不得出现 faultinject.Enable，也不得以别名或点导入 faultinject（否则可绕过检查）。
+func TestFaultInjectEnabledOnlyByE2E(t *testing.T) {
+	root := filepath.Join("..", "..")
+	importPath := `"` + module + `/internal/faultinject"`
+	aliased := regexp.MustCompile(`(?m)^\s*(?:import\s+)?([\w.]+)\s+` + regexp.QuoteMeta(importPath))
+	// 拼接而成，使本文件自身不含该调用文本。
+	enableCall := "faultinject." + "Enable("
+	var e2eCalls int
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(root, path)
+		rel = filepath.ToSlash(rel)
+		if d.IsDir() {
+			if rel == "worker" || rel == "web" || d.Name() == "node_modules" || (strings.HasPrefix(d.Name(), ".") && rel != ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(rel, ".go") || strings.HasPrefix(rel, "internal/faultinject/") {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		src := string(b)
+		calls := strings.Count(src, enableCall)
+		if strings.HasPrefix(rel, "tests/e2e/") {
+			e2eCalls += calls
+			return nil
+		}
+		if calls > 0 {
+			t.Errorf("%s 调用了 faultinject.Enable：只有 tests/e2e 可以开启故障注入", rel)
+		}
+		if m := aliased.FindStringSubmatch(src); m != nil && m[1] != "import" {
+			t.Errorf("%s 以别名导入 faultinject（使 Enable 的调用无法被检查）", rel)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e2eCalls == 0 {
+		t.Fatal("tests/e2e 中没有找到 faultinject.Enable 的调用：检查本身失效")
 	}
 }
 
