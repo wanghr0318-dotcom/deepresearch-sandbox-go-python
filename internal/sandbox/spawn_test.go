@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +42,10 @@ func TestMain(m *testing.M) {
 	// reaper 子进程分流：见 runReaperCase。
 	if name := os.Getenv(envReaperChild); name != "" {
 		os.Exit(runReaperChild(name))
+	}
+	// init 服务循环子进程分流：见 runServeCase。
+	if name := os.Getenv(envServeChild); name != "" {
+		os.Exit(runServeChild(name))
 	}
 	if len(os.Args) > 1 && os.Args[1] == InitArg {
 		if err := RunInit(); err != nil {
@@ -1488,4 +1493,494 @@ func reaperChildOutErr() error {
 		return fmt.Errorf("消息 = %+v, want 一条带 reason 的 start_err", msgs)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// init 服务循环（规格 §4.2–§4.4）
+// ---------------------------------------------------------------------------
+
+// envServeChild 让测试二进制在 TestMain 中直接进入 runServeChild。
+//
+// 每个用例在 re-exec 出来的子进程里扮演 init：Serve 注册 SIGCHLD 并经
+// Wait4(-1) 收割本进程的全部子进程，放在独立进程里不影响同一测试二进制中
+// 其他自己 Wait 子进程的用例。控制通道是子进程内的一对 socketpair：init 端
+// 阻塞（与经 ExtraFiles 继承的生产 fd 一致），宿主端非阻塞。
+const envServeChild = "AGENTBOX_TEST_SERVE_CHILD"
+
+var serveChildren = map[string]func() error{
+	"ack-exit":   serveChildAckExit,
+	"start-err":  serveChildStartErr,
+	"terminate":  serveChildTerminate,
+	"parallel":   serveChildParallel,
+	"duplicate":  serveChildDuplicate,
+	"unexpected": serveChildUnexpected,
+	"host-close": serveChildHostClose,
+}
+
+// runServeCase 以 envServeChild=name re-exec 测试二进制，要求子进程报告通过。
+// 60 秒只是防挂死的上限，不用于同步。
+func runServeCase(t *testing.T, name string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(), envServeChild+"="+name)
+	out, err := cmd.CombinedOutput()
+	t.Logf("子进程输出:\n%s", out)
+	if err != nil {
+		t.Fatalf("子进程失败: %v", err)
+	}
+	if !strings.Contains(string(out), "serve child: ok") {
+		t.Fatalf("子进程没有报告完成")
+	}
+}
+
+// runServeChild 把本进程设为 child subreaper（与沙箱内 init 的处境相同），
+// 然后运行用例 name。
+func runServeChild(name string) int {
+	fn, ok := serveChildren[name]
+	if !ok {
+		fmt.Printf("serve child: FAIL: 未知用例 %q\n", name)
+		return 1
+	}
+	const prSetChildSubreaper = 36 // include/uapi/linux/prctl.h
+	if _, _, e := syscall.RawSyscall6(syscall.SYS_PRCTL, prSetChildSubreaper, 1, 0, 0, 0, 0); e != 0 {
+		fmt.Printf("serve child: FAIL: PR_SET_CHILD_SUBREAPER: %v\n", e)
+		return 1
+	}
+	if err := fn(); err != nil {
+		fmt.Printf("serve child: FAIL: %s: %v\n", name, err)
+		return 1
+	}
+	fmt.Printf("serve child: ok (%s)\n", name)
+	return 0
+}
+
+// TestServeStartAckThenExit：start → start_ack{pid}，workload 输出经传入的管道送达，然后 exit{code}。
+func TestServeStartAckThenExit(t *testing.T) { runServeCase(t, "ack-exit") }
+
+// TestServeLaunchFailureSendsStartErr：Launcher 失败或 spec 非法 → start_err，无 start_ack，FD 已关闭。
+func TestServeLaunchFailureSendsStartErr(t *testing.T) { runServeCase(t, "start-err") }
+
+// TestServeTerminateEscalatesToSIGKILL：忽略 SIGTERM 的进程在 grace 到期后被 SIGKILL；
+// grace 期间继续服务（另一个 exec 被 SIGTERM 终止并先收到 exit）。
+func TestServeTerminateEscalatesToSIGKILL(t *testing.T) { runServeCase(t, "terminate") }
+
+// TestServeParallelExecs：两个并行 exec 各自收到自己的 exit。
+func TestServeParallelExecs(t *testing.T) { runServeCase(t, "parallel") }
+
+// TestServeDuplicateExecIDRejected：exec_id 已登记且未退出 → start_err{duplicate_exec_id}，
+// 不启动、关闭 FD；该 exec 退出后同一 exec_id 可再次启动。
+func TestServeDuplicateExecIDRejected(t *testing.T) { runServeCase(t, "duplicate") }
+
+// TestServeUnexpectedMessageIsProtocolError：宿主发来 start/terminate 以外的消息 →
+// Serve 关闭连接并返回 ErrProtocol。
+func TestServeUnexpectedMessageIsProtocolError(t *testing.T) { runServeCase(t, "unexpected") }
+
+// TestServeReturnsWhenHostCloses：宿主关闭连接 → Serve 返回 nil。
+func TestServeReturnsWhenHostCloses(t *testing.T) { runServeCase(t, "host-close") }
+
+// pgLauncher 是测试用 Launcher：按 StartSpec 解码，直接 exec 并让 workload 成为
+// 自己进程组的组长（Setpgid），不建 namespace、不降权。只调用 exec.Cmd.Start，
+// 然后 Release，不等待进程。收到的 FD 已由 Serve 清除 O_NONBLOCK（exec.Cmd
+// 不会清除：os.NewFile 对已非阻塞的 fd 不记 nonblock，File.Fd() 不切换）。
+type pgLauncher struct{}
+
+func (pgLauncher) Launch(spec json.RawMessage, stdin, stdout, stderr *os.File) (int, error) {
+	var s StartSpec
+	if err := json.Unmarshal(spec, &s); err != nil {
+		return 0, err
+	}
+	cmd := exec.Command(s.Argv[0], s.Argv[1:]...)
+	cmd.Env, cmd.Dir = s.Env, s.Dir
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return 0, err
+	}
+	pid := cmd.Process.Pid
+	if err := cmd.Process.Release(); err != nil {
+		return 0, err
+	}
+	return pid, nil
+}
+
+// serveHost 是用例中的宿主端：conn 是控制通道宿主端，errc 收到 Serve 的返回值。
+type serveHost struct {
+	conn *Conn
+	errc chan error
+}
+
+// hostExec 是宿主持有的一个 exec 的管道端：stdin 写端与 stdout/stderr 合并的读端。
+type hostExec struct {
+	stdin, stdout *os.File
+}
+
+func (e hostExec) close() {
+	e.stdin.Close()
+	e.stdout.Close()
+}
+
+// startServe 创建控制通道并在 goroutine 中运行 Serve。
+func startServe() (*serveHost, error) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("socketpair: %w", err)
+	}
+	if err := syscall.SetNonblock(fds[0], true); err != nil {
+		return nil, fmt.Errorf("SetNonblock: %w", err)
+	}
+	host := NewConn(os.NewFile(uintptr(fds[0]), "control-host"), 64)
+	initConn := NewConn(os.NewFile(uintptr(fds[1]), "control-init"), 64)
+	reg := NewRegistry(func(m Message) error { return initConn.Send(m, nil) })
+	h := &serveHost{conn: host, errc: make(chan error, 1)}
+	go func() { h.errc <- Serve(context.Background(), initConn, reg, pgLauncher{}) }()
+	return h, nil
+}
+
+// start 发送 start 及三个 FD（stdin 管道读端；stdout 与 stderr 共用一个管道写端），
+// 并按规格 §4.2 在 Send 返回后关闭子端副本。
+func (h *serveHost) start(execID string, spec json.RawMessage) (hostExec, error) {
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		return hostExec{}, err
+	}
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		inR.Close()
+		inW.Close()
+		return hostExec{}, err
+	}
+	err = h.conn.Send(Message{Type: MsgStart, ExecID: execID, Spec: spec}, []*os.File{inR, outW, outW})
+	inR.Close()
+	outW.Close()
+	e := hostExec{stdin: inW, stdout: outR}
+	if err != nil {
+		e.close()
+		return hostExec{}, fmt.Errorf("Send(start %s): %w", execID, err)
+	}
+	return e, nil
+}
+
+// expect 接收下一条消息，要求其类型与 exec_id 符合。
+func (h *serveHost) expect(typ, execID string) (Message, error) {
+	m, files, err := h.conn.Recv()
+	for _, f := range files {
+		f.Close()
+	}
+	if err != nil {
+		return m, fmt.Errorf("等待 %s(%s): %w", typ, execID, err)
+	}
+	if m.Type != typ || m.ExecID != execID {
+		if m.Exit != nil {
+			return m, fmt.Errorf("收到 %+v（exit %+v）, want %s(%s)", m, *m.Exit, typ, execID)
+		}
+		return m, fmt.Errorf("收到 %+v, want %s(%s)", m, typ, execID)
+	}
+	return m, nil
+}
+
+// expectExit 接收下一条消息，要求它是 execID 的 exit 且退出状态为 want。
+func (h *serveHost) expectExit(execID string, want ExitInfo) error {
+	m, err := h.expect(MsgExit, execID)
+	if err != nil {
+		return err
+	}
+	if *m.Exit != want {
+		return fmt.Errorf("exit(%s) = %+v, want %+v", execID, *m.Exit, want)
+	}
+	return nil
+}
+
+// closeAndWait 关闭宿主端并要求 Serve 返回 nil。
+func (h *serveHost) closeAndWait() error {
+	h.conn.Close()
+	if err := <-h.errc; err != nil {
+		return fmt.Errorf("宿主关闭后 Serve = %v, want nil", err)
+	}
+	return nil
+}
+
+func shSpec(script string) json.RawMessage { return argvSpec("/bin/sh", "-c", script) }
+
+// readEOF 读到 EOF 并返回全部内容；EOF 说明所有写端副本（包括 init 的）都已关闭。
+func readEOF(f *os.File) (string, error) {
+	b, err := io.ReadAll(f)
+	return string(b), err
+}
+
+func serveChildAckExit() error {
+	h, err := startServe()
+	if err != nil {
+		return err
+	}
+	// workload 报告自己 fd 0/1/2 的打开标志（八进制）与进程组号。宿主的管道端
+	// 是非阻塞的；workload 拿到的必须是阻塞的，且自成进程组（terminate 依赖它）。
+	e, err := h.start("e1", shSpec(`awk '/^flags/{print $2}' /proc/$$/fdinfo/0 /proc/$$/fdinfo/1 /proc/$$/fdinfo/2; cut -d' ' -f5 /proc/$$/stat; exit 5`))
+	if err != nil {
+		return err
+	}
+	defer e.close()
+	m, err := h.expect(MsgStartAck, "e1")
+	if err != nil {
+		return err
+	}
+	if m.PID <= 0 {
+		return fmt.Errorf("start_ack pid = %d", m.PID)
+	}
+	out, err := readEOF(e.stdout)
+	lines := strings.Fields(out)
+	if err != nil || len(lines) != 4 {
+		return fmt.Errorf("stdout = %q, %v; want 3 行标志与 1 行进程组号", out, err)
+	}
+	for i, s := range lines[:3] {
+		flags, err := strconv.ParseUint(s, 8, 32)
+		if err != nil {
+			return fmt.Errorf("fd %d 标志 %q: %v", i, s, err)
+		}
+		if flags&syscall.O_NONBLOCK != 0 {
+			return fmt.Errorf("workload 的 fd %d 是非阻塞的（flags 0%o）", i, flags)
+		}
+	}
+	if lines[3] != strconv.Itoa(m.PID) {
+		return fmt.Errorf("workload 进程组 = %s, want pid %d", lines[3], m.PID)
+	}
+	if err := h.expectExit("e1", ExitInfo{Code: 5}); err != nil {
+		return err
+	}
+	return h.closeAndWait()
+}
+
+func serveChildStartErr() error {
+	h, err := startServe()
+	if err != nil {
+		return err
+	}
+	cases := []struct {
+		id, reason string
+		spec       json.RawMessage
+	}{
+		{"missing", "", argvSpec("/nonexistent/agentbox-test")},
+		{"empty-argv", reasonInvalidSpec, json.RawMessage(`{"argv":[]}`)},
+		{"unknown-field", reasonInvalidSpec, json.RawMessage(`{"argv":["/bin/true"],"cmd":"x"}`)},
+	}
+	for _, c := range cases {
+		e, err := h.start(c.id, c.spec)
+		if err != nil {
+			return err
+		}
+		m, err := h.expect(MsgStartErr, c.id)
+		if err != nil {
+			e.close()
+			return err
+		}
+		if m.Reason == "" || !strings.HasPrefix(m.Reason, c.reason) {
+			e.close()
+			return fmt.Errorf("start_err(%s).reason = %q, want 前缀 %q", c.id, m.Reason, c.reason)
+		}
+		// init 已关闭它的 FD 副本、没有进程持有写端：stdout 立即 EOF。
+		out, err := readEOF(e.stdout)
+		e.close()
+		if err != nil || out != "" {
+			return fmt.Errorf("start_err(%s) 后 stdout = %q, %v; want 立即 EOF", c.id, out, err)
+		}
+	}
+	// 失败的 exec 没有 start_ack/exit：下一条消息属于新的 exec。
+	e, err := h.start("ok", argvSpec("/bin/true"))
+	if err != nil {
+		return err
+	}
+	defer e.close()
+	if _, err := h.expect(MsgStartAck, "ok"); err != nil {
+		return err
+	}
+	if err := h.expectExit("ok", ExitInfo{Code: 0}); err != nil {
+		return err
+	}
+	return h.closeAndWait()
+}
+
+// waitReady 从 stdout 读出一行 "ready"：此时 workload 已装好信号处置。
+func waitReady(e hostExec) error {
+	buf := make([]byte, len("ready\n"))
+	if _, err := io.ReadFull(e.stdout, buf); err != nil || string(buf) != "ready\n" {
+		return fmt.Errorf("等待 ready: %q, %v", buf, err)
+	}
+	return nil
+}
+
+func serveChildTerminate() error {
+	h, err := startServe()
+	if err != nil {
+		return err
+	}
+	// stubborn 忽略 SIGTERM（忽略的处置在 exec 后保留），只能被 SIGKILL 结束。
+	stubborn, err := h.start("stubborn", shSpec(`trap "" TERM; echo ready; exec sleep 1000`))
+	if err != nil {
+		return err
+	}
+	defer stubborn.close()
+	if _, err := h.expect(MsgStartAck, "stubborn"); err != nil {
+		return err
+	}
+	polite, err := h.start("polite", shSpec(`echo ready; exec sleep 1000`))
+	if err != nil {
+		return err
+	}
+	defer polite.close()
+	if _, err := h.expect(MsgStartAck, "polite"); err != nil {
+		return err
+	}
+	if err := waitReady(stubborn); err != nil {
+		return err
+	}
+	if err := waitReady(polite); err != nil {
+		return err
+	}
+
+	const grace = 2 * time.Second
+	sent := time.Now()
+	if err := h.conn.Send(Message{Type: MsgTerminate, ExecID: "stubborn", GraceMS: grace.Milliseconds()}, nil); err != nil {
+		return err
+	}
+	// 未知 exec_id 被忽略，不产生任何消息。
+	if err := h.conn.Send(Message{Type: MsgTerminate, ExecID: "nobody", GraceMS: 1}, nil); err != nil {
+		return err
+	}
+	// grace 期间 Serve 继续服务：polite 收到 SIGTERM 即退出，它的 exit 先到。
+	if err := h.conn.Send(Message{Type: MsgTerminate, ExecID: "polite", GraceMS: time.Hour.Milliseconds()}, nil); err != nil {
+		return err
+	}
+	if err := h.expectExit("polite", ExitInfo{Signal: syscall.SIGTERM}); err != nil {
+		return err
+	}
+	if err := h.expectExit("stubborn", ExitInfo{Signal: syscall.SIGKILL}); err != nil {
+		return err
+	}
+	if d := time.Since(sent); d < grace {
+		return fmt.Errorf("SIGKILL 在 terminate 后 %v 到达，早于 grace %v", d, grace)
+	}
+	// polite 的一小时计时器仍在等待；Serve 返回时停止它。
+	return h.closeAndWait()
+}
+
+func serveChildParallel() error {
+	h, err := startServe()
+	if err != nil {
+		return err
+	}
+	a, err := h.start("a", shSpec("cat >/dev/null; exit 1"))
+	if err != nil {
+		return err
+	}
+	defer a.close()
+	b, err := h.start("b", shSpec("cat >/dev/null; exit 2"))
+	if err != nil {
+		return err
+	}
+	defer b.close()
+	if _, err := h.expect(MsgStartAck, "a"); err != nil {
+		return err
+	}
+	if _, err := h.expect(MsgStartAck, "b"); err != nil {
+		return err
+	}
+	// 两者同时在运行；按与启动相反的顺序让它们退出。
+	b.stdin.Close()
+	if err := h.expectExit("b", ExitInfo{Code: 2}); err != nil {
+		return err
+	}
+	a.stdin.Close()
+	if err := h.expectExit("a", ExitInfo{Code: 1}); err != nil {
+		return err
+	}
+	return h.closeAndWait()
+}
+
+func serveChildDuplicate() error {
+	h, err := startServe()
+	if err != nil {
+		return err
+	}
+	first, err := h.start("e1", shSpec("cat >/dev/null; exit 3"))
+	if err != nil {
+		return err
+	}
+	defer first.close()
+	if _, err := h.expect(MsgStartAck, "e1"); err != nil {
+		return err
+	}
+
+	dup, err := h.start("e1", argvSpec("/bin/true"))
+	if err != nil {
+		return err
+	}
+	m, err := h.expect(MsgStartErr, "e1")
+	if err != nil {
+		dup.close()
+		return err
+	}
+	if m.Reason != ReasonDuplicateExecID {
+		dup.close()
+		return fmt.Errorf("start_err.reason = %q, want %q", m.Reason, ReasonDuplicateExecID)
+	}
+	out, err := readEOF(dup.stdout)
+	dup.close()
+	if err != nil || out != "" {
+		return fmt.Errorf("重复 start 的 stdout = %q, %v; want 立即 EOF（FD 已关闭、未启动）", out, err)
+	}
+
+	// 原 exec 不受影响；它退出后同一 exec_id 可以再次启动。
+	first.stdin.Close()
+	if err := h.expectExit("e1", ExitInfo{Code: 3}); err != nil {
+		return err
+	}
+	again, err := h.start("e1", shSpec("exit 4"))
+	if err != nil {
+		return err
+	}
+	defer again.close()
+	if _, err := h.expect(MsgStartAck, "e1"); err != nil {
+		return err
+	}
+	if err := h.expectExit("e1", ExitInfo{Code: 4}); err != nil {
+		return err
+	}
+	return h.closeAndWait()
+}
+
+func serveChildUnexpected() error {
+	h, err := startServe()
+	if err != nil {
+		return err
+	}
+	defer h.conn.Close()
+	if err := h.conn.Send(Message{Type: MsgStartAck, ExecID: "e1", PID: 1}, nil); err != nil {
+		return err
+	}
+	if err := <-h.errc; !errors.Is(err, ErrProtocol) {
+		return fmt.Errorf("Serve = %v, want ErrProtocol", err)
+	}
+	// Serve 已关闭 init 端：宿主读到 EOF。
+	if _, _, err := h.conn.Recv(); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("Serve 返回后宿主 Recv = %v, want io.EOF", err)
+	}
+	return nil
+}
+
+func serveChildHostClose() error {
+	h, err := startServe()
+	if err != nil {
+		return err
+	}
+	// 有 workload 仍在运行时宿主关闭连接，Serve 也返回（残留进程由 cgroup 回收）。
+	e, err := h.start("e1", shSpec("cat >/dev/null"))
+	if err != nil {
+		return err
+	}
+	defer e.close()
+	if _, err := h.expect(MsgStartAck, "e1"); err != nil {
+		return err
+	}
+	return h.closeAndWait()
 }
