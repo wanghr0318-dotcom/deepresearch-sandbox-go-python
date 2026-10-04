@@ -70,7 +70,7 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
 
 **事件流错误码**：`seq_invalid`、`before_ready`、`duplicate_ready`、`after_terminal`、`handshake_error_misplaced`、`after_handshake_error`。
 
-**判定优先级**（两侧一致）：行长超过任何类型上限中的最大值（1 MiB）→ `message_too_large`，不解析（避免解析超大输入）；行不是 JSON 对象 → `malformed_json`；`type` 缺失、非字符串或不属于该方向 → `unknown_type`；超过该类型的大小上限 → `message_too_large`；字段类型错误 → `invalid_field`；然后按各类型的语义规则依次检查。
+**判定优先级**（两侧一致）：行长超过任何类型上限中的最大值（1 MiB）→ `message_too_large`，不解析（避免解析超大输入）；行不是严格的 UTF-8（含 BOM 前缀）、不是 JSON 对象或嵌套过深 → `malformed_json`；`type` 缺失、非字符串或不属于该方向 → `unknown_type`；超过该类型的大小上限 → `message_too_large`；字段类型错误 → `invalid_field`；然后按各类型的语义规则依次检查。
 
 **事件流规则**（task 模式）：`seq` 从 1 严格递增；`ready` 之前只允许 `error`（启动失败）；`ready` 只能出现一次；终态提议（`result`、`error`、`paused`）至多一个，其后只允许 `checkpoint_query`；`handshake_error` 只能是第一条且是唯一一条 Worker 消息。
 
@@ -96,6 +96,7 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
 - **输入**：读取阶段即按帧长上限（init 上限 1 MiB + 行尾）截断判定，超长帧报 `message_too_large` 并停止读取；读到的行进入线程安全的有界队列（默认 64 条），队列满时读线程阻塞，对宿主形成背压。读线程绑定首次 `receive` 所在的事件循环，该循环关闭后不再读取输入并退出。输入缓冲约为 (64 + 1) 帧：队列中的 64 帧，加上读线程正在读取或等待入队的一帧，另有对象与底层文件缓冲的开销；这是估算，**不是**总内存的硬上限（不能写成"最多 64 MiB"）。
 - **进程入口** `main()` 是 SDK 中唯一调用 `os._exit` 的地方：运行 Worker（任何异常都记录并按失败处理）→ 在期限内等待已提交的输出写完 → `os._exit`。期限由环境变量 `AGENTBOX_WORKER_SHUTDOWN_TIMEOUT` 设置（秒，默认 5）。读写线程可能阻塞在 stdin 或 stdout 上且无法取消，正常的解释器收尾会挂起或崩溃（计划演练中实测复现 `Fatal Python error: _enter_buffered_busy`）。
 - **该期限只约束协议输出的收尾，不是整个 Worker 的退出期限。** `register_artifact` 在线程池中计算哈希，不能保证有限时间内完成（路径是 FIFO 或读操作阻塞时线程会一直等待且无法取消）；`asyncio.run` 返回前会等待线程池中的线程（演练中在 3.11 与 3.13 上实测），这段等待发生在进入输出收尾之前，不受该期限约束。**最终强制终止由宿主负责。**
+- **边界输入的两侧一致性**：数值超出 int64 范围的整数字段 → `invalid_field`；JSON 中的孤立代理项转义（如 `\ud800`）在解码时接受（Go 替换为 U+FFFD，Python 保留并按 surrogatepass 计长），Python 编码含孤立代理项的消息 → `invalid_field`。inline state 的大小由宿主（Go）按原始文本的紧凑形式判定，为准；SDK 按重新序列化计，作为发送前预检——对 SDK 生成的消息两者一致，手写的非规范写法（`\u` 转义、数字拼写、重复键）以宿主为准。已知差异：Python 不接受超过 4300 位的整数字面量（解释器限制，报 `malformed_json`），Go 在自由格式字段（`state`、`data`、`config`）中接受。
 - **checkpoint 快照**：`state` 在首次提交前经 JSON 往返生成快照，所有重试复用它。往返会归一化：tuple 变为 list，非字符串键变为字符串；NaN 与 Infinity 被拒绝（`invalid_field`）。
 
 ---
@@ -192,7 +193,9 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
     {"name": "cancel_negative_grace", "direction": "host", "message": {"type": "cancel", "v": 1, "attempt_id": "a-1", "reason": "user", "grace_ms": -1}, "code": "invalid_field"},
     {"name": "error_missing_code", "direction": "worker", "message": {"type": "error", "v": 1, "seq": 2, "message": "boom", "retryable": false}, "code": "missing_field"},
     {"name": "error_retryable_not_bool", "direction": "worker", "message": {"type": "error", "v": 1, "seq": 2, "code": "x", "message": "boom", "retryable": "yes"}, "code": "invalid_field"},
-    {"name": "handshake_error_bad_bootstrap", "direction": "worker", "message": {"type": "handshake_error", "bootstrap": 2, "code": "no_common_version"}, "code": "invalid_field"}
+    {"name": "handshake_error_bad_bootstrap", "direction": "worker", "message": {"type": "handshake_error", "bootstrap": 2, "code": "no_common_version"}, "code": "invalid_field"},
+    {"name": "utf8_bom_prefix", "direction": "worker", "raw": "\ufeff{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "malformed_json"},
+    {"name": "seq_out_of_int64_range", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":99999999999999999999,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"}
   ]
 }
 ```
@@ -319,6 +322,9 @@ func TestDecodeLimits(t *testing.T) {
 		{"refs 恰好到上限", WorkerToHost, string(checkpointLine(`{}`, refs)), ""},
 		{"refs 超过上限", WorkerToHost, string(checkpointLine(`{}`, append(refs, ref))), CodeTooManyRefs},
 		{"超过所有上限的行不解析", HostToWorker, strings.Repeat("x", MaxInitBytes+1), CodeMessageTooLarge},
+		{"非法 UTF-8", WorkerToHost, "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"\xff\"}", CodeMalformedJSON},
+		{"嵌套过深", WorkerToHost, `{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":` + strings.Repeat("[", 20000) + strings.Repeat("]", 20000) + `}`, CodeMalformedJSON},
+		{"孤立代理项转义可以解码", WorkerToHost, string(checkpointLine(`"\ud800"`, []string{})), ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1013,6 +1019,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"unicode/utf8"
 )
 
 // Direction 是消息的传输方向。
@@ -1051,6 +1058,9 @@ var registry = map[Direction]map[string]func() Message{
 func DecodeLine(dir Direction, line []byte) (Message, error) {
 	if len(line) > maxLineBytes {
 		return nil, newError(CodeMessageTooLarge, "%d 字节，上限 %d", len(line), maxLineBytes)
+	}
+	if !utf8.Valid(line) {
+		return nil, newError(CodeMalformedJSON, "行不是合法的 UTF-8")
 	}
 	if t := bytes.TrimSpace(line); len(t) == 0 || t[0] != '{' {
 		return nil, newError(CodeMalformedJSON, "消息必须是 JSON 对象")
@@ -1876,6 +1886,24 @@ LIMIT_CASES = [
     ),
     pytest.param(
         WORKER,
+        b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"\xff"}',
+        "malformed_json",
+        id="invalid_utf8",
+    ),
+    pytest.param(
+        WORKER,
+        b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":'
+        + b"[" * 20000
+        + b"]" * 20000
+        + b"}",
+        "malformed_json",
+        id="nesting_too_deep",
+    ),
+    pytest.param(
+        WORKER, checkpoint_line('"\\ud800"', []), None, id="lone_surrogate_escape_accepted"
+    ),
+    pytest.param(
+        WORKER,
         b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":NaN}',
         "malformed_json",
         id="nan_is_malformed",
@@ -1914,6 +1942,12 @@ def test_decode_limits(direction, line, code):
             {"type": "paused", "v": 1, "seq": 1, "checkpoint_id": "cp-1"},
             "unknown_type",
             id="wrong_direction",
+        ),
+        pytest.param(
+            WORKER,
+            {"type": "progress", "v": 1, "seq": 1, "kind": "x", "message": "\ud800"},
+            "invalid_field",
+            id="lone_surrogate",
         ),
     ],
 )
@@ -1987,8 +2021,12 @@ def _is_str(v: Any) -> bool:
     return isinstance(v, str)
 
 
+_INT64_MIN, _INT64_MAX = -(1 << 63), (1 << 63) - 1
+
+
 def _is_int(v: Any) -> bool:
-    return isinstance(v, int) and not isinstance(v, bool)
+    """与 Go 一致：整数字段必须落在 int64 范围内。"""
+    return isinstance(v, int) and not isinstance(v, bool) and _INT64_MIN <= v <= _INT64_MAX
 
 
 def _is_bool(v: Any) -> bool:
@@ -2128,7 +2166,7 @@ def valid_sha256(s: str) -> bool:
 
 def valid_artifact_path(path: str) -> bool:
     """相对、非空、无 NUL、不超过上限、不含空、. 或 .. 分量（规格 §5.6）。"""
-    if not path or len(path.encode("utf-8")) > MAX_ARTIFACT_PATH_BYTES:
+    if not path or len(path.encode("utf-8", "surrogatepass")) > MAX_ARTIFACT_PATH_BYTES:
         return False
     if "\x00" in path or path.startswith("/"):
         return False
@@ -2145,7 +2183,8 @@ def _check_state(msg: dict[str, Any]) -> None:
             raise ProtocolError("invalid_field", "state_ref 不是合法的 sha256")
         return
     compact = json.dumps(msg["state"], ensure_ascii=False, separators=(",", ":"))
-    size = len(compact.encode("utf-8"))
+    # 孤立代理项按 3 字节计，与 Go 替换成的 U+FFFD 相同
+    size = len(compact.encode("utf-8", "surrogatepass"))
     if size > MAX_INLINE_STATE_BYTES:
         raise ProtocolError(
             "state_too_large", f"inline state {size} 字节，上限 {MAX_INLINE_STATE_BYTES}"
@@ -2328,13 +2367,16 @@ def _validator_for(direction: str, typ: Any) -> Callable[[dict[str, Any]], None]
 
 
 def decode_line(direction: str, line: bytes | str) -> dict[str, Any]:
-    """解析并校验一行消息（不含行尾换行符）。"""
-    raw = line.encode("utf-8") if isinstance(line, str) else line
+    """解析并校验一行消息（不含行尾换行符）。行必须是严格的 UTF-8，不含 BOM。"""
+    try:
+        raw = line.encode("utf-8") if isinstance(line, str) else line
+    except UnicodeEncodeError as exc:  # str 中含孤立代理项字符
+        raise ProtocolError("malformed_json", "行不是合法的 UTF-8") from exc
     if len(raw) > MAX_LINE_BYTES:
         raise ProtocolError("message_too_large", f"{len(raw)} 字节，上限 {MAX_LINE_BYTES}")
     try:
-        msg = json.loads(raw, parse_constant=_reject_constant)
-    except ValueError as exc:  # JSONDecodeError 与 UnicodeDecodeError 都是 ValueError
+        msg = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+    except (ValueError, RecursionError) as exc:  # 非法 UTF-8、BOM、语法错误、嵌套过深
         raise ProtocolError("malformed_json", str(exc)) from exc
     if not isinstance(msg, dict):
         raise ProtocolError("malformed_json", "消息必须是 JSON 对象")
@@ -2356,7 +2398,10 @@ def encode_line(direction: str, msg: dict[str, Any]) -> bytes:
         text = json.dumps(msg, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     except ValueError as exc:  # NaN、Infinity 不是合法 JSON
         raise ProtocolError("invalid_field", f"消息含有 JSON 不支持的数值：{exc}") from exc
-    line = text.encode("utf-8")
+    try:
+        line = text.encode("utf-8")
+    except UnicodeEncodeError as exc:  # 字符串中含孤立代理项
+        raise ProtocolError("invalid_field", "消息含有孤立代理项，无法编码为 UTF-8") from exc
     _check_size(direction, typ, len(line))
     return line
 ```
