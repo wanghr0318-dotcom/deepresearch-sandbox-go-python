@@ -4761,6 +4761,39 @@ func TestCheckpointFencingAndRefs(t *testing.T) {
 		t.Fatalf("当前 attempt 引用本任务已授权的 blob 应提交：%+v %v", got, err)
 	}
 }
+
+// TestNoWritesAfterVerdict 覆盖规格 §5.8：判决提交后，同一 attempt 迟到的 checkpoint、产物与终态提议都被拒绝，
+// 任务的指针、事件与产物不变；判决前已完成的写入重放时仍返回原结果。
+func TestNoWritesAfterVerdict(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	art := runner.Artifact{TaskID: "t1", AttemptID: "att-t1", ArtifactID: "report", SHA256: strings.Repeat("a", 64), Size: 9,
+		MediaType: "text/markdown", Visibility: "output"}
+	first, err := s.RegisterArtifact(ctx, art)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.FinalizeAttempt(ctx, verdict("t1", 1)); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshot(t, s, "t1")
+	_, err = s.CommitCheckpoint(ctx, runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "t1"}, CheckpointID: "cp-late",
+		AttemptID: "att-t1", StepID: "s1", State: json.RawMessage(`{"n":1}`)})
+	expectRejected(t, err, persistence.CodeStaleAttempt)
+	late := art
+	late.SHA256 = strings.Repeat("b", 64)
+	_, err = s.RegisterArtifact(ctx, late)
+	expectRejected(t, err, persistence.CodeStaleAttempt)
+	_, err = s.RecordTerminalProposal(ctx, runner.TerminalProposal{AttemptID: "att-t1", Kind: "result", Ref: "seq:9"})
+	expectRejected(t, err, persistence.CodeStaleAttempt)
+	if after := snapshot(t, s, "t1"); after != before {
+		t.Fatalf("判决后迟到的写入不应改变任务：%s → %s", before, after)
+	}
+	if again, err := s.RegisterArtifact(ctx, art); err != nil || again != first {
+		t.Fatalf("判决前已登记的产物重放应返回原结果：%+v %v", again, err)
+	}
+}
 ```
 
 - [ ] **Step 2：确认测试失败**
@@ -4896,22 +4929,26 @@ func (s *Store) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runn
 	return out, err
 }
 
-// fenceAttempt 要求 attemptID 是任务的当前 attempt 且其访问仍为 active；调用方已持有任务行锁，
-// 因此检查到提交之间 current_attempt_id 不会改变。
+// fenceAttempt 要求 attemptID 是任务的当前 attempt、其访问仍为 active，且尚无判决：判决提交后
+// 迟到的写入不得改写终态（规格 §5.8）。调用方已持有任务行锁（FinalizeAttempt 需要 FOR UPDATE），
+// 因此检查到提交之间 current_attempt_id 与判决都不会改变。
 func fenceAttempt(ctx context.Context, tx pgx.Tx, taskID, attemptID string) error {
 	var current *string
 	var access string
-	err := tx.QueryRow(ctx, `SELECT t.current_attempt_id, COALESCE(aa.state, '') FROM tasks t
-		LEFT JOIN attempt_access aa ON aa.task_id = t.task_id AND aa.attempt_id = $2 WHERE t.task_id = $1`,
-		taskID, attemptID).Scan(&current, &access)
+	var decided bool
+	err := tx.QueryRow(ctx, `SELECT t.current_attempt_id, COALESCE(aa.state, ''), COALESCE(a.verdict_hash IS NOT NULL, false)
+		FROM tasks t
+		LEFT JOIN attempt_access aa ON aa.task_id = t.task_id AND aa.attempt_id = $2
+		LEFT JOIN attempts a ON a.task_id = t.task_id AND a.attempt_id = $2
+		WHERE t.task_id = $1`, taskID, attemptID).Scan(&current, &access, &decided)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return notFoundf("任务 %s", taskID)
 	}
 	if err != nil {
 		return err
 	}
-	if current == nil || *current != attemptID || access != "active" {
-		return rejectf(persistence.CodeStaleAttempt, "attempt %s 不是任务 %s 的当前 attempt，或访问已撤销", attemptID, taskID)
+	if current == nil || *current != attemptID || access != "active" || decided {
+		return rejectf(persistence.CodeStaleAttempt, "attempt %s 不是任务 %s 的当前 attempt、访问已撤销或已有判决", attemptID, taskID)
 	}
 	return nil
 }
@@ -5077,6 +5114,13 @@ func (s *Store) RecordTerminalProposal(ctx context.Context, p runner.TerminalPro
 			return nil
 		case existingHash != nil:
 			return conflictf("attempt %s 已有不同的终态提议 %s", p.AttemptID, existing.Kind)
+		}
+		var decided bool
+		if err := tx.QueryRow(ctx, "SELECT verdict_hash IS NOT NULL FROM attempts WHERE attempt_id = $1", p.AttemptID).Scan(&decided); err != nil {
+			return err
+		}
+		if decided { // 判决已提交（例如无提议即退出）后，迟到的提议不再记录
+			return rejectf(persistence.CodeStaleAttempt, "attempt %s 已有判决，不再接受终态提议", p.AttemptID)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE attempts SET terminal_proposal = $2, terminal_proposal_ref = $3, terminal_proposal_hash = $4
 			WHERE attempt_id = $1`, p.AttemptID, p.Kind, p.Ref, hash); err != nil {
@@ -5792,6 +5836,7 @@ cd /f/go-agentbox-m1-4 && git add .github/workflows/ci.yml && git commit -m "ci:
 - **执行中评审修订（Task 2、3）**：BlobStore 的已存在路径曾直接返回成功（只比较大小、不 fsync），新分片目录的父目录未 fsync——改为 NewLocal 预建 256 个分片并 fsync，Put 总是以校验过的副本原子替换后 fsync 分片目录，并补损坏/截断替换测试；Bootstrap 的前置条件（先 flock、后 advisory lock）写入文档注释，出错时不返回 install_id，拒绝空的 newID，空库判定加上无 installation 记录，测试补齐（未知 schema 有文件、CompleteInstallation 校验 ID、空 ID）。
 - **执行中评审修订（Task 4）**：事务辅助的错误分类（服务端终止会话与超时码、COMMIT 的 FATAL 与 SafeToRetry、`ErrTxCommitRollback`、调用方取消、`%w` 保留原因）按设计 §2.1 修正并补 `TestErrorClassification`；spec §6 的复合外键（events、artifacts）补上并有违反测试；失锁测试按当前数据库过滤 pid、等待在途操作阻塞并断言检测延迟；`Ownership.Close` 幂等；迁移路径随失锁取消；`InspectInstallation` 统一用 pg_catalog 查表；回滚有界超时。修订在含 Task 4–7 全部代码的演练树中验证：全部测试连续三次通过、各阶段独立通过、逐项回退均被测试捕获。
 - **执行中评审修订（Task 5）**：ApplyControl 按规格 §8.1 的转换表（`controlTransition`）检查来源状态并以 CAS 写入，拒绝终态（`task_ended`）与被取代的控制版本（`control_changed`）；FinalizeAttempt 只接受 running/pausing/cancelling 的任务并推进 `applied_control_version`；AcceptControl 拒绝跨任务复用 request_id，CreateTask/CreateAttempt 对已存在的 task_id/env_id 立即冲突；`snapshot` 覆盖更多字段，控制拒绝与转换、宿主事件幂等均有测试。在含 Task 4–7 全部代码的演练树中验证并做逐项回退检查。
+- **执行中评审修订（Task 6）**：Plan 4 没有撤销 `attempt_access` 的用例，判决后同一 attempt 仍是当前且访问有效；`fenceAttempt` 另要求该 attempt 尚无判决，`RecordTerminalProposal` 在判决后拒绝新提议（规格 §5.8），补 `TestNoWritesAfterVerdict` 与两处回退检查。
 - **未在本地验证**：golangci-lint（本机未安装，由 CI 判定）。
 - **评审修订（第三轮）**：checkpoint 缺少 fencing 与引用授权、最终判决未在锁内仲裁取消与当前 attempt、创建 attempt 缺少准入前置条件——均为规格 §5.5、§8.1 的实现遗漏，已按设计 §2.6 并入 Task 5、6，并补测试。同类遗漏 `AcceptControl` 的控制写入规则（`task_ended` 等）一并补上，"判决先提交"的测试依赖它。设计文档的 pgx 版本已统一为 v5.7.6；提交署名只在有真实共同作者时添加，不编造、不阻止提交。
 - **占位符**：无（`COAUTHOR` 是可选的环境变量，未设置时提交命令省略署名）。
