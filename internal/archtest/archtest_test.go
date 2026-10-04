@@ -1,6 +1,6 @@
 // Package archtest 以测试固定包之间的依赖规则（代码组织设计 §3.2）。
 //
-// Plan 4 先固定持久化的依赖方向；其余规则随 Plan 6 加入同一文件。
+// 规则 1–4 的包依赖部分按传递依赖检查（比直接依赖边更严）；规则 2 的同包 Decide/actor 区分与规则 5 由代码评审保证。
 package archtest
 
 import (
@@ -53,6 +53,53 @@ func TestReconcileIsPlanOnly(t *testing.T) {
 	forbid(t, "internal/reconcile", []string{
 		module + "/internal/task", module + "/internal/session", module + "/internal/recovery",
 	})
+}
+
+// TestLowLevelDoesNotDependOnControlPlane：规则 1——sandbox、cgroup、rootfs、provider/local 不依赖控制面。
+func TestLowLevelDoesNotDependOnControlPlane(t *testing.T) {
+	control := []string{
+		module + "/internal/task", module + "/internal/session", module + "/internal/gateway",
+		module + "/internal/persistence", module + "/internal/runner", module + "/internal/api",
+	}
+	for _, pkg := range []string{"internal/sandbox", "internal/cgroup", "internal/rootfs", "internal/provider/local"} {
+		forbid(t, pkg, control)
+	}
+}
+
+// TestDecisionCodeHasNoSideEffectDeps：规则 2——task 的决策代码不依赖 HTTP、Redis、PostgreSQL 驱动与进程。
+// 文件系统访问（os）无法按包排除，由代码评审保证。
+func TestDecisionCodeHasNoSideEffectDeps(t *testing.T) {
+	forbid(t, "internal/task", []string{"net/http", "os/exec", "github.com/jackc/pgx", "github.com/redis"})
+}
+
+// TestProtocolIsStdlibOnly：规则 3——protocol 只依赖标准库。
+func TestProtocolIsStdlibOnly(t *testing.T) {
+	for _, d := range deps(t, "internal/protocol") {
+		if d == module+"/internal/protocol" {
+			continue
+		}
+		if first, _, _ := strings.Cut(d, "/"); strings.Contains(first, ".") {
+			t.Errorf("internal/protocol 依赖了非标准库包 %s", d)
+		}
+	}
+}
+
+// TestTestOnlyPackagesNotInProduction：provider/fake、providertest 只被测试导入（-deps 不含测试文件的导入）。
+func TestTestOnlyPackagesNotInProduction(t *testing.T) {
+	cmd := exec.Command("go", "list", module+"/...")
+	cmd.Env = append(cmd.Environ(), "GOOS=linux")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go list: %v", err)
+	}
+	testOnly := []string{module + "/internal/provider/fake", module + "/internal/provider/providertest"}
+	for _, pkg := range strings.Fields(string(out)) {
+		rel := strings.TrimPrefix(pkg, module+"/")
+		if rel == "internal/provider/fake" || rel == "internal/provider/providertest" || strings.HasPrefix(rel, "tests/") {
+			continue
+		}
+		forbid(t, rel, testOnly)
+	}
 }
 
 // forbid 断言 pkg 的传递依赖不含 forbidden 中的包及其子包。
