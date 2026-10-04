@@ -5883,3 +5883,19 @@ cd /f/go-agentbox-m1-4 && git add .github/workflows/ci.yml && git commit -m "ci:
 - **未在本地验证**：golangci-lint（本机未安装，由 CI 判定）。
 - **评审修订（第三轮）**：checkpoint 缺少 fencing 与引用授权、最终判决未在锁内仲裁取消与当前 attempt、创建 attempt 缺少准入前置条件——均为规格 §5.5、§8.1 的实现遗漏，已按设计 §2.6 并入 Task 5、6，并补测试。同类遗漏 `AcceptControl` 的控制写入规则（`task_ended` 等）一并补上，"判决先提交"的测试依赖它。设计文档的 pgx 版本已统一为 v5.7.6；提交署名只在有真实共同作者时添加，不编造、不阻止提交。
 - **占位符**：无（`COAUTHOR` 是可选的环境变量，未设置时提交命令省略署名）。
+
+---
+
+## 验收记录（2026-10-05）
+
+**状态：本地验收通过，待 Linux CI 验收**（分支 `m1-4-persistence` 未推送，未合并）。
+
+- **分支**：`m1-4-persistence`，基于 `m1-3-protocol-worker`（96e1e8a），12 个提交 2212f10..03ba636，30 个文件，与本计划各任务 Files 一致。
+- **本地（WSL Ubuntu + Docker Desktop PostgreSQL 16）**：对导出的 HEAD 运行 correctness 作业的等价命令——`go build ./...`、`GOOS=windows go build ./...`、`gofmt -l .`（提交内容为 LF，无输出）、`go vet ./...`、`CI=true go test -count=1 ./...` 全部通过；`internal/persistence/postgres` 在 Task 4–7 每个任务完成时连续三次通过；Task 4–7 各阶段的代码树独立通过。
+- **合并后的 `ci.yml`**：整文件解析，`correctness` 与 `linux-integration` 均有 postgres 服务与 `AGENTBOX_TEST_DATABASE_URL`，其余作业不变；`linux-integration` 以 `sudo -E` 运行测试，变量随之传递。
+- **评审与修订**：Task 1–5 由子 agent 实现并经评审（高风险任务双评审）；按项目负责人 2026-10-04 的要求，此后不再使用子 agent，Task 6–8 由主 agent 实现与评审。评审发现的计划缺陷均先改计划、在含全部代码的演练树中验证，再改代码，见"自查记录"中的执行中修订条目；每项修订都有对应测试与回退检查。
+- **未覆盖 / 待验收**：
+  - Linux CI（GitHub Actions）尚未运行——需推送授权；golangci-lint 只在 CI 中运行。
+  - 需项目负责人决定（规格层面，未改动）：§7.4 中"pending + 无身份文件 → 继续"无法区分"本数据目录的文件写入丢失"与"另一个数据目录指向同一数据库"，在文件写入后、置 complete 前崩溃时，另一个数据目录可能接管该 pending 安装。可选：记为已知限制（与"无跨主机接管"并列），或在 pending 记录中存数据目录指纹。
+  - 记录待整体评审的次要项：失锁后约一个检测周期内仍可能提交；调用方 deadline 短于 OpDeadline 时慢库不计入故障阈值；按严重级别而非代码识别更多 FATAL；测试的若干计时余量；`resume_point`、`fault_retries_used`、`not_before` 的写入与 `attempt_no` 连续性属于 Plan 5 的 actor 范围。
+
