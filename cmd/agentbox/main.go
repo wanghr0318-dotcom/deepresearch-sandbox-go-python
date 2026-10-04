@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/cli"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/hostcheck"
 )
 
@@ -27,6 +28,9 @@ func main() {
 		fmt.Println("宿主环境检查通过")
 		return
 	}
-	fmt.Fprintln(os.Stderr, "用法: agentbox doctor")
+	if len(os.Args) > 1 && (os.Args[1] == "task" || os.Args[1] == "status") {
+		os.Exit(cli.Run(os.Args[1:], os.Stdout, os.Stderr))
+	}
+	fmt.Fprintln(os.Stderr, "用法: agentbox doctor | task ... | status")
 	os.Exit(2)
 }
