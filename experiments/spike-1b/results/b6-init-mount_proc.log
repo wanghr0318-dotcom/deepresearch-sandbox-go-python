@@ -1,0 +1,7 @@
+[launch] launcher supplementary groups before: [0]
+[launch] launcher cleared its supplementary groups before clone: []
+[launch] init started, host pid 4956
+[init] pid=1; fd 3 (control socket from ExtraFiles) inherited with FD_CLOEXEC=false
+[init] setup failed: mount_proc: injected failure
+[launch] init exited: exit status 1
+RESULT label=b6-init-mount_proc outcome=init_err workload_started=no pass= fail= exit= reason="init/mount_proc: injected failure"

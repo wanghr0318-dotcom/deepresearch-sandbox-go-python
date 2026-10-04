@@ -1,0 +1,10 @@
+date: 2026-10-04T17:29:12Z
+uname: Linux LAPTOP-HQ5E1RG1 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 GNU/Linux
+PRETTY_NAME="Ubuntu 26.04 LTS"
+glibc: ldd (Ubuntu GLIBC 2.43-2ubuntu2) 2.43
+python: Python 3.14.4
+go: go version go1.27.1 linux/amd64
+cap_last_cap: 40
+unprivileged_userns_clone: n/a
+max_user_namespaces: 62777
+root cgroup subtree_control: cpuset cpu io memory hugetlb pids rdma
