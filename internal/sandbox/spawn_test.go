@@ -8,9 +8,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
+	"unsafe"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
 )
@@ -23,6 +25,12 @@ import (
 // 进入 namespace -> 跑 RunInit" 链路的前提：Spawn 内部硬编码 re-exec
 // /proc/self/exe，从测试里调用时那就是这个测试二进制自己。
 func TestMain(m *testing.M) {
+	// seccomp 子进程分流：见 TestSeccompOrchestratorFilterInChildProcess。
+	// 放在 TestMain 而不是一个“非子进程时跳过”的辅助用例里，是因为
+	// linux-integration 不允许出现任何 skip。
+	if os.Getenv(envSeccompChild) == "1" {
+		os.Exit(runSeccompChild())
+	}
 	if len(os.Args) > 1 && os.Args[1] == InitArg {
 		if err := RunInit(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -201,4 +209,363 @@ func goBinary() string {
 		return p
 	}
 	return "/usr/local/go/bin/go"
+}
+
+// ---------------------------------------------------------------------------
+// seccomp 配置（规格 §4.5）
+// ---------------------------------------------------------------------------
+
+// seccompTestNrs 是测试侧独立抄写的系统调用号，故意不复用 seccomp.go 里的
+// 表：两边按同一份内核头文件各抄一遍，任何一边抄错都会让规则用例失败。
+// 来源：amd64 为 arch/x86/entry/syscalls/syscall_64.tbl（64 位 ABI），
+// arm64 为 include/uapi/asm-generic/unistd.h。
+// TestSeccompSyscallNumbersMatchStdlib 再用标准库 syscall.SYS_* 交叉核对其中
+// 本机架构上标准库有定义的部分。
+var seccompTestNrs = map[Arch]map[string]uint32{
+	ArchAMD64: {
+		"read": 0, "getpid": 39, "socket": 41, "clone": 56, "ptrace": 101,
+		"pivot_root": 155, "mount": 165, "umount2": 166, "init_module": 175,
+		"delete_module": 176, "kexec_load": 246, "add_key": 248, "request_key": 249,
+		"keyctl": 250, "unshare": 272, "perf_event_open": 298, "open_by_handle_at": 304,
+		"setns": 308, "process_vm_readv": 310, "process_vm_writev": 311,
+		"finit_module": 313, "kexec_file_load": 320, "bpf": 321, "userfaultfd": 323,
+		"io_uring_setup": 425, "io_uring_enter": 426, "io_uring_register": 427,
+		"clone3": 435,
+	},
+	ArchARM64: {
+		"read": 63, "getpid": 172, "socket": 198, "clone": 220, "ptrace": 117,
+		"pivot_root": 41, "mount": 40, "umount2": 39, "init_module": 105,
+		"delete_module": 106, "kexec_load": 104, "add_key": 217, "request_key": 218,
+		"keyctl": 219, "unshare": 97, "perf_event_open": 241, "open_by_handle_at": 265,
+		"setns": 268, "process_vm_readv": 270, "process_vm_writev": 271,
+		"finit_module": 273, "kexec_file_load": 294, "bpf": 280, "userfaultfd": 282,
+		"io_uring_setup": 425, "io_uring_enter": 426, "io_uring_register": 427,
+		"clone3": 435,
+	},
+}
+
+// seccompDeniedEPERM 是规格 §4.5 中无条件返回 EPERM 的系统调用。
+var seccompDeniedEPERM = []string{
+	"mount", "umount2", "pivot_root", "unshare", "setns", "ptrace",
+	"process_vm_readv", "process_vm_writev", "bpf", "perf_event_open",
+	"userfaultfd", "io_uring_setup", "io_uring_enter", "io_uring_register",
+	"keyctl", "add_key", "request_key", "open_by_handle_at", "init_module",
+	"finit_module", "delete_module", "kexec_load", "kexec_file_load",
+}
+
+// 测试侧独立写出的内核常量（include/uapi/linux/audit.h、seccomp.h、
+// sched.h、socket.h、asm-generic/errno-base.h、errno.h）。
+const (
+	tAuditArchX86_64  = 0xC000003E
+	tAuditArchI386    = 0x40000003
+	tAuditArchAArch64 = 0xC00000B7
+	tAuditArchARM     = 0x40000028
+	tX32SyscallBit    = 0x40000000
+
+	tRetKillProcess = 0x80000000
+	tRetAllow       = 0x7FFF0000
+	tRetErrnoEPERM  = 0x00050000 | 1
+	tRetErrnoENOSYS = 0x00050000 | 38
+
+	tAFUnix    = 1
+	tAFInet    = 2
+	tAFNetlink = 16
+	tAFPacket  = 17
+	tAFInet6   = 10
+)
+
+// seccompData 对应内核 struct seccomp_data（include/uapi/linux/seccomp.h）：
+// nr@0、arch@4、instruction_pointer@8、args[6]@16。
+type seccompData struct {
+	nr   uint32
+	arch uint32
+	ip   uint64
+	args [6]uint64
+}
+
+// loadWord 按小端布局（x86_64 与 aarch64 都是小端）取 seccomp_data 中
+// 偏移 off 处的 32 位字；非对齐或越界的偏移返回 false。
+func (d seccompData) loadWord(off uint32) (uint32, bool) {
+	switch {
+	case off == 0:
+		return d.nr, true
+	case off == 4:
+		return d.arch, true
+	case off == 8:
+		return uint32(d.ip), true
+	case off == 12:
+		return uint32(d.ip >> 32), true
+	case off >= 16 && off < 64 && off%4 == 0:
+		a := d.args[(off-16)/8]
+		if (off-16)%8 == 0 {
+			return uint32(a), true
+		}
+		return uint32(a >> 32), true
+	}
+	return 0, false
+}
+
+// runSeccompBPF 是一个最小 classic-BPF 解释器，只支持本过滤器用到的指令：
+// BPF_LD|BPF_W|BPF_ABS、BPF_JMP|{BPF_JEQ,BPF_JGE,BPF_JSET}|BPF_K、
+// BPF_RET|BPF_K。遇到其他指令、越界跳转或程序在 RET 之前结束都判为失败，
+// 这同时校验了程序结构（内核校验器也会拒绝这些情况）。
+func runSeccompBPF(t *testing.T, prog []SockFilter, d seccompData) uint32 {
+	t.Helper()
+	if len(prog) == 0 || len(prog) > 4096 { // BPF_MAXINSNS
+		t.Fatalf("程序长度 %d 不合法", len(prog))
+	}
+	var acc uint32
+	for pc := 0; pc < len(prog); {
+		ins := prog[pc]
+		switch ins.Code {
+		case 0x00 | 0x00 | 0x20: // BPF_LD|BPF_W|BPF_ABS
+			v, ok := d.loadWord(ins.K)
+			if !ok {
+				t.Fatalf("pc=%d: 非法的 seccomp_data 偏移 %d", pc, ins.K)
+			}
+			acc = v
+			pc++
+		case 0x05 | 0x10, 0x05 | 0x30, 0x05 | 0x40: // BPF_JMP|{JEQ,JGE,JSET}|BPF_K
+			var cond bool
+			switch ins.Code &^ 0x07 {
+			case 0x10:
+				cond = acc == ins.K
+			case 0x30:
+				cond = acc >= ins.K
+			case 0x40:
+				cond = acc&ins.K != 0
+			}
+			off := int(ins.Jf)
+			if cond {
+				off = int(ins.Jt)
+			}
+			pc += 1 + off
+		case 0x06: // BPF_RET|BPF_K
+			return ins.K
+		default:
+			t.Fatalf("pc=%d: 解释器不支持的指令 code=%#x", pc, ins.Code)
+		}
+	}
+	t.Fatalf("程序在 RET 之前结束（跳出末尾）")
+	return 0
+}
+
+// TestSeccompFilterRules 用解释器对两套配置、两种架构逐条核对规格 §4.5 的规则。
+// exec 配置“在 orchestrator 基础上不额外放宽”，因此两者跑同一张期望表。
+func TestSeccompFilterRules(t *testing.T) {
+	type arch struct {
+		name       string
+		arch       Arch
+		auditArch  uint32
+		foreignABI []uint32 // 必须被杀死的其他 audit arch
+	}
+	arches := []arch{
+		{"amd64", ArchAMD64, tAuditArchX86_64, []uint32{tAuditArchI386, tAuditArchAArch64, tAuditArchARM}},
+		{"arm64", ArchARM64, tAuditArchAArch64, []uint32{tAuditArchARM, tAuditArchX86_64, tAuditArchI386}},
+	}
+	profiles := map[string]SeccompProfile{"orchestrator": ProfileOrchestrator, "exec": ProfileExec}
+
+	for pname, profile := range profiles {
+		for _, a := range arches {
+			nrs := seccompTestNrs[a.arch]
+			t.Run(pname+"/"+a.name, func(t *testing.T) {
+				prog, err := BuildFilter(profile, a.arch)
+				if err != nil {
+					t.Fatalf("BuildFilter: %v", err)
+				}
+				call := func(name string, args ...uint64) seccompData {
+					nr, ok := nrs[name]
+					if !ok {
+						t.Fatalf("测试表缺少 %s", name)
+					}
+					d := seccompData{nr: nr, arch: a.auditArch, ip: 0x400000}
+					copy(d.args[:], args)
+					return d
+				}
+				expect := func(what string, d seccompData, want uint32) {
+					t.Helper()
+					if got := runSeccompBPF(t, prog, d); got != want {
+						t.Errorf("%s: 动作 = %#x, want %#x", what, got, want)
+					}
+				}
+
+				// 默认允许。
+				expect("read", call("read", 0, 0, 0), tRetAllow)
+				expect("getpid", call("getpid"), tRetAllow)
+
+				// 显式拒绝列表 → EPERM。
+				for _, name := range seccompDeniedEPERM {
+					expect(name, call(name), tRetErrnoEPERM)
+				}
+
+				// clone：带任一 CLONE_NEW* → EPERM；线程/fork 式的普通 clone → 允许。
+				newFlags := map[string]uint64{
+					"CLONE_NEWNS": 0x00020000, "CLONE_NEWCGROUP": 0x02000000,
+					"CLONE_NEWUTS": 0x04000000, "CLONE_NEWIPC": 0x08000000,
+					"CLONE_NEWUSER": 0x10000000, "CLONE_NEWPID": 0x20000000,
+					"CLONE_NEWNET": 0x40000000,
+				}
+				const sigchld = 17
+				for fname, f := range newFlags {
+					expect("clone "+fname, call("clone", f|sigchld), tRetErrnoEPERM)
+				}
+				// 高 32 位垃圾不能掩盖低位的 CLONE_NEWUSER。
+				expect("clone CLONE_NEWUSER+高位", call("clone", 0xFFFFFFFF00000000|0x10000000), tRetErrnoEPERM)
+				// Go/glibc 创建线程用的标志组合（CLONE_VM|FS|FILES|SIGHAND|SYSVSEM|THREAD|SETTLS|PARENT_SETTID|CHILD_CLEARTID）。
+				expect("clone 线程", call("clone", 0x003D0F00), tRetAllow)
+				expect("clone fork", call("clone", sigchld), tRetAllow)
+
+				// socket：仅 AF_UNIX 允许。
+				expect("socket AF_UNIX", call("socket", tAFUnix, 1, 0), tRetAllow)
+				for fname, fam := range map[string]uint64{"AF_INET": tAFInet, "AF_INET6": tAFInet6, "AF_NETLINK": tAFNetlink, "AF_PACKET": tAFPacket} {
+					expect("socket "+fname, call("socket", fam, 1, 0), tRetErrnoEPERM)
+				}
+				// family 是 int，内核只看低 32 位：高位垃圾不能让 AF_INET 绕过。
+				expect("socket AF_INET+高位", call("socket", 0xFFFFFFFF00000000|tAFInet, 1, 0), tRetErrnoEPERM)
+
+				// clone3 → ENOSYS（让 glibc 回退到 clone）。
+				expect("clone3", call("clone3", 0, 88), tRetErrnoENOSYS)
+
+				// 非原生 ABI → KILL_PROCESS，无论调用号是什么（包括本会被允许的 read）。
+				for _, foreign := range a.foreignABI {
+					for _, name := range []string{"read", "socket", "clone3"} {
+						d := call(name)
+						d.arch = foreign
+						expect(fmt.Sprintf("arch %#x %s", foreign, name), d, tRetKillProcess)
+					}
+				}
+				if a.arch == ArchAMD64 {
+					// x32：arch 仍是 AUDIT_ARCH_X86_64，但调用号带 __X32_SYSCALL_BIT。
+					for _, name := range []string{"read", "socket", "mount"} {
+						d := call(name)
+						d.nr |= tX32SyscallBit
+						expect("x32 "+name, d, tRetKillProcess)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestSeccompBuildFilterRejectsUnknownInputs 确认未知配置或架构返回错误而不是
+// 生成一个默认允许的空过滤器。
+func TestSeccompBuildFilterRejectsUnknownInputs(t *testing.T) {
+	if _, err := BuildFilter(SeccompProfile(99), ArchAMD64); err == nil {
+		t.Errorf("未知配置应返回错误")
+	}
+	if _, err := BuildFilter(ProfileOrchestrator, Arch(99)); err == nil {
+		t.Errorf("未知架构应返回错误")
+	}
+	native, err := NativeArch()
+	if err != nil {
+		t.Fatalf("NativeArch: %v", err)
+	}
+	want := map[string]Arch{"amd64": ArchAMD64, "arm64": ArchARM64}[runtime.GOARCH]
+	if native != want {
+		t.Errorf("NativeArch() = %d, want %d（GOARCH=%s）", native, want, runtime.GOARCH)
+	}
+}
+
+// TestSeccompSyscallNumbersMatchStdlib 用标准库 syscall.SYS_* 交叉核对测试表
+// 中本机架构的调用号（只核对两种架构的标准库都定义了的那部分）。
+func TestSeccompSyscallNumbersMatchStdlib(t *testing.T) {
+	native, err := NativeArch()
+	if err != nil {
+		t.Fatalf("NativeArch: %v", err)
+	}
+	std := map[string]uintptr{
+		"read": syscall.SYS_READ, "getpid": syscall.SYS_GETPID, "socket": syscall.SYS_SOCKET,
+		"clone": syscall.SYS_CLONE, "ptrace": syscall.SYS_PTRACE, "pivot_root": syscall.SYS_PIVOT_ROOT,
+		"mount": syscall.SYS_MOUNT, "umount2": syscall.SYS_UMOUNT2, "init_module": syscall.SYS_INIT_MODULE,
+		"delete_module": syscall.SYS_DELETE_MODULE, "kexec_load": syscall.SYS_KEXEC_LOAD,
+		"add_key": syscall.SYS_ADD_KEY, "request_key": syscall.SYS_REQUEST_KEY,
+		"keyctl": syscall.SYS_KEYCTL, "unshare": syscall.SYS_UNSHARE,
+		"perf_event_open": syscall.SYS_PERF_EVENT_OPEN,
+	}
+	for name, want := range std {
+		if got := seccompTestNrs[native][name]; uintptr(got) != want {
+			t.Errorf("%s: 测试表 %d, 标准库 %d", name, got, want)
+		}
+	}
+}
+
+// envSeccompChild 让测试二进制在 TestMain 中直接进入 runSeccompChild。
+const envSeccompChild = "AGENTBOX_TEST_SECCOMP_CHILD"
+
+// TestSeccompOrchestratorFilterInChildProcess 在子进程里真实安装 orchestrator
+// 配置并发起系统调用，验证内核执行的结果与规则一致。只验证配置内容；
+// 安装时机与 TSYNC 属于 Plan 1B。不需要 root（先设置 no_new_privs）。
+func TestSeccompOrchestratorFilterInChildProcess(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(), envSeccompChild+"=1")
+	out, err := cmd.CombinedOutput()
+	t.Logf("子进程输出:\n%s", out)
+	if err != nil {
+		t.Fatalf("子进程失败: %v", err)
+	}
+	if !strings.Contains(string(out), "seccomp child: ok") {
+		t.Fatalf("子进程没有报告完成")
+	}
+}
+
+// runSeccompChild 在当前线程上设置 no_new_privs、安装过滤器，再在同一线程上
+// 发起系统调用（未用 TSYNC，过滤器只作用于本线程，因此全程锁定 OS 线程）。
+// 每项期望都选在“没有过滤器时结果不同”的调用上：unshare(0) 与
+// socket(AF_INET) 本会成功，clone3(NULL, 0) 本会返回 EINVAL。
+func runSeccompChild() int {
+	runtime.LockOSThread()
+
+	fail := func(format string, args ...any) int {
+		fmt.Printf("seccomp child: FAIL: "+format+"\n", args...)
+		return 1
+	}
+	native, err := NativeArch()
+	if err != nil {
+		return fail("NativeArch: %v", err)
+	}
+	prog, err := BuildFilter(ProfileOrchestrator, native)
+	if err != nil {
+		return fail("BuildFilter: %v", err)
+	}
+	kprog := make([]syscall.SockFilter, len(prog))
+	for i, ins := range prog {
+		kprog[i] = syscall.SockFilter{Code: ins.Code, Jt: ins.Jt, Jf: ins.Jf, K: ins.K}
+	}
+	fprog := syscall.SockFprog{Len: uint16(len(kprog)), Filter: &kprog[0]}
+
+	const prSetNoNewPrivs = 38 // include/uapi/linux/prctl.h
+	if _, _, e := syscall.RawSyscall6(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0, 0, 0, 0); e != 0 {
+		return fail("PR_SET_NO_NEW_PRIVS: %v", e)
+	}
+	// seccomp(2) 调用号：arch/x86/entry/syscalls/syscall_64.tbl 317；asm-generic/unistd.h 277。
+	sysSeccomp := map[Arch]uintptr{ArchAMD64: 317, ArchARM64: 277}[native]
+	const seccompSetModeFilter = 1 // include/uapi/linux/seccomp.h
+	if _, _, e := syscall.RawSyscall(sysSeccomp, seccompSetModeFilter, 0, uintptr(unsafe.Pointer(&fprog))); e != 0 {
+		return fail("seccomp(SECCOMP_SET_MODE_FILTER): %v", e)
+	}
+	runtime.KeepAlive(kprog)
+
+	if pid, _, e := syscall.RawSyscall(syscall.SYS_GETPID, 0, 0, 0); e != 0 || int(pid) != os.Getpid() {
+		return fail("getpid = %d, %v", pid, e)
+	}
+	if _, _, e := syscall.RawSyscall(syscall.SYS_UNSHARE, 0, 0, 0); e != syscall.EPERM {
+		return fail("unshare(0) errno = %v, want EPERM", e)
+	}
+	if fd, _, e := syscall.RawSyscall(syscall.SYS_SOCKET, syscall.AF_INET, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0); e != syscall.EPERM {
+		if e == 0 {
+			syscall.Close(int(fd))
+		}
+		return fail("socket(AF_INET) errno = %v, want EPERM", e)
+	}
+	fd, _, e := syscall.RawSyscall(syscall.SYS_SOCKET, syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if e != 0 {
+		return fail("socket(AF_UNIX) errno = %v, want 成功", e)
+	}
+	syscall.Close(int(fd))
+	const sysClone3 = 435 // 两种架构相同
+	if _, _, e := syscall.RawSyscall(sysClone3, 0, 0, 0); e != syscall.ENOSYS {
+		return fail("clone3 errno = %v, want ENOSYS", e)
+	}
+	fmt.Println("seccomp child: ok (getpid ok, unshare EPERM, socket(AF_INET) EPERM, socket(AF_UNIX) ok, clone3 ENOSYS)")
+	return 0
 }
