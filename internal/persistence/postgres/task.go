@@ -147,42 +147,10 @@ func selectAttempt(ctx context.Context, q queryer, attemptID string, forUpdate b
 	return a, err
 }
 
-// controlTransition 是规格 §8.1 中控制意图引起的任务状态转换：cancel 使 queued、paused 直接
-// cancelled，使执行中的任务进入 cancelling；pause 使 queued 进入 paused，使执行中的任务进入
-// pausing；run（resume）使 paused 回到 queued。其余组合不是合法转换。
-func controlTransition(status, desired string) (next string, ok bool) {
-	switch desired {
-	case "cancel":
-		switch status {
-		case "queued", "paused":
-			return "cancelled", true
-		case "running", "pausing", "cancelling":
-			return "cancelling", true
-		}
-	case "pause":
-		switch status {
-		case "queued":
-			return "paused", true
-		case "running", "pausing":
-			return "pausing", true
-		case "paused":
-			return "paused", true
-		}
-	case "run":
-		switch status {
-		case "paused", "queued":
-			return "queued", true
-		case "running":
-			return "running", true
-		}
-	}
-	return "", false
-}
-
 // ApplyControl 以 applied_control_version 的 CAS 应用控制意图（实现 task.Store）。持有任务锁后
 // 依次核对：已应用到不低于目标的版本时返回当前状态（重放）；目标版本尚未被接受为冲突；目标版本
 // 已被更新的控制取代为 control_changed（调用方应用最新版本）；终态任务为 task_ended；调用方给出的
-// 状态必须是 controlTransition 对当前状态与 desired 的结果。写入以来源状态 CAS（规格 §8.1）。
+// 状态必须是 task.ControlTransition 对当前状态与 desired 的结果。写入以来源状态 CAS（规格 §8.1）。
 // 锁顺序：tasks → task_control → task_event_seq。
 func (s *Store) ApplyControl(ctx context.Context, c task.ApplyControl) (task.ControlState, error) {
 	if c.TaskID == "" || c.ControlVersion < 1 || c.Status == "" {
@@ -202,10 +170,10 @@ func (s *Store) ApplyControl(ctx context.Context, c task.ApplyControl) (task.Con
 			return conflictf("任务 %s 的控制版本 %d 尚未被接受（当前 %d）", c.TaskID, c.ControlVersion, st.ControlVersion)
 		case c.ControlVersion < st.ControlVersion:
 			return rejectf(persistence.CodeControlChanged, "任务 %s 的控制版本 %d 已被 %d 取代", c.TaskID, c.ControlVersion, st.ControlVersion)
-		case st.Status == "succeeded" || st.Status == "failed" || st.Status == "cancelled":
+		case task.IsTerminal(st.Status):
 			return rejectf(persistence.CodeTaskEnded, "任务 %s 已是 %s", c.TaskID, st.Status)
 		}
-		if next, ok := controlTransition(st.Status, st.Desired); !ok || c.Status != next {
+		if next, ok := task.ControlTransition(st.Status, st.Desired); !ok || c.Status != next {
 			return invalidf("任务 %s 处于 %s、desired = %s 时不能转换为 %s", c.TaskID, st.Status, st.Desired, c.Status)
 		}
 		tag, err := tx.Exec(ctx, `UPDATE tasks SET applied_control_version = $2, status = $3, status_reason = $4,
@@ -260,19 +228,6 @@ func selectControlState(ctx context.Context, q queryer, taskID string, forUpdate
 	err = q.QueryRow(ctx, "SELECT desired, control_version FROM task_control WHERE task_id = $1"+lock, taskID).
 		Scan(&st.Desired, &st.ControlVersion)
 	return st, err
-}
-
-// verdictAllowed 是规格 §8.1 最终裁决对 desired 的约束：cancel → cancelled；pause → paused；
-// run → 按 §5.8 与 §14.3 裁决为 succeeded、failed，或故障重试回到 queued。
-func verdictAllowed(desired, taskStatus string) bool {
-	switch desired {
-	case "cancel":
-		return taskStatus == "cancelled"
-	case "pause":
-		return taskStatus == "paused"
-	default:
-		return taskStatus == "succeeded" || taskStatus == "failed" || taskStatus == "queued"
-	}
 }
 
 // verdictHash 是完整判决内容的哈希；FromStatus 是 CAS 来源，不属于判决内容（设计 §2.4）。
@@ -346,7 +301,7 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 		case controlVersion != v.ControlVersion:
 			return rejectf(persistence.CodeControlChanged, "判决依据控制版本 %d，当前为 %d（desired = %s）",
 				v.ControlVersion, controlVersion, desired)
-		case !verdictAllowed(desired, v.TaskStatus):
+		case !task.VerdictAllowed(desired, v.TaskStatus):
 			return invalidf("desired = %s 时任务不能裁决为 %s", desired, v.TaskStatus)
 		case a.Status != v.FromStatus:
 			return conflictf("attempt %s 处于 %s，不是 %s", v.AttemptID, a.Status, v.FromStatus)
