@@ -725,6 +725,39 @@ func TestPutHonoursCancellation(t *testing.T) {
 	if _, err := s.Put(ctx, strings.NewReader("x")); !errors.Is(err, context.Canceled) {
 		t.Fatalf("已取消的 context 应使 Put 失败，得到 %v", err)
 	}
+	if tmp, _ := os.ReadDir(filepath.Join(s.root, "tmp")); len(tmp) != 0 {
+		t.Fatalf("失败后临时目录应为空，得到 %d 项", len(tmp))
+	}
+}
+
+// TestPutReplacesDamagedExistingBlob：内容路径上已有的文件不被信任——同样大小的损坏内容与
+// 截断的内容都被刚校验过的副本替换。
+func TestPutReplacesDamagedExistingBlob(t *testing.T) {
+	s, err := NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("checkpoint state")
+	ref, err := s.Put(context.Background(), bytes.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, damaged := range map[string][]byte{
+		"同样大小的损坏内容": bytes.Repeat([]byte("x"), len(content)),
+		"截断":        content[:3],
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(s.path(ref.SHA256), damaged, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := s.Put(context.Background(), bytes.NewReader(content)); err != nil || got != ref {
+				t.Fatalf("Put 应修复已有文件：(%+v, %v)", got, err)
+			}
+			if b, _ := os.ReadFile(s.path(ref.SHA256)); !bytes.Equal(b, content) {
+				t.Fatalf("内容应被替换为校验过的副本，得到 %q", b)
+			}
+		})
+	}
 }
 ```
 
@@ -941,11 +974,23 @@ type Local struct {
 	root string
 }
 
-// NewLocal 返回以 root 为根目录的本地存储，并确保目录存在。
+// NewLocal 返回以 root 为根目录的本地存储。目录结构（含全部 256 个分片目录）在这里一次建好并
+// fsync，因此 Put 不再创建目录，返回成功前只需 fsync 分片目录。
 func NewLocal(root string) (*Local, error) {
-	for _, d := range []string{filepath.Join(root, "tmp"), filepath.Join(root, "sha256")} {
+	content := filepath.Join(root, "sha256")
+	for _, d := range []string{filepath.Join(root, "tmp"), content} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return nil, fmt.Errorf("blob: 创建目录: %w", err)
+		}
+	}
+	for i := 0; i < 256; i++ {
+		if err := os.Mkdir(filepath.Join(content, fmt.Sprintf("%02x", i)), 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("blob: 创建分片目录: %w", err)
+		}
+	}
+	for _, d := range []string{content, root} {
+		if err := syncDir(d); err != nil {
+			return nil, err
 		}
 	}
 	return &Local{root: root}, nil
@@ -955,7 +1000,11 @@ func (l *Local) path(sum string) string {
 	return filepath.Join(l.root, "sha256", sum[:2], sum[2:])
 }
 
-// Put 边写边哈希到临时文件，fsync 后 rename 到内容路径，再 fsync 父目录。
+// Put 边写边哈希到临时文件，fsync 后 rename 到内容路径，再 fsync 分片目录。
+//
+// 内容路径已存在时也用刚校验过的副本原子替换，而不是直接返回成功：已存在的文件可能损坏
+// （同样大小也不可信），也可能来自 rename 成功但目录 fsync 失败的上一次写入或并发的同一内容
+// 写入。替换后再 fsync 目录，保证返回成功时 blob 已持久化。
 func (l *Local) Put(ctx context.Context, r io.Reader) (Ref, error) {
 	tmp, err := os.CreateTemp(filepath.Join(l.root, "tmp"), "put-*")
 	if err != nil {
@@ -975,16 +1024,7 @@ func (l *Local) Put(ctx context.Context, r io.Reader) (Ref, error) {
 		return Ref{}, fmt.Errorf("blob: 写入: %w", err)
 	}
 	ref := Ref{SHA256: hex.EncodeToString(h.Sum(nil)), Size: size}
-	if existing, err := l.Stat(ref.SHA256); err == nil {
-		if existing.Size != ref.Size {
-			return Ref{}, fmt.Errorf("blob: %s 已存在但大小不同（%d ≠ %d）", ref.SHA256, existing.Size, ref.Size)
-		}
-		return ref, nil
-	}
 	dest := l.path(ref.SHA256)
-	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
-		return Ref{}, fmt.Errorf("blob: 创建目录: %w", err)
-	}
 	if err := os.Rename(tmpPath, dest); err != nil {
 		return Ref{}, fmt.Errorf("blob: rename: %w", err)
 	}
@@ -1144,6 +1184,7 @@ func TestDecideCoversSpecTable(t *testing.T) {
 		{"有 schema_migrations 无记录（有文件）", noRecord, same, Refuse},
 		{"空库但有身份文件", empty, same, Refuse},
 		{"未知 schema", unknown, none, Refuse},
+		{"未知 schema（有文件）", unknown, same, Refuse},
 		{"pending，无身份文件：继续引导", pending, none, WriteFileAndComplete},
 		{"pending，身份一致", pending, same, Complete},
 		{"pending，身份不一致", pending, other, Refuse},
@@ -1182,6 +1223,9 @@ func (s *fakeStore) InitializeInstallation(_ context.Context, id string) error {
 }
 
 func (s *fakeStore) CompleteInstallation(_ context.Context, id string) error {
+	if s.db.Installation == nil || s.db.Installation.InstallID != id {
+		return errors.New("CompleteInstallation 的 install_id 与 pending 记录不一致")
+	}
 	s.db.Installation.Complete = true
 	return nil
 }
@@ -1202,14 +1246,16 @@ func (f *fakeFile) Write(id string) error {
 	return nil
 }
 
-// TestBootstrapResumesAfterEachInterruption 覆盖 E46 的三个中断点：每次中断后重新引导都能完成。
+// TestBootstrapResumesAfterEachInterruption 覆盖 E46 中初始迁移提交之后的两个中断点：每次中断后
+// 重新引导都能完成，且中断时不返回 install_id。提交前中断由 postgres 包的 TestInstallationBootstrapE46
+// 在真实事务上覆盖。
 func TestBootstrapResumesAfterEachInterruption(t *testing.T) {
 	for _, point := range []string{"initialize", "write"} {
 		t.Run(point, func(t *testing.T) {
 			store := &fakeStore{failAfter: point}
 			file := &fakeFile{failAfter: point == "write"}
-			if _, err := Bootstrap(context.Background(), store, file, func() string { return "new" }); !errors.Is(err, errCrash) {
-				t.Fatalf("第一次引导应中断，得到 %v", err)
+			if id, err := Bootstrap(context.Background(), store, file, func() string { return "new" }); !errors.Is(err, errCrash) || id != "" {
+				t.Fatalf("第一次引导应中断且不返回 install_id，得到 (%q, %v)", id, err)
 			}
 			store.failAfter, file.failAfter = "", false
 			id, err := Bootstrap(context.Background(), store, file, func() string { t.Fatal("不应再生成新 ID"); return "" })
@@ -1217,6 +1263,16 @@ func TestBootstrapResumesAfterEachInterruption(t *testing.T) {
 				t.Fatalf("重新引导得到 (%q, %v)，状态 %+v 文件 %+v", id, err, store.db.Installation, file)
 			}
 		})
+	}
+}
+
+func TestBootstrapRejectsEmptyNewID(t *testing.T) {
+	store := &fakeStore{}
+	if id, err := Bootstrap(context.Background(), store, &fakeFile{}, func() string { return "" }); err == nil || id != "" {
+		t.Fatalf("空的 install_id 应被拒绝，得到 (%q, %v)", id, err)
+	}
+	if store.db.Installation != nil {
+		t.Fatal("拒绝空 install_id 时不应初始化数据库")
 	}
 }
 
@@ -1300,7 +1356,7 @@ type Decision struct {
 // Decide 按规格 §7.4 的决策表判定下一步。"表不存在"本身不被当作全新安装：
 // 只有整个库为空且数据目录无身份时才初始化。
 func Decide(db DBState, file FileState) Decision {
-	empty := !db.HasMigrations && !db.HasAgentboxTables
+	empty := !db.HasMigrations && !db.HasAgentboxTables && db.Installation == nil
 	switch {
 	case empty && !file.Exists:
 		return Decision{Action: Initialize}
@@ -1309,7 +1365,7 @@ func Decide(db DBState, file FileState) Decision {
 	case !db.HasMigrations:
 		return refuse("存在 agentbox 表但没有 schema_migrations：未知 schema")
 	case db.Installation == nil:
-		return refuse("有 schema_migrations 但无 installation 记录：初始迁移与记录原子提交，只能来自外部改动或损坏")
+		return refuse("有 schema_migrations 但无 installation 记录：初始迁移与记录原子提交，只能来自外部改动、损坏，或该库属于另一个使用 schema_migrations 的应用")
 	case file.Exists && file.InstallID != db.Installation.InstallID:
 		return refuse(fmt.Sprintf("安装身份不一致：数据库 %q，数据目录 %q", db.Installation.InstallID, file.InstallID))
 	case !db.Installation.Complete && !file.Exists:
@@ -1351,7 +1407,19 @@ func (e *RefusedError) Is(target error) bool { return target == ErrRefused }
 
 // Bootstrap 执行安装身份引导与校验，返回本安装的 install_id。任何一步中断后重新调用，
 // 都会按当时的事实继续或明确拒绝。newID 只在全新安装时调用。
+//
+// 前置条件（规格 §7.4 的顺序）：调用方已持有数据目录的 flock，然后已持有数据库 advisory lock；
+// 两把锁共同保证同一时刻只有一个进程对同一数据目录与同一数据库执行引导。返回错误时 install_id
+// 为空，调用方不得使用；拒绝原因不含数据目录与数据库位置，由装配层包装后报告给运维。
 func Bootstrap(ctx context.Context, store InstallStore, file IDFile, newID func() string) (string, error) {
+	id, err := bootstrap(ctx, store, file, newID)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func bootstrap(ctx context.Context, store InstallStore, file IDFile, newID func() string) (string, error) {
 	db, err := store.InspectInstallation(ctx)
 	if err != nil {
 		return "", fmt.Errorf("ownership: 读取数据库状态: %w", err)
@@ -1364,6 +1432,9 @@ func Bootstrap(ctx context.Context, store InstallStore, file IDFile, newID func(
 	switch d.Action {
 	case Initialize:
 		id = newID()
+		if id == "" {
+			return "", errors.New("ownership: 生成的 install_id 为空")
+		}
 		if err := store.InitializeInstallation(ctx, id); err != nil {
 			return "", fmt.Errorf("ownership: 初始化安装: %w", err)
 		}
@@ -5089,6 +5160,7 @@ cd /f/go-agentbox-m1-4 && git add .github/workflows/ci.yml && git commit -m "ci:
 - **验收归属**：E11a（Task 5–7 的提交回复丢失）、E12 存储部分（Task 4 死锁重跑）、E13 存储部分（Task 4 失锁）、E46（Task 3、4）。
 - **演练**：本计划的全部代码已在临时 worktree 中按计划文本组装，并在 WSL + Docker Desktop 的 PostgreSQL 16.15 上运行：全仓库 `go build`（Linux 与 Windows）、`go vet`、`CI=true go test ./...` 通过；`internal/persistence/postgres` 连续三次通过；Task 4、5、6、7 各阶段的代码树分别通过；变异检查——去掉 `CreateAttempt` 的事务内身份仲裁、让终态提议静默忽略不同内容、跳过 Worker 事件的逐条内容比较、不重跑死锁中止——均被对应测试捕获；评审修订后又逐个去掉 9 条前置条件规则（checkpoint 的 fencing、引用授权，产物的 fencing，判决的当前 attempt、控制版本、desired 约束，attempt 准入、"准入先于幂等查询"的错误顺序，控制写入规则），均被捕获；失锁检测延迟约 100 ms（检测周期 200 ms 时）。
 - **执行中修订**：Task 1 的 archtest 原先列出 Task 2、3 才创建的包，`go list` 失败（演练只逐阶段验证了 Task 4–7）；改为 Task 1 只列已存在的包、Task 4 扩展到全部八个，最终文件与原计划相同。
+- **执行中评审修订（Task 2、3）**：BlobStore 的已存在路径曾直接返回成功（只比较大小、不 fsync），新分片目录的父目录未 fsync——改为 NewLocal 预建 256 个分片并 fsync，Put 总是以校验过的副本原子替换后 fsync 分片目录，并补损坏/截断替换测试；Bootstrap 的前置条件（先 flock、后 advisory lock）写入文档注释，出错时不返回 install_id，拒绝空的 newID，空库判定加上无 installation 记录，测试补齐（未知 schema 有文件、CompleteInstallation 校验 ID、空 ID）。
 - **未在本地验证**：golangci-lint（本机未安装，由 CI 判定）。
 - **评审修订（第三轮）**：checkpoint 缺少 fencing 与引用授权、最终判决未在锁内仲裁取消与当前 attempt、创建 attempt 缺少准入前置条件——均为规格 §5.5、§8.1 的实现遗漏，已按设计 §2.6 并入 Task 5、6，并补测试。同类遗漏 `AcceptControl` 的控制写入规则（`task_ended` 等）一并补上，"判决先提交"的测试依赖它。设计文档的 pgx 版本已统一为 v5.7.6；提交署名只在有真实共同作者时添加，不编造、不阻止提交。
 - **占位符**：无（`COAUTHOR` 是可选的环境变量，未设置时提交命令省略署名）。
