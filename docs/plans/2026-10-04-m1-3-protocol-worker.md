@@ -96,7 +96,7 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
 - **输入**：读取阶段即按帧长上限（init 上限 1 MiB + 行尾）截断判定，超长帧报 `message_too_large` 并停止读取；读到的行进入线程安全的有界队列（默认 64 条），队列满时读线程阻塞，对宿主形成背压。读线程绑定首次 `receive` 所在的事件循环，该循环关闭后不再读取输入并退出。输入缓冲约为 (64 + 1) 帧：队列中的 64 帧，加上读线程正在读取或等待入队的一帧，另有对象与底层文件缓冲的开销；这是估算，**不是**总内存的硬上限（不能写成"最多 64 MiB"）。
 - **进程入口** `main()` 是 SDK 中唯一调用 `os._exit` 的地方：运行 Worker（任何异常都记录并按失败处理）→ 在期限内等待已提交的输出写完 → `os._exit`。期限由环境变量 `AGENTBOX_WORKER_SHUTDOWN_TIMEOUT` 设置（秒，默认 5；不在 0–3600 内时用默认值），收尾步骤本身失败也必须执行 `os._exit`。读写线程可能阻塞在 stdin 或 stdout 上且无法取消，正常的解释器收尾会挂起或崩溃（计划演练中实测复现 `Fatal Python error: _enter_buffered_busy`）。
 - **该期限只约束协议输出的收尾，不是整个 Worker 的退出期限。** `register_artifact` 在线程池中计算哈希，不能保证有限时间内完成（路径是 FIFO 或读操作阻塞时线程会一直等待且无法取消）；`asyncio.run` 返回前会等待线程池中的线程（演练中在 3.11 与 3.13 上实测），这段等待发生在进入输出收尾之前，不受该期限约束。**最终强制终止由宿主负责。**
-- **边界输入的两侧一致性**：数值超出 int64 范围的整数字段 → `invalid_field`；JSON 中的孤立代理项转义（如 `\ud800`）在解码时接受（Go 替换为 U+FFFD，Python 保留并按 surrogatepass 计长），Python 编码含孤立代理项的消息 → `invalid_field`。inline state 的大小由宿主（Go）按原始文本的紧凑形式判定，为准；SDK 按重新序列化计，作为发送前预检——对 SDK 生成的消息两者一致，手写的非规范写法（`\u` 转义、数字拼写、重复键）以宿主为准。已知差异：Python 不接受超过 4300 位的整数字面量（解释器限制，报 `malformed_json`），Go 在自由格式字段（`state`、`data`、`config`）中接受。
+- **边界输入的两侧一致性**：数值超出 int64 范围的整数字段 → `invalid_field`；JSON 中的孤立代理项转义（如 `\ud800`）在解码时接受（Go 替换为 U+FFFD，Python 保留并按 surrogatepass 计长），Python 编码含孤立代理项的消息 → `invalid_field`。inline state 的大小由宿主（Go）按原始文本的紧凑形式判定，为准；SDK 按重新序列化计，作为发送前预检——对 SDK 生成的消息两者一致，手写的非规范写法（`\u` 转义、数字拼写、重复键）以宿主为准。**两侧已知差异**（尚未统一，是否收紧由协议另行决定）：① 嵌套深度没有协议级上限——Go 在 10000 层报 `malformed_json`，Python 取决于解释器（3.11、3.13 在约 1000–2500 层报 `malformed_json`，3.14 起按 C 栈检查，数万层仍可解析；测试统一用 10 万层，各方都拒绝）；② 键名大小写——Go 按结构体字段不区分大小写匹配（含 Unicode 折叠），Python 只认精确键名；③ 重复键——Go 取后者但 `null` 不覆盖前值、前值的类型错误不被后者纠正，Python 取最后一个；④ 超过 4300 位的整数——Go 在整数字段报 `invalid_field`、在自由格式字段（`state`、`data`、`config`）接受，Python 一律报 `malformed_json`。合规的发送方（本 SDK 与宿主）不会产生这些输入。
 - **checkpoint 快照**：`state` 在首次提交前经 JSON 往返生成快照，所有重试复用它。往返会归一化：tuple 变为 list，非字符串键变为字符串；NaN 与 Infinity 被拒绝（`invalid_field`）。
 
 ---
@@ -323,7 +323,7 @@ func TestDecodeLimits(t *testing.T) {
 		{"refs 超过上限", WorkerToHost, string(checkpointLine(`{}`, append(refs, ref))), CodeTooManyRefs},
 		{"超过所有上限的行不解析", HostToWorker, strings.Repeat("x", MaxInitBytes+1), CodeMessageTooLarge},
 		{"非法 UTF-8", WorkerToHost, "{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"\xff\"}", CodeMalformedJSON},
-		{"嵌套过深", WorkerToHost, `{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":` + strings.Repeat("[", 20000) + strings.Repeat("]", 20000) + `}`, CodeMalformedJSON},
+		{"嵌套过深", WorkerToHost, `{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":` + strings.Repeat("[", 100000) + strings.Repeat("]", 100000) + `}`, CodeMalformedJSON},
 		{"孤立代理项转义可以解码", WorkerToHost, string(checkpointLine(`"\ud800"`, []string{})), ""},
 	}
 	for _, c := range cases {
@@ -1197,7 +1197,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Files:**
 - Create: `internal/protocol/stream.go`
 - Modify: `internal/protocol/protocol_test.go`（末尾追加场景回放，下方给出完整追加内容）
-- Create: `protocol/fixtures/v1/scenarios/` 下 12 个文件（下方给出）
+- Create: `protocol/fixtures/v1/scenarios/` 下 13 个文件（下方给出）
 
 **Interfaces:**
 - Consumes: Task 1 的 `DecodeLine`、`Message`、`event`、`CodeOf`、`Type*`。
@@ -1216,7 +1216,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 }
 ```
 
-- [ ] **Step 1：写入 12 个协议层场景**
+- [ ] **Step 1：写入 13 个协议层场景**
 
 `protocol/fixtures/v1/scenarios/seq_gap.json`：
 
@@ -1362,6 +1362,23 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
     {"from": "worker", "message": {"type": "error", "v": 1, "seq": 1, "code": "unsupported_mode", "message": "不支持的模式：session", "retryable": false}}
   ],
   "expect": {"stream": "ok"}
+}
+```
+
+`protocol/fixtures/v1/scenarios/event_after_paused.json`：
+
+```json
+{
+  "name": "event_after_paused",
+  "description": "paused 是终态提议，之后不得再有业务事件",
+  "layers": ["protocol"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "task", "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}},
+    {"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "task", "worker": {"name": "sim-worker", "version": "0.1.0"}, "capabilities": []}},
+    {"from": "worker", "message": {"type": "paused", "v": 1, "seq": 2, "checkpoint_id": "cp-1"}},
+    {"from": "worker", "message": {"type": "progress", "v": 1, "seq": 3, "kind": "step_started", "message": "x"}}
+  ],
+  "expect": {"stream": "violation", "violation": "after_terminal", "at": 3}
 }
 ```
 
@@ -1591,7 +1608,7 @@ func isTerminal(typ string) bool {
 wsl -d Ubuntu -- bash -c 'export PATH=$PATH:/usr/local/go/bin; cd /mnt/f/go-agentbox-m1-3 && gofmt -w internal/protocol && go vet ./internal/protocol/ && go test -count=1 -v ./internal/protocol/ 2>&1 | grep -E "^(--- FAIL|ok|FAIL)|TestScenarioFixtures/"'
 ```
 
-Expected: 12 个 `TestScenarioFixtures/<场景名>` 均为 PASS，最后一行 `ok`。
+Expected: 13 个 `TestScenarioFixtures/<场景名>` 均为 PASS，最后一行 `ok`。
 
 - [ ] **Step 6：提交**
 
@@ -1684,6 +1701,21 @@ max-complexity = 10
 "os.execle".msg = "Worker 不直接替换进程映像"
 "os.execlp".msg = "Worker 不直接替换进程映像"
 "os.execlpe".msg = "Worker 不直接替换进程映像"
+"asyncio.create_subprocess_exec".msg = "Worker 不直接创建子进程"
+"asyncio.create_subprocess_shell".msg = "Worker 不直接创建子进程"
+"os.posix_spawn".msg = "Worker 不直接创建子进程"
+"os.posix_spawnp".msg = "Worker 不直接创建子进程"
+"os.spawnl".msg = "Worker 不直接创建子进程"
+"os.spawnle".msg = "Worker 不直接创建子进程"
+"os.spawnlp".msg = "Worker 不直接创建子进程"
+"os.spawnlpe".msg = "Worker 不直接创建子进程"
+"os.spawnv".msg = "Worker 不直接创建子进程"
+"os.spawnve".msg = "Worker 不直接创建子进程"
+"os.spawnvp".msg = "Worker 不直接创建子进程"
+"os.spawnvpe".msg = "Worker 不直接创建子进程"
+"os.forkpty".msg = "Worker 不直接创建子进程"
+"pty.spawn".msg = "Worker 不直接创建子进程"
+"multiprocessing".msg = "Worker 不直接创建子进程"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["TID251", "E402"]  # 测试文件按关注点分节，各节在节首导入
@@ -1895,8 +1927,8 @@ LIMIT_CASES = [
     pytest.param(
         WORKER,
         b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":'
-        + b"[" * 20000
-        + b"]" * 20000
+        + b"[" * 100_000
+        + b"]" * 100_000
         + b"}",
         "malformed_json",
         id="nesting_too_deep",
@@ -1976,7 +2008,8 @@ Expected: 收集错误 `ModuleNotFoundError: No module named 'agentbox_worker.pr
 
 规则与 Go 侧 internal/protocol 逐条对应，二者共用 protocol/fixtures/v1。
 消息以 dict 表示；未知字段忽略，未知类型是错误（规格 §5.3）。
-判定顺序：非 JSON 对象 → 类型未知 → 超限 → 字段类型错误 → 语义规则。
+判定顺序：行长超过 1 MiB → 非严格 UTF-8 / 非 JSON 对象 / 嵌套过深 → 类型未知 → 超限
+→ 字段类型错误 → 语义规则。
 """
 
 from __future__ import annotations
@@ -2864,6 +2897,8 @@ Expected: 收集错误 `FileNotFoundError`（schema 文件不存在）。
 
 依次检查：行长超过任何类型上限中的最大值（1 MiB）→ `message_too_large`，不解析；行不是严格的 UTF-8（含 BOM 前缀）、不是 JSON 对象或嵌套过深 → `malformed_json`；`type` 缺失、非字符串或不属于该方向 → `unknown_type`；超过该类型的上限 → `message_too_large`；字段类型错误 → `invalid_field`；然后是各类型的语义规则：`version_mismatch`、`missing_field`、`invalid_field`、`state_too_large`、`too_many_refs`、`path_invalid`。
 
+**两侧已知差异**（尚未统一，是否收紧由协议另行决定）：① 嵌套深度没有协议级上限——Go 在 10000 层报 `malformed_json`，Python 取决于解释器（3.11、3.13 在约 1000–2500 层报 `malformed_json`，3.14 起按 C 栈检查，数万层仍可解析；测试统一用 10 万层，各方都拒绝）；② 键名大小写——Go 按结构体字段不区分大小写匹配（含 Unicode 折叠），Python 只认精确键名；③ 重复键——Go 取后者但 `null` 不覆盖前值、前值的类型错误不被后者纠正，Python 取最后一个；④ 超过 4300 位的整数——Go 在整数字段报 `invalid_field`、在自由格式字段（`state`、`data`、`config`）接受，Python 一律报 `malformed_json`。合规的发送方（本 SDK 与宿主）不会产生这些输入。
+
 ## 事件流顺序（task 模式）
 
 `seq` 从 1 严格递增（`seq_invalid`）；`ready` 之前只允许 `error`，用于启动失败（`before_ready`）；`ready` 只能出现一次（`duplicate_ready`）；终态提议 `result`、`error`、`paused` 至多一个，其后只允许 `checkpoint_query`（`after_terminal`）；`handshake_error` 只能是第一条（`handshake_error_misplaced`）且是唯一一条（`after_handshake_error`）。
@@ -3661,6 +3696,17 @@ def test_ready_checkpoint_artifact_result(tmp_path):
     assert result["summary"] == "cp-1/v2" and result["outputs"] == ["report"]
 
 
+def test_deeply_nested_init_fails_without_crashing(tmp_path):
+    async def go():
+        transport = MemoryTransport()
+        head = json.dumps({**INIT, "out_dir": str(tmp_path)})[:-1]
+        transport.feed(f'{head},"config":{"[" * 100_000}{"]" * 100_000}}}'.encode())
+        code = await run_worker(returns_ok, transport, name="w", version="0", timing=FAST)
+        return code, sent_json(transport)
+
+    assert asyncio.run(go()) == (1, [])
+
+
 def test_unsupported_mode_fails_before_ready(tmp_path):
     code, events = run(returns_ok, tmp_path, init={"mode": "session"})
     assert code == 1
@@ -4239,9 +4285,9 @@ class TaskContext:
 
 def _supports_protocol(line: bytes) -> bool:
     """只读引导信封判断是否有共同版本（规格 §5.2）；信封本身不合法时交由完整校验报错。"""
-    try:
-        envelope = json.loads(line)
-    except ValueError:
+    try:  # 与 decode_line 相同：严格 UTF-8，嵌套过深按无法解析处理
+        envelope = json.loads(line.decode("utf-8"))
+    except (ValueError, RecursionError):
         return True
     if not isinstance(envelope, dict) or envelope.get("type") != "init":
         return True
@@ -5133,7 +5179,7 @@ Expected: ruff 无问题；`lint-imports` 报告 1 个契约 KEPT；pytest 全�
 wsl -d Ubuntu -- bash -c 'export PATH=$PATH:/usr/local/go/bin; cd /mnt/f/go-agentbox-m1-3 && go test -count=1 -v ./internal/protocol/ 2>&1 | grep -cE "^    --- PASS: TestScenarioFixtures/"; go test -count=1 ./internal/protocol/'
 ```
 
-Expected: 计数为 21（12 个协议层 + 9 个 SDK 层场景）；最后一行 `ok`。
+Expected: 计数为 22（13 个协议层 + 9 个 SDK 层场景）；最后一行 `ok`。
 
 - [ ] **Step 7：提交**
 
@@ -5226,7 +5272,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
    cd F:\go-agentbox-m1-3\worker; uv sync --locked; uv run ruff check .; uv run ruff format --check .; uv run lint-imports; uv run pytest -q
    ```
    Expected: 全部通过。
-3. **跨语言一致性**：Go 的 `TestMessageFixtures`、`TestScenarioFixtures` 与 Python 的 `test_valid_message_round_trips`、`test_invalid_message_has_expected_code`、`test_scenario_stream`、`test_schema_*`、`test_sdk_reproduces_scenario` 全部通过，且读取的是同一批 fixtures 文件（`protocol/fixtures/v1/messages.json` 与 21 个场景）。
+3. **跨语言一致性**：Go 的 `TestMessageFixtures`、`TestScenarioFixtures` 与 Python 的 `test_valid_message_round_trips`、`test_invalid_message_has_expected_code`、`test_scenario_stream`、`test_schema_*`、`test_sdk_reproduces_scenario` 全部通过，且读取的是同一批 fixtures 文件（`protocol/fixtures/v1/messages.json` 与 22 个场景）。
 4. **CI（Linux，判定依据）**：推送分支并开 Draft PR（`Refs #4`），确认 `correctness`、`complexity-report`、`linux-integration`、`python (3.11)`、`python (3.13)` 全部实际执行并通过；`test_process.py` 的五个真实进程测试（保持 stdin 打开时退出、停止读取 stdout 后取消、stdout 被关闭、输入超长、print 改道）在 Linux 上通过。
 5. **范围核对**：`git diff --stat m1-local-provider...HEAD` 只包含本计划 Files 中列出的文件。
 
