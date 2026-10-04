@@ -203,3 +203,11 @@ func Run(ctx context.Context, cfg Config, d Deps) error // 返回即进程应退
 - **结构决定**：`internal/app` 承载启动顺序（见 Global Constraints），需本批审阅。
 - **M2 衔接**：账本转换步骤位置保留；`Access` 接口（Plan 5）由 M2 的 `gateway/edge` 实现。
 - **占位符**：无。
+
+## 验收记录（2026-10-05）——状态：已验收（控制面层；Draft PR #11，未合并）
+
+- 本地 WSL2 联合验收：`go vet`、`GOOS=windows go build`、真实 PostgreSQL 上 `CI=true go test ./...`、`tests/e2e` 连续三次（约 96 s）、root 下 `provider/local`/`sandbox`/`cgroup`/`rootfs`、pytest 335 项；Linux CI 全绿（run 37232687123：correctness 含 `-race` 与 golangci-lint、linux-integration 以 root 运行且无非预期 skip、python 3.11/3.13）。
+- 验收归属：E5（12 个故障点，SIGKILL 后重启恢复，无重复执行）、E6、E13、E14、E15、E16；不变量 I1、I2、I4–I8、I16 在每个 e2e 用例结束时检查。
+- 系统级用例以磁盘持久化的进程型测试 provider（`tests/e2e/procprov`）运行，使执行树在 server 被杀后存活、由重启后的恢复停止。
+- 已知限制：`agentbox server` 在生产启动器就绪前拒绝启动（等待规格 §4.6 回写审阅）；结果与产物下载端点返回 501；累计运行时限默认 1 h（规格 §14.4 未给出来源，M1 默认值，待确认）。
+- 不在本次验收内：以真实隔离环境运行 `tests/e2e`、E5 的物理回收部分——依赖 Plan 1B。

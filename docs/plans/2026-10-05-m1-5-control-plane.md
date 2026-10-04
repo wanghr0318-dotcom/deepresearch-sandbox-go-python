@@ -312,3 +312,11 @@ type Scheduler struct{ /* 管理 actor 集合；ListActiveTasks 启动；新任�
 - **恢复的 stop_blocked attempt 的运行时间**：actor 选项 `OnStopRecorded`，由装配接到 `recovery.Store.AccountUnrecordedRunTime`；停止确认（`Recorded`）后、裁决前调用一次，失败退避重试并保留事实。
 - **永远无法满足的 limits**：在 API 创建时拒绝（400），actor 不处理；`Admission` 的非取消错误保持致命并在注释中说明。
 - **超限任务的终止（不改 `Decide`/Store）**：attempt 结束时累计运行时间已达上限且 Outcome 可重试 → actor 在调用 `Decide` 前改为 `task_deadline_exceeded`、不重试；queued 任务启动时已超限（重启记账或配置调低）→ 照常走创建路径，但 run ctx 以 `context.DeadlineExceeded` 预先取消，runner 立即分类为 `task_deadline_exceeded`，经既有裁决路径终止（接受一次环境创建的代价）。`RunTimeLimit` 为 `func(TaskState) time.Duration`，由装配按任务计算。
+
+## 验收记录（2026-10-05）——状态：已验收（控制面层；Draft PR #11，未合并）
+
+- 本地 WSL2 联合验收：`go vet`、`GOOS=windows go build`、真实 PostgreSQL 上 `CI=true go test ./...`、`tests/e2e` 连续三次（约 96 s）、root 下 `provider/local`/`sandbox`/`cgroup`/`rootfs`、pytest 335 项；Linux CI 全绿（run 37232687123：correctness 含 `-race` 与 golangci-lint、linux-integration 以 root 运行且无非预期 skip、python 3.11/3.13）。
+- 验收归属：E1、E4（1000 次随机交错）、E7、E8、E10 与首个切片，以进程型 fake provider 与真实 Python sim_worker 运行（`tests/e2e`）。
+- 执行中发现并修复：UID 范围池耗尽此前使任务永久失败（`create_failed_env`），现为等待归还的暂时性情况，停止记录后立即唤醒清理。
+- 不在本次验收内：以生产启动器（真实隔离）运行上述用例、E2/E3——依赖 Plan 1B 与 Plan 2 生产启动器。
+- 留待最终评审的次要项见 `.superpowers/sdd/progress.md`（负载下取消偶发 `503 contention`、E7 受 SDK 固定 10 s 确认超时影响等）。

@@ -2,7 +2,7 @@
 
 单执行主机上的 Agent Runtime：Go 负责执行与权限边界，Python 负责研究编排。
 
-> **状态：开发中（v0.2 内部里程碑 M1），尚不能端到端运行任务。** 下文"已实现"只列出已经通过验收的部分；"这是什么"描述的是设计目标，每项保证在对应验收通过前都不成立。
+> **状态：开发中（v0.2 内部里程碑 M1）。** 控制面（调度、恢复、API、CLI）已在测试环境中端到端验证，但**尚不能作为服务运行任务**：`agentbox server` 在沙箱生产启动器完成前拒绝启动。下文"已实现"只列出已经通过验收的部分；"这是什么"描述的是设计目标，每项保证在对应验收通过前都不成立。
 
 ---
 
@@ -13,15 +13,15 @@
 | Worker 协议 v1（task 模式）与 Python Worker SDK、sim-worker（Plan 3） | **已验收** | Go 侧 `internal/protocol` 与 Python 侧 `worker/agentbox_worker` 共用 `protocol/fixtures` |
 | PostgreSQL 持久化、BlobStore、安装身份引导（Plan 4） | **已验收** | `internal/persistence`、`internal/blob`、`internal/datadir`、`internal/ownership`；事务语义只在真实 PostgreSQL 上测试 |
 | `internal/runtime` 改名为 `internal/sandbox`（Plan 1A） | **已验收** | 纯改名 |
-| Provider 契约包与内存 fake（Plan 2 Task 1） | 已实现，所在计划未验收 | `internal/provider`、`internal/provider/fake`、契约一致性测试 |
-| cgroup 扩展、宿主自检（Plan 2 Task 2） | 已实现，所在计划未验收 | `cgroup.kill`、`populated`、OOM 与 CPU 统计；`agentbox doctor` |
-| LocalProvider 其余部分、控制面、恢复、API、CLI（Plan 2、5、6） | 进行中 | 计划见[计划索引](docs/plans/2026-10-03-m1-index.md) |
-| 降权启动序列 spike（Plan 1B） | 进行中 | 结论回写规格 §4.6 后再实现生产启动路径 |
+| 控制面：准入、资源 coordinator 与清理、AttemptRunner、task actor 与调度（Plan 5） | **已验收**（控制面层） | `internal/admission`、`resource`、`runner`、`task`；E1、E4、E7、E8、E10 以进程型 fake provider 与真实 sim_worker 验证 |
+| 启动恢复、REST/SSE API、CLI、不变量检查、故障注入（Plan 6） | **已验收**（控制面层） | `internal/reconcile`、`recovery`、`api`、`cli`、`app`、`invariants`、`faultinject`；E5、E6、E13–E16 |
+| Provider 契约、cgroup 扩展、宿主自检、init 服务循环、环境生命周期（Plan 2 Task 1–8） | 已实现，所在计划未验收 | `internal/provider`、`provider/local`（以测试启动器验证）、`sandbox`、`cgroup`、`hostcheck`；`agentbox doctor` |
+| 沙箱生产启动器（Plan 1B 结论 + Plan 2 后续任务） | spike 已完成，待审阅 | WSL2 上 §16.2 全部通过；规格 §4.6 回写提案待审阅，之后实现 |
 | Gateway、DeepResearch、Redis、Vue、会话、exec 沙箱、sub-run | 未开始 | M2–M4 |
 
 ## 现在可以运行的命令
 
-Go、Docker 与 PostgreSQL 命令已在 WSL2（内核 6.6）上验证；Python 测试已在 Windows（uv）与 CI 的 Linux 作业上验证。没有列出的命令（server、CLI、端到端任务）尚未实现。
+Go、Docker 与 PostgreSQL 命令已在 WSL2（内核 6.6）上验证；Python 测试已在 Windows（uv）与 CI 的 Linux 作业上验证。没有列出的命令尚不能使用：`agentbox server` 在生产启动器完成前拒绝启动，因此 `agentbox task …`、`agentbox status` 与 `verify-invariants` 还没有可连接的服务。
 
 **依赖**：Linux（cgroup v2）或 Windows 下的 WSL2；Go 1.23+；Python 3.11+ 与 [uv](https://docs.astral.sh/uv/)；Docker（运行 PostgreSQL）。
 
@@ -47,7 +47,13 @@ docker compose -f deploy/docker-compose.yml down
 
 `CI=true` 时未设置 `AGENTBOX_TEST_DATABASE_URL` 会使数据库测试失败而不是跳过（CI 即如此运行）。
 
-**需要 root 的测试**（cgroup 等）：以 root 运行 `go test ./internal/cgroup/ ./internal/rootfs/`（WSL 中可用 `wsl -u root`）。
+**控制面端到端测试**（需要上面的 PostgreSQL 与 `python3`；以 `app.Run` 装配全部组件，用进程型测试 provider 运行真实的 `sim_worker`，覆盖崩溃重启恢复、取消竞争、数据库断连等；约 2 分钟）：
+
+```bash
+CI=true go test -count=1 ./tests/e2e/...
+```
+
+**需要 root 的测试**（cgroup、环境生命周期等）：以 root 运行 `go test ./internal/cgroup/ ./internal/rootfs/ ./internal/sandbox/ ./internal/provider/local/`（WSL 中可用 `wsl -u root`）。
 
 **宿主自检**（需要 root）：
 
@@ -73,6 +79,9 @@ uv run pytest -q
 | [M1 计划索引](docs/plans/2026-10-03-m1-index.md) | M1 各计划、依赖与验收归属 |
 | [持久化设计](docs/design/2026-10-04-m1-4-persistence-design.md)、[安装身份修订](docs/design/2026-10-05-installation-identity-amendment.md) | Plan 4 的设计依据 |
 | [Provider 契约](docs/design/2026-10-05-provider-contract.md) | 环境生命周期的 Go 接口、错误、并发边界 |
+| [Plan 2](docs/plans/2026-10-05-m1-2-local-provider.md)、[Plan 5](docs/plans/2026-10-05-m1-5-control-plane.md)、[Plan 6](docs/plans/2026-10-05-m1-6-recovery-entry.md) | M1 第 2 批计划、执行中修订与验收记录 |
+| [REST API（OpenAPI）](api/openapi.yaml) | 任务提交、控制、查询与 SSE 事件流的契约 |
+| [Plan 1B spike 记录](docs/experiments/2026-10-05-spike-1b.md)、[§4.6 回写提案](docs/design/2026-10-05-spec-4.6-writeback-proposal.md) | 降权启动序列的实验结论（待审阅） |
 | [Worker 协议](protocol/README.md) | 协议 v1 的语义与 fixtures |
 
 历史文档（不可直接执行）：[2026-09-29 设计稿](docs/design/2026-09-29-sandbox-runtime-design.md)、[v0.1 规格](docs/design/2026-10-03-v0.1-reliable-execution-design.md)、[旧 M1 计划](docs/plans/2026-09-29-m1-local-provider.md)。
