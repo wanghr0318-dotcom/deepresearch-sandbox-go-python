@@ -444,11 +444,7 @@ type taskJSON struct {
 }
 
 func toTaskJSON(v TaskView) taskJSON {
-	return taskJSON{
-		TaskID: v.TaskID, Status: v.Status, StatusReason: v.StatusReason, CurrentAttemptID: v.CurrentAttemptID,
-		Desired: v.Desired, ControlVersion: v.ControlVersion, AppliedControlVersion: v.AppliedControlVersion,
-		AttemptsTotal: v.AttemptsTotal,
-	}
+	return taskJSON(v) // 字段一一对应；TaskView 增加字段时此转换编译失败，提醒同步 JSON 形状
 }
 
 type taskListJSON struct {
@@ -664,9 +660,7 @@ func (h *Handler) inspect(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	for _, c := range in.Checkpoints {
-		out.Checkpoints = append(out.Checkpoints, checkpointJSON{
-			CheckpointID: c.CheckpointID, StepID: c.StepID, AttemptID: c.AttemptID, CommitSeq: c.CommitSeq, CommittedAt: c.CommittedAt,
-		})
+		out.Checkpoints = append(out.Checkpoints, checkpointJSON(c))
 	}
 	writeJSON(w, http.StatusOK, out)
 }

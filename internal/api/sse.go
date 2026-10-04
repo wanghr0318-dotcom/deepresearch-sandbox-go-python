@@ -112,10 +112,7 @@ func (h *Handler) streamEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeEvent(w http.ResponseWriter, ev Event) error {
-	data, err := json.Marshal(eventJSON{
-		TaskSeq: ev.TaskSeq, AttemptID: ev.AttemptID, Source: ev.Source, Type: ev.Type,
-		WorkerSeq: ev.WorkerSeq, Payload: ev.Payload, TS: ev.TS,
-	})
+	data, err := json.Marshal(eventJSON(ev))
 	if err != nil {
 		return err
 	}
