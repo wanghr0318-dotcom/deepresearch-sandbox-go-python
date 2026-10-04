@@ -28,7 +28,8 @@ func deps(t *testing.T, pkg string) []string {
 func TestConsumersDoNotDependOnPostgres(t *testing.T) {
 	forbidden := []string{module + "/internal/persistence/postgres", "github.com/jackc/pgx"}
 	for _, pkg := range []string{
-		"internal/api", "internal/task", "internal/runner", "internal/resource", "internal/persistence",
+		"internal/api", "internal/task", "internal/runner", "internal/resource",
+		"internal/ownership", "internal/persistence", "internal/datadir", "internal/blob",
 	} {
 		for _, d := range deps(t, pkg) {
 			for _, f := range forbidden {
