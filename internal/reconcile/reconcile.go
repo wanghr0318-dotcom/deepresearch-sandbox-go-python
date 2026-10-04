@@ -63,7 +63,8 @@ const (
 	// KeepQueued：desired = run 且无未结束 attempt——保持排队，保留计数与 not_before（§14.2 第 3 行）；
 	// 裁决已安排故障重试时不再计数（第 5 行）。Expect = "queued"。
 	KeepQueued StepKind = "keep_queued"
-	// KeepPaused：已暂停且 desired = pause——保持 paused 与恢复点。Expect = "paused"。
+	// KeepPaused：已暂停——保持 paused 与恢复点。desired = run（resume 已接受未应用）同样保持：恢复不应用
+	// 控制，由 actor 启动后应用。Expect = "paused"。
 	KeepPaused StepKind = "keep_paused"
 	// KeepTerminal：环境所属 attempt 不是任何非终态任务的当前 attempt——其裁决已提交，保留终态，只处理残留
 	// 资源（§14.2 第 6 行）。Expect = "verdict_committed"，执行器据此复核。
@@ -91,7 +92,7 @@ type Step struct {
 	TaskID, AttemptID, EnvID string
 	Expect                   string // 执行后应达到（并复核）的状态
 	Reason                   string // 隔离、报警与保持类步骤的原因
-	Layer, Path              string // 扫描项（Quarantine）
+	Layer, Path              string // Quarantine/Alert：扫描项，或 "record" 与 "record/<类别>/<ID>"（非空）
 	IntentID                 string // ResolveIntent，或被隔离的 intent
 	UIDRangeID, AllocationID string // ReleaseUIDRange，或被隔离的 UID 范围
 }
@@ -116,6 +117,8 @@ const (
 
 	attemptEnded = "ended"
 	uidAssigned  = "assigned"
+
+	recordLayer = "record" // 无物理资源的隔离项的 Layer 与 Path 前缀
 )
 
 // openAttemptStatus 是未结束 attempt 的全部状态（§8.2；stop_blocked 为非终态）。
@@ -234,8 +237,13 @@ func (p *planner) plan() RecoveryPlan {
 	return RecoveryPlan{Steps: steps}
 }
 
-// isolate 生成一对隔离与报警步骤；obj 是被隔离对象的类别与 ID（用于步骤 ID）。
+// isolate 生成一对隔离与报警步骤；obj 是被隔离对象的类别与 ID（用于步骤 ID）。没有物理资源的隔离
+// （任务、环境记录、intent、UID 范围的不一致）以 Layer = "record"、Path = "record/<类别>/<ID>" 标识，
+// 使执行器能以路径为键写入 quarantined_resources 并报警，并把被隔离的任务排除在 actor 启动之外。
 func (p *planner) isolate(s Step, obj ...string) {
+	if s.Layer == "" {
+		s.Layer, s.Path = recordLayer, recordLayer+"/"+strings.Join(obj, "/")
+	}
 	q, a := s, s
 	q.Kind, q.ID, q.Expect = Quarantine, id(Quarantine, obj...), "quarantined"
 	a.Kind, a.ID, a.Expect = Alert, id(Alert, obj...), "alerted"
@@ -340,11 +348,11 @@ func (p *planner) task(t TaskFact, envs map[string]EnvFact) {
 		s.Kind, s.Expect = KeepPaused, taskPaused
 	case open: // desired = run
 		s.Kind, s.Expect, s.Reason = MarkAttemptLost, "lost", "lost_on_restart"
+	case t.Status == taskPaused: // desired = run：resume 已接受未应用；恢复不应用控制，由 actor 启动后应用
+		s.Kind, s.Expect, s.Reason = KeepPaused, taskPaused, "resume 已接受，由 actor 启动后应用"
 	default: // desired = run，无未结束 attempt
 		s.Kind, s.Expect = KeepQueued, taskQueued
 		switch {
-		case t.Status == taskPaused:
-			s.Reason = "resume 已接受"
 		case a != nil: // 裁决已提交且安排了重试
 			s.Reason = "已安排重试，不再计数"
 		default:

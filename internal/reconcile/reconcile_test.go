@@ -105,6 +105,11 @@ func TestPlan(t *testing.T) {
 			want:  []string{"keep_paused:t1"},
 		},
 		{
+			name:  "14.2 已暂停、resume 已接受未应用：保持 paused，由 actor 应用",
+			facts: Facts{Tasks: []TaskFact{task("t1", "paused", "run", nil)}},
+			want:  []string{"keep_paused:t1"},
+		},
+		{
 			name:  "14.2 desired=run 无未完成 attempt：保持排队",
 			facts: Facts{Tasks: []TaskFact{task("t1", "queued", "run", nil)}},
 			want:  []string{"keep_queued:t1"},
@@ -244,6 +249,11 @@ func TestPlan(t *testing.T) {
 			name:  "无效：执行中但没有当前 attempt",
 			facts: Facts{Tasks: []TaskFact{task("t1", "running", "run", nil)}},
 			want:  []string{"quarantine:task:t1", "alert:task:t1"},
+			check: func(t *testing.T, p RecoveryPlan) {
+				if s := step(t, p, "quarantine:task:t1"); s.Layer != "record" || s.Path != "record/task/t1" {
+					t.Fatalf("记录类隔离应以 record/task/t1 标识：%+v", s)
+				}
+			},
 		},
 		{
 			name:  "无效：排队中但当前 attempt 未结束",
@@ -284,6 +294,11 @@ func TestPlan(t *testing.T) {
 			p := Plan(c.facts, provider.ScanReport{Items: c.scan}, install)
 			if got := ids(p); !reflect.DeepEqual(got, c.want) {
 				t.Fatalf("步骤\n got %v\nwant %v", got, c.want)
+			}
+			for _, s := range p.Steps { // 执行器以 Path 为键写入 quarantined_resources
+				if s.Kind == Quarantine && (s.Layer == "" || s.Path == "") {
+					t.Fatalf("隔离步骤缺少 Layer 或 Path：%+v", s)
+				}
 			}
 			if c.check != nil {
 				c.check(t, p)
