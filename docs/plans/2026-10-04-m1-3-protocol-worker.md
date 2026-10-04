@@ -70,7 +70,7 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
 
 **事件流错误码**：`seq_invalid`、`before_ready`、`duplicate_ready`、`after_terminal`、`handshake_error_misplaced`、`after_handshake_error`。
 
-**判定优先级**（两侧一致）：行不是 JSON 对象 → `malformed_json`；`type` 缺失、非字符串或不属于该方向 → `unknown_type`；超过该类型的大小上限 → `message_too_large`；字段类型错误 → `invalid_field`；然后按各类型的语义规则依次检查。
+**判定优先级**（两侧一致）：行长超过任何类型上限中的最大值（1 MiB）→ `message_too_large`，不解析（避免解析超大输入）；行不是 JSON 对象 → `malformed_json`；`type` 缺失、非字符串或不属于该方向 → `unknown_type`；超过该类型的大小上限 → `message_too_large`；字段类型错误 → `invalid_field`；然后按各类型的语义规则依次检查。
 
 **事件流规则**（task 模式）：`seq` 从 1 严格递增；`ready` 之前只允许 `error`（启动失败）；`ready` 只能出现一次；终态提议（`result`、`error`、`paused`）至多一个，其后只允许 `checkpoint_query`；`handshake_error` 只能是第一条且是唯一一条 Worker 消息。
 
@@ -318,6 +318,7 @@ func TestDecodeLimits(t *testing.T) {
 		{"state 的空白不计入", WorkerToHost, string(checkpointLine(`{ "k" :  "aaaaaaaaaa" }`, []string{})), ""},
 		{"refs 恰好到上限", WorkerToHost, string(checkpointLine(`{}`, refs)), ""},
 		{"refs 超过上限", WorkerToHost, string(checkpointLine(`{}`, append(refs, ref))), CodeTooManyRefs},
+		{"超过所有上限的行不解析", HostToWorker, strings.Repeat("x", MaxInitBytes+1), CodeMessageTooLarge},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -436,6 +437,9 @@ const (
 	MaxRefsPerCheckpoint = 1024
 	MaxArtifactPathBytes = 4096
 )
+
+// maxLineBytes 是任何消息类型上限中的最大值；超过它的行不解析，直接判为过大。
+const maxLineBytes = max(MaxEventBytes, MaxInitBytes)
 ```
 
 `internal/protocol/errors.go`：
@@ -1045,8 +1049,8 @@ var registry = map[Direction]map[string]func() Message{
 // DecodeLine 解析并校验一行消息（不含行尾换行符）。
 // 未知字段忽略；未知类型、超限、字段类型错误与语义违规均返回 *Error。
 func DecodeLine(dir Direction, line []byte) (Message, error) {
-	if len(line) > MaxEventBytes {
-		return nil, newError(CodeMessageTooLarge, "%d 字节，上限 %d", len(line), MaxEventBytes)
+	if len(line) > maxLineBytes {
+		return nil, newError(CodeMessageTooLarge, "%d 字节，上限 %d", len(line), maxLineBytes)
 	}
 	if t := bytes.TrimSpace(line); len(t) == 0 || t[0] != '{' {
 		return nil, newError(CodeMalformedJSON, "消息必须是 JSON 对象")
@@ -1103,10 +1107,14 @@ func EncodeLine(dir Direction, m Message) ([]byte, error) {
 	return b, nil
 }
 
-// checkSize 按方向与类型检查上限：宿主控制消息（init 除外）16 KiB，其余 1 MiB。
+// checkSize 按方向与类型检查上限：Worker 事件 MaxEventBytes，init MaxInitBytes，
+// 其他宿主控制消息 MaxControlBytes。
 func checkSize(dir Direction, typ string, n int) error {
 	limit := MaxEventBytes
-	if dir == HostToWorker && typ != TypeInit {
+	switch {
+	case dir == HostToWorker && typ == TypeInit:
+		limit = MaxInitBytes
+	case dir == HostToWorker:
 		limit = MaxControlBytes
 	}
 	if n > limit {
@@ -1751,6 +1759,7 @@ from agentbox_worker.protocol import (
     HOST,
     MAX_CONTROL_BYTES,
     MAX_EVENT_BYTES,
+    MAX_INIT_BYTES,
     MAX_INLINE_STATE_BYTES,
     MAX_REFS_PER_CHECKPOINT,
     WORKER,
@@ -1863,6 +1872,9 @@ LIMIT_CASES = [
         id="refs_over_limit",
     ),
     pytest.param(
+        HOST, b"x" * (MAX_INIT_BYTES + 1), "message_too_large", id="oversized_line_not_parsed"
+    ),
+    pytest.param(
         WORKER,
         b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":NaN}',
         "malformed_json",
@@ -1949,6 +1961,8 @@ MAX_CONTROL_BYTES = 16 << 10
 MAX_INLINE_STATE_BYTES = 256 << 10
 MAX_REFS_PER_CHECKPOINT = 1024
 MAX_ARTIFACT_PATH_BYTES = 4096
+# 任何消息类型上限中的最大值；超过它的行不解析，直接判为过大。
+MAX_LINE_BYTES = max(MAX_EVENT_BYTES, MAX_INIT_BYTES)
 
 MODE_TASK = "task"
 MODE_SESSION = "session"
@@ -2289,7 +2303,12 @@ def _reject_constant(name: str) -> Any:
 
 
 def _check_size(direction: str, typ: str, size: int) -> None:
-    limit = MAX_CONTROL_BYTES if direction == HOST and typ != "init" else MAX_EVENT_BYTES
+    if direction == WORKER:
+        limit = MAX_EVENT_BYTES
+    elif typ == "init":
+        limit = MAX_INIT_BYTES
+    else:
+        limit = MAX_CONTROL_BYTES
     if size > limit:
         raise ProtocolError("message_too_large", f"{typ} {size} 字节，上限 {limit}")
 
@@ -2311,8 +2330,8 @@ def _validator_for(direction: str, typ: Any) -> Callable[[dict[str, Any]], None]
 def decode_line(direction: str, line: bytes | str) -> dict[str, Any]:
     """解析并校验一行消息（不含行尾换行符）。"""
     raw = line.encode("utf-8") if isinstance(line, str) else line
-    if len(raw) > MAX_EVENT_BYTES:
-        raise ProtocolError("message_too_large", f"{len(raw)} 字节，上限 {MAX_EVENT_BYTES}")
+    if len(raw) > MAX_LINE_BYTES:
+        raise ProtocolError("message_too_large", f"{len(raw)} 字节，上限 {MAX_LINE_BYTES}")
     try:
         msg = json.loads(raw, parse_constant=_reject_constant)
     except ValueError as exc:  # JSONDecodeError 与 UnicodeDecodeError 都是 ValueError
