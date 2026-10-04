@@ -399,12 +399,19 @@ class HoldsProgress(MemoryTransport):
             await self.release.wait()
 
 
-def test_control_error_waits_for_inflight_send(tmp_path):
-    async def app(ctx):
-        await ctx.progress("step_started", "x")
-        await asyncio.sleep(10)
-        return Result("never", [])
+async def progress_then_sleep(ctx: TaskContext) -> Result:
+    await ctx.progress("step_started", "x")
+    await asyncio.sleep(10)
+    return Result("never", [])
 
+
+async def progress_then_return(ctx: TaskContext) -> Result:
+    await ctx.progress("step_started", "x")
+    return Result("done", [])
+
+
+@pytest.mark.parametrize("app", [progress_then_sleep, progress_then_return])
+def test_control_error_waits_for_inflight_send(tmp_path, app):
     async def go():
         transport = HoldsProgress()
         transport.feed(json.dumps({**INIT, "out_dir": str(tmp_path)}).encode())
@@ -429,6 +436,7 @@ def test_control_error_waits_for_inflight_send(tmp_path):
             id="oversized_message",
         ),
         pytest.param(ValueError("坏文件名 \udcff"), "ValueError: 坏文件名 ?", id="lone_surrogate"),
+        pytest.param(WorkerFailure("bad_input", 42, retryable=1), "42", id="non_string_fields"),
     ],
 )
 def test_failure_message_is_made_encodable(tmp_path, raised, message):

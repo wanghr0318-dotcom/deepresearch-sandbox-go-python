@@ -414,6 +414,9 @@ async def _run_task(app: App, ctx: TaskContext, transport: Transport) -> int:
         return await _emit_failure(ctx, failure)
     finally:
         control_task.cancel()
+    if ctx.control_error is not None:  # 控制错误发生在应用最后一次发送期间：同样以错误结束
+        failure = WorkerFailure("control_protocol_error", str(ctx.control_error))
+        return await _emit_failure(ctx, failure)
     return await _emit_outcome(ctx, outcome)
 
 
@@ -432,23 +435,21 @@ async def _emit_outcome(ctx: TaskContext, outcome: Any) -> int:
     return await _emit_failure(ctx, failure)
 
 
-def _safe_text(text: str, limit: int) -> str:
-    """替换孤立代理项并按 UTF-8 字节截断，保证 error 事件一定可以编码。"""
-    return text.encode("utf-8", "replace")[:limit].decode("utf-8", "ignore")
+def _safe_text(value: object, limit: int) -> str:
+    """转为字符串、替换孤立代理项并按 UTF-8 字节截断，保证 error 事件一定可以编码。"""
+    return str(value).encode("utf-8", "replace")[:limit].decode("utf-8", "ignore")
 
 
 async def _emit_failure(ctx: TaskContext, failure: WorkerFailure) -> int:
-    body = {
-        "type": "error",
-        "code": _safe_text(failure.code, MAX_ERROR_CODE_BYTES),
-        "message": _safe_text(failure.message, MAX_ERROR_MESSAGE_BYTES),
-        "retryable": failure.retryable,
-    }
-    try:
-        await ctx._outbox.emit(body)
-    except ProtocolError:  # 清理后仍无法编码：退回固定内容的 internal_error
-        fallback = {"type": "error", "code": "internal_error", "message": "错误事件无法编码"}
-        await ctx._outbox.emit({**fallback, "retryable": failure.retryable})
+    # 应用可能传入非字符串的 code/message 或非布尔的 retryable：一律规范化后再发送
+    await ctx._outbox.emit(
+        {
+            "type": "error",
+            "code": _safe_text(failure.code, MAX_ERROR_CODE_BYTES),
+            "message": _safe_text(failure.message, MAX_ERROR_MESSAGE_BYTES),
+            "retryable": bool(failure.retryable),
+        }
+    )
     return EXIT_FAILURE
 
 
