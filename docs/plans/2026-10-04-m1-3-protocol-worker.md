@@ -3444,6 +3444,7 @@ class Outbox:
         """等当前在途发送结束后取消 task，使取消不会落在发送中途而令通道失效。
 
         task 的取消在它下一次恢复执行时生效；若它正等待发送锁，会在取得锁之前收到取消。
+        在途发送若永久阻塞（宿主停止读取 stdout），本调用随之等待，最终由宿主强制终止。
         """
         async with self._lock:
             task.cancel()
@@ -3522,7 +3523,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `checkpoint` 在首次提交前以 JSON 往返生成与调用方对象无关的快照，所有重试复用它；快照按 JSON 归一化（tuple 变为 list，非字符串键变为字符串）；不可序列化（含 NaN、Infinity）时抛 `WorkerFailure("invalid_field")`
   - `register_artifact` 的哈希在线程池中计算，等待不保证有限；关闭期限不覆盖它，最终强制终止由宿主负责
   - checkpoint 的查询与重发共用 `max_ack_attempts` 次上限，每次发送之后都等待一次结果（最后一次查询的答复同样有效）
-  - error 事件的 `code`、`message` 先替换孤立代理项并按 UTF-8 字节截断（`MAX_ERROR_CODE_BYTES = 256`、`MAX_ERROR_MESSAGE_BYTES = 8 KiB`），仍无法编码时退回固定的 `internal_error`
+  - error 事件的 `code`、`message` 先转为字符串、替换孤立代理项并按 UTF-8 字节截断（`MAX_ERROR_CODE_BYTES = 256`、`MAX_ERROR_MESSAGE_BYTES = 8 KiB`），`retryable` 转为布尔，保证一定可以编码
+  - 控制协议错误即使发生在应用最后一次发送期间（应用随后正常返回），也以 `control_protocol_error` 结束，不发终态 `result`
   - `main()` 的收尾放在内层 `try/finally` 中，`os._exit` 无条件执行；收尾期限取值不在 `[0, 3600]` 秒内（含非数值、NaN、无穷大）时使用默认 5 秒
   - 退出码常量 `EXIT_OK = 0`、`EXIT_FAILURE = 1`、`EXIT_HANDSHAKE = 2`；`SHUTDOWN_TIMEOUT_ENV = "AGENTBOX_WORKER_SHUTDOWN_TIMEOUT"`；包根导出 `TransportBroken`
 
@@ -3717,12 +3719,19 @@ class HoldsProgress(MemoryTransport):
             await self.release.wait()
 
 
-def test_control_error_waits_for_inflight_send(tmp_path):
-    async def app(ctx):
-        await ctx.progress("step_started", "x")
-        await asyncio.sleep(10)
-        return Result("never", [])
+async def progress_then_sleep(ctx: TaskContext) -> Result:
+    await ctx.progress("step_started", "x")
+    await asyncio.sleep(10)
+    return Result("never", [])
 
+
+async def progress_then_return(ctx: TaskContext) -> Result:
+    await ctx.progress("step_started", "x")
+    return Result("done", [])
+
+
+@pytest.mark.parametrize("app", [progress_then_sleep, progress_then_return])
+def test_control_error_waits_for_inflight_send(tmp_path, app):
     async def go():
         transport = HoldsProgress()
         transport.feed(json.dumps({**INIT, "out_dir": str(tmp_path)}).encode())
@@ -3747,6 +3756,7 @@ def test_control_error_waits_for_inflight_send(tmp_path):
             id="oversized_message",
         ),
         pytest.param(ValueError("坏文件名 \udcff"), "ValueError: 坏文件名 ?", id="lone_surrogate"),
+        pytest.param(WorkerFailure("bad_input", 42, retryable=1), "42", id="non_string_fields"),
     ],
 )
 def test_failure_message_is_made_encodable(tmp_path, raised, message):
@@ -4358,6 +4368,9 @@ async def _run_task(app: App, ctx: TaskContext, transport: Transport) -> int:
         return await _emit_failure(ctx, failure)
     finally:
         control_task.cancel()
+    if ctx.control_error is not None:  # 控制错误发生在应用最后一次发送期间：同样以错误结束
+        failure = WorkerFailure("control_protocol_error", str(ctx.control_error))
+        return await _emit_failure(ctx, failure)
     return await _emit_outcome(ctx, outcome)
 
 
@@ -4376,23 +4389,21 @@ async def _emit_outcome(ctx: TaskContext, outcome: Any) -> int:
     return await _emit_failure(ctx, failure)
 
 
-def _safe_text(text: str, limit: int) -> str:
-    """替换孤立代理项并按 UTF-8 字节截断，保证 error 事件一定可以编码。"""
-    return text.encode("utf-8", "replace")[:limit].decode("utf-8", "ignore")
+def _safe_text(value: object, limit: int) -> str:
+    """转为字符串、替换孤立代理项并按 UTF-8 字节截断，保证 error 事件一定可以编码。"""
+    return str(value).encode("utf-8", "replace")[:limit].decode("utf-8", "ignore")
 
 
 async def _emit_failure(ctx: TaskContext, failure: WorkerFailure) -> int:
-    body = {
-        "type": "error",
-        "code": _safe_text(failure.code, MAX_ERROR_CODE_BYTES),
-        "message": _safe_text(failure.message, MAX_ERROR_MESSAGE_BYTES),
-        "retryable": failure.retryable,
-    }
-    try:
-        await ctx._outbox.emit(body)
-    except ProtocolError:  # 清理后仍无法编码：退回固定内容的 internal_error
-        fallback = {"type": "error", "code": "internal_error", "message": "错误事件无法编码"}
-        await ctx._outbox.emit({**fallback, "retryable": failure.retryable})
+    # 应用可能传入非字符串的 code/message 或非布尔的 retryable：一律规范化后再发送
+    await ctx._outbox.emit(
+        {
+            "type": "error",
+            "code": _safe_text(failure.code, MAX_ERROR_CODE_BYTES),
+            "message": _safe_text(failure.message, MAX_ERROR_MESSAGE_BYTES),
+            "retryable": bool(failure.retryable),
+        }
+    )
     return EXIT_FAILURE
 
 
