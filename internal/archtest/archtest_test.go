@@ -48,6 +48,13 @@ func TestControlPlaneUsesProviderContractOnly(t *testing.T) {
 	forbid(t, "cmd/agentbox", []string{module + "/internal/provider/fake"})
 }
 
+// TestReconcileIsPlanOnly：reconcile 只生成计划，不依赖 task、session、recovery（代码组织规则 4、§6.1）。
+func TestReconcileIsPlanOnly(t *testing.T) {
+	forbid(t, "internal/reconcile", []string{
+		module + "/internal/task", module + "/internal/session", module + "/internal/recovery",
+	})
+}
+
 // forbid 断言 pkg 的传递依赖不含 forbidden 中的包及其子包。
 func forbid(t *testing.T, pkg string, forbidden []string) {
 	t.Helper()
