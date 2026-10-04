@@ -40,11 +40,23 @@ type Local struct {
 	root string
 }
 
-// NewLocal 返回以 root 为根目录的本地存储，并确保目录存在。
+// NewLocal 返回以 root 为根目录的本地存储。目录结构（含全部 256 个分片目录）在这里一次建好并
+// fsync，因此 Put 不再创建目录，返回成功前只需 fsync 分片目录。
 func NewLocal(root string) (*Local, error) {
-	for _, d := range []string{filepath.Join(root, "tmp"), filepath.Join(root, "sha256")} {
+	content := filepath.Join(root, "sha256")
+	for _, d := range []string{filepath.Join(root, "tmp"), content} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return nil, fmt.Errorf("blob: 创建目录: %w", err)
+		}
+	}
+	for i := 0; i < 256; i++ {
+		if err := os.Mkdir(filepath.Join(content, fmt.Sprintf("%02x", i)), 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("blob: 创建分片目录: %w", err)
+		}
+	}
+	for _, d := range []string{content, root} {
+		if err := syncDir(d); err != nil {
+			return nil, err
 		}
 	}
 	return &Local{root: root}, nil
@@ -54,7 +66,11 @@ func (l *Local) path(sum string) string {
 	return filepath.Join(l.root, "sha256", sum[:2], sum[2:])
 }
 
-// Put 边写边哈希到临时文件，fsync 后 rename 到内容路径，再 fsync 父目录。
+// Put 边写边哈希到临时文件，fsync 后 rename 到内容路径，再 fsync 分片目录。
+//
+// 内容路径已存在时也用刚校验过的副本原子替换，而不是直接返回成功：已存在的文件可能损坏
+// （同样大小也不可信），也可能来自 rename 成功但目录 fsync 失败的上一次写入或并发的同一内容
+// 写入。替换后再 fsync 目录，保证返回成功时 blob 已持久化。
 func (l *Local) Put(ctx context.Context, r io.Reader) (Ref, error) {
 	tmp, err := os.CreateTemp(filepath.Join(l.root, "tmp"), "put-*")
 	if err != nil {
@@ -74,16 +90,7 @@ func (l *Local) Put(ctx context.Context, r io.Reader) (Ref, error) {
 		return Ref{}, fmt.Errorf("blob: 写入: %w", err)
 	}
 	ref := Ref{SHA256: hex.EncodeToString(h.Sum(nil)), Size: size}
-	if existing, err := l.Stat(ref.SHA256); err == nil {
-		if existing.Size != ref.Size {
-			return Ref{}, fmt.Errorf("blob: %s 已存在但大小不同（%d ≠ %d）", ref.SHA256, existing.Size, ref.Size)
-		}
-		return ref, nil
-	}
 	dest := l.path(ref.SHA256)
-	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
-		return Ref{}, fmt.Errorf("blob: 创建目录: %w", err)
-	}
 	if err := os.Rename(tmpPath, dest); err != nil {
 		return Ref{}, fmt.Errorf("blob: rename: %w", err)
 	}

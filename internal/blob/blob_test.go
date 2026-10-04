@@ -65,4 +65,37 @@ func TestPutHonoursCancellation(t *testing.T) {
 	if _, err := s.Put(ctx, strings.NewReader("x")); !errors.Is(err, context.Canceled) {
 		t.Fatalf("已取消的 context 应使 Put 失败，得到 %v", err)
 	}
+	if tmp, _ := os.ReadDir(filepath.Join(s.root, "tmp")); len(tmp) != 0 {
+		t.Fatalf("失败后临时目录应为空，得到 %d 项", len(tmp))
+	}
+}
+
+// TestPutReplacesDamagedExistingBlob：内容路径上已有的文件不被信任——同样大小的损坏内容与
+// 截断的内容都被刚校验过的副本替换。
+func TestPutReplacesDamagedExistingBlob(t *testing.T) {
+	s, err := NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("checkpoint state")
+	ref, err := s.Put(context.Background(), bytes.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, damaged := range map[string][]byte{
+		"同样大小的损坏内容": bytes.Repeat([]byte("x"), len(content)),
+		"截断":        content[:3],
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(s.path(ref.SHA256), damaged, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := s.Put(context.Background(), bytes.NewReader(content)); err != nil || got != ref {
+				t.Fatalf("Put 应修复已有文件：(%+v, %v)", got, err)
+			}
+			if b, _ := os.ReadFile(s.path(ref.SHA256)); !bytes.Equal(b, content) {
+				t.Fatalf("内容应被替换为校验过的副本，得到 %q", b)
+			}
+		})
+	}
 }
