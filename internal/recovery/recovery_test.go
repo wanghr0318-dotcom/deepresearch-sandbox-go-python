@@ -248,6 +248,8 @@ func (w *world) RecordQuarantine(_ context.Context, q resource.Quarantine) error
 	})
 }
 
+func (w *world) MarkQuarantineAlerted(context.Context, string) error { return nil }
+
 // ---- Coordinator ----
 
 func (w *world) StopEnv(_ context.Context, envID string) (resource.StopResult, error) {

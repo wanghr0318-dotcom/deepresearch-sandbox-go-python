@@ -31,6 +31,8 @@ type Coordinator interface {
 	ReclaimOrphan(ctx context.Context, envID string) error
 }
 
+var _ Coordinator = (*resource.Coordinator)(nil)
+
 // Options 配置执行器。
 type Options struct {
 	// DefaultMemoryBytes 是占用项的内存：任务 limits 没有 memory_max（或无法关联到任务）时使用。

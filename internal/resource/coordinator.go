@@ -372,6 +372,25 @@ func (c *Coordinator) StopEnv(ctx context.Context, envID string) (StopResult, er
 	return StopResult{Stopped: true, Recorded: true, At: at}, nil
 }
 
+// ReclaimOrphan 回收属于本安装、没有对应记录的环境资源（规格 §14.1 扫描表）：在该环境的串行执行者内
+// Stop，权威检查成立后 Destroy 逐层销毁。资源已不存在时幂等返回 nil。停止未确认时返回
+// provider.ErrStopUnconfirmed（不销毁，由调用方记为阻塞）；外来资源返回 provider.ErrForeign（不触碰）。
+// 不写数据库：孤儿没有 environments 行。
+func (c *Coordinator) ReclaimOrphan(ctx context.Context, envID string) error {
+	unlock, err := c.lock(ctx, envID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := c.p.Stop(ctx, envID); err != nil {
+		return fmt.Errorf("resource: 回收孤儿环境 %s: 停止: %w", envID, err)
+	}
+	if err := c.p.Destroy(ctx, envID); err != nil {
+		return fmt.Errorf("resource: 回收孤儿环境 %s: 销毁: %w", envID, err)
+	}
+	return nil
+}
+
 func (c *Coordinator) stopPending(envID string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()

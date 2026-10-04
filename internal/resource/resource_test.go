@@ -856,3 +856,34 @@ func TestRunCleanupLoop(t *testing.T) {
 		t.Fatalf("env = %+v", e)
 	}
 }
+
+// TestReclaimOrphan：孤儿 → Stop → Destroy，不写数据库；重复调用幂等；停止未确认不销毁；外来资源不触碰。
+func TestReclaimOrphan(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	f.prov.InjectResidue(specFor("o1"))
+	if err := f.c.ReclaimOrphan(ctx, "o1"); err != nil {
+		t.Fatal(err)
+	}
+	assertLog(t, f.rec, "Stop:ok", "Destroy:ok")
+	if envs, _ := f.prov.List(ctx); len(envs) != 0 {
+		t.Fatalf("孤儿未被销毁：%+v", envs)
+	}
+	if err := f.c.ReclaimOrphan(ctx, "o1"); err != nil {
+		t.Fatalf("重复回收应幂等：%v", err)
+	}
+
+	f.prov.InjectResidue(specFor("o2"))
+	f.prov.FailStop("o2", provider.ErrStopUnconfirmed)
+	if err := f.c.ReclaimOrphan(ctx, "o2"); !errors.Is(err, provider.ErrStopUnconfirmed) {
+		t.Fatalf("停止未确认应返回 ErrStopUnconfirmed，得到 %v", err)
+	}
+	if envs, _ := f.prov.List(ctx); len(envs) != 1 {
+		t.Fatalf("停止未确认时不应销毁：%+v", envs)
+	}
+
+	f.prov.InjectForeign("x1")
+	if err := f.c.ReclaimOrphan(ctx, "x1"); !errors.Is(err, provider.ErrForeign) {
+		t.Fatalf("外来资源应返回 ErrForeign，得到 %v", err)
+	}
+}
