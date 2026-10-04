@@ -21,6 +21,38 @@ type Store interface {
 	GetTask(ctx context.Context, taskID string) (TaskView, error)
 	// ListEvents 按 task_seq 升序返回 afterSeq 之后的至多 limit 条事件。
 	ListEvents(ctx context.Context, taskID string, afterSeq int64, limit int) ([]Event, error)
+	// ListTasks 按创建时间倒序 keyset 分页：after 为上一页最后一个 task_id（首页为空）；
+	// 返回的游标为本页最后一个 task_id，没有下一页时为空。
+	ListTasks(ctx context.Context, after string, limit int) ([]TaskView, string, error)
+	// Inspect 读取任务的诊断时间线：attempt 与 outcome、退出与 OOM、环境与清理、checkpoint（规格 §14.6）。
+	Inspect(ctx context.Context, taskID string) (Inspection, error)
+}
+
+// Inspection 是 Inspect 的结果。
+type Inspection struct {
+	Task        TaskView
+	Attempts    []AttemptView
+	Checkpoints []CheckpointView
+}
+
+// AttemptView 是一个 attempt 及其环境的诊断视图。
+type AttemptView struct {
+	AttemptID, Status, OutcomeClass string
+	AttemptNo                       int64
+	ExitCode, ExitSignal            *int64
+	OOMKillDelta                    int64
+	PlatformKilled                  bool
+	EnvID, EnvStatus, CleanupState  string
+	StoppedAt                       *time.Time
+	CleanupTries                    int64
+	CleanupError                    string
+}
+
+// CheckpointView 是一个已提交 checkpoint 的诊断视图。
+type CheckpointView struct {
+	CheckpointID, StepID, AttemptID string
+	CommitSeq                       int64
+	CommittedAt                     time.Time
 }
 
 // CreateTaskRequest 是创建任务的输入。TaskID 由调用方在事务前生成。

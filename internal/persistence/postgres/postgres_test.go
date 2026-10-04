@@ -1804,3 +1804,127 @@ func TestRecordQuarantine(t *testing.T) {
 		t.Fatalf("应只有首次记录，得到 %d", n)
 	}
 }
+
+// ---- 恢复与入口补齐（Plan 6 Task 1）：恢复事实、撤销全部访问、未记账运行时间、任务列表、inspect ----
+
+// TestLoadRecoveryFacts：非终态任务及其当前 attempt、未完成的环境、未结束的 intent、可归还的 UID 范围。
+func TestLoadRecoveryFacts(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1") // 运行中
+	fixture(t, s, "t2") // 已终态且清理完成
+	if _, err := s.FinalizeAttempt(ctx, verdict("t2", 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SeedUIDRanges(ctx, 100000, 4096, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AssignUIDRange(ctx, "env-t2", "alloc-2"); err != nil {
+		t.Fatal(err)
+	}
+	stopAndClean(t, s, "env-t2")
+	if _, err := s.RecordTerminalProposal(ctx, runner.TerminalProposal{AttemptID: "att-t1", Kind: "result", Ref: "seq:9"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordIntent(ctx, resource.Intent{IntentID: "i1", EnvID: "env-t1", Kind: "cgroup", Name: "env-t1"}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := s.LoadRecoveryFacts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Tasks) != 1 || f.Tasks[0].TaskID != "t1" || f.Tasks[0].CurrentAttempt == nil ||
+		f.Tasks[0].CurrentAttempt.AttemptID != "att-t1" || f.Tasks[0].CurrentAttempt.ProposalKind != "result" || f.Tasks[0].CurrentAttempt.HasVerdict {
+		t.Fatalf("任务事实：%+v", f.Tasks)
+	}
+	if len(f.Environments) != 1 || f.Environments[0].EnvID != "env-t1" || f.Environments[0].StoppedAt != nil {
+		t.Fatalf("环境事实只应含未完成的 env-t1：%+v", f.Environments)
+	}
+	if len(f.PendingIntents) != 1 || f.PendingIntents[0].IntentID != "i1" {
+		t.Fatalf("intent 事实：%+v", f.PendingIntents)
+	}
+	if len(f.UnreleasedRanges) != 1 || f.UnreleasedRanges[0].OwnerID != "env-t2" {
+		t.Fatalf("清理完成但未归还的范围：%+v", f.UnreleasedRanges)
+	}
+}
+
+// TestRevokeAllActive：单事务撤销全部 active 访问，之后旧 attempt 的提交被拒绝；重复调用无新撤销。
+func TestRevokeAllActive(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	fixture(t, s, "t2")
+	if n, err := s.RevokeAllActive(ctx, "restart"); err != nil || n != 2 {
+		t.Fatalf("应撤销 2 个：(%d, %v)", n, err)
+	}
+	if n, err := s.RevokeAllActive(ctx, "restart"); err != nil || n != 0 {
+		t.Fatalf("重复调用不应再撤销：(%d, %v)", n, err)
+	}
+	_, err := s.CommitCheckpoint(ctx, runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "t1"}, CheckpointID: "cp1",
+		AttemptID: "att-t1", StepID: "s1", State: json.RawMessage(`{}`)})
+	expectRejected(t, err, persistence.CodeStaleAttempt)
+}
+
+// TestAccountUnrecordedRunTime：未记账区间按墙钟差全额计入；同一 until 重复调用不重复计入；旧 attempt 被拒绝。
+func TestAccountUnrecordedRunTime(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	if _, err := s.PersistRunTime(ctx, "t1", "att-t1", 1000); err != nil {
+		t.Fatal(err)
+	}
+	var persisted time.Time
+	if err := s.pool.QueryRow(ctx, "SELECT run_time_persisted_at FROM tasks WHERE task_id = 't1'").Scan(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	until := persisted.Add(5 * time.Second)
+	for i := 0; i < 2; i++ {
+		if err := s.AccountUnrecordedRunTime(ctx, "t1", "att-t1", until); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if st, _ := s.LoadTask(ctx, "t1"); st.RunTimeMs != 6000 {
+		t.Fatalf("应计入 5 s 未记账区间且只计一次，得到 %d ms", st.RunTimeMs)
+	}
+	retryWithNewAttempt(t, s, "t1")
+	expectRejected(t, s.AccountUnrecordedRunTime(ctx, "t1", "att-t1", until.Add(time.Second)), persistence.CodeStaleAttempt)
+}
+
+// TestListTasksAndInspect：keyset 分页稳定且无重复；inspect 返回 attempt、环境与 checkpoint。
+func TestListTasksAndInspect(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	for _, id := range []string{"t1", "t2", "t3"} {
+		fixture(t, s, id)
+	}
+	var seen []string
+	cursor := ""
+	for page := 0; page < 3; page++ {
+		views, next, err := s.ListTasks(ctx, cursor, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, v := range views {
+			seen = append(seen, v.TaskID)
+		}
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	if strings.Join(seen, ",") != "t3,t2,t1" {
+		t.Fatalf("应按创建时间倒序、无重复：%v", seen)
+	}
+	if _, err := s.CommitCheckpoint(ctx, runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "t1"}, CheckpointID: "cp1",
+		AttemptID: "att-t1", StepID: "s1", State: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	in, err := s.Inspect(ctx, "t1")
+	if err != nil || in.Task.TaskID != "t1" || len(in.Attempts) != 1 || in.Attempts[0].EnvID != "env-t1" ||
+		len(in.Checkpoints) != 1 || in.Checkpoints[0].CommitSeq != 1 {
+		t.Fatalf("inspect：%+v %v", in, err)
+	}
+	if _, err := s.Inspect(ctx, "missing"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("不存在的任务应为 ErrNotFound，得到 %v", err)
+	}
+}
