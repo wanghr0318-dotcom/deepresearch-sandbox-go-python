@@ -22,6 +22,8 @@ packages = ["agentbox_worker", "sim_worker"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 协程未被等待等 RuntimeWarning 一律视为失败：本地演练与 CI 判定一致
+filterwarnings = ["error::RuntimeWarning"]
 
 [tool.ruff]
 target-version = "py311"

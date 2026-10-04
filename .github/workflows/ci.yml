@@ -89,6 +89,7 @@ jobs:
   # Python Worker SDK：最低支持版本 3.11 必须实际覆盖。
   python:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:

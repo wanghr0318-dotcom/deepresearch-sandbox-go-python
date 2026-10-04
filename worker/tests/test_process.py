@@ -63,8 +63,8 @@ def test_process_result_and_print_goes_to_stderr(tmp_path):
         ]
         proc.stdin.write(init_line(tmp_path, steps))
         proc.stdin.flush()
+        code = proc.wait(timeout=20)  # 先等待退出再读输出：Worker 若不退出，测试超时失败而不是挂起
         events = [json.loads(line) for line in proc.stdout]
-        code = proc.wait(timeout=20)
         stderr = proc.stderr.read().decode("utf-8", errors="replace")
     finally:
         stop(proc)
@@ -78,8 +78,8 @@ def test_process_exits_while_host_keeps_stdin_open(tmp_path):
     try:
         proc.stdin.write(init_line(tmp_path, []))
         proc.stdin.flush()  # stdin 保持打开，Worker 仍须在结束后退出
-        events = [json.loads(line) for line in proc.stdout]
         code = proc.wait(timeout=20)
+        events = [json.loads(line) for line in proc.stdout]
     finally:
         stop(proc)
     assert code == 0 and events[-1]["type"] == "result"
@@ -110,10 +110,13 @@ def test_process_fails_fast_when_stdout_is_closed(tmp_path):
     try:
         proc.stdin.write(init_line(tmp_path, [{"op": "flood", "count": 5000, "size": 1000}]))
         proc.stdin.flush()
+        started = time.monotonic()
         code = proc.wait(timeout=20)
+        elapsed = time.monotonic() - started
     finally:
         stop(proc)
     assert code == 1
+    assert elapsed < 10
 
 
 def test_process_rejects_oversized_input_line(tmp_path):
@@ -123,8 +126,8 @@ def test_process_rejects_oversized_input_line(tmp_path):
         try:
             proc.stdin.write(b"a" * (MAX_FRAME_BYTES + 10))
             proc.stdin.flush()
-        except OSError:
-            pass  # Worker 已在超限后退出
+        except (OSError, ValueError):
+            pass  # Worker 已在超限后退出，或管道已被关闭
 
     writer = threading.Thread(target=feed, daemon=True)
     writer.start()
