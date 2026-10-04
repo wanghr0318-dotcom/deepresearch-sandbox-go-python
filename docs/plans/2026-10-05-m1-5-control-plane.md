@@ -202,7 +202,7 @@ func (r *Runner) Run(ctx context.Context, a Attempt, controls <-chan Control) Ou
 - 事件持久化：业务事件经 `AppendWorkerEvents` 分批原子追加；**artifact 保存完成后才处理其后的 checkpoint**（§5.7）。
 - 产物（§5.6）：持有 `OutDir` 的目录 FD；`path` 校验（相对、非空、无 NUL、≤ 4 KiB、无 `.`/`..`）；以 `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_XDEV, O_RDONLY|O_NOFOLLOW|O_NONBLOCK)` 打开并 `fstat` 为普通文件；从已打开 FD 复制并哈希，`blob.Put` 后 `RegisterArtifact`，再发 `artifact_result`；声明的哈希与大小只是待验证数据；保存有独立超时与大小上限（§5.10）。
 - checkpoint：`CommitCheckpoint` 的结果映射为 `checkpoint_result{committed|conflict|rejected|retryable_error, code}`（`ErrRejected` 的 code 原样传递；`ErrCommitUnknown` 与暂时性错误 → `retryable_error`）；`checkpoint_query` → `QueryCheckpoint` → `committed`/`not_found`/`retryable_error`；同一 attempt 至多一个在途提交（`commit_in_flight`）。
-- 终态提议：`result`/`error`/`paused` 到达时 `RecordTerminalProposal` 并保存其内容；之后的业务事件记为协议违规（§5.8），`checkpoint_query`、`task_outcome_query`、`task_released` 例外。
+- 终态提议：`result`/`error`/`paused` 到达时 `RecordTerminalProposal` 并保存其内容；（执行中修订）`Attempt.OnReady func()`：处理完合法的 `ready` 后同步调用一次，供 actor 在 Worker 就绪后改用协议 `cancel`/`pause`；之后的业务事件记为协议违规（§5.8），`checkpoint_query`、`task_outcome_query`、`task_released` 例外。
 - 大小与结构限制由 `protocol` 包执行；超限 → `output_limit_exceeded`。
 
 **Tests**（fake `Starter` 回放 `protocol/fixtures` 的场景转录，不需要 Python；规格 §5.11 列出的 task 模式场景各一个用例）：`happy_path`、`checkpoint_conflict`、`seq_gap`、`missing_ref`、`ack_lost_retry_same_result`、`old_checkpoint_no_rewind`、`foreign_blob_rejected`、`artifact_fail_blocks_checkpoint`、`artifact_path_escape_out_to_in`、`state_ref_foreign_blob_rejected`、`historical_output_version_pinned`；另：符号链接、FIFO、`../in` 路径被拒（E10 的单元层）；登记后改写文件不影响已保存副本。
@@ -227,7 +227,7 @@ func Classify(in ClassifyInput) (class string, retry string) // retry 取值 ""�
 ```
 
 **规则：**
-- `Classify` 是 §5.8 与 §14.3 的唯一实现：`crashed_signal`（不含平台主动终止）、`control_lost`、`ready_timeout`、`worker_oom_likely`（SIGKILL 且 `OOMKillDelta > 0`）、`oom_observed_in_attempt`（正常结束但 delta > 0，按 Worker 结果裁决）、`worker_error`（`retryable` 与拒绝列表 `budget_exhausted`、`protocol_*`）、`protocol_violation`、`output_limit_exceeded`、`exit_after_result`、`store_unavailable` 等；平台主动终止按原因分类并置 `platform_killed`。
+- `Classify` 是 §5.8 与 §14.3 的唯一实现：（执行中修订）有效 result 在 cancel/pause 生效期间仍分类为 `succeeded`（或 `oom_observed_in_attempt`），由 `Decide` 据 desired 记 `completed_during_cancel`/`completed_during_pause`；`crashed_signal`（不含平台主动终止）、`control_lost`、`ready_timeout`、`worker_oom_likely`（SIGKILL 且 `OOMKillDelta > 0`）、`oom_observed_in_attempt`（正常结束但 delta > 0，按 Worker 结果裁决）、`worker_error`（`retryable` 与拒绝列表 `budget_exhausted`、`protocol_*`）、`protocol_violation`、`output_limit_exceeded`、`exit_after_result`、`store_unavailable` 等；平台主动终止按原因分类并置 `platform_killed`。
 - 屏障（§5.7）：进程退出后 A：管道收尾（5 s，超时终止执行树、`output_incomplete`、丢弃末尾半行）；B：处理全部已完整接收的事件（120 s）；然后返回 `Outcome`。
 - 期限：`T_ready` 内无 `ready` → 终止、`ready_timeout`；终态提议后 `exit_grace` 内未退出 → 终止后按提议与退出原因分类。
 - 控制：`controls` 收到 cancel/pause → 发送协议 `cancel`/`pause{grace_ms}`；到期 → `Terminate`。
@@ -259,7 +259,7 @@ type Scheduler struct{ /* 管理 actor 集合；ListActiveTasks 启动；新任�
 
 **依赖方向：** `decide.go` 只使用本包类型；actor 文件可导入 `runner`、`resource`、`admission`、`provider` 以声明窄接口并把 `runner.Outcome` 转换为 `task.Outcome`（规则 2 的直接依赖边不含驱动、HTTP、进程与文件系统包）。
 
-**规则：** actor 循环：`LoadTask` 建立 `State` → 对每个事件调用 `Decide` → 依次执行 `Effects`（异步操作在独立 goroutine 中执行，结果以带 `attempt_id` 的事件回到收件箱）→ 持久化经 Store 用例；运行时间每 10 s `PersistRunTime`（§14.4）；`RevokeAccess` 在停止前执行（DB 撤销 + `Access.Revoke`）；Store 写失败按退避重试并保留待提交事实（§14.5 在线补偿）；actor 不关闭 socket、不写 cgroup、不重试数据库连接（代码组织 §5）。
+**规则：** actor 循环：（执行中修订）待定的重试类别不单独持久化：queued 任务的 `StatusReason` 即上一次 attempt 的 outcome class，actor 以纯函数据此推出下一次 `CreateAttempt` 的 `Retry`（`worker_oom_likely` → oom，§14.3 可重试的故障类 → fault，其余 → none），重启后同样成立；`LoadTask` 建立 `State` → 对每个事件调用 `Decide` → 依次执行 `Effects`（异步操作在独立 goroutine 中执行，结果以带 `attempt_id` 的事件回到收件箱）→ 持久化经 Store 用例；运行时间每 10 s `PersistRunTime`（§14.4）；`RevokeAccess` 在停止前执行（DB 撤销 + `Access.Revoke`）；Store 写失败按退避重试并保留待提交事实（§14.5 在线补偿）；actor 不关闭 socket、不写 cgroup、不重试数据库连接（代码组织 §5）。
 
 **Tests**（fake 依赖：内存 Store 替身、fake Coordinator、fake AttemptRunner；不需要数据库）：正常路径的副作用顺序（申请槽位 → 创建 attempt → 创建环境 → 启动 → 裁决 → 停止 → 归还槽位）；过期结果不改变状态；控制变化在各阶段的处理（含 starting 阶段直接停止）；`stop_blocked` 阻止替代执行；Store 写失败后恢复由同一 actor 补提交。
 
