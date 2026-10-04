@@ -189,3 +189,70 @@ func TestImportsOnlyStandardLibrary(t *testing.T) {
 		}
 	}
 }
+
+type scenarioLine struct {
+	From    string          `json:"from"`
+	Message json.RawMessage `json:"message"`
+	Raw     string          `json:"raw"`
+}
+
+type scenario struct {
+	Name   string         `json:"name"`
+	Lines  []scenarioLine `json:"lines"`
+	Expect struct {
+		Stream    string `json:"stream"`
+		Violation string `json:"violation"`
+		At        int    `json:"at"`
+	} `json:"expect"`
+}
+
+// replayScenario 依次解码每一行，并把 Worker 消息送入 WorkerStream；
+// 返回首个违规所在行号与错误码，无违规时返回 (-1, "")。
+func replayScenario(t *testing.T, sc scenario) (int, string) {
+	t.Helper()
+	var s WorkerStream
+	for i, l := range sc.Lines {
+		dir := parseDirection(t, l.From)
+		line := []byte(l.Message)
+		if l.Raw != "" {
+			line = []byte(l.Raw)
+		}
+		m, err := DecodeLine(dir, line)
+		if err == nil && dir == WorkerToHost {
+			err = s.Observe(m)
+		}
+		if err != nil {
+			if code := CodeOf(err); code != "" {
+				return i, code
+			}
+			t.Fatalf("第 %d 行返回了非协议错误：%v", i, err)
+		}
+	}
+	return -1, ""
+}
+
+func TestScenarioFixtures(t *testing.T) {
+	files, err := filepath.Glob(filepath.Join(fixtureDir, "scenarios", "*.json"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("没有场景 fixtures（err=%v）", err)
+	}
+	for _, path := range files {
+		var sc scenario
+		loadJSON(t, path, &sc)
+		t.Run(sc.Name, func(t *testing.T) {
+			at, code := replayScenario(t, sc)
+			switch sc.Expect.Stream {
+			case "ok":
+				if code != "" {
+					t.Fatalf("第 %d 行违规 %s，期望无违规", at, code)
+				}
+			case "violation":
+				if at != sc.Expect.At || code != sc.Expect.Violation {
+					t.Fatalf("得到 (%d, %q)，期望 (%d, %q)", at, code, sc.Expect.At, sc.Expect.Violation)
+				}
+			default:
+				t.Fatalf("未知的 expect.stream %q", sc.Expect.Stream)
+			}
+		})
+	}
+}

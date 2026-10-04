@@ -1,0 +1,10 @@
+{
+  "name": "error_before_ready_allowed",
+  "description": "启动失败时允许在 ready 之前发出 error",
+  "layers": ["protocol"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "session", "session_id": "s-1"}},
+    {"from": "worker", "message": {"type": "error", "v": 1, "seq": 1, "code": "unsupported_mode", "message": "不支持的模式：session", "retryable": false}}
+  ],
+  "expect": {"stream": "ok"}
+}
