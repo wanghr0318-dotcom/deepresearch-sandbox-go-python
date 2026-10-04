@@ -3342,10 +3342,16 @@ func snapshot(t *testing.T, s *Store, taskID string) string {
 	t.Helper()
 	var out string
 	if err := s.pool.QueryRow(context.Background(), `SELECT concat_ws('|', t.status, t.current_attempt_id, t.row_version,
-			c.desired, c.control_version, p.latest_checkpoint_id, p.latest_commit_seq,
+			t.applied_control_version, t.status_reason, c.desired, c.control_version, c.reason,
+			p.latest_checkpoint_id, p.latest_commit_seq,
 			(SELECT count(*) FROM events e WHERE e.task_id = t.task_id),
 			(SELECT count(*) FROM attempts a WHERE a.task_id = t.task_id),
 			(SELECT count(*) FROM attempts a WHERE a.task_id = t.task_id AND a.verdict_hash IS NOT NULL),
+			(SELECT string_agg(concat_ws(':', a.attempt_id, a.status, a.outcome_class), ',' ORDER BY a.attempt_no)
+				FROM attempts a WHERE a.task_id = t.task_id),
+			(SELECT string_agg(x.state, ',' ORDER BY x.attempt_id) FROM attempt_access x WHERE x.task_id = t.task_id),
+			(SELECT count(*) FROM environments v JOIN attempts a USING (attempt_id) WHERE a.task_id = t.task_id),
+			(SELECT count(*) FROM api_requests q WHERE q.resource_id = t.task_id),
 			(SELECT count(*) FROM artifacts r WHERE r.task_id = t.task_id))
 		FROM tasks t JOIN task_control c USING (task_id) JOIN task_progress p USING (task_id) WHERE t.task_id = $1`, taskID).Scan(&out); err != nil {
 		t.Fatal(err)
@@ -3470,24 +3476,219 @@ func TestFinalizeArbitratesControl(t *testing.T) {
 			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
 		}
 	})
+	t.Run("任务已回到 queued 而尚无新 attempt，判决被拒绝", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		// 恢复已把任务交还队列，current_attempt_id 仍是 att-t1：判决不能把 queued 的任务裁决为终态。
+		if _, err := s.pool.Exec(ctx, "UPDATE tasks SET status = 'queued' WHERE task_id = 't1'"); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, s, "t1")
+		_, err := s.FinalizeAttempt(ctx, succeeded(1))
+		expectRejected(t, err, persistence.CodeStaleAttempt)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+	})
 }
 
-// TestControlWriteRules 覆盖规格 §8.1 控制写入：已接受的 cancel 不可被覆盖；resume 要求 paused。
+// TestControlWriteRules 覆盖规格 §8.1 控制写入：已接受的 cancel 不可被覆盖；resume 要求 paused；
+// 被拒绝的请求不留下任何改变与请求记录；request_id 不能被另一个任务重用。
 func TestControlWriteRules(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t, Options{})
 	fixture(t, s, "t1")
-	control := func(id, desired string) error {
-		_, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: id, BodyHash: []byte(desired), TaskID: "t1", Desired: desired})
+	fixture(t, s, "t2")
+	control := func(id, taskID, desired string) error {
+		_, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: id, BodyHash: []byte(desired), TaskID: taskID, Desired: desired})
 		return err
 	}
-	expectRejected(t, control("c1", "run"), persistence.CodeNotPaused)
-	if err := control("c2", "cancel"); err != nil {
+	rejected := func(id, taskID, desired, code string) {
+		t.Helper()
+		before := snapshot(t, s, taskID)
+		expectRejected(t, control(id, taskID, desired), code)
+		if after := snapshot(t, s, taskID); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+		if _, err := s.GetRequest(ctx, id); !errors.Is(err, persistence.ErrNotFound) {
+			t.Fatalf("被拒绝的请求 %s 不应留下记录，得到 %v", id, err)
+		}
+	}
+	rejected("c1", "t1", "run", persistence.CodeNotPaused)
+	if err := control("c2", "t1", "cancel"); err != nil {
 		t.Fatal(err)
 	}
-	expectRejected(t, control("c3", "pause"), persistence.CodeCancelPending)
-	if err := control("c4", "cancel"); err != nil {
+	rejected("c3", "t1", "pause", persistence.CodeCancelPending)
+	if err := control("c4", "t1", "cancel"); err != nil {
 		t.Fatalf("重复 cancel 应被接受：%v", err)
+	}
+
+	// resume：经由用例到达 paused（接受 pause → pausing → 以当前控制版本裁决为 paused），再接受 run 并应用。
+	if err := control("p1", "t2", "pause"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ApplyControl(ctx, task.ApplyControl{TaskID: "t2", ControlVersion: 2, Status: "pausing"}); err != nil {
+		t.Fatalf("应用 pause：%v", err)
+	}
+	v := verdict("t2", 0)
+	v.ControlVersion, v.OutcomeClass, v.TaskStatus, v.TaskStatusReason = 2, "paused", "paused", ""
+	if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+		t.Fatalf("暂停判决：%v", err)
+	}
+	if err := control("p2", "t2", "run"); err != nil {
+		t.Fatalf("paused 的任务应能 resume：%v", err)
+	}
+	st, err := s.ApplyControl(ctx, task.ApplyControl{TaskID: "t2", ControlVersion: 3, Status: "queued"})
+	if err != nil || st.Status != "queued" || st.AppliedControlVersion != 3 {
+		t.Fatalf("应用 resume：%+v %v", st, err)
+	}
+	if got, _ := s.GetTask(ctx, "t2"); got.Status != "queued" || got.Desired != "run" {
+		t.Fatalf("resume 后任务应为 queued：%+v", got)
+	}
+
+	// 同一 request_id 与请求体用于另一个任务：冲突，而不是返回 t1 的结果。
+	before := snapshot(t, s, "t2")
+	if err := control("c2", "t2", "cancel"); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("跨任务重用 request_id 应为冲突，得到 %v", err)
+	}
+	if after := snapshot(t, s, "t2"); after != before {
+		t.Fatalf("冲突后任务不应改变：%s → %s", before, after)
+	}
+}
+
+// TestApplyControlTransitions 覆盖规格 §8.1 控制应用的来源状态：判决后迟到的应用是重放，
+// 被取代的版本为 control_changed，状态机不允许的转换为无效输入；被拒绝时任务不变。
+func TestApplyControlTransitions(t *testing.T) {
+	ctx := context.Background()
+	accept := func(t *testing.T, s *Store, id, desired string) int64 {
+		t.Helper()
+		r, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: id, BodyHash: []byte(desired), TaskID: "t1", Desired: desired})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.ControlVersion
+	}
+	apply := func(s *Store, cv int64, status string) (task.ControlState, error) {
+		return s.ApplyControl(ctx, task.ApplyControl{TaskID: "t1", ControlVersion: cv, Status: status})
+	}
+	t.Run("判决后迟到的应用是重放，终态保持", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		cv := accept(t, s, "c1", "cancel")
+		v := verdict("t1", 1)
+		v.ControlVersion, v.OutcomeClass, v.TaskStatus, v.TaskStatusReason = cv, "cancelled", "cancelled", ""
+		if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := s.GetTask(ctx, "t1"); got.AppliedControlVersion != 2 {
+			t.Fatalf("判决应推进 applied_control_version 到 2：%+v", got)
+		}
+		before := snapshot(t, s, "t1")
+		st, err := apply(s, cv, "cancelling")
+		if err != nil || st.Status != "cancelled" || st.AppliedControlVersion != 2 {
+			t.Fatalf("迟到的应用应返回当前状态：%+v %v", st, err)
+		}
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("重放不应改变任务：%s → %s", before, after)
+		}
+	})
+	t.Run("被取代的版本被拒绝，最新版本可应用", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		pause := accept(t, s, "c1", "pause")
+		cancel := accept(t, s, "c2", "cancel")
+		before := snapshot(t, s, "t1")
+		_, err := apply(s, pause, "pausing")
+		expectRejected(t, err, persistence.CodeControlChanged)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+		st, err := apply(s, cancel, "cancelling")
+		if err != nil || st.Status != "cancelling" || st.AppliedControlVersion != cancel {
+			t.Fatalf("最新版本应能应用：%+v %v", st, err)
+		}
+	})
+	t.Run("状态机不允许的转换是无效输入", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		cv := accept(t, s, "c1", "pause")
+		before := snapshot(t, s, "t1")
+		for _, status := range []string{"paused", "cancelling", "queued"} { // running + pause 只能到 pausing
+			if _, err := apply(s, cv, status); !errors.Is(err, errInvalid) {
+				t.Fatalf("running 在 desired = pause 时不能转换为 %s，得到 %v", status, err)
+			}
+		}
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+	})
+	t.Run("成功判决后按判决版本迟到的应用是重放", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		zero := int64(0)
+		v := verdict("t1", 0)
+		v.ExitCode, v.OutcomeClass, v.TaskStatus, v.TaskStatusReason = &zero, "succeeded", "succeeded", ""
+		if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, s, "t1")
+		st, err := apply(s, 1, "running")
+		if err != nil || st.Status != "succeeded" {
+			t.Fatalf("迟到的应用应返回 succeeded：%+v %v", st, err)
+		}
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("重放不应改变任务：%s → %s", before, after)
+		}
+	})
+	t.Run("终态而控制未应用时被拒绝为 task_ended", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		cv := accept(t, s, "c1", "cancel")
+		// 用例不会产生这种组合（判决会推进 applied_control_version）；直接写入以检查终态防线。
+		if _, err := s.pool.Exec(ctx, "UPDATE tasks SET status = 'cancelled' WHERE task_id = 't1'"); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, s, "t1")
+		_, err := apply(s, cv, "cancelling")
+		expectRejected(t, err, persistence.CodeTaskEnded)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+	})
+}
+
+// TestHostEventIdempotency 直接驱动 appendHostEvent：同一 event_key 同内容返回原 task_seq，
+// 内容不同为冲突；task_seq 从 1 起连续无空洞。
+func TestHostEventIdempotency(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	appendEvent := func(payload string) (int64, error) {
+		var seq int64
+		err := s.run(ctx, "AppendHostEvent", "t1/k1", func(ctx context.Context, tx pgx.Tx) error {
+			if err := lockEventSeq(ctx, tx, "t1"); err != nil {
+				return err
+			}
+			n, err := appendHostEvent(ctx, tx, hostEvent{taskID: "t1", key: "k1", typ: "probe", payload: []byte(payload)})
+			seq = n
+			return err
+		})
+		return seq, err
+	}
+	first, err := appendEvent(`{"n":1}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := appendEvent(`{"n":1}`)
+	if err != nil || again != first {
+		t.Fatalf("同一 event_key 同内容应返回原 task_seq %d，得到 %d %v", first, again, err)
+	}
+	if _, err := appendEvent(`{"n":2}`); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("同一 event_key 不同内容应为冲突，得到 %v", err)
+	}
+	if n, m := count(t, s, "SELECT count(*) FROM events WHERE task_id = 't1'"),
+		count(t, s, "SELECT COALESCE(max(task_seq), 0)::int FROM events WHERE task_id = 't1'"); n != m || n != 3 {
+		t.Fatalf("task_seq 应从 1 起连续：count = %d，max = %d", n, m)
 	}
 }
 
@@ -3575,6 +3776,9 @@ func TestAPIAndTaskConflicts(t *testing.T) {
 	if _, err := s.FinalizeAttempt(ctx, verdict("t1", 1)); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.CreateTask(ctx, api.CreateTaskRequest{RequestID: "req-t3", BodyHash: []byte("h"), TaskID: "t3", Spec: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
 	expectConflicts(t, map[string]func() error{
 		"CreateTask 同 request_id 不同内容": func() error {
 			_, err := s.CreateTask(ctx, api.CreateTaskRequest{RequestID: "req-t1", BodyHash: []byte("other"), TaskID: "t9", Spec: json.RawMessage(`{}`)})
@@ -3594,6 +3798,23 @@ func TestAPIAndTaskConflicts(t *testing.T) {
 		},
 		"ApplyControl 版本尚未被接受": func() error {
 			_, err := s.ApplyControl(ctx, task.ApplyControl{TaskID: "t1", ControlVersion: 9, Status: "x"})
+			return err
+		},
+		"CreateTask 已存在的 task_id（新 request_id）": func() error {
+			start := time.Now()
+			_, err := s.CreateTask(ctx, api.CreateTaskRequest{RequestID: "req-new", BodyHash: []byte("h"), TaskID: "t1", Spec: json.RawMessage(`{}`)})
+			if d := time.Since(start); d > 500*time.Millisecond { // 不应重试到 OpDeadline
+				return fmt.Errorf("冲突应立即返回，耗时 %v（%v）", d, err)
+			}
+			return err
+		},
+		"CreateAttempt 已存在的 env_id": func() error {
+			start := time.Now()
+			// t3 处于 queued，准入成立；只有 env_id 已被 t1 的环境占用
+			_, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: "t3", AttemptID: "att-t3", AttemptNo: 1, EnvID: "env-t1"})
+			if d := time.Since(start); d > 500*time.Millisecond {
+				return fmt.Errorf("冲突应立即返回，耗时 %v（%v）", d, err)
+			}
 			return err
 		},
 	})
@@ -3789,6 +4010,13 @@ func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest) (api.
 			res.Replayed = true
 			return json.Unmarshal(stored, &res)
 		}
+		var exists bool // 否则 INSERT 的 23505 会被当作可重试错误一直重试到期限
+		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM tasks WHERE task_id = $1)", req.TaskID).Scan(&exists); err != nil {
+			return err
+		}
+		if exists {
+			return conflictf("任务 %s 已存在", req.TaskID)
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO tasks (task_id, spec_json, config_version, limits_json, status, max_fault_retries)
 			VALUES ($1, $2, $3, $4, 'queued', $5)`,
 			req.TaskID, []byte(req.Spec), req.ConfigVersion, nullJSON(req.Limits), req.MaxFaultRetries); err != nil {
@@ -3833,8 +4061,14 @@ func (s *Store) AcceptControl(ctx context.Context, req api.ControlRequest) (api.
 			return err
 		}
 		if replayed {
+			if err := json.Unmarshal(stored, &res); err != nil {
+				return err
+			}
+			if res.TaskID != req.TaskID { // body_hash 不含 task_id 时，同一 request_id 可能被另一个任务重用
+				return conflictf("request_conflict: request_id %s 已用于任务 %s", req.RequestID, res.TaskID)
+			}
 			res.Replayed = true
-			return json.Unmarshal(stored, &res)
+			return nil
 		}
 		var status, desired string
 		err = tx.QueryRow(ctx, "SELECT status FROM tasks WHERE task_id = $1 FOR UPDATE", req.TaskID).Scan(&status)
@@ -4006,6 +4240,13 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
+		var envTaken bool // 否则 INSERT 的 23505 会被当作可重试错误一直重试到期限
+		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM environments WHERE env_id = $1)", a.EnvID).Scan(&envTaken); err != nil {
+			return err
+		}
+		if envTaken {
+			return conflictf("环境 %s 已存在", a.EnvID)
+		}
 		if err := admitAttempt(ctx, tx, a.TaskID, status, desired); err != nil {
 			return err
 		}
@@ -4080,8 +4321,42 @@ func selectAttempt(ctx context.Context, q queryer, attemptID string, forUpdate b
 	return a, err
 }
 
-// ApplyControl 以 applied_control_version 的 CAS 应用控制意图（实现 task.Store）：
-// 已应用到不低于目标的版本时返回当前状态；目标版本尚未被接受为冲突。
+// controlTransition 是规格 §8.1 中控制意图引起的任务状态转换：cancel 使 queued、paused 直接
+// cancelled，使执行中的任务进入 cancelling；pause 使 queued 进入 paused，使执行中的任务进入
+// pausing；run（resume）使 paused 回到 queued。其余组合不是合法转换。
+func controlTransition(status, desired string) (next string, ok bool) {
+	switch desired {
+	case "cancel":
+		switch status {
+		case "queued", "paused":
+			return "cancelled", true
+		case "running", "pausing", "cancelling":
+			return "cancelling", true
+		}
+	case "pause":
+		switch status {
+		case "queued":
+			return "paused", true
+		case "running", "pausing":
+			return "pausing", true
+		case "paused":
+			return "paused", true
+		}
+	case "run":
+		switch status {
+		case "paused", "queued":
+			return "queued", true
+		case "running":
+			return "running", true
+		}
+	}
+	return "", false
+}
+
+// ApplyControl 以 applied_control_version 的 CAS 应用控制意图（实现 task.Store）。持有任务锁后
+// 依次核对：已应用到不低于目标的版本时返回当前状态（重放）；目标版本尚未被接受为冲突；目标版本
+// 已被更新的控制取代为 control_changed（调用方应用最新版本）；终态任务为 task_ended；调用方给出的
+// 状态必须是 controlTransition 对当前状态与 desired 的结果。写入以来源状态 CAS（规格 §8.1）。
 // 锁顺序：tasks → task_control → task_event_seq。
 func (s *Store) ApplyControl(ctx context.Context, c task.ApplyControl) (task.ControlState, error) {
 	if c.TaskID == "" || c.ControlVersion < 1 || c.Status == "" {
@@ -4093,16 +4368,27 @@ func (s *Store) ApplyControl(ctx context.Context, c task.ApplyControl) (task.Con
 		if err != nil {
 			return err
 		}
-		if st.AppliedControlVersion >= c.ControlVersion {
+		switch {
+		case st.AppliedControlVersion >= c.ControlVersion:
 			out = st
 			return nil
-		}
-		if c.ControlVersion > st.ControlVersion {
+		case c.ControlVersion > st.ControlVersion:
 			return conflictf("任务 %s 的控制版本 %d 尚未被接受（当前 %d）", c.TaskID, c.ControlVersion, st.ControlVersion)
+		case c.ControlVersion < st.ControlVersion:
+			return rejectf(persistence.CodeControlChanged, "任务 %s 的控制版本 %d 已被 %d 取代", c.TaskID, c.ControlVersion, st.ControlVersion)
+		case st.Status == "succeeded" || st.Status == "failed" || st.Status == "cancelled":
+			return rejectf(persistence.CodeTaskEnded, "任务 %s 已是 %s", c.TaskID, st.Status)
 		}
-		if _, err := tx.Exec(ctx, `UPDATE tasks SET applied_control_version = $2, status = $3, status_reason = $4,
-			row_version = row_version + 1 WHERE task_id = $1`, c.TaskID, c.ControlVersion, c.Status, c.StatusReason); err != nil {
+		if next, ok := controlTransition(st.Status, st.Desired); !ok || c.Status != next {
+			return invalidf("任务 %s 处于 %s、desired = %s 时不能转换为 %s", c.TaskID, st.Status, st.Desired, c.Status)
+		}
+		tag, err := tx.Exec(ctx, `UPDATE tasks SET applied_control_version = $2, status = $3, status_reason = $4,
+			row_version = row_version + 1 WHERE task_id = $1 AND status = $5`, c.TaskID, c.ControlVersion, c.Status, c.StatusReason, st.Status)
+		if err != nil {
 			return err
+		}
+		if tag.RowsAffected() != 1 { // 持有任务行锁时不会发生；保留 CAS 作为最后一道检查
+			return conflictf("任务 %s 已不在 %s", c.TaskID, st.Status)
 		}
 		if err := lockEventSeq(ctx, tx, c.TaskID); err != nil {
 			return err
@@ -4176,8 +4462,9 @@ func verdictHash(v task.Verdict) ([]byte, error) {
 
 // FinalizeAttempt 提交判决、任务状态与终态 host 事件（实现 task.Store）。完整判决内容一致
 // 才返回原结果；已有不同判决为冲突。新判决在持有任务锁后核对最新事实（规格 §8.1）：
-// 提交者必须仍是当前 attempt（stale_attempt）；判决依据的控制版本必须是最新（control_changed，
-// 调用方按最新控制重算）；任务状态必须与 desired 相符；attempt 必须处于 FromStatus。
+// 提交者必须仍是当前 attempt，且任务仍处于 running、pausing 或 cancelling（stale_attempt）；
+// 判决依据的控制版本必须是最新（control_changed，调用方按最新控制重算）；任务状态必须与 desired
+// 相符；attempt 必须处于 FromStatus。判决同时把 applied_control_version 推进到该控制版本。
 // 锁顺序：tasks → task_control → task_event_seq → attempts。
 func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attempt, error) {
 	if v.AttemptID == "" || v.TaskID == "" || v.ControlVersion < 1 || v.FromStatus == "" || v.AttemptStatus == "" ||
@@ -4191,7 +4478,8 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 	var out task.Attempt
 	err = s.run(ctx, "FinalizeAttempt", v.AttemptID, func(ctx context.Context, tx pgx.Tx) error {
 		var current *string
-		err := tx.QueryRow(ctx, "SELECT current_attempt_id FROM tasks WHERE task_id = $1 FOR UPDATE", v.TaskID).Scan(&current)
+		var status string
+		err := tx.QueryRow(ctx, "SELECT current_attempt_id, status FROM tasks WHERE task_id = $1 FOR UPDATE", v.TaskID).Scan(&current, &status)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return notFoundf("任务 %s", v.TaskID)
 		}
@@ -4224,6 +4512,8 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 			return conflictf("attempt %s 已有不同的判决", v.AttemptID)
 		case current == nil || *current != v.AttemptID:
 			return rejectf(persistence.CodeStaleAttempt, "attempt %s 不是任务 %s 的当前 attempt", v.AttemptID, v.TaskID)
+		case status != "running" && status != "pausing" && status != "cancelling":
+			return rejectf(persistence.CodeStaleAttempt, "任务 %s 处于 %s，不接受判决", v.TaskID, status)
 		case controlVersion != v.ControlVersion:
 			return rejectf(persistence.CodeControlChanged, "判决依据控制版本 %d，当前为 %d（desired = %s）",
 				v.ControlVersion, controlVersion, desired)
@@ -4237,8 +4527,10 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 			v.AttemptID, v.AttemptStatus, v.OutcomeClass, v.ExitCode, v.ExitSignal, v.OOMKillDelta, v.PlatformKilled, hash); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE tasks SET status = $2, status_reason = $3, result_json = $4, row_version = row_version + 1
-			WHERE task_id = $1`, v.TaskID, v.TaskStatus, v.TaskStatusReason, nullJSON(v.Result)); err != nil {
+		// 判决已按 controlVersion 裁决，一并推进 applied_control_version，actor 不再对已裁决的任务应用控制。
+		if _, err := tx.Exec(ctx, `UPDATE tasks SET status = $2, status_reason = $3, result_json = $4,
+			applied_control_version = GREATEST(applied_control_version, $5), row_version = row_version + 1
+			WHERE task_id = $1`, v.TaskID, v.TaskStatus, v.TaskStatusReason, nullJSON(v.Result), controlVersion); err != nil {
 			return err
 		}
 		if _, err := appendHostEvent(ctx, tx, hostEvent{taskID: v.TaskID, key: "attempt_finalized:" + v.AttemptID,
@@ -5499,6 +5791,7 @@ cd /f/go-agentbox-m1-4 && git add .github/workflows/ci.yml && git commit -m "ci:
 - **执行中修订**：Task 1 的 archtest 原先列出 Task 2、3 才创建的包，`go list` 失败（演练只逐阶段验证了 Task 4–7）；改为 Task 1 只列已存在的包、Task 4 扩展到全部八个，最终文件与原计划相同。
 - **执行中评审修订（Task 2、3）**：BlobStore 的已存在路径曾直接返回成功（只比较大小、不 fsync），新分片目录的父目录未 fsync——改为 NewLocal 预建 256 个分片并 fsync，Put 总是以校验过的副本原子替换后 fsync 分片目录，并补损坏/截断替换测试；Bootstrap 的前置条件（先 flock、后 advisory lock）写入文档注释，出错时不返回 install_id，拒绝空的 newID，空库判定加上无 installation 记录，测试补齐（未知 schema 有文件、CompleteInstallation 校验 ID、空 ID）。
 - **执行中评审修订（Task 4）**：事务辅助的错误分类（服务端终止会话与超时码、COMMIT 的 FATAL 与 SafeToRetry、`ErrTxCommitRollback`、调用方取消、`%w` 保留原因）按设计 §2.1 修正并补 `TestErrorClassification`；spec §6 的复合外键（events、artifacts）补上并有违反测试；失锁测试按当前数据库过滤 pid、等待在途操作阻塞并断言检测延迟；`Ownership.Close` 幂等；迁移路径随失锁取消；`InspectInstallation` 统一用 pg_catalog 查表；回滚有界超时。修订在含 Task 4–7 全部代码的演练树中验证：全部测试连续三次通过、各阶段独立通过、逐项回退均被测试捕获。
+- **执行中评审修订（Task 5）**：ApplyControl 按规格 §8.1 的转换表（`controlTransition`）检查来源状态并以 CAS 写入，拒绝终态（`task_ended`）与被取代的控制版本（`control_changed`）；FinalizeAttempt 只接受 running/pausing/cancelling 的任务并推进 `applied_control_version`；AcceptControl 拒绝跨任务复用 request_id，CreateTask/CreateAttempt 对已存在的 task_id/env_id 立即冲突；`snapshot` 覆盖更多字段，控制拒绝与转换、宿主事件幂等均有测试。在含 Task 4–7 全部代码的演练树中验证并做逐项回退检查。
 - **未在本地验证**：golangci-lint（本机未安装，由 CI 判定）。
 - **评审修订（第三轮）**：checkpoint 缺少 fencing 与引用授权、最终判决未在锁内仲裁取消与当前 attempt、创建 attempt 缺少准入前置条件——均为规格 §5.5、§8.1 的实现遗漏，已按设计 §2.6 并入 Task 5、6，并补测试。同类遗漏 `AcceptControl` 的控制写入规则（`task_ended` 等）一并补上，"判决先提交"的测试依赖它。设计文档的 pgx 版本已统一为 v5.7.6；提交署名只在有真实共同作者时添加，不编造、不阻止提交。
 - **占位符**：无（`COAUTHOR` 是可选的环境变量，未设置时提交命令省略署名）。
