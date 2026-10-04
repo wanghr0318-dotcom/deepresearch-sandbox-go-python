@@ -21,6 +21,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/datadir"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/resource"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
 )
@@ -1382,5 +1383,137 @@ func TestNoWritesAfterVerdict(t *testing.T) {
 	}
 	if again, err := s.RegisterArtifact(ctx, art); err != nil || again != first {
 		t.Fatalf("判决前已登记的产物重放应返回原结果：%+v %v", again, err)
+	}
+}
+
+// ---- resource 用例：未知提交、单调性与分配代次 ----
+
+func withRanges(t *testing.T, s *Store) {
+	withFixture(t, s)
+	if err := s.SeedUIDRanges(context.Background(), 100000, 4096, 4); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// stopAndClean 记录环境已停止并完成清理——归还其 UID 范围的前置条件（规格 §4.5）。
+func stopAndClean(t *testing.T, s *Store, envID string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.MarkStopped(ctx, envID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateCleanup(ctx, resource.CleanupUpdate{EnvID: envID, State: resource.CleanupDone}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCommitLostResolvesResourceUseCases(t *testing.T) {
+	ctx := context.Background()
+	at := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	checkCommitLost(t, []useCase{
+		{"RecordIntent", withFixture, func(s *Store) (any, error) {
+			return s.RecordIntent(ctx, resource.Intent{IntentID: "i1", EnvID: "env-t1", Kind: "cgroup", Name: "env-t1"})
+		}, "SELECT count(*) FROM resource_intents"},
+		{"ResolveIntent", func(t *testing.T, s *Store) {
+			withFixture(t, s)
+			if _, err := s.RecordIntent(ctx, resource.Intent{IntentID: "i1", EnvID: "env-t1", Kind: "cgroup", Name: "env-t1"}); err != nil {
+				t.Fatal(err)
+			}
+		}, func(s *Store) (any, error) {
+			return s.ResolveIntent(ctx, "i1", resource.IntentAcquired)
+		}, "SELECT count(*) FROM resource_intents WHERE state = 'acquired'"},
+		{"AssignUIDRange", withRanges, func(s *Store) (any, error) {
+			return s.AssignUIDRange(ctx, "env-t1", "alloc-1")
+		}, "SELECT count(*) FROM uid_ranges WHERE state = 'assigned'"},
+		{"ReleaseUIDRange", func(t *testing.T, s *Store) {
+			withRanges(t, s)
+			if _, err := s.AssignUIDRange(ctx, "env-t1", "alloc-1"); err != nil {
+				t.Fatal(err)
+			}
+			stopAndClean(t, s, "env-t1")
+		}, func(s *Store) (any, error) {
+			return s.ReleaseUIDRange(ctx, "uid-100000", "alloc-1")
+		}, "SELECT count(*) FROM uid_ranges WHERE uid_range_id = 'uid-100000' AND state = 'free'"},
+		{"MarkStopped", withFixture, func(s *Store) (any, error) {
+			return s.MarkStopped(ctx, "env-t1", at)
+		}, "SELECT count(*) FROM environments WHERE stopped_at IS NOT NULL"},
+		{"UpdateCleanup", withFixture, func(s *Store) (any, error) {
+			return s.UpdateCleanup(ctx, resource.CleanupUpdate{EnvID: "env-t1", ExpectedTries: 0, State: resource.CleanupPending, Error: "busy"})
+		}, "SELECT count(*) FROM environments WHERE cleanup_tries = 1"},
+	})
+}
+
+func TestResourceConflicts(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	withRanges(t, s)
+	if _, err := s.AssignUIDRange(ctx, "env-t1", "alloc-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordIntent(ctx, resource.Intent{IntentID: "i1", EnvID: "env-t1", Kind: "cgroup", Name: "env-t1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateCleanup(ctx, resource.CleanupUpdate{EnvID: "env-t1", State: resource.CleanupDone}); err != nil {
+		t.Fatal(err)
+	}
+	expectConflicts(t, map[string]func() error{
+		"RecordIntent 占用同一资源": func() error {
+			_, err := s.RecordIntent(ctx, resource.Intent{IntentID: "i2", EnvID: "env-t1", Kind: "cgroup", Name: "env-t1"})
+			return err
+		},
+		"ResolveIntent 跳跃":       func() error { _, err := s.ResolveIntent(ctx, "i1", resource.IntentReleased); return err },
+		"AssignUIDRange 同环境不同分配": func() error { _, err := s.AssignUIDRange(ctx, "env-t1", "alloc-2"); return err },
+		"ReleaseUIDRange 分配代次不符": func() error { _, err := s.ReleaseUIDRange(ctx, "uid-100000", "alloc-old"); return err },
+		"UpdateCleanup 状态倒退": func() error {
+			_, err := s.UpdateCleanup(ctx, resource.CleanupUpdate{EnvID: "env-t1", ExpectedTries: 1, State: resource.CleanupPending})
+			return err
+		},
+		"UpdateCleanup 过期的尝试次数": func() error {
+			_, err := s.UpdateCleanup(ctx, resource.CleanupUpdate{EnvID: "env-t1", ExpectedTries: 0, State: resource.CleanupDone, Error: "x"})
+			return err
+		},
+	})
+}
+
+// TestReleaseDoesNotFreeLaterAllocation：环境未停止并完成清理时不能归还范围（规格 §4.5）；
+// 释放旧分配不得释放后来复用的同一段范围。
+func TestReleaseDoesNotFreeLaterAllocation(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	fixture(t, s, "t2")
+	if err := s.SeedUIDRanges(ctx, 100000, 4096, 1); err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.AssignUIDRange(ctx, "env-t1", "alloc-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReleaseUIDRange(ctx, r.UIDRangeID, "alloc-1"); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("环境仍在运行时归还范围应为冲突，得到 %v", err)
+	}
+	if _, err := s.MarkStopped(ctx, "env-t1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReleaseUIDRange(ctx, r.UIDRangeID, "alloc-1"); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("已停止但未完成清理时归还范围应为冲突，得到 %v", err)
+	}
+	if got, err := s.GetUIDRange(ctx, "env-t1"); err != nil || got.State != "assigned" {
+		t.Fatalf("被拒绝的归还不应改变分配：%+v %v", got, err)
+	}
+	if _, err := s.UpdateCleanup(ctx, resource.CleanupUpdate{EnvID: "env-t1", State: resource.CleanupDone}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReleaseUIDRange(ctx, r.UIDRangeID, "alloc-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AssignUIDRange(ctx, "env-t2", "alloc-2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReleaseUIDRange(ctx, r.UIDRangeID, "alloc-1"); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("重放旧的释放应为冲突，得到 %v", err)
+	}
+	if got, err := s.GetUIDRange(ctx, "env-t2"); err != nil || got.AllocationID != "alloc-2" {
+		t.Fatalf("后来的分配应保持不变：%+v %v", got, err)
 	}
 }
