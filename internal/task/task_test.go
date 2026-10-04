@@ -1886,7 +1886,9 @@ func TestActorRetryableOutcomeOverLimitIsNotRetried(t *testing.T) {
 	h.spawn("t1")
 	r := h.nextRun()
 	h.clk.Advance(20 * time.Second)
-	h.waitCause(r)
+	if err := h.waitCause(r); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("超限应以 DeadlineExceeded 取消 run ctx，得到 %v", err)
+	}
 	h.waitDone()
 	ts := h.st.task("t1")
 	if ts.Status != "failed" || ts.StatusReason != ClassDeadlineExceeded || ts.AttemptsTotal != 1 || ts.FaultRetriesUsed != 0 {

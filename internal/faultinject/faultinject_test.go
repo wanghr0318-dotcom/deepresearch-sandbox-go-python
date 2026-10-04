@@ -2,6 +2,7 @@ package faultinject
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -12,21 +13,28 @@ import (
 
 const childEnv = "FAULTINJECT_TEST_CHILD"
 
-// TestChildProcess 是 TestKillsOnNthHit 启动的子进程：以 AGENTBOX_FAULT 武装后依次到达钩子点并报告进度。
-// 直接运行（没有 childEnv）时跳过。
-func TestChildProcess(t *testing.T) {
-	if os.Getenv(childEnv) == "" {
-		t.Skip("只作为子进程运行")
+// TestMain 在设置了 childEnv 时作为 TestKillsOnNthHit 的子进程运行（不进入测试框架，因此不产生被
+// 跳过的用例）：以 AGENTBOX_FAULT 武装后依次到达钩子点并报告进度。
+func TestMain(m *testing.M) {
+	if os.Getenv(childEnv) != "" {
+		runChild()
+		return
 	}
+	os.Exit(m.Run())
+}
+
+func runChild() {
 	if err := enable(os.Getenv(Env)); err != nil {
-		t.Fatal(err)
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
 	}
 	Point(VerdictAfter) // 其他点不计数
-	os.Stdout.WriteString("hit-1\n")
+	fmt.Println("hit-1")
 	Point(VerdictBefore)
-	os.Stdout.WriteString("hit-2\n")
+	fmt.Println("hit-2")
 	Point(VerdictBefore) // 第 2 次：SIGKILL
-	os.Stdout.WriteString("survived\n")
+	fmt.Println("survived")
+	os.Exit(0)
 }
 
 // TestKillsOnNthHit：武装后在目标点第 n 次到达时以 SIGKILL 杀死进程，之前的到达与其他点不触发。
@@ -34,7 +42,7 @@ func TestKillsOnNthHit(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("SIGKILL 语义只在 Linux 上验证")
 	}
-	cmd := exec.Command(os.Args[0], "-test.run=^TestChildProcess$", "-test.count=1")
+	cmd := exec.Command(os.Args[0])
 	cmd.Env = append(os.Environ(), childEnv+"=1", Env+"="+VerdictBefore+":2")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr

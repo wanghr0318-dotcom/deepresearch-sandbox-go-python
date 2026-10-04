@@ -104,8 +104,12 @@ func TestExecSuccess(t *testing.T) {
 		}
 		send(t, fake, sandbox.Message{Type: sandbox.MsgStartAck, ExecID: "e1", PID: 42})
 		in, _ := io.ReadAll(files[0])
-		files[1].WriteString("out")
-		files[2].WriteString("err")
+		if _, err := files[1].WriteString("out"); err != nil {
+			t.Errorf("写 stdout: %v", err)
+		}
+		if _, err := files[2].WriteString("err"); err != nil {
+			t.Errorf("写 stderr: %v", err)
+		}
 		closeFiles(files)
 		send(t, fake, sandbox.Message{Type: sandbox.MsgExit, ExecID: "e1", Exit: &sandbox.ExitInfo{Code: 3}})
 		initDone <- string(in)
@@ -115,7 +119,9 @@ func TestExecSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	h.Stdin().Write([]byte("in"))
+	if _, err := h.Stdin().Write([]byte("in")); err != nil {
+		t.Fatalf("写 stdin: %v", err)
+	}
 	h.Stdin().Close()
 	// 宿主在发送后关闭了子端副本，因此假 init 关闭它的副本后 stdout/stderr 读到 EOF。
 	out, err := io.ReadAll(h.Stdout())
@@ -428,7 +434,7 @@ func (testStarter) StartInit(ctx context.Context, _ provider.EnvSpec, dir string
 		host.Close()
 		return nil, 0, err
 	}
-	go cmd.Wait() // 收割 init
+	go func() { _ = cmd.Wait() }() // 收割 init；退出状态由契约测试另行断言
 	child.Close()
 	rw.Close()
 
@@ -670,7 +676,7 @@ func TestE9DetachedSleeperKilledByStop(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.Stdin().Close()
-	go io.Copy(io.Discard, h.Stderr())
+	go func() { _, _ = io.Copy(io.Discard, h.Stderr()) }()
 	if out, err := io.ReadAll(h.Stdout()); err != nil || strings.TrimSpace(string(out)) != "started" {
 		t.Fatalf("stdout = %q, %v", out, err)
 	}
@@ -856,8 +862,8 @@ func TestResourceDiagOOM(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.Stdin().Close()
-	go io.Copy(io.Discard, h.Stdout())
-	go io.Copy(io.Discard, h.Stderr())
+	go func() { _, _ = io.Copy(io.Discard, h.Stdout()) }()
+	go func() { _, _ = io.Copy(io.Discard, h.Stderr()) }()
 	if st, err := h.Wait(); err != nil || st.Signal != syscall.SIGKILL {
 		t.Fatalf("Wait = %+v, %v；期望被 SIGKILL（OOM）", st, err)
 	}

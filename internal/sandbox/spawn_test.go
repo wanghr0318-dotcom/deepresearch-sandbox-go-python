@@ -334,7 +334,7 @@ func runSeccompBPF(t *testing.T, prog []SockFilter, d seccompData) uint32 {
 	for pc := 0; pc < len(prog); {
 		ins := prog[pc]
 		switch ins.Code {
-		case 0x00 | 0x00 | 0x20: // BPF_LD|BPF_W|BPF_ABS
+		case 0x20: // BPF_LD(0x00)|BPF_W(0x00)|BPF_ABS(0x20)
 			v, ok := d.loadWord(ins.K)
 			if !ok {
 				t.Fatalf("pc=%d: 非法的 seccomp_data 偏移 %d", pc, ins.K)
@@ -1296,7 +1296,7 @@ func reaperChildEINTR() error {
 	go func() {
 		defer close(flooded)
 		for !stop.Load() {
-			syscall.Kill(os.Getpid(), syscall.SIGUSR1)
+			_ = syscall.Kill(os.Getpid(), syscall.SIGUSR1) // 向自身发信号；失败只会减少洪泛量
 			select {
 			case <-sigs:
 			default:

@@ -169,7 +169,9 @@ func TestResultVerifiesSHA256(t *testing.T) {
 			return
 		}
 		w.Header().Set("ETag", `"`+etag+`"`)
-		w.Write(body)
+		if _, err := w.Write(body); err != nil {
+			t.Errorf("写响应: %v", err)
+		}
 	}))
 	defer srv.Close()
 
@@ -220,7 +222,9 @@ func TestSubmitRetryReusesRequestID(t *testing.T) {
 			RequestID string          `json:"request_id"`
 			Spec      json.RawMessage `json:"spec"`
 		}
-		json.NewDecoder(r.Body).Decode(&b)
+		if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+			t.Errorf("解码请求: %v", err)
+		}
 		ids = append(ids, b.RequestID)
 		specs = append(specs, string(b.Spec))
 		switch len(ids) {
@@ -302,7 +306,9 @@ func TestControlAndInspect(t *testing.T) {
 	var gotPath, gotBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b := new(bytes.Buffer)
-		b.ReadFrom(r.Body)
+		if _, err := b.ReadFrom(r.Body); err != nil {
+			t.Errorf("读请求: %v", err)
+		}
 		gotPath, gotBody = r.Method+" "+r.URL.Path, b.String()
 		fmt.Fprint(w, `{"ok":true}`)
 	}))

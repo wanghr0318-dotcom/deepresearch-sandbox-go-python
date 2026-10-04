@@ -35,7 +35,6 @@ type fakeStore struct {
 	events   map[string][]Event
 	requests map[string]RequestRecord
 	inspect  map[string]Inspection
-	nextID   int
 	// failWith 非空时，下一次 CreateTask/AcceptControl/GetTask/ListTasks 返回该错误；
 	// commitThenUnknown 为真时先提交再返回 ErrCommitUnknown。
 	failWith          error
