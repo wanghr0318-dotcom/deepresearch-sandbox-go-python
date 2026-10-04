@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,9 +17,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/datadir"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
 )
 
 // ---- 基础：测试数据库、安装引导（E46）、事务辅助（E12、争用、未知提交）、失锁（E13） ----
@@ -560,5 +564,415 @@ func TestCompositeForeignKeys(t *testing.T) {
 	}
 	if err := artifact("B", "out"); err != nil {
 		t.Fatalf("同一任务内的引用应被接受，得到 %v", err)
+	}
+}
+
+// ---- api 与 task 用例：未知提交（E11a）、首次提交未完成、同身份不同内容、重放与读取 ----
+
+// useCase 是一次幂等事务用例调用及其"只有一份结果"的检查。
+type useCase struct {
+	op     string
+	setup  func(t *testing.T, s *Store)
+	call   func(s *Store) (any, error)
+	unique string // 应恰有 1 行的计数查询
+}
+
+// checkCommitLost 覆盖 E11a：COMMIT 真正执行而客户端收到连接错误。用例必须在同一 deadline
+// 内以同一身份重跑并得到原结果；重复调用返回同一结果；只有一份结果。
+func checkCommitLost(t *testing.T, cases []useCase) {
+	for _, uc := range cases {
+		t.Run(uc.op, func(t *testing.T) {
+			s := newStore(t, Options{})
+			uc.setup(t, s)
+			var lost atomic.Bool
+			s.hooks.afterCommit = func(op string) error {
+				if op == uc.op && lost.CompareAndSwap(false, true) {
+					return errors.New("模拟：COMMIT 已执行但回复丢失")
+				}
+				return nil
+			}
+			got, err := uc.call(s)
+			if err != nil {
+				t.Fatalf("提交回复丢失后应解析为成功，得到 %v", err)
+			}
+			if !lost.Load() {
+				t.Fatal("故障钩子没有触发")
+			}
+			s.hooks.afterCommit = nil
+			again, err := uc.call(s)
+			if err != nil || fmt.Sprintf("%+v", again) != fmt.Sprintf("%+v", got) {
+				t.Fatalf("重复调用应返回原结果：%+v / %v，原为 %+v", again, err, got)
+			}
+			if n := count(t, s, uc.unique); n != 1 {
+				t.Fatalf("%s 应恰有 1 行，得到 %d", uc.unique, n)
+			}
+		})
+	}
+}
+
+// expectConflicts 断言每个调用都返回 persistence.ErrConflict。
+func expectConflicts(t *testing.T, cases map[string]func() error) {
+	for name, call := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := call(); !errors.Is(err, persistence.ErrConflict) {
+				t.Fatalf("应为冲突，得到 %v", err)
+			}
+		})
+	}
+}
+
+// fixture 建立一个任务及其第一次 attempt（att-<taskID>，环境 env-<taskID>）。
+func fixture(t *testing.T, s *Store, taskID string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.CreateTask(ctx, api.CreateTaskRequest{RequestID: "req-" + taskID, BodyHash: []byte("h"), TaskID: taskID,
+		Spec: json.RawMessage(`{"worker":"sim"}`), MaxFaultRetries: 3}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if _, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: taskID, AttemptID: "att-" + taskID, AttemptNo: 1, EnvID: "env-" + taskID}); err != nil {
+		t.Fatalf("CreateAttempt: %v", err)
+	}
+}
+
+// verdict 是 att-<taskID> 在 control_version 1（desired = run）下的失败判决。
+func verdict(taskID string, exit int64) task.Verdict {
+	return task.Verdict{AttemptID: "att-" + taskID, TaskID: taskID, ControlVersion: 1, FromStatus: "starting", AttemptStatus: "ended",
+		OutcomeClass: "worker_error", ExitCode: &exit, TaskStatus: "failed", TaskStatusReason: "worker_error",
+		EventType: "attempt_ended", EventPayload: json.RawMessage(fmt.Sprintf(`{"exit":%d}`, exit))}
+}
+
+func withFixture(t *testing.T, s *Store) { fixture(t, s, "t1") }
+
+// stopEnv 模拟 Reconciler 确认环境已停止（stopped_at 由 resource 用例写入，Task 7 才实现）。
+func stopEnv(t *testing.T, s *Store, envID string) {
+	t.Helper()
+	if _, err := s.pool.Exec(context.Background(), "UPDATE environments SET stopped_at = now() WHERE env_id = $1", envID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// retryWithNewAttempt 走一次故障重试：att-<taskID> 裁决回到 queued，旧环境停止，创建第 2 个 attempt。
+func retryWithNewAttempt(t *testing.T, s *Store, taskID string) {
+	t.Helper()
+	ctx := context.Background()
+	v := verdict(taskID, 1)
+	v.TaskStatus = "queued"
+	if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+		t.Fatalf("故障重试的判决: %v", err)
+	}
+	stopEnv(t, s, "env-"+taskID)
+	if _, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: taskID, AttemptID: "att2-" + taskID, AttemptNo: 2, EnvID: "env2-" + taskID}); err != nil {
+		t.Fatalf("第 2 个 attempt: %v", err)
+	}
+}
+
+// expectRejected 断言 err 是原因码为 code 的 *persistence.RejectedError。
+func expectRejected(t *testing.T, err error, code string) {
+	t.Helper()
+	var rej *persistence.RejectedError
+	if !errors.As(err, &rej) || rej.Code != code || !errors.Is(err, persistence.ErrRejected) || persistence.CountsTowardFailureThreshold(err) {
+		t.Fatalf("应以 %s 拒绝，得到 %v", code, err)
+	}
+}
+
+// snapshot 记录任务的可观察状态，用于确认被拒绝的写入没有留下任何改变。
+func snapshot(t *testing.T, s *Store, taskID string) string {
+	t.Helper()
+	var out string
+	if err := s.pool.QueryRow(context.Background(), `SELECT concat_ws('|', t.status, t.current_attempt_id, t.row_version,
+			c.desired, c.control_version, p.latest_checkpoint_id, p.latest_commit_seq,
+			(SELECT count(*) FROM events e WHERE e.task_id = t.task_id),
+			(SELECT count(*) FROM attempts a WHERE a.task_id = t.task_id),
+			(SELECT count(*) FROM attempts a WHERE a.task_id = t.task_id AND a.verdict_hash IS NOT NULL),
+			(SELECT count(*) FROM artifacts r WHERE r.task_id = t.task_id))
+		FROM tasks t JOIN task_control c USING (task_id) JOIN task_progress p USING (task_id) WHERE t.task_id = $1`, taskID).Scan(&out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestCreateAttemptAdmission 覆盖规格 §8.1 创建 attempt 的准入：前置条件在同一事务内检查，
+// 被拒绝时任务不变；已创建的 attempt 重复请求时返回原结果（即使前置条件此时已不成立）。
+func TestCreateAttemptAdmission(t *testing.T) {
+	ctx := context.Background()
+	t.Run("取消后创建", func(t *testing.T) {
+		s := newStore(t, Options{})
+		if _, err := s.CreateTask(ctx, api.CreateTaskRequest{RequestID: "r1", BodyHash: []byte("h"), TaskID: "t1", Spec: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "c1", BodyHash: []byte("h"), TaskID: "t1", Desired: "cancel"}); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, s, "t1")
+		_, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: "t1", AttemptID: "a1", AttemptNo: 1, EnvID: "e1"})
+		expectRejected(t, err, persistence.CodeNotRunnable)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+	})
+	t.Run("旧环境未停止时创建，停止后创建，重复请求", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		v := verdict("t1", 1)
+		v.TaskStatus = "queued"
+		if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+			t.Fatal(err)
+		}
+		req := task.NewAttempt{TaskID: "t1", AttemptID: "att2-t1", AttemptNo: 2, EnvID: "env2-t1"}
+		before := snapshot(t, s, "t1")
+		_, err := s.CreateAttempt(ctx, req)
+		expectRejected(t, err, persistence.CodePreviousNotStopped)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+		stopEnv(t, s, "env-t1")
+		first, err := s.CreateAttempt(ctx, req)
+		if err != nil {
+			t.Fatalf("旧环境停止后应能创建：%v", err)
+		}
+		again, err := s.CreateAttempt(ctx, req) // 任务已是 running，准入不再成立，但这是同一请求
+		if err != nil || fmt.Sprintf("%+v", again) != fmt.Sprintf("%+v", first) {
+			t.Fatalf("重复请求应返回原结果：%+v %v，原为 %+v", again, err, first)
+		}
+		if v, _ := s.GetTask(ctx, "t1"); v.Status != "running" || v.CurrentAttemptID != "att2-t1" || v.AttemptsTotal != 2 {
+			t.Fatalf("任务应由第 2 个 attempt 运行：%+v", v)
+		}
+	})
+}
+
+// TestFinalizeArbitratesControl 覆盖规格 §8.1 最终裁决：判决在持有任务锁后核对最新控制与当前 attempt。
+func TestFinalizeArbitratesControl(t *testing.T) {
+	ctx := context.Background()
+	succeeded := func(cv int64) task.Verdict {
+		zero := int64(0)
+		return task.Verdict{AttemptID: "att-t1", TaskID: "t1", ControlVersion: cv, FromStatus: "starting", AttemptStatus: "ended",
+			OutcomeClass: "succeeded", ExitCode: &zero, TaskStatus: "succeeded", Result: json.RawMessage(`{"ok":true}`),
+			EventType: "attempt_ended", EventPayload: json.RawMessage(`{"exit":0}`)}
+	}
+	t.Run("取消先提交，过期的成功判决被拒绝，按最新控制重算", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		c, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "c1", BodyHash: []byte("h"), TaskID: "t1", Desired: "cancel"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, s, "t1")
+		_, err = s.FinalizeAttempt(ctx, succeeded(1))
+		expectRejected(t, err, persistence.CodeControlChanged)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+		if _, err := s.FinalizeAttempt(ctx, succeeded(c.ControlVersion)); !errors.Is(err, errInvalid) {
+			t.Fatalf("desired = cancel 时不能裁决为 succeeded，得到 %v", err)
+		}
+		v := succeeded(c.ControlVersion)
+		v.TaskStatus, v.TaskStatusReason = "cancelled", "completed_during_cancel"
+		if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+			t.Fatalf("按最新控制重算的判决应提交：%v", err)
+		}
+		if got, _ := s.GetTask(ctx, "t1"); got.Status != "cancelled" {
+			t.Fatalf("任务应为 cancelled：%+v", got)
+		}
+	})
+	t.Run("判决先提交，随后的取消被拒绝", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		if _, err := s.FinalizeAttempt(ctx, succeeded(1)); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, s, "t1")
+		_, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "c1", BodyHash: []byte("h"), TaskID: "t1", Desired: "cancel"})
+		expectRejected(t, err, persistence.CodeTaskEnded)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+		if _, err := s.GetRequest(ctx, "c1"); !errors.Is(err, persistence.ErrNotFound) {
+			t.Fatalf("被拒绝的请求不应留下记录，得到 %v", err)
+		}
+	})
+	t.Run("旧 attempt 的迟到判决被拒绝", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "t1")
+		// 模拟恢复（Plan 6）把执行交还队列而旧 attempt 尚无判决：任务回到 queued，旧环境已停止。
+		if _, err := s.pool.Exec(ctx, "UPDATE tasks SET status = 'queued' WHERE task_id = 't1'"); err != nil {
+			t.Fatal(err)
+		}
+		stopEnv(t, s, "env-t1")
+		if _, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: "t1", AttemptID: "att2-t1", AttemptNo: 2, EnvID: "env2-t1"}); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshot(t, s, "t1")
+		_, err := s.FinalizeAttempt(ctx, succeeded(1))
+		expectRejected(t, err, persistence.CodeStaleAttempt)
+		if after := snapshot(t, s, "t1"); after != before {
+			t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+		}
+	})
+}
+
+// TestControlWriteRules 覆盖规格 §8.1 控制写入：已接受的 cancel 不可被覆盖；resume 要求 paused。
+func TestControlWriteRules(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	control := func(id, desired string) error {
+		_, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: id, BodyHash: []byte(desired), TaskID: "t1", Desired: desired})
+		return err
+	}
+	expectRejected(t, control("c1", "run"), persistence.CodeNotPaused)
+	if err := control("c2", "cancel"); err != nil {
+		t.Fatal(err)
+	}
+	expectRejected(t, control("c3", "pause"), persistence.CodeCancelPending)
+	if err := control("c4", "cancel"); err != nil {
+		t.Fatalf("重复 cancel 应被接受：%v", err)
+	}
+}
+
+func TestCommitLostResolvesAPIAndTaskUseCases(t *testing.T) {
+	ctx := context.Background()
+	createTask := func(t *testing.T, s *Store) {
+		if _, err := s.CreateTask(ctx, api.CreateTaskRequest{RequestID: "r1", BodyHash: []byte("h"), TaskID: "t1", Spec: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkCommitLost(t, []useCase{
+		{"CreateTask", func(*testing.T, *Store) {}, func(s *Store) (any, error) {
+			r, err := s.CreateTask(ctx, api.CreateTaskRequest{RequestID: "r1", BodyHash: []byte("h"), TaskID: "t1", Spec: json.RawMessage(`{}`)})
+			r.Replayed = false
+			return r, err
+		}, "SELECT count(*) FROM tasks"},
+		{"AcceptControl", withFixture, func(s *Store) (any, error) {
+			r, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "c1", BodyHash: []byte("h"), TaskID: "t1", Desired: "cancel"})
+			r.Replayed = false
+			return r, err
+		}, "SELECT count(*) FROM events WHERE type = 'control_accepted'"},
+		{"CreateAttempt", createTask, func(s *Store) (any, error) {
+			return s.CreateAttempt(ctx, task.NewAttempt{TaskID: "t1", AttemptID: "a1", AttemptNo: 1, EnvID: "e1"})
+		}, "SELECT count(*) FROM attempts"},
+		{"ApplyControl", func(t *testing.T, s *Store) {
+			withFixture(t, s)
+			if _, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "c1", BodyHash: []byte("h"), TaskID: "t1", Desired: "cancel"}); err != nil {
+				t.Fatal(err)
+			}
+		}, func(s *Store) (any, error) {
+			return s.ApplyControl(ctx, task.ApplyControl{TaskID: "t1", ControlVersion: 2, Status: "cancelling"})
+		}, "SELECT count(*) FROM events WHERE type = 'control_applied'"},
+		{"FinalizeAttempt", withFixture, func(s *Store) (any, error) {
+			return s.FinalizeAttempt(ctx, verdict("t1", 1))
+		}, "SELECT count(*) FROM events WHERE type = 'attempt_ended'"},
+	})
+}
+
+// TestPendingFirstCommitIsArbitratedByRetry：第一次提交尚未完成 → 新连接查询为空 →
+// 以同一身份重跑（等待锁）→ 第一次随后提交成功 → 重跑得到原结果，表中只有一份。
+func TestPendingFirstCommitIsArbitratedByRetry(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{OpDeadline: 5 * time.Second, LockTimeout: 4 * time.Second, StatementTimeout: 4 * time.Second})
+	if _, err := s.CreateTask(ctx, api.CreateTaskRequest{RequestID: "r1", BodyHash: []byte("h"), TaskID: "t1", Spec: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	held, release := make(chan struct{}), make(chan struct{})
+	var first atomic.Bool
+	s.hooks.beforeCommit = func(op string) error {
+		if op == "CreateAttempt" && first.CompareAndSwap(false, true) {
+			close(held)
+			<-release
+		}
+		return nil
+	}
+	req := task.NewAttempt{TaskID: "t1", AttemptID: "a1", AttemptNo: 1, EnvID: "e1"}
+	type result struct {
+		a   task.Attempt
+		err error
+	}
+	results := make(chan result, 2)
+	go func() { a, err := s.CreateAttempt(ctx, req); results <- result{a, err} }()
+	<-held
+	if _, err := s.GetAttempt(ctx, "a1"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("第一次提交完成前查询应为空（仍是未知），得到 %v", err)
+	}
+	go func() { a, err := s.CreateAttempt(ctx, req); results <- result{a, err} }()
+	time.Sleep(200 * time.Millisecond) // 让重跑进入锁等待；结论不依赖这段时间
+	close(release)
+	for i := 0; i < 2; i++ {
+		r := <-results
+		if r.err != nil || r.a.AttemptID != "a1" {
+			t.Fatalf("两次调用都应得到原结果，得到 %+v %v", r.a, r.err)
+		}
+	}
+	if n := count(t, s, "SELECT count(*) FROM attempts"); n != 1 {
+		t.Fatalf("attempts 应只有 1 行，得到 %d", n)
+	}
+}
+
+func TestAPIAndTaskConflicts(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	if _, err := s.FinalizeAttempt(ctx, verdict("t1", 1)); err != nil {
+		t.Fatal(err)
+	}
+	expectConflicts(t, map[string]func() error{
+		"CreateTask 同 request_id 不同内容": func() error {
+			_, err := s.CreateTask(ctx, api.CreateTaskRequest{RequestID: "req-t1", BodyHash: []byte("other"), TaskID: "t9", Spec: json.RawMessage(`{}`)})
+			return err
+		},
+		"CreateAttempt 同 attempt_id 不同环境": func() error {
+			_, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: "t1", AttemptID: "att-t1", AttemptNo: 1, EnvID: "env-other"})
+			return err
+		},
+		"CreateAttempt 同 attempt_no 不同 attempt_id": func() error {
+			_, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: "t1", AttemptID: "att-x", AttemptNo: 1, EnvID: "env-x"})
+			return err
+		},
+		"FinalizeAttempt 同为 failed 但退出码不同": func() error {
+			_, err := s.FinalizeAttempt(ctx, verdict("t1", 2))
+			return err
+		},
+		"ApplyControl 版本尚未被接受": func() error {
+			_, err := s.ApplyControl(ctx, task.ApplyControl{TaskID: "t1", ControlVersion: 9, Status: "x"})
+			return err
+		},
+	})
+}
+
+// TestRequestReplayAndReads：同一请求重放返回 Replayed，读取接口与事件顺序正确。
+func TestRequestReplayAndReads(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	r, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "c1", BodyHash: []byte("h"), TaskID: "t1", Desired: "pause"})
+	if err != nil || r.ControlVersion != 2 || r.Replayed {
+		t.Fatalf("首次控制：%+v %v", r, err)
+	}
+	r2, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "c1", BodyHash: []byte("h"), TaskID: "t1", Desired: "pause"})
+	if err != nil || !r2.Replayed || r2.ControlVersion != 2 {
+		t.Fatalf("重放应返回原结果并标记 Replayed：%+v %v", r2, err)
+	}
+	rec, err := s.GetRequest(ctx, "c1")
+	if err != nil || rec.Kind != "control" || rec.ResourceID != "t1" {
+		t.Fatalf("GetRequest：%+v %v", rec, err)
+	}
+	v, err := s.GetTask(ctx, "t1")
+	if err != nil || v.Desired != "pause" || v.ControlVersion != 2 || v.CurrentAttemptID != "att-t1" || v.AttemptsTotal != 1 {
+		t.Fatalf("GetTask：%+v %v", v, err)
+	}
+	events, err := s.ListEvents(ctx, "t1", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var types []string
+	for i, e := range events {
+		if e.TaskSeq != int64(i+1) {
+			t.Fatalf("事件序号应从 1 起连续：%+v", events)
+		}
+		types = append(types, e.Type)
+	}
+	if strings.Join(types, ",") != "task_created,attempt_created,control_accepted" {
+		t.Fatalf("事件顺序：%v", types)
+	}
+	if _, err := s.GetTask(ctx, "missing"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("不存在的任务应为 ErrNotFound，得到 %v", err)
 	}
 }
