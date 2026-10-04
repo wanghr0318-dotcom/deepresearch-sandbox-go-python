@@ -31,11 +31,30 @@ func TestConsumersDoNotDependOnPostgres(t *testing.T) {
 		"internal/api", "internal/task", "internal/runner", "internal/resource",
 		"internal/ownership", "internal/persistence", "internal/datadir", "internal/blob",
 	} {
-		for _, d := range deps(t, pkg) {
-			for _, f := range forbidden {
-				if d == f || strings.HasPrefix(d, f+"/") {
-					t.Errorf("%s 依赖了 %s", pkg, d)
-				}
+		forbid(t, pkg, forbidden)
+	}
+}
+
+// TestControlPlaneUsesProviderContractOnly：控制面包只依赖 internal/provider（契约），不依赖 provider/local、
+// sandbox、cgroup、rootfs（代码组织 §2.1、Provider 契约第 1 节）；生产入口不导入只供测试的 provider/fake。
+func TestControlPlaneUsesProviderContractOnly(t *testing.T) {
+	lowLevel := []string{
+		module + "/internal/provider/local", module + "/internal/provider/fake",
+		module + "/internal/sandbox", module + "/internal/cgroup", module + "/internal/rootfs",
+	}
+	for _, pkg := range []string{"internal/api", "internal/task", "internal/runner", "internal/resource", "internal/provider"} {
+		forbid(t, pkg, lowLevel)
+	}
+	forbid(t, "cmd/agentbox", []string{module + "/internal/provider/fake"})
+}
+
+// forbid 断言 pkg 的传递依赖不含 forbidden 中的包及其子包。
+func forbid(t *testing.T, pkg string, forbidden []string) {
+	t.Helper()
+	for _, d := range deps(t, pkg) {
+		for _, f := range forbidden {
+			if d == f || strings.HasPrefix(d, f+"/") {
+				t.Errorf("%s 依赖了 %s", pkg, d)
 			}
 		}
 	}
