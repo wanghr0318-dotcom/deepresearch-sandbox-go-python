@@ -137,9 +137,10 @@ func TestInstallationBootstrapE46(t *testing.T) {
 	})
 	t.Run("初始迁移提交前中断", func(t *testing.T) {
 		s, f := open(t)
-		s.hooks.beforeCommit = func(string) error { return errors.New("模拟中断") }
-		if _, err := ownership.Bootstrap(ctx, s, f, newID); err == nil {
-			t.Fatal("中断应使引导失败")
+		fired := false
+		s.hooks.beforeCommit = func(string) error { fired = true; return errors.New("模拟中断") }
+		if _, err := ownership.Bootstrap(ctx, s, f, newID); err == nil || !fired {
+			t.Fatalf("中断应使引导失败（钩子触发 %v），得到 %v", fired, err)
 		}
 		s.hooks.beforeCommit = nil
 		if st, _ := s.InspectInstallation(ctx); st.HasMigrations || st.HasAgentboxTables {
@@ -203,6 +204,33 @@ func probeTable(t *testing.T, s *Store) {
 func lockProbe(ctx context.Context, tx pgx.Tx, id int) error {
 	_, err := tx.Exec(ctx, "SELECT 1 FROM probe WHERE id = $1 FOR UPDATE", id)
 	return err
+}
+
+// holdProbe 在独立事务中持有 probe 行锁，测试结束时回滚。
+func holdProbe(t *testing.T, s *Store, id int) {
+	t.Helper()
+	ctx := context.Background()
+	holder, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = holder.Rollback(ctx) })
+	if err := lockProbe(ctx, holder, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// waitLockWait 等到当前数据库中有会话阻塞在行锁上，确认在途操作确实停在锁等待中。
+func waitLockWait(t *testing.T, s *Store) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for count(t, s, `SELECT count(*) FROM pg_stat_activity
+		WHERE datname = current_database() AND wait_event_type = 'Lock'`) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("5 s 内在途操作没有阻塞在行锁上")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // TestDeadlockIsRetried 覆盖 E12 的存储部分：两事务经屏障违反锁顺序形成环，
@@ -291,21 +319,17 @@ func TestOwnershipLossCancelsOperations(t *testing.T) {
 	s := newStore(t, Options{DSN: dsn, Ownership: own, OpDeadline: 10 * time.Second, LockTimeout: 9 * time.Second, StatementTimeout: 9 * time.Second})
 	probeTable(t, s)
 
-	holder, err := s.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = holder.Rollback(ctx) }()
-	if _, err := holder.Exec(ctx, "SELECT 1 FROM probe WHERE id = 1 FOR UPDATE"); err != nil {
-		t.Fatal(err)
-	}
+	holdProbe(t, s, 1)
 	inflight := make(chan error, 1)
 	go func() {
 		inflight <- s.run(ctx, "inflight", "1", func(ctx context.Context, tx pgx.Tx) error { return lockProbe(ctx, tx, 1) })
 	}()
+	waitLockWait(t, s)
 
+	// 只取本测试数据库中的锁连接：其他并行测试的库里也可能有同键的 advisory lock。
 	var pid int
-	if err := s.pool.QueryRow(ctx, "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted").Scan(&pid); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted
+		AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`).Scan(&pid); err != nil {
 		t.Fatal(err)
 	}
 	start := time.Now()
@@ -314,7 +338,11 @@ func TestOwnershipLossCancelsOperations(t *testing.T) {
 	}
 	select {
 	case <-own.Lost():
-		t.Logf("失锁检测延迟 %v", time.Since(start))
+		latency, bound := time.Since(start), 2*(200*time.Millisecond+200*time.Millisecond)
+		t.Logf("失锁检测延迟 %v", latency)
+		if latency >= bound {
+			t.Fatalf("失锁检测延迟 %v 超过 2*(CheckInterval+CheckTimeout) = %v", latency, bound)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("5 s 内没有检测到失锁")
 	}
@@ -328,5 +356,209 @@ func TestOwnershipLossCancelsOperations(t *testing.T) {
 	}
 	if _, err := s.InspectInstallation(ctx); !errors.Is(err, persistence.ErrOwnershipLost) {
 		t.Fatalf("失锁后新操作应被拒绝，得到 %v", err)
+	}
+	if err := s.Migrate(ctx); !errors.Is(err, persistence.ErrOwnershipLost) {
+		t.Fatalf("失锁后迁移应被拒绝，得到 %v", err)
+	}
+	if err := own.Close(); err != nil {
+		t.Fatalf("关闭锁连接: %v", err)
+	}
+	if err := own.Close(); err != nil { // 幂等；随后 defer 中的第三次调用同样无害
+		t.Fatalf("再次关闭应返回 nil，得到 %v", err)
+	}
+}
+
+// TestErrorClassification 在真实 PostgreSQL 上核对事务辅助的错误归类与是否计入故障阈值。
+func TestErrorClassification(t *testing.T) {
+	ctx := context.Background()
+	long := Options{OpDeadline: 10 * time.Second, LockTimeout: 9 * time.Second, StatementTimeout: 9 * time.Second}
+
+	t.Run("事务中后端被终止", func(t *testing.T) {
+		s := newStore(t, long)
+		probeTable(t, s)
+		pids, killed := make(chan int, 1), make(chan struct{})
+		go func() {
+			defer close(killed)
+			pid := <-pids
+			_, _ = s.pool.Exec(ctx, "SELECT pg_terminate_backend($1)", pid)
+			// 等后端真正退出，事务体的下一条语句必然落在已终止的连接上。
+			for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+				var alive bool
+				if err := s.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)", pid).Scan(&alive); err != nil || !alive {
+					return
+				}
+			}
+		}()
+		var attempts atomic.Int32
+		var firstErr error
+		err := s.run(ctx, "terminated", "probe-3", func(ctx context.Context, tx pgx.Tx) error {
+			n := attempts.Add(1)
+			if n == 1 {
+				var pid int
+				if err := tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pid); err != nil {
+					return err
+				}
+				pids <- pid
+				<-killed
+			}
+			_, err := tx.Exec(ctx, "INSERT INTO probe (id) VALUES (3) ON CONFLICT DO NOTHING")
+			if n == 1 {
+				firstErr = err
+			}
+			return err
+		})
+		if err != nil || attempts.Load() != 2 {
+			t.Fatalf("被终止的尝试应重跑并成功：err %v，尝试 %d 次", err, attempts.Load())
+		}
+		// 通常是 FATAL 57P01；若客户端先看到套接字关闭，则是网络错误——两者都应按连接错误重跑。
+		if !isConnection(firstErr) {
+			t.Fatalf("第一次尝试应以连接错误（57P01 或套接字关闭）结束，得到 %v", firstErr)
+		}
+		if n := count(t, s, "SELECT count(*) FROM probe WHERE id = 3"); n != 1 {
+			t.Fatalf("应只写入一行，得到 %d", n)
+		}
+	})
+
+	t.Run("语句超时", func(t *testing.T) {
+		s := newStore(t, Options{OpDeadline: 500 * time.Millisecond, LockTimeout: time.Second, StatementTimeout: 50 * time.Millisecond})
+		var timeouts, attempts int
+		var last error
+		err := s.run(ctx, "slow", "1", func(ctx context.Context, tx pgx.Tx) error {
+			attempts++
+			_, last = tx.Exec(ctx, "SELECT pg_sleep(0.2)")
+			if sqlState(last) == "57014" {
+				timeouts++
+			}
+			return last
+		})
+		if !errors.Is(err, persistence.ErrUnavailable) || !persistence.CountsTowardFailureThreshold(err) {
+			t.Fatalf("语句超时应为 ErrUnavailable 且计入故障阈值，得到 %v", err)
+		}
+		// 57014 在 deadline 内重跑；最后一次尝试可能被操作 deadline 截断，故只要求出现过 57014。
+		if timeouts == 0 || attempts < 2 {
+			t.Fatalf("语句超时应在 deadline 内重跑：尝试 %d 次，其中 57014 %d 次", attempts, timeouts)
+		}
+		// 底层错误以 %w 保留：最后一次尝试的错误，或它在事务体之前被 deadline 截断时的 context 错误。
+		if !errors.Is(err, last) && !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("结果应以 %%w 保留最后一次的底层错误 %v，得到 %v", last, err)
+		}
+	})
+
+	t.Run("事务体吞掉语句错误", func(t *testing.T) {
+		s := newStore(t, long)
+		var attempts atomic.Int32
+		err := s.run(ctx, "swallow", "1", func(ctx context.Context, tx pgx.Tx) error {
+			attempts.Add(1)
+			_, _ = tx.Exec(ctx, "SELECT 1/0")
+			return nil
+		})
+		if !errors.Is(err, errInvalid) || persistence.CountsTowardFailureThreshold(err) || attempts.Load() != 1 {
+			t.Fatalf("应为 errInvalid、不计入阈值且只尝试一次：%v（尝试 %d 次）", err, attempts.Load())
+		}
+	})
+
+	t.Run("COMMIT 时连接被终止", func(t *testing.T) {
+		// 每次尝试在 COMMIT 前终止自己的后端：COMMIT 得到 FATAL 57P01，可能已到达服务端，
+		// 只能视为结果未知；deadline 用尽时返回 CommitUnknownError。
+		s := newStore(t, Options{OpDeadline: time.Second, LockTimeout: time.Second, StatementTimeout: time.Second})
+		var pid int
+		s.hooks.beforeCommit = func(string) error {
+			_, _ = s.pool.Exec(ctx, "SELECT pg_terminate_backend($1)", pid)
+			for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+				if count(t, s, "SELECT count(*) FROM pg_stat_activity WHERE pid = $1", pid) == 0 {
+					break
+				}
+			}
+			return nil
+		}
+		err := s.run(ctx, "commit-fatal", "1", func(ctx context.Context, tx pgx.Tx) error {
+			return tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pid)
+		})
+		var unknown *persistence.CommitUnknownError
+		if !errors.As(err, &unknown) || !persistence.CountsTowardFailureThreshold(err) {
+			t.Fatalf("COMMIT 得到 FATAL 时应为 CommitUnknownError，得到 %v", err)
+		}
+		if !isConnection(unknown.Err) {
+			t.Fatalf("未知提交应携带连接错误（57P01 或套接字关闭），得到 %v", unknown.Err)
+		}
+	})
+
+	t.Run("COMMIT 前调用方取消", func(t *testing.T) {
+		// context 已结束时 COMMIT 不会发出（SafeToRetry）：确定未提交，归为调用方取消而非未知。
+		s := newStore(t, long)
+		probeTable(t, s)
+		cctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		s.hooks.beforeCommit = func(string) error { cancel(); return nil }
+		err := s.run(cctx, "cancel-before-commit", "probe-3", func(ctx context.Context, tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, "INSERT INTO probe (id) VALUES (3) ON CONFLICT DO NOTHING")
+			return err
+		})
+		if !errors.Is(err, context.Canceled) || errors.Is(err, persistence.ErrCommitUnknown) || persistence.CountsTowardFailureThreshold(err) {
+			t.Fatalf("COMMIT 未发出时应为调用方取消、不是未知提交，得到 %v", err)
+		}
+		if n := count(t, s, "SELECT count(*) FROM probe WHERE id = 3"); n != 0 {
+			t.Fatalf("未提交的事务不应留下行，得到 %d", n)
+		}
+	})
+
+	t.Run("调用方取消", func(t *testing.T) {
+		s := newStore(t, long)
+		probeTable(t, s)
+		holdProbe(t, s, 1)
+		cctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			done <- s.run(cctx, "canceled", "1", func(ctx context.Context, tx pgx.Tx) error { return lockProbe(ctx, tx, 1) })
+		}()
+		waitLockWait(t, s)
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) || errors.Is(err, persistence.ErrUnavailable) || persistence.CountsTowardFailureThreshold(err) {
+				t.Fatalf("调用方取消应包装 context.Canceled、不是 ErrUnavailable、不计入阈值，得到 %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("取消后操作没有结束")
+		}
+	})
+}
+
+// TestCompositeForeignKeys：任务内引用使用复合外键，事件不能指向另一个任务的 attempt（规格 §6）。
+func TestCompositeForeignKeys(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO tasks (task_id, spec_json, status, max_fault_retries) VALUES ('A', '{}', 'queued', 0), ('B', '{}', 'queued', 0);
+		INSERT INTO attempts (attempt_id, task_id, attempt_no, env_id, status) VALUES ('b-1', 'B', 1, 'env-b', 'running');
+		INSERT INTO blobs (sha256, size) VALUES ('h', 1);
+		INSERT INTO artifact_heads (task_id, artifact_id) VALUES ('A', 'out'), ('B', 'out')`); err != nil {
+		t.Fatal(err)
+	}
+	event := func(taskID string) error {
+		_, err := s.pool.Exec(ctx, `INSERT INTO events (task_id, task_seq, event_key, attempt_id, source, type, payload, content_hash)
+			VALUES ($1, 1, 'k', 'b-1', 'host', 'x', '{}', '\x00')`, taskID)
+		return err
+	}
+	artifact := func(taskID, artifactID string) error {
+		_, err := s.pool.Exec(ctx, `INSERT INTO artifacts (task_id, artifact_id, version, sha256, size, media_type, visibility, attempt_id)
+			VALUES ($1, $2, 1, 'h', 1, 'text/plain', 'output', 'b-1')`, taskID, artifactID)
+		return err
+	}
+	if err := event("A"); sqlState(err) != "23503" {
+		t.Fatalf("任务 A 的事件引用任务 B 的 attempt 应违反外键，得到 %v", err)
+	}
+	if err := artifact("A", "out"); sqlState(err) != "23503" {
+		t.Fatalf("任务 A 的产物引用任务 B 的 attempt 应违反外键，得到 %v", err)
+	}
+	if err := artifact("B", "missing"); sqlState(err) != "23503" {
+		t.Fatalf("没有 artifact_heads 的产物应违反外键，得到 %v", err)
+	}
+	if err := event("B"); err != nil {
+		t.Fatalf("同一任务内的引用应被接受，得到 %v", err)
+	}
+	if err := artifact("B", "out"); err != nil {
+		t.Fatalf("同一任务内的引用应被接受，得到 %v", err)
 	}
 }

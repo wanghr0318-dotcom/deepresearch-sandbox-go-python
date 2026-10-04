@@ -15,6 +15,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -30,6 +31,7 @@ const (
 	DefaultLockTimeout      = time.Second
 	DefaultStatementTimeout = 2 * time.Second
 	migrationTimeout        = 5 * time.Minute
+	rollbackTimeout         = time.Second // 延迟回滚的上限，连接卡住时不无限等待
 )
 
 // Options 配置 Store。零值字段取默认值。
@@ -83,10 +85,15 @@ func (s *Store) lost() bool { return s.opt.Ownership != nil && s.opt.Ownership.I
 
 // opContext 为一次操作建立整体 deadline；失去所有权时立即取消。
 func (s *Store) opContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	return s.boundContext(ctx, s.opt.OpDeadline)
+}
+
+// boundContext 从调用方 context 派生带超时的 context；配置了 Ownership 时失去所有权即取消。
+func (s *Store) boundContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc, error) {
 	if s.lost() {
 		return nil, nil, persistence.ErrOwnershipLost
 	}
-	ctx, cancel := context.WithTimeout(ctx, s.opt.OpDeadline)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	if s.opt.Ownership == nil {
 		return ctx, cancel, nil
 	}
@@ -94,10 +101,17 @@ func (s *Store) opContext(ctx context.Context) (context.Context, context.CancelF
 	return ctx, func() { stop(); cancel() }, nil
 }
 
+// rollback 以有界的 context 回滚；已提交或已关闭时为空操作。
+func rollback(tx pgx.Tx) {
+	ctx, cancel := context.WithTimeout(context.Background(), rollbackTimeout)
+	defer cancel()
+	_ = tx.Rollback(ctx)
+}
+
 // txFunc 是一个事务体；必须幂等（设计 §2.3）。
 type txFunc func(ctx context.Context, tx pgx.Tx) error
 
-// commitUnknown 表示 COMMIT 的结果未知（无 SQLSTATE 的错误）。
+// commitUnknown 表示 COMMIT 可能已到达服务端而结果未知。
 type commitUnknown struct{ err error }
 
 func (e *commitUnknown) Error() string { return "COMMIT 结果未知: " + e.err.Error() }
@@ -108,7 +122,7 @@ func (s *Store) txOnce(ctx context.Context, op string, fn txFunc) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback(context.Background()) }() // 已提交时为空操作
+	defer rollback(tx) // 已提交时为空操作
 	if _, err := tx.Exec(ctx, "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
 		durationSetting(s.opt.LockTimeout), durationSetting(s.opt.StatementTimeout)); err != nil {
 		return err
@@ -122,11 +136,7 @@ func (s *Store) txOnce(ctx context.Context, op string, fn txFunc) error {
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) {
-			return err // 服务端明确拒绝提交（例如提交时的序列化失败）
-		}
-		return &commitUnknown{err: err}
+		return commitError(err)
 	}
 	if s.hooks.afterCommit != nil {
 		if err := s.hooks.afterCommit(op); err != nil {
@@ -136,11 +146,38 @@ func (s *Store) txOnce(ctx context.Context, op string, fn txFunc) error {
 	return nil
 }
 
+// commitError 归类 COMMIT 的错误。只有确定未提交时才按普通失败返回；COMMIT 可能已到达
+// 服务端时一律为未知（设计 §2.2）。
+func commitError(err error) error {
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.Is(err, pgx.ErrTxCommitRollback):
+		// 事务已处于失败状态，COMMIT 实际执行了回滚：事务体忽略了某条语句的错误（编程错误）。
+		return fmt.Errorf("%w: 事务体吞掉了语句错误，事务已回滚: %w", errInvalid, err)
+	case pgconn.SafeToRetry(err):
+		return err // COMMIT 未发出（例如 context 已结束），确定未提交
+	case errors.As(err, &pgErr) && severity(pgErr) == "ERROR" && !isConnectionCode(pgErr.Code):
+		return err // 服务端明确拒绝提交（例如提交时的序列化失败）
+	default:
+		return &commitUnknown{err: err} // 含 FATAL/PANIC 与连接类 SQLSTATE：连接已断，结果未知
+	}
+}
+
+// severity 优先取不随语言环境变化的严重级别。
+func severity(e *pgconn.PgError) string {
+	if e.SeverityUnlocalized != "" {
+		return e.SeverityUnlocalized
+	}
+	return e.Severity
+}
+
 // run 在一个整体 deadline 内执行幂等事务用例。遇到提交结果未知或可重试的中止、锁超时、
-// 连接错误时，以同一身份在剩余时间内重跑；查不到不等于没提交，结论只由事务内的仲裁给出。
-// deadline 用完仍无结论时：曾出现提交结果未知 → *persistence.CommitUnknownError；
-// 否则按最后一次错误归类为 ErrContention 或 ErrUnavailable。
+// 语句超时、连接错误时，以同一身份在剩余时间内重跑；查不到不等于没提交，结论只由事务内的
+// 仲裁给出。deadline 用完仍无结论时：曾出现提交结果未知 → *persistence.CommitUnknownError；
+// 调用方 context 结束 → 包装调用方的 ctx.Err()；否则按最后一次错误归类为 ErrContention 或
+// ErrUnavailable。
 func (s *Store) run(ctx context.Context, op, identity string, fn txFunc) error {
+	caller := ctx
 	ctx, cancel, err := s.opContext(ctx)
 	if err != nil {
 		return err
@@ -161,20 +198,22 @@ func (s *Store) run(ctx context.Context, op, identity string, fn txFunc) error {
 			last = err
 			contended = contended || isLockTimeout(err) || isRetryableAbort(err)
 		default:
-			return s.final(ctx, op, identity, unknown, contended, err)
+			return s.final(caller, ctx, op, identity, unknown, contended, err)
 		}
 		if s.lost() {
 			return persistence.ErrOwnershipLost
 		}
 		if !sleepBackoff(ctx, attempt) {
-			return s.final(ctx, op, identity, unknown, contended, last)
+			return s.final(caller, ctx, op, identity, unknown, contended, last)
 		}
 	}
 }
 
-// final 把最后一次错误归类为对消费者公开的错误。contended 表示本次操作曾因锁超时或
-// 可重试的中止而重跑：此时 deadline 到期归为 ErrContention（不计入 Store 故障阈值）。
-func (s *Store) final(ctx context.Context, op, identity string, unknown error, contended bool, err error) error {
+// final 把最后一次错误归类为对消费者公开的错误，并以 %w 保留底层错误。caller 是调用方的
+// context，ctx 是由它派生的操作 context。contended 表示本次操作曾因锁超时或可重试的中止而
+// 重跑：此时 deadline 到期归为 ErrContention（不计入 Store 故障阈值）。调用方取消不是存储
+// 故障：返回包装调用方 ctx.Err() 的错误，不计入阈值。
+func (s *Store) final(caller, ctx context.Context, op, identity string, unknown error, contended bool, err error) error {
 	switch {
 	case s.lost():
 		return persistence.ErrOwnershipLost
@@ -182,12 +221,14 @@ func (s *Store) final(ctx context.Context, op, identity string, unknown error, c
 		return err
 	case unknown != nil:
 		return &persistence.CommitUnknownError{Op: op, Identity: identity, Err: unknown}
+	case caller.Err() != nil:
+		return fmt.Errorf("%s(%s): 调用方已结束: %w: %w", op, identity, caller.Err(), err)
 	case isUniqueViolation(err):
-		return fmt.Errorf("%s(%s): %w: %v", op, identity, persistence.ErrConflict, err)
+		return fmt.Errorf("%s(%s): %w: %w", op, identity, persistence.ErrConflict, err)
 	case isLockTimeout(err) || isRetryableAbort(err) || (contended && ctx.Err() != nil):
-		return fmt.Errorf("%s(%s): %w: %v", op, identity, persistence.ErrContention, err)
-	case ctx.Err() != nil || isConnection(err):
-		return fmt.Errorf("%s(%s): %w: %v", op, identity, persistence.ErrUnavailable, err)
+		return fmt.Errorf("%s(%s): %w: %w", op, identity, persistence.ErrContention, err)
+	case ctx.Err() != nil || isConnection(err) || isStatementTimeout(err):
+		return fmt.Errorf("%s(%s): %w: %w", op, identity, persistence.ErrUnavailable, err)
 	default:
 		return fmt.Errorf("%s(%s): %w", op, identity, err)
 	}
@@ -201,13 +242,14 @@ type queryer interface {
 }
 
 func (s *Store) read(ctx context.Context, op string, fn func(ctx context.Context, q queryer) error) error {
+	caller := ctx
 	ctx, cancel, err := s.opContext(ctx)
 	if err != nil {
 		return err
 	}
 	defer cancel()
 	if err := fn(ctx, s.pool); err != nil {
-		return s.final(ctx, op, "", nil, false, err)
+		return s.final(caller, ctx, op, "", nil, false, err)
 	}
 	return nil
 }
@@ -249,11 +291,25 @@ func isRetryableAbort(err error) bool  { c := sqlState(err); return c == "40001"
 func isLockTimeout(err error) bool     { return sqlState(err) == "55P03" }
 func isUniqueViolation(err error) bool { return sqlState(err) == "23505" }
 
-// isConnection 判断错误是否来自连接层：网络错误、连接建立失败、超时或 context 结束。
-// 其他没有 SQLSTATE 的错误（编程错误）不在此列，不会被重跑。
+// isStatementTimeout：57014 是 statement_timeout 或取消请求导致的语句中止；context 结束引起的
+// 情形由 final 按 context 归类。
+func isStatementTimeout(err error) bool { return sqlState(err) == "57014" }
+
+// isConnectionCode 判断 SQLSTATE 是否表示连接已断或服务端暂不可用：类 08（连接异常）、
+// 57P01–57P03（管理员终止、崩溃恢复、暂不接受连接）、53300（连接数已满）。
+func isConnectionCode(code string) bool {
+	return strings.HasPrefix(code, "08") || code == "57P01" || code == "57P02" || code == "57P03" || code == "53300"
+}
+
+// isConnection 判断错误是否来自连接层：网络错误、连接建立失败、超时、context 结束，或服务端
+// 以连接类 SQLSTATE 报告的错误（含包在 *pgconn.ConnectError 中的）。其他带 SQLSTATE 的错误
+// 与没有 SQLSTATE 的编程错误不在此列，不会被重跑。
 func isConnection(err error) bool {
-	if sqlState(err) != "" || isDomain(err) {
+	if isDomain(err) {
 		return false
+	}
+	if c := sqlState(err); c != "" {
+		return isConnectionCode(c)
 	}
 	var netErr net.Error
 	var connErr *pgconn.ConnectError
@@ -265,7 +321,7 @@ func isConnection(err error) bool {
 // retryable 判断一次事务尝试的失败是否可以在剩余时间内以同一身份重跑。
 // 唯一约束冲突也重跑：并发的同一身份写入在对方提交后由事务内仲裁得出结论。
 func retryable(err error) bool {
-	return isRetryableAbort(err) || isLockTimeout(err) || isUniqueViolation(err) || isConnection(err)
+	return isRetryableAbort(err) || isLockTimeout(err) || isUniqueViolation(err) || isStatementTimeout(err) || isConnection(err)
 }
 
 // sleepBackoff 以带抖动的指数退避等待；deadline 不足时返回 false。
@@ -285,7 +341,14 @@ func sleepBackoff(ctx context.Context, attempt int) bool {
 	}
 }
 
-func durationSetting(d time.Duration) string { return fmt.Sprintf("%dms", d.Milliseconds()) }
+// durationSetting 把时长换成 PostgreSQL 的毫秒设置；不足 1 ms 的正值取 1ms（0 表示不限）。
+func durationSetting(d time.Duration) string {
+	ms := d.Milliseconds()
+	if d > 0 && ms == 0 {
+		ms = 1
+	}
+	return fmt.Sprintf("%dms", ms)
+}
 
 // contentHash 计算若干字段的内容哈希；每段带长度前缀，避免拼接歧义。
 func contentHash(parts ...[]byte) []byte {

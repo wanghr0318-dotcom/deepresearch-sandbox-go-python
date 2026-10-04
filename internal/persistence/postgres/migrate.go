@@ -28,6 +28,17 @@ var agentboxTables = []string{
 	"artifact_heads", "artifacts",
 }
 
+// inspectTablesSQL 在同一份目录中查三组表名是否存在：pg_catalog 限定 current_schema()。
+// pg_class 对所有角色可见，不像 information_schema 那样只列出角色有权限的表；只看表类关系
+// （普通表、分区表、视图、物化视图、外部表）。
+const inspectTablesSQL = `WITH rel AS (
+	SELECT c.relname::text AS name
+	FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+	WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'v', 'm', 'f'))
+SELECT EXISTS (SELECT 1 FROM rel WHERE name = ANY($1::text[])),
+       EXISTS (SELECT 1 FROM rel WHERE name = ANY($2::text[])),
+       EXISTS (SELECT 1 FROM rel WHERE name = ANY($3::text[]))`
+
 type migration struct {
 	version int
 	name    string
@@ -63,19 +74,13 @@ func loadMigrations() ([]migration, error) {
 func (s *Store) InspectInstallation(ctx context.Context) (ownership.DBState, error) {
 	var st ownership.DBState
 	err := s.read(ctx, "InspectInstallation", func(ctx context.Context, q queryer) error {
-		if err := q.QueryRow(ctx, "SELECT to_regclass('schema_migrations') IS NOT NULL").Scan(&st.HasMigrations); err != nil {
-			return err
-		}
-		var n int
-		if err := q.QueryRow(ctx,
-			"SELECT count(*) FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = ANY($1)",
-			agentboxTables).Scan(&n); err != nil {
-			return err
-		}
-		st.HasAgentboxTables = n > 0
 		var hasInstallation bool
-		if err := q.QueryRow(ctx, "SELECT to_regclass('installation') IS NOT NULL").Scan(&hasInstallation); err != nil || !hasInstallation {
+		if err := q.QueryRow(ctx, inspectTablesSQL, []string{"schema_migrations"}, agentboxTables, []string{"installation"}).
+			Scan(&st.HasMigrations, &st.HasAgentboxTables, &hasInstallation); err != nil {
 			return err
+		}
+		if !hasInstallation {
+			return nil
 		}
 		var inst ownership.Installation
 		var state string
@@ -135,9 +140,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var applied int
-	if err := s.pool.QueryRow(ctx, "SELECT COALESCE(max(version), 0) FROM schema_migrations").Scan(&applied); err != nil {
-		return fmt.Errorf("postgres: 读取迁移版本: %w", err)
+	applied, err := s.appliedVersion(ctx)
+	if err != nil {
+		return err
 	}
 	for _, m := range ms {
 		if m.version <= applied {
@@ -160,18 +165,46 @@ func applyMigration(ctx context.Context, tx pgx.Tx, m migration) error {
 	return err
 }
 
-// migrationTx 以独立的迁移超时（规格 §7.3：5 min）执行一个事务；不重跑。
-func (s *Store) migrationTx(ctx context.Context, op string, fn txFunc) error {
-	if s.lost() {
-		return persistence.ErrOwnershipLost
+// appliedVersion 在迁移超时内读取已应用的最高迁移版本；失去所有权时返回 ErrOwnershipLost。
+func (s *Store) appliedVersion(ctx context.Context) (int, error) {
+	ctx, cancel, err := s.boundContext(ctx, migrationTimeout)
+	if err != nil {
+		return 0, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, migrationTimeout)
 	defer cancel()
+	var applied int
+	if err := s.pool.QueryRow(ctx, "SELECT COALESCE(max(version), 0) FROM schema_migrations").Scan(&applied); err != nil {
+		if s.lost() {
+			return 0, persistence.ErrOwnershipLost
+		}
+		return 0, fmt.Errorf("postgres: 读取迁移版本: %w", err)
+	}
+	return applied, nil
+}
+
+// migrationTx 以独立的迁移超时（规格 §7.3：5 min）执行一个事务；不重跑。context 同时由调用方
+// 与所有权派生：失去所有权时取消并返回 ErrOwnershipLost。
+func (s *Store) migrationTx(ctx context.Context, op string, fn txFunc) error {
+	ctx, cancel, err := s.boundContext(ctx, migrationTimeout)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	if err := s.migrationTxOnce(ctx, op, fn); err != nil {
+		if s.lost() {
+			return persistence.ErrOwnershipLost
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Store) migrationTxOnce(ctx context.Context, op string, fn txFunc) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("postgres: %s: %w", op, err)
 	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
+	defer rollback(tx)
 	if err := fn(ctx, tx); err != nil {
 		return err
 	}

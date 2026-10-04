@@ -104,7 +104,9 @@ CREATE TABLE events (
     ts           timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (task_id, task_seq),
     UNIQUE (task_id, event_key),
-    CHECK ((source = 'worker') = (worker_seq IS NOT NULL))
+    CHECK ((source = 'worker') = (worker_seq IS NOT NULL)),
+    -- 任务内引用用复合外键，防止跨任务引用（规格 §6）；MATCH SIMPLE：attempt_id 为 NULL 的宿主事件不受约束
+    FOREIGN KEY (task_id, attempt_id) REFERENCES attempts (task_id, attempt_id)
 );
 CREATE UNIQUE INDEX events_worker_seq ON events (attempt_id, worker_seq) WHERE worker_seq IS NOT NULL;
 
@@ -211,5 +213,7 @@ CREATE TABLE artifacts (
     attempt_id  text NOT NULL,
     created_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (task_id, artifact_id, version),
-    UNIQUE (task_id, artifact_id, sha256)
+    UNIQUE (task_id, artifact_id, sha256),
+    FOREIGN KEY (task_id, artifact_id) REFERENCES artifact_heads (task_id, artifact_id),
+    FOREIGN KEY (task_id, attempt_id) REFERENCES attempts (task_id, attempt_id)
 );

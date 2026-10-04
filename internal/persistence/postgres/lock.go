@@ -25,14 +25,15 @@ type OwnershipOptions struct {
 // Ownership 是专用连接上的会话级 advisory lock（规格 §7.4；设计 §3.4）。
 // 失去锁连接或无法确认锁仍在时进入不可逆的 ownership_lost：Lost() 关闭，Context() 取消。
 type Ownership struct {
-	conn     *pgx.Conn // 只由监视 goroutine 使用；Close 先停止监视再使用
-	ctx      context.Context
-	cancel   context.CancelFunc
-	lost     chan struct{}
-	lostOnce sync.Once
-	stop     chan struct{}
-	done     chan struct{}
-	opt      OwnershipOptions
+	conn      *pgx.Conn // 只由监视 goroutine 使用；Close 先停止监视再使用
+	ctx       context.Context
+	cancel    context.CancelFunc
+	lost      chan struct{}
+	lostOnce  sync.Once
+	closeOnce sync.Once
+	stop      chan struct{}
+	done      chan struct{}
+	opt       OwnershipOptions
 }
 
 // AcquireOwnership 建立专用连接并取得 advisory lock；已被持有时返回 ErrAlreadyOwned。
@@ -78,12 +79,16 @@ func (o *Ownership) IsLost() bool {
 // Context 在失去所有权时取消；业务操作的 context 由它派生。
 func (o *Ownership) Context() context.Context { return o.ctx }
 
-// Close 停止监视并释放锁与连接。之后 IsLost 为 true。
+// Close 停止监视并释放锁与连接。之后 IsLost 为 true。幂等：再次调用返回 nil。
 func (o *Ownership) Close() error {
-	close(o.stop)
-	<-o.done
-	o.markLost()
-	return o.conn.Close(context.Background()) // 关闭会话即释放会话级 advisory lock
+	var err error
+	o.closeOnce.Do(func() {
+		close(o.stop)
+		<-o.done
+		o.markLost()
+		err = o.conn.Close(context.Background()) // 关闭会话即释放会话级 advisory lock
+	})
+	return err
 }
 
 func (o *Ownership) markLost() {
