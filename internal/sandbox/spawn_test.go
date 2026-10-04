@@ -9,9 +9,13 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -33,6 +37,10 @@ func TestMain(m *testing.M) {
 	// linux-integration 不允许出现任何 skip。
 	if os.Getenv(envSeccompChild) == "1" {
 		os.Exit(runSeccompChild())
+	}
+	// reaper 子进程分流：见 runReaperCase。
+	if name := os.Getenv(envReaperChild); name != "" {
+		os.Exit(runReaperChild(name))
 	}
 	if len(os.Args) > 1 && os.Args[1] == InitArg {
 		if err := RunInit(); err != nil {
@@ -1000,4 +1008,484 @@ func TestControlBlockingFDCloseUnblocksRecv(t *testing.T) {
 	if err := c.Send(Message{Type: "terminate", ExecID: "e1"}, nil); err == nil {
 		t.Fatal("Close 后 Send 返回 nil")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 登记表与单一 reaper（规格 §4.3）
+// ---------------------------------------------------------------------------
+
+// envReaperChild 让测试二进制在 TestMain 中直接进入 runReaperChild。
+//
+// 每个 reaper 用例都在 re-exec 出来的子进程里运行：Reap 调用 Wait4(-1)，
+// 会收割本进程的任何子进程，并且用例要把进程设为 child subreaper；放在
+// 独立进程里，这两件事都不会影响同一测试二进制中的其他用例（它们自己
+// exec.Cmd.Wait 子进程）。
+const envReaperChild = "AGENTBOX_TEST_REAPER_CHILD"
+
+// reaperChildren 是子进程侧的用例表；返回 nil 表示通过。
+var reaperChildren = map[string]func() error{
+	"order":  reaperChildOrder,
+	"eintr":  reaperChildEINTR,
+	"orphan": reaperChildOrphan,
+	"outerr": reaperChildOutErr,
+}
+
+// runReaperCase 以 envReaperChild=name re-exec 测试二进制，要求子进程报告通过。
+func runReaperCase(t *testing.T, name string) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(), envReaperChild+"="+name)
+	out, err := cmd.CombinedOutput()
+	t.Logf("子进程输出:\n%s", out)
+	if err != nil {
+		t.Fatalf("子进程失败: %v", err)
+	}
+	if !strings.Contains(string(out), "reaper child: ok") {
+		t.Fatalf("子进程没有报告完成")
+	}
+}
+
+// runReaperChild 把本进程设为 child subreaper（被收养的孤儿归本进程收割，
+// 与沙箱内的 init 同样处境；不需要 root），然后运行用例 name。
+func runReaperChild(name string) int {
+	fn, ok := reaperChildren[name]
+	if !ok {
+		fmt.Printf("reaper child: FAIL: 未知用例 %q\n", name)
+		return 1
+	}
+	const prSetChildSubreaper = 36 // include/uapi/linux/prctl.h
+	if _, _, e := syscall.RawSyscall6(syscall.SYS_PRCTL, prSetChildSubreaper, 1, 0, 0, 0, 0); e != 0 {
+		fmt.Printf("reaper child: FAIL: PR_SET_CHILD_SUBREAPER: %v\n", e)
+		return 1
+	}
+	if err := fn(); err != nil {
+		fmt.Printf("reaper child: FAIL: %s: %v\n", name, err)
+		return 1
+	}
+	fmt.Printf("reaper child: ok (%s)\n", name)
+	return 0
+}
+
+// TestReaperStartAckPrecedesExit：立即退出的进程也是先 start_ack 后 exit（重复 200 次）。
+func TestReaperStartAckPrecedesExit(t *testing.T) { runReaperCase(t, "order") }
+
+// TestReaperRetriesEINTR：Wait4 返回 EINTR 时重试，一次 Reap 收割全部已退出进程。
+func TestReaperRetriesEINTR(t *testing.T) { runReaperCase(t, "eintr") }
+
+// TestReaperDropsAdoptedOrphan：双重 fork 的孙进程被收割，但不产生 exit。
+func TestReaperDropsAdoptedOrphan(t *testing.T) { runReaperCase(t, "orphan") }
+
+// TestReaperOutErrorPropagates：out 返回错误时 Start 与 Reap 返回该错误。
+func TestReaperOutErrorPropagates(t *testing.T) { runReaperCase(t, "outerr") }
+
+// execLauncher 是测试用 Launcher：spec 为 {"argv":[...]}，直接 exec，不建
+// namespace、不降权。只调用 exec.Cmd.Start（经 File.Fd() 把收到的 FD 置为阻塞），
+// 然后 Release，不等待进程。pids 非 nil 时记录每次启动的 pid。
+type execLauncher struct {
+	pids *[]int
+}
+
+func (l execLauncher) Launch(spec json.RawMessage, stdin, stdout, stderr *os.File) (int, error) {
+	var s struct {
+		Argv []string `json:"argv"`
+	}
+	if err := json.Unmarshal(spec, &s); err != nil {
+		return 0, err
+	}
+	if len(s.Argv) == 0 {
+		return 0, errors.New("argv 为空")
+	}
+	cmd := exec.Command(s.Argv[0], s.Argv[1:]...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
+	if err := cmd.Start(); err != nil {
+		return 0, err
+	}
+	pid := cmd.Process.Pid
+	if err := cmd.Process.Release(); err != nil {
+		return 0, err
+	}
+	if l.pids != nil {
+		*l.pids = append(*l.pids, pid)
+	}
+	return pid, nil
+}
+
+func argvSpec(argv ...string) json.RawMessage {
+	b, _ := json.Marshal(map[string][]string{"argv": argv})
+	return b
+}
+
+// reaperSink 记录 out 收到的消息；exit 另外送进 exits（非阻塞，满则报错）。
+type reaperSink struct {
+	mu    sync.Mutex
+	msgs  []Message
+	exits chan string
+}
+
+func newReaperSink(n int) *reaperSink { return &reaperSink{exits: make(chan string, n)} }
+
+func (s *reaperSink) out(m Message) error {
+	s.mu.Lock()
+	s.msgs = append(s.msgs, m)
+	s.mu.Unlock()
+	if m.Type == MsgExit {
+		select {
+		case s.exits <- m.ExecID:
+		default:
+			return errors.New("exits 已满")
+		}
+	}
+	return nil
+}
+
+func (s *reaperSink) snapshot() []Message {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Message(nil), s.msgs...)
+}
+
+// devNullFDs 返回三个 /dev/null 文件，作为 Start 的 stdin/stdout/stderr（Start 负责关闭）。
+func devNullFDs() ([3]*os.File, error) {
+	var fds [3]*os.File
+	for i := range fds {
+		f, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+		if err != nil {
+			for _, g := range fds[:i] {
+				g.Close()
+			}
+			return fds, err
+		}
+		fds[i] = f
+	}
+	return fds, nil
+}
+
+// waitZombie 阻塞直到 pid 退出成为僵尸，但不收割它（waitid 带 WNOWAIT），
+// 使测试能在确定的时刻调用 Reap，而不靠 sleep。
+func waitZombie(pid int) error {
+	const pPID = 1     // include/uapi/linux/wait.h
+	var info [128]byte // siginfo_t
+	for {
+		_, _, e := syscall.Syscall6(syscall.SYS_WAITID, pPID, uintptr(pid),
+			uintptr(unsafe.Pointer(&info[0])), syscall.WEXITED|syscall.WNOWAIT, 0, 0)
+		switch e {
+		case 0:
+			return nil
+		case syscall.EINTR:
+			continue
+		default:
+			return fmt.Errorf("waitid(%d): %w", pid, e)
+		}
+	}
+}
+
+// ackPID 在 msgs 中找到 execID 的 start_ack 并返回其 pid。
+func ackPID(msgs []Message, execID string) (int, error) {
+	for _, m := range msgs {
+		if m.Type == MsgStartAck && m.ExecID == execID {
+			return m.PID, nil
+		}
+	}
+	return 0, fmt.Errorf("没有 %s 的 start_ack", execID)
+}
+
+// reaperChildOrder：另一个 goroutine 持续 Reap，同时逐个启动 200 个立即退出的
+// 进程。进程可能在 Launch 返回前就已退出，但 Reap 在 Start 持锁期间无法收割它；
+// 每个 exec 必须恰好一条 start_ack、一条 exit，且 start_ack 在前。若 Reap 抢在
+// 登记之前收割，该 pid 会被当作孤儿丢弃，exit 永远不会到达。
+func reaperChildOrder() error {
+	const n = 200
+	sink := newReaperSink(n)
+	reg := NewRegistry(sink.out)
+
+	var stop atomic.Bool
+	reapErr := make(chan error, 1)
+	go func() {
+		for !stop.Load() {
+			if err := reg.Reap(); err != nil {
+				reapErr <- err
+				return
+			}
+			runtime.Gosched()
+		}
+		reapErr <- nil
+	}()
+
+	for i := 0; i < n; i++ {
+		fds, err := devNullFDs()
+		if err != nil {
+			return err
+		}
+		if err := reg.Start(fmt.Sprintf("e%d", i), execLauncher{}, argvSpec("/bin/true"), fds); err != nil {
+			return fmt.Errorf("Start e%d: %w", i, err)
+		}
+	}
+
+	// 等待全部 exit；超时只是防止挂死的兜底，不参与同步。
+	timeout := time.After(60 * time.Second)
+	for got := 0; got < n; got++ {
+		select {
+		case <-sink.exits:
+		case err := <-reapErr:
+			return fmt.Errorf("Reap 提前结束: %v（已收到 %d 个 exit）", err, got)
+		case <-timeout:
+			return fmt.Errorf("只收到 %d/%d 个 exit", got, n)
+		}
+	}
+	stop.Store(true)
+	if err := <-reapErr; err != nil {
+		return fmt.Errorf("Reap: %w", err)
+	}
+
+	type seen struct{ ack, exit, acks, exits int }
+	idx := map[string]*seen{}
+	for i, m := range sink.snapshot() {
+		s := idx[m.ExecID]
+		if s == nil {
+			s = &seen{ack: -1, exit: -1}
+			idx[m.ExecID] = s
+		}
+		switch m.Type {
+		case MsgStartAck:
+			if m.PID <= 0 {
+				return fmt.Errorf("%s: start_ack pid = %d", m.ExecID, m.PID)
+			}
+			s.ack, s.acks = i, s.acks+1
+		case MsgExit:
+			if m.Exit == nil || *m.Exit != (ExitInfo{}) {
+				return fmt.Errorf("%s: exit = %+v, want code 0", m.ExecID, m.Exit)
+			}
+			s.exit, s.exits = i, s.exits+1
+		default:
+			return fmt.Errorf("意外消息 %+v", m)
+		}
+	}
+	if len(idx) != n {
+		return fmt.Errorf("消息涉及 %d 个 exec, want %d", len(idx), n)
+	}
+	for id, s := range idx {
+		if s.acks != 1 || s.exits != 1 {
+			return fmt.Errorf("%s: %d 条 start_ack、%d 条 exit, want 各 1", id, s.acks, s.exits)
+		}
+		if s.ack > s.exit {
+			return fmt.Errorf("%s: exit（#%d）先于 start_ack（#%d）", id, s.exit, s.ack)
+		}
+	}
+	// 全部收割后再 Reap：Wait4 返回 ECHILD，Reap 返回 nil。
+	if err := reg.Reap(); err != nil {
+		return fmt.Errorf("无子进程时 Reap = %v, want nil", err)
+	}
+	return nil
+}
+
+// reaperChildEINTR：注入的 wait4 在每次真实调用之前先返回一次 EINTR，同时另一个
+// goroutine 不断向本进程发送 SIGUSR1。20 个以不同退出码退出的进程与 1 个被
+// SIGKILL 杀死的进程全部成为僵尸之后，只调用一次 Reap：它必须重试 EINTR 并
+// 收割到没有为止，交出全部 21 条 exit，退出状态逐个正确。
+func reaperChildEINTR() error {
+	sigs := make(chan os.Signal, 64)
+	signal.Notify(sigs, syscall.SIGUSR1)
+	defer signal.Stop(sigs)
+	var stop atomic.Bool
+	flooded := make(chan struct{})
+	go func() {
+		defer close(flooded)
+		for !stop.Load() {
+			syscall.Kill(os.Getpid(), syscall.SIGUSR1)
+			select {
+			case <-sigs:
+			default:
+			}
+			runtime.Gosched()
+		}
+	}()
+	defer func() { stop.Store(true); <-flooded }()
+
+	const n = 20
+	sink := newReaperSink(n + 1)
+	reg := NewRegistry(sink.out)
+	var injected, real atomic.Int64
+	reg.wait4 = func(pid int, ws *syscall.WaitStatus, options int, ru *syscall.Rusage) (int, error) {
+		if injected.Load() == real.Load() {
+			injected.Add(1)
+			return 0, syscall.EINTR
+		}
+		real.Add(1)
+		return syscall.Wait4(pid, ws, options, ru)
+	}
+
+	want := map[string]ExitInfo{}
+	var pids []int
+	l := execLauncher{pids: &pids}
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("code%d", i)
+		want[id] = ExitInfo{Code: i}
+		fds, err := devNullFDs()
+		if err != nil {
+			return err
+		}
+		if err := reg.Start(id, l, argvSpec("/bin/sh", "-c", "exit "+strconv.Itoa(i)), fds); err != nil {
+			return fmt.Errorf("Start %s: %w", id, err)
+		}
+	}
+	want["killed"] = ExitInfo{Signal: syscall.SIGKILL}
+	fds, err := devNullFDs()
+	if err != nil {
+		return err
+	}
+	if err := reg.Start("killed", l, argvSpec("/bin/sh", "-c", "kill -9 $$"), fds); err != nil {
+		return fmt.Errorf("Start killed: %w", err)
+	}
+	for _, pid := range pids {
+		if err := waitZombie(pid); err != nil {
+			return err
+		}
+	}
+
+	if err := reg.Reap(); err != nil {
+		return fmt.Errorf("Reap: %w", err)
+	}
+	if injected.Load() < int64(n+2) {
+		return fmt.Errorf("只注入了 %d 次 EINTR", injected.Load())
+	}
+	got := map[string]ExitInfo{}
+	for _, m := range sink.snapshot() {
+		if m.Type == MsgExit {
+			got[m.ExecID] = *m.Exit
+		}
+	}
+	if len(got) != len(want) {
+		return fmt.Errorf("一次 Reap 交出 %d 条 exit, want %d（EINTR 后丢失了退出）", len(got), len(want))
+	}
+	for id, w := range want {
+		if got[id] != w {
+			return fmt.Errorf("%s: exit = %+v, want %+v", id, got[id], w)
+		}
+	}
+	return nil
+}
+
+// reaperChildOrphan：登记的 workload 后台启动一个孙进程（读 stdin 管道直到 EOF）
+// 后以 7 退出。孙进程被收养给本进程（subreaper）。workload 的 exit 照常送出；
+// 关闭管道让孙进程退出后，Reap 收割它（之后 Wait4 对其返回 ECHILD），但不产生
+// 任何消息。
+func reaperChildOrphan() error {
+	sink := newReaperSink(4)
+	reg := NewRegistry(sink.out)
+
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer inW.Close()
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer outR.Close()
+	errF, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	// 非交互 sh 会把后台命令的 stdin 改为 /dev/null，所以先把管道复制到 fd 3。
+	script := `exec 3<&0; cat <&3 >/dev/null 3<&- & echo $!; exit 7`
+	if err := reg.Start("parent", execLauncher{}, argvSpec("/bin/sh", "-c", script), [3]*os.File{inR, outW, errF}); err != nil {
+		return fmt.Errorf("Start: %w", err)
+	}
+	// Start 已关闭本进程的 outW；孙进程的 stdout 是 /dev/null，所以 workload 退出即 EOF。
+	b, err := io.ReadAll(outR)
+	if err != nil {
+		return err
+	}
+	gpid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return fmt.Errorf("孙进程 pid %q: %w", b, err)
+	}
+	ppid, err := ackPID(sink.snapshot(), "parent")
+	if err != nil {
+		return err
+	}
+
+	if err := waitZombie(ppid); err != nil {
+		return err
+	}
+	if err := reg.Reap(); err != nil {
+		return fmt.Errorf("Reap（workload）: %w", err)
+	}
+	// workload 退出时孙进程已被收养；它仍在运行（管道写端在本进程手里）。
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", gpid))
+	if err != nil {
+		return fmt.Errorf("读取孙进程 stat: %w", err)
+	}
+	fields := strings.Fields(string(stat[strings.LastIndexByte(string(stat), ')')+1:]))
+	if len(fields) < 2 || fields[1] != strconv.Itoa(os.Getpid()) {
+		return fmt.Errorf("孙进程 %d 的父进程 = %v, want 本进程 %d（未被收养）", gpid, fields, os.Getpid())
+	}
+
+	inW.Close()
+	if err := waitZombie(gpid); err != nil {
+		return err
+	}
+	if err := reg.Reap(); err != nil {
+		return fmt.Errorf("Reap（孤儿）: %w", err)
+	}
+	var ws syscall.WaitStatus
+	if _, err := syscall.Wait4(gpid, &ws, syscall.WNOHANG, nil); err != syscall.ECHILD {
+		return fmt.Errorf("Reap 之后 Wait4(孙进程) = %v, want ECHILD（孤儿未被收割）", err)
+	}
+
+	msgs := sink.snapshot()
+	if len(msgs) != 2 || msgs[0].Type != MsgStartAck || msgs[1].Type != MsgExit ||
+		msgs[1].ExecID != "parent" || *msgs[1].Exit != (ExitInfo{Code: 7}) {
+		return fmt.Errorf("消息 = %+v, want 仅 parent 的 start_ack 与 exit(code 7)", msgs)
+	}
+	return nil
+}
+
+// reaperChildOutErr：out 返回错误时 Start（start_ack、start_err 两条路径）与
+// Reap 都返回包装了该错误的错误；out 正常时 Launch 失败只入队 start_err，
+// Start 返回 nil。
+func reaperChildOutErr() error {
+	boom := errors.New("队列已满（测试）")
+	reg := NewRegistry(func(Message) error { return boom })
+	var pids []int
+	fds, err := devNullFDs()
+	if err != nil {
+		return err
+	}
+	if err := reg.Start("ack", execLauncher{pids: &pids}, argvSpec("/bin/true"), fds); !errors.Is(err, boom) {
+		return fmt.Errorf("start_ack 入队失败时 Start = %v, want 包装 %v", err, boom)
+	}
+	if len(pids) != 1 {
+		return fmt.Errorf("启动了 %d 个进程, want 1", len(pids))
+	}
+	if err := waitZombie(pids[0]); err != nil {
+		return err
+	}
+	if err := reg.Reap(); !errors.Is(err, boom) {
+		return fmt.Errorf("exit 入队失败时 Reap = %v, want 包装 %v", err, boom)
+	}
+
+	fds, err = devNullFDs()
+	if err != nil {
+		return err
+	}
+	if err := reg.Start("bad", execLauncher{}, argvSpec("/nonexistent/agentbox-test"), fds); !errors.Is(err, boom) {
+		return fmt.Errorf("start_err 入队失败时 Start = %v, want 包装 %v", err, boom)
+	}
+
+	sink := newReaperSink(1)
+	ok := NewRegistry(sink.out)
+	fds, err = devNullFDs()
+	if err != nil {
+		return err
+	}
+	if err := ok.Start("bad", execLauncher{}, argvSpec("/nonexistent/agentbox-test"), fds); err != nil {
+		return fmt.Errorf("Launch 失败时 Start = %v, want nil（经 start_err 报告）", err)
+	}
+	msgs := sink.snapshot()
+	if len(msgs) != 1 || msgs[0].Type != MsgStartErr || msgs[0].ExecID != "bad" || msgs[0].Reason == "" {
+		return fmt.Errorf("消息 = %+v, want 一条带 reason 的 start_err", msgs)
+	}
+	return nil
 }
