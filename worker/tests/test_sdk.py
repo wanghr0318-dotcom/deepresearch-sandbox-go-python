@@ -211,3 +211,300 @@ def test_stdio_reader_stops_consuming_after_event_loop_closes():
     assert asyncio.run(go()) == LINES[0]
     assert transport.wait_reader_stopped(5)
     assert (reader.calls, reader.tell()) == (READ_LIMIT, READ_LIMIT_BYTES)
+
+
+# ---- 运行时：握手、控制消息、checkpoint、产物 ----
+# 正常路径、查询、重发、冲突、暂停、取消与恢复由 SDK 层场景逐条回放（见下一节），此处不重复。
+
+import hashlib
+import itertools
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from agentbox_worker import Result, TaskContext, Timing, WorkerFailure, run_worker
+
+FAST = Timing(ack_timeout=0.05, max_ack_attempts=3, retry_backoff=0.01, artifact_timeout=0.5)
+INIT = {
+    "type": "init",
+    "bootstrap": 1,
+    "protocol_versions": [1],
+    "mode": "task",
+    "task_id": "t-1",
+    "attempt_id": "a-1",
+    "attempt_no": 1,
+}
+
+Responder = Callable[[dict[str, Any], MemoryTransport], None]
+
+
+def run(
+    app,
+    tmp_path: Path,
+    *,
+    host_lines: list[bytes | None] = (),
+    responder: Responder | None = None,
+    init: dict[str, Any] | None = None,
+) -> tuple[int, list[dict[str, Any]]]:
+    async def go():
+        transport = MemoryTransport()
+        transport.feed(json.dumps({**INIT, "out_dir": str(tmp_path), **(init or {})}).encode())
+        for line in host_lines:
+            transport.feed(line)
+        if responder is not None:
+            transport.on_send = lambda line: responder(json.loads(line), transport)
+        counter = itertools.count(1)
+        code = await asyncio.wait_for(
+            run_worker(
+                app,
+                transport,
+                name="test-worker",
+                version="0",
+                timing=FAST,
+                new_id=lambda: f"cp-{next(counter)}",
+            ),
+            timeout=5,
+        )
+        return code, sent_json(transport)
+
+    return asyncio.run(go())
+
+
+def reply(transport: MemoryTransport, message: dict[str, Any]) -> None:
+    transport.feed(json.dumps({"v": 1, **message}).encode())
+
+
+def checkpoint_reply(status: str) -> Responder:
+    def respond(msg: dict[str, Any], transport: MemoryTransport) -> None:
+        if msg["type"] == "checkpoint":
+            reply(
+                transport,
+                {
+                    "type": "checkpoint_result",
+                    "checkpoint_id": msg["checkpoint_id"],
+                    "scope": "task",
+                    "status": status,
+                },
+            )
+
+    return respond
+
+
+def types(events: list[dict[str, Any]]) -> list[str]:
+    return [e["type"] for e in events]
+
+
+async def returns_ok(ctx: TaskContext) -> Result:
+    return Result("ok", [])
+
+
+async def sleeps(ctx: TaskContext) -> Result:
+    await asyncio.sleep(10)
+    return Result("never", [])
+
+
+def test_ready_checkpoint_artifact_result(tmp_path):
+    content = "# 报告".encode() + b"\n"
+    (tmp_path / "report.md").write_bytes(content)
+
+    def respond(msg, transport):
+        checkpoint_reply("committed")(msg, transport)
+        if msg["type"] == "artifact":
+            reply(
+                transport,
+                {
+                    "type": "artifact_result",
+                    "artifact_id": msg["artifact_id"],
+                    "status": "saved",
+                    "version": 2,
+                    "sha256": msg["declared_sha256"],
+                },
+            )
+
+    async def app(ctx):
+        checkpoint_id = await ctx.checkpoint("s1", state={"n": 1})
+        ref = await ctx.register_artifact("report", "report.md", media_type="text/markdown")
+        return Result(f"{checkpoint_id}/v{ref.version}", [ref.artifact_id])
+
+    code, events = run(app, tmp_path, responder=respond)
+    assert code == 0
+    assert types(events) == ["ready", "checkpoint", "artifact", "result"]
+    ready, checkpoint, artifact, result = events
+    assert ready["worker"] == {"name": "test-worker", "version": "0"}
+    assert checkpoint["checkpoint_id"] == "cp-1" and checkpoint["state"] == {"n": 1}
+    assert checkpoint["refs"] == [] and "state_ref" not in checkpoint
+    assert artifact["declared_sha256"] == hashlib.sha256(content).hexdigest()
+    assert artifact["declared_size"] == len(content) and artifact["visibility"] == "output"
+    assert result["summary"] == "cp-1/v2" and result["outputs"] == ["report"]
+
+
+def test_unsupported_mode_fails_before_ready(tmp_path):
+    code, events = run(returns_ok, tmp_path, init={"mode": "session"})
+    assert code == 1
+    assert types(events) == ["error"]
+    assert events[0]["code"] == "unsupported_mode" and events[0]["retryable"] is False
+
+
+@pytest.mark.parametrize(
+    ("raised", "code", "retryable"),
+    [
+        pytest.param(
+            WorkerFailure("bad_input", "输入缺少字段"), "bad_input", False, id="worker_failure"
+        ),
+        pytest.param(KeyError("boom"), "internal_error", True, id="unexpected_exception"),
+    ],
+)
+def test_app_failure_becomes_error_event(tmp_path, raised, code, retryable):
+    async def app(ctx):
+        raise raised
+
+    exit_code, events = run(app, tmp_path)
+    assert exit_code == 1
+    assert types(events) == ["ready", "error"]
+    assert events[1]["code"] == code and events[1]["retryable"] is retryable
+
+
+def test_stdin_eof_is_treated_as_cancel(tmp_path):
+    code, events = run(sleeps, tmp_path, host_lines=[None])
+    assert code == 0
+    assert types(events) == ["ready"]
+
+
+def test_invalid_control_message_fails_task(tmp_path):
+    code, events = run(sleeps, tmp_path, host_lines=[b'{"type":"bogus","v":1}'])
+    assert code == 1
+    assert types(events) == ["ready", "error"]
+    assert events[1]["code"] == "control_protocol_error"
+
+
+def test_only_one_checkpoint_in_flight(tmp_path):
+    in_flight = 0
+    overlaps: list[str] = []
+
+    def respond(msg, transport):
+        nonlocal in_flight
+        if msg["type"] != "checkpoint":
+            return
+        if in_flight:
+            overlaps.append(msg["checkpoint_id"])
+        in_flight += 1
+
+        def deliver():
+            nonlocal in_flight
+            in_flight -= 1
+            checkpoint_reply("committed")(msg, transport)
+
+        asyncio.get_running_loop().call_later(0.02, deliver)
+
+    async def app(ctx):
+        async with asyncio.TaskGroup() as group:
+            group.create_task(ctx.checkpoint("s1", state={}))
+            group.create_task(ctx.checkpoint("s2", state={}))
+        return Result("ok", [])
+
+    code, events = run(app, tmp_path, responder=respond)
+    assert code == 0 and overlaps == []
+    assert [e["checkpoint_id"] for e in events if e["type"] == "checkpoint"] == ["cp-1", "cp-2"]
+
+
+def test_unresolved_after_max_attempts(tmp_path):
+    async def app(ctx):
+        await ctx.checkpoint("s1", state={})
+        return Result("never", [])
+
+    code, events = run(app, tmp_path)
+    assert code == 1
+    assert types(events).count("checkpoint_query") == FAST.max_ack_attempts
+    assert events[-1]["code"] == "checkpoint_unresolved" and events[-1]["retryable"] is True
+
+
+@pytest.mark.parametrize(
+    ("state", "code"),
+    [
+        pytest.param("x" * (256 << 10), "state_too_large", id="oversized"),
+        pytest.param({"x": object()}, "invalid_field", id="unserializable"),
+    ],
+)
+def test_bad_state_fails_without_sending(tmp_path, state, code):
+    async def app(ctx):
+        await ctx.checkpoint("s1", state=state)
+        return Result("never", [])
+
+    exit_code, events = run(app, tmp_path)
+    assert exit_code == 1
+    assert types(events) == ["ready", "error"]
+    assert events[1]["code"] == code
+
+
+def test_checkpoint_retries_use_snapshot_of_state(tmp_path):
+    state = {"n": 1}
+    replies = iter(["retryable_error", "committed"])
+
+    def respond(msg, transport):
+        if msg["type"] == "checkpoint":
+            state["n"] = 99  # 提交后修改调用方对象，不得影响同一 checkpoint 的重试内容
+            checkpoint_reply(next(replies))(msg, transport)
+
+    async def app(ctx):
+        return Result(await ctx.checkpoint("s1", state=state), [])
+
+    code, events = run(app, tmp_path, responder=respond)
+    sent = [e for e in events if e["type"] == "checkpoint"]
+    assert code == 0
+    assert [e["state"] for e in sent] == [{"n": 1}, {"n": 1}]
+
+
+@pytest.mark.parametrize(
+    ("path", "code", "sent"),
+    [
+        pytest.param(
+            "x.txt", "artifact_rejected", ["ready", "artifact", "error"], id="host_rejects"
+        ),
+        pytest.param("../in/x", "path_invalid", ["ready", "error"], id="invalid_path_local"),
+    ],
+)
+def test_artifact_failure_fails_task(tmp_path, path, code, sent):
+    (tmp_path / "x.txt").write_bytes(b"x")
+
+    def respond(msg, transport):
+        if msg["type"] == "artifact":
+            reply(
+                transport,
+                {
+                    "type": "artifact_result",
+                    "artifact_id": msg["artifact_id"],
+                    "status": "rejected",
+                    "code": "hash_mismatch",
+                },
+            )
+
+    async def app(ctx):
+        await ctx.register_artifact("x", path, media_type="text/plain")
+        return Result("never", [])
+
+    exit_code, events = run(app, tmp_path, responder=respond)
+    assert exit_code == 1
+    assert types(events) == sent and events[-1]["code"] == code
+
+
+class BreaksAfterReady(MemoryTransport):
+    async def send(self, line: bytes) -> None:
+        if self.sent:
+            raise OSError("broken pipe")
+        await super().send(line)
+
+
+def test_broken_transport_ends_worker_with_failure(tmp_path):
+    async def app(ctx):
+        await ctx.progress("step_started", "x")
+        return Result("never", [])
+
+    async def go():
+        transport = BreaksAfterReady()
+        transport.feed(json.dumps({**INIT, "out_dir": str(tmp_path)}).encode())
+        code = await asyncio.wait_for(
+            run_worker(app, transport, name="w", version="0", timing=FAST), timeout=5
+        )
+        return code, types(sent_json(transport))
+
+    assert asyncio.run(go()) == (1, ["ready"])
