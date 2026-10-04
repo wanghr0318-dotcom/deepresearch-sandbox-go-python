@@ -67,12 +67,13 @@ type ExitInfo struct {
 //	exit       ExecID, Exit
 //	terminate  ExecID
 type Message struct {
-	Type   string          `json:"type"`
-	ExecID string          `json:"exec_id"`
-	Spec   json.RawMessage `json:"spec,omitempty"`
-	PID    int             `json:"pid,omitempty"`
-	Reason string          `json:"reason,omitempty"`
-	Exit   *ExitInfo       `json:"exit,omitempty"`
+	Type    string          `json:"type"`
+	ExecID  string          `json:"exec_id"`
+	Spec    json.RawMessage `json:"spec,omitempty"`
+	PID     int             `json:"pid,omitempty"`
+	Reason  string          `json:"reason,omitempty"`
+	Exit    *ExitInfo       `json:"exit,omitempty"`
+	GraceMS int64           `json:"grace_ms,omitempty"` // terminate：SIGTERM 之后到 SIGKILL 的宽限（规格 §4.4）
 }
 
 // validateMessage 检查一条消息在给定 FD 数下是否合法；发送端与接收端共用。
