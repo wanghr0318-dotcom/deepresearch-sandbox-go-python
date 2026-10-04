@@ -1,0 +1,15 @@
+{
+  "name": "pause_at_boundary",
+  "description": "收到 pause 后在下一个提交边界暂停，paused 指向最新已提交 checkpoint",
+  "layers": ["protocol", "sdk"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "task", "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1", "config": {"steps": [{"op": "checkpoint", "step_id": "s1"}, {"op": "progress", "step_id": "s2", "kind": "step_started", "message": "继续"}, {"op": "checkpoint", "step_id": "s2"}], "summary": "完成", "outputs": []}}},
+    {"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "task", "worker": {"name": "sim-worker", "version": "0.1.0"}, "capabilities": []}},
+    {"from": "worker", "message": {"type": "checkpoint", "v": 1, "seq": 2, "checkpoint_id": "cp-1", "scope": "task", "step_id": "s1", "state": {"next_index": 1}, "refs": []}},
+    {"from": "host", "message": {"type": "pause", "v": 1, "attempt_id": "a-1", "reason": "user", "grace_ms": 5000}},
+    {"from": "host", "message": {"type": "checkpoint_result", "v": 1, "checkpoint_id": "cp-1", "scope": "task", "status": "committed"}},
+    {"from": "worker", "message": {"type": "paused", "v": 1, "seq": 3, "checkpoint_id": "cp-1"}}
+  ],
+  "expect": {"stream": "ok"},
+  "sdk": {"exit_code": 0}
+}

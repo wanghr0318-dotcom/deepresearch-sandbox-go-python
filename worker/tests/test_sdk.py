@@ -617,3 +617,110 @@ def test_broken_transport_ends_worker_with_failure(tmp_path):
         return code, types(sent_json(transport))
 
     assert asyncio.run(go()) == (1, ["ready"])
+
+
+# ---- SDK 层场景回放与 sim-worker ----
+# 用 SDK 驱动 sim-worker 逐条复现 layers 含 "sdk" 的场景：宿主行按顺序送入内存传输；每当
+# Worker 发出一行，就与场景中下一条 Worker 行比较（忽略 ts），再送入其后连续的宿主行。
+# init.out_dir 替换为临时目录。
+
+from protocol_fixtures import load_scenarios
+
+from agentbox_worker.stream import StreamChecker
+from sim_worker import NAME, VERSION
+from sim_worker.app import run as sim_app
+
+SCENARIO_TIMING = Timing(
+    ack_timeout=0.05, max_ack_attempts=5, retry_backoff=0.01, artifact_timeout=1.0
+)
+SDK_SCENARIOS = [s for s in load_scenarios() if "sdk" in s["layers"]]
+assert len(SDK_SCENARIOS) >= 9, "SDK 层场景缺失"
+
+
+def replay_sdk(scenario: dict[str, Any], out_dir: str) -> tuple[int, list[str], int]:
+    lines = scenario["lines"]
+    problems: list[str] = []
+    cursor = 0
+
+    async def go() -> int:
+        nonlocal cursor
+        transport = MemoryTransport()
+
+        def pump() -> None:
+            nonlocal cursor
+            while cursor < len(lines) and lines[cursor]["from"] == "host":
+                message = dict(lines[cursor]["message"])
+                if message.get("type") == "init":
+                    message["out_dir"] = out_dir
+                transport.feed(json.dumps(message, ensure_ascii=False).encode())
+                cursor += 1
+
+        def on_send(raw: bytes) -> None:
+            nonlocal cursor
+            got = json.loads(raw)
+            got.pop("ts", None)
+            if cursor >= len(lines) or lines[cursor]["from"] != "worker":
+                problems.append(f"多出的 Worker 消息：{got}")
+                return
+            want = lines[cursor]["message"]
+            if got != want:
+                problems.append(f"第 {cursor} 行不一致：期望 {want}，得到 {got}")
+            cursor += 1
+            pump()
+
+        transport.on_send = on_send
+        pump()
+        counter = itertools.count(1)
+        code = await asyncio.wait_for(
+            run_worker(
+                sim_app,
+                transport,
+                name=NAME,
+                version=VERSION,
+                timing=SCENARIO_TIMING,
+                new_id=lambda: f"cp-{next(counter)}",
+            ),
+            timeout=10,
+        )
+        checker = StreamChecker()
+        for raw in transport.sent:
+            checker.observe(json.loads(raw))
+        return code
+
+    code = asyncio.run(go())
+    return code, problems, cursor
+
+
+@pytest.mark.parametrize("scenario", SDK_SCENARIOS, ids=lambda s: s["name"])
+def test_sdk_reproduces_scenario(scenario, tmp_path):
+    code, problems, cursor = replay_sdk(scenario, str(tmp_path))
+    assert problems == []
+    assert cursor == len(scenario["lines"]), "场景中仍有未出现的行"
+    assert code == scenario["sdk"]["exit_code"]
+
+
+@pytest.mark.parametrize(
+    ("steps", "config", "code", "last"),
+    [
+        pytest.param(
+            [{"op": "fail", "code": "sim_failure", "message": "x", "retryable": True}],
+            {},
+            1,
+            {"code": "sim_failure", "retryable": True},
+            id="fail",
+        ),
+        pytest.param(
+            [{"op": "allocate_mb", "mb": 4}],
+            {"summary": "分配完成"},
+            0,
+            {"summary": "分配完成"},
+            id="allocate_mb",
+        ),
+        pytest.param([{"op": "teleport"}], {}, 1, {"code": "sim_bad_config"}, id="unknown_op"),
+        pytest.param([], {}, 0, {"summary": "done", "outputs": []}, id="defaults"),
+    ],
+)
+def test_sim_worker_ops(tmp_path, steps, config, code, last):
+    exit_code, events = run(sim_app, tmp_path, init={"config": {"steps": steps, **config}})
+    assert exit_code == code
+    assert events[-1] == {**events[-1], **last}

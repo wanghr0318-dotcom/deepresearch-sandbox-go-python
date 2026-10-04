@@ -1,0 +1,11 @@
+{
+  "name": "handshake_no_common_version",
+  "description": "没有共同协议版本时只输出 handshake_error",
+  "layers": ["protocol", "sdk"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [2], "mode": "task", "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1", "config": {"steps": []}}},
+    {"from": "worker", "message": {"type": "handshake_error", "bootstrap": 1, "code": "no_common_version"}}
+  ],
+  "expect": {"stream": "ok"},
+  "sdk": {"exit_code": 2}
+}

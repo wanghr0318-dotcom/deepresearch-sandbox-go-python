@@ -1,0 +1,15 @@
+{
+  "name": "ack_lost_retry_same_result",
+  "description": "checkpoint_result 丢失时用同一 checkpoint_id 查询",
+  "layers": ["protocol", "sdk"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "task", "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1", "config": {"steps": [{"op": "checkpoint", "step_id": "s1"}], "summary": "完成", "outputs": []}}},
+    {"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "task", "worker": {"name": "sim-worker", "version": "0.1.0"}, "capabilities": []}},
+    {"from": "worker", "message": {"type": "checkpoint", "v": 1, "seq": 2, "checkpoint_id": "cp-1", "scope": "task", "step_id": "s1", "state": {"next_index": 1}, "refs": []}},
+    {"from": "worker", "message": {"type": "checkpoint_query", "v": 1, "seq": 3, "checkpoint_id": "cp-1", "scope": "task"}},
+    {"from": "host", "message": {"type": "checkpoint_result", "v": 1, "checkpoint_id": "cp-1", "scope": "task", "status": "committed"}},
+    {"from": "worker", "message": {"type": "result", "v": 1, "seq": 4, "summary": "完成", "outputs": []}}
+  ],
+  "expect": {"stream": "ok"},
+  "sdk": {"exit_code": 0}
+}
