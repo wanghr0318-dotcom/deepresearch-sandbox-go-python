@@ -519,7 +519,7 @@ type Environment struct {
 
 - [ ] **Step 2：写入依赖方向检查**
 
-这是守护性测试：当前没有任何包违反规则，它防止后续任务（尤其 Task 4 引入 pgx 之后）把驱动带进消费者包。
+这是守护性测试：当前没有任何包违反规则，它防止后续任务（尤其 Task 4 引入 pgx 之后）把驱动带进消费者包。此时只列出已存在的五个包；`ownership`、`datadir`、`blob` 由 Task 4 在引入 pgx 时加入列表（`go list` 对不存在的包会失败，不能提前列出，也不应以跳过的方式放宽检查）。
 
 `internal/archtest/archtest_test.go`：
 
@@ -554,8 +554,7 @@ func deps(t *testing.T, pkg string) []string {
 func TestConsumersDoNotDependOnPostgres(t *testing.T) {
 	forbidden := []string{module + "/internal/persistence/postgres", "github.com/jackc/pgx"}
 	for _, pkg := range []string{
-		"internal/api", "internal/task", "internal/runner", "internal/resource",
-		"internal/ownership", "internal/persistence", "internal/datadir", "internal/blob",
+		"internal/api", "internal/task", "internal/runner", "internal/resource", "internal/persistence",
 	} {
 		for _, d := range deps(t, pkg) {
 			for _, f := range forbidden {
@@ -1421,6 +1420,7 @@ cd /f/go-agentbox-m1-4 && git add internal/ownership && git commit -m "feat(owne
 - Create: `internal/persistence/postgres/migrations/0001_init.sql`
 - Create: `internal/persistence/postgres/postgres.go`、`lock.go`、`migrate.go`
 - Create: `internal/persistence/postgres/postgres_test.go`（第一节；Task 5–7 依次追加）
+- Modify: `internal/archtest/archtest_test.go`（把 Task 2、3 新建的包加入依赖方向检查）
 
 **Interfaces:**
 - Consumes：Task 1 的 `persistence` 错误；Task 3 的 `ownership.InstallStore`、`ownership.Bootstrap`；Task 2 的 `datadir.IDFile`（测试中）。
@@ -2741,10 +2741,27 @@ func (s *Store) migrationTx(ctx context.Context, op string, fn txFunc) error {
 }
 ```
 
+然后在 `internal/archtest/archtest_test.go` 中把包列表
+
+```go
+	for _, pkg := range []string{
+		"internal/api", "internal/task", "internal/runner", "internal/resource", "internal/persistence",
+	} {
+```
+
+替换为
+
+```go
+	for _, pkg := range []string{
+		"internal/api", "internal/task", "internal/runner", "internal/resource",
+		"internal/ownership", "internal/persistence", "internal/datadir", "internal/blob",
+	} {
+```
+
 - [ ] **Step 5：验证**
 
 ```bash
-MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -e bash -c 'export PATH=/usr/local/go/bin:/usr/bin:/bin GOTOOLCHAIN=local GOPROXY=file:///mnt/f/go-agentbox/.superpowers/goproxy GOSUMDB=off AGENTBOX_TEST_DATABASE_URL="postgres://agentbox:agentbox@127.0.0.1:5432/agentbox?sslmode=disable"; cd /mnt/f/go-agentbox-m1-4 && gofmt -l internal/persistence; go vet ./internal/persistence/... && GOOS=windows go build ./... && CI=true go test -count=1 -v ./internal/persistence/postgres/ 2>&1 | grep -E "^(--- |ok|FAIL)|失锁检测延迟"'
+MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -e bash -c 'export PATH=/usr/local/go/bin:/usr/bin:/bin GOTOOLCHAIN=local GOPROXY=file:///mnt/f/go-agentbox/.superpowers/goproxy GOSUMDB=off AGENTBOX_TEST_DATABASE_URL="postgres://agentbox:agentbox@127.0.0.1:5432/agentbox?sslmode=disable"; cd /mnt/f/go-agentbox-m1-4 && gofmt -l internal/persistence; go vet ./internal/persistence/... && GOOS=windows go build ./... && go test -count=1 ./internal/archtest/ && CI=true go test -count=1 -v ./internal/persistence/postgres/ 2>&1 | grep -E "^(--- |ok|FAIL)|失锁检测延迟"'
 ```
 
 Expected: 全部 PASS（`TestInstallationBootstrapE46` 的 7 个子测试、`TestDeadlockIsRetried`、`TestContentionAndUnknownDeadline`、`TestOwnershipLossCancelsOperations`），日志中有失锁检测延迟；最后一行 `ok`。
@@ -2752,7 +2769,7 @@ Expected: 全部 PASS（`TestInstallationBootstrapE46` 的 7 个子测试、`Tes
 - [ ] **Step 6：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add go.mod go.sum deploy/docker-compose.yml internal/persistence/postgres/migrations/0001_init.sql internal/persistence/postgres/postgres.go internal/persistence/postgres/lock.go internal/persistence/postgres/migrate.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): PostgreSQL 迁移、事务辅助、advisory lock 与安装存储（E46、E12/E13 存储部分）" ${COAUTHOR:+-m "$COAUTHOR"}
+cd /f/go-agentbox-m1-4 && git add go.mod go.sum deploy/docker-compose.yml internal/persistence/postgres/migrations/0001_init.sql internal/persistence/postgres/postgres.go internal/persistence/postgres/lock.go internal/persistence/postgres/migrate.go internal/persistence/postgres/postgres_test.go internal/archtest/archtest_test.go && git commit -m "feat(persistence): PostgreSQL 迁移、事务辅助、advisory lock 与安装存储（E46、E12/E13 存储部分）" ${COAUTHOR:+-m "$COAUTHOR"}
 ```
 
 ---
@@ -5071,6 +5088,7 @@ cd /f/go-agentbox-m1-4 && git add .github/workflows/ci.yml && git commit -m "ci:
 - **设计覆盖**：设计 §1.1 依赖规则 → Task 1 archtest；§1.2 所有权三分 → Task 2、3、4；§1.3 表结构 → Task 4 迁移；§1.4 接口批次 → Task 1（接口）与 Task 5–7（实现），`recovery.Store` 明确交给 Plan 6；§2.1–§2.3 事务辅助与未知提交 → Task 4 `run`/`final` 与测试，Task 5 的"第一次提交未完成"；§2.4 每个用例的身份与内容比较 → Task 5–7 的实现与"提交回复丢失""冲突"测试；§2.6 前置条件 → Task 5（控制写入、准入、判决仲裁）与 Task 6（checkpoint 与产物的 fencing、引用授权）；§3.1 事件 → Task 5、6；§3.2 BlobStore → Task 2；§3.3 E46 → Task 3、4；§3.4 E13 存储部分 → Task 4；§3.5 迁移 → Task 4；§4 测试与环境 → Task 4、8。
 - **验收归属**：E11a（Task 5–7 的提交回复丢失）、E12 存储部分（Task 4 死锁重跑）、E13 存储部分（Task 4 失锁）、E46（Task 3、4）。
 - **演练**：本计划的全部代码已在临时 worktree 中按计划文本组装，并在 WSL + Docker Desktop 的 PostgreSQL 16.15 上运行：全仓库 `go build`（Linux 与 Windows）、`go vet`、`CI=true go test ./...` 通过；`internal/persistence/postgres` 连续三次通过；Task 4、5、6、7 各阶段的代码树分别通过；变异检查——去掉 `CreateAttempt` 的事务内身份仲裁、让终态提议静默忽略不同内容、跳过 Worker 事件的逐条内容比较、不重跑死锁中止——均被对应测试捕获；评审修订后又逐个去掉 9 条前置条件规则（checkpoint 的 fencing、引用授权，产物的 fencing，判决的当前 attempt、控制版本、desired 约束，attempt 准入、"准入先于幂等查询"的错误顺序，控制写入规则），均被捕获；失锁检测延迟约 100 ms（检测周期 200 ms 时）。
+- **执行中修订**：Task 1 的 archtest 原先列出 Task 2、3 才创建的包，`go list` 失败（演练只逐阶段验证了 Task 4–7）；改为 Task 1 只列已存在的包、Task 4 扩展到全部八个，最终文件与原计划相同。
 - **未在本地验证**：golangci-lint（本机未安装，由 CI 判定）。
 - **评审修订（第三轮）**：checkpoint 缺少 fencing 与引用授权、最终判决未在锁内仲裁取消与当前 attempt、创建 attempt 缺少准入前置条件——均为规格 §5.5、§8.1 的实现遗漏，已按设计 §2.6 并入 Task 5、6，并补测试。同类遗漏 `AcceptControl` 的控制写入规则（`task_ended` 等）一并补上，"判决先提交"的测试依赖它。设计文档的 pgx 版本已统一为 v5.7.6；提交署名只在有真实共同作者时添加，不编造、不阻止提交。
 - **占位符**：无（`COAUTHOR` 是可选的环境变量，未设置时提交命令省略署名）。
