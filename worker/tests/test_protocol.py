@@ -195,3 +195,56 @@ def test_encode_rejects(direction, message, code):
     with pytest.raises(ProtocolError) as exc:
         encode_line(direction, message)
     assert exc.value.code == code
+
+
+# ---- JSON Schema：与 fixtures 一致 ----
+
+from typing import Any
+
+from jsonschema import Draft202012Validator
+from protocol_fixtures import FIXTURES
+
+SCHEMA_NAMES = ("task", "control", "event")
+
+
+def load_schema(name: str) -> dict[str, Any]:
+    path = FIXTURES.parents[1] / "v1" / f"{name}.schema.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+VALIDATORS = {name: Draft202012Validator(load_schema(name)) for name in SCHEMA_NAMES}
+
+
+def validator_for(direction: str, msg: dict[str, Any]) -> Draft202012Validator:
+    if direction == "worker":
+        return VALIDATORS["event"]
+    return VALIDATORS["task"] if msg.get("type") == "init" else VALIDATORS["control"]
+
+
+def test_schemas_are_valid_draft_2020_12():
+    for name in SCHEMA_NAMES:
+        Draft202012Validator.check_schema(load_schema(name))
+
+
+def valid_items() -> list[tuple[str, str, dict[str, Any]]]:
+    items = [(c["name"], c["direction"], c["message"]) for c in MESSAGES["valid"]]
+    for scenario in SCENARIOS:
+        bad = scenario["expect"].get("at")
+        for index, line in enumerate(scenario["lines"]):
+            if index != bad and "message" in line:
+                items.append((f"{scenario['name']}[{index}]", line["from"], line["message"]))
+    return items
+
+
+@pytest.mark.parametrize("item", valid_items(), ids=lambda i: i[0])
+def test_schema_accepts_valid(item):
+    _, direction, msg = item
+    errors = list(validator_for(direction, msg).iter_errors(msg))
+    assert not errors, [e.message for e in errors]
+
+
+@pytest.mark.parametrize(
+    "case", [c for c in MESSAGES["invalid"] if "message" in c], ids=lambda c: c["name"]
+)
+def test_schema_rejects_invalid(case):
+    assert not validator_for(case["direction"], case["message"]).is_valid(case["message"])

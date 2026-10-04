@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wanghr0318-dotcom/go-agentbox/protocol/v1/control.schema.json",
+  "title": "宿主 → Worker 控制消息（init 除外）",
+  "oneOf": [
+    {"$ref": "#/$defs/checkpoint_result"},
+    {"$ref": "#/$defs/artifact_result"},
+    {"$ref": "#/$defs/cancel"},
+    {"$ref": "#/$defs/pause"}
+  ],
+  "$defs": {
+    "nonEmpty": {"type": "string", "minLength": 1},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "checkpoint_result": {
+      "type": "object",
+      "required": ["type", "v", "checkpoint_id", "scope", "status"],
+      "properties": {
+        "type": {"const": "checkpoint_result"},
+        "v": {"const": 1},
+        "checkpoint_id": {"$ref": "#/$defs/nonEmpty"},
+        "scope": {"enum": ["task", "session"]},
+        "status": {"enum": ["committed", "conflict", "rejected", "retryable_error", "not_found"]},
+        "code": {"type": "string"}
+      }
+    },
+    "artifact_result": {
+      "type": "object",
+      "required": ["type", "v", "artifact_id", "status"],
+      "properties": {
+        "type": {"const": "artifact_result"},
+        "v": {"const": 1},
+        "artifact_id": {"$ref": "#/$defs/nonEmpty"},
+        "status": {"enum": ["saved", "rejected"]},
+        "version": {"type": "integer"},
+        "sha256": {"type": "string"},
+        "code": {"type": "string"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "saved"}}},
+          "then": {"required": ["version", "sha256"], "properties": {"version": {"minimum": 1}, "sha256": {"$ref": "#/$defs/sha256"}}}
+        },
+        {
+          "if": {"properties": {"status": {"const": "rejected"}}},
+          "then": {"required": ["code"], "properties": {"code": {"minLength": 1}}}
+        }
+      ]
+    },
+    "stop": {
+      "type": "object",
+      "required": ["type", "v", "attempt_id"],
+      "properties": {
+        "v": {"const": 1},
+        "attempt_id": {"$ref": "#/$defs/nonEmpty"},
+        "reason": {"type": "string"},
+        "grace_ms": {"type": "integer", "minimum": 0}
+      }
+    },
+    "cancel": {"allOf": [{"$ref": "#/$defs/stop"}, {"properties": {"type": {"const": "cancel"}}}]},
+    "pause": {"allOf": [{"$ref": "#/$defs/stop"}, {"properties": {"type": {"const": "pause"}}}]}
+  }
+}

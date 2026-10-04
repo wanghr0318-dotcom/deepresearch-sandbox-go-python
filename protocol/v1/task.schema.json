@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wanghr0318-dotcom/go-agentbox/protocol/v1/task.schema.json",
+  "title": "init（宿主 → Worker）",
+  "description": "type、bootstrap、protocol_versions 组成引导信封，永不改变；mode=task 时其余字段按 v1 校验。",
+  "type": "object",
+  "required": ["type", "bootstrap", "protocol_versions", "mode"],
+  "properties": {
+    "type": {"const": "init"},
+    "bootstrap": {"const": 1},
+    "protocol_versions": {"type": "array", "minItems": 1, "items": {"type": "integer"}},
+    "mode": {"enum": ["task", "session"]},
+    "task_id": {"$ref": "#/$defs/nonEmpty"},
+    "attempt_id": {"$ref": "#/$defs/nonEmpty"},
+    "attempt_no": {"type": "integer", "minimum": 1},
+    "traceparent": {"type": "string"},
+    "config_version": {"type": "string"},
+    "input_refs": {"type": "array", "items": {"$ref": "#/$defs/sha256"}},
+    "out_dir": {"$ref": "#/$defs/nonEmpty"},
+    "resume": {"$ref": "#/$defs/resume"}
+  },
+  "if": {"properties": {"mode": {"const": "task"}}},
+  "then": {"required": ["task_id", "attempt_id", "attempt_no", "out_dir"]},
+  "$defs": {
+    "nonEmpty": {"type": "string", "minLength": 1},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "resume": {
+      "type": "object",
+      "required": ["checkpoint_id", "step_id"],
+      "properties": {
+        "checkpoint_id": {"$ref": "#/$defs/nonEmpty"},
+        "step_id": {"$ref": "#/$defs/nonEmpty"},
+        "state_ref": {"$ref": "#/$defs/sha256"},
+        "refs": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/sha256"}}
+      },
+      "oneOf": [
+        {"required": ["state"], "not": {"required": ["state_ref"]}},
+        {"required": ["state_ref"], "not": {"required": ["state"]}}
+      ]
+    }
+  }
+}
