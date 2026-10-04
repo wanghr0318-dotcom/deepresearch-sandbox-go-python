@@ -94,7 +94,7 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
 
 - **seq 的提交点**是"校验通过、开始发送"：此后无论发送成功、失败还是被取消，该 seq 都已用掉。发送失败或在途被取消时结果不确定，输出通道进入失效状态（`TransportBroken`），此后不再发送任何事件，绝不以同一 seq 重发；Worker 以 1 退出且无法再发出 `error`。
 - **输入**：读取阶段即按帧长上限（init 上限 1 MiB + 行尾）截断判定，超长帧报 `message_too_large` 并停止读取；读到的行进入线程安全的有界队列（默认 64 条），队列满时读线程阻塞，对宿主形成背压。读线程绑定首次 `receive` 所在的事件循环，该循环关闭后不再读取输入并退出。输入缓冲约为 (64 + 1) 帧：队列中的 64 帧，加上读线程正在读取或等待入队的一帧，另有对象与底层文件缓冲的开销；这是估算，**不是**总内存的硬上限（不能写成"最多 64 MiB"）。
-- **进程入口** `main()` 是 SDK 中唯一调用 `os._exit` 的地方：运行 Worker（任何异常都记录并按失败处理）→ 在期限内等待已提交的输出写完 → `os._exit`。期限由环境变量 `AGENTBOX_WORKER_SHUTDOWN_TIMEOUT` 设置（秒，默认 5）。读写线程可能阻塞在 stdin 或 stdout 上且无法取消，正常的解释器收尾会挂起或崩溃（计划演练中实测复现 `Fatal Python error: _enter_buffered_busy`）。
+- **进程入口** `main()` 是 SDK 中唯一调用 `os._exit` 的地方：运行 Worker（任何异常都记录并按失败处理）→ 在期限内等待已提交的输出写完 → `os._exit`。期限由环境变量 `AGENTBOX_WORKER_SHUTDOWN_TIMEOUT` 设置（秒，默认 5；不在 0–3600 内时用默认值），收尾步骤本身失败也必须执行 `os._exit`。读写线程可能阻塞在 stdin 或 stdout 上且无法取消，正常的解释器收尾会挂起或崩溃（计划演练中实测复现 `Fatal Python error: _enter_buffered_busy`）。
 - **该期限只约束协议输出的收尾，不是整个 Worker 的退出期限。** `register_artifact` 在线程池中计算哈希，不能保证有限时间内完成（路径是 FIFO 或读操作阻塞时线程会一直等待且无法取消）；`asyncio.run` 返回前会等待线程池中的线程（演练中在 3.11 与 3.13 上实测），这段等待发生在进入输出收尾之前，不受该期限约束。**最终强制终止由宿主负责。**
 - **边界输入的两侧一致性**：数值超出 int64 范围的整数字段 → `invalid_field`；JSON 中的孤立代理项转义（如 `\ud800`）在解码时接受（Go 替换为 U+FFFD，Python 保留并按 surrogatepass 计长），Python 编码含孤立代理项的消息 → `invalid_field`。inline state 的大小由宿主（Go）按原始文本的紧凑形式判定，为准；SDK 按重新序列化计，作为发送前预检——对 SDK 生成的消息两者一致，手写的非规范写法（`\u` 转义、数字拼写、重复键）以宿主为准。已知差异：Python 不接受超过 4300 位的整数字面量（解释器限制，报 `malformed_json`），Go 在自由格式字段（`state`、`data`、`config`）中接受。
 - **checkpoint 快照**：`state` 在首次提交前经 JSON 往返生成快照，所有重试复用它。往返会归一化：tuple 变为 list，非字符串键变为字符串；NaN 与 Infinity 被拒绝（`invalid_field`）。
@@ -2924,6 +2924,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `transport.MemoryTransport()`：`feed(line: bytes | None)`、`sent: list[bytes]`、`on_send: Callable[[bytes], None] | None`
   - `outbox.Outbox(transport)`：`async emit(body: dict) -> None`（补 `v`、`seq`、`ts`；校验失败抛 `ProtocolError` 且不占用 seq；seq 在开始发送时提交；发送失败或在途取消后进入失效状态，此后一律抛 `TransportBroken`）、`async send_handshake_error(code: str) -> None`、属性 `last_seq`
   - `outbox.Waiters`：`expect(key: str) -> asyncio.Future[dict]`、`deliver(key: str, message: dict) -> bool`
+  - `Outbox.cancel_when_idle(task) -> None`（async）：等在途发送结束后取消 task，供运行时在控制协议错误时使用，避免取消落在发送中途而令通道失效
 
 - [ ] **Step 1：写失败的测试**
 
@@ -3439,6 +3440,14 @@ class Outbox:
             body = {"type": "handshake_error", "bootstrap": BOOTSTRAP_VERSION, "code": code}
             await self._send(encode_line(WORKER, body), "handshake_error")
 
+    async def cancel_when_idle(self, task: asyncio.Task[Any]) -> None:
+        """等当前在途发送结束后取消 task，使取消不会落在发送中途而令通道失效。
+
+        task 的取消在它下一次恢复执行时生效；若它正等待发送锁，会在取得锁之前收到取消。
+        """
+        async with self._lock:
+            task.cancel()
+
     def _check_usable(self) -> None:
         if self._broken is not None:
             raise TransportBroken(self._broken)
@@ -3512,6 +3521,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `main(app, *, name, version, capabilities=()) -> NoReturn`：进程入口策略见"错误码与契约约定"——异常按失败处理、期限内刷新已提交输出、`os._exit`；Task 7 的五个真实进程测试是其回归测试
   - `checkpoint` 在首次提交前以 JSON 往返生成与调用方对象无关的快照，所有重试复用它；快照按 JSON 归一化（tuple 变为 list，非字符串键变为字符串）；不可序列化（含 NaN、Infinity）时抛 `WorkerFailure("invalid_field")`
   - `register_artifact` 的哈希在线程池中计算，等待不保证有限；关闭期限不覆盖它，最终强制终止由宿主负责
+  - checkpoint 的查询与重发共用 `max_ack_attempts` 次上限，每次发送之后都等待一次结果（最后一次查询的答复同样有效）
+  - error 事件的 `code`、`message` 先替换孤立代理项并按 UTF-8 字节截断（`MAX_ERROR_CODE_BYTES = 256`、`MAX_ERROR_MESSAGE_BYTES = 8 KiB`），仍无法编码时退回固定的 `internal_error`
+  - `main()` 的收尾放在内层 `try/finally` 中，`os._exit` 无条件执行；收尾期限取值不在 `[0, 3600]` 秒内（含非数值、NaN、无穷大）时使用默认 5 秒
   - 退出码常量 `EXIT_OK = 0`、`EXIT_FAILURE = 1`、`EXIT_HANDSHAKE = 2`；`SHUTDOWN_TIMEOUT_ENV = "AGENTBOX_WORKER_SHUTDOWN_TIMEOUT"`；包根导出 `TransportBroken`
 
 - [ ] **Step 1：写失败的测试**
@@ -3529,6 +3541,7 @@ from pathlib import Path
 from typing import Any
 
 from agentbox_worker import Result, TaskContext, Timing, WorkerFailure, run_worker
+from agentbox_worker.runtime import MAX_ERROR_MESSAGE_BYTES, SHUTDOWN_TIMEOUT_ENV, _shutdown_timeout
 
 FAST = Timing(ack_timeout=0.05, max_ack_attempts=3, retry_backoff=0.01, artifact_timeout=0.5)
 INIT = {
@@ -3683,6 +3696,78 @@ def test_invalid_control_message_fails_task(tmp_path):
     assert events[1]["code"] == "control_protocol_error"
 
 
+class HoldsProgress(MemoryTransport):
+    """progress 的发送要等宿主的第二条消息（第一条是 init）被读出之后才完成。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+        self.received = 0
+
+    async def receive(self) -> bytes | None:
+        line = await super().receive()
+        self.received += 1
+        if self.received == 2:
+            asyncio.get_running_loop().call_soon(self.release.set)
+        return line
+
+    async def send(self, line: bytes) -> None:
+        await super().send(line)
+        if json.loads(line)["type"] == "progress":
+            await self.release.wait()
+
+
+def test_control_error_waits_for_inflight_send(tmp_path):
+    async def app(ctx):
+        await ctx.progress("step_started", "x")
+        await asyncio.sleep(10)
+        return Result("never", [])
+
+    async def go():
+        transport = HoldsProgress()
+        transport.feed(json.dumps({**INIT, "out_dir": str(tmp_path)}).encode())
+        transport.feed(b'{"type":"bogus","v":1}')
+        code = await asyncio.wait_for(
+            run_worker(app, transport, name="w", version="0", timing=FAST), timeout=5
+        )
+        return code, sent_json(transport)
+
+    code, events = asyncio.run(go())
+    assert code == 1
+    assert types(events) == ["ready", "progress", "error"]
+    assert events[-1]["code"] == "control_protocol_error"
+
+
+@pytest.mark.parametrize(
+    ("raised", "message"),
+    [
+        pytest.param(
+            WorkerFailure("bad_input", "x" * (1 << 20)),
+            "x" * MAX_ERROR_MESSAGE_BYTES,
+            id="oversized_message",
+        ),
+        pytest.param(ValueError("坏文件名 \udcff"), "ValueError: 坏文件名 ?", id="lone_surrogate"),
+    ],
+)
+def test_failure_message_is_made_encodable(tmp_path, raised, message):
+    async def app(ctx):
+        raise raised
+
+    code, events = run(app, tmp_path)
+    assert code == 1
+    assert types(events) == ["ready", "error"]
+    assert events[1]["message"] == message
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("2.5", 2.5), ("0", 0.0), ("inf", 5.0), ("nan", 5.0), ("-1", 5.0), ("1e300", 5.0), ("x", 5.0)],
+)
+def test_shutdown_timeout_falls_back_on_unusable_values(monkeypatch, raw, expected):
+    monkeypatch.setenv(SHUTDOWN_TIMEOUT_ENV, raw)
+    assert _shutdown_timeout() == expected
+
+
 def test_only_one_checkpoint_in_flight(tmp_path):
     in_flight = 0
     overlaps: list[str] = []
@@ -3722,6 +3807,34 @@ def test_unresolved_after_max_attempts(tmp_path):
     assert code == 1
     assert types(events).count("checkpoint_query") == FAST.max_ack_attempts
     assert events[-1]["code"] == "checkpoint_unresolved" and events[-1]["retryable"] is True
+
+
+def test_reply_to_last_query_is_awaited(tmp_path):
+    queries = 0
+
+    def respond(msg, transport):
+        nonlocal queries
+        if msg["type"] != "checkpoint_query":
+            return
+        queries += 1
+        if queries == FAST.max_ack_attempts:
+            reply(
+                transport,
+                {
+                    "type": "checkpoint_result",
+                    "checkpoint_id": msg["checkpoint_id"],
+                    "scope": "task",
+                    "status": "committed",
+                },
+            )
+
+    async def app(ctx):
+        return Result(await ctx.checkpoint("s1", state={}), [])
+
+    code, events = run(app, tmp_path, responder=respond)
+    assert code == 0
+    assert types(events).count("checkpoint_query") == FAST.max_ack_attempts
+    assert events[-1]["type"] == "result"
 
 
 @pytest.mark.parametrize(
@@ -3871,6 +3984,12 @@ EXIT_FAILURE = 1
 EXIT_HANDSHAKE = 2
 
 SHUTDOWN_TIMEOUT_ENV = "AGENTBOX_WORKER_SHUTDOWN_TIMEOUT"
+DEFAULT_SHUTDOWN_TIMEOUT = 5.0
+MAX_SHUTDOWN_TIMEOUT = 3600.0  # 超过线程等待的可表示范围会抛异常，取一个足够大的上限
+
+# error 事件中 code 与 message 的上限（UTF-8 字节），保证事件远小于 1 MiB 的事件上限
+MAX_ERROR_CODE_BYTES = 256
+MAX_ERROR_MESSAGE_BYTES = 8 << 10
 
 
 @dataclass(frozen=True)
@@ -4024,26 +4143,30 @@ class TaskContext:
     async def _submit_checkpoint(
         self, checkpoint_id: str, body: dict[str, Any]
     ) -> tuple[str, str | None]:
+        query = {"type": "checkpoint_query", "checkpoint_id": checkpoint_id, "scope": "task"}
+        limit = self._timing.max_ack_attempts
+        retries = 0  # 查询与重发共用上限；每次发送之后都等待一次结果
         pending = self._checkpoint_results.expect(checkpoint_id)
         await self._emit(body)
-        for _ in range(self._timing.max_ack_attempts):
+        while True:
             try:
                 result = await asyncio.wait_for(asyncio.shield(pending), self._timing.ack_timeout)
             except TimeoutError:
-                query = {
-                    "type": "checkpoint_query",
-                    "checkpoint_id": checkpoint_id,
-                    "scope": "task",
-                }
+                if retries == limit:
+                    break
+                retries += 1
                 await self._emit(query)
                 continue
             if result["status"] not in ("retryable_error", "not_found"):
                 return result["status"], result.get("code")
+            if retries == limit:
+                break
+            retries += 1
             await asyncio.sleep(self._timing.retry_backoff)
             pending = self._checkpoint_results.expect(checkpoint_id)
             await self._emit(body)
         raise CheckpointUnresolved(
-            f"checkpoint {checkpoint_id}: {self._timing.max_ack_attempts} 次后仍无确定结果"
+            f"checkpoint {checkpoint_id}: {limit} 次查询或重发后仍无确定结果"
         )
 
     async def register_artifact(
@@ -4208,7 +4331,8 @@ async def _control_loop(ctx: TaskContext, transport: Transport, app_task: asynci
             keep_going = ctx._handle_control(decode_line(HOST, line))
         except ProtocolError as exc:
             ctx.control_error = exc
-            app_task.cancel()
+            # 等在途发送结束再取消：取消落在发送中途会使输出通道失效，error 事件就发不出去
+            await ctx._outbox.cancel_when_idle(app_task)
             return
         if not keep_going:
             app_task.cancel()
@@ -4252,23 +4376,35 @@ async def _emit_outcome(ctx: TaskContext, outcome: Any) -> int:
     return await _emit_failure(ctx, failure)
 
 
+def _safe_text(text: str, limit: int) -> str:
+    """替换孤立代理项并按 UTF-8 字节截断，保证 error 事件一定可以编码。"""
+    return text.encode("utf-8", "replace")[:limit].decode("utf-8", "ignore")
+
+
 async def _emit_failure(ctx: TaskContext, failure: WorkerFailure) -> int:
-    await ctx._outbox.emit(
-        {
-            "type": "error",
-            "code": failure.code,
-            "message": failure.message,
-            "retryable": failure.retryable,
-        }
-    )
+    body = {
+        "type": "error",
+        "code": _safe_text(failure.code, MAX_ERROR_CODE_BYTES),
+        "message": _safe_text(failure.message, MAX_ERROR_MESSAGE_BYTES),
+        "retryable": failure.retryable,
+    }
+    try:
+        await ctx._outbox.emit(body)
+    except ProtocolError:  # 清理后仍无法编码：退回固定内容的 internal_error
+        fallback = {"type": "error", "code": "internal_error", "message": "错误事件无法编码"}
+        await ctx._outbox.emit({**fallback, "retryable": failure.retryable})
     return EXIT_FAILURE
 
 
 def _shutdown_timeout() -> float:
+    """读取收尾期限；非数值、负数、NaN 或超过上限时使用默认值。"""
     try:
-        return float(os.environ.get(SHUTDOWN_TIMEOUT_ENV, "5"))
+        value = float(os.environ.get(SHUTDOWN_TIMEOUT_ENV, DEFAULT_SHUTDOWN_TIMEOUT))
     except ValueError:
-        return 5.0
+        return DEFAULT_SHUTDOWN_TIMEOUT
+    if 0 <= value <= MAX_SHUTDOWN_TIMEOUT:  # NaN 的比较为假
+        return value
+    return DEFAULT_SHUTDOWN_TIMEOUT
 
 
 def main(app: App, *, name: str, version: str, capabilities: Iterable[str] = ()) -> NoReturn:
@@ -4295,10 +4431,12 @@ def main(app: App, *, name: str, version: str, capabilities: Iterable[str] = ())
     except BaseException:  # noqa: B036  进程入口：任何异常都必须走有界退出
         traceback.print_exc()
     finally:
-        if not transport.close(_shutdown_timeout()):
-            _log("退出时仍有未写出的协议输出（宿主可能已停止读取 stdout）")
-        sys.stderr.flush()
-        os._exit(code)
+        try:
+            if not transport.close(_shutdown_timeout()):
+                _log("退出时仍有未写出的协议输出（宿主可能已停止读取 stdout）")
+            sys.stderr.flush()
+        finally:  # 收尾本身失败（如 stderr 已关闭）也必须以既定退出码退出
+            os._exit(code)
 ```
 
 `worker/agentbox_worker/__init__.py`（完整替换）：
