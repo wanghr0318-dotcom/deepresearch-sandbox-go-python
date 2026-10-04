@@ -305,3 +305,9 @@ type Scheduler struct{ /* 管理 actor 集合；ListActiveTasks 启动；新任�
 - **单一权威实现**：控制转换表从 `persistence/postgres` 移入 `internal/task`（Task 3），Store 与 `Decide` 共用；裁决分类只在 `runner.Classify`。
 - **接口新增**：Task 1 的事务用例与字段是对 Plan 4 窄接口的扩展，需随本批计划一并审阅。
 - **占位符**：无。
+
+### 执行中修订（Task 7 之后）
+
+- **累计运行时限的来源（规格 §14.4 只定义计量，未给出上限来源与默认值）**：上限取任务 `limits.max_run_time_ms`；缺省时取服务配置的默认值（由 Plan 6 Task 6 的配置定义）。actor 选项 `RunTimeLimit`（0 = 不限）；跨 attempt 累计、不因新 attempt 重置；运行中达到上限 → 以 `context.DeadlineExceeded` 取消 run ctx，runner 分类为 `task_deadline_exceeded`。
+- **恢复的 stop_blocked attempt 的运行时间**：actor 选项 `OnStopRecorded`，由装配接到 `recovery.Store.AccountUnrecordedRunTime`；停止确认（`Recorded`）后、裁决前调用一次，失败退避重试并保留事实。
+- **永远无法满足的 limits**：在 API 创建时拒绝（400），actor 不处理；`Admission` 的非取消错误保持致命并在注释中说明。
