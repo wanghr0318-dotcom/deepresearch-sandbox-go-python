@@ -1188,11 +1188,12 @@ type fkRun struct {
 	spec     RunSpec
 	controls <-chan Control
 	result   chan Outcome
+	cause    chan error // Run 的 ctx 被取消时的 cause
 }
 
 func (r *fkRunner) Run(ctx context.Context, spec RunSpec, controls <-chan Control) Outcome {
 	r.log.add("run:%s sock=%s", spec.AttemptID, spec.GatewaySocket)
-	h := &fkRun{spec: spec, controls: controls, result: make(chan Outcome, 1)}
+	h := &fkRun{spec: spec, controls: controls, result: make(chan Outcome, 1), cause: make(chan error, 1)}
 	select {
 	case r.runs <- h:
 	case <-ctx.Done():
@@ -1201,9 +1202,17 @@ func (r *fkRunner) Run(ctx context.Context, spec RunSpec, controls <-chan Contro
 	case o := <-h.result:
 		return o
 	case <-ctx.Done():
+		cause := context.Cause(ctx)
+		h.cause <- cause
+		if errors.Is(cause, context.DeadlineExceeded) { // 与 runner.Classify 相同：累计运行时限
+			return Outcome{Class: ClassDeadlineExceeded}
+		}
 		return Outcome{Class: "lost_on_restart", Retry: RetryFault}
 	}
 }
+
+// cancelled 报告 Run 的 ctx 是否已被取消（不等待）。
+func (h *fkRun) cancelled() bool { return len(h.cause) > 0 }
 
 func (h *fkRun) ready()             { h.spec.OnReady() }
 func (h *fkRun) finish(o Outcome)   { h.result <- o }
@@ -1228,6 +1237,17 @@ type actorHarness struct {
 	cancel context.CancelFunc
 	actor  *Actor
 	fatal  chan error
+
+	limit       time.Duration // Deps.RunTimeLimit 的返回值
+	accountMu   sync.Mutex
+	accounts    []string // OnStopRecorded 的调用：attempt@stoppedAt
+	accountFail []error
+}
+
+func (h *actorHarness) accountCalls() []string {
+	h.accountMu.Lock()
+	defer h.accountMu.Unlock()
+	return append([]string(nil), h.accounts...)
 }
 
 func queuedTask(id string) TaskState {
@@ -1266,8 +1286,21 @@ func (h *actorHarness) deps() Deps {
 			n++
 			return fmt.Sprintf("id-%d", n)
 		},
-		Jitter:  func() float64 { return 0 },
-		OnFatal: func(_ string, err error) { h.fatal <- err },
+		Jitter:       func() float64 { return 0 },
+		OnFatal:      func(_ string, err error) { h.fatal <- err },
+		RunTimeLimit: func(TaskState) time.Duration { return h.limit },
+		OnStopRecorded: func(_ context.Context, attemptID string, at time.Time) error {
+			h.accountMu.Lock()
+			defer h.accountMu.Unlock()
+			h.accounts = append(h.accounts, fmt.Sprintf("%s@%s", attemptID, at.Sub(t0)))
+			h.log.add("account:%s", attemptID)
+			if len(h.accountFail) > 0 {
+				err := h.accountFail[0]
+				h.accountFail = h.accountFail[1:]
+				return err
+			}
+			return nil
+		},
 	}
 }
 
@@ -1378,6 +1411,9 @@ func TestActorHappyPathEffectOrder(t *testing.T) {
 	}
 	if created, _, _, _ := h.st.snapshot(); len(created) != 1 || created[0].Retry != RetryNone {
 		t.Errorf("首个 attempt 的重试类别应为 none: %+v", created)
+	}
+	if got := h.accountCalls(); len(got) != 0 {
+		t.Errorf("非恢复的 attempt 不应调用 OnStopRecorded: %v", got)
 	}
 }
 
@@ -1736,5 +1772,130 @@ func TestSchedulerStartsActiveTasksAndSkipsExcluded(t *testing.T) {
 	case <-waited:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("ctx 结束后 Scheduler.Wait 未返回")
+	}
+}
+
+// ==== 修订 1：累计运行时限与恢复 attempt 的运行时间记账 ====
+
+// waitCause 等待 Run 的 ctx 被取消并返回 cause。
+func (h *actorHarness) waitCause(r *fkRun) error {
+	h.t.Helper()
+	select {
+	case err := <-r.cause:
+		return err
+	case <-time.After(5 * time.Second):
+		h.t.Fatalf("Run 的 ctx 未被取消；日志: %v", h.log.all())
+	}
+	return nil
+}
+
+// notCancelledYet 让 actor 处理已到期的计时器后断言 Run 仍在运行。
+func (h *actorHarness) notCancelledYet(r *fkRun, at string) {
+	h.t.Helper()
+	time.Sleep(20 * time.Millisecond)
+	if r.cancelled() {
+		h.t.Fatalf("%s 时 Run 不应被取消", at)
+	}
+}
+
+// 执行中到达累计运行时限：以 context.DeadlineExceeded 取消 Run，任务 task_deadline_exceeded、不重试。
+func TestActorRunTimeLimitCancelsRun(t *testing.T) {
+	ts := queuedTask("t1")
+	ts.RunTimeMs = 5000 // 限额按任务计：已持久化的部分计入
+	h := newActorHarness(t, ts)
+	h.limit = 30 * time.Second
+	h.spawn("t1")
+	r := h.nextRun() // 区间从 t0 开始，到达限额在 t0 + 25 s
+	h.clk.Advance(24 * time.Second)
+	h.notCancelledYet(r, "累计 29 s")
+	h.clk.Advance(time.Second)
+	if cause := h.waitCause(r); !errors.Is(cause, context.DeadlineExceeded) {
+		t.Fatalf("cause = %v，期望 context.DeadlineExceeded", cause)
+	}
+	h.waitDone()
+	if ts := h.st.task("t1"); ts.Status != "failed" || ts.StatusReason != ClassDeadlineExceeded || ts.AttemptsTotal != 1 {
+		t.Errorf("任务应 failed（task_deadline_exceeded）且不重试: %+v", ts)
+	}
+}
+
+// 限额跨 attempt 累计：新 attempt 不重置。
+func TestActorRunTimeLimitCountsAcrossAttempts(t *testing.T) {
+	h := newActorHarness(t, queuedTask("t1"))
+	h.limit = 20 * time.Second
+	h.spawn("t1")
+	r := h.nextRun()
+	h.clk.Advance(12 * time.Second) // 第一个 attempt 用去 12 s
+	r.finish(crash())
+	h.waitFor("裁决为 queued 且归还槽位", func() bool { return h.st.task("t1").Status == "queued" && h.log.count("release:1") == 1 })
+	h.clk.Advance(RetryBackoff(0, 0)) // 到 not_before
+	r2 := h.nextRun()                 // 区间从 t0 + 13 s 开始，剩余 8 s
+	h.clk.Advance(7 * time.Second)
+	h.notCancelledYet(r2, "累计 19 s")
+	h.clk.Advance(time.Second)
+	if cause := h.waitCause(r2); !errors.Is(cause, context.DeadlineExceeded) {
+		t.Fatalf("cause = %v", cause)
+	}
+	h.waitDone()
+	if ts := h.st.task("t1"); ts.Status != "failed" || ts.StatusReason != ClassDeadlineExceeded || ts.RunTimeMs != 20000 {
+		t.Errorf("任务应在累计 20 s 时 failed: %+v", ts)
+	}
+}
+
+func TestActorRunTimeLimitZeroNeverCancels(t *testing.T) {
+	h := newActorHarness(t, queuedTask("t1"))
+	h.spawn("t1")
+	r := h.nextRun()
+	for i := 0; i < 6; i++ {
+		h.clk.Advance(10 * time.Minute)
+	}
+	h.notCancelledYet(r, "运行 1 h（不限）")
+	r.ready()
+	r.finish(success())
+	h.waitDone()
+}
+
+// queued 任务已达到限额：不申请槽位、不创建 attempt；控制仍可使其离开。
+func TestActorRunTimeLimitExhaustedCreatesNoAttempt(t *testing.T) {
+	ts := queuedTask("t1")
+	ts.RunTimeMs = 30000
+	h := newActorHarness(t, ts)
+	h.limit = 30 * time.Second
+	a := h.spawn("t1")
+	h.clk.Advance(RunTimePersistInterval) // 经过一次周期检查
+	time.Sleep(20 * time.Millisecond)
+	if n := h.log.count("acquire:"); n != 0 {
+		t.Fatalf("已达限额的任务不应申请槽位；日志: %v", h.log.all())
+	}
+	h.st.setControl("t1", "cancel")
+	a.Notify()
+	h.waitDone()
+	if created, _, _, _ := h.st.snapshot(); len(created) != 0 || h.st.task("t1").Status != "cancelled" {
+		t.Errorf("不应创建 attempt，任务应 cancelled: %+v", created)
+	}
+}
+
+// 恢复交来的 stop_blocked：确认记录后、判决之前调用 OnStopRecorded 恰好一次成功；失败按退避重试。
+func TestActorStopBlockedAccountsUnrecordedRunTime(t *testing.T) {
+	ts := queuedTask("t1")
+	ts.Status, ts.CurrentAttemptID, ts.AttemptsTotal = "running", "a0", 1
+	h := newActorHarness(t, ts)
+	h.st.attempts["a0"] = &Attempt{AttemptID: "a0", TaskID: "t1", AttemptNo: 1, EnvID: "e0", Status: "active"}
+	h.accountFail = []error{persistence.ErrUnavailable}
+	h.spawn("t1", WithStopBlocked(SlotGrant{ID: 77, TaskID: "t1"}))
+	h.waitFor("首次记账失败", func() bool { return len(h.accountCalls()) == 1 })
+	if h.log.count("finalize:") != 0 {
+		t.Fatalf("记账成功之前不应提交判决；日志: %v", h.log.all())
+	}
+	h.advanceUntil("记账重试并提交判决", 100*time.Millisecond, h.logged("finalize:a0:queued", 1))
+	h.before("account:a0", "finalize:a0")
+	if i, j := h.log.index("account:a0", 2), h.log.index("finalize:a0", 1); i < 0 || j < i {
+		t.Errorf("判决应在记账成功之后；日志: %v", h.log.all())
+	}
+	h.advanceUntil("故障重试", 250*time.Millisecond, h.logged("acquire:", 1))
+	r := h.nextRun()
+	r.finish(success())
+	h.waitDone()
+	if got := h.accountCalls(); !reflect.DeepEqual(got, []string{"a0@0s", "a0@0s"}) {
+		t.Errorf("OnStopRecorded 调用 = %v，期望同一事实一次失败、一次成功", got)
 	}
 }

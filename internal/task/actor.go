@@ -129,6 +129,16 @@ type Deps struct {
 	IDs       func() string
 	Jitter    func() float64
 	OnFatal   func(taskID string, err error)
+
+	// RunTimeLimit 可选：任务的累计运行时限（§14.4），0 表示不限。装配代码取任务 limits 的
+	// max_run_time_ms，没有时取服务配置的默认值。限额按任务计（已持久化的 run_time_ms 加当前区间），
+	// 新 attempt 不重置：执行中到达时以 cause context.DeadlineExceeded 取消 Run 的 ctx（runner 据此
+	// 分类为 task_deadline_exceeded）；queued 任务已达到限额时不再申请槽位、不创建 attempt。
+	RunTimeLimit func(TaskState) time.Duration
+	// OnStopRecorded 可选：恢复交来的 stop_blocked attempt 的环境确认停止（Recorded）后调用恰好一次
+	// 成功，在提交判决之前（经 Store 队列排在 Finalize 之前），把未记账区间计入运行时间（装配为
+	// recovery.Store.AccountUnrecordedRunTime，§14.1 第 8 步）。暂时失败按退避重试，事实保留。
+	OnStopRecorded func(ctx context.Context, attemptID string, stoppedAt time.Time) error
 }
 
 func (d Deps) withDefaults() Deps {
@@ -234,6 +244,13 @@ type Actor struct {
 	storeRetryAt  *time.Time
 
 	rt runTime
+	// limit 是累计运行时限（0 不限）；runCancel 是执行中 attempt 的 Run ctx 的取消函数；
+	// slotWithheld：queued 任务已达到限额，Decide 请求的槽位不再申请。
+	limit        time.Duration
+	runCancel    map[string]context.CancelCauseFunc
+	slotWithheld bool
+	// accountAttempt 是恢复交来、尚待 OnStopRecorded 计入运行时间的 attempt。
+	accountAttempt string
 }
 
 // runTime 是累计运行时间（§14.4）：base 是已结束区间的累计（毫秒），openAt 非 nil 时当前 attempt 的
@@ -257,7 +274,7 @@ func Spawn(ctx context.Context, taskID string, d Deps, opts ...SpawnOption) *Act
 	a := &Actor{taskID: taskID, d: d.withDefaults(), ctx: ctx, cancel: cancel,
 		inbox: make(chan any, 16), notify: make(chan struct{}, 1), done: make(chan struct{}),
 		attemptNo: map[string]int64{}, controls: map[string]chan Control{}, revoking: map[string]string{},
-		stopAt: map[string]time.Time{}}
+		stopAt: map[string]time.Time{}, runCancel: map[string]context.CancelCauseFunc{}}
 	for _, o := range opts {
 		o(&a.opt)
 	}
@@ -342,6 +359,9 @@ func (a *Actor) load() bool {
 	}
 	a.limits, a.spec, a.attemptsTotal = ts.Limits, ts.Spec, ts.AttemptsTotal
 	a.rt.base = ts.RunTimeMs
+	if a.d.RunTimeLimit != nil {
+		a.limit = max(a.d.RunTimeLimit(ts), 0)
+	}
 	a.s = State{TaskID: a.taskID, TaskStatus: ts.Status, Desired: ts.Desired, ControlVersion: ts.ControlVersion,
 		AppliedControlVersion: ts.AppliedControlVersion, FaultRetriesUsed: ts.FaultRetriesUsed,
 		MaxFaultRetries: ts.MaxFaultRetries, OOMRetriesUsed: ts.OOMRetriesUsed,
@@ -359,6 +379,9 @@ func (a *Actor) load() bool {
 		a.s.Attempt = &AttemptState{AttemptID: att.AttemptID, EnvID: att.EnvID, Status: "stop_blocked",
 			StoredStatus: att.Status, Outcome: &Outcome{Class: "lost_on_restart", Retry: RetryFault}}
 		a.s.SlotHeld, a.grant = true, *g
+		if a.d.OnStopRecorded != nil {
+			a.accountAttempt = att.AttemptID
+		}
 	}
 	return true
 }
@@ -367,7 +390,20 @@ func (a *Actor) load() bool {
 func (a *Actor) finished() bool {
 	at := a.s.Attempt
 	return IsTerminal(a.s.TaskStatus) && a.inflight == 0 && len(a.storeQ) == 0 && !a.s.SlotHeld &&
-		!a.s.SlotRequested && (at == nil || at.EnvStopped)
+		(!a.s.SlotRequested || a.slotWithheld) && (at == nil || at.EnvStopped)
+}
+
+// limitAt 返回执行中 attempt 到达累计运行时限的时间；没有限额、区间未开始或 Run 已被取消时 ok 为假。
+func (a *Actor) limitAt() (time.Time, bool) {
+	if a.limit <= 0 || a.rt.openAt == nil || a.runCancel[a.rt.attemptID] == nil {
+		return time.Time{}, false
+	}
+	return a.rt.openAt.Add(a.limit - time.Duration(a.rt.base)*time.Millisecond), true
+}
+
+// overLimit：累计运行时间已达到限额。
+func (a *Actor) overLimit(now time.Time) bool {
+	return a.limit > 0 && a.rt.total(now) >= a.limit.Milliseconds()
 }
 
 // ---- 计时 ----
@@ -383,6 +419,9 @@ func (a *Actor) arm() {
 	if a.storeRetryAt != nil && a.storeRetryAt.Before(next) {
 		next = *a.storeRetryAt
 	}
+	if at, ok := a.limitAt(); ok && at.Before(next) {
+		next = at
+	}
 	if a.timerC != nil && next.Equal(a.timerAt) {
 		return
 	}
@@ -395,6 +434,9 @@ func (a *Actor) arm() {
 
 func (a *Actor) fire() {
 	now := a.d.Clock.Now()
+	if at, ok := a.limitAt(); ok && !now.Before(at) {
+		a.stopRunForLimit(a.rt.attemptID)
+	}
 	if a.storeRetryAt != nil && !now.Before(*a.storeRetryAt) {
 		a.storeRetryAt = nil
 		a.pumpStore()
@@ -462,6 +504,12 @@ func (a *Actor) trackRunTime(e Event, now time.Time) {
 func (a *Actor) exec(eff Effect) {
 	switch f := eff.(type) {
 	case RequestSlot:
+		if a.overLimit(a.s.Now) {
+			// 累计运行时限已用尽：不再创建 attempt（新 attempt 不重置限额，§8.1）。Decide 没有把 queued
+			// 任务裁决为 task_deadline_exceeded 的事件，任务保持 queued，直到控制使其离开（见报告）。
+			a.slotWithheld = true
+			return
+		}
 		req := SlotRequest{TaskID: a.taskID, Limits: a.limits}
 		a.async(func(ctx context.Context) any {
 			g, err := a.d.Admission.Acquire(ctx, req)
@@ -518,7 +566,14 @@ func (a *Actor) startWorker(f StartWorker) {
 	a.controls[f.AttemptID] = ch
 	spec := RunSpec{AttemptID: f.AttemptID, EnvID: f.EnvID, AttemptNo: a.attemptNo[f.AttemptID]}
 	taskID := a.taskID
+	// Run 的 ctx 可单独以 context.DeadlineExceeded 取消（累计运行时限，§14.4）；结果仍经 actor 的 ctx 投递。
+	runCtx, cancelRun := context.WithCancelCause(a.ctx)
+	a.runCancel[f.AttemptID] = cancelRun
+	if a.rt.attemptID == f.AttemptID && a.overLimit(a.d.Clock.Now()) {
+		a.stopRunForLimit(f.AttemptID)
+	}
 	a.async(func(ctx context.Context) any {
+		defer cancelRun(nil)
 		spec.Task, spec.StartErr = readRetry(ctx, a.d, func(ctx context.Context) (TaskState, error) {
 			return a.d.Store.LoadTask(ctx, taskID)
 		})
@@ -526,8 +581,17 @@ func (a *Actor) startWorker(f StartWorker) {
 			spec.GatewaySocket, spec.StartErr = a.d.Access.Bind(ctx, f.AttemptID)
 		}
 		spec.OnReady = func() { a.post(ctx, WorkerStarted{AttemptID: f.AttemptID, EnvID: f.EnvID}) }
-		return AttemptFinished{AttemptID: f.AttemptID, EnvID: f.EnvID, Outcome: a.d.Runner.Run(ctx, spec, ch)}
+		return AttemptFinished{AttemptID: f.AttemptID, EnvID: f.EnvID, Outcome: a.d.Runner.Run(runCtx, spec, ch)}
 	})
+}
+
+// stopRunForLimit 以 cause context.DeadlineExceeded 取消 attempt 的 Run（runner 分类为
+// task_deadline_exceeded，Decide 不重试）。每个 attempt 至多一次。
+func (a *Actor) stopRunForLimit(attemptID string) {
+	if cancel := a.runCancel[attemptID]; cancel != nil {
+		cancel(context.DeadlineExceeded)
+		a.runCancel[attemptID] = nil
+	}
 }
 
 // stopEnv：先撤销访问（Gateway 入口与 Store 中的 attempt_access），再经 coordinator 停止环境。
@@ -613,13 +677,16 @@ func (a *Actor) handleResult(v any) {
 		case r.err == nil:
 			a.grant = r.g
 			a.apply(SlotGranted{})
-		case a.ctx.Err() == nil: // 例如请求超过总容量：没有可交给 Decide 的事件
+		case a.ctx.Err() == nil:
+			// 例如 ErrExceedsCapacity（请求超过总容量）：创建任务时 API 已拒绝永远无法满足的 limits，
+			// 到这里是配置变化或程序错误；Decide 没有"永远无法授予"的事件，按致命错误处理。
 			a.die(fmt.Errorf("task: 任务 %s 申请 run slot: %w", a.taskID, r.err))
 		}
 	case EnvCreated:
 		a.apply(r)
 	case AttemptFinished:
 		delete(a.controls, r.AttemptID)
+		delete(a.runCancel, r.AttemptID)
 		a.apply(r)
 	case controlResult:
 		a.controlReading = false
@@ -673,6 +740,11 @@ func (a *Actor) handleStop(r stopDone) {
 		}
 	}
 	if r.err == nil && r.report.Recorded {
+		if r.attemptID != "" && r.attemptID == a.accountAttempt {
+			// 恢复交来的 attempt：未记账区间在判决之前计入（Store 队列保证排在 Finalize 之前）。
+			a.accountAttempt = ""
+			a.enqueue(&storeOp{kind: opAccountRunTime, attemptID: r.attemptID, stoppedAt: r.report.At})
+		}
 		a.apply(EnvStopped{AttemptID: r.attemptID, EnvID: r.envID})
 		delete(a.stopAt, r.envID)
 		return
@@ -690,6 +762,7 @@ const (
 	opApplyControl
 	opPersistRunTime
 	opRevoke
+	opAccountRunTime // 恢复交来的 attempt：Deps.OnStopRecorded
 )
 
 // storeOp 是一个待提交的事实。队列按产生顺序串行提交：暂时失败（Store 不可用、提交结果未知、锁争用）
@@ -702,12 +775,14 @@ type storeOp struct {
 	attemptID string
 	reason    string
 	totalMs   int64
+	stoppedAt time.Time
 	started   bool
 }
 
 type storeDone struct {
-	attempt Attempt
-	err     error
+	attempt   Attempt
+	err       error
+	runTimeMs *int64 // opAccountRunTime 之后重新读取的 run_time_ms（读取失败为 nil）
 }
 
 func (a *Actor) enqueue(op *storeOp) {
@@ -735,6 +810,12 @@ func (a *Actor) pumpStore() {
 			_, r.err = a.d.Store.PersistRunTime(ctx, taskID, cp.attemptID, cp.totalMs)
 		case opRevoke:
 			r.err = a.d.Store.RevokeAttemptAccess(ctx, cp.attemptID, cp.reason)
+		case opAccountRunTime:
+			if r.err = a.d.OnStopRecorded(ctx, cp.attemptID, cp.stoppedAt); r.err == nil {
+				if ts, err := a.d.Store.LoadTask(ctx, taskID); err == nil { // 限额以计入后的累计为准
+					r.runTimeMs = &ts.RunTimeMs
+				}
+			}
 		}
 		return r
 	})
@@ -746,7 +827,7 @@ func (a *Actor) handleStore(r storeDone) {
 	switch {
 	case r.err == nil:
 		a.storeQ, a.storeFailures = a.storeQ[1:], 0
-		a.committed(op, r.attempt)
+		a.committed(op, r)
 	case errors.Is(r.err, persistence.ErrOwnershipLost), errors.Is(r.err, persistence.ErrInvalid):
 		a.die(fmt.Errorf("task: 任务 %s 的持久化操作 %d: %w", a.taskID, op.kind, r.err))
 		return
@@ -763,15 +844,19 @@ func (a *Actor) handleStore(r storeDone) {
 	a.pumpStore()
 }
 
-func (a *Actor) committed(op *storeOp, att Attempt) {
+func (a *Actor) committed(op *storeOp, r storeDone) {
 	switch op.kind {
 	case opCreateAttempt:
 		na := op.attempt
 		a.attemptsTotal = max(a.attemptsTotal, na.AttemptNo)
 		a.attemptNo[na.AttemptID] = na.AttemptNo
-		a.apply(AttemptCreated{AttemptID: na.AttemptID, EnvID: na.EnvID, Status: att.Status})
+		a.apply(AttemptCreated{AttemptID: na.AttemptID, EnvID: na.EnvID, Status: r.attempt.Status})
 	case opFinalize:
 		a.apply(VerdictCommitted{Verdict: op.verdict})
+	case opAccountRunTime:
+		if r.runTimeMs != nil && a.rt.openAt == nil {
+			a.rt.base = max(a.rt.base, *r.runTimeMs)
+		}
 	}
 }
 
