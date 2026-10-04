@@ -135,7 +135,10 @@ func BuildFilter(p SeccompProfile, arch Arch) ([]SockFilter, error) // Arch：AM
 **Interfaces：**
 
 ```go
-type Message struct { Type string; ExecID string; Spec json.RawMessage; PID int; Reason string; Exit *ExitInfo }
+type Message struct { Type string; ExecID string; Spec json.RawMessage; PID int; Reason string; Exit *ExitInfo; GraceMS int64 }
+type ExitInfo struct { Code int; Signal syscall.Signal } // 与规格 §4.1 的 ExitStatus 对应
+// 执行中修订：GraceMS 承载 terminate 的宽限（Task 6、7 需要）；接收端收到的管道 FD 保留发送端的 O_NONBLOCK，
+// 不经 exec.Cmd 的启动器（stage-2 helper）须自行清除。
 // Type：start、start_ack、start_err、exit、terminate（规格 §4.2–§4.4）
 type Conn struct { /* 一端：一个写 goroutine 经有界队列串行写出 */ }
 func NewConn(f *os.File, queueLen int) *Conn
