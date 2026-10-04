@@ -1386,10 +1386,7 @@ func TestE4CancelResultRace(t *testing.T) {
 	h := newHarness(t)
 	cfg := baseConfig()
 	cfg.Capacity = admission.Capacity{RunSlots: lanes, MemoryBytes: 8 << 30}
-	// UID 范围只在 cleanup loop（每 2 s 至多 16 个环境）销毁环境后归还；本测试的吞吐远高于此，默认的 64
-	// 段会耗尽，而耗尽目前被分类为 create_failed_env（永久失败，见任务报告的 concern）。E4 检验的是取消
-	// 与 result 的竞争，因此按运行次数配置范围池；无泄漏检查仍要求结束时全部范围归还。
-	cfg.UIDCount = runs + 64
+	// 使用默认的 UID 范围池（64 段）：池耗尽时 CreateEnv 等待清理归还，不使任务失败；停止记录后立即唤醒清理。
 	h.start(cfg)
 
 	// 屏障 1：result 已由 Worker 发出但尚未交给 runner 时接受取消 → 裁决必为 cancelled。

@@ -75,6 +75,11 @@ type Options struct {
 // 创建请求是过期操作（规格 §3.2、§4.4）。
 var ErrEnvStopped = errors.New("resource: 环境已停止，不能再创建")
 
+// ErrNoFreeUIDRange 表示 UID 范围池暂时没有空闲范围。范围在环境清理完成后归还，因此是暂时性的：
+// CreateEnv 等待归还（或 ctx 结束），不把它报告为创建失败（规格 §14.3 的 create_failed_env 只用于
+// 环境与配置错误）。
+var ErrNoFreeUIDRange = errors.New("resource: 没有空闲的 UID 范围")
+
 // 资源意图的类型；每个环境恰有一个创建意图，身份由 env_id 决定，重试不产生第二份。
 const intentKindEnvironment = "environment"
 
@@ -93,6 +98,8 @@ type Coordinator struct {
 	pendingStop  map[string]time.Time // 已确认停止、stopped_at 尚未提交
 	pendingFree  map[string]struct{}  // 清理已完成、UID 范围尚未归还
 	seeded       bool
+	kick         chan struct{}      // 唤醒 cleanup loop（容量 1，合并多次唤醒）
+	freed        chan struct{}      // 有 UID 范围归还时关闭并替换（广播给等待中的 CreateEnv）
 	onLockWait   func(envID string) // 测试钩子：串行执行者被占用、开始等待时调用
 	onCleanupRun func()             // 测试钩子：cleanup loop 每轮结束时调用
 }
@@ -125,6 +132,47 @@ func NewCoordinator(store Store, p Provider, opt Options) *Coordinator {
 		locks:       make(map[string]*envLock),
 		pendingStop: make(map[string]time.Time),
 		pendingFree: make(map[string]struct{}),
+		kick:        make(chan struct{}, 1),
+		freed:       make(chan struct{}),
+	}
+}
+
+// kickCleanup 请求 cleanup loop 立即运行一轮（不阻塞）。
+func (c *Coordinator) kickCleanup() {
+	select {
+	case c.kick <- struct{}{}:
+	default:
+	}
+}
+
+// notifyFreed 唤醒全部等待空闲 UID 范围的 CreateEnv。
+func (c *Coordinator) notifyFreed() {
+	c.mu.Lock()
+	close(c.freed)
+	c.freed = make(chan struct{})
+	c.mu.Unlock()
+}
+
+// assignUIDRange 分配 UID 范围；池耗尽时唤醒清理并等待归还（每个清理间隔至少重试一次），直到成功或 ctx 结束。
+func (c *Coordinator) assignUIDRange(ctx context.Context, envID string) (UIDRange, error) {
+	for {
+		c.mu.Lock()
+		freed := c.freed
+		c.mu.Unlock()
+		ur, err := c.store.AssignUIDRange(ctx, envID, allocationID(envID))
+		if !errors.Is(err, ErrNoFreeUIDRange) {
+			return ur, err
+		}
+		c.kickCleanup()
+		t := time.NewTimer(c.opt.CleanupInterval)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return UIDRange{}, fmt.Errorf("%w（等待空闲 UID 范围）", ctx.Err())
+		case <-freed:
+		case <-t.C:
+		}
+		t.Stop()
 	}
 }
 
@@ -221,7 +269,7 @@ func (c *Coordinator) create(ctx context.Context, r EnvRequest) (provider.EnvInf
 	if _, err := c.store.RecordIntent(ctx, Intent{IntentID: id, EnvID: r.EnvID, Kind: intentKindEnvironment, Name: r.EnvID}); err != nil {
 		return provider.EnvInfo{}, err
 	}
-	ur, err := c.store.AssignUIDRange(ctx, r.EnvID, allocationID(r.EnvID))
+	ur, err := c.assignUIDRange(ctx, r.EnvID)
 	if err != nil {
 		return provider.EnvInfo{}, err
 	}
@@ -366,6 +414,7 @@ func (c *Coordinator) StopEnv(ctx context.Context, envID string) (StopResult, er
 	c.mu.Lock()
 	delete(c.pendingStop, envID)
 	c.mu.Unlock()
+	c.kickCleanup() // 裁决提交后即可清理；不必等下一个间隔
 	if env.StoppedAt != nil {
 		at = *env.StoppedAt // 已记录时保持原值，重试不倒退
 	}

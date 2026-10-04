@@ -202,7 +202,7 @@ func (s *memStore) AssignUIDRange(_ context.Context, envID, alloc string) (UIDRa
 			return *r, nil
 		}
 	}
-	return UIDRange{}, fmt.Errorf("%w: 没有空闲的 UID 范围", persistence.ErrConflict)
+	return UIDRange{}, ErrNoFreeUIDRange
 }
 
 func (s *memStore) ReleaseUIDRange(_ context.Context, id, alloc string) (UIDRange, error) {
@@ -885,5 +885,68 @@ func TestReclaimOrphan(t *testing.T) {
 	f.prov.InjectForeign("x1")
 	if err := f.c.ReclaimOrphan(ctx, "x1"); !errors.Is(err, provider.ErrForeign) {
 		t.Fatalf("外来资源应返回 ErrForeign，得到 %v", err)
+	}
+}
+
+// TestCreateEnvWaitsForFreeUIDRange：池耗尽时 CreateEnv 不失败，而是等待清理归还范围后继续；
+// ctx 结束时返回 ctx 的错误（不是创建失败）。
+func TestCreateEnvWaitsForFreeUIDRange(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	for i := 0; i < 4; i++ { // UIDCount = 4：占满
+		id := fmt.Sprintf("full%d", i)
+		f.store.addEnv(id, i == 0) // full0 的 attempt 已有裁决，可被清理
+		if _, err := f.c.CreateEnv(ctx, req(id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.store.addEnv("late", false)
+	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	_, err := f.c.CreateEnv(short, req("late"))
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrNoFreeUIDRange) {
+		t.Fatalf("池耗尽且 ctx 到期应返回 ctx 错误，得到 %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { _, err := f.c.CreateEnv(ctx, req("late")); done <- err }()
+	// 停止并清理 full0：清理归还范围后，等待中的 CreateEnv 被唤醒并完成。
+	if res, err := f.c.StopEnv(ctx, "full0"); err != nil || !res.Recorded {
+		t.Fatalf("StopEnv = %+v, %v", res, err)
+	}
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("归还后 CreateEnv 应成功：%v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("归还后 CreateEnv 未被唤醒")
+	}
+}
+
+// TestStopRecordedKicksCleanup：停止记录成功后 cleanup loop 立即运行一轮，不等间隔。
+func TestStopRecordedKicksCleanup(t *testing.T) {
+	f := newFixture(t, true)
+	f.c.opt.CleanupInterval = time.Hour
+	runs := make(chan struct{}, 8)
+	f.c.onCleanupRun = func() { runs <- struct{}{} }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = f.c.RunCleanup(ctx) }()
+	<-runs // 启动时的第一轮
+	f.store.addEnv("e1", false)
+	if _, err := f.c.CreateEnv(ctx, req("e1")); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := f.c.StopEnv(ctx, "e1"); err != nil || !res.Recorded {
+		t.Fatalf("StopEnv = %+v, %v", res, err)
+	}
+	select {
+	case <-runs:
+	case <-time.After(10 * time.Second):
+		t.Fatal("停止记录后 cleanup loop 未被唤醒")
 	}
 }

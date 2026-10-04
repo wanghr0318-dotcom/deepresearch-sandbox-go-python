@@ -32,6 +32,7 @@ func (c *Coordinator) RunCleanup(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
+		case <-c.kick:
 		}
 	}
 }
@@ -127,6 +128,9 @@ func (c *Coordinator) releaseUIDRange(ctx context.Context, envID string) error {
 	c.mu.Lock()
 	delete(c.pendingFree, envID)
 	c.mu.Unlock()
+	if err == nil {
+		c.notifyFreed()
+	}
 	return err
 }
 

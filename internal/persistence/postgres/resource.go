@@ -137,7 +137,7 @@ func (s *Store) AssignUIDRange(ctx context.Context, envID, allocationID string) 
 		// SKIP LOCKED：并发分配不等待同一行，也不会因对方刚分配而误报无空闲范围
 		free, err := selectUIDRange(ctx, tx, "state = 'free' ORDER BY base LIMIT 1 FOR UPDATE SKIP LOCKED", nil)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return conflictf("没有空闲的 UID 范围")
+			return resource.ErrNoFreeUIDRange
 		}
 		if err != nil {
 			return err

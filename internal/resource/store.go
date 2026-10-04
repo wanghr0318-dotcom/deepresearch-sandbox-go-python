@@ -20,7 +20,8 @@ type Store interface {
 	// SeedUIDRanges 幂等地登记 count 段 UID 范围：第 i 段为 [base+i*size, base+(i+1)*size)。
 	SeedUIDRanges(ctx context.Context, base, size int64, count int) error
 	// AssignUIDRange 为环境分配一段空闲 UID 范围；以 (env_id, allocation_id) 为身份，
-	// 结果丢失后重试返回原分配，不再占第二段。
+	// 结果丢失后重试返回原分配，不再占第二段。没有空闲范围时返回 ErrNoFreeUIDRange（暂时性：
+	// 范围在清理完成后归还）。
 	AssignUIDRange(ctx context.Context, envID, allocationID string) (UIDRange, error)
 	// ReleaseUIDRange 释放一段范围；只有分配代次匹配才释放，已被后来的分配复用为冲突。
 	ReleaseUIDRange(ctx context.Context, uidRangeID, allocationID string) (UIDRange, error)

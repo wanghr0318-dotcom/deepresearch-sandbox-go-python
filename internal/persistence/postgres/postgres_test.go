@@ -1948,3 +1948,21 @@ func TestLatestArtifact(t *testing.T) {
 		t.Fatalf("不存在应为 ErrNotFound，得到 %v", err)
 	}
 }
+
+// TestAssignUIDRangeExhausted：池耗尽为 resource.ErrNoFreeUIDRange（暂时性），不是 ErrConflict。
+func TestAssignUIDRangeExhausted(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	fixture(t, s, "t2")
+	if err := s.SeedUIDRanges(ctx, 100000, 4096, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AssignUIDRange(ctx, "env-t1", "alloc-1"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.AssignUIDRange(ctx, "env-t2", "alloc-2")
+	if !errors.Is(err, resource.ErrNoFreeUIDRange) || errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("池耗尽应为 ErrNoFreeUIDRange，得到 %v", err)
+	}
+}
