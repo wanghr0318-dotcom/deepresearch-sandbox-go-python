@@ -3,8 +3,10 @@
 package sandbox
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
@@ -717,4 +720,284 @@ func seccompDenyProbes(arch Arch) []seccompProbe {
 		probes = append(probes, mk("socket("+f.name+")", "socket", false, f.fam, 99, 0))
 	}
 	return probes
+}
+
+// ---------------------------------------------------------------------------
+// 控制通道（规格 §4.2）
+// ---------------------------------------------------------------------------
+
+// controlPair 返回一对 SOCK_SEQPACKET socket 的两端文件。两端都是非阻塞的，
+// 与宿主侧的用法一致（init 侧继承到的是阻塞 fd，见 TestControlBlockingFDCloseUnblocksRecv）。
+func controlPair(t *testing.T) (*os.File, *os.File) {
+	t.Helper()
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET|syscall.SOCK_CLOEXEC|syscall.SOCK_NONBLOCK, 0)
+	if err != nil {
+		t.Fatalf("socketpair: %v", err)
+	}
+	return os.NewFile(uintptr(fds[0]), "control-a"), os.NewFile(uintptr(fds[1]), "control-b")
+}
+
+// controlConnPair 返回两端 Conn，测试结束时关闭。
+func controlConnPair(t *testing.T, queueLen int) (*Conn, *Conn) {
+	t.Helper()
+	a, b := controlPair(t)
+	ca, cb := NewConn(a, queueLen), NewConn(b, queueLen)
+	t.Cleanup(func() { ca.Close(); cb.Close() })
+	return ca, cb
+}
+
+// controlPipes 创建 n 个管道，返回读端与写端；测试结束时全部关闭。
+func controlPipes(t *testing.T, n int) (rs, ws []*os.File) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("pipe: %v", err)
+		}
+		rs, ws = append(rs, r), append(ws, w)
+	}
+	t.Cleanup(func() {
+		for _, f := range append(append([]*os.File{}, rs...), ws...) {
+			f.Close()
+		}
+	})
+	return rs, ws
+}
+
+// countFDs 返回本进程当前打开的 fd 数量。
+func countFDs(t *testing.T) int {
+	t.Helper()
+	ents, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatalf("读取 /proc/self/fd: %v", err)
+	}
+	return len(ents)
+}
+
+// rawFd 取出文件的 fd 而不改变其阻塞模式（os.File.Fd 会把它切成阻塞）。
+func rawFd(t *testing.T, f *os.File) int {
+	t.Helper()
+	sc, err := f.SyscallConn()
+	if err != nil {
+		t.Fatalf("SyscallConn: %v", err)
+	}
+	var fd int
+	if err := sc.Control(func(p uintptr) { fd = int(p) }); err != nil {
+		t.Fatalf("Control: %v", err)
+	}
+	return fd
+}
+
+// rawSend 绕过 Conn 的发送端校验，直接向 socket 写一帧（可附带 fd）。
+func rawSend(t *testing.T, sock *os.File, frame []byte, files []*os.File) {
+	t.Helper()
+	var oob []byte
+	if len(files) > 0 {
+		fds := make([]int, len(files))
+		for i, f := range files {
+			fds[i] = rawFd(t, f)
+		}
+		oob = syscall.UnixRights(fds...)
+	}
+	if err := syscall.Sendmsg(rawFd(t, sock), frame, oob, nil, 0); err != nil {
+		t.Fatalf("sendmsg: %v", err)
+	}
+}
+
+func controlStartMsg() Message {
+	return Message{Type: "start", ExecID: "e1", Spec: json.RawMessage(`{"argv":["true"]}`)}
+}
+
+// TestControlStartRoundTripPassesThreeFDs：start 与三个管道 FD 在同一帧中送达，
+// 接收端 FD 带 FD_CLOEXEC，经收到的 FD 写入的数据能从对应管道读出。
+func TestControlStartRoundTripPassesThreeFDs(t *testing.T) {
+	host, child := controlConnPair(t, 8)
+	rs, ws := controlPipes(t, 3)
+
+	if err := host.Send(controlStartMsg(), ws); err != nil {
+		t.Fatalf("Send(start): %v", err)
+	}
+	m, files, err := child.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	defer func() {
+		for _, f := range files {
+			f.Close()
+		}
+	}()
+	if m.Type != "start" || m.ExecID != "e1" || string(m.Spec) != `{"argv":["true"]}` {
+		t.Fatalf("收到 %+v", m)
+	}
+	if len(files) != 3 {
+		t.Fatalf("收到 %d 个 FD, want 3", len(files))
+	}
+	for i, f := range files {
+		flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(rawFd(t, f)), syscall.F_GETFD, 0)
+		if errno != 0 {
+			t.Fatalf("F_GETFD: %v", errno)
+		}
+		if flags&syscall.FD_CLOEXEC == 0 {
+			t.Errorf("FD %d 未带 FD_CLOEXEC（未使用 MSG_CMSG_CLOEXEC）", i)
+		}
+		want := fmt.Sprintf("via-fd-%d", i)
+		if _, err := f.Write([]byte(want)); err != nil {
+			t.Fatalf("经收到的 FD %d 写入: %v", i, err)
+		}
+		buf := make([]byte, 64)
+		n, err := rs[i].Read(buf)
+		if err != nil || string(buf[:n]) != want {
+			t.Fatalf("管道 %d 读出 %q, %v; want %q", i, buf[:n], err, want)
+		}
+	}
+
+	// 非 start 消息往返，确认字段完整。
+	ack := Message{Type: "exit", ExecID: "e1", Exit: &ExitInfo{Code: 3, Signal: syscall.SIGKILL}}
+	if err := child.Send(ack, nil); err != nil {
+		t.Fatalf("Send(exit): %v", err)
+	}
+	got, gotFiles, err := host.Recv()
+	if err != nil || len(gotFiles) != 0 {
+		t.Fatalf("Recv(exit): %v, %d 个 FD", err, len(gotFiles))
+	}
+	if got.Type != "exit" || got.Exit == nil || *got.Exit != *ack.Exit {
+		t.Fatalf("收到 %+v", got)
+	}
+}
+
+// TestControlSenderRejectsInvalidMessages：发送端拒绝 spec 超 32 KiB、帧超 64 KiB、
+// start 不带恰好 3 个 FD、非 start 带 FD；全部为 ErrProtocol，且什么都没发出去。
+func TestControlSenderRejectsInvalidMessages(t *testing.T) {
+	host, child := controlConnPair(t, 8)
+	_, ws := controlPipes(t, 3)
+
+	bigSpec := json.RawMessage(`"` + strings.Repeat("x", 32*1024) + `"`)
+	cases := []struct {
+		name  string
+		m     Message
+		files []*os.File
+	}{
+		{"spec 超 32 KiB", Message{Type: "start", ExecID: "e1", Spec: bigSpec}, ws},
+		{"帧超 64 KiB", Message{Type: "start_err", ExecID: "e1", Reason: strings.Repeat("r", 64*1024)}, nil},
+		{"start 带 2 个 FD", controlStartMsg(), ws[:2]},
+		{"start 不带 FD", controlStartMsg(), nil},
+		{"非 start 带 FD", Message{Type: "start_ack", ExecID: "e1", PID: 7}, ws},
+		{"未知类型", Message{Type: "bogus", ExecID: "e1"}, nil},
+	}
+	for _, c := range cases {
+		if err := host.Send(c.m, c.files); !errors.Is(err, ErrProtocol) {
+			t.Errorf("%s: Send = %v, want ErrProtocol", c.name, err)
+		}
+	}
+
+	// 对端什么都没收到：之后发出的第一条合法消息就是它读到的第一帧。
+	if err := host.Send(Message{Type: "terminate", ExecID: "marker"}, nil); err != nil {
+		t.Fatalf("Send(terminate): %v", err)
+	}
+	m, _, err := child.Recv()
+	if err != nil || m.ExecID != "marker" {
+		t.Fatalf("Recv = %+v, %v; want 只有 marker", m, err)
+	}
+}
+
+// TestControlReceiverRejectsViolations：接收端遇到超长帧（MSG_TRUNC）、start 带 2 个 FD、
+// 非 start 带 FD、start 带 4 或 5 个 FD（后者触发 MSG_CTRUNC）时返回 ErrProtocol，并关闭全部已收 FD。
+func TestControlReceiverRejectsViolations(t *testing.T) {
+	startFrame, _ := json.Marshal(controlStartMsg())
+	ackFrame, _ := json.Marshal(Message{Type: "start_ack", ExecID: "e1", PID: 7})
+	cases := []struct {
+		name  string
+		frame []byte
+		nfds  int
+	}{
+		{"超长帧", append([]byte(`{"type":"start_err","exec_id":"e1","reason":"`), append(make([]byte, 70*1024), '"', '}')...), 0},
+		{"start 带 2 个 FD", startFrame, 2},
+		{"start 带 4 个 FD", startFrame, 4},
+		{"start 带 5 个 FD（超出接收缓冲区，MSG_CTRUNC）", startFrame, 5},
+		{"非 start 带 FD", ackFrame, 1},
+		{"超长帧且带 FD", append([]byte(`{"type":"start","exec_id":"e1","spec":"`), append(make([]byte, 70*1024), '"', '}')...), 3},
+		{"非法 JSON 且带 FD", []byte("{not json"), 3},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			a, b := controlPair(t)
+			recv := NewConn(b, 4)
+			t.Cleanup(func() { recv.Close(); a.Close() })
+			_, ws := controlPipes(t, c.nfds)
+
+			before := countFDs(t)
+			rawSend(t, a, c.frame, ws)
+			m, files, err := recv.Recv()
+			if !errors.Is(err, ErrProtocol) {
+				t.Fatalf("Recv = %+v, %d 个 FD, %v; want ErrProtocol", m, len(files), err)
+			}
+			if len(files) != 0 {
+				t.Fatalf("违规时仍返回了 %d 个 FD", len(files))
+			}
+			if after := countFDs(t); after != before {
+				t.Fatalf("/proc/self/fd 数量 %d → %d：收到的 FD 未全部关闭", before, after)
+			}
+		})
+	}
+}
+
+// TestControlQueueFullReturnsErrQueueFull：对端不读，socket 缓冲区写满后写 goroutine 阻塞，
+// 队列随之写满，Send 不阻塞而是返回 ErrQueueFull。
+func TestControlQueueFullReturnsErrQueueFull(t *testing.T) {
+	host, _ := controlConnPair(t, 2)
+	m := Message{Type: "terminate", ExecID: strings.Repeat("q", 1024)}
+	deadline := time.Now().Add(10 * time.Second)
+	for i := 0; ; i++ {
+		err := host.Send(m, nil)
+		if errors.Is(err, ErrQueueFull) {
+			return
+		}
+		if err != nil {
+			t.Fatalf("第 %d 次 Send: %v", i, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("发送 %d 条后仍未出现 ErrQueueFull", i)
+		}
+	}
+}
+
+// TestControlPeerCloseGivesEOF：对端关闭后 Recv 返回 io.EOF。
+func TestControlPeerCloseGivesEOF(t *testing.T) {
+	host, child := controlConnPair(t, 4)
+	if err := host.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, _, err := child.Recv(); err != io.EOF {
+		t.Fatalf("Recv = %v, want io.EOF", err)
+	}
+}
+
+// TestControlBlockingFDCloseUnblocksRecv：init 侧经 ExtraFiles 继承的是阻塞 fd；
+// 阻塞在 Recv 中的读者在本端 Close 后必须返回，且 Send 返回错误。
+func TestControlBlockingFDCloseUnblocksRecv(t *testing.T) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("socketpair: %v", err)
+	}
+	peer := os.NewFile(uintptr(fds[0]), "peer")
+	defer peer.Close()
+	c := NewConn(os.NewFile(uintptr(fds[1]), "init-end"), 4)
+
+	done := make(chan error, 1)
+	go func() { _, _, err := c.Recv(); done <- err }()
+	time.Sleep(50 * time.Millisecond)
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Close 后 Recv 返回 nil 错误")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close 后 Recv 仍阻塞")
+	}
+	if err := c.Send(Message{Type: "terminate", ExecID: "e1"}, nil); err == nil {
+		t.Fatal("Close 后 Send 返回 nil")
+	}
 }
