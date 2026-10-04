@@ -133,7 +133,8 @@ type Deps struct {
 	// RunTimeLimit 可选：任务的累计运行时限（§14.4），0 表示不限。装配代码取任务 limits 的
 	// max_run_time_ms，没有时取服务配置的默认值。限额按任务计（已持久化的 run_time_ms 加当前区间），
 	// 新 attempt 不重置：执行中到达时以 cause context.DeadlineExceeded 取消 Run 的 ctx（runner 据此
-	// 分类为 task_deadline_exceeded）；queued 任务已达到限额时不再申请槽位、不创建 attempt。
+	// 分类为 task_deadline_exceeded）；已达到限额时启动的执行以已取消的 ctx 开始；限额已用尽时可重试的
+	// 结果改为 task_deadline_exceeded、不重试（capRetry）。
 	RunTimeLimit func(TaskState) time.Duration
 	// OnStopRecorded 可选：恢复交来的 stop_blocked attempt 的环境确认停止（Recorded）后调用恰好一次
 	// 成功，在提交判决之前（经 Store 队列排在 Finalize 之前），把未记账区间计入运行时间（装配为
@@ -244,11 +245,9 @@ type Actor struct {
 	storeRetryAt  *time.Time
 
 	rt runTime
-	// limit 是累计运行时限（0 不限）；runCancel 是执行中 attempt 的 Run ctx 的取消函数；
-	// slotWithheld：queued 任务已达到限额，Decide 请求的槽位不再申请。
-	limit        time.Duration
-	runCancel    map[string]context.CancelCauseFunc
-	slotWithheld bool
+	// limit 是累计运行时限（0 不限）；runCancel 是执行中 attempt 的 Run ctx 的取消函数。
+	limit     time.Duration
+	runCancel map[string]context.CancelCauseFunc
 	// accountAttempt 是恢复交来、尚待 OnStopRecorded 计入运行时间的 attempt。
 	accountAttempt string
 }
@@ -390,7 +389,16 @@ func (a *Actor) load() bool {
 func (a *Actor) finished() bool {
 	at := a.s.Attempt
 	return IsTerminal(a.s.TaskStatus) && a.inflight == 0 && len(a.storeQ) == 0 && !a.s.SlotHeld &&
-		(!a.s.SlotRequested || a.slotWithheld) && (at == nil || at.EnvStopped)
+		!a.s.SlotRequested && (at == nil || at.EnvStopped)
+}
+
+// capRetry：累计运行时间已达到限额时，可重试的结果改为 task_deadline_exceeded、不重试（§14.3、§14.4：
+// 新 attempt 不重置限额），使重试判决不会让已用尽限额的任务重新排队。不可重试的结果保持原样。
+func (a *Actor) capRetry(o Outcome) Outcome {
+	if o.Retry != RetryNone && a.overLimit(a.d.Clock.Now()) {
+		o.Class, o.Retry = ClassDeadlineExceeded, RetryNone
+	}
+	return o
 }
 
 // limitAt 返回执行中 attempt 到达累计运行时限的时间；没有限额、区间未开始或 Run 已被取消时 ok 为假。
@@ -504,12 +512,8 @@ func (a *Actor) trackRunTime(e Event, now time.Time) {
 func (a *Actor) exec(eff Effect) {
 	switch f := eff.(type) {
 	case RequestSlot:
-		if a.overLimit(a.s.Now) {
-			// 累计运行时限已用尽：不再创建 attempt（新 attempt 不重置限额，§8.1）。Decide 没有把 queued
-			// 任务裁决为 task_deadline_exceeded 的事件，任务保持 queued，直到控制使其离开（见报告）。
-			a.slotWithheld = true
-			return
-		}
+		// 已达累计运行时限的 queued 任务（重启记账或调低配置之后）同样走正常路径：startWorker 以已取消
+		// 的 ctx 启动执行，runner 分类为 task_deadline_exceeded，经现有判决路径结束（代价是创建一次环境）。
 		req := SlotRequest{TaskID: a.taskID, Limits: a.limits}
 		a.async(func(ctx context.Context) any {
 			g, err := a.d.Admission.Acquire(ctx, req)
@@ -683,10 +687,15 @@ func (a *Actor) handleResult(v any) {
 			a.die(fmt.Errorf("task: 任务 %s 申请 run slot: %w", a.taskID, r.err))
 		}
 	case EnvCreated:
+		if r.Err != nil && r.Outcome != nil {
+			o := a.capRetry(*r.Outcome)
+			r.Outcome = &o
+		}
 		a.apply(r)
 	case AttemptFinished:
 		delete(a.controls, r.AttemptID)
 		delete(a.runCancel, r.AttemptID)
+		r.Outcome = a.capRetry(r.Outcome)
 		a.apply(r)
 	case controlResult:
 		a.controlReading = false

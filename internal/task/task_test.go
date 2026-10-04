@@ -1182,6 +1182,8 @@ func (f *fkEnv) StopEnv(_ context.Context, envID string) (StopReport, error) {
 type fkRunner struct {
 	log  *fkLog
 	runs chan *fkRun
+	// onDeadline 非 nil 时，ctx 以 DeadlineExceeded 取消后返回它（模拟同时发生的可重试故障）。
+	onDeadline *Outcome
 }
 
 type fkRun struct {
@@ -1205,6 +1207,9 @@ func (r *fkRunner) Run(ctx context.Context, spec RunSpec, controls <-chan Contro
 		cause := context.Cause(ctx)
 		h.cause <- cause
 		if errors.Is(cause, context.DeadlineExceeded) { // 与 runner.Classify 相同：累计运行时限
+			if r.onDeadline != nil {
+				return *r.onDeadline
+			}
 			return Outcome{Class: ClassDeadlineExceeded}
 		}
 		return Outcome{Class: "lost_on_restart", Retry: RetryFault}
@@ -1829,6 +1834,9 @@ func TestActorRunTimeLimitCountsAcrossAttempts(t *testing.T) {
 	h.waitFor("裁决为 queued 且归还槽位", func() bool { return h.st.task("t1").Status == "queued" && h.log.count("release:1") == 1 })
 	h.clk.Advance(RetryBackoff(0, 0)) // 到 not_before
 	r2 := h.nextRun()                 // 区间从 t0 + 13 s 开始，剩余 8 s
+	if created, _, _, _ := h.st.snapshot(); len(created) != 2 || created[1].Retry != RetryFault {
+		t.Fatalf("限额未用尽时重试不变: %+v", created)
+	}
 	h.clk.Advance(7 * time.Second)
 	h.notCancelledYet(r2, "累计 19 s")
 	h.clk.Advance(time.Second)
@@ -1854,23 +1862,38 @@ func TestActorRunTimeLimitZeroNeverCancels(t *testing.T) {
 	h.waitDone()
 }
 
-// queued 任务已达到限额：不申请槽位、不创建 attempt；控制仍可使其离开。
-func TestActorRunTimeLimitExhaustedCreatesNoAttempt(t *testing.T) {
+// queued 任务已达到限额（重启记账或调低配置之后）：走正常路径，执行以已取消的 ctx 开始，
+// 经现有判决路径结束为 failed / task_deadline_exceeded。
+func TestActorRunTimeLimitExhaustedEndsThroughNormalPath(t *testing.T) {
 	ts := queuedTask("t1")
 	ts.RunTimeMs = 30000
 	h := newActorHarness(t, ts)
 	h.limit = 30 * time.Second
-	a := h.spawn("t1")
-	h.clk.Advance(RunTimePersistInterval) // 经过一次周期检查
-	time.Sleep(20 * time.Millisecond)
-	if n := h.log.count("acquire:"); n != 0 {
-		t.Fatalf("已达限额的任务不应申请槽位；日志: %v", h.log.all())
+	h.spawn("t1")
+	h.waitDone() // 不推进时钟：取消在启动时即已生效
+	if ts := h.st.task("t1"); ts.Status != "failed" || ts.StatusReason != ClassDeadlineExceeded || ts.AttemptsTotal != 1 {
+		t.Errorf("任务应经一次 attempt 结束为 failed（task_deadline_exceeded）: %+v", ts)
 	}
-	h.st.setControl("t1", "cancel")
-	a.Notify()
+	h.before("create_env:", "stop:")
+}
+
+// 限额已用尽时可重试的结果（例如与限额取消同时发生的崩溃）改为 task_deadline_exceeded，不再排队。
+func TestActorRetryableOutcomeOverLimitIsNotRetried(t *testing.T) {
+	h := newActorHarness(t, queuedTask("t1"))
+	h.limit = 20 * time.Second
+	crashed := crash()
+	h.rn.onDeadline = &crashed
+	h.spawn("t1")
+	r := h.nextRun()
+	h.clk.Advance(20 * time.Second)
+	h.waitCause(r)
 	h.waitDone()
-	if created, _, _, _ := h.st.snapshot(); len(created) != 0 || h.st.task("t1").Status != "cancelled" {
-		t.Errorf("不应创建 attempt，任务应 cancelled: %+v", created)
+	ts := h.st.task("t1")
+	if ts.Status != "failed" || ts.StatusReason != ClassDeadlineExceeded || ts.AttemptsTotal != 1 || ts.FaultRetriesUsed != 0 {
+		t.Errorf("已用尽限额的任务不应重试: %+v", ts)
+	}
+	if _, fin, _, _ := h.st.snapshot(); len(fin) != 1 || fin[0].OutcomeClass != ClassDeadlineExceeded || fin[0].ExitSignal == nil {
+		t.Errorf("判决应为 task_deadline_exceeded 并保留退出事实: %+v", fin)
 	}
 }
 
