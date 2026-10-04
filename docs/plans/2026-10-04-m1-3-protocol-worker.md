@@ -92,8 +92,10 @@ Unix socket、沙箱内运行不在本计划范围（Plan 2、Plan 5）。
 **发送与退出的生命周期**：
 
 - **seq 的提交点**是"校验通过、开始发送"：此后无论发送成功、失败还是被取消，该 seq 都已用掉。发送失败或在途被取消时结果不确定，输出通道进入失效状态（`TransportBroken`），此后不再发送任何事件，绝不以同一 seq 重发；Worker 以 1 退出且无法再发出 `error`。
-- **输入**：读取阶段即按帧长上限（init 上限 1 MiB + 行尾）截断判定，超长帧报 `message_too_large` 并停止读取；读到的行进入有界队列（默认 64 条），队列满时读线程阻塞，对宿主形成背压。
+- **输入**：读取阶段即按帧长上限（init 上限 1 MiB + 行尾）截断判定，超长帧报 `message_too_large` 并停止读取；读到的行进入线程安全的有界队列（默认 64 条），队列满时读线程阻塞，对宿主形成背压。读线程绑定首次 `receive` 所在的事件循环，该循环关闭后不再读取输入并退出。输入缓冲约为 (64 + 1) 帧：队列中的 64 帧，加上读线程正在读取或等待入队的一帧，另有对象与底层文件缓冲的开销；这是估算，**不是**总内存的硬上限（不能写成"最多 64 MiB"）。
 - **进程入口** `main()` 是 SDK 中唯一调用 `os._exit` 的地方：运行 Worker（任何异常都记录并按失败处理）→ 在期限内等待已提交的输出写完 → `os._exit`。期限由环境变量 `AGENTBOX_WORKER_SHUTDOWN_TIMEOUT` 设置（秒，默认 5）。读写线程可能阻塞在 stdin 或 stdout 上且无法取消，正常的解释器收尾会挂起或崩溃（计划演练中实测复现 `Fatal Python error: _enter_buffered_busy`）。
+- **该期限只约束协议输出的收尾，不是整个 Worker 的退出期限。** `register_artifact` 在线程池中计算哈希，不能保证有限时间内完成（路径是 FIFO 或读操作阻塞时线程会一直等待且无法取消）；`asyncio.run` 返回前会等待线程池中的线程（演练中在 3.11 与 3.13 上实测），这段等待发生在进入输出收尾之前，不受该期限约束。**最终强制终止由宿主负责。**
+- **checkpoint 快照**：`state` 在首次提交前经 JSON 往返生成快照，所有重试复用它。往返会归一化：tuple 变为 list，非字符串键变为字符串；NaN 与 Infinity 被拒绝（`invalid_field`）。
 
 ---
 
@@ -2870,7 +2872,7 @@ Expected: 收集错误 `FileNotFoundError`（schema 文件不存在）。
 
 退出码：0 表示已发出 `result`/`paused`，或被宿主取消（取消不发终态提议，stdin 关闭视为取消）；1 表示已发出 `error`、无法开始，或协议输出通道失效；2 表示 `handshake_error`。
 
-发送与退出：seq 在开始发送时即被占用；发送失败或在途被取消后不再发送任何事件（不会复用 seq）。输入行在读取阶段按帧长上限判定，读到的行进入有界队列以形成背压。进程入口在 `AGENTBOX_WORKER_SHUTDOWN_TIMEOUT` 秒（默认 5）内等待已提交的输出写完后退出。
+发送与退出：seq 在开始发送时即被占用；发送失败或在途被取消后不再发送任何事件（不会复用 seq）。输入行在读取阶段按帧长上限判定，读到的行进入有界队列以形成背压；缓冲约为队列容量加一帧，另有对象开销，不是总内存的硬上限。进程入口在 `AGENTBOX_WORKER_SHUTDOWN_TIMEOUT` 秒（默认 5）内等待已提交的输出写完后退出；该期限只约束输出收尾，不覆盖 `register_artifact` 的哈希线程（遇到 FIFO 或阻塞读时可能无限等待），最终强制终止由宿主负责。checkpoint 的 `state` 按 JSON 往返归一化后提交（tuple 变为 list，非字符串键变为字符串，拒绝 NaN 与 Infinity）。
 
 ## fixtures
 
@@ -2910,7 +2912,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Produces：
   - `errors.WorkerFailure(code: str, message: str, *, retryable: bool = False)`（属性 `code`、`message`、`retryable`；code 为空时 `ValueError`）；子类 `CheckpointRejected(code, message)`、`CheckpointUnresolved(message)`、`ArtifactRejected(message)`；`errors.TransportBroken(Exception)`（输出通道失效，不是 `WorkerFailure`）
   - `transport.Transport`（Protocol：`async receive() -> bytes | None`，`None` 表示 EOF，帧超长时抛 `ProtocolError("message_too_large")`；`async send(line: bytes) -> None`，调用方须串行化，失败时抛 `TransportBroken`）
-  - `transport.StdioTransport(reader: BinaryIO, writer: BinaryIO, *, queue_size: int = 64)`：`receive`、`send`、`close(timeout: float) -> bool`（期限内等待已提交写出完成，返回是否全部成功写出）、属性 `pending_lines`；常量 `MAX_FRAME_BYTES`、`DEFAULT_QUEUE_SIZE`
+  - `transport.StdioTransport(reader: BinaryIO, writer: BinaryIO, *, queue_size: int = 64)`：`receive`、`send`、`close(timeout: float) -> bool`（期限内等待已提交写出完成，返回是否全部成功写出）、`wait_reader_stopped(timeout: float) -> bool`（诊断与测试用）、属性 `pending_lines`；常量 `MAX_FRAME_BYTES`、`DEFAULT_QUEUE_SIZE`。读线程只使用线程安全队列与 `call_soon_threadsafe`，不创建协程；入队失败（事件循环已关闭）时立即停止读取
   - `transport.MemoryTransport()`：`feed(line: bytes | None)`、`sent: list[bytes]`、`on_send: Callable[[bytes], None] | None`
   - `outbox.Outbox(transport)`：`async emit(body: dict) -> None`（补 `v`、`seq`、`ts`；校验失败抛 `ProtocolError` 且不占用 seq；seq 在开始发送时提交；发送失败或在途取消后进入失效状态，此后一律抛 `TransportBroken`）、`async send_handshake_error(code: str) -> None`、属性 `last_seq`
   - `outbox.Waiters`：`expect(key: str) -> asyncio.Future[dict]`、`deliver(key: str, message: dict) -> bool`
@@ -2923,6 +2925,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 import asyncio
 import io
 import json
+import threading
 
 import pytest
 
@@ -3104,22 +3107,66 @@ def test_stdio_accepts_line_at_frame_limit():
     assert asyncio.run(go()) == line
 
 
+class TrackingReader:
+    """包装 BytesIO：记录 readline 调用次数，第 notify_at 次调用读完时触发 reached。"""
+
+    def __init__(self, data: bytes, notify_at: int) -> None:
+        self._inner = io.BytesIO(data)
+        self._notify_at = notify_at
+        self.calls = 0
+        self.reached = threading.Event()
+
+    def readline(self, size: int = -1) -> bytes:
+        line = self._inner.readline(size)
+        self.calls += 1
+        if self.calls >= self._notify_at:
+            self.reached.set()
+        return line
+
+    def tell(self) -> int:
+        return self._inner.tell()
+
+
+LINES = [f"line-{i}".encode() for i in range(100)]
+QUEUE_SIZE = 2
+# 取走第一行后，读线程最多再读 QUEUE_SIZE + 1 行：QUEUE_SIZE 行在队列中，1 行等待入队。
+# 第 READ_LIMIT 次 readline 只能发生在第一行被取走之后；此后无人消费，读线程必然阻塞在入队上。
+READ_LIMIT = QUEUE_SIZE + 2
+READ_LIMIT_BYTES = sum(len(line) + 1 for line in LINES[:READ_LIMIT])
+
+
+def tracking_input() -> TrackingReader:
+    return TrackingReader(b"\n".join(LINES) + b"\n", notify_at=READ_LIMIT)
+
+
 def test_stdio_reader_applies_backpressure():
-    lines = [f"line-{i}".encode() for i in range(100)]
+    reader = tracking_input()
 
     async def go():
-        transport = StdioTransport(
-            io.BytesIO(b"\n".join(lines) + b"\n"), io.BytesIO(), queue_size=2
-        )
+        transport = StdioTransport(reader, io.BytesIO(), queue_size=QUEUE_SIZE)
         first = await transport.receive()
-        await asyncio.sleep(0.1)
-        pending = transport.pending_lines
-        rest = [await transport.receive() for _ in range(len(lines))]
-        return first, pending, rest
+        assert await asyncio.to_thread(reader.reached.wait, 5)
+        snapshot = (reader.calls, reader.tell(), transport.pending_lines)
+        rest = [await transport.receive() for _ in range(len(LINES))]
+        return first, snapshot, rest
 
-    first, pending, rest = asyncio.run(go())
-    assert pending <= 2
-    assert [first, *rest] == [*lines, None]
+    first, snapshot, rest = asyncio.run(go())
+    assert snapshot == (READ_LIMIT, READ_LIMIT_BYTES, QUEUE_SIZE)
+    assert [first, *rest] == [*LINES, None]
+
+
+def test_stdio_reader_stops_consuming_after_event_loop_closes():
+    reader = tracking_input()
+    transport = StdioTransport(reader, io.BytesIO(), queue_size=QUEUE_SIZE)
+
+    async def go():
+        first = await transport.receive()
+        assert await asyncio.to_thread(reader.reached.wait, 5)
+        return first
+
+    assert asyncio.run(go()) == LINES[0]
+    assert transport.wait_reader_stopped(5)
+    assert (reader.calls, reader.tell()) == (READ_LIMIT, READ_LIMIT_BYTES)
 
 
 class BrokenWriter(io.RawIOBase):
@@ -3208,7 +3255,6 @@ import asyncio
 import queue
 import threading
 from collections.abc import Callable
-from concurrent.futures import CancelledError as FutureCancelledError
 from typing import BinaryIO, Protocol
 
 from agentbox_worker.errors import TransportBroken
@@ -3219,6 +3265,7 @@ MAX_FRAME_BYTES = MAX_INIT_BYTES + 2
 DEFAULT_QUEUE_SIZE = 64
 
 _OVERSIZED = object()  # 读线程放入队列的"超长帧"标记
+_POLL_SECONDS = 0.05  # 读线程因背压阻塞时检查事件循环是否已关闭的间隔
 
 
 class Transport(Protocol):
@@ -3242,7 +3289,10 @@ class StdioTransport:
     """基于二进制文件对象的行传输。
 
     - 读：守护线程以 readline(上限) 读取，超长帧在读取阶段即判定，之后停止读取；
-      读到的行进入有界队列，队列满时读线程阻塞，对宿主形成背压。读失败按对端关闭处理。
+      读到的行进入线程安全的有界队列，队列满时读线程阻塞，对宿主形成背压。读失败按对端关闭处理。
+      读线程绑定首次 receive 所在的事件循环；该循环关闭后读线程不再读取输入并退出。
+      输入缓冲约为 (queue_size + 1) 帧：队列中的 queue_size 帧，加上读线程正在读取或
+      等待入队的一帧；另有对象与底层文件缓冲的开销。这是估算，不是总内存的硬上限。
     - 写：专用守护线程逐行写出并 flush，发送方等待写出完成；写失败后传输进入失败状态。
     - close(timeout)：在期限内等待已提交的写出完成。阻塞的读写线程不会阻止进程退出。
     """
@@ -3252,8 +3302,9 @@ class StdioTransport:
     ) -> None:
         self._reader = reader
         self._writer = writer
-        self._queue_size = queue_size
-        self._inbox: asyncio.Queue[object] | None = None
+        self._lines: queue.Queue[object] = queue.Queue(maxsize=queue_size)
+        self._readable = asyncio.Event()
+        self._read_thread: threading.Thread | None = None
         self._writes: queue.SimpleQueue[
             tuple[bytes, asyncio.AbstractEventLoop, asyncio.Future[None]] | None
         ] = queue.SimpleQueue()
@@ -3263,41 +3314,62 @@ class StdioTransport:
     @property
     def pending_lines(self) -> int:
         """已读入、尚未被 receive 取走的行数（诊断用）。"""
-        return 0 if self._inbox is None else self._inbox.qsize()
+        return self._lines.qsize()
+
+    def wait_reader_stopped(self, timeout: float) -> bool:
+        """在 timeout 秒内等待读线程结束；返回读线程是否已结束（诊断与测试用）。"""
+        if self._read_thread is None:
+            return True
+        self._read_thread.join(timeout)
+        return not self._read_thread.is_alive()
 
     async def receive(self) -> bytes | None:
-        if self._inbox is None:
-            self._inbox = asyncio.Queue(maxsize=self._queue_size)
+        if self._read_thread is None:
             loop = asyncio.get_running_loop()
-            reader = threading.Thread(target=self._read_loop, args=(loop, self._inbox), daemon=True)
-            reader.start()
-        item = await self._inbox.get()
+            self._read_thread = threading.Thread(target=self._read_loop, args=(loop,), daemon=True)
+            self._read_thread.start()
+        item = await self._next_line()
         if item is _OVERSIZED:
             raise ProtocolError("message_too_large", f"输入行超过 {MAX_FRAME_BYTES} 字节")
         return item  # type: ignore[return-value]
 
-    def _read_loop(self, loop: asyncio.AbstractEventLoop, inbox: asyncio.Queue[object]) -> None:
+    async def _next_line(self) -> object:
+        while True:
+            self._readable.clear()  # 先清除再检查，避免漏掉检查与等待之间放入的行
+            try:
+                return self._lines.get_nowait()
+            except queue.Empty:
+                await self._readable.wait()
+
+    def _read_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         try:
             while raw := self._reader.readline(MAX_FRAME_BYTES + 1):
-                if len(raw) > MAX_FRAME_BYTES:
-                    self._put(loop, inbox, _OVERSIZED)  # 帧边界已丢失，不再继续读取
-                    break
-                self._put(loop, inbox, raw.rstrip(b"\r\n"))
+                item = _OVERSIZED if len(raw) > MAX_FRAME_BYTES else raw.rstrip(b"\r\n")
+                if not self._put(loop, item):
+                    return  # 事件循环已关闭：不再消费输入
+                if item is _OVERSIZED:
+                    break  # 帧边界已丢失，不再继续读取
         except (OSError, ValueError):
             pass  # 读失败按对端关闭处理
-        finally:
-            self._put(loop, inbox, None)
+        self._put(loop, None)
 
-    @staticmethod
-    def _put(loop: asyncio.AbstractEventLoop, inbox: asyncio.Queue[object], item: object) -> None:
-        """放入有界队列；队列满时阻塞读线程。事件循环已结束时放弃。"""
-        put = inbox.put(item)
-        try:
-            asyncio.run_coroutine_threadsafe(put, loop).result()
-        except RuntimeError:  # 事件循环已关闭：协程未被调度，需手动关闭
-            put.close()
-        except FutureCancelledError:  # 事件循环退出时取消了等待中的放入
-            return
+    def _put(self, loop: asyncio.AbstractEventLoop, item: object) -> bool:
+        """放入有界队列并唤醒接收方；队列满时阻塞（背压）。返回是否已交付。
+
+        读线程不创建协程，只在放入后以 call_soon_threadsafe 唤醒接收方；
+        阻塞期间每 _POLL_SECONDS 检查一次事件循环，循环关闭后返回 False。
+        """
+        while not loop.is_closed():
+            try:
+                self._lines.put(item, timeout=_POLL_SECONDS)
+            except queue.Full:
+                continue
+            try:
+                loop.call_soon_threadsafe(self._readable.set)
+            except RuntimeError:  # 放入后事件循环恰好关闭
+                return False
+            return True
+        return False
 
     async def send(self, line: bytes) -> None:
         if self._failed is not None:
@@ -3479,7 +3551,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `TaskContext`：属性 `task_id`、`attempt_id`、`attempt_no`、`config`、`out_dir: Path`、`resume: ResumeInfo | None`、`cancel_reason: str | None`；方法 `should_pause() -> bool`、`async progress(kind, message, *, step_id=None, data=None)`、`async checkpoint(step_id, *, state=None, state_ref=None, refs=()) -> str`、`async register_artifact(artifact_id, path, *, media_type, visibility="output") -> ArtifactRef`
   - `async run_worker(app, transport, *, name, version, capabilities=(), timing=Timing(), new_id=None) -> int`（输出通道失效时返回 `EXIT_FAILURE`，不再尝试发送）
   - `main(app, *, name, version, capabilities=()) -> NoReturn`：进程入口策略见"错误码与契约约定"——异常按失败处理、期限内刷新已提交输出、`os._exit`；Task 7 的五个真实进程测试是其回归测试
-  - `checkpoint` 在首次提交前以 JSON 往返生成与调用方对象无关的快照，所有重试复用它；不可序列化（含 NaN）时抛 `WorkerFailure("invalid_field")`
+  - `checkpoint` 在首次提交前以 JSON 往返生成与调用方对象无关的快照，所有重试复用它；快照按 JSON 归一化（tuple 变为 list，非字符串键变为字符串）；不可序列化（含 NaN、Infinity）时抛 `WorkerFailure("invalid_field")`
+  - `register_artifact` 的哈希在线程池中计算，等待不保证有限；关闭期限不覆盖它，最终强制终止由宿主负责
   - 退出码常量 `EXIT_OK = 0`、`EXIT_FAILURE = 1`、`EXIT_HANDSHAKE = 2`；`SHUTDOWN_TIMEOUT_ENV = "AGENTBOX_WORKER_SHUTDOWN_TIMEOUT"`；包根导出 `TransportBroken`
 
 - [ ] **Step 1：写失败的测试**
@@ -4019,7 +4092,10 @@ def _resume_info(raw: dict[str, Any] | None) -> ResumeInfo | None:
 
 
 def _snapshot(state: Any) -> Any:
-    """生成与调用方对象无关的状态快照；同一 checkpoint 的所有重试都使用它（规格 §5.5）。"""
+    """生成与调用方对象无关的状态快照；同一 checkpoint 的所有重试都使用它（规格 §5.5）。
+
+    快照经 JSON 往返归一化：tuple 变为 list，非字符串键变为字符串，NaN 与 Infinity 被拒绝。
+    """
     try:
         return json.loads(json.dumps(state, ensure_ascii=False, allow_nan=False))
     except (TypeError, ValueError) as exc:
@@ -4085,7 +4161,9 @@ class TaskContext:
         """提交 checkpoint，宿主确认已提交后返回 checkpoint_id（规格 §5.5）。
 
         同一时刻至多一个在途提交；结果丢失时用同一 ID 查询，
-        retryable_error 或 not_found 时用同一 ID 重发。
+        retryable_error 或 not_found 时用同一 ID 重发。state 在首次提交前按 JSON 归一化
+        生成快照（tuple 变为 list，非字符串键变为字符串），无法序列化或含 NaN、Infinity 时
+        抛出 WorkerFailure("invalid_field")；之后修改调用方对象不影响重试内容。
         """
         async with self._checkpoint_lock:
             checkpoint_id = self._new_id()
@@ -4135,7 +4213,12 @@ class TaskContext:
     async def register_artifact(
         self, artifact_id: str, path: str, *, media_type: str, visibility: str = "output"
     ) -> ArtifactRef:
-        """登记 out_dir 下的产物；宿主保存并校验后返回其版本（规格 §5.6）。"""
+        """登记 out_dir 下的产物；宿主保存并校验后返回其版本（规格 §5.6）。
+
+        哈希在线程池中计算，不能保证有限时间内完成：path 若是 FIFO 或读操作阻塞，线程会一直
+        等待且无法取消。任务被取消后 asyncio.run 退出时仍会等待该线程，进程停在那里，尚未进入
+        main() 的输出收尾；最终强制终止由宿主负责。
+        """
         if not valid_artifact_path(path):
             raise WorkerFailure("path_invalid", f"产物路径不合法：{path!r}")
         sha256, size = await asyncio.to_thread(_hash_file, self.out_dir / path)
@@ -4359,7 +4442,11 @@ def main(app: App, *, name: str, version: str, capabilities: Iterable[str] = ())
     失败处理）→ 在期限内等待已提交的协议输出写完 → os._exit。不走正常的解释器收尾：读线程
     可能阻塞在 stdin 的 readline 中，写线程可能因宿主停止读取 stdout 而阻塞在 write 中，
     二者都无法取消或 join；正常收尾会挂起，或以 "Fatal Python error: _enter_buffered_busy"
-    崩溃。期限由环境变量 AGENTBOX_WORKER_SHUTDOWN_TIMEOUT 设置（秒，默认 5）。
+    崩溃。
+
+    期限由环境变量 AGENTBOX_WORKER_SHUTDOWN_TIMEOUT 设置（秒，默认 5），只约束协议输出的
+    收尾，不是整个 Worker 的退出期限：asyncio.run 返回前会等待线程池中的线程（例如
+    register_artifact 的哈希线程），这段等待不受该期限约束。最终强制终止由宿主负责。
     """
     protocol_out = sys.stdout.buffer
     sys.stdout = sys.stderr
@@ -4819,7 +4906,8 @@ import time
 
 from agentbox_worker.transport import MAX_FRAME_BYTES
 
-ENV = {**os.environ, "AGENTBOX_WORKER_SHUTDOWN_TIMEOUT": "1"}
+# 固定子进程 stderr 编码：Windows 上默认使用本地代码页（如 GBK），断言中文日志会失败。
+ENV = {**os.environ, "AGENTBOX_WORKER_SHUTDOWN_TIMEOUT": "1", "PYTHONIOENCODING": "utf-8"}
 CANCEL = b'{"type":"cancel","v":1,"attempt_id":"a-1","reason":"user","grace_ms":0}\n'
 
 
@@ -5197,6 +5285,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 - **规格覆盖**：§5.1 通道（SDK 的 stdin/stdout/stderr 处理、print 改道）；§5.2 引导与 `handshake_error`（Task 6、场景 `handshake_no_common_version`）；§5.3 公共规则与阶段（Task 2、3 的事件流检查）；§5.4 task 模式消息（Task 1、3）；§5.5 第 1、4、5 条（state 二选一、一个在途提交、同 ID 查询与重发）；§5.8 由宿主裁决（SDK 取消时不发终态提议）；§5.9 协作式暂停与取消；§5.10 大小上限；§5.11 fixtures（本计划覆盖协议层与 SDK 层场景，宿主层场景随 Plan 5 加入同一目录）。session 与 sub-run 扩展不在本计划范围。
 - **评审修正（第二轮）**：seq 提交点与取消语义（Task 5，`test_cancel_during_send_breaks_outbox_without_reusing_seq`）；有界关闭（Task 6 `main`，Task 7 三个真实进程场景）；读取阶段限长与有界背压（Task 5，`test_stdio_rejects_oversized_line_at_read_time`、`test_stdio_reader_applies_backpressure`，Task 7 `test_process_rejects_oversized_input_line`）；checkpoint 快照（Task 6，`test_checkpoint_retries_use_snapshot_of_state`）。
-- **演练**：本计划的全部代码已在临时目录按计划文本组装并运行：Go vet/test 与 18 个场景通过；Python ruff、模块依赖契约通过，pytest 在 Windows 3.13 与 3.11 上各 280 项通过（3.11 以 `-W error::RuntimeWarning` 连续三次）；Linux（WSL，Python 3.14）上除 schema 测试外的 147 项通过，含全部真实进程测试。
+- **评审修正（第三轮）**：读线程改用线程安全的有界队列，不再从读线程创建协程；`_put` 返回是否交付，事件循环关闭后读线程立即停止读取（`test_stdio_reader_stops_consuming_after_event_loop_closes`，已做变异验证：忽略返回值时读线程在循环关闭后读完全部 100 行，测试失败）；背压测试以同步屏障断言输入读取位置，不再依赖固定 sleep；缓冲上限、快照 JSON 归一化与关闭期限的范围写清；e2e 测试固定子进程 `PYTHONIOENCODING=utf-8`（Windows 默认代码页下断言中文日志会失败）。
+- **演练**：本计划的全部代码已在临时目录按计划文本组装并运行：Go vet/test 与 18 个场景通过；Python ruff、模块依赖契约通过，pytest 在 Windows 3.13 与 3.11 上各 281 项通过（`-W error::RuntimeWarning`，3.11 连续三次）；Linux（WSL，Python 3.14）上除 schema 测试外的 148 项通过（连续三次），含全部真实进程测试。
 - **占位符**：无。
 - **类型一致性**：`run_worker(app, transport, *, name, version, capabilities, timing, new_id)`、`Timing(ack_timeout, max_ack_attempts, retry_backoff, artifact_timeout)`、`TaskContext.checkpoint(step_id, *, state, state_ref, refs)`、`register_artifact(artifact_id, path, *, media_type, visibility)` 在 Task 6、7 的测试与实现中一致；Go 的 `DecodeLine`、`EncodeLine`、`WorkerStream.Observe`、`CodeOf` 在 Task 1、2 中一致。
