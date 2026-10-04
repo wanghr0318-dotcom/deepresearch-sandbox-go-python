@@ -65,6 +65,8 @@
     {"name": "cancel_negative_grace", "direction": "host", "message": {"type": "cancel", "v": 1, "attempt_id": "a-1", "reason": "user", "grace_ms": -1}, "code": "invalid_field"},
     {"name": "error_missing_code", "direction": "worker", "message": {"type": "error", "v": 1, "seq": 2, "message": "boom", "retryable": false}, "code": "missing_field"},
     {"name": "error_retryable_not_bool", "direction": "worker", "message": {"type": "error", "v": 1, "seq": 2, "code": "x", "message": "boom", "retryable": "yes"}, "code": "invalid_field"},
-    {"name": "handshake_error_bad_bootstrap", "direction": "worker", "message": {"type": "handshake_error", "bootstrap": 2, "code": "no_common_version"}, "code": "invalid_field"}
+    {"name": "handshake_error_bad_bootstrap", "direction": "worker", "message": {"type": "handshake_error", "bootstrap": 2, "code": "no_common_version"}, "code": "invalid_field"},
+    {"name": "utf8_bom_prefix", "direction": "worker", "raw": "\ufeff{\"type\":\"progress\",\"v\":1,\"seq\":1,\"kind\":\"x\",\"message\":\"y\"}", "code": "malformed_json"},
+    {"name": "seq_out_of_int64_range", "direction": "worker", "raw": "{\"type\":\"progress\",\"v\":1,\"seq\":99999999999999999999,\"kind\":\"x\",\"message\":\"y\"}", "code": "invalid_field"}
   ]
 }

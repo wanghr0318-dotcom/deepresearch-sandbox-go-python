@@ -49,8 +49,12 @@ def _is_str(v: Any) -> bool:
     return isinstance(v, str)
 
 
+_INT64_MIN, _INT64_MAX = -(1 << 63), (1 << 63) - 1
+
+
 def _is_int(v: Any) -> bool:
-    return isinstance(v, int) and not isinstance(v, bool)
+    """与 Go 一致：整数字段必须落在 int64 范围内。"""
+    return isinstance(v, int) and not isinstance(v, bool) and _INT64_MIN <= v <= _INT64_MAX
 
 
 def _is_bool(v: Any) -> bool:
@@ -190,7 +194,7 @@ def valid_sha256(s: str) -> bool:
 
 def valid_artifact_path(path: str) -> bool:
     """相对、非空、无 NUL、不超过上限、不含空、. 或 .. 分量（规格 §5.6）。"""
-    if not path or len(path.encode("utf-8")) > MAX_ARTIFACT_PATH_BYTES:
+    if not path or len(path.encode("utf-8", "surrogatepass")) > MAX_ARTIFACT_PATH_BYTES:
         return False
     if "\x00" in path or path.startswith("/"):
         return False
@@ -207,7 +211,8 @@ def _check_state(msg: dict[str, Any]) -> None:
             raise ProtocolError("invalid_field", "state_ref 不是合法的 sha256")
         return
     compact = json.dumps(msg["state"], ensure_ascii=False, separators=(",", ":"))
-    size = len(compact.encode("utf-8"))
+    # 孤立代理项按 3 字节计，与 Go 替换成的 U+FFFD 相同
+    size = len(compact.encode("utf-8", "surrogatepass"))
     if size > MAX_INLINE_STATE_BYTES:
         raise ProtocolError(
             "state_too_large", f"inline state {size} 字节，上限 {MAX_INLINE_STATE_BYTES}"
@@ -390,13 +395,16 @@ def _validator_for(direction: str, typ: Any) -> Callable[[dict[str, Any]], None]
 
 
 def decode_line(direction: str, line: bytes | str) -> dict[str, Any]:
-    """解析并校验一行消息（不含行尾换行符）。"""
-    raw = line.encode("utf-8") if isinstance(line, str) else line
+    """解析并校验一行消息（不含行尾换行符）。行必须是严格的 UTF-8，不含 BOM。"""
+    try:
+        raw = line.encode("utf-8") if isinstance(line, str) else line
+    except UnicodeEncodeError as exc:  # str 中含孤立代理项字符
+        raise ProtocolError("malformed_json", "行不是合法的 UTF-8") from exc
     if len(raw) > MAX_LINE_BYTES:
         raise ProtocolError("message_too_large", f"{len(raw)} 字节，上限 {MAX_LINE_BYTES}")
     try:
-        msg = json.loads(raw, parse_constant=_reject_constant)
-    except ValueError as exc:  # JSONDecodeError 与 UnicodeDecodeError 都是 ValueError
+        msg = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+    except (ValueError, RecursionError) as exc:  # 非法 UTF-8、BOM、语法错误、嵌套过深
         raise ProtocolError("malformed_json", str(exc)) from exc
     if not isinstance(msg, dict):
         raise ProtocolError("malformed_json", "消息必须是 JSON 对象")
@@ -418,6 +426,9 @@ def encode_line(direction: str, msg: dict[str, Any]) -> bytes:
         text = json.dumps(msg, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     except ValueError as exc:  # NaN、Infinity 不是合法 JSON
         raise ProtocolError("invalid_field", f"消息含有 JSON 不支持的数值：{exc}") from exc
-    line = text.encode("utf-8")
+    try:
+        line = text.encode("utf-8")
+    except UnicodeEncodeError as exc:  # 字符串中含孤立代理项
+        raise ProtocolError("invalid_field", "消息含有孤立代理项，无法编码为 UTF-8") from exc
     _check_size(direction, typ, len(line))
     return line

@@ -126,6 +126,24 @@ LIMIT_CASES = [
     ),
     pytest.param(
         WORKER,
+        b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"\xff"}',
+        "malformed_json",
+        id="invalid_utf8",
+    ),
+    pytest.param(
+        WORKER,
+        b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":'
+        + b"[" * 20000
+        + b"]" * 20000
+        + b"}",
+        "malformed_json",
+        id="nesting_too_deep",
+    ),
+    pytest.param(
+        WORKER, checkpoint_line('"\\ud800"', []), None, id="lone_surrogate_escape_accepted"
+    ),
+    pytest.param(
+        WORKER,
         b'{"type":"progress","v":1,"seq":1,"kind":"x","message":"y","data":NaN}',
         "malformed_json",
         id="nan_is_malformed",
@@ -164,6 +182,12 @@ def test_decode_limits(direction, line, code):
             {"type": "paused", "v": 1, "seq": 1, "checkpoint_id": "cp-1"},
             "unknown_type",
             id="wrong_direction",
+        ),
+        pytest.param(
+            WORKER,
+            {"type": "progress", "v": 1, "seq": 1, "kind": "x", "message": "\ud800"},
+            "invalid_field",
+            id="lone_surrogate",
         ),
     ],
 )

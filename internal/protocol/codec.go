@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"unicode/utf8"
 )
 
 // Direction 是消息的传输方向。
@@ -42,6 +43,9 @@ var registry = map[Direction]map[string]func() Message{
 func DecodeLine(dir Direction, line []byte) (Message, error) {
 	if len(line) > maxLineBytes {
 		return nil, newError(CodeMessageTooLarge, "%d 字节，上限 %d", len(line), maxLineBytes)
+	}
+	if !utf8.Valid(line) {
+		return nil, newError(CodeMalformedJSON, "行不是合法的 UTF-8")
 	}
 	if t := bytes.TrimSpace(line); len(t) == 0 || t[0] != '{' {
 		return nil, newError(CodeMalformedJSON, "消息必须是 JSON 对象")
