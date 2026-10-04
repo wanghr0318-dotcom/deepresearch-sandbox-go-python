@@ -55,7 +55,7 @@ type Decision struct {
 // Decide 按规格 §7.4 的决策表判定下一步。"表不存在"本身不被当作全新安装：
 // 只有整个库为空且数据目录无身份时才初始化。
 func Decide(db DBState, file FileState) Decision {
-	empty := !db.HasMigrations && !db.HasAgentboxTables
+	empty := !db.HasMigrations && !db.HasAgentboxTables && db.Installation == nil
 	switch {
 	case empty && !file.Exists:
 		return Decision{Action: Initialize}
@@ -64,7 +64,7 @@ func Decide(db DBState, file FileState) Decision {
 	case !db.HasMigrations:
 		return refuse("存在 agentbox 表但没有 schema_migrations：未知 schema")
 	case db.Installation == nil:
-		return refuse("有 schema_migrations 但无 installation 记录：初始迁移与记录原子提交，只能来自外部改动或损坏")
+		return refuse("有 schema_migrations 但无 installation 记录：初始迁移与记录原子提交，只能来自外部改动、损坏，或该库属于另一个使用 schema_migrations 的应用")
 	case file.Exists && file.InstallID != db.Installation.InstallID:
 		return refuse(fmt.Sprintf("安装身份不一致：数据库 %q，数据目录 %q", db.Installation.InstallID, file.InstallID))
 	case !db.Installation.Complete && !file.Exists:
@@ -106,7 +106,19 @@ func (e *RefusedError) Is(target error) bool { return target == ErrRefused }
 
 // Bootstrap 执行安装身份引导与校验，返回本安装的 install_id。任何一步中断后重新调用，
 // 都会按当时的事实继续或明确拒绝。newID 只在全新安装时调用。
+//
+// 前置条件（规格 §7.4 的顺序）：调用方已持有数据目录的 flock，然后已持有数据库 advisory lock；
+// 两把锁共同保证同一时刻只有一个进程对同一数据目录与同一数据库执行引导。返回错误时 install_id
+// 为空，调用方不得使用；拒绝原因不含数据目录与数据库位置，由装配层包装后报告给运维。
 func Bootstrap(ctx context.Context, store InstallStore, file IDFile, newID func() string) (string, error) {
+	id, err := bootstrap(ctx, store, file, newID)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func bootstrap(ctx context.Context, store InstallStore, file IDFile, newID func() string) (string, error) {
 	db, err := store.InspectInstallation(ctx)
 	if err != nil {
 		return "", fmt.Errorf("ownership: 读取数据库状态: %w", err)
@@ -119,6 +131,9 @@ func Bootstrap(ctx context.Context, store InstallStore, file IDFile, newID func(
 	switch d.Action {
 	case Initialize:
 		id = newID()
+		if id == "" {
+			return "", errors.New("ownership: 生成的 install_id 为空")
+		}
 		if err := store.InitializeInstallation(ctx, id); err != nil {
 			return "", fmt.Errorf("ownership: 初始化安装: %w", err)
 		}
