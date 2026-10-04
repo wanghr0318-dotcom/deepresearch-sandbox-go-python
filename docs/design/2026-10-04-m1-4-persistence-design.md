@@ -46,7 +46,12 @@
 
 - 整体 deadline（默认 2 s）覆盖连接池获取、事务与全部重跑；事务内 `SET LOCAL lock_timeout = '1s'`、`statement_timeout = '2s'`，`READ COMMITTED`。
 - 任何错误回滚。`40001`/`40P01` 只在**确认中止**时重跑整个 `fn`（语句返回该码，或 `COMMIT` 返回该码），有界、带抖动退避。
-- `COMMIT` 返回无 SQLSTATE 的错误（连接断开，或提交过程中 deadline 到期）时不重跑，返回 `persistence.ErrCommitUnknown`。
+- **分类原则：只有确定未提交时才报告"未提交"；`COMMIT` 可能已到达服务端时一律视为未知。**
+  - 连接类错误：网络错误、连接建立失败，以及服务端的 `08*`、`57P01`/`57P02`/`57P03`（会话被终止、崩溃恢复、暂不接受连接）与 `53300`（连接数已满）。语句阶段遇到时在 deadline 内重跑，最终为 `ErrUnavailable`。
+  - `57014`（语句超时）且操作 context 未结束：视为超时，在 deadline 内重跑，最终为 `ErrUnavailable`（规格 §7.3：timeout 计入阈值）。
+  - `COMMIT` 的结果：`ERROR` 级 PgError（非连接类）→ 服务端拒绝，确认未提交；`pgconn.SafeToRetry`（COMMIT 未发出）→ 确认未提交，普通重跑；`pgx.ErrTxCommitRollback`（事务体吞掉了语句错误）→ 编程错误，不重跑、不计入阈值；其余（`FATAL`/`PANIC`、连接类、无 SQLSTATE）→ 结果未知，以同一身份在剩余时间内重跑幂等事务体，用尽时返回 `persistence.ErrCommitUnknown`。
+  - **调用方取消**（调用方自己的 context 结束）不是存储故障：未出现未知结果时返回包装调用方 `ctx.Err()` 的错误，不计入阈值；出现过未知结果时仍返回 `ErrCommitUnknown`。操作自身的整体 deadline 到期仍按 `ErrUnavailable`/`ErrContention` 归类。失去所有权优先于其他归类。
+  - 返回的错误以 `%w` 同时保留类别哨兵与最后一次的底层错误；调用方先按 `persistence` 哨兵判断。
 
 ### 2.2 错误契约（`internal/persistence`，无驱动依赖）
 

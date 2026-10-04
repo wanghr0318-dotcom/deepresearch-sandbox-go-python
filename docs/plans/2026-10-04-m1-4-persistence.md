@@ -1738,9 +1738,10 @@ func TestInstallationBootstrapE46(t *testing.T) {
 	})
 	t.Run("初始迁移提交前中断", func(t *testing.T) {
 		s, f := open(t)
-		s.hooks.beforeCommit = func(string) error { return errors.New("模拟中断") }
-		if _, err := ownership.Bootstrap(ctx, s, f, newID); err == nil {
-			t.Fatal("中断应使引导失败")
+		fired := false
+		s.hooks.beforeCommit = func(string) error { fired = true; return errors.New("模拟中断") }
+		if _, err := ownership.Bootstrap(ctx, s, f, newID); err == nil || !fired {
+			t.Fatalf("中断应使引导失败（钩子触发 %v），得到 %v", fired, err)
 		}
 		s.hooks.beforeCommit = nil
 		if st, _ := s.InspectInstallation(ctx); st.HasMigrations || st.HasAgentboxTables {
@@ -1804,6 +1805,33 @@ func probeTable(t *testing.T, s *Store) {
 func lockProbe(ctx context.Context, tx pgx.Tx, id int) error {
 	_, err := tx.Exec(ctx, "SELECT 1 FROM probe WHERE id = $1 FOR UPDATE", id)
 	return err
+}
+
+// holdProbe 在独立事务中持有 probe 行锁，测试结束时回滚。
+func holdProbe(t *testing.T, s *Store, id int) {
+	t.Helper()
+	ctx := context.Background()
+	holder, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = holder.Rollback(ctx) })
+	if err := lockProbe(ctx, holder, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// waitLockWait 等到当前数据库中有会话阻塞在行锁上，确认在途操作确实停在锁等待中。
+func waitLockWait(t *testing.T, s *Store) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for count(t, s, `SELECT count(*) FROM pg_stat_activity
+		WHERE datname = current_database() AND wait_event_type = 'Lock'`) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("5 s 内在途操作没有阻塞在行锁上")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // TestDeadlockIsRetried 覆盖 E12 的存储部分：两事务经屏障违反锁顺序形成环，
@@ -1892,21 +1920,17 @@ func TestOwnershipLossCancelsOperations(t *testing.T) {
 	s := newStore(t, Options{DSN: dsn, Ownership: own, OpDeadline: 10 * time.Second, LockTimeout: 9 * time.Second, StatementTimeout: 9 * time.Second})
 	probeTable(t, s)
 
-	holder, err := s.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = holder.Rollback(ctx) }()
-	if _, err := holder.Exec(ctx, "SELECT 1 FROM probe WHERE id = 1 FOR UPDATE"); err != nil {
-		t.Fatal(err)
-	}
+	holdProbe(t, s, 1)
 	inflight := make(chan error, 1)
 	go func() {
 		inflight <- s.run(ctx, "inflight", "1", func(ctx context.Context, tx pgx.Tx) error { return lockProbe(ctx, tx, 1) })
 	}()
+	waitLockWait(t, s)
 
+	// 只取本测试数据库中的锁连接：其他并行测试的库里也可能有同键的 advisory lock。
 	var pid int
-	if err := s.pool.QueryRow(ctx, "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted").Scan(&pid); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted
+		AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`).Scan(&pid); err != nil {
 		t.Fatal(err)
 	}
 	start := time.Now()
@@ -1915,7 +1939,11 @@ func TestOwnershipLossCancelsOperations(t *testing.T) {
 	}
 	select {
 	case <-own.Lost():
-		t.Logf("失锁检测延迟 %v", time.Since(start))
+		latency, bound := time.Since(start), 2*(200*time.Millisecond+200*time.Millisecond)
+		t.Logf("失锁检测延迟 %v", latency)
+		if latency >= bound {
+			t.Fatalf("失锁检测延迟 %v 超过 2*(CheckInterval+CheckTimeout) = %v", latency, bound)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("5 s 内没有检测到失锁")
 	}
@@ -1929,6 +1957,210 @@ func TestOwnershipLossCancelsOperations(t *testing.T) {
 	}
 	if _, err := s.InspectInstallation(ctx); !errors.Is(err, persistence.ErrOwnershipLost) {
 		t.Fatalf("失锁后新操作应被拒绝，得到 %v", err)
+	}
+	if err := s.Migrate(ctx); !errors.Is(err, persistence.ErrOwnershipLost) {
+		t.Fatalf("失锁后迁移应被拒绝，得到 %v", err)
+	}
+	if err := own.Close(); err != nil {
+		t.Fatalf("关闭锁连接: %v", err)
+	}
+	if err := own.Close(); err != nil { // 幂等；随后 defer 中的第三次调用同样无害
+		t.Fatalf("再次关闭应返回 nil，得到 %v", err)
+	}
+}
+
+// TestErrorClassification 在真实 PostgreSQL 上核对事务辅助的错误归类与是否计入故障阈值。
+func TestErrorClassification(t *testing.T) {
+	ctx := context.Background()
+	long := Options{OpDeadline: 10 * time.Second, LockTimeout: 9 * time.Second, StatementTimeout: 9 * time.Second}
+
+	t.Run("事务中后端被终止", func(t *testing.T) {
+		s := newStore(t, long)
+		probeTable(t, s)
+		pids, killed := make(chan int, 1), make(chan struct{})
+		go func() {
+			defer close(killed)
+			pid := <-pids
+			_, _ = s.pool.Exec(ctx, "SELECT pg_terminate_backend($1)", pid)
+			// 等后端真正退出，事务体的下一条语句必然落在已终止的连接上。
+			for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+				var alive bool
+				if err := s.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)", pid).Scan(&alive); err != nil || !alive {
+					return
+				}
+			}
+		}()
+		var attempts atomic.Int32
+		var firstErr error
+		err := s.run(ctx, "terminated", "probe-3", func(ctx context.Context, tx pgx.Tx) error {
+			n := attempts.Add(1)
+			if n == 1 {
+				var pid int
+				if err := tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pid); err != nil {
+					return err
+				}
+				pids <- pid
+				<-killed
+			}
+			_, err := tx.Exec(ctx, "INSERT INTO probe (id) VALUES (3) ON CONFLICT DO NOTHING")
+			if n == 1 {
+				firstErr = err
+			}
+			return err
+		})
+		if err != nil || attempts.Load() != 2 {
+			t.Fatalf("被终止的尝试应重跑并成功：err %v，尝试 %d 次", err, attempts.Load())
+		}
+		// 通常是 FATAL 57P01；若客户端先看到套接字关闭，则是网络错误——两者都应按连接错误重跑。
+		if !isConnection(firstErr) {
+			t.Fatalf("第一次尝试应以连接错误（57P01 或套接字关闭）结束，得到 %v", firstErr)
+		}
+		if n := count(t, s, "SELECT count(*) FROM probe WHERE id = 3"); n != 1 {
+			t.Fatalf("应只写入一行，得到 %d", n)
+		}
+	})
+
+	t.Run("语句超时", func(t *testing.T) {
+		s := newStore(t, Options{OpDeadline: 500 * time.Millisecond, LockTimeout: time.Second, StatementTimeout: 50 * time.Millisecond})
+		var timeouts, attempts int
+		var last error
+		err := s.run(ctx, "slow", "1", func(ctx context.Context, tx pgx.Tx) error {
+			attempts++
+			_, last = tx.Exec(ctx, "SELECT pg_sleep(0.2)")
+			if sqlState(last) == "57014" {
+				timeouts++
+			}
+			return last
+		})
+		if !errors.Is(err, persistence.ErrUnavailable) || !persistence.CountsTowardFailureThreshold(err) {
+			t.Fatalf("语句超时应为 ErrUnavailable 且计入故障阈值，得到 %v", err)
+		}
+		// 57014 在 deadline 内重跑；最后一次尝试可能被操作 deadline 截断，故只要求出现过 57014。
+		if timeouts == 0 || attempts < 2 {
+			t.Fatalf("语句超时应在 deadline 内重跑：尝试 %d 次，其中 57014 %d 次", attempts, timeouts)
+		}
+		// 底层错误以 %w 保留：最后一次尝试的错误，或它在事务体之前被 deadline 截断时的 context 错误。
+		if !errors.Is(err, last) && !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("结果应以 %%w 保留最后一次的底层错误 %v，得到 %v", last, err)
+		}
+	})
+
+	t.Run("事务体吞掉语句错误", func(t *testing.T) {
+		s := newStore(t, long)
+		var attempts atomic.Int32
+		err := s.run(ctx, "swallow", "1", func(ctx context.Context, tx pgx.Tx) error {
+			attempts.Add(1)
+			_, _ = tx.Exec(ctx, "SELECT 1/0")
+			return nil
+		})
+		if !errors.Is(err, errInvalid) || persistence.CountsTowardFailureThreshold(err) || attempts.Load() != 1 {
+			t.Fatalf("应为 errInvalid、不计入阈值且只尝试一次：%v（尝试 %d 次）", err, attempts.Load())
+		}
+	})
+
+	t.Run("COMMIT 时连接被终止", func(t *testing.T) {
+		// 每次尝试在 COMMIT 前终止自己的后端：COMMIT 得到 FATAL 57P01，可能已到达服务端，
+		// 只能视为结果未知；deadline 用尽时返回 CommitUnknownError。
+		s := newStore(t, Options{OpDeadline: time.Second, LockTimeout: time.Second, StatementTimeout: time.Second})
+		var pid int
+		s.hooks.beforeCommit = func(string) error {
+			_, _ = s.pool.Exec(ctx, "SELECT pg_terminate_backend($1)", pid)
+			for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+				if count(t, s, "SELECT count(*) FROM pg_stat_activity WHERE pid = $1", pid) == 0 {
+					break
+				}
+			}
+			return nil
+		}
+		err := s.run(ctx, "commit-fatal", "1", func(ctx context.Context, tx pgx.Tx) error {
+			return tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pid)
+		})
+		var unknown *persistence.CommitUnknownError
+		if !errors.As(err, &unknown) || !persistence.CountsTowardFailureThreshold(err) {
+			t.Fatalf("COMMIT 得到 FATAL 时应为 CommitUnknownError，得到 %v", err)
+		}
+		if !isConnection(unknown.Err) {
+			t.Fatalf("未知提交应携带连接错误（57P01 或套接字关闭），得到 %v", unknown.Err)
+		}
+	})
+
+	t.Run("COMMIT 前调用方取消", func(t *testing.T) {
+		// context 已结束时 COMMIT 不会发出（SafeToRetry）：确定未提交，归为调用方取消而非未知。
+		s := newStore(t, long)
+		probeTable(t, s)
+		cctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		s.hooks.beforeCommit = func(string) error { cancel(); return nil }
+		err := s.run(cctx, "cancel-before-commit", "probe-3", func(ctx context.Context, tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, "INSERT INTO probe (id) VALUES (3) ON CONFLICT DO NOTHING")
+			return err
+		})
+		if !errors.Is(err, context.Canceled) || errors.Is(err, persistence.ErrCommitUnknown) || persistence.CountsTowardFailureThreshold(err) {
+			t.Fatalf("COMMIT 未发出时应为调用方取消、不是未知提交，得到 %v", err)
+		}
+		if n := count(t, s, "SELECT count(*) FROM probe WHERE id = 3"); n != 0 {
+			t.Fatalf("未提交的事务不应留下行，得到 %d", n)
+		}
+	})
+
+	t.Run("调用方取消", func(t *testing.T) {
+		s := newStore(t, long)
+		probeTable(t, s)
+		holdProbe(t, s, 1)
+		cctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			done <- s.run(cctx, "canceled", "1", func(ctx context.Context, tx pgx.Tx) error { return lockProbe(ctx, tx, 1) })
+		}()
+		waitLockWait(t, s)
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) || errors.Is(err, persistence.ErrUnavailable) || persistence.CountsTowardFailureThreshold(err) {
+				t.Fatalf("调用方取消应包装 context.Canceled、不是 ErrUnavailable、不计入阈值，得到 %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("取消后操作没有结束")
+		}
+	})
+}
+
+// TestCompositeForeignKeys：任务内引用使用复合外键，事件不能指向另一个任务的 attempt（规格 §6）。
+func TestCompositeForeignKeys(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO tasks (task_id, spec_json, status, max_fault_retries) VALUES ('A', '{}', 'queued', 0), ('B', '{}', 'queued', 0);
+		INSERT INTO attempts (attempt_id, task_id, attempt_no, env_id, status) VALUES ('b-1', 'B', 1, 'env-b', 'running');
+		INSERT INTO blobs (sha256, size) VALUES ('h', 1);
+		INSERT INTO artifact_heads (task_id, artifact_id) VALUES ('A', 'out'), ('B', 'out')`); err != nil {
+		t.Fatal(err)
+	}
+	event := func(taskID string) error {
+		_, err := s.pool.Exec(ctx, `INSERT INTO events (task_id, task_seq, event_key, attempt_id, source, type, payload, content_hash)
+			VALUES ($1, 1, 'k', 'b-1', 'host', 'x', '{}', '\x00')`, taskID)
+		return err
+	}
+	artifact := func(taskID, artifactID string) error {
+		_, err := s.pool.Exec(ctx, `INSERT INTO artifacts (task_id, artifact_id, version, sha256, size, media_type, visibility, attempt_id)
+			VALUES ($1, $2, 1, 'h', 1, 'text/plain', 'output', 'b-1')`, taskID, artifactID)
+		return err
+	}
+	if err := event("A"); sqlState(err) != "23503" {
+		t.Fatalf("任务 A 的事件引用任务 B 的 attempt 应违反外键，得到 %v", err)
+	}
+	if err := artifact("A", "out"); sqlState(err) != "23503" {
+		t.Fatalf("任务 A 的产物引用任务 B 的 attempt 应违反外键，得到 %v", err)
+	}
+	if err := artifact("B", "missing"); sqlState(err) != "23503" {
+		t.Fatalf("没有 artifact_heads 的产物应违反外键，得到 %v", err)
+	}
+	if err := event("B"); err != nil {
+		t.Fatalf("同一任务内的引用应被接受，得到 %v", err)
+	}
+	if err := artifact("B", "out"); err != nil {
+		t.Fatalf("同一任务内的引用应被接受，得到 %v", err)
 	}
 }
 ```
@@ -2052,7 +2284,9 @@ CREATE TABLE events (
     ts           timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (task_id, task_seq),
     UNIQUE (task_id, event_key),
-    CHECK ((source = 'worker') = (worker_seq IS NOT NULL))
+    CHECK ((source = 'worker') = (worker_seq IS NOT NULL)),
+    -- 任务内引用用复合外键，防止跨任务引用（规格 §6）；MATCH SIMPLE：attempt_id 为 NULL 的宿主事件不受约束
+    FOREIGN KEY (task_id, attempt_id) REFERENCES attempts (task_id, attempt_id)
 );
 CREATE UNIQUE INDEX events_worker_seq ON events (attempt_id, worker_seq) WHERE worker_seq IS NOT NULL;
 
@@ -2159,7 +2393,9 @@ CREATE TABLE artifacts (
     attempt_id  text NOT NULL,
     created_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (task_id, artifact_id, version),
-    UNIQUE (task_id, artifact_id, sha256)
+    UNIQUE (task_id, artifact_id, sha256),
+    FOREIGN KEY (task_id, artifact_id) REFERENCES artifact_heads (task_id, artifact_id),
+    FOREIGN KEY (task_id, attempt_id) REFERENCES attempts (task_id, attempt_id)
 );
 ```
 
@@ -2183,6 +2419,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -2198,6 +2435,7 @@ const (
 	DefaultLockTimeout      = time.Second
 	DefaultStatementTimeout = 2 * time.Second
 	migrationTimeout        = 5 * time.Minute
+	rollbackTimeout         = time.Second // 延迟回滚的上限，连接卡住时不无限等待
 )
 
 // Options 配置 Store。零值字段取默认值。
@@ -2251,10 +2489,15 @@ func (s *Store) lost() bool { return s.opt.Ownership != nil && s.opt.Ownership.I
 
 // opContext 为一次操作建立整体 deadline；失去所有权时立即取消。
 func (s *Store) opContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	return s.boundContext(ctx, s.opt.OpDeadline)
+}
+
+// boundContext 从调用方 context 派生带超时的 context；配置了 Ownership 时失去所有权即取消。
+func (s *Store) boundContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc, error) {
 	if s.lost() {
 		return nil, nil, persistence.ErrOwnershipLost
 	}
-	ctx, cancel := context.WithTimeout(ctx, s.opt.OpDeadline)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	if s.opt.Ownership == nil {
 		return ctx, cancel, nil
 	}
@@ -2262,10 +2505,17 @@ func (s *Store) opContext(ctx context.Context) (context.Context, context.CancelF
 	return ctx, func() { stop(); cancel() }, nil
 }
 
+// rollback 以有界的 context 回滚；已提交或已关闭时为空操作。
+func rollback(tx pgx.Tx) {
+	ctx, cancel := context.WithTimeout(context.Background(), rollbackTimeout)
+	defer cancel()
+	_ = tx.Rollback(ctx)
+}
+
 // txFunc 是一个事务体；必须幂等（设计 §2.3）。
 type txFunc func(ctx context.Context, tx pgx.Tx) error
 
-// commitUnknown 表示 COMMIT 的结果未知（无 SQLSTATE 的错误）。
+// commitUnknown 表示 COMMIT 可能已到达服务端而结果未知。
 type commitUnknown struct{ err error }
 
 func (e *commitUnknown) Error() string { return "COMMIT 结果未知: " + e.err.Error() }
@@ -2276,7 +2526,7 @@ func (s *Store) txOnce(ctx context.Context, op string, fn txFunc) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback(context.Background()) }() // 已提交时为空操作
+	defer rollback(tx) // 已提交时为空操作
 	if _, err := tx.Exec(ctx, "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
 		durationSetting(s.opt.LockTimeout), durationSetting(s.opt.StatementTimeout)); err != nil {
 		return err
@@ -2290,11 +2540,7 @@ func (s *Store) txOnce(ctx context.Context, op string, fn txFunc) error {
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) {
-			return err // 服务端明确拒绝提交（例如提交时的序列化失败）
-		}
-		return &commitUnknown{err: err}
+		return commitError(err)
 	}
 	if s.hooks.afterCommit != nil {
 		if err := s.hooks.afterCommit(op); err != nil {
@@ -2304,11 +2550,38 @@ func (s *Store) txOnce(ctx context.Context, op string, fn txFunc) error {
 	return nil
 }
 
+// commitError 归类 COMMIT 的错误。只有确定未提交时才按普通失败返回；COMMIT 可能已到达
+// 服务端时一律为未知（设计 §2.2）。
+func commitError(err error) error {
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.Is(err, pgx.ErrTxCommitRollback):
+		// 事务已处于失败状态，COMMIT 实际执行了回滚：事务体忽略了某条语句的错误（编程错误）。
+		return fmt.Errorf("%w: 事务体吞掉了语句错误，事务已回滚: %w", errInvalid, err)
+	case pgconn.SafeToRetry(err):
+		return err // COMMIT 未发出（例如 context 已结束），确定未提交
+	case errors.As(err, &pgErr) && severity(pgErr) == "ERROR" && !isConnectionCode(pgErr.Code):
+		return err // 服务端明确拒绝提交（例如提交时的序列化失败）
+	default:
+		return &commitUnknown{err: err} // 含 FATAL/PANIC 与连接类 SQLSTATE：连接已断，结果未知
+	}
+}
+
+// severity 优先取不随语言环境变化的严重级别。
+func severity(e *pgconn.PgError) string {
+	if e.SeverityUnlocalized != "" {
+		return e.SeverityUnlocalized
+	}
+	return e.Severity
+}
+
 // run 在一个整体 deadline 内执行幂等事务用例。遇到提交结果未知或可重试的中止、锁超时、
-// 连接错误时，以同一身份在剩余时间内重跑；查不到不等于没提交，结论只由事务内的仲裁给出。
-// deadline 用完仍无结论时：曾出现提交结果未知 → *persistence.CommitUnknownError；
-// 否则按最后一次错误归类为 ErrContention 或 ErrUnavailable。
+// 语句超时、连接错误时，以同一身份在剩余时间内重跑；查不到不等于没提交，结论只由事务内的
+// 仲裁给出。deadline 用完仍无结论时：曾出现提交结果未知 → *persistence.CommitUnknownError；
+// 调用方 context 结束 → 包装调用方的 ctx.Err()；否则按最后一次错误归类为 ErrContention 或
+// ErrUnavailable。
 func (s *Store) run(ctx context.Context, op, identity string, fn txFunc) error {
+	caller := ctx
 	ctx, cancel, err := s.opContext(ctx)
 	if err != nil {
 		return err
@@ -2329,20 +2602,22 @@ func (s *Store) run(ctx context.Context, op, identity string, fn txFunc) error {
 			last = err
 			contended = contended || isLockTimeout(err) || isRetryableAbort(err)
 		default:
-			return s.final(ctx, op, identity, unknown, contended, err)
+			return s.final(caller, ctx, op, identity, unknown, contended, err)
 		}
 		if s.lost() {
 			return persistence.ErrOwnershipLost
 		}
 		if !sleepBackoff(ctx, attempt) {
-			return s.final(ctx, op, identity, unknown, contended, last)
+			return s.final(caller, ctx, op, identity, unknown, contended, last)
 		}
 	}
 }
 
-// final 把最后一次错误归类为对消费者公开的错误。contended 表示本次操作曾因锁超时或
-// 可重试的中止而重跑：此时 deadline 到期归为 ErrContention（不计入 Store 故障阈值）。
-func (s *Store) final(ctx context.Context, op, identity string, unknown error, contended bool, err error) error {
+// final 把最后一次错误归类为对消费者公开的错误，并以 %w 保留底层错误。caller 是调用方的
+// context，ctx 是由它派生的操作 context。contended 表示本次操作曾因锁超时或可重试的中止而
+// 重跑：此时 deadline 到期归为 ErrContention（不计入 Store 故障阈值）。调用方取消不是存储
+// 故障：返回包装调用方 ctx.Err() 的错误，不计入阈值。
+func (s *Store) final(caller, ctx context.Context, op, identity string, unknown error, contended bool, err error) error {
 	switch {
 	case s.lost():
 		return persistence.ErrOwnershipLost
@@ -2350,12 +2625,14 @@ func (s *Store) final(ctx context.Context, op, identity string, unknown error, c
 		return err
 	case unknown != nil:
 		return &persistence.CommitUnknownError{Op: op, Identity: identity, Err: unknown}
+	case caller.Err() != nil:
+		return fmt.Errorf("%s(%s): 调用方已结束: %w: %w", op, identity, caller.Err(), err)
 	case isUniqueViolation(err):
-		return fmt.Errorf("%s(%s): %w: %v", op, identity, persistence.ErrConflict, err)
+		return fmt.Errorf("%s(%s): %w: %w", op, identity, persistence.ErrConflict, err)
 	case isLockTimeout(err) || isRetryableAbort(err) || (contended && ctx.Err() != nil):
-		return fmt.Errorf("%s(%s): %w: %v", op, identity, persistence.ErrContention, err)
-	case ctx.Err() != nil || isConnection(err):
-		return fmt.Errorf("%s(%s): %w: %v", op, identity, persistence.ErrUnavailable, err)
+		return fmt.Errorf("%s(%s): %w: %w", op, identity, persistence.ErrContention, err)
+	case ctx.Err() != nil || isConnection(err) || isStatementTimeout(err):
+		return fmt.Errorf("%s(%s): %w: %w", op, identity, persistence.ErrUnavailable, err)
 	default:
 		return fmt.Errorf("%s(%s): %w", op, identity, err)
 	}
@@ -2369,13 +2646,14 @@ type queryer interface {
 }
 
 func (s *Store) read(ctx context.Context, op string, fn func(ctx context.Context, q queryer) error) error {
+	caller := ctx
 	ctx, cancel, err := s.opContext(ctx)
 	if err != nil {
 		return err
 	}
 	defer cancel()
 	if err := fn(ctx, s.pool); err != nil {
-		return s.final(ctx, op, "", nil, false, err)
+		return s.final(caller, ctx, op, "", nil, false, err)
 	}
 	return nil
 }
@@ -2417,11 +2695,25 @@ func isRetryableAbort(err error) bool  { c := sqlState(err); return c == "40001"
 func isLockTimeout(err error) bool     { return sqlState(err) == "55P03" }
 func isUniqueViolation(err error) bool { return sqlState(err) == "23505" }
 
-// isConnection 判断错误是否来自连接层：网络错误、连接建立失败、超时或 context 结束。
-// 其他没有 SQLSTATE 的错误（编程错误）不在此列，不会被重跑。
+// isStatementTimeout：57014 是 statement_timeout 或取消请求导致的语句中止；context 结束引起的
+// 情形由 final 按 context 归类。
+func isStatementTimeout(err error) bool { return sqlState(err) == "57014" }
+
+// isConnectionCode 判断 SQLSTATE 是否表示连接已断或服务端暂不可用：类 08（连接异常）、
+// 57P01–57P03（管理员终止、崩溃恢复、暂不接受连接）、53300（连接数已满）。
+func isConnectionCode(code string) bool {
+	return strings.HasPrefix(code, "08") || code == "57P01" || code == "57P02" || code == "57P03" || code == "53300"
+}
+
+// isConnection 判断错误是否来自连接层：网络错误、连接建立失败、超时、context 结束，或服务端
+// 以连接类 SQLSTATE 报告的错误（含包在 *pgconn.ConnectError 中的）。其他带 SQLSTATE 的错误
+// 与没有 SQLSTATE 的编程错误不在此列，不会被重跑。
 func isConnection(err error) bool {
-	if sqlState(err) != "" || isDomain(err) {
+	if isDomain(err) {
 		return false
+	}
+	if c := sqlState(err); c != "" {
+		return isConnectionCode(c)
 	}
 	var netErr net.Error
 	var connErr *pgconn.ConnectError
@@ -2433,7 +2725,7 @@ func isConnection(err error) bool {
 // retryable 判断一次事务尝试的失败是否可以在剩余时间内以同一身份重跑。
 // 唯一约束冲突也重跑：并发的同一身份写入在对方提交后由事务内仲裁得出结论。
 func retryable(err error) bool {
-	return isRetryableAbort(err) || isLockTimeout(err) || isUniqueViolation(err) || isConnection(err)
+	return isRetryableAbort(err) || isLockTimeout(err) || isUniqueViolation(err) || isStatementTimeout(err) || isConnection(err)
 }
 
 // sleepBackoff 以带抖动的指数退避等待；deadline 不足时返回 false。
@@ -2453,7 +2745,14 @@ func sleepBackoff(ctx context.Context, attempt int) bool {
 	}
 }
 
-func durationSetting(d time.Duration) string { return fmt.Sprintf("%dms", d.Milliseconds()) }
+// durationSetting 把时长换成 PostgreSQL 的毫秒设置；不足 1 ms 的正值取 1ms（0 表示不限）。
+func durationSetting(d time.Duration) string {
+	ms := d.Milliseconds()
+	if d > 0 && ms == 0 {
+		ms = 1
+	}
+	return fmt.Sprintf("%dms", ms)
+}
 
 // contentHash 计算若干字段的内容哈希；每段带长度前缀，避免拼接歧义。
 func contentHash(parts ...[]byte) []byte {
@@ -2526,14 +2825,15 @@ type OwnershipOptions struct {
 // Ownership 是专用连接上的会话级 advisory lock（规格 §7.4；设计 §3.4）。
 // 失去锁连接或无法确认锁仍在时进入不可逆的 ownership_lost：Lost() 关闭，Context() 取消。
 type Ownership struct {
-	conn     *pgx.Conn // 只由监视 goroutine 使用；Close 先停止监视再使用
-	ctx      context.Context
-	cancel   context.CancelFunc
-	lost     chan struct{}
-	lostOnce sync.Once
-	stop     chan struct{}
-	done     chan struct{}
-	opt      OwnershipOptions
+	conn      *pgx.Conn // 只由监视 goroutine 使用；Close 先停止监视再使用
+	ctx       context.Context
+	cancel    context.CancelFunc
+	lost      chan struct{}
+	lostOnce  sync.Once
+	closeOnce sync.Once
+	stop      chan struct{}
+	done      chan struct{}
+	opt       OwnershipOptions
 }
 
 // AcquireOwnership 建立专用连接并取得 advisory lock；已被持有时返回 ErrAlreadyOwned。
@@ -2579,12 +2879,16 @@ func (o *Ownership) IsLost() bool {
 // Context 在失去所有权时取消；业务操作的 context 由它派生。
 func (o *Ownership) Context() context.Context { return o.ctx }
 
-// Close 停止监视并释放锁与连接。之后 IsLost 为 true。
+// Close 停止监视并释放锁与连接。之后 IsLost 为 true。幂等：再次调用返回 nil。
 func (o *Ownership) Close() error {
-	close(o.stop)
-	<-o.done
-	o.markLost()
-	return o.conn.Close(context.Background()) // 关闭会话即释放会话级 advisory lock
+	var err error
+	o.closeOnce.Do(func() {
+		close(o.stop)
+		<-o.done
+		o.markLost()
+		err = o.conn.Close(context.Background()) // 关闭会话即释放会话级 advisory lock
+	})
+	return err
 }
 
 func (o *Ownership) markLost() {
@@ -2656,6 +2960,17 @@ var agentboxTables = []string{
 	"artifact_heads", "artifacts",
 }
 
+// inspectTablesSQL 在同一份目录中查三组表名是否存在：pg_catalog 限定 current_schema()。
+// pg_class 对所有角色可见，不像 information_schema 那样只列出角色有权限的表；只看表类关系
+// （普通表、分区表、视图、物化视图、外部表）。
+const inspectTablesSQL = `WITH rel AS (
+	SELECT c.relname::text AS name
+	FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+	WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p', 'v', 'm', 'f'))
+SELECT EXISTS (SELECT 1 FROM rel WHERE name = ANY($1::text[])),
+       EXISTS (SELECT 1 FROM rel WHERE name = ANY($2::text[])),
+       EXISTS (SELECT 1 FROM rel WHERE name = ANY($3::text[]))`
+
 type migration struct {
 	version int
 	name    string
@@ -2691,19 +3006,13 @@ func loadMigrations() ([]migration, error) {
 func (s *Store) InspectInstallation(ctx context.Context) (ownership.DBState, error) {
 	var st ownership.DBState
 	err := s.read(ctx, "InspectInstallation", func(ctx context.Context, q queryer) error {
-		if err := q.QueryRow(ctx, "SELECT to_regclass('schema_migrations') IS NOT NULL").Scan(&st.HasMigrations); err != nil {
-			return err
-		}
-		var n int
-		if err := q.QueryRow(ctx,
-			"SELECT count(*) FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = ANY($1)",
-			agentboxTables).Scan(&n); err != nil {
-			return err
-		}
-		st.HasAgentboxTables = n > 0
 		var hasInstallation bool
-		if err := q.QueryRow(ctx, "SELECT to_regclass('installation') IS NOT NULL").Scan(&hasInstallation); err != nil || !hasInstallation {
+		if err := q.QueryRow(ctx, inspectTablesSQL, []string{"schema_migrations"}, agentboxTables, []string{"installation"}).
+			Scan(&st.HasMigrations, &st.HasAgentboxTables, &hasInstallation); err != nil {
 			return err
+		}
+		if !hasInstallation {
+			return nil
 		}
 		var inst ownership.Installation
 		var state string
@@ -2763,9 +3072,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var applied int
-	if err := s.pool.QueryRow(ctx, "SELECT COALESCE(max(version), 0) FROM schema_migrations").Scan(&applied); err != nil {
-		return fmt.Errorf("postgres: 读取迁移版本: %w", err)
+	applied, err := s.appliedVersion(ctx)
+	if err != nil {
+		return err
 	}
 	for _, m := range ms {
 		if m.version <= applied {
@@ -2788,18 +3097,46 @@ func applyMigration(ctx context.Context, tx pgx.Tx, m migration) error {
 	return err
 }
 
-// migrationTx 以独立的迁移超时（规格 §7.3：5 min）执行一个事务；不重跑。
-func (s *Store) migrationTx(ctx context.Context, op string, fn txFunc) error {
-	if s.lost() {
-		return persistence.ErrOwnershipLost
+// appliedVersion 在迁移超时内读取已应用的最高迁移版本；失去所有权时返回 ErrOwnershipLost。
+func (s *Store) appliedVersion(ctx context.Context) (int, error) {
+	ctx, cancel, err := s.boundContext(ctx, migrationTimeout)
+	if err != nil {
+		return 0, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, migrationTimeout)
 	defer cancel()
+	var applied int
+	if err := s.pool.QueryRow(ctx, "SELECT COALESCE(max(version), 0) FROM schema_migrations").Scan(&applied); err != nil {
+		if s.lost() {
+			return 0, persistence.ErrOwnershipLost
+		}
+		return 0, fmt.Errorf("postgres: 读取迁移版本: %w", err)
+	}
+	return applied, nil
+}
+
+// migrationTx 以独立的迁移超时（规格 §7.3：5 min）执行一个事务；不重跑。context 同时由调用方
+// 与所有权派生：失去所有权时取消并返回 ErrOwnershipLost。
+func (s *Store) migrationTx(ctx context.Context, op string, fn txFunc) error {
+	ctx, cancel, err := s.boundContext(ctx, migrationTimeout)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	if err := s.migrationTxOnce(ctx, op, fn); err != nil {
+		if s.lost() {
+			return persistence.ErrOwnershipLost
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Store) migrationTxOnce(ctx context.Context, op string, fn txFunc) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("postgres: %s: %w", op, err)
 	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
+	defer rollback(tx)
 	if err := fn(ctx, tx); err != nil {
 		return err
 	}
@@ -5161,6 +5498,7 @@ cd /f/go-agentbox-m1-4 && git add .github/workflows/ci.yml && git commit -m "ci:
 - **演练**：本计划的全部代码已在临时 worktree 中按计划文本组装，并在 WSL + Docker Desktop 的 PostgreSQL 16.15 上运行：全仓库 `go build`（Linux 与 Windows）、`go vet`、`CI=true go test ./...` 通过；`internal/persistence/postgres` 连续三次通过；Task 4、5、6、7 各阶段的代码树分别通过；变异检查——去掉 `CreateAttempt` 的事务内身份仲裁、让终态提议静默忽略不同内容、跳过 Worker 事件的逐条内容比较、不重跑死锁中止——均被对应测试捕获；评审修订后又逐个去掉 9 条前置条件规则（checkpoint 的 fencing、引用授权，产物的 fencing，判决的当前 attempt、控制版本、desired 约束，attempt 准入、"准入先于幂等查询"的错误顺序，控制写入规则），均被捕获；失锁检测延迟约 100 ms（检测周期 200 ms 时）。
 - **执行中修订**：Task 1 的 archtest 原先列出 Task 2、3 才创建的包，`go list` 失败（演练只逐阶段验证了 Task 4–7）；改为 Task 1 只列已存在的包、Task 4 扩展到全部八个，最终文件与原计划相同。
 - **执行中评审修订（Task 2、3）**：BlobStore 的已存在路径曾直接返回成功（只比较大小、不 fsync），新分片目录的父目录未 fsync——改为 NewLocal 预建 256 个分片并 fsync，Put 总是以校验过的副本原子替换后 fsync 分片目录，并补损坏/截断替换测试；Bootstrap 的前置条件（先 flock、后 advisory lock）写入文档注释，出错时不返回 install_id，拒绝空的 newID，空库判定加上无 installation 记录，测试补齐（未知 schema 有文件、CompleteInstallation 校验 ID、空 ID）。
+- **执行中评审修订（Task 4）**：事务辅助的错误分类（服务端终止会话与超时码、COMMIT 的 FATAL 与 SafeToRetry、`ErrTxCommitRollback`、调用方取消、`%w` 保留原因）按设计 §2.1 修正并补 `TestErrorClassification`；spec §6 的复合外键（events、artifacts）补上并有违反测试；失锁测试按当前数据库过滤 pid、等待在途操作阻塞并断言检测延迟；`Ownership.Close` 幂等；迁移路径随失锁取消；`InspectInstallation` 统一用 pg_catalog 查表；回滚有界超时。修订在含 Task 4–7 全部代码的演练树中验证：全部测试连续三次通过、各阶段独立通过、逐项回退均被测试捕获。
 - **未在本地验证**：golangci-lint（本机未安装，由 CI 判定）。
 - **评审修订（第三轮）**：checkpoint 缺少 fencing 与引用授权、最终判决未在锁内仲裁取消与当前 attempt、创建 attempt 缺少准入前置条件——均为规格 §5.5、§8.1 的实现遗漏，已按设计 §2.6 并入 Task 5、6，并补测试。同类遗漏 `AcceptControl` 的控制写入规则（`task_ended` 等）一并补上，"判决先提交"的测试依赖它。设计文档的 pgx 版本已统一为 v5.7.6；提交署名只在有真实共同作者时添加，不编造、不阻止提交。
 - **占位符**：无（`COAUTHOR` 是可选的环境变量，未设置时提交命令省略署名）。
