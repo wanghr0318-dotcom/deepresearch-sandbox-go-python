@@ -23,6 +23,9 @@ type Store interface {
 	RegisterArtifact(ctx context.Context, a Artifact) (ArtifactVersion, error)
 	// GetArtifact 读取已登记的产物版本。
 	GetArtifact(ctx context.Context, taskID, artifactID, sha256 string) (ArtifactVersion, error)
+	// LatestArtifact 返回任务中该产物的最新版本（用于固定 result 输出：恢复后的 attempt 可能不再登记之前保存的产物）；
+	// 不存在为 persistence.ErrNotFound。
+	LatestArtifact(ctx context.Context, taskID, artifactID string) (ArtifactVersion, error)
 	// RecordTerminalProposal 记录 attempt 的终态提议：相同内容返回原结果，不同内容为冲突。
 	RecordTerminalProposal(ctx context.Context, p TerminalProposal) (TerminalProposal, error)
 	// GetTerminalProposal 读取 attempt 的终态提议；未记录为 persistence.ErrNotFound。

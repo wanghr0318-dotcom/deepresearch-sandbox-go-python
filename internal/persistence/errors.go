@@ -27,6 +27,8 @@ var (
 	// ErrRejected 表示事务内读取的最新事实不满足用例的前置条件（规格 §5.5、§8.1）。
 	// 具体错误为 *RejectedError，Code 说明原因；不重跑，不计入故障阈值。
 	ErrRejected = errors.New("persistence: 前置条件不满足")
+	// ErrInvalid 表示调用方传入了不合法的参数（编程错误或未校验的外部输入）；不重跑，不计入故障阈值。
+	ErrInvalid = errors.New("persistence: 参数不合法")
 )
 
 // RejectedError 的原因码。stale_attempt 与 control_changed 表示调用方依据的事实已过期：

@@ -1928,3 +1928,23 @@ func TestListTasksAndInspect(t *testing.T) {
 		t.Fatalf("不存在的任务应为 ErrNotFound，得到 %v", err)
 	}
 }
+
+// TestLatestArtifact：返回任务中该产物的最新版本；不存在为 ErrNotFound。
+func TestLatestArtifact(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	for _, sha := range []string{strings.Repeat("a", 64), strings.Repeat("b", 64)} {
+		if _, err := s.RegisterArtifact(ctx, runner.Artifact{TaskID: "t1", AttemptID: "att-t1", ArtifactID: "report", SHA256: sha,
+			Size: 9, MediaType: "text/markdown", Visibility: "output"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.LatestArtifact(ctx, "t1", "report")
+	if err != nil || got.Version != 2 || got.SHA256 != strings.Repeat("b", 64) {
+		t.Fatalf("应返回第 2 版：%+v %v", got, err)
+	}
+	if _, err := s.LatestArtifact(ctx, "t1", "missing"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("不存在应为 ErrNotFound，得到 %v", err)
+	}
+}

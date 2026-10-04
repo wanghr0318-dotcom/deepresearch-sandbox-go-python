@@ -30,12 +30,10 @@ import (
 // 会在进程退出后自行 wait 的句柄（使用 exec.Cmd 时只调用 Start，然后
 // Process.Release）。
 //
-// stdin/stdout/stderr 来自控制通道（Conn.Recv）收到的 FD，可能处于非阻塞
-// 模式（O_NONBLOCK 是打开文件描述的状态，随 SCM_RIGHTS 一起传递，宿主侧
-// os.Pipe 创建的管道就是非阻塞的）。实现必须在交给子进程之前把它们切回
-// 阻塞模式，否则 workload 读写会遇到 EAGAIN。用 exec.Cmd（或
-// os.StartProcess）传递 *os.File 时，标准库经 File.Fd() 已把它们置为阻塞；
-// 直接用 syscall.ForkExec 的实现必须自己清除 O_NONBLOCK。
+// stdin/stdout/stderr 来自控制通道（Conn.Recv）收到的 FD。O_NONBLOCK 是打开文件描述的状态，随
+// SCM_RIGHTS 一起传递（宿主侧 os.Pipe 创建的管道是非阻塞的）；os.NewFile 包装已非阻塞的 fd 时不会
+// 记录这一点，exec.Cmd 也不会把它切回阻塞。Serve 在调用 Launch 之前已清除这三个 FD 的 O_NONBLOCK，
+// 因此 Launcher 收到的是阻塞 FD；不经 Serve 调用 Launch 的代码须自行清除。
 //
 // Launch 返回错误表示 workload 未运行（规格 §4.2 的 start_err）。
 type Launcher interface {

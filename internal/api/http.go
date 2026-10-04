@@ -336,6 +336,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.As(err, &rej):
 		writeError(w, http.StatusConflict, rej.Code, rejectedMessage(rej))
+	case errors.Is(err, persistence.ErrInvalid):
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 	case errors.Is(err, persistence.ErrNotFound):
 		writeError(w, http.StatusNotFound, "task_not_found", "任务不存在")
 	case errors.Is(err, persistence.ErrConflict):

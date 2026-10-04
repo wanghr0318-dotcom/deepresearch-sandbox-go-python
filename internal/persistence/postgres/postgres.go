@@ -260,7 +260,7 @@ func isDomain(err error) bool {
 }
 
 // errInvalid 表示调用方传入了不合法的参数（编程错误），不重跑。
-var errInvalid = errors.New("postgres: 参数不合法")
+var errInvalid = persistence.ErrInvalid
 
 func invalidf(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", errInvalid, fmt.Sprintf(format, args...))

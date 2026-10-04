@@ -278,6 +278,20 @@ func (s *Store) GetArtifact(ctx context.Context, taskID, artifactID, sha256 stri
 	return out, err
 }
 
+// LatestArtifact 返回任务中该产物的最新版本（实现 runner.Store）。
+func (s *Store) LatestArtifact(ctx context.Context, taskID, artifactID string) (runner.ArtifactVersion, error) {
+	out := runner.ArtifactVersion{TaskID: taskID, ArtifactID: artifactID}
+	err := s.read(ctx, "LatestArtifact", func(ctx context.Context, q queryer) error {
+		err := q.QueryRow(ctx, `SELECT version, sha256 FROM artifacts WHERE task_id = $1 AND artifact_id = $2
+			ORDER BY version DESC LIMIT 1`, taskID, artifactID).Scan(&out.Version, &out.SHA256)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("产物 %s/%s", taskID, artifactID)
+		}
+		return err
+	})
+	return out, err
+}
+
 func proposalHash(p runner.TerminalProposal) []byte {
 	return contentHash([]byte(p.Kind), []byte(p.Ref))
 }
