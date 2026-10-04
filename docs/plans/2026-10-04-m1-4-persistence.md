@@ -5332,6 +5332,18 @@ func withRanges(t *testing.T, s *Store) {
 	}
 }
 
+// stopAndClean 记录环境已停止并完成清理——归还其 UID 范围的前置条件（规格 §4.5）。
+func stopAndClean(t *testing.T, s *Store, envID string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.MarkStopped(ctx, envID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateCleanup(ctx, resource.CleanupUpdate{EnvID: envID, State: resource.CleanupDone}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCommitLostResolvesResourceUseCases(t *testing.T) {
 	ctx := context.Background()
 	at := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
@@ -5355,6 +5367,7 @@ func TestCommitLostResolvesResourceUseCases(t *testing.T) {
 			if _, err := s.AssignUIDRange(ctx, "env-t1", "alloc-1"); err != nil {
 				t.Fatal(err)
 			}
+			stopAndClean(t, s, "env-t1")
 		}, func(s *Store) (any, error) {
 			return s.ReleaseUIDRange(ctx, "uid-100000", "alloc-1")
 		}, "SELECT count(*) FROM uid_ranges WHERE uid_range_id = 'uid-100000' AND state = 'free'"},
@@ -5399,7 +5412,8 @@ func TestResourceConflicts(t *testing.T) {
 	})
 }
 
-// TestReleaseDoesNotFreeLaterAllocation：释放旧分配不得释放后来复用的同一段范围。
+// TestReleaseDoesNotFreeLaterAllocation：环境未停止并完成清理时不能归还范围（规格 §4.5）；
+// 释放旧分配不得释放后来复用的同一段范围。
 func TestReleaseDoesNotFreeLaterAllocation(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t, Options{})
@@ -5410,6 +5424,21 @@ func TestReleaseDoesNotFreeLaterAllocation(t *testing.T) {
 	}
 	r, err := s.AssignUIDRange(ctx, "env-t1", "alloc-1")
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReleaseUIDRange(ctx, r.UIDRangeID, "alloc-1"); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("环境仍在运行时归还范围应为冲突，得到 %v", err)
+	}
+	if _, err := s.MarkStopped(ctx, "env-t1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReleaseUIDRange(ctx, r.UIDRangeID, "alloc-1"); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("已停止但未完成清理时归还范围应为冲突，得到 %v", err)
+	}
+	if got, err := s.GetUIDRange(ctx, "env-t1"); err != nil || got.State != "assigned" {
+		t.Fatalf("被拒绝的归还不应改变分配：%+v %v", got, err)
+	}
+	if _, err := s.UpdateCleanup(ctx, resource.CleanupUpdate{EnvID: "env-t1", State: resource.CleanupDone}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.ReleaseUIDRange(ctx, r.UIDRangeID, "alloc-1"); err != nil {
@@ -5599,7 +5628,11 @@ func (s *Store) AssignUIDRange(ctx context.Context, envID, allocationID string) 
 }
 
 // ReleaseUIDRange 释放 UID 范围（实现 resource.Store）：只有分配代次匹配才释放；
-// 已释放且未复用返回原结果；已被后来的分配复用为冲突。
+// 已释放且未复用返回原结果；已被后来的分配复用为冲突。规格 §4.5：拥有该范围的环境必须已
+// 停止且清理完成（cleanup_state = done），否则为冲突——仍在运行的进程会与下一个使用者共用 UID。
+// 文件属主与挂载等条件由调用方（coordinator）在调用前核对。环境行不加锁读取：stopped_at 与
+// cleanup_state 只会前进，读到"已完成"之后不会倒退；不加锁也避免与 AssignUIDRange 的
+// environments → uid_ranges 锁顺序成环。
 func (s *Store) ReleaseUIDRange(ctx context.Context, uidRangeID, allocationID string) (resource.UIDRange, error) {
 	var out resource.UIDRange
 	err := s.run(ctx, "ReleaseUIDRange", uidRangeID+"/"+allocationID, func(ctx context.Context, tx pgx.Tx) error {
@@ -5616,6 +5649,15 @@ func (s *Store) ReleaseUIDRange(ctx context.Context, uidRangeID, allocationID st
 		case cur.State == "free":
 			out = cur
 			return nil
+		}
+		var cleaned bool
+		err = tx.QueryRow(ctx, "SELECT stopped_at IS NOT NULL AND cleanup_state = 'done' FROM environments WHERE env_id = $1",
+			cur.OwnerID).Scan(&cleaned)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if !cleaned {
+			return conflictf("UID 范围 %s 的环境 %s 尚未停止并完成清理，不能归还", uidRangeID, cur.OwnerID)
 		}
 		if _, err := tx.Exec(ctx, "UPDATE uid_ranges SET state = 'free', owner_kind = '', owner_id = '' WHERE uid_range_id = $1",
 			uidRangeID); err != nil {
@@ -5837,6 +5879,7 @@ cd /f/go-agentbox-m1-4 && git add .github/workflows/ci.yml && git commit -m "ci:
 - **执行中评审修订（Task 4）**：事务辅助的错误分类（服务端终止会话与超时码、COMMIT 的 FATAL 与 SafeToRetry、`ErrTxCommitRollback`、调用方取消、`%w` 保留原因）按设计 §2.1 修正并补 `TestErrorClassification`；spec §6 的复合外键（events、artifacts）补上并有违反测试；失锁测试按当前数据库过滤 pid、等待在途操作阻塞并断言检测延迟；`Ownership.Close` 幂等；迁移路径随失锁取消；`InspectInstallation` 统一用 pg_catalog 查表；回滚有界超时。修订在含 Task 4–7 全部代码的演练树中验证：全部测试连续三次通过、各阶段独立通过、逐项回退均被测试捕获。
 - **执行中评审修订（Task 5）**：ApplyControl 按规格 §8.1 的转换表（`controlTransition`）检查来源状态并以 CAS 写入，拒绝终态（`task_ended`）与被取代的控制版本（`control_changed`）；FinalizeAttempt 只接受 running/pausing/cancelling 的任务并推进 `applied_control_version`；AcceptControl 拒绝跨任务复用 request_id，CreateTask/CreateAttempt 对已存在的 task_id/env_id 立即冲突；`snapshot` 覆盖更多字段，控制拒绝与转换、宿主事件幂等均有测试。在含 Task 4–7 全部代码的演练树中验证并做逐项回退检查。
 - **执行中评审修订（Task 6）**：Plan 4 没有撤销 `attempt_access` 的用例，判决后同一 attempt 仍是当前且访问有效；`fenceAttempt` 另要求该 attempt 尚无判决，`RecordTerminalProposal` 在判决后拒绝新提议（规格 §5.8），补 `TestNoWritesAfterVerdict` 与两处回退检查。
+- **执行中评审修订（Task 7）**：`ReleaseUIDRange` 原先可归还仍在运行的环境的范围；按规格 §4.5 改为要求拥有环境已停止且 `cleanup_state = done`（否则冲突），补测试与回退检查。
 - **未在本地验证**：golangci-lint（本机未安装，由 CI 判定）。
 - **评审修订（第三轮）**：checkpoint 缺少 fencing 与引用授权、最终判决未在锁内仲裁取消与当前 attempt、创建 attempt 缺少准入前置条件——均为规格 §5.5、§8.1 的实现遗漏，已按设计 §2.6 并入 Task 5、6，并补测试。同类遗漏 `AcceptControl` 的控制写入规则（`task_ended` 等）一并补上，"判决先提交"的测试依赖它。设计文档的 pgx 版本已统一为 v5.7.6；提交署名只在有真实共同作者时添加，不编造、不阻止提交。
 - **占位符**：无（`COAUTHOR` 是可选的环境变量，未设置时提交命令省略署名）。
