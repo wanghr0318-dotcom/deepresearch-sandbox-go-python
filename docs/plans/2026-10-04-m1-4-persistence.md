@@ -23,7 +23,7 @@
 - **执行环境**：Go 只在 WSL Ubuntu 中运行（`/usr/local/go/bin`），WSL 无外网：Go 模块经本地文件代理 `F:\go-agentbox\.superpowers\goproxy` 获取（已含 pgx v5.7.6 及其依赖）；PostgreSQL 由 Windows 上的 Docker Desktop 运行，WSL 经 `127.0.0.1:5432` 访问。下文 WSL 命令统一带以下环境（已写在每条命令里）：`export PATH=/usr/local/go/bin:/usr/bin:/bin GOTOOLCHAIN=local GOPROXY=file:///mnt/f/go-agentbox/.superpowers/goproxy GOSUMDB=off AGENTBOX_TEST_DATABASE_URL="postgres://agentbox:agentbox@127.0.0.1:5432/agentbox?sslmode=disable";`
 - **执行工作区**：`git worktree add ../go-agentbox-m1-4 -b m1-4-persistence m1-3-protocol-worker`（叠在 Plan 3 之上，二者都修改 `.github/workflows/ci.yml`）。Windows `F:\go-agentbox-m1-4`，WSL `/mnt/f/go-agentbox-m1-4`，Git Bash `/f/go-agentbox-m1-4`。
 - 工作区为 CRLF：gofmt 检查以暂存内容为准（`scripts/dev/gofmt-staged.sh`，在 linked worktree 中需设置 `GIT_DIR=/mnt/f/go-agentbox/.git/worktrees/go-agentbox-m1-4 GIT_WORK_TREE=/mnt/f/go-agentbox-m1-4`）。新文件用编辑工具写入，不用 shell heredoc（会吞掉反斜杠）。
-- **提交署名按实际参与者填写**：执行者在开始前设置 `COAUTHOR` 为自己的署名行（格式 `Co-Authored-By: <实际模型或作者> <邮箱>`），各任务的提交命令以 `-m "$COAUTHOR"` 追加；未设置时不得提交，也不得照抄他人的署名。只暂存本任务列出的文件，禁止 `git add -A`。只在本地提交，不推送。
+- **提交署名**：有真实共同作者时才加 `Co-Authored-By` 行，没有就省略；不得编造署名或邮箱，缺少署名也不阻止提交。执行者可把真实署名行放进环境变量 `COAUTHOR`；各任务的提交命令写作 `${COAUTHOR:+-m "$COAUTHOR"}`，未设置时自动省略。只暂存本任务列出的文件，禁止 `git add -A`。只在本地提交，不推送。
 
 ## 子 agent 上下文包
 
@@ -579,7 +579,7 @@ Expected: gofmt 无输出；`ok  .../internal/archtest`。
 - [ ] **Step 4：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add internal/persistence/errors.go internal/api/store.go internal/task/store.go internal/runner/store.go internal/resource/store.go internal/archtest/archtest_test.go && git commit -m "feat(persistence): 错误契约与 api/task/runner/resource 窄接口；依赖方向检查" -m "$COAUTHOR"
+cd /f/go-agentbox-m1-4 && git add internal/persistence/errors.go internal/api/store.go internal/task/store.go internal/runner/store.go internal/resource/store.go internal/archtest/archtest_test.go && git commit -m "feat(persistence): 错误契约与 api/task/runner/resource 窄接口；依赖方向检查" ${COAUTHOR:+-m "$COAUTHOR"}
 ```
 
 ---
@@ -1095,7 +1095,7 @@ Expected: gofmt 无输出；两个包 `ok`。
 - [ ] **Step 5：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add internal/datadir internal/blob && git commit -m "feat(datadir,blob): 数据目录 flock 与 install_id 持久化写入；本地内容寻址 BlobStore" -m "$COAUTHOR"
+cd /f/go-agentbox-m1-4 && git add internal/datadir internal/blob && git commit -m "feat(datadir,blob): 数据目录 flock 与 install_id 持久化写入；本地内容寻址 BlobStore" ${COAUTHOR:+-m "$COAUTHOR"}
 ```
 
 ---
@@ -1406,7 +1406,7 @@ Expected: `ok  .../internal/ownership`。
 - [ ] **Step 5：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add internal/ownership && git commit -m "feat(ownership): 安装身份引导决策表与引导编排（规格 §7.4）" -m "$COAUTHOR"
+cd /f/go-agentbox-m1-4 && git add internal/ownership && git commit -m "feat(ownership): 安装身份引导决策表与引导编排（规格 §7.4）" ${COAUTHOR:+-m "$COAUTHOR"}
 ```
 
 ---
@@ -2752,7 +2752,7 @@ Expected: 全部 PASS（`TestInstallationBootstrapE46` 的 7 个子测试、`Tes
 - [ ] **Step 6：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add go.mod go.sum deploy/docker-compose.yml internal/persistence/postgres/migrations/0001_init.sql internal/persistence/postgres/postgres.go internal/persistence/postgres/lock.go internal/persistence/postgres/migrate.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): PostgreSQL 迁移、事务辅助、advisory lock 与安装存储（E46、E12/E13 存储部分）" -m "$COAUTHOR"
+cd /f/go-agentbox-m1-4 && git add go.mod go.sum deploy/docker-compose.yml internal/persistence/postgres/migrations/0001_init.sql internal/persistence/postgres/postgres.go internal/persistence/postgres/lock.go internal/persistence/postgres/migrate.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): PostgreSQL 迁移、事务辅助、advisory lock 与安装存储（E46、E12/E13 存储部分）" ${COAUTHOR:+-m "$COAUTHOR"}
 ```
 
 ---
@@ -3839,7 +3839,7 @@ Expected: 两个包 `ok`。
 - [ ] **Step 5：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add internal/persistence/postgres/events.go internal/persistence/postgres/api.go internal/persistence/postgres/task.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): 事件追加与 api、task 事务用例（E11a）" -m "$COAUTHOR"
+cd /f/go-agentbox-m1-4 && git add internal/persistence/postgres/events.go internal/persistence/postgres/api.go internal/persistence/postgres/task.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): 事件追加与 api、task 事务用例（E11a）" ${COAUTHOR:+-m "$COAUTHOR"}
 ```
 
 ---
@@ -4508,7 +4508,7 @@ Expected: `ok`。
 - [ ] **Step 5：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add internal/persistence/postgres/runner.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): runner 事务用例——Worker 事件逐条内容校验、checkpoint、产物、终态提议" -m "$COAUTHOR"
+cd /f/go-agentbox-m1-4 && git add internal/persistence/postgres/runner.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): runner 事务用例——Worker 事件逐条内容校验、checkpoint、产物、终态提议" ${COAUTHOR:+-m "$COAUTHOR"}
 ```
 
 ---
@@ -4999,7 +4999,7 @@ Expected: 两个包 `ok`。
 - [ ] **Step 5：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add internal/persistence/postgres/resource.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): resource 事务用例——意图、UID 范围分配代次、停止与清理的单调更新" -m "$COAUTHOR"
+cd /f/go-agentbox-m1-4 && git add internal/persistence/postgres/resource.go internal/persistence/postgres/postgres_test.go && git commit -m "feat(persistence): resource 事务用例——意图、UID 范围分配代次、停止与清理的单调更新" ${COAUTHOR:+-m "$COAUTHOR"}
 ```
 
 ---
@@ -5050,7 +5050,7 @@ Expected: 全部包 `ok` 或 `[no test files]`。
 - [ ] **Step 3：提交**
 
 ```bash
-cd /f/go-agentbox-m1-4 && git add .github/workflows/ci.yml && git commit -m "ci: correctness 与 linux-integration 作业加入 PostgreSQL 服务" -m "$COAUTHOR"
+cd /f/go-agentbox-m1-4 && git add .github/workflows/ci.yml && git commit -m "ci: correctness 与 linux-integration 作业加入 PostgreSQL 服务" ${COAUTHOR:+-m "$COAUTHOR"}
 ```
 
 ---
@@ -5072,5 +5072,5 @@ cd /f/go-agentbox-m1-4 && git add .github/workflows/ci.yml && git commit -m "ci:
 - **验收归属**：E11a（Task 5–7 的提交回复丢失）、E12 存储部分（Task 4 死锁重跑）、E13 存储部分（Task 4 失锁）、E46（Task 3、4）。
 - **演练**：本计划的全部代码已在临时 worktree 中按计划文本组装，并在 WSL + Docker Desktop 的 PostgreSQL 16.15 上运行：全仓库 `go build`（Linux 与 Windows）、`go vet`、`CI=true go test ./...` 通过；`internal/persistence/postgres` 连续三次通过；Task 4、5、6、7 各阶段的代码树分别通过；变异检查——去掉 `CreateAttempt` 的事务内身份仲裁、让终态提议静默忽略不同内容、跳过 Worker 事件的逐条内容比较、不重跑死锁中止——均被对应测试捕获；评审修订后又逐个去掉 9 条前置条件规则（checkpoint 的 fencing、引用授权，产物的 fencing，判决的当前 attempt、控制版本、desired 约束，attempt 准入、"准入先于幂等查询"的错误顺序，控制写入规则），均被捕获；失锁检测延迟约 100 ms（检测周期 200 ms 时）。
 - **未在本地验证**：golangci-lint（本机未安装，由 CI 判定）。
-- **评审修订（第三轮）**：checkpoint 缺少 fencing 与引用授权、最终判决未在锁内仲裁取消与当前 attempt、创建 attempt 缺少准入前置条件——均为规格 §5.5、§8.1 的实现遗漏，已按设计 §2.6 并入 Task 5、6，并补测试。同类遗漏 `AcceptControl` 的控制写入规则（`task_ended` 等）一并补上，"判决先提交"的测试依赖它。设计文档的 pgx 版本已统一为 v5.7.6；提交署名改为执行者按实际参与者填写。
-- **占位符**：无（`$COAUTHOR` 是执行者设置的环境变量，不是计划占位符）。
+- **评审修订（第三轮）**：checkpoint 缺少 fencing 与引用授权、最终判决未在锁内仲裁取消与当前 attempt、创建 attempt 缺少准入前置条件——均为规格 §5.5、§8.1 的实现遗漏，已按设计 §2.6 并入 Task 5、6，并补测试。同类遗漏 `AcceptControl` 的控制写入规则（`task_ended` 等）一并补上，"判决先提交"的测试依赖它。设计文档的 pgx 版本已统一为 v5.7.6；提交署名只在有真实共同作者时添加，不编造、不阻止提交。
+- **占位符**：无（`COAUTHOR` 是可选的环境变量，未设置时提交命令省略署名）。
