@@ -223,3 +223,17 @@ CLI submit → admission → 创建 task 环境 → StartExec → 握手 → pro
 | `hostcheck.Check` | 移除 overlay 作为必需条件，改为检查当前方案的前置条件 |
 | `rootfs/overlay.go` | 将仍需要的 bind/unmount 原语与已退出主线的 Overlay 实现分开；Overlay 实现及其测试删除 |
 | `sandbox/spawn.go` 注释 | 保留 FD、Wait 所有权等契约；Pdeathsig 与线程生命周期的经验推断移入设计记录，并修正为"不作为可靠性依据"（规格已规定不依赖 Pdeathsig） |
+
+### 9.3 测试布局与范围
+
+测试集中在少数固定位置，只覆盖契约与风险路径。
+
+| 内容 | 位置 |
+|---|---|
+| 跨语言协议契约 | `protocol/fixtures/` 下的数据，Go 与 Python 两侧回放同一份；不在两侧各写一套用例 |
+| Go 单元与集成测试 | 每个包一个 `*_test.go`（Go 要求测试与被测包同目录） |
+| Python 测试 | 每个 Python 项目一个 `tests/` 目录，按关注点分少数几个文件（Worker SDK 为 `test_protocol.py`、`test_sdk.py`、`test_process.py`），共享辅助放在 `conftest.py` |
+| 系统级端到端（Plan 6 起） | 仅在 `tests/e2e/` |
+
+- 每条错误码或契约规则一个用例；每个风险路径（取消、关闭、背压、恢复、事务冲突等）一个用例；评审修正附带回归测试。
+- 不为简单的取值、转发或改名写测试；同一行为不在多层重复测试。
