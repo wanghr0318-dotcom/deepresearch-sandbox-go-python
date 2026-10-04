@@ -163,8 +163,8 @@ func (c *Coordinator) RunCleanup(ctx) error                         // cleanup l
 
 **规则：**
 - `CreateEnv`：同一 env 串行；`RecordIntent(env)` → `AssignUIDRange(env, allocation)` → `provider.Create` → `ResolveIntent(acquired)`；`ErrIncomplete` → `Stop` → `Destroy` → 以新的创建重建一次；`ErrForeign` → `RecordQuarantine` 并返回错误（`create_failed_env` 由调用方分类）；`ErrConflict` → 返回错误；ctx 取消或失败 → `ResolveIntent(failed)` 只在确认无残留时（规格 §8.3 intent 规则），否则保留 pending 交给清理。
-- `StopEnv`：`provider.Stop` 成功 → `MarkStopped(now)` → 返回 `Stopped`；`ErrStopUnconfirmed` → `Blocked`（不写 `stopped_at`）；Store 写失败时保留"已停止"事实并退避重试提交（§14.5 在线补偿）。
-- cleanup loop：只处理 `ListCleanupCandidates`；`Destroy` → `UpdateCleanup(done)` → `ReleaseUIDRange`；失败 → `UpdateCleanup(pending, error, next_retry_at = 退避)`；只写清理列（§3.2）。
+- `StopEnv`：`provider.Stop` 成功 → `MarkStopped(now)` → 返回 `Stopped`、`Recorded`（执行中修订：`MarkStopped` 失败时返回 `Stopped=true, Recorded=false`、错误为空，保留事实，下次调用以原时间补记；调用方只在 `Recorded` 时归还容量；`ErrForeign` 时按 `Scan` 条目原样记录隔离；已确认停止的环境再 `CreateEnv` 为 `ErrEnvStopped`）；`ErrStopUnconfirmed` → `Blocked`（不写 `stopped_at`）；Store 写失败时保留"已停止"事实并退避重试提交（§14.5 在线补偿）。
+- cleanup loop：只处理 `ListCleanupCandidates`；`Destroy` → `UpdateCleanup(done)` → `ReleaseUIDRange` → 关闭创建 intent（acquired→released，pending→failed）（执行中修订）；失败 → `UpdateCleanup(pending, error, next_retry_at = 退避)`；只写清理列（§3.2）。
 
 **Tests**（fake provider + 内存 Store 替身实现 `resource.Store`；事务语义已在 Plan 4 覆盖）：正常创建的调用顺序；`ErrIncomplete` → 停止、销毁、重建；`ErrForeign` → 记录隔离且不销毁；创建中途取消时 intent 不被置为 failed；`StopEnv` 在 `ErrStopUnconfirmed` 时不写 `stopped_at`；同一 env 的并发 `CreateEnv`/`StopEnv` 被串行化（以 fake 的阻塞钩子检验顺序）；cleanup：成功后归还 UID 范围，失败后按退避重试，未停止的环境不处理。
 

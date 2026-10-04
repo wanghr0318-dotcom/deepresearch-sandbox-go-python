@@ -235,7 +235,7 @@ func New(opt Options) (*Provider, error) // Starter 为 nil 时返回错误（�
 - `Stop`：关闭闸门 → `Kill` → `WaitEmpty(ctx)`；成功仅当 cgroup 不存在或 `populated 0`；期限内未确认 → `ErrStopUnconfirmed`。
 - `Destroy`：前置为 `Stop` 的权威检查（否则 `ErrNotStopped`）；卸载数据目录下属于该环境的挂载（读 `/proc/self/mountinfo`）→ 删除 cgroup → 删除目录；成功前逐层核对三层均不存在。
 - `List`：读 `<data>/envs/*/owner.json`，install_id 一致者报告 `Complete`（闸门打开且 init 存活）与 `Running`（`Populated`）。
-- `Scan`：独立扫描环境目录（含无/损坏 owner.json）、`mountinfo` 中数据目录下的挂载、`agentbox-*` cgroup（含其他 install_id）、`<data>/envs/*/gw.sock`；逐项分类 `OwnedComplete`/`OwnedPartial`/`Foreign`/`Unknown`。UID 范围文件属主一层在 1B 引入 UID 映射后补充（见文末）。
+- `Scan`：独立扫描环境目录（含无/损坏 owner.json）、`mountinfo` 中数据目录下的挂载、`agentbox-*` cgroup（含其他 install_id）、`<data>/envs/*/gw.sock`；逐项分类 `OwnedComplete`/`OwnedPartial`/`Foreign`/`Unknown`。环境目录类条目即使没有 owner.json 也要以目录名填写 `EnvID`（执行中修订：coordinator 据 `EnvID` 匹配残留并按 `Layer`/`Path` 原样记录隔离）。UID 范围文件属主一层在 1B 引入 UID 映射后补充（见文末）。
 - `ResourceDiag`：`OOMKills` 相对 `Create` 时记录的基线之差、`OOMObserved = delta > 0`、`CPUUsageUsec`；cgroup 不存在 → `ErrNotFound`。
 
 **测试用环境启动器**（`local_test.go` 内）：以 `/proc/self/exe` 的测试辅助模式启动一个运行 Task 6 `Serve` 的 init，直接放入环境 cgroup（不建 namespace、不降权）。只在测试中构造。
