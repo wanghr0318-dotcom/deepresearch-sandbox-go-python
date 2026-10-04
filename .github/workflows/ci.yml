@@ -85,3 +85,31 @@ jobs:
         with:
           name: linux-integration-test-json
           path: test.json
+
+  # Python Worker SDK：最低支持版本 3.11 必须实际覆盖。
+  python:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.14"
+      - name: 安装依赖（锁文件必须最新）
+        run: uv sync --locked --python ${{ matrix.python }}
+      - name: ruff（正确性与禁用 API）
+        run: uv run ruff check .
+      - name: ruff 格式
+        run: uv run ruff format --check .
+      - name: 模块依赖契约
+        run: uv run lint-imports
+      - name: pytest（含真实进程端到端测试）
+        run: uv run pytest -q
+      - name: 复杂度报告（只报告，不阻断）
+        run: uv run ruff check --select C90 --exit-zero .
