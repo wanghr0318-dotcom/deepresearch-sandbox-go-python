@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/faultinject"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 )
@@ -181,7 +182,8 @@ func (s *Store) ReserveTry(ctx context.Context, r call.ReserveTryRequest) (call.
 		return call.Try{}, err
 	}
 	var out call.Try
-	err = s.run(ctx, "ReserveTry", r.TaskID+"/"+r.CallID+"@"+rid, func(ctx context.Context, tx pgx.Tx) error {
+	identity := r.TaskID + "/" + r.CallID + "@" + rid
+	body := func(ctx context.Context, tx pgx.Tx) error {
 		out = call.Try{}
 		if prev, ok, err := heldTry(ctx, tx, r, rid); err != nil || ok {
 			out = prev
@@ -254,7 +256,12 @@ func (s *Store) ReserveTry(ctx context.Context, r call.ReserveTryRequest) (call.
 		}
 		out = call.Try{TaskID: r.TaskID, CallID: r.CallID, TryNo: tryNo, ReservationID: rid, AttemptID: r.AttemptID}
 		return nil
-	})
+	}
+	err = s.run(ctx, "ReserveTry", identity, body)
+	if err == nil && faultinject.Lose(faultinject.ReservationCommit) {
+		// E11b 故障注入：COMMIT 已执行而回复丢失——与 run 遇到提交结果未知时相同，以同一 reservation_id 重跑事务体。
+		err = s.run(ctx, "ReserveTry", identity, body)
+	}
 	return out, err
 }
 

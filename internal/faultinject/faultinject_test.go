@@ -79,3 +79,22 @@ func TestEnableRejectsMalformed(t *testing.T) {
 		}
 	}
 }
+
+// TestLoseOnNthHitOnly："回复丢失"类钩子点只在目标点第 n 次到达时返回 true（只此一次、不杀死进程）；
+// 其他点与未武装时为 false。
+func TestLoseOnNthHitOnly(t *testing.T) {
+	if Lose(ReservationCommit) {
+		t.Fatal("未武装时 Lose 应为 false")
+	}
+	if err := enable(ReservationCommit + ":2"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { armed.Store(false) })
+	var got []bool
+	for range 3 {
+		got = append(got, Lose(ReservationCommit))
+	}
+	if Lose(VerdictBefore) || got[0] || !got[1] || got[2] {
+		t.Fatalf("第 1..3 次到达得到 %v，期望只有第 2 次为 true；其他点应为 false", got)
+	}
+}

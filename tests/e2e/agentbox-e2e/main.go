@@ -9,6 +9,13 @@
 //
 // --lock-database-url 使 advisory lock 的专用连接可以绕过测试控制的 TCP 代理（E14：业务连接中断而所有权
 // 保持）；缺省与 --database-url 相同。生产二进制不得导入本包或 procprov（archtest）。
+//
+// Gateway（M2）：--fake-upstream URL 把模型上游指向 tests/e2e/fakeupstream（模型名 fakeupstream.Model，单价
+// 每 token 1 微美元），搜索供应商取 fake，并把该地址的 host:port 加入 upstream_allow_private（与 cmd/agentbox 的
+// --search-provider fake 校验相同）；模型 Key 与 cmd/agentbox 一样只读环境变量 AGENTBOX_MODEL_API_KEY。
+// --call-deadline、--gateway-backoff-base、--gateway-per-task-inflight 覆盖 §19 的调用限额（零值取默认）。
+// procprov 在宿主上运行 Worker（没有挂载），因此本 main 为每个执行设置 AGENTBOX_GATEWAY_SOCKET 为该 attempt
+// 的 socket 宿主路径（EnvSpec.Mounts.GatewaySocket）。
 package main
 
 import (
@@ -18,9 +25,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,11 +39,64 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/blob"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/datadir"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/faultinject"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/invariants"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence/postgres"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/go-agentbox/tests/e2e/fakeupstream"
 	"github.com/wanghr0318-dotcom/go-agentbox/tests/e2e/procprov"
 )
+
+// modelKeyEnv 是模型 Key 的宿主环境变量（与 cmd/agentbox 相同）。
+const modelKeyEnv = "AGENTBOX_MODEL_API_KEY"
+
+// gatewaySocketEnv 是 Worker SDK 读取的 Gateway socket 路径覆盖（worker/agentbox_worker/runtime.py）。
+const gatewaySocketEnv = "AGENTBOX_GATEWAY_SOCKET"
+
+// socketProv 包装 procprov：记录每个环境的 Gateway socket 宿主路径，并在启动执行时把它交给 Worker。
+type socketProv struct {
+	*procprov.Provider
+	mu      sync.Mutex
+	sockets map[string]string // env_id → socket 宿主路径
+}
+
+func (p *socketProv) Create(ctx context.Context, spec provider.EnvSpec) (provider.EnvInfo, error) {
+	info, err := p.Provider.Create(ctx, spec)
+	if err == nil && spec.Mounts.GatewaySocket != "" {
+		p.mu.Lock()
+		p.sockets[spec.EnvID] = spec.Mounts.GatewaySocket
+		p.mu.Unlock()
+	}
+	return info, err
+}
+
+func (p *socketProv) StartExec(ctx context.Context, envID string, spec provider.ExecSpec) (provider.ExecHandle, error) {
+	p.mu.Lock()
+	sock := p.sockets[envID]
+	p.mu.Unlock()
+	if sock != "" {
+		spec.Env = append(slices.Clone(spec.Env), gatewaySocketEnv+"="+sock)
+	}
+	return p.Provider.StartExec(ctx, envID, spec)
+}
+
+// gatewayConfig 按 --fake-upstream 与调用限额标志填入 Gateway 配置。
+func gatewayConfig(cfg *app.Config, fake string, lim call.Limits) error {
+	cfg.Gateway = lim
+	if fake == "" {
+		return nil
+	}
+	u, err := url.Parse(fake)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("--fake-upstream %q 不是 URL", fake)
+	}
+	cfg.Model = app.ModelConfig{BaseURL: fake + "/v1", Name: fakeupstream.Model, APIKey: os.Getenv(modelKeyEnv),
+		Pricing: upstream.Pricing{InputMicroPerMTok: 1_000_000, OutputMicroPerMTok: 1_000_000}}
+	cfg.SearchProvider = upstream.SearchFake
+	cfg.UpstreamAllowPrivate = []string{u.Host}
+	return nil
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -63,6 +126,10 @@ func runServer(args []string, stderr io.Writer) int {
 	checkInterval := fs.Duration("check-interval", 200*time.Millisecond, "失锁检测周期")
 	retryBackoff := fs.Duration("retry-backoff", 200*time.Millisecond, "恢复、报警与 coordinator 持久化的重试退避（固定值）")
 	shutdown := fs.Duration("shutdown-timeout", 20*time.Second, "退出时有期限清理的上限")
+	fakeUpstream := fs.String("fake-upstream", "", "fake upstream 的根地址（http://127.0.0.1:<port>）：模型与 fake 搜索指向它")
+	callDeadline := fs.Duration("call-deadline", 0, "Gateway 调用期限（0 取默认 120 s）")
+	backoffBase := fs.Duration("gateway-backoff-base", 0, "Gateway 退避基数（0 取默认 2 s）")
+	perTask := fs.Int("gateway-per-task-inflight", 0, "每任务上游在途上限（0 取默认 4）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -95,6 +162,11 @@ func runServer(args []string, stderr io.Writer) int {
 	if *pythonPath != "" {
 		cfg.WorkerEnv = []string{"PYTHONPATH=" + *pythonPath}
 	}
+	if err := gatewayConfig(&cfg, *fakeUpstream, call.Limits{CallDeadline: *callDeadline, BackoffBase: *backoffBase,
+		PerTaskInflight: *perTask}); err != nil {
+		fmt.Fprintln(stderr, "agentbox-e2e server:", err)
+		return 2
+	}
 	deps := app.Deps{
 		DataDir: dir,
 		AcquireOwnership: func(ctx context.Context) (app.Ownership, error) {
@@ -120,7 +192,7 @@ func runServer(args []string, stderr io.Writer) int {
 			if err != nil {
 				return nil, err
 			}
-			return p, nil
+			return &socketProv{Provider: p, sockets: map[string]string{}}, nil
 		},
 		Logger: slog.New(slog.NewJSONHandler(stderr, nil)),
 		Hooks: app.Hooks{Listening: func(addr string) {

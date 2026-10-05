@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/blob"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/faultinject"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/jcs"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
@@ -611,6 +612,7 @@ func (c *Coordinator) execute(j *job, rec CallRecord) (Result, error) {
 		// 3. 上游 try：使用 Coordinator 自有上下文（期限 = deadline_at；adapter 的客户端另有自身超时）。
 		start := c.now()
 		resp, uerr := j.ad.Do(ctx, j.resolved)
+		faultinject.Point(faultinject.CallInFlight)
 		latency := c.now().Sub(start)
 		release()
 		outcome, status, code := upstream.OutcomeOK, 200, ""

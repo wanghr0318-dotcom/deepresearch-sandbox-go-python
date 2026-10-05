@@ -4,6 +4,9 @@
 // 本包编译进生产代码，但默认是空操作：只有同时满足"进程调用了 Enable"与"设置了环境变量"才生效。
 // 生产入口 cmd/agentbox 从不调用 Enable；只有只供测试的 tests/e2e/agentbox-e2e 调用（archtest 检查）。
 // 钩子点在各包中各占一行（Point(<常量>)），不改变所在代码的行为。
+//
+// "回复丢失"类钩子点（M2 E11b）不杀死进程：调用方以 Lose(<常量>) 询问，第 n 次到达时得到 true，据此模拟
+// "操作已生效而回复丢失"。每个钩子点只以 Point 或 Lose 之一使用（见常量注释）。
 package faultinject
 
 import (
@@ -32,13 +35,16 @@ const (
 	VerdictBefore          = "verdict.before"           // task actor：FinalizeAttempt 事务之前
 	VerdictAfter           = "verdict.after"            // task actor：FinalizeAttempt 事务之后
 	CleanupDestroyed       = "cleanup.destroyed"        // cleanup loop：Destroy 完成之后（cleanup_state 未记录）
+	// Gateway（M2，§16.4 E48、E11b）。
+	CallInFlight      = "call.in_flight"     // gateway/call：Tx2 已提交、上游 try 已返回，结算之前（Point）
+	ReservationCommit = "reservation.commit" // persistence：ReserveTry 的 COMMIT 已执行而回复丢失（Lose，不杀死进程）
 )
 
 // Points 是全部钩子点。
 var Points = []string{
 	AttemptCreateBefore, AttemptCreateAfter, EnvCreateBefore, EnvCreateAfter, WorkerStarted,
 	CheckpointCommitBefore, CheckpointCommitAfter, EnvStopBefore, EnvStopAfter, VerdictBefore, VerdictAfter,
-	CleanupDestroyed,
+	CleanupDestroyed, CallInFlight, ReservationCommit,
 }
 
 var (
@@ -101,4 +107,23 @@ func Point(name string) {
 		fmt.Fprintf(os.Stderr, "faultinject: SIGKILL at %s:%d\n", name, nth)
 		kill()
 	}
+}
+
+// Lose 标记"回复丢失"类钩子点 name。武装且 name 是目标点时计数，第 n 次到达时在 stderr 写一行记录并返回
+// true（只此一次，不杀死进程）；调用方据此模拟操作已生效而回复丢失。未武装时返回 false。
+func Lose(name string) bool {
+	if !armed.Load() {
+		return false
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if name != target {
+		return false
+	}
+	hits++
+	if hits != nth {
+		return false
+	}
+	fmt.Fprintf(os.Stderr, "faultinject: reply lost at %s:%d\n", name, nth)
+	return true
 }
