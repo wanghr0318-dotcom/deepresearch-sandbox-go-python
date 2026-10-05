@@ -557,10 +557,10 @@ func (a *Actor) exec(eff Effect) {
 		}
 	case RevokeAccess:
 		a.revoking[f.AttemptID] = f.Reason
-	case RevokeAccessNow:
-		// 取消生效时立即撤销（§9.1）：经 Store 队列串行提交（排在同一决策的 ApplyControl 之后）；opRevoke 在
-		// 提交（或被确定拒绝）之后才关闭 Gateway 入口，暂时失败按退避以同一身份重试。环境不在此停止。
-		a.enqueue(&storeOp{kind: opRevoke, attemptID: f.AttemptID, reason: f.Reason})
+	case RevokeGateway:
+		// 取消生效时只关闭 Gateway 入口（§9.1；不动 attempt_access，见 RevokeGateway）。排入 Store 队列，使它在
+		// 同一决策的 ApplyControl（desired = cancel 的持久化执行点）提交之后才执行：先持久化、再关闭。
+		a.enqueue(&storeOp{kind: opRevokeGateway, attemptID: f.AttemptID, reason: f.Reason})
 	case StopEnvironment:
 		a.stopEnv(f)
 	case Finalize:
@@ -787,6 +787,7 @@ const (
 	opPersistRunTime
 	opRevoke
 	opAccountRunTime // 恢复交来的 attempt：Deps.OnStopRecorded
+	opRevokeGateway  // 只关闭 Gateway 入口（Access.Revoke），不写 Store；排在之前的 Store 写入之后
 )
 
 // storeOp 是一个待提交的事实。队列按产生顺序串行提交：暂时失败（Store 不可用、提交结果未知、锁争用）
@@ -843,6 +844,9 @@ func (a *Actor) pumpStore() {
 				// 关闭入口只是清理：失败（例如删除 socket 文件失败）不影响已提交的撤销，也不重试。
 				_ = a.d.Access.Revoke(ctx, cp.attemptID, cp.reason)
 			}
+		case opRevokeGateway:
+			// 关闭入口只是清理：失败（例如删除 socket 文件失败）不重试，停止时的撤销会再次关闭。
+			_ = a.d.Access.Revoke(ctx, cp.attemptID, cp.reason)
 		case opAccountRunTime:
 			if r.err = a.d.OnStopRecorded(ctx, cp.attemptID, cp.stoppedAt); r.err == nil {
 				if ts, err := a.d.Store.LoadTask(ctx, taskID); err == nil { // 限额以计入后的累计为准

@@ -265,9 +265,9 @@ var matrix = map[string]map[string]cell{
 		"ControlChanged": c("cancelling", "handshaking", "ApplyControl,RevokeAccess,StopEnvironment"),
 		"WorkerStarted":  c("running", "active", "")}),
 	"running/active": liveRow("running", "active", map[string]cell{ // 取消生效时立即撤销访问（§9.1）
-		"ControlChanged": c("cancelling", "active", "ApplyControl,RevokeAccessNow,SendControl")}),
+		"ControlChanged": c("cancelling", "active", "ApplyControl,RevokeGateway,SendControl")}),
 	"pausing/active": liveRow("pausing", "active", map[string]cell{
-		"ControlChanged": c("cancelling", "active", "ApplyControl,RevokeAccessNow,SendControl")}), // cancel 优先于 pause
+		"ControlChanged": c("cancelling", "active", "ApplyControl,RevokeGateway,SendControl")}), // cancel 优先于 pause
 	"cancelling/active": liveRow("cancelling", "active", map[string]cell{
 		"ControlChanged": c("cancelling", "active", "ApplyControl")}),
 	"running/finishing": liveRow("running", "finishing", map[string]cell{
@@ -528,12 +528,12 @@ func TestActiveControlUsesGrace(t *testing.T) {
 	}
 }
 
-// revokes 返回副作用中的撤销（now 为立即撤销，stop 为停止时撤销）及其原因。
+// revokes 返回副作用中的撤销（now 为立即撤销 Gateway 入口的 RevokeGateway，stop 为停止时的 RevokeAccess）及其原因。
 func revokes(effects []Effect) []string {
 	var out []string
 	for _, e := range effects {
 		switch e := e.(type) {
-		case RevokeAccessNow:
+		case RevokeGateway:
 			out = append(out, "now:"+e.AttemptID+":"+e.Reason)
 		case RevokeAccess:
 			out = append(out, "stop:"+e.AttemptID+":"+e.Reason)
@@ -542,8 +542,9 @@ func revokes(effects []Effect) []string {
 	return out
 }
 
-// 取消生效时立即撤销访问（§9.1），不等协议 cancel 的 grace；停止时至多再撤销一次（幂等），两次原因都是
-// cancel。重复的 cancel 不再立即撤销。暂停不撤销；暂停后再取消同样立即撤销。
+// 取消生效时立即撤销 Gateway 入口（§9.1；RevokeGateway，不动 attempt_access），不等协议 cancel 的 grace；
+// 停止时的 RevokeAccess 至多一次，两次原因都是 cancel。重复的 cancel 不再立即撤销。暂停不撤销；暂停后再
+// 取消同样立即撤销。
 func TestCancelRevokesImmediately(t *testing.T) {
 	s := base()
 	s.TaskStatus, s.Attempt, s.SlotHeld = "running", att("a1", "active"), true
@@ -991,11 +992,12 @@ type memStore struct {
 	callTimes     map[string][]time.Time
 	runTimes      []int64
 	fail          map[string][]error
+	revoked       map[string]bool // 已提交的 attempt_access 撤销
 }
 
 func newMemStore(log *fkLog, clk *fkClock, tasks ...TaskState) *memStore {
 	m := &memStore{log: log, clk: clk, tasks: map[string]*TaskState{}, attempts: map[string]*Attempt{},
-		callTimes: map[string][]time.Time{}, fail: map[string][]error{}}
+		callTimes: map[string][]time.Time{}, fail: map[string][]error{}, revoked: map[string]bool{}}
 	for _, ts := range tasks {
 		ts := ts
 		m.tasks[ts.TaskID] = &ts
@@ -1140,7 +1142,22 @@ func (m *memStore) RevokeAttemptAccess(_ context.Context, attemptID, reason stri
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.log.add("revoke_db:%s:%s", attemptID, reason)
-	return m.enter("RevokeAttemptAccess")
+	if err := m.enter("RevokeAttemptAccess"); err != nil {
+		return err
+	}
+	m.revoked[attemptID] = true
+	return nil
+}
+
+// commitCheckpoint 模拟以 attempt_access 为栅栏的提交（runner.Store 的 CommitCheckpoint 等）：访问已撤销时
+// 以 stale_attempt 拒绝。
+func (m *memStore) commitCheckpoint(attemptID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.revoked[attemptID] {
+		return &persistence.RejectedError{Code: persistence.CodeStaleAttempt}
+	}
+	return nil
 }
 
 func (m *memStore) LookupAttempt(_ context.Context, attemptID string) (string, string, error) {
@@ -1686,8 +1703,9 @@ func TestActorCancelRevokesWithCancelReason(t *testing.T) {
 	}
 }
 
-// ready 之后的 cancel：取消生效时立即撤销（Store 先提交，再以原因 cancel 关闭 Gateway 入口），不等 Worker
-// 在 grace 内结束；停止时再撤销一次（幂等）。
+// ready 之后的 cancel：取消生效时（ApplyControl 提交之后）立即以原因 cancel 关闭 Gateway 入口，不等 Worker
+// 在 grace 内结束，且不撤销 attempt_access——grace 内同一 attempt 的 checkpoint 提交仍成功（§5.8）。停止时
+// 先在 Store 撤销（此后提交以 stale_attempt 拒绝）、再关闭入口一次（幂等）。
 func TestActorCancelRevokesImmediatelyBeforeGrace(t *testing.T) {
 	h := newActorHarness(t, queuedTask("t1"))
 	a := h.spawn("t1")
@@ -1702,15 +1720,26 @@ func TestActorCancelRevokesImmediatelyBeforeGrace(t *testing.T) {
 	if h.log.count("stop:") != 0 || r.cancelled() {
 		t.Fatalf("立即撤销不应停止环境或等待 Run 结束；日志: %v", h.log.all())
 	}
-	h.before("apply_control:cancelling", "revoke_db:id-1:"+RevokeReasonCancel)
-	h.before("revoke_db:id-1:"+RevokeReasonCancel, "revoke_gw:id-1:"+RevokeReasonCancel)
+	h.before("apply_control:cancelling", "revoke_gw:id-1:"+RevokeReasonCancel)
+	if h.log.count("revoke_db:") != 0 {
+		t.Fatalf("取消生效时不应撤销 attempt_access；日志: %v", h.log.all())
+	}
 	if got := h.acc.RevokeReasons(); !reflect.DeepEqual(got, []string{RevokeReasonCancel}) {
 		t.Fatalf("grace 内 Gateway 收到的撤销 = %v", got)
 	}
+	if err := h.st.commitCheckpoint("id-1"); err != nil {
+		t.Fatalf("grace 内同一 attempt 的 checkpoint 提交应成功，得到 %v", err)
+	}
 	r.finish(Outcome{Class: ClassCancelled})
 	h.waitDone()
+	if i, j := h.log.index("revoke_db:id-1:"+RevokeReasonCancel, 1), h.log.index("revoke_gw:id-1:"+RevokeReasonCancel, 2); i < 0 || j < i {
+		t.Errorf("停止时应先在 Store 撤销、再关闭入口；日志: %v", h.log.all())
+	}
 	if got := h.acc.RevokeReasons(); !reflect.DeepEqual(got, []string{RevokeReasonCancel, RevokeReasonCancel}) {
 		t.Errorf("撤销原因 = %v，期望立即一次、停止时一次，均为 cancel", got)
+	}
+	if err := h.st.commitCheckpoint("id-1"); !errors.Is(err, persistence.ErrRejected) {
+		t.Errorf("停止时撤销之后提交应以 stale_attempt 拒绝，得到 %v", err)
 	}
 	if ts := h.st.task("t1"); ts.Status != "cancelled" {
 		t.Errorf("任务应 cancelled: %+v", ts)

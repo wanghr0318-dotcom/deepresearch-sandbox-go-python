@@ -196,10 +196,18 @@ type StopEnvironment struct{ AttemptID, EnvID string }
 // RevokeReasonCancel，否则为 attempt_stopping。
 type RevokeAccess struct{ AttemptID, Reason string }
 
-// RevokeAccessNow 立即撤销 attempt 的访问而不停止环境：取消生效时（§9.1"取消生效时立即撤销"），在协议
-// cancel 与 grace 期间就撤销，使 Gateway 立即取消该 attempt 的在途上游 try。actor 与 RevokeAccess 相同的
-// 顺序执行（Store 先提交，再关闭 Gateway 入口）。之后停止时的 RevokeAccess 照常执行（两者均幂等）。
-type RevokeAccessNow struct{ AttemptID, Reason string }
+// RevokeGateway 只撤销 attempt 的 **Gateway 入口**（关闭连接与 listener，并以 Reason 让 Gateway 取消该
+// attempt 的在途上游 try），不改变 Store 中的 attempt_access、不停止环境。用于取消生效时的立即撤销（§9.1
+// "取消生效时立即撤销"）：
+//   - 与 RevokeAccess 的区别：RevokeAccess 在停止时执行，先把 attempt_access 置为 revoked（Store）再关闭入口；
+//     RevokeGateway 不动 attempt_access——CommitCheckpoint、RegisterArtifact、AppendWorkerEvents、
+//     RecordTerminalProposal 以它为栅栏，而 cancel 的 grace 内送达的合法 result 须保留（§5.8
+//     completed_during_cancel）。
+//   - 取消的持久化执行点是 task_control.desired = cancel：同一决策的 ApplyControl 先提交（actor 经 Store 队列
+//     保证），§9.2 的访问检查据此拒绝新的 Gateway 调用；关闭入口仍只是清理，"先持久化、再关闭"不变。
+//
+// 之后停止时的 RevokeAccess 照常执行（Gateway 撤销幂等）。
+type RevokeGateway struct{ AttemptID, Reason string }
 
 // Finalize 以 Store.FinalizeAttempt 提交判决；结果为 VerdictCommitted 或 StoreFailed{OpFinalize}。
 type Finalize struct{ Verdict Verdict }
@@ -218,7 +226,7 @@ func (StartWorker) isEffect()       {}
 func (SendControl) isEffect()       {}
 func (StopEnvironment) isEffect()   {}
 func (RevokeAccess) isEffect()      {}
-func (RevokeAccessNow) isEffect()   {}
+func (RevokeGateway) isEffect()     {}
 func (Finalize) isEffect()          {}
 func (WakeAt) isEffect()            {}
 
@@ -538,8 +546,9 @@ func (d *decider) interrupt() {
 			if grace == 0 {
 				grace = DefaultControlGraceMs
 			}
-			if d.s.Desired == "cancel" { // 取消生效时立即撤销（§9.1）；暂停不撤销
-				d.emit(RevokeAccessNow{AttemptID: a.AttemptID, Reason: RevokeReasonCancel})
+			// 取消生效时立即撤销 Gateway 入口（§9.1；attempt_access 留到停止时，见 RevokeGateway）；暂停不撤销。
+			if d.s.Desired == "cancel" {
+				d.emit(RevokeGateway{AttemptID: a.AttemptID, Reason: RevokeReasonCancel})
 			}
 			d.emit(SendControl{AttemptID: a.AttemptID, Kind: d.s.Desired, GraceMs: grace})
 		}
