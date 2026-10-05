@@ -121,6 +121,9 @@ type ModelConfig struct {
 	// 价格只是配置，用于预留估算与结算，不代表供应商的实际计费。
 	PricingByModel map[string]upstream.Pricing
 	APIKey         string
+	// MaxTokensCap 是 max_tokens 的上限（超出者截断，§9.6）；≤ 0 时取 adapter 默认值。推理模型先消耗
+	// 推理 token，上限过低会得到空的 content。
+	MaxTokensCap int
 }
 
 // declared 报告模型是否在声明的白名单中（Models 为空时只有 Name）。

@@ -40,6 +40,7 @@ type modelFlags struct {
 	BaseURL, Name, Models string
 	Prices                []string // model=IN:OUT（每百万 token 的微美元）
 	PriceIn, PriceOut     int64    // 未在 Prices 中给出的模型的单价
+	MaxTokensCap          int      // max_tokens 上限（0 = adapter 默认值；不能为负）
 }
 
 // modelConfig 校验模型标志并构造 app.ModelConfig（不含 Key）：
@@ -48,7 +49,10 @@ type modelFlags struct {
 //   - --model-price 的模型须已声明，每个模型至多一项，单价为非负整数。
 func modelConfig(f modelFlags) (app.ModelConfig, error) {
 	m := app.ModelConfig{BaseURL: f.BaseURL, Name: f.Name,
-		Pricing: upstream.Pricing{InputMicroPerMTok: f.PriceIn, OutputMicroPerMTok: f.PriceOut}}
+		Pricing: upstream.Pricing{InputMicroPerMTok: f.PriceIn, OutputMicroPerMTok: f.PriceOut}, MaxTokensCap: f.MaxTokensCap}
+	if f.MaxTokensCap < 0 {
+		return app.ModelConfig{}, errors.New("--model-max-tokens-cap 不能为负数")
+	}
 	if f.PriceIn < 0 || f.PriceOut < 0 {
 		return app.ModelConfig{}, errors.New("--model-price-in/out-micro-per-mtok 不能为负数")
 	}

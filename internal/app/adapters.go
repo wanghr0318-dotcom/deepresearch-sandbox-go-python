@@ -443,7 +443,7 @@ func (c Config) gatewayAdapters(d *upstream.Dialer) ([]upstream.Adapter, map[ups
 		pricing[upstream.KindChat] = c.Model.Pricing
 		chatPricing = c.Model.PricingByModel
 		adapters = append(adapters, upstream.NewChat(upstream.ChatConfig{BaseURL: c.Model.BaseURL, Model: c.Model.Name,
-			Models: c.Model.Models, APIKey: c.Model.APIKey, Pricing: c.Model.Pricing, PricingByModel: chatPricing,
+			Models: c.Model.Models, APIKey: c.Model.APIKey, Pricing: c.Model.Pricing, PricingByModel: chatPricing, MaxTokensCap: c.Model.MaxTokensCap,
 			HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0)}))
 	}
 	return adapters, pricing, chatPricing
