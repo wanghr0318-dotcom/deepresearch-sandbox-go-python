@@ -31,9 +31,18 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U agentbox -d agentbox"
           --health-interval 2s --health-timeout 2s --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 2s --health-retries 30
     env:
       # 事务语义只在真实 PostgreSQL 上测试；CI 中未设置时数据库测试失败而不是跳过。
       AGENTBOX_TEST_DATABASE_URL: postgres://agentbox:agentbox@localhost:5432/agentbox?sslmode=disable
+      # 缓存用例使用真实 Redis；CI 中未设置时失败而不是跳过。
+      AGENTBOX_TEST_REDIS_ADDR: localhost:6379
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -90,9 +99,18 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U agentbox -d agentbox"
           --health-interval 2s --health-timeout 2s --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 2s --health-retries 30
     env:
       # 事务语义只在真实 PostgreSQL 上测试；CI 中未设置时数据库测试失败而不是跳过。
       AGENTBOX_TEST_DATABASE_URL: postgres://agentbox:agentbox@localhost:5432/agentbox?sslmode=disable
+      # 缓存用例使用真实 Redis；CI 中未设置时失败而不是跳过。
+      AGENTBOX_TEST_REDIS_ADDR: localhost:6379
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
