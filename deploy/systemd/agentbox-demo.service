@@ -1,0 +1,36 @@
+# 演示服务器上的常驻 agentbox server（HTTPS 443，同源提供工作台）。
+# 安装：二进制 /usr/local/bin/agentbox；工作台 /opt/agentbox-web（web/dist）；worker 包 /opt/agentbox；
+# 机密只在 /etc/agentbox/agentbox.env（root 0600）：AGENTBOX_MODEL_API_KEY、AGENTBOX_SEARCH_API_KEY（serper 的 Key）、
+# AGENTBOX_DATABASE_URL；访问令牌 /var/lib/agentbox/api.token（0600）；自签证书 /etc/agentbox/tls.{crt,key}。
+# 4C8G 配置：任务环境内存池 4 GiB、最多 3 个并发任务；单任务预算默认 2 USD、上限 3 USD（按配置单价估算）。
+# 对外只在测试窗口经安全组放通 443；结束后删除规则并轮换 api.token。
+[Unit]
+Description=go-agentbox server (demo, HTTPS)
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/agentbox/agentbox.env
+ExecStart=/usr/local/bin/agentbox server \
+  --data-dir /var/lib/agentbox \
+  --listen 0.0.0.0:443 \
+  --allowed-host 49.235.41.14 \
+  --allowed-origin https://49.235.41.14 \
+  --tls-cert /etc/agentbox/tls.crt --tls-key /etc/agentbox/tls.key \
+  --web-dir /opt/agentbox-web \
+  --worker-argv python3,-m,deepresearch \
+  --model-base-url https://api.moonshot.cn/v1 \
+  --model-name kimi-k2.6 \
+  --models kimi-k2.6,kimi-k2.7-code,kimi-k2.7-code-highspeed,kimi-k3 \
+  --search-provider serper \
+  --redis-addr 127.0.0.1:6379 \
+  --memory-bytes 4294967296 --run-slots 3 \
+  --default-budget-micro 2000000 --budget-cap-micro 3000000
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
