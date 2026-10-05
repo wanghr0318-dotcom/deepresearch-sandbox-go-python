@@ -4130,7 +4130,13 @@ func TestE19AttemptReplacedDuringCall(t *testing.T) {
 	fu.Release()
 	eventually(t, "旧 try 完成并写入 journal", func() bool { return gwCallRow(t, h.dsn, id, e2eCallID).State == "completed" })
 	c := gwCallRow(t, h.dsn, id, e2eCallID)
-	got, err = gwDo(sock2, http.MethodPost, "/v1/chat/completions", e2eCallID, chatBody(gwMessages))
+	// journal 已是 completed，但旧 try 的执行者在结算事务提交之后才释放进程内的调用占用：在此之间到达的同 ID
+	// 请求得到 call_in_progress（契约：可重试，Worker SDK 同样以同一 ID 有界重试）。等待的条件是同 ID 请求本身
+	// 不再是 call_in_progress（期限只决定失败），之后断言它是重放。
+	eventually(t, "旧 try 的执行者释放调用占用（同 ID 请求不再是 call_in_progress）", func() bool {
+		got, err = gwDo(sock2, http.MethodPost, "/v1/chat/completions", e2eCallID, chatBody(gwMessages))
+		return err != nil || got.Code != "call_in_progress"
+	})
 	if err != nil || got.Status != http.StatusOK || !got.Replayed || got.Blob != c.ResultRef {
 		t.Fatalf("完成后的同 ID 请求得到 %+v %v，期望 200 重放、blob %s", got, err, c.ResultRef)
 	}
