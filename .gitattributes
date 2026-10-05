@@ -1,0 +1,2 @@
+# Shell 脚本在任何平台检出都保持 LF：CRLF 会让 bash 把 "pipefail" 当作未知选项（Windows 检出后在 WSL 中运行时）。
+*.sh text eol=lf
