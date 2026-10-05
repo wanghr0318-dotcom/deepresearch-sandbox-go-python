@@ -19,7 +19,7 @@
 | 沙箱生产启动器、init 环境建立、stage-2 helper、启用 server（Plan 2 Task 9–13） | **已验收**（Plan 2 联合验收，2026-10-05） | `local.NewProcessStarter`；首个切片、E1–E5（E5 为物理回收部分）、E7、E8、E10 与累计运行时限跨重启，在真实沙箱中以 root 通过（`tests/e2e` 的 `TestReal*`） |
 | Gateway：每 attempt 的 Unix socket 入口、调用 journal 与 task 层预算、OpenAI 兼容 chat / 搜索 / 抓取 adapter、SSRF 验证 dialer、启动账本转换（M2 Plan 7） | **已验收**（2026-10-05） | `internal/gateway/{edge,call,upstream}`；E11b、E17–E20、E48、I3、I14（journal）；供应商 Key 只在宿主进程内，沙箱中不可见（G3，真实沙箱验证） |
 | Worker SDK Gateway 客户端与 DeepResearch 接入（M2 Plan 8 Task 1–5） | **已验收**（以 fake upstream 自动化验收） | `worker/agentbox_worker/gateway.py`、`worker/deepresearch`（零运行时依赖）；计划 → 检索 → 阅读 → 总结 → 报告，checkpoint 可恢复，引用对应已保存证据 blob |
-| 真实模型研究演示（M2 Plan 8 Task 6） | 待执行 | 需要 OpenAI 兼容端点的 base URL 与模型名 |
+| 真实模型研究演示（M2 Plan 8 Task 6） | 演示脚本已就绪（演练通过）；真实模型运行待执行 | `scripts/demo-m2.sh`（见"真实研究演示"）；真实运行需要 OpenAI 兼容端点的 base URL 与模型名 |
 | Redis 缓存、Vue、会话、exec 沙箱、sub-run | 未开始 | M3–M4 |
 
 ## 现在可以运行的命令
@@ -108,6 +108,26 @@ sudo sh -c 'set -a; . deploy/agentbox.env.example; exec ./bin/agentbox verify-in
 Worker 在沙箱中以映射 UID 运行，只读看到宿主的 `/usr`、`/etc` 的子集与 `/opt/agentbox`，可写的只有 `/workspace`（宿主 `<data>/workspaces/<task_id>`）与限额 tmpfs。M1 的结果下载端点尚未实现（`agentbox task result` 返回 501）：产物按固定版本保存在 `<data>/blobs`，版本与 sha256 见 `task watch` 的 `artifact_saved` 事件。
 
 **Gateway 配置**：每个 attempt 在 `<data>/gateway/<attempt_id>.sock` 有一个 Gateway 入口，挂载到沙箱内的 `/run/agentbox/gateway.sock`（属主为环境映射 uid 1000、0600）；attempt 结束或取消生效时先在数据库撤销访问、再关闭入口。供应商 Key 只从宿主环境变量 `AGENTBOX_MODEL_API_KEY`、`AGENTBOX_SEARCH_API_KEY` 读取，不进入 Worker 的 init、沙箱环境变量与日志；`--worker-env` 的键须在白名单中（如 `PYTHONPATH`）。相关标志（含义与默认值见配置示例）：`--default-budget-micro` / `--budget-cap-micro`（task 层预算，微美元；任务可用 `limits.budget_micro` 指定，超过上限返回 `400 invalid_limits`）、`--model-base-url` / `--model-name` / `--model-price-in-micro-per-mtok` / `--model-price-out-micro-per-mtok`（OpenAI 兼容模型上游；不设 `--model-base-url` 时不提供模型端点）、`--search-provider ddg_lite|tavily|fake`、`--upstream-allow-private`（显式放行的私有上游，例如本机模型服务）。`agentbox task inspect` 除 attempt 与 checkpoint 外列出每个 Gateway 调用及其 try（端点、状态、费用、延迟、上游请求 ID；不含请求与响应正文）。
+
+### 真实研究演示（M2）
+
+`scripts/demo-m2.sh` 在全新的数据目录（`/var/lib/agentbox-demo-m2`）与数据库（`agentbox_demo_m2`）上，以真实沙箱与真实 Gateway 运行一个 DeepResearch 任务（`--worker-argv python3,-m,deepresearch`），逐步打印：提交 → Worker 运行中从宿主读取沙箱内每个进程的 `/proc/<pid>/environ` 与命令行，确认不含 Key 的值与变量名（G3）→ 等待 `task_terminal` → `inspect` 的调用明细（端点、tries、费用、延迟；不含正文）与总费用 → 报告前 40 行与证据列表（报告从 `<data>/blobs` 读取并校验 sha256）→ 环境清理 → `verify-invariants --quiescent` → 泄漏检查 → Key 不出现在 server 日志、事件流与 inspect 输出中。任一步失败即非零退出。
+
+**前提**：与上文快速开始相同（root、cgroup v2、`python3` 3.11+、PostgreSQL；数据库经本机 `psql` 或 docker 新建）；脚本自行构建 `bin/agentbox` 并把 `worker/` 中的 `agentbox_worker`、`sim_worker`、`deepresearch` 安装到 `/opt/agentbox`。
+
+**变量**（变量名也列在 [`deploy/agentbox.env.example`](deploy/agentbox.env.example)）：`AGENTBOX_DEMO_MODEL_BASE_URL`、`AGENTBOX_DEMO_MODEL_NAME`（真实模式必填，OpenAI 兼容端点）、`AGENTBOX_DEMO_SEARCH_PROVIDER`（`ddg_lite` 默认、无 Key；`tavily` 需要 `AGENTBOX_SEARCH_API_KEY`）、`AGENTBOX_DEMO_TOPIC`（默认一个固定中文题目）、`AGENTBOX_DEMO_PRICE_IN_MICRO_PER_MTOK` / `AGENTBOX_DEMO_PRICE_OUT_MICRO_PER_MTOK`、`AGENTBOX_DEMO_BUDGET_MICRO`（可选）。模型 Key 取环境变量 `AGENTBOX_MODEL_API_KEY`，未设置时从仓库根的 `.env`（git 忽略；可用 `AGENTBOX_DEMO_ENV_FILE` 指定）中**只读取这一行**，不 `source` 整个文件；脚本只报告"已设置"，不打印、不写入任何文件，只经环境变量交给 server。
+
+**演练**（fake upstream 扮演模型、搜索与网页，不访问外网；Key 为随机生成的假值；其余流程与真实模式相同。已在 WSL2 6.6 x86_64 上以 root 执行，16 步全部通过）：
+
+```bash
+sudo AGENTBOX_DEMO_FAKE=1 bash scripts/demo-m2.sh
+```
+
+**真实模型**（待执行：需要 OpenAI 兼容端点的 base URL 与模型名；运行后证据记录在 `docs/evidence/`）：
+
+```bash
+sudo AGENTBOX_DEMO_MODEL_BASE_URL='https://<端点>/v1' AGENTBOX_DEMO_MODEL_NAME='<模型名>' bash scripts/demo-m2.sh
+```
 
 **Python Worker SDK 测试**：
 
