@@ -1,6 +1,6 @@
 # M1 Plan 2：LocalProvider（不依赖 Plan 1B 的部分）实施计划
 
-> **执行方式**：主 agent 逐任务实现与评审（项目负责人 2026-10-04 的要求：不使用子 agent）。每个任务 TDD：先写本任务列出的测试，确认失败，再实现，按"验证"一节的命令通过后提交。
+> **执行方式**：有界多 agent（2026-10-05 起）：主 agent 负责接口、集成与验收，子 agent 在隔离 worktree 中实现指定文件。每个任务 TDD：先写本任务列出的测试，确认失败，再实现，按"验证"一节的命令通过后提交。
 
 **Goal:** 按已审阅的 [Provider 契约](../design/2026-10-05-provider-contract.md) 实现 `internal/provider`（契约类型、错误、内存 fake、契约一致性测试）与 `internal/provider/local` 中不依赖启动序列 spike 的全部部分：控制通道、带登记表的单一 reaper、init 服务循环、宿主侧 `StartExec`/`ExecHandle` 与执行闸门、环境生命周期（Create/Stop/Destroy/List/Scan/ResourceDiag）、seccomp 配置生成，以及代码组织设计 §9.2 规定的旧代码处理。
 
@@ -253,16 +253,93 @@ func New(opt Options) (*Provider, error) // Starter 为 nil 时返回错误（�
 3. 范围：diff 只含本计划 Files；archtest 新规则通过。
 4. 验收归属：E9（cgroup 层）；provider 集成测试；契约一致性测试在 fake 与 local 上都通过。
 
-## 依赖 Plan 1B 的任务（本计划不编写，1B 结论回写规格 §4.6 后补充为 Task 9 起）
+## 依赖 Plan 1B 的任务（Task 9–13；依据回写后的规格 §4.6、§16.2，2026-10-05 用户审阅结论）
 
-| 任务 | 依赖的 1B 结论 |
-|---|---|
-| 生产 `EnvStarter`：clone 各 namespace、`setgroups=deny` 与 UID/GID 映射、附加组清空 | B1 |
-| 挂载：只读 rootfs bind、tmpfs、`/proc` 掩蔽、不挂载 `/sys`、pivot_root 与脱离旧根；Gateway socket 与 `/in`、`/out` 挂载 | B2 |
-| stage-2 helper：bounding 清空、setresuid/gid、能力清空、securebits、no_new_privs、seccomp（TSYNC）安装、FD 全部 close-on-exec | B3、B4、B5 |
-| `Launcher` 的生产实现与 `start_err` 原因文本 | B6 |
-| `hostcheck` 的挂载 API 与内核能力检查；`Scan` 的 UID 范围文件属主一层 | B1、B2、B4 |
-| 验收：§16.2 spike 验收、E34、I11 的隔离部分；E2、E3 在真实环境中的运行 | 全部 |
+**审阅结论带来的两条实现门槛（规格 §4.6 末尾）贯穿以下任务：**进程级凭据边界（附加组只在专用启动进程中清空，server 凭据不变）；
+不依赖名称的启动成功判据（R3）。"实验可行"与"生产启动路径通过验收"分开判定：Task 9–12 各自的测试通过不等于生产启动路径验收，
+后者是 Task 12 的 §16.2 生产验收加 Task 13 的真实端到端。
+
+**规格增量（随本节一并审阅）**：为实现 R3 的判据，init 的 permitted 集合由 `{KILL}` 改为 `{KILL, SETUID, SETGID, SETPCAP}`
+（effective 仍只有 `{KILL}`，inheritable 与 ambient 为空）。原因：判据依赖 ptrace 的 exec 事件，而被跟踪进程 execve 时内核把
+新的 permitted 限制在原 permitted 之内（tracer 无 `CAP_SYS_PTRACE` 时），init 若只保留 `{KILL}`，helper 将拿不到降权所需的能力。
+Task 11 第一步以测试验证这一点；验证不成立则停止并报告，不退回到基于名称或轮询的判据。
+
+| 任务 | 内容 | 依赖 |
+|---|---|---|
+| 9 | 专用启动进程与生产 `EnvStarter`（user namespace、ID 映射、`CLONE_INTO_CGROUP`、pidfd 交还、server 为 subreaper） | 8 |
+| 10 | init 环境建立：挂载（新挂载 API + 回退）、tmpfs、`/dev`、proc 与掩蔽、pivot_root、init 能力；`init_err` | 9 |
+| 11 | stage-2 helper 与 init 的生产 `Launcher`：降权序列、exec-status 管道、**R3 启动成功判据（ptrace exec 事件）**、reaper 集成 | 10 |
+| 12 | `hostcheck` 补充、构建约束（`CGO_ENABLED=0`）、§16.2 生产验收（隔离检查器） | 11 |
+| 13 | 启用 `agentbox server`；真实隔离环境上的端到端与重启恢复验收（首个切片、E1–E10、E2/E3、E5 物理回收）；README 快速开始 | 12；Plan 5、6 |
+
+### Task 9：专用启动进程与生产 `EnvStarter`
+
+**Files:** Create `internal/sandbox/launch.go`（`sandbox-launch` 子命令的实现）、`internal/provider/local/starter.go`（生产 `EnvStarter`）；Modify `cmd/agentbox/main.go`（在 `init` 之后分流 `sandbox-launch`）、`internal/sandbox/spawn_test.go`、`internal/provider/local/local_test.go`；Delete `internal/sandbox/spawn.go` 中旧的无 user namespace 的 `Spawn`（及其调用与测试）。
+
+**规则：**
+- server 以 `/proc/self/exe sandbox-launch` re-exec 一个专用启动进程（每个环境一个，短生命周期），经继承的 FD 传入：控制 socket 的沙箱端、环境 cgroup 目录 fd、启动规格（JSON：UID/GID 范围、hostname）与一个用于交还结果的 SEQPACKET socket。
+- 启动进程：`setgroups([])` 清空**自身**附加组并以 `getgroups` 断言为空 → 以 `exec.Cmd` 启动 `/proc/self/exe init`，`SysProcAttr`：`Cloneflags = NEWUSER|NEWNS|NEWPID|NEWUTS|NEWIPC|NEWNET`、`UseCgroupFD/CgroupFD`（`CLONE_INTO_CGROUP`）、`UidMappings/GidMappings`（ns 0 → 范围基址，长度为范围大小）、`GidMappingsEnableSetgroups = false`（写 `setgroups=deny`）、`Credential{Uid: 0, Gid: 0, NoSetGroups: true}`、`PidFD` → 经结果 socket 以 `SCM_RIGHTS` 交还 init 的 pidfd 与 pid → 退出。任何一步失败：以结果 socket 报告原因文本后以非零码退出，不留进程（clone 之后的失败先 `pidfd_send_signal(SIGKILL)`）。
+- server 在启动时设置 `PR_SET_CHILD_SUBREAPER`，启动进程退出后 init 由 server 收养；`EnvStarter` 用 pidfd 等待并收割 init（满足 Task 8 记录的 `EnvStarter` 保证：成功返回即 init 就绪、starter 收割 init、init 在执行任何代码前已在环境 cgroup 中、ctx 取消后的残留留在 cgroup 中由 Stop 清理）。
+- **凭据边界**：server 进程不调用 `setgroups`/`setresuid` 等改变自身凭据的系统调用；archtest 增加源码检查——这些调用只出现在 `internal/sandbox` 的启动进程与 helper 代码中。
+- `local.New` 的生产装配使用本启动器；测试启动器保留在 `_test.go`。
+
+**Tests（root，cgroup v2）：** server（测试进程）的 `/proc/self/status` `Groups` 在启动若干环境前后不变；init 的 `/proc/<pid>/status`：`Groups` 为空、`NSpid` 两级、uid/gid 映射与范围一致；init 在执行代码前已在环境 cgroup（以 `cgroup.procs` 与 init 启动时自报的 cgroup 路径核对）；启动进程在 clone 前/后各注入失败 → `ErrIncomplete` 语义成立（残留只在 cgroup 中，Stop+Destroy 后可重建）；启动进程退出后 init 由 server 收割（无僵尸）。
+
+**验证：** root：`go test -count=1 ./internal/sandbox/ ./internal/provider/local/`；非 root 全量；`GOOS=windows go build ./...`。
+
+### Task 10：init 环境建立
+
+**Files:** Create `internal/sandbox/mounts.go`、`internal/sandbox/caps.go`；Modify `internal/sandbox/init.go`（`RunInit` 按 §4.6 的 init 段执行，失败报告 `init_err{reason}`）、`internal/sandbox/spawn_test.go`、`internal/rootfs/*`（模板描述）。
+
+**规则（规格 §4.5、§4.6 init 段，逐条）：** 控制 socket 立即 `F_DUPFD_CLOEXEC` 移到高位并关闭原 fd → `mount("/", MS_REC|MS_PRIVATE)` → rootfs：新挂载 API（`open_tree(OPEN_TREE_CLONE|AT_RECURSIVE)` → `mount_setattr(AT_RECURSIVE, RDONLY|NOSUID|NODEV, MS_PRIVATE)` → `move_mount`），不可用时回退 `mount(2)` 递归 bind 后逐个子挂载 remount ro（回退路径有独立测试）→ tmpfs `/tmp`、`/run`（限额）→ `/dev`（tmpfs + bind null/zero/random/urandom，remount ro）→ Gateway socket bind（编排环境，属主映射 uid 1000，0600；M1 无 Gateway 时该步按 spec 跳过且有测试断言 exec 环境不可见）→ `/workspace/{attempt,out}` bind（宿主已 chown 到映射 UID）→ 新 proc（`nosuid,nodev,noexec`）→ 掩蔽清单（目录：只读空 tmpfs；文件：bind `/dev/null`）与只读路径 → 打开 helper 二进制 `O_PATH|O_CLOEXEC` 移到高位 → `pivot_root(".", ".")` → `umount2(".", MNT_DETACH)` → `chdir("/")` → 全部线程：bounding = `{KILL, SETUID, SETGID, SETPCAP}`，permitted = 同上，effective = `{KILL}`，inheritable、ambient 为空，不设 securebits。
+- **不提供 `/dev/shm`**（规格 §4.5 环境限制），有测试断言其不存在。
+- **模板**：M1 模板为只读 bind 的宿主目录集合（配置项给出 `/usr`、`/etc` 子集、`/lib*` 与 worker 包目录 `/opt/agentbox`），`rootfs.EnsureTemplate` 校验；不提供可写 rootfs。
+- 每一步失败报告 `init_err{init/<step>: <原因>}`（实验记录 §8 的 9 个注入点），环境创建失败（`Create` 按契约处理残留）。注入点只在测试构建中可用。
+
+**Tests（root）：** 沙箱内 `/proc/self/mountinfo`：全部私有传播、旧根已脱离、rootfs 与只读路径为 `ro,nosuid,nodev`、掩蔽项生效、`/sys` 与 cgroupfs 未挂载、`/dev/shm` 不存在；init 的能力集合如上（逐线程）；控制 socket 与 helper fd 带 close-on-exec；9 个注入点各报告对应 `init_err` 且 workload 未运行；新挂载 API 与回退路径各运行一次。
+
+**验证：** 同 Task 9。
+
+### Task 11：stage-2 helper、生产 `Launcher` 与启动成功判据
+
+**Files:** Create `internal/sandbox/helper.go`（`exec-stage2` 子命令）、`internal/sandbox/rawfork_linux.go`（raw clone + `execveat`，移植 spike 的 `rawfork.go`）、`internal/sandbox/launcher.go`（init 的生产 `Launcher`）；Modify `internal/sandbox/reaper.go`（ptrace 停止事件交给启动路径）、`internal/sandbox/spawn_test.go`、`cmd/agentbox/main.go`（分流 `exec-stage2`）。
+
+**降权序列（规格 §4.6 helper 段，逐条）：** `PR_SET_NAME` → fd 3 设 `FD_CLOEXEC`、`close_range(4, ~0, CLOSE_RANGE_CLOEXEC)` → 清空 bounding → 设置并锁定 securebits 0x0f（在 `setresuid` 之前）→ `setresgid/setresuid(1000)` → 显式清空 eff/prm/inh 与 ambient → 显式设置 rlimit（`RLIMIT_NOFILE`、`RLIMIT_CORE=0`；exec 环境另 `RLIMIT_FSIZE`）→ `no_new_privs` → seccomp（Task 3 的过滤器，`SECCOMP_FILTER_FLAG_TSYNC`，`clone3 → ENOSYS`）→ `execve` workload。`LockOSThread`；身份与能力调用经 `syscall.AllThreadsSyscall`。任一步失败经 fd 3 写 `helper/<step>: <原因>` 后退出。
+
+**init 的启动路径（持 `reg.mu`）：** `recvmsg(MSG_CMSG_CLOEXEC)` 恰好 3 个 FD → `pipe2(O_CLOEXEC)` 作为 exec-status → 阻塞全部信号 → raw `clone(SIGCHLD)` → 子进程：`dup3` 到 0/1/2/3，`setpgid(0,0)`，`ptrace(PTRACE_TRACEME)`，清空信号掩码，`execveat(helper_fd, "", AT_EMPTY_PATH)`。
+
+**R3 启动成功判据（ptrace exec 事件，不依赖名称或轮询）：**
+1. 子进程 `PTRACE_TRACEME` 后 `execveat` helper：成功时内核使其停在 exec 后的 `SIGTRAP`；init 收到该停止后 `PTRACE_SETOPTIONS(PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL)` 并 `PTRACE_CONT`。
+2. helper 执行降权序列后 `execve` workload：成功时内核产生 `PTRACE_EVENT_EXEC` 停止——这是"workload 已完成 execve、尚未执行任何指令"的内核事实。init 随即 `PTRACE_DETACH` 并回复 `start_ack`。
+3. 在 `PTRACE_EVENT_EXEC` 之前：exec-status 管道有数据 → `start_err{helper/<step>}`；进程退出或被信号终止 → `start_err{helper/died_before_exec: <状态>}`。两种情况 workload 都未运行。
+4. 因为事件发生在 workload 的第一条指令之前，workload 快速退出（如 `true`）总是报告为 `start_ack` 后的 `exit`；workload 与 helper 同名不影响判定。
+5. ptrace 请求必须由 clone 子进程的那个 OS 线程发出（tracer 是线程）：启动路径在一个锁定的 goroutine 中完成 clone、等待与 detach。reaper 仍是唯一的 `wait` 调用者：对处于"启动中"的 pid，reaper 把停止事件（`WIFSTOPPED`）经登记表交给该启动路径，不收割、不丢弃。
+6. ptrace 不可用（`ptrace_scope ≥ 2`、LSM 拒绝）→ `start_err{init/ptrace: …}`，不退回启发式判据；`hostcheck` 预先检查（Task 12）。
+7. 第一步验证：helper 在被跟踪的情况下 execve 后能否获得 `{SETUID, SETGID, SETPCAP}`（取决于 init 的 permitted，见本节开头的规格增量）。测试先行；不成立则停止报告。
+
+**Tests（root）：** R3 矩阵——workload `true`（快速退出）→ `start_ack` + exit 0；helper 在每个降权步骤注入失败（12 个注入点）→ 对应 `start_err`、workload 未运行（以 workload 写入的标记文件不存在判定）；helper 在 exec 前被 SIGKILL（注入点处自杀）→ `start_err{helper/died_before_exec: signal killed}`；workload 二进制与 helper 同名（复制为同名文件、`PR_SET_NAME` 相同）→ 判定不受影响；workload 被 SIGKILL 立即终止 → `start_ack` + 信号退出；并发 32 次启动无错配。workload 内核验：uid/gid 1000、能力全 0（逐线程）、`NoNewPrivs: 1`、securebits 0x0f 锁定、除 0/1/2 外无 FD、`TracerPid: 0`（已 detach）。
+
+**验证：** 同 Task 9。
+
+### Task 12：宿主检查、构建约束与 §16.2 生产验收
+
+**Files:** Modify `internal/hostcheck/*`、`internal/archtest/archtest_test.go`、`.github/workflows/ci.yml`、`scripts/ci/check-runner.sh`；Create `internal/sandbox/isolation_test.go`（或并入 `spawn_test.go`，以本包唯一测试文件规则为准）与检查器（移植 spike `check.go` 为测试辅助二进制）。
+
+**规则：** `hostcheck` 增加：新挂载 API（`open_tree`/`mount_setattr` 可用）、`close_range`、`kernel.yama.ptrace_scope ≤ 1`、user namespace 可用（含 AppArmor 的非特权 userns 限制不影响 root 创建）；`agentbox doctor` 输出每项结果。构建约束：helper 所在二进制以 `CGO_ENABLED=0` 构建——`internal/sandbox` 增加 `//go:build cgo` 的文件使 helper 在 cgo 构建下拒绝运行（`start_err{helper/cgo_enabled}`），CI 的构建步骤固定 `CGO_ENABLED=0`。
+
+**§16.2 生产验收（检查器在生产启动路径启动的 workload 内运行）：** 规格 §16.2 全部条目，`Seccomp_filters ≥ 宿主基线 + 1`（基线在宿主上同法读取）；启动成功判据条目；server 凭据不变条目。CI 的 `linux-integration`（ubuntu-24.04，x86_64）实际运行且无 skip。验收范围按 §16.2 表述：WSL2 指定环境 + CI 的 GitHub runner；不代表其他 Linux 环境或 aarch64。
+
+**验证：** root：`go test -count=1 ./internal/sandbox/ ./internal/hostcheck/`；`sudo ./bin/agentbox doctor`。
+
+### Task 13：启用 server 与真实隔离环境的端到端验收
+
+**Files:** Modify `cmd/agentbox/server.go`（去掉"生产启动器未就绪"的拒绝，装配生产启动器与模板配置）、`tests/e2e/e2e_test.go`（追加 root 用例）、`README.md`（快速开始）、`deploy/`（配置示例）。
+
+**规则与验收：** root 下以 `provider/local` + 生产启动器运行：首个切片（提交 → checkpoint → 杀死 Worker → 恢复 → result）、E1、E4（降低次数，记录 seed）、E7、E8、E10；E2（Worker 主进程超出 `memory.max` → `worker_oom_likely` 与 OOM 重试）、E3（子进程 OOM）；E5 的物理回收部分（server 被 SIGKILL 后重启，残留执行树经 cgroup 停止、孤儿环境回收、无误隔离）；每个用例结束运行 `verify-invariants --quiescent`。累计运行时限按规格 §14.4：时限到期 → `task_deadline_exceeded`，重启不重置（一条用例）。README 增加可复现快速开始（`docker compose` 起 PostgreSQL → 构建 → `sudo agentbox server` → `agentbox task submit/watch/result`），只写本任务实际执行过的命令；配置示例与 `server` 标志一致。
+
+**验证：** root：`CI=true go test -count=1 ./tests/e2e/...`（连续三次）；按 README 快速开始逐条执行一遍并记录输出。
+
+**M1 门槛**：Task 13 通过后，Plan 2 联合验收（含本节）与 M1 门槛一并判定。
 
 ## 自查记录
 
