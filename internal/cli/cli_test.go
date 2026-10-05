@@ -200,6 +200,51 @@ func TestResultVerifiesSHA256(t *testing.T) {
 	}
 }
 
+// TestResultArtifactVerifiesSHA256：--artifact 下载产物版本（--version 指定，缺省最新），以 ETag 中登记的
+// sha256 校验；blob 被篡改（正文与登记的 sha256 不符）时报错，不输出也不写文件。
+func TestResultArtifactVerifiesSHA256(t *testing.T) {
+	registered := []byte("# report v2")
+	sum := sha256.Sum256(registered)
+	var body atomic.Value
+	body.Store(registered)
+	var gotURI atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURI.Store(r.URL.RequestURI())
+		if r.URL.Path != "/tasks/t1/artifacts/my report" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:])+`"`)
+		if _, err := w.Write(body.Load().([]byte)); err != nil {
+			t.Errorf("写响应: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	res := run(t, srv, nil, "task", "result", "t1", "--artifact", "my report", "--version", "2")
+	if res.code != 0 || res.stdout != string(registered) || gotURI.Load() != "/tasks/t1/artifacts/my%20report?version=2" {
+		t.Fatalf("code=%d out=%q err=%s uri=%v", res.code, res.stdout, res.err, gotURI.Load())
+	}
+	res = run(t, srv, nil, "task", "result", "t1", "--artifact", "my report")
+	if res.code != 0 || gotURI.Load() != "/tasks/t1/artifacts/my%20report" {
+		t.Fatalf("缺省应下载最新版本：code=%d err=%s uri=%v", res.code, res.err, gotURI.Load())
+	}
+
+	body.Store([]byte("# tampered!")) // blob 被篡改：ETag 仍是登记的 sha256
+	out := filepath.Join(t.TempDir(), "a.md")
+	res = run(t, srv, nil, "task", "result", "t1", "--artifact", "my report", "--out", out)
+	if res.code != 1 || !strings.Contains(res.err, "sha256 不符") || res.stdout != "" {
+		t.Fatalf("篡改应报错：code=%d out=%q err=%s", res.code, res.stdout, res.err)
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Fatal("校验失败不得写出文件")
+	}
+
+	if res := run(t, srv, nil, "task", "result", "t1", "--version", "1"); res.code != 2 {
+		t.Fatalf("--version 不带 --artifact 应为用法错误：code=%d err=%s", res.code, res.err)
+	}
+}
+
 func TestResultNotImplementedSurfaced(t *testing.T) {
 	var reqs int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

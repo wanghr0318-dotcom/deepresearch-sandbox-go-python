@@ -181,36 +181,73 @@ paths:
       - {$ref: '#/components/parameters/TaskID'}
     get:
       operationId: getTaskResult
-      summary: Download the pinned result of a task
-      description: Not implemented in this build (501); the pinned-output query arrives with the runner integration.
+      summary: The pinned result of a terminal task
+      description: |
+        The result recorded when the task ended, with its outputs pinned to `(artifact_id, version, sha256)`
+        (spec §5.6). The body is canonical JSON (sorted keys, no whitespace) and `ETag` is the quoted SHA-256
+        of the body; clients verify it.
       responses:
-        '200': {$ref: '#/components/responses/Blob'}
+        '200':
+          description: The pinned result
+          headers:
+            ETag:
+              description: The quoted SHA-256 of the body
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Result'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
-        '404': {$ref: '#/components/responses/NotFound'}
-        '501': {$ref: '#/components/responses/NotImplemented'}
+        '404':
+          description: '`task_not_found`; or `not_ready`: the task is terminal but recorded no result (failed, or cancelled before completing)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: '`task_not_terminal`: the task has not ended yet'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/artifacts/{artifact_id}:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+      - {$ref: '#/components/parameters/ArtifactID'}
+    get:
+      operationId: getArtifact
+      summary: Download an artifact version (the latest unless `version` is given)
+      parameters:
+        - name: version
+          in: query
+          description: The version to download; omit for the latest registered version.
+          schema: {type: integer, format: int64, minimum: 1}
+      responses:
+        '200': {$ref: '#/components/responses/Blob'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/ArtifactNotFound'}
+        '500': {$ref: '#/components/responses/BlobUnavailable'}
         '503': {$ref: '#/components/responses/Unavailable'}
   /tasks/{id}/artifacts/{artifact_id}/versions/{v}:
     parameters:
       - {$ref: '#/components/parameters/TaskID'}
-      - name: artifact_id
-        in: path
-        required: true
-        schema: {type: string}
+      - {$ref: '#/components/parameters/ArtifactID'}
       - name: v
         in: path
         required: true
-        schema: {type: integer, minimum: 1}
+        schema: {type: integer, format: int64, minimum: 1}
     get:
       operationId: getArtifactVersion
-      summary: Download one pinned artifact version
-      description: Not implemented in this build (501); the pinned-output query arrives with the runner integration.
+      summary: Download one pinned artifact version (same as `?version=v`)
       responses:
         '200': {$ref: '#/components/responses/Blob'}
+        '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
-        '404': {$ref: '#/components/responses/NotFound'}
-        '501': {$ref: '#/components/responses/NotImplemented'}
+        '404': {$ref: '#/components/responses/ArtifactNotFound'}
+        '500': {$ref: '#/components/responses/BlobUnavailable'}
         '503': {$ref: '#/components/responses/Unavailable'}
   /tasks/{id}/inspect:
     parameters:
@@ -241,6 +278,11 @@ components:
       in: path
       required: true
       schema: {type: string}
+    ArtifactID:
+      name: artifact_id
+      in: path
+      required: true
+      schema: {type: string}
   requestBodies:
     Control:
       required: true
@@ -254,14 +296,36 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/ControlResult'}
     Blob:
-      description: The pinned content
+      description: |
+        The artifact content, streamed from the blob store. Readable with read access; only blobs authorized
+        to the task (`scope_blobs`) are served. `Content-Type` is the media type registered with the
+        artifact. Active content (anything other than text/plain, text/markdown, application/json, image/png,
+        image/jpeg and application/pdf — notably text/html and image/svg+xml) is always sent with
+        `Content-Disposition: attachment`. The content is verified while it is sent; if it does not match the
+        registered SHA-256 the connection is aborted, so the response is never complete.
       headers:
         ETag:
-          description: The quoted SHA-256 of the content
+          description: The quoted SHA-256 of the content (as registered)
+          schema: {type: string}
+        X-Content-Type-Options:
+          description: Always `nosniff`
+          schema: {type: string}
+        Content-Disposition:
+          description: '`attachment; filename=...` for active content; absent for the inline-safe types'
           schema: {type: string}
       content:
-        application/octet-stream:
+        '*/*':
           schema: {type: string, format: binary}
+    ArtifactNotFound:
+      description: '`task_not_found`; or `artifact_not_found`: no such artifact or version in the task'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    BlobUnavailable:
+      description: '`internal`; or `blob_unavailable`: the registered content cannot be read from the blob store'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
     BadRequest:
       description: '`invalid_request`: malformed body, missing request_id or invalid parameter; `invalid_limits` (POST /tasks): limits that can never fit the configured capacity, or max_run_time_ms not a positive integer within the server cap (omitted max_run_time_ms is filled with the default and stored with the task)'
       content:
@@ -297,11 +361,6 @@ components:
           schema: {$ref: '#/components/schemas/Error'}
     Internal:
       description: '`internal`'
-      content:
-        application/json:
-          schema: {$ref: '#/components/schemas/Error'}
-    NotImplemented:
-      description: '`not_implemented`'
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
@@ -442,6 +501,22 @@ components:
         tries:
           type: array
           items: {$ref: '#/components/schemas/CallTry'}
+    PinnedOutput:
+      type: object
+      description: An output pinned when the result was processed; version and sha256 are absent if the artifact was never saved
+      required: [artifact_id]
+      properties:
+        artifact_id: {type: string}
+        version: {type: integer, format: int64}
+        sha256: {type: string}
+    Result:
+      type: object
+      required: [summary, outputs]
+      properties:
+        summary: {type: string}
+        outputs:
+          type: array
+          items: {$ref: '#/components/schemas/PinnedOutput'}
     Inspection:
       type: object
       required: [task, attempts, checkpoints, calls]

@@ -1952,6 +1952,72 @@ func TestLatestArtifact(t *testing.T) {
 	}
 }
 
+// TestPinnedOutputReads：TaskResult 返回状态与 result_json；PinnedArtifact 按版本选择（0 为最新），
+// 授权按 scope_blobs(task)——最新版本未授权时视为不存在，不回退到更早的版本。
+func TestPinnedOutputReads(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	if _, err := s.TaskResult(ctx, "missing"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("不存在的任务应为 ErrNotFound，得到 %v", err)
+	}
+	if r, err := s.TaskResult(ctx, "t1"); err != nil || task.IsTerminal(r.Status) || r.Result != nil {
+		t.Fatalf("运行中的任务没有结果：%+v %v", r, err)
+	}
+	shas := []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
+	for _, sha := range shas {
+		if _, err := s.RegisterArtifact(ctx, runner.Artifact{TaskID: "t1", AttemptID: "att-t1", ArtifactID: "report", SHA256: sha,
+			Size: 9, MediaType: "text/markdown", Visibility: "output"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []struct {
+		version int64
+		want    string
+	}{{0, shas[1]}, {1, shas[0]}, {2, shas[1]}, {3, ""}} {
+		v, found, err := s.PinnedArtifact(ctx, "t1", "report", c.version)
+		if err != nil || found != (c.want != "") || v.SHA256 != c.want {
+			t.Fatalf("version %d：%+v found=%v %v，期望 %q", c.version, v, found, err, c.want)
+		}
+		if found && (v.Size != 9 || v.MediaType != "text/markdown" || (c.version != 0 && v.Version != c.version)) {
+			t.Fatalf("version %d：%+v", c.version, v)
+		}
+	}
+	if _, found, err := s.PinnedArtifact(ctx, "t1", "missing", 0); err != nil || found {
+		t.Fatalf("不存在的产物：found=%v %v", found, err)
+	}
+	if _, _, err := s.PinnedArtifact(ctx, "missing", "report", 0); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("不存在的任务应为 ErrNotFound，得到 %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, "DELETE FROM scope_blobs WHERE scope_id = 't1' AND sha256 = $1", shas[1]); err != nil {
+		t.Fatal(err)
+	}
+	if v, found, err := s.PinnedArtifact(ctx, "t1", "report", 0); err != nil || found {
+		t.Fatalf("最新版本未授权时不应回退到更早的版本：%+v found=%v %v", v, found, err)
+	}
+	if _, found, err := s.PinnedArtifact(ctx, "t1", "report", 1); err != nil || !found {
+		t.Fatalf("已授权的第 1 版应可读：found=%v %v", found, err)
+	}
+
+	zero := int64(0)
+	if _, err := s.FinalizeAttempt(ctx, task.Verdict{AttemptID: "att-t1", TaskID: "t1", ControlVersion: 1, FromStatus: "starting",
+		AttemptStatus: "ended", OutcomeClass: "succeeded", ExitCode: &zero, TaskStatus: "succeeded",
+		Result:    json.RawMessage(`{"summary":"s","outputs":[{"artifact_id":"report","version":1,"sha256":"` + shas[0] + `"}]}`),
+		EventType: "attempt_ended", EventPayload: json.RawMessage(`{"exit":0}`)}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.TaskResult(ctx, "t1")
+	var got struct {
+		Outputs []struct {
+			ArtifactID string `json:"artifact_id"`
+			Version    int64  `json:"version"`
+		} `json:"outputs"`
+	}
+	if err != nil || r.Status != "succeeded" || json.Unmarshal(r.Result, &got) != nil || len(got.Outputs) != 1 || got.Outputs[0].Version != 1 {
+		t.Fatalf("终态任务的结果：%+v %v", r, err)
+	}
+}
+
 // TestAssignUIDRangeExhausted：池耗尽为 resource.ErrNoFreeUIDRange（暂时性），不是 ErrConflict。
 func TestAssignUIDRangeExhausted(t *testing.T) {
 	ctx := context.Background()

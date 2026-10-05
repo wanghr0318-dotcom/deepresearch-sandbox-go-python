@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jackc/pgx/v5"
 
@@ -80,6 +81,56 @@ func (s *Store) Inspect(ctx context.Context, taskID string) (api.Inspection, err
 		return err
 	})
 	return in, err
+}
+
+// TaskResult 读取任务状态与固定的结果 tasks.result_json（实现 api.Store；规格 §5.6）。
+func (s *Store) TaskResult(ctx context.Context, taskID string) (api.ResultView, error) {
+	var v api.ResultView
+	err := s.read(ctx, "TaskResult", func(ctx context.Context, q queryer) error {
+		var result []byte
+		err := q.QueryRow(ctx, "SELECT status, result_json FROM tasks WHERE task_id = $1", taskID).Scan(&v.Status, &result)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("任务 %s", taskID)
+		}
+		v.Result = result
+		return err
+	})
+	return v, err
+}
+
+// PinnedArtifact 读取任务中一个产物的版本（实现 api.Store）：version 为 0 时取最新版本。授权按
+// scope_blobs(task)：blob 未授权到该任务的版本视为不存在。
+func (s *Store) PinnedArtifact(ctx context.Context, taskID, artifactID string, version int64) (api.ArtifactView, bool, error) {
+	if version < 0 {
+		return api.ArtifactView{}, false, invalidf("PinnedArtifact 的 version 不能为负")
+	}
+	v := api.ArtifactView{ArtifactID: artifactID}
+	var found bool
+	err := s.read(ctx, "PinnedArtifact", func(ctx context.Context, q queryer) error {
+		var exists bool
+		if err := q.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM tasks WHERE task_id = $1)", taskID).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return notFoundf("任务 %s", taskID)
+		}
+		// 先选版本（最新或指定），再核对授权：最新版本未授权时不回退到更早的版本。
+		var authorized bool
+		err := q.QueryRow(ctx, `SELECT a.version, a.sha256, a.size, a.media_type,
+				EXISTS (SELECT 1 FROM scope_blobs sb WHERE sb.scope_kind = 'task' AND sb.scope_id = a.task_id AND sb.sha256 = a.sha256)
+			FROM artifacts a
+			WHERE a.task_id = $1 AND a.artifact_id = $2 AND ($3::bigint = 0 OR a.version = $3::bigint)
+			ORDER BY a.version DESC LIMIT 1`, taskID, artifactID, version).Scan(&v.Version, &v.SHA256, &v.Size, &v.MediaType, &authorized)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		found = err == nil && authorized
+		return err
+	})
+	if err != nil || !found {
+		return api.ArtifactView{}, false, err
+	}
+	return v, true, nil
 }
 
 // inspectCalls 读取任务的 Gateway 调用与每次 try 的审计元数据（§9.9；不含正文）。调用按登记时间排序，

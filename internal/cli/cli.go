@@ -177,13 +177,16 @@ func (c *cmd) task(sub string, args []string) error {
 		return usageError{"未知子命令 task " + sub}
 	}
 	fs, f := c.flags("task " + sub)
-	var reason, reqID, outPath *string
+	var reason, reqID, outPath, artifact *string
+	var version *int64
 	switch sub {
 	case "cancel", "pause", "resume":
 		reason = fs.String("reason", "", "原因")
 		reqID = fs.String("request-id", "", "request_id（缺省自动生成）")
 	case "result":
 		outPath = fs.String("out", "", "写入文件（缺省写标准输出）")
+		artifact = fs.String("artifact", "", "下载该产物（缺省下载任务结果）")
+		version = fs.Int64("version", 0, "与 --artifact 一起使用：产物版本（缺省最新版本）")
 	}
 	// 任务 ID 可在标志前或后。
 	var id string
@@ -201,6 +204,9 @@ func (c *cmd) task(sub string, args []string) error {
 	if id == "" {
 		return usageError{"缺少任务 ID"}
 	}
+	if sub == "result" && (*version < 0 || (*version != 0 && *artifact == "")) {
+		return usageError{"--version 须为正整数且与 --artifact 一起使用"}
+	}
 	if err := c.setup(f); err != nil {
 		return err
 	}
@@ -211,7 +217,14 @@ func (c *cmd) task(sub string, args []string) error {
 	case "inspect":
 		return c.getJSON(base + "/inspect")
 	case "result":
-		return c.result(base+"/result", *outPath)
+		if *artifact == "" {
+			return c.result(base+"/result", *outPath)
+		}
+		p := base + "/artifacts/" + url.PathEscape(*artifact)
+		if *version > 0 {
+			p += "?version=" + strconv.FormatInt(*version, 10)
+		}
+		return c.result(p, *outPath)
 	}
 	rid := *reqID
 	if rid == "" {
@@ -417,7 +430,8 @@ func (c *cmd) printJSON(b []byte) error {
 
 // ---- result ----
 
-// result 下载固定结果并校验 sha256：与 ETag 声明的哈希比对，不符则报错且不输出内容。
+// result 下载固定结果或产物版本并校验 sha256：与 ETag 声明的哈希比对，不符则报错且不输出内容。
+// 服务端在发送时发现 blob 与登记不符会中止连接，此时以传输错误失败（重试后仍失败），同样不输出内容。
 func (c *cmd) result(path, outPath string) error {
 	body, hdr, err := c.doRetry(http.MethodGet, path, nil)
 	if err != nil {

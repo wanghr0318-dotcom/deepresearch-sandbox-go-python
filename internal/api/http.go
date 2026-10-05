@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -51,6 +52,8 @@ const (
 // Config 是 HTTP 处理器的装配参数。
 type Config struct {
 	Store Store
+	// Blobs 是产物下载读取内容的 BlobStore（必填）。
+	Blobs Blobs
 	// Mode 返回当前运行模式；nil 视为 normal。
 	Mode func() Mode
 	// ListenAddr 是服务绑定的地址。非 loopback 地址必须配置 Token（规格 §15.3）。
@@ -108,7 +111,8 @@ const (
 var (
 	readStatuses    = []int{200, 401, 403, 404, 500, 503}
 	controlStatuses = []int{200, 400, 401, 403, 404, 409, 500, 503}
-	pinnedStatuses  = []int{200, 401, 403, 404, 501, 503}
+	resultStatuses  = []int{200, 401, 403, 404, 409, 500, 503}
+	blobStatuses    = []int{200, 400, 401, 403, 404, 500, 503}
 )
 
 // routes 是已实现操作的唯一列表；测试据此与 openapi.yaml 比对。
@@ -121,8 +125,9 @@ var routes = []route{
 	{"POST", "/tasks/{id}/pause", accessWrite, controlStatuses, control("pause")},
 	{"POST", "/tasks/{id}/resume", accessWrite, controlStatuses, control("run")},
 	{"GET", "/tasks/{id}/events", accessRead, []int{200, 400, 401, 403, 404, 500, 503}, (*Handler).streamEvents},
-	{"GET", "/tasks/{id}/result", accessRead, pinnedStatuses, (*Handler).pinnedOutput},
-	{"GET", "/tasks/{id}/artifacts/{artifact_id}/versions/{v}", accessRead, pinnedStatuses, (*Handler).pinnedOutput},
+	{"GET", "/tasks/{id}/result", accessRead, resultStatuses, (*Handler).getResult},
+	{"GET", "/tasks/{id}/artifacts/{artifact_id}", accessRead, blobStatuses, (*Handler).getArtifact},
+	{"GET", "/tasks/{id}/artifacts/{artifact_id}/versions/{v}", accessRead, blobStatuses, (*Handler).getArtifact},
 	{"GET", "/tasks/{id}/inspect", accessDiagnostic, readStatuses, (*Handler).inspect},
 }
 
@@ -130,6 +135,9 @@ var routes = []route{
 func New(cfg Config) (*Handler, error) {
 	if cfg.Store == nil {
 		return nil, errors.New("api: 缺少 Store")
+	}
+	if cfg.Blobs == nil {
+		return nil, errors.New("api: 缺少 Blobs")
 	}
 	host, port, err := net.SplitHostPort(cfg.ListenAddr)
 	if err != nil {
@@ -601,10 +609,126 @@ func control(desired string) func(h *Handler, w http.ResponseWriter, r *http.Req
 	}
 }
 
-// pinnedOutput 是结果与产物版本下载。下载需要 BlobStore 与按任务查询固定输出（pinned output）
-// 的 Store 用例；该查询随 runner 集成加入，在此之前本端点返回 501。
-func (h *Handler) pinnedOutput(w http.ResponseWriter, r *http.Request) {
-	writeError(w, http.StatusNotImplemented, "not_implemented", "固定输出的下载随 runner 集成提供")
+// ---- 固定输出下载（规格 §5.6、§15.1） ----
+
+// isTerminal 报告任务状态是否为终态（与 internal/task.IsTerminal 一致）。
+func isTerminal(status string) bool {
+	return status == "succeeded" || status == "failed" || status == "cancelled"
+}
+
+// inlineSafeTypes 是可以内联显示的媒体类型；其余类型（含 text/html、image/svg+xml 等主动内容）
+// 一律以 attachment 下载（规格 §15.4）。
+var inlineSafeTypes = map[string]bool{
+	"text/plain": true, "text/markdown": true, "application/json": true,
+	"image/png": true, "image/jpeg": true, "application/pdf": true,
+}
+
+// getResult 返回终态任务的固定结果（含固定的输出 (artifact_id, version, sha256)）。正文为结果的规范 JSON，
+// ETag 为其带引号的 sha256。任务未终态为 409 task_not_terminal；终态但没有结果为 404 not_ready。
+func (h *Handler) getResult(w http.ResponseWriter, r *http.Request) {
+	v, err := h.cfg.Store.TaskResult(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if !isTerminal(v.Status) {
+		writeError(w, http.StatusConflict, "task_not_terminal", "任务尚未终态，没有固定结果")
+		return
+	}
+	if len(bytes.TrimSpace(v.Result)) == 0 || string(bytes.TrimSpace(v.Result)) == "null" {
+		writeError(w, http.StatusNotFound, "not_ready", "任务已终态但没有结果")
+		return
+	}
+	body, err := jcs.Canonical(v.Result)
+	if err != nil {
+		h.logError("结果无法规范化", err)
+		writeError(w, http.StatusInternalServerError, "internal", "内部错误")
+		return
+	}
+	sum := sha256.Sum256(body)
+	hdr := w.Header()
+	hdr.Set("Content-Type", "application/json")
+	hdr.Set("Cache-Control", "no-store")
+	hdr.Set("X-Content-Type-Options", "nosniff")
+	hdr.Set("ETag", `"`+hex.EncodeToString(sum[:])+`"`)
+	hdr.Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(body); err != nil {
+		h.logError("写结果", err)
+	}
+}
+
+// getArtifact 下载任务中一个产物的版本：`/artifacts/{artifact_id}` 默认最新版本，`?version=N` 指定；
+// `/artifacts/{artifact_id}/versions/{v}` 是指定版本的固定路径。只返回授权到 scope_blobs(task) 的 blob。
+// 正文从 BlobStore 流式读取，ETag 为登记的 sha256，Content-Type 为登记的媒体类型；主动内容强制 attachment。
+//
+// 正文边发送边校验：读到的字节与登记的 sha256 或大小不符（blob 被篡改或损坏）时中止连接，使客户端
+// 得到不完整的响应而不是一份看似完整的错误内容。为此不设置 Content-Length（分块传输在中止时必然不完整）。
+func (h *Handler) getArtifact(w http.ResponseWriter, r *http.Request) {
+	raw := r.PathValue("v")
+	if raw == "" {
+		raw = r.URL.Query().Get("version")
+	}
+	var version int64
+	if raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "invalid_request", "version 须为正整数")
+			return
+		}
+		version = n
+	}
+	a, found, err := h.cfg.Store.PinnedArtifact(r.Context(), r.PathValue("id"), r.PathValue("artifact_id"), version)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "artifact_not_found", "产物或版本不存在")
+		return
+	}
+	rc, err := h.cfg.Blobs.Open(a.SHA256)
+	if err != nil {
+		h.logError("打开产物 blob", err, "sha256", a.SHA256)
+		writeError(w, http.StatusInternalServerError, "blob_unavailable", "产物内容不可读")
+		return
+	}
+	defer func() { _ = rc.Close() }() // 只读，关闭错误不影响已发送的内容
+
+	hdr := w.Header()
+	mediaType, inline := "application/octet-stream", false
+	if mt, params, err := mime.ParseMediaType(a.MediaType); err == nil {
+		if s := mime.FormatMediaType(mt, params); s != "" {
+			mediaType, inline = s, inlineSafeTypes[mt]
+		}
+	}
+	hdr.Set("Content-Type", mediaType)
+	hdr.Set("X-Content-Type-Options", "nosniff")
+	hdr.Set("Cache-Control", "no-store")
+	hdr.Set("ETag", `"`+a.SHA256+`"`)
+	if !inline {
+		disp := mime.FormatMediaType("attachment", map[string]string{"filename": a.ArtifactID})
+		if disp == "" {
+			disp = "attachment"
+		}
+		hdr.Set("Content-Disposition", disp)
+	}
+	w.WriteHeader(http.StatusOK)
+	hash := sha256.New()
+	n, err := io.Copy(io.MultiWriter(w, hash), rc)
+	if err == nil && (n != a.Size || hex.EncodeToString(hash.Sum(nil)) != a.SHA256) {
+		err = fmt.Errorf("内容与登记不符：%d 字节，登记 %d 字节、sha256 %s", n, a.Size, a.SHA256)
+	}
+	if err != nil {
+		h.logError("发送产物", err, "sha256", a.SHA256)
+		panic(http.ErrAbortHandler) // 中止连接：客户端不会把不完整或被篡改的内容当作完整响应
+	}
+}
+
+func (h *Handler) logError(msg string, err error, attrs ...any) {
+	if h.cfg.Logger != nil {
+		h.cfg.Logger.Error("api: "+msg, append([]any{"error", err.Error()}, attrs...)...)
+	}
 }
 
 type attemptJSON struct {

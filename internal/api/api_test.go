@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,11 +42,80 @@ type fakeStore struct {
 	// commitThenUnknown 为真时先提交再返回 ErrCommitUnknown。
 	failWith          error
 	commitThenUnknown bool
+	results           map[string]json.RawMessage // task_id → result_json
+	artifacts         map[string][]ArtifactView  // task_id/artifact_id → 按版本升序
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{tasks: map[string]*TaskView{}, events: map[string][]Event{},
-		requests: map[string]RequestRecord{}, inspect: map[string]Inspection{}, limits: map[string]string{}}
+		requests: map[string]RequestRecord{}, inspect: map[string]Inspection{}, limits: map[string]string{},
+		results: map[string]json.RawMessage{}, artifacts: map[string][]ArtifactView{}}
+}
+
+func (f *fakeStore) TaskResult(_ context.Context, taskID string) (ResultView, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, ok := f.tasks[taskID]
+	if !ok {
+		return ResultView{}, persistence.ErrNotFound
+	}
+	return ResultView{Status: t.Status, Result: f.results[taskID]}, nil
+}
+
+func (f *fakeStore) PinnedArtifact(_ context.Context, taskID, artifactID string, version int64) (ArtifactView, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.tasks[taskID]; !ok {
+		return ArtifactView{}, false, persistence.ErrNotFound
+	}
+	vs := f.artifacts[taskID+"/"+artifactID]
+	if len(vs) == 0 {
+		return ArtifactView{}, false, nil
+	}
+	if version == 0 {
+		return vs[len(vs)-1], true, nil
+	}
+	for _, v := range vs {
+		if v.Version == version {
+			return v, true, nil
+		}
+	}
+	return ArtifactView{}, false, nil
+}
+
+// addArtifact 登记产物的下一个版本，并把内容写入 blobs；返回登记的 sha256。
+func (f *fakeStore) addArtifact(blobs *fakeBlobs, taskID, artifactID, mediaType string, content []byte) string {
+	sum := sha256.Sum256(content)
+	sha := hex.EncodeToString(sum[:])
+	blobs.put(sha, content)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := taskID + "/" + artifactID
+	f.artifacts[k] = append(f.artifacts[k], ArtifactView{ArtifactID: artifactID, Version: int64(len(f.artifacts[k]) + 1),
+		SHA256: sha, Size: int64(len(content)), MediaType: mediaType})
+	return sha
+}
+
+// fakeBlobs 是内存 BlobStore；put 可以写入与 sha256 不符的内容以模拟篡改。
+type fakeBlobs struct {
+	mu sync.Mutex
+	m  map[string][]byte
+}
+
+func (b *fakeBlobs) put(sha string, content []byte) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.m[sha] = content
+}
+
+func (b *fakeBlobs) Open(sha string) (io.ReadCloser, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	c, ok := b.m[sha]
+	if !ok {
+		return nil, errors.New("blob 不存在")
+	}
+	return io.NopCloser(bytes.NewReader(c)), nil
 }
 
 func (f *fakeStore) limitsOf(t *testing.T, requestID string) string {
@@ -232,6 +303,7 @@ type testServer struct {
 	h     *Handler
 	srv   *httptest.Server
 	store *fakeStore
+	blobs *fakeBlobs
 	mode  Mode
 	mu    sync.Mutex
 	logs  bytes.Buffer
@@ -240,10 +312,11 @@ type testServer struct {
 // newTestServer 启动绑定 127.0.0.1 的服务；mutate 可修改配置（ListenAddr 已填为实际地址）。
 func newTestServer(t *testing.T, mutate func(*Config)) *testServer {
 	t.Helper()
-	ts := &testServer{t: t, store: newFakeStore(), mode: ModeNormal}
+	ts := &testServer{t: t, store: newFakeStore(), blobs: &fakeBlobs{m: map[string][]byte{}}, mode: ModeNormal}
 	srv := httptest.NewUnstartedServer(nil)
 	cfg := Config{
 		Store:        ts.store,
+		Blobs:        ts.blobs,
 		Mode:         func() Mode { ts.mu.Lock(); defer ts.mu.Unlock(); return ts.mode },
 		ListenAddr:   srv.Listener.Addr().String(),
 		Logger:       slog.New(slog.NewJSONHandler(&lockedWriter{mu: &ts.mu, w: &ts.logs}, nil)),
@@ -406,8 +479,8 @@ func TestHandlersMatchOpenAPI(t *testing.T) {
 			t.Errorf("处理器实现了 %s，openapi.yaml 未声明", k)
 		}
 	}
-	if len(spec) != 11 {
-		t.Errorf("openapi.yaml 解析出 %d 个操作，期望 11（M1 范围）", len(spec))
+	if len(spec) != 12 {
+		t.Errorf("openapi.yaml 解析出 %d 个操作，期望 12（M1 范围加产物最新版本下载）", len(spec))
 	}
 	for k := range spec {
 		if strings.Contains(k, "/sessions") {
@@ -634,11 +707,120 @@ func TestInspect(t *testing.T) {
 	expect(t, st, b, 404, "task_not_found")
 }
 
-func TestPinnedOutputNotImplemented(t *testing.T) {
+// ---- 固定输出下载 ----
+
+// TestTaskResult：终态且有结果时返回规范 JSON，ETag 为正文的 sha256；未终态 409、无结果 404、不存在 404。
+func TestTaskResult(t *testing.T) {
 	ts := newTestServer(t, nil)
-	for _, p := range []string{"/tasks/t1/result", "/tasks/t1/artifacts/a1/versions/1"} {
-		st, b, _ := ts.do("GET", p, "", nil)
-		expect(t, st, b, 501, "not_implemented")
+	st, b, _ := ts.do("GET", "/tasks/nope/result", "", nil)
+	expect(t, st, b, 404, "task_not_found")
+
+	ts.store.addTask("run", "running", "run")
+	st, b, _ = ts.do("GET", "/tasks/run/result", "", nil)
+	expect(t, st, b, 409, "task_not_terminal")
+
+	ts.store.addTask("bad", "failed", "run")
+	st, b, _ = ts.do("GET", "/tasks/bad/result", "", nil)
+	expect(t, st, b, 404, "not_ready")
+
+	ts.store.addTask("ok", "succeeded", "run")
+	sha := strings.Repeat("ab", 32)
+	ts.store.results["ok"] = json.RawMessage(`{"summary": "done", "outputs": [{"version": 2, "sha256": "` + sha + `", "artifact_id": "report"}]}`)
+	st, b, hdr := ts.do("GET", "/tasks/ok/result", "", nil)
+	expect(t, st, b, 200, "")
+	want := `{"outputs":[{"artifact_id":"report","sha256":"` + sha + `","version":2}],"summary":"done"}`
+	if string(b) != want {
+		t.Fatalf("结果应为规范 JSON：%s", b)
+	}
+	sum := sha256.Sum256(b)
+	if hdr.Get("ETag") != `"`+hex.EncodeToString(sum[:])+`"` || hdr.Get("Content-Type") != "application/json" {
+		t.Fatalf("ETag 应为正文的带引号 sha256：%v", hdr)
+	}
+}
+
+// TestArtifactDownload：默认最新版本、?version=N 与 /versions/{v} 选版本；ETag 与内容 sha256 一致；
+// 主动内容（HTML、SVG、无法解析的类型）一律 attachment，全部带 nosniff。
+func TestArtifactDownload(t *testing.T) {
+	ts := newTestServer(t, nil)
+	ts.store.addTask("t1", "running", "run")
+	v1 := ts.store.addArtifact(ts.blobs, "t1", "report", "text/markdown", []byte("# v1"))
+	v2 := ts.store.addArtifact(ts.blobs, "t1", "report", "text/markdown", []byte("# v2"))
+	for _, c := range []struct{ path, body, sha string }{
+		{"/tasks/t1/artifacts/report", "# v2", v2},
+		{"/tasks/t1/artifacts/report?version=1", "# v1", v1},
+		{"/tasks/t1/artifacts/report?version=2", "# v2", v2},
+		{"/tasks/t1/artifacts/report/versions/1", "# v1", v1},
+	} {
+		st, b, hdr := ts.do("GET", c.path, "", nil)
+		expect(t, st, b, 200, "")
+		sum := sha256.Sum256(b)
+		if string(b) != c.body || hdr.Get("ETag") != `"`+c.sha+`"` || hex.EncodeToString(sum[:]) != c.sha {
+			t.Fatalf("%s：内容 %q ETag %s", c.path, b, hdr.Get("ETag"))
+		}
+		if hdr.Get("Content-Type") != "text/markdown" || hdr.Get("X-Content-Type-Options") != "nosniff" ||
+			hdr.Get("Content-Disposition") != "" {
+			t.Fatalf("%s：安全类型应内联并带 nosniff：%v", c.path, hdr)
+		}
+	}
+	for _, c := range []struct {
+		path   string
+		status int
+		code   string
+	}{
+		{"/tasks/t1/artifacts/report?version=3", 404, "artifact_not_found"},
+		{"/tasks/t1/artifacts/report/versions/9", 404, "artifact_not_found"},
+		{"/tasks/t1/artifacts/missing", 404, "artifact_not_found"},
+		{"/tasks/nope/artifacts/report", 404, "task_not_found"},
+		{"/tasks/t1/artifacts/report?version=0", 400, "invalid_request"},
+		{"/tasks/t1/artifacts/report?version=x", 400, "invalid_request"},
+		{"/tasks/t1/artifacts/report/versions/-1", 400, "invalid_request"},
+	} {
+		st, b, _ := ts.do("GET", c.path, "", nil)
+		expect(t, st, b, c.status, c.code)
+	}
+
+	for _, c := range []struct{ id, media, wantType string }{
+		{"page.html", "text/html; charset=utf-8", "text/html; charset=utf-8"},
+		{"pic.svg", "image/svg+xml", "image/svg+xml"},
+		{"odd", "not a media type", "application/octet-stream"},
+	} {
+		ts.store.addArtifact(ts.blobs, "t1", c.id, c.media, []byte("<script>alert(1)</script>"))
+		st, b, hdr := ts.do("GET", "/tasks/t1/artifacts/"+c.id, "", nil)
+		expect(t, st, b, 200, "")
+		if disp := hdr.Get("Content-Disposition"); hdr.Get("Content-Type") != c.wantType || hdr.Get("X-Content-Type-Options") != "nosniff" ||
+			(disp != "attachment; filename="+c.id && disp != `attachment; filename="`+c.id+`"`) {
+			t.Fatalf("%s（%s）应以 attachment 下载：%v", c.id, c.media, hdr)
+		}
+	}
+
+	sha := ts.store.addArtifact(ts.blobs, "t1", "lost", "text/plain", []byte("x"))
+	ts.blobs.mu.Lock()
+	delete(ts.blobs.m, sha)
+	ts.blobs.mu.Unlock()
+	st, b, _ := ts.do("GET", "/tasks/t1/artifacts/lost", "", nil)
+	expect(t, st, b, 500, "blob_unavailable")
+}
+
+// TestArtifactTamperedAborts：BlobStore 中的内容与登记的 sha256 不符（篡改或损坏）时中止连接，客户端
+// 读不到完整响应——小内容（仍在缓冲内）与大内容（已分块发送一部分）都一样。
+func TestArtifactTamperedAborts(t *testing.T) {
+	ts := newTestServer(t, nil)
+	ts.store.addTask("t1", "running", "run")
+	for _, size := range []int{16, 256 << 10} {
+		id := fmt.Sprintf("a%d", size)
+		sha := ts.store.addArtifact(ts.blobs, "t1", id, "text/plain", bytes.Repeat([]byte("a"), size))
+		ts.blobs.put(sha, bytes.Repeat([]byte("b"), size)) // 同样大小、不同内容
+		resp, err := ts.srv.Client().Get(ts.srv.URL + "/tasks/t1/artifacts/" + id)
+		if err != nil {
+			continue // 响应头发出之前就中止
+		}
+		b, err := io.ReadAll(resp.Body)
+		if cerr := resp.Body.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+		if err == nil {
+			t.Fatalf("%d 字节：篡改的内容被完整发送（%d 字节，状态 %d）", size, len(b), resp.StatusCode)
+		}
 	}
 }
 
@@ -823,16 +1005,16 @@ func TestSSEHeartbeat(t *testing.T) {
 // ---- 访问控制 ----
 
 func TestNonLoopbackRequiresTokenAndHostAllowlist(t *testing.T) {
-	if _, err := New(Config{Store: newFakeStore(), ListenAddr: "0.0.0.0:8080", AllowedHosts: []string{"box:8080"}}); err == nil {
+	if _, err := New(Config{Store: newFakeStore(), Blobs: &fakeBlobs{}, ListenAddr: "0.0.0.0:8080", AllowedHosts: []string{"box:8080"}}); err == nil {
 		t.Fatal("非 loopback 无 token 应拒绝启动")
 	}
-	if _, err := New(Config{Store: newFakeStore(), ListenAddr: ":8080", Token: "x", AllowedHosts: []string{"box:8080"}}); err != nil {
+	if _, err := New(Config{Store: newFakeStore(), Blobs: &fakeBlobs{}, ListenAddr: ":8080", Token: "x", AllowedHosts: []string{"box:8080"}}); err != nil {
 		t.Fatalf("配置 token 后应可启动: %v", err)
 	}
-	if _, err := New(Config{Store: newFakeStore(), ListenAddr: "10.0.0.1:8080", Token: "x"}); err == nil {
+	if _, err := New(Config{Store: newFakeStore(), Blobs: &fakeBlobs{}, ListenAddr: "10.0.0.1:8080", Token: "x"}); err == nil {
 		t.Fatal("非 loopback 无 Host 允许列表应拒绝启动")
 	}
-	if _, err := New(Config{Store: newFakeStore(), ListenAddr: "127.0.0.1:8080", AllowedOrigins: []string{"*"}}); err == nil {
+	if _, err := New(Config{Store: newFakeStore(), Blobs: &fakeBlobs{}, ListenAddr: "127.0.0.1:8080", AllowedOrigins: []string{"*"}}); err == nil {
 		t.Fatal("通配 Origin 应拒绝")
 	}
 }

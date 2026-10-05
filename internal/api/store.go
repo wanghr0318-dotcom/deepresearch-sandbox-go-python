@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"time"
 )
 
@@ -27,6 +28,33 @@ type Store interface {
 	// Inspect 读取任务的诊断时间线：attempt 与 outcome、退出与 OOM、环境与清理、checkpoint（规格 §14.6），
 	// 以及 Gateway 调用与每次 try 的审计元数据（§9.9、G11：task_id → attempt_id → call_id → try_no）。
 	Inspect(ctx context.Context, taskID string) (Inspection, error)
+	// TaskResult 读取任务状态与固定的结果（tasks.result_json；规格 §5.6：输出固定为
+	// (artifact_id, version, sha256)）。任务不存在为 persistence.ErrNotFound；没有结果时 Result 为 nil。
+	TaskResult(ctx context.Context, taskID string) (ResultView, error)
+	// PinnedArtifact 读取任务中一个产物的指定版本（version 为 0 时取最新版本）。只返回 blob 已授权到
+	// scope_blobs(task) 的版本。任务不存在为 persistence.ErrNotFound；产物或版本不存在（或未授权）时 found 为 false。
+	PinnedArtifact(ctx context.Context, taskID, artifactID string, version int64) (ArtifactView, bool, error)
+}
+
+// Blobs 是 API 读取内容寻址存储的窄接口（blob.Store 满足）。
+type Blobs interface {
+	// Open 打开 blob 以读取。
+	Open(sha256 string) (io.ReadCloser, error)
+}
+
+// ResultView 是 TaskResult 的结果。
+type ResultView struct {
+	Status string
+	Result json.RawMessage
+}
+
+// ArtifactView 是一个已登记的产物版本：内容为 BlobStore 中的 SHA256，MediaType 为登记时的媒体类型。
+type ArtifactView struct {
+	ArtifactID string
+	Version    int64
+	SHA256     string
+	Size       int64
+	MediaType  string
 }
 
 // Inspection 是 Inspect 的结果。

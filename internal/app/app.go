@@ -419,6 +419,7 @@ type server struct {
 	taskDeps  task.Deps
 	calls     *call.Coordinator // Gateway 的记账与 journal 所有者
 	edge      *edge.Edge        // Gateway 的每 attempt 入口（task.Access）
+	blobs     blob.Store        // runner、Gateway 与 API 产物下载共用的 BlobStore
 
 	mode    atomic.Value // api.Mode
 	sched   atomic.Pointer[task.Scheduler]
@@ -520,6 +521,7 @@ func (s *server) assemble() error {
 	if err != nil {
 		return fmt.Errorf("app: BlobStore: %w", err)
 	}
+	s.blobs = blobs
 	s.adm = admission.New(s.cfg.Capacity)
 	s.coord = resource.NewCoordinator(s.store, prov, resource.Options{InstallID: s.installID,
 		UIDBase: s.cfg.UIDBase, UIDCount: s.cfg.UIDCount, Backoff: s.cfg.RetryBackoff})
@@ -943,7 +945,7 @@ func (s *server) startAPI() error {
 		return fmt.Errorf("app: API 监听 %s: %w", s.cfg.Listen, err)
 	}
 	h, err := api.New(api.Config{
-		Store: notifyingStore{Store: s.store, s: s}, Mode: s.currentMode, ListenAddr: ln.Addr().String(),
+		Store: notifyingStore{Store: s.store, s: s}, Blobs: s.blobs, Mode: s.currentMode, ListenAddr: ln.Addr().String(),
 		Token: s.cfg.APIToken, AllowedHosts: s.cfg.AllowedHosts, AllowedOrigins: s.cfg.AllowedOrigins,
 		Logger: s.log, ConfigVersion: s.cfg.ConfigVersion, MaxFaultRetries: s.cfg.MaxFaultRetries,
 		EffectiveLimits: s.cfg.effectiveLimits,

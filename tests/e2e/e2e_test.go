@@ -1025,6 +1025,42 @@ func (h *harness) pinnedResult(taskID, attemptID string) (summary string, output
 	return r.Summary, r.Outputs, content
 }
 
+// assertPinnedDownloads 经 API 下载结果与每个固定版本的产物（规格 §15.1）：ETag 为内容的带引号 sha256，
+// 结果中的固定输出与终态提议一致，产物内容与 BlobStore 中的一致。
+func (h *harness) assertPinnedDownloads(taskID string, outs []pinnedRef, content map[string]string) {
+	h.t.Helper()
+	get := func(path string) ([]byte, string) {
+		resp, err := http.Get(h.base + path)
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			h.t.Fatalf("GET %s = %d %s %v", path, resp.StatusCode, b, err)
+		}
+		s := sha256.Sum256(b)
+		sum := hex.EncodeToString(s[:])
+		if etag := resp.Header.Get("ETag"); etag != `"`+sum+`"` {
+			h.t.Fatalf("GET %s：ETag %s 与内容的 sha256 %s 不符", path, etag, sum)
+		}
+		return b, sum
+	}
+	b, _ := get("/tasks/" + taskID + "/result")
+	var r struct {
+		Outputs []pinnedRef `json:"outputs"`
+	}
+	if err := json.Unmarshal(b, &r); err != nil || !slices.Equal(r.Outputs, outs) {
+		h.t.Fatalf("GET /result 的固定输出 %s，期望 %+v", b, outs)
+	}
+	for _, o := range outs {
+		b, sha := get(fmt.Sprintf("/tasks/%s/artifacts/%s?version=%d", taskID, url.PathEscape(o.ArtifactID), o.Version))
+		if sha != o.SHA256 || string(b) != content[o.ArtifactID] {
+			h.t.Fatalf("产物 %+v 下载为 %q（sha256 %s）", o, b, sha)
+		}
+	}
+}
+
 func attemptByNo(in api.Inspection, n int64) api.AttemptView {
 	for _, a := range in.Attempts {
 		if a.AttemptNo == n {
@@ -1348,14 +1384,12 @@ func testFirstSlice(t *testing.T, h *harness) {
 	if got := h.rec(id).workerTypes(2); slices.Contains(got, "checkpoint") || countType2(got, "artifact") != 1 {
 		t.Fatalf("attempt 2 重做了 checkpoint 之前的步骤：%q", got)
 	}
-	// 产物按固定版本可读（下载端点在 M1 为 501：经 Store 与 BlobStore 读取并校验哈希）。
+	// 产物按固定版本可读：经 Store 与 BlobStore 读取并校验哈希，再经 API 下载结果与固定版本。
 	summary, outs, content := h.pinnedResult(id, a2.AttemptID)
 	if summary != "report ready" || len(outs) != 2 || content["notes"] != "draft notes" || content["report"] != "# final report" {
 		t.Fatalf("result %q %+v %q", summary, outs, content)
 	}
-	if st, _, _ := httpDo("GET", h.base+"/tasks/"+id+"/result", ""); st != http.StatusNotImplemented {
-		t.Fatalf("GET /result = %d（M1 期望 501；实现后应改为经 API 读取）", st)
-	}
+	h.assertPinnedDownloads(id, outs, content)
 	// 环境停止并清理。
 	h.assertNoLeak()
 	in = h.inspect(id)
