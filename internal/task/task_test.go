@@ -264,10 +264,10 @@ var matrix = map[string]map[string]cell{
 	"running/handshaking": liveRow("running", "handshaking", map[string]cell{
 		"ControlChanged": c("cancelling", "handshaking", "ApplyControl,RevokeAccess,StopEnvironment"),
 		"WorkerStarted":  c("running", "active", "")}),
-	"running/active": liveRow("running", "active", map[string]cell{
-		"ControlChanged": c("cancelling", "active", "ApplyControl,SendControl")}),
+	"running/active": liveRow("running", "active", map[string]cell{ // 取消生效时立即撤销访问（§9.1）
+		"ControlChanged": c("cancelling", "active", "ApplyControl,RevokeAccessNow,SendControl")}),
 	"pausing/active": liveRow("pausing", "active", map[string]cell{
-		"ControlChanged": c("cancelling", "active", "ApplyControl,SendControl")}), // cancel 优先于 pause
+		"ControlChanged": c("cancelling", "active", "ApplyControl,RevokeAccessNow,SendControl")}), // cancel 优先于 pause
 	"cancelling/active": liveRow("cancelling", "active", map[string]cell{
 		"ControlChanged": c("cancelling", "active", "ApplyControl")}),
 	"running/finishing": liveRow("running", "finishing", map[string]cell{
@@ -519,12 +519,58 @@ func TestActiveControlUsesGrace(t *testing.T) {
 	}
 	s.ControlGraceMs = 2500
 	d = mustDecide(t, s, ControlChanged{Desired: "cancel", ControlVersion: 2})
-	if sc := d.Effects[1].(SendControl); sc.Kind != "cancel" || sc.GraceMs != 2500 {
+	if sc := d.Effects[2].(SendControl); sc.Kind != "cancel" || sc.GraceMs != 2500 {
 		t.Fatalf("SendControl %+v", sc)
 	}
 	// 重复或更旧的控制读取被忽略。
 	if d := mustDecide(t, d.Next, ControlChanged{Desired: "pause", ControlVersion: 2}); len(d.Effects) != 0 || d.Next.Desired != "cancel" {
 		t.Fatalf("旧控制被应用: %s", kinds(d.Effects))
+	}
+}
+
+// revokes 返回副作用中的撤销（now 为立即撤销，stop 为停止时撤销）及其原因。
+func revokes(effects []Effect) []string {
+	var out []string
+	for _, e := range effects {
+		switch e := e.(type) {
+		case RevokeAccessNow:
+			out = append(out, "now:"+e.AttemptID+":"+e.Reason)
+		case RevokeAccess:
+			out = append(out, "stop:"+e.AttemptID+":"+e.Reason)
+		}
+	}
+	return out
+}
+
+// 取消生效时立即撤销访问（§9.1），不等协议 cancel 的 grace；停止时至多再撤销一次（幂等），两次原因都是
+// cancel。重复的 cancel 不再立即撤销。暂停不撤销；暂停后再取消同样立即撤销。
+func TestCancelRevokesImmediately(t *testing.T) {
+	s := base()
+	s.TaskStatus, s.Attempt, s.SlotHeld = "running", att("a1", "active"), true
+	d := mustDecide(t, s, ControlChanged{Desired: "cancel", ControlVersion: 2})
+	if got := revokes(d.Effects); !reflect.DeepEqual(got, []string{"now:a1:" + RevokeReasonCancel}) || !has[SendControl](d.Effects) {
+		t.Fatalf("cancel 生效：%s %v", kinds(d.Effects), got)
+	}
+	again := mustDecide(t, d.Next, ControlChanged{Desired: "cancel", ControlVersion: 3})
+	if got := revokes(again.Effects); len(got) != 0 {
+		t.Fatalf("重复的 cancel 不应再撤销：%v", got)
+	}
+	_, fx := run(t, again.Next, AttemptFinished{AttemptID: "a1", EnvID: "env-a1", Outcome: Outcome{Class: ClassCancelled}})
+	if got := revokes(fx); !reflect.DeepEqual(got, []string{"stop:a1:" + RevokeReasonCancel}) {
+		t.Fatalf("停止时的撤销 = %v，期望一次、原因 cancel", got)
+	}
+
+	p := mustDecide(t, s, ControlChanged{Desired: "pause", ControlVersion: 2})
+	if got := revokes(p.Effects); len(got) != 0 {
+		t.Fatalf("pause 不应撤销访问：%v", got)
+	}
+	_, fx = run(t, p.Next, AttemptFinished{AttemptID: "a1", EnvID: "env-a1", Outcome: Outcome{Class: ClassPaused, ProposalKind: "paused"}})
+	if got := revokes(fx); !reflect.DeepEqual(got, []string{"stop:a1:attempt_stopping"}) {
+		t.Fatalf("暂停结束时的撤销 = %v", got)
+	}
+	c := mustDecide(t, p.Next, ControlChanged{Desired: "cancel", ControlVersion: 3})
+	if got := revokes(c.Effects); !reflect.DeepEqual(got, []string{"now:a1:" + RevokeReasonCancel}) {
+		t.Fatalf("暂停中取消：%s %v", kinds(c.Effects), got)
 	}
 }
 
@@ -1637,6 +1683,37 @@ func TestActorCancelRevokesWithCancelReason(t *testing.T) {
 	h.waitDone()
 	if got := h.acc.RevokeReasons(); !reflect.DeepEqual(got, []string{RevokeReasonCancel}) {
 		t.Errorf("撤销原因 = %v，期望 [cancel]", got)
+	}
+}
+
+// ready 之后的 cancel：取消生效时立即撤销（Store 先提交，再以原因 cancel 关闭 Gateway 入口），不等 Worker
+// 在 grace 内结束；停止时再撤销一次（幂等）。
+func TestActorCancelRevokesImmediatelyBeforeGrace(t *testing.T) {
+	h := newActorHarness(t, queuedTask("t1"))
+	a := h.spawn("t1")
+	r := h.nextRun()
+	r.ready()
+	h.st.setControl("t1", "cancel")
+	a.Notify()
+	if c := r.control(); c.Kind != "cancel" {
+		t.Fatalf("控制 = %+v", c)
+	}
+	h.waitFor("取消生效时撤销 Gateway 入口", h.logged("revoke_gw:id-1:"+RevokeReasonCancel, 1))
+	if h.log.count("stop:") != 0 || r.cancelled() {
+		t.Fatalf("立即撤销不应停止环境或等待 Run 结束；日志: %v", h.log.all())
+	}
+	h.before("apply_control:cancelling", "revoke_db:id-1:"+RevokeReasonCancel)
+	h.before("revoke_db:id-1:"+RevokeReasonCancel, "revoke_gw:id-1:"+RevokeReasonCancel)
+	if got := h.acc.RevokeReasons(); !reflect.DeepEqual(got, []string{RevokeReasonCancel}) {
+		t.Fatalf("grace 内 Gateway 收到的撤销 = %v", got)
+	}
+	r.finish(Outcome{Class: ClassCancelled})
+	h.waitDone()
+	if got := h.acc.RevokeReasons(); !reflect.DeepEqual(got, []string{RevokeReasonCancel, RevokeReasonCancel}) {
+		t.Errorf("撤销原因 = %v，期望立即一次、停止时一次，均为 cancel", got)
+	}
+	if ts := h.st.task("t1"); ts.Status != "cancelled" {
+		t.Errorf("任务应 cancelled: %+v", ts)
 	}
 }
 

@@ -192,8 +192,14 @@ type SendControl struct {
 // StopEnvironment 经 coordinator 停止环境；结果为 EnvStopped 或 StopUnconfirmed。
 type StopEnvironment struct{ AttemptID, EnvID string }
 
-// RevokeAccess 撤销 attempt 的访问（Store 与 Gateway）；在停止之前执行。
+// RevokeAccess 撤销 attempt 的访问（Store 与 Gateway）；在停止之前执行。Reason 在 desired = cancel 时为
+// RevokeReasonCancel，否则为 attempt_stopping。
 type RevokeAccess struct{ AttemptID, Reason string }
+
+// RevokeAccessNow 立即撤销 attempt 的访问而不停止环境：取消生效时（§9.1"取消生效时立即撤销"），在协议
+// cancel 与 grace 期间就撤销，使 Gateway 立即取消该 attempt 的在途上游 try。actor 与 RevokeAccess 相同的
+// 顺序执行（Store 先提交，再关闭 Gateway 入口）。之后停止时的 RevokeAccess 照常执行（两者均幂等）。
+type RevokeAccessNow struct{ AttemptID, Reason string }
 
 // Finalize 以 Store.FinalizeAttempt 提交判决；结果为 VerdictCommitted 或 StoreFailed{OpFinalize}。
 type Finalize struct{ Verdict Verdict }
@@ -212,6 +218,7 @@ func (StartWorker) isEffect()       {}
 func (SendControl) isEffect()       {}
 func (StopEnvironment) isEffect()   {}
 func (RevokeAccess) isEffect()      {}
+func (RevokeAccessNow) isEffect()   {}
 func (Finalize) isEffect()          {}
 func (WakeAt) isEffect()            {}
 
@@ -531,6 +538,9 @@ func (d *decider) interrupt() {
 			if grace == 0 {
 				grace = DefaultControlGraceMs
 			}
+			if d.s.Desired == "cancel" { // 取消生效时立即撤销（§9.1）；暂停不撤销
+				d.emit(RevokeAccessNow{AttemptID: a.AttemptID, Reason: RevokeReasonCancel})
+			}
 			d.emit(SendControl{AttemptID: a.AttemptID, Kind: d.s.Desired, GraceMs: grace})
 		}
 	} // stop_blocked：没有可控制的执行，确认停止后按 desired 裁决
@@ -561,7 +571,11 @@ func (d *decider) stop() {
 		return
 	}
 	a.StopRequested = true
-	d.emit(RevokeAccess{AttemptID: a.AttemptID, Reason: "attempt_stopping"},
+	reason := "attempt_stopping"
+	if d.s.Desired == "cancel" {
+		reason = RevokeReasonCancel
+	}
+	d.emit(RevokeAccess{AttemptID: a.AttemptID, Reason: reason},
 		StopEnvironment{AttemptID: a.AttemptID, EnvID: a.EnvID})
 }
 

@@ -557,6 +557,10 @@ func (a *Actor) exec(eff Effect) {
 		}
 	case RevokeAccess:
 		a.revoking[f.AttemptID] = f.Reason
+	case RevokeAccessNow:
+		// 取消生效时立即撤销（§9.1）：经 Store 队列串行提交（排在同一决策的 ApplyControl 之后）；opRevoke 在
+		// 提交（或被确定拒绝）之后才关闭 Gateway 入口，暂时失败按退避以同一身份重试。环境不在此停止。
+		a.enqueue(&storeOp{kind: opRevoke, attemptID: f.AttemptID, reason: f.Reason})
 	case StopEnvironment:
 		a.stopEnv(f)
 	case Finalize:
@@ -607,13 +611,10 @@ func (a *Actor) stopRunForLimit(attemptID string) {
 // stopEnv：先撤销访问，再经 coordinator 停止环境。撤销顺序是 **DB 先提交、再关连接**（§9.1"持久化
 // 检查才是执行点"）：Store.RevokeAttemptAccess 提交（或被确定拒绝）之后才 Access.Revoke；Store 暂时失败时
 // 不关闭入口（它在 Store 中仍是 active），由 Store 队列补提交后再关闭（见 opRevoke），物理停止不等待它。
-// 取消生效时（desired = cancel）原因为 RevokeReasonCancel，使 Gateway 取消该 attempt 的在途上游 try。
+// 原因由 Decide 给出（desired = cancel 时为 RevokeReasonCancel，Gateway 据此取消该 attempt 的在途上游 try）。
 func (a *Actor) stopEnv(f StopEnvironment) {
 	reason, revoke := a.revoking[f.AttemptID]
 	delete(a.revoking, f.AttemptID)
-	if revoke && a.s.Desired == "cancel" {
-		reason = RevokeReasonCancel
-	}
 	a.async(func(ctx context.Context) any {
 		r := stopDone{attemptID: f.AttemptID, envID: f.EnvID, reason: reason}
 		if revoke {
