@@ -41,3 +41,38 @@ class TransportBroken(Exception):
 
     此后不再发送任何事件（不会复用 seq），也无法再发出 error 事件；Worker 以失败退出。
     """
+
+
+class GatewayError(Exception):
+    """Gateway 返回错误或无法完成请求。status 为 HTTP 状态码（未得到响应时为 0），code 来自
+    错误体 {"error":{"code","message"}}，客户端自身判定的失败使用 connection_lost、
+    connection_refused、client_timeout、invalid_response 等代码。"""
+
+    def __init__(self, status: int, code: str, message: str = "") -> None:
+        super().__init__(f"{status} {code}: {message}" if message else f"{status} {code}")
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+class BudgetExhausted(GatewayError):
+    """402 budget_exhausted / budget_insufficient_for_request（规格 §9.6：不等于任务终止）。"""
+
+
+class CallDivergence(GatewayError):
+    """409 fingerprint_mismatch：同一 call id 的请求内容与已记录的不同（规格 §9.4）。
+
+    SDK 不自动换 ID；由编排层以新 ID 与 X-Agentbox-Supersedes 显式重发。
+    """
+
+
+class CallInProgress(GatewayError):
+    """409 call_in_progress：客户端以同一 ID 有界等待重试后仍未结束。"""
+
+
+class AccessRevoked(GatewayError):
+    """403 access_revoked 或连接被拒：本 attempt 已无权访问 Gateway。"""
+
+
+class CallDeadlineExceeded(GatewayError):
+    """504 call_deadline_exceeded，或客户端 HTTP 超时（code 为 client_timeout）。"""

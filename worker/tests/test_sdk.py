@@ -764,3 +764,390 @@ def test_sim_worker_exec_log_records_each_executed_step(tmp_path):
         (2, 2, "result"),
     ]
     assert all(r["task_id"] == "t-1" and r["pid"] > 0 for r in records)
+
+
+# ---- Gateway 客户端（规格 §9.3、§9.4；契约见 Plan 7 Task 4）----
+# 依赖 Unix socket 的测试使用 conftest 的 fake_gateway；没有 AF_UNIX 的平台跳过（见 conftest）。
+
+import ast
+import sys
+import time
+import tomllib
+
+from conftest import FakeGateway, Reply, error_reply
+
+from agentbox_worker.errors import (
+    AccessRevoked,
+    BudgetExhausted,
+    CallDeadlineExceeded,
+    CallDivergence,
+    CallInProgress,
+    GatewayError,
+)
+from agentbox_worker.gateway import CallIds, GatewayClient
+from agentbox_worker.runtime import GATEWAY_SOCKET_ENV
+
+WORKER_ROOT = Path(__file__).resolve().parent.parent
+
+
+def client(gw: FakeGateway, call_ids: CallIds | None = None, **attrs: float) -> GatewayClient:
+    c = GatewayClient(gw.socket_path, call_ids=call_ids or CallIds(), timeout_s=5)
+    c.in_progress_backoff_s = 0.01
+    for name, value in attrs.items():
+        setattr(c, name, value)
+    return c
+
+
+def test_call_ids_format_sequence_and_restore():
+    ids = CallIds()
+    assert [ids.next("s1", "search") for _ in range(3)] == [
+        "root/s1/search/1",
+        "root/s1/search/2",
+        "root/s1/search/3",
+    ]
+    assert ids.next("s1", "chat") == "root/s1/chat/1"  # 每个 step 内每个 kind 独立计数
+    assert ids.next("s2", "search") == "root/s2/search/1"
+    assert ids.next("s1", "search", subrun_id="sr-7") == "sr-7/s1/search/1"
+    snap = ids.snapshot()
+    assert snap == {
+        "root/s1/search": 3,
+        "root/s1/chat": 1,
+        "root/s2/search": 1,
+        "sr-7/s1/search": 1,
+    }
+    restored = CallIds.restore(json.loads(json.dumps(snap)))  # 经 JSON 往返，如同 checkpoint
+    assert restored.next("s1", "search") == "root/s1/search/4"  # 续号，不重复、不回退
+    assert restored.next("s9", "fetch") == "root/s9/fetch/1"
+    assert ids.snapshot() == snap  # 快照与原计数器互不影响
+    with pytest.raises(ValueError):
+        ids.next("x" * 300, "chat")  # > 256 字节
+    assert "root/" + "x" * 300 + "/chat" not in ids.snapshot()  # 失败不占号
+    for bad in ({"root/s/chat": -1}, {"root/s/chat": "1"}, {"root/s/chat": True}):
+        with pytest.raises(ValueError):
+            CallIds.restore(bad)
+
+
+def test_runtime_dependencies_stay_empty():
+    pyproject = tomllib.loads((WORKER_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert pyproject["project"]["dependencies"] == []
+    for path in (WORKER_ROOT / "agentbox_worker").glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                names = [node.module or ""]
+            else:
+                continue
+            for name in names:
+                top = name.split(".")[0]
+                assert top in sys.stdlib_module_names or top == "agentbox_worker", (path, name)
+
+
+def test_three_endpoints_send_call_id_and_body(fake_gateway):
+    gw = client(fake_gateway)
+    messages = [{"role": "user", "content": "你好"}]
+    chat = gw.chat("plan", messages, max_tokens=64, temperature=0.2)
+    search = gw.search("task-1", "agent sandbox", max_results=3)
+    fetch = gw.fetch("task-1", "https://example.com/a")
+    chat2 = gw.chat("plan", messages)
+    got = [
+        (r.method, r.path, r.headers.get("x-agentbox-call-id"), r.json())
+        for r in fake_gateway.requests
+    ]
+    assert got == [
+        (
+            "POST",
+            "/v1/chat/completions",
+            "root/plan/chat/1",
+            {"messages": messages, "max_tokens": 64, "temperature": 0.2},
+        ),
+        (
+            "POST",
+            "/v1/search",
+            "root/task-1/search/1",
+            {"query": "agent sandbox", "max_results": 3},
+        ),
+        ("POST", "/v1/fetch", "root/task-1/fetch/1", {"url": "https://example.com/a"}),
+        ("POST", "/v1/chat/completions", "root/plan/chat/2", {"messages": messages}),
+    ]
+    for r in fake_gateway.requests:
+        assert r.headers["content-type"] == "application/json"
+        assert not {"x-agentbox-retry", "x-agentbox-supersedes", "x-agentbox-subrun"} & set(
+            r.headers
+        )
+    for res, kind in ((chat, "chat"), (search, "search"), (fetch, "fetch"), (chat2, "chat")):
+        assert res.status == 200 and res.replayed is False
+        assert res.blob_sha256 == fake_gateway.calls[res.call_id]
+        assert res.body["kind"] == kind and res.body["call_id"] == res.call_id
+
+
+def test_retry_replay_and_supersede_headers(fake_gateway):
+    gw = client(fake_gateway)
+    first = gw.search("s1", "q")
+    again = gw.retry("s1", "search", first.call_id, {"query": "q", "max_results": 5})
+    assert again.replayed is True and again.call_id == first.call_id
+    assert again.blob_sha256 == first.blob_sha256 and again.body == first.body
+    assert fake_gateway.requests[1].headers["x-agentbox-retry"] == "true"
+    new = gw.supersede(
+        "s1", "search", first.call_id, "divergence", {"query": "q2", "max_results": 5}
+    )
+    assert new.call_id == "root/s1/search/2" and new.replayed is False
+    headers = fake_gateway.requests[2].headers
+    assert headers["x-agentbox-call-id"] == "root/s1/search/2"
+    assert headers["x-agentbox-supersedes"] == first.call_id
+    assert headers["x-agentbox-supersede-reason"] == "divergence"
+    assert "x-agentbox-retry" not in headers
+
+
+@pytest.mark.parametrize(
+    ("reply", "exc_type", "code"),
+    [
+        (error_reply(402, "budget_exhausted"), BudgetExhausted, "budget_exhausted"),
+        (
+            error_reply(402, "budget_insufficient_for_request"),
+            BudgetExhausted,
+            "budget_insufficient_for_request",
+        ),
+        (error_reply(409, "fingerprint_mismatch"), CallDivergence, "fingerprint_mismatch"),
+        (error_reply(403, "access_revoked"), AccessRevoked, "access_revoked"),
+        (
+            error_reply(504, "call_deadline_exceeded"),
+            CallDeadlineExceeded,
+            "call_deadline_exceeded",
+        ),
+        (error_reply(409, "cancel_requested"), GatewayError, "cancel_requested"),
+        (error_reply(429, "tries_exhausted"), GatewayError, "tries_exhausted"),
+        (error_reply(501, "not_implemented"), GatewayError, "not_implemented"),
+        (Reply(500, b"boom"), GatewayError, "http_500"),
+    ],
+    ids=lambda v: v if isinstance(v, str) else None,
+)
+def test_error_responses_map_to_typed_exceptions(fake_gateway, reply, exc_type, code):
+    fake_gateway.replies.append(reply)
+    with pytest.raises(GatewayError) as caught:
+        client(fake_gateway).chat("s1", [{"role": "user", "content": "x"}])
+    assert type(caught.value) is exc_type
+    assert (caught.value.status, caught.value.code) == (reply.status, code)
+    assert len(fake_gateway.requests) == 1  # 只有 call_in_progress 在客户端重试
+
+
+def test_call_in_progress_is_retried_with_same_id(fake_gateway):
+    fake_gateway.replies += [error_reply(409, "call_in_progress")] * 2
+    res = client(fake_gateway).fetch("s1", "https://example.com")
+    assert res.status == 200 and res.call_id == "root/s1/fetch/1"
+    ids = [r.headers["x-agentbox-call-id"] for r in fake_gateway.requests]
+    assert ids == ["root/s1/fetch/1"] * 3
+
+
+def test_call_in_progress_wait_is_bounded(fake_gateway):
+    fake_gateway.replies += [error_reply(409, "call_in_progress")] * 50
+    gw = client(fake_gateway, in_progress_wait_s=0.1, in_progress_backoff_s=0.02)
+    started = time.monotonic()
+    with pytest.raises(CallInProgress):
+        gw.fetch("s1", "https://example.com")
+    assert time.monotonic() - started < 1
+    assert 2 <= len(fake_gateway.requests) < 10
+
+
+def test_client_timeout_is_call_deadline_exceeded(fake_gateway):
+    fake_gateway.delay = 5
+    gw = client(fake_gateway)
+    gw.timeout_s = 0.2
+    started = time.monotonic()
+    with pytest.raises(CallDeadlineExceeded) as caught:
+        gw.chat("s1", [{"role": "user", "content": "x"}])
+    assert caught.value.code == "client_timeout" and caught.value.status == 0
+    assert time.monotonic() - started < 2
+
+
+def test_default_timeout_exceeds_gateway_deadline():
+    # Gateway 期限 120 s（Plan 7 Task 3）；客户端 HTTP 超时须略大于它，由 Gateway 先给出 504
+    assert GatewayClient(call_ids=CallIds()).timeout_s == 130.0
+
+
+def test_read_blob_and_budget(fake_gateway):
+    gw = client(fake_gateway)
+    sha = fake_gateway.put_blob("证据正文".encode())
+    assert gw.read_blob(sha) == "证据正文".encode()
+    assert gw.budget() == fake_gateway.budget
+    with pytest.raises(GatewayError) as caught:
+        gw.read_blob("0" * 64)
+    assert (caught.value.status, caught.value.code) == (404, "not_found")
+    fake_gateway.replies.append(Reply(200, b"tampered"))
+    with pytest.raises(GatewayError) as caught:
+        gw.read_blob(sha)
+    assert caught.value.code == "blob_corrupt"
+    with pytest.raises(ValueError):
+        gw.read_blob("../etc/passwd")
+    # 只读端点不携带 call id
+    assert all("x-agentbox-call-id" not in r.headers for r in fake_gateway.requests)
+
+
+def test_missing_socket_is_access_revoked(fake_gateway):
+    gw = GatewayClient(fake_gateway.socket_path + ".gone", call_ids=CallIds(), timeout_s=1)
+    with pytest.raises(AccessRevoked) as caught:
+        gw.budget()
+    assert caught.value.code == "connection_refused"
+
+
+# ---- TaskContext：gateway、budget_limits、call id 计数器随 checkpoint 持久化 ----
+
+
+def test_context_budget_limits_and_lazy_gateway(tmp_path, monkeypatch):
+    monkeypatch.setenv(GATEWAY_SOCKET_ENV, "/tmp/x.sock")
+    seen = {}
+
+    async def app(ctx):
+        seen["before"] = ctx._gateway
+        seen["gateway"] = ctx.gateway
+        seen["same"] = ctx.gateway is seen["gateway"]
+        seen["limits"] = ctx.budget_limits
+        return Result("ok", [])
+
+    code, _ = run(app, tmp_path, init={"budget_limits": {"budget_micro": 5000}})
+    assert code == 0
+    assert seen["before"] is None and seen["same"] is True
+    assert seen["gateway"].socket_path == "/tmp/x.sock"
+    assert seen["limits"] == {"budget_micro": 5000}
+    monkeypatch.delenv(GATEWAY_SOCKET_ENV)
+
+    async def default_path(ctx):
+        return Result(f"{ctx.gateway.socket_path}|{ctx.budget_limits}", [])
+
+    code, events = run(default_path, tmp_path)
+    assert events[-1]["summary"] == "/run/agentbox/gateway.sock|{}"
+
+
+def test_checkpoint_persists_call_ids_under_reserved_key(tmp_path):
+    async def app(ctx):
+        await ctx.checkpoint("s0", state={"a": 1})  # 尚无调用：state 原样
+        ctx.gateway.call_ids.next("s1", "chat")
+        ctx.gateway.call_ids.next("s1", "chat")
+        state = {"a": 2}
+        await ctx.checkpoint("s1", state=state)
+        assert state == {"a": 2}  # 应用对象不被修改
+        return Result("ok", [])
+
+    code, events = run(app, tmp_path, responder=checkpoint_reply("committed"))
+    assert code == 0
+    states = [e["state"] for e in events if e["type"] == "checkpoint"]
+    assert states == [{"a": 1}, {"a": 2, "_agentbox": {"call_ids": {"root/s1/chat": 2}}}]
+
+
+def test_resume_restores_call_ids_and_hides_reserved_key(tmp_path):
+    resume = {
+        "checkpoint_id": "cp-0",
+        "step_id": "s1",
+        "state": {"a": 2, "_agentbox": {"call_ids": {"root/s1/chat": 2}}},
+        "refs": [],
+    }
+    seen = {}
+
+    async def app(ctx):
+        seen["state"] = ctx.resume.state
+        seen["next"] = ctx.gateway.call_ids.next("s1", "chat")
+        await ctx.checkpoint("s2", state={"a": 3})
+        return Result("ok", [])
+
+    code, events = run(
+        app, tmp_path, init={"resume": resume}, responder=checkpoint_reply("committed")
+    )
+    assert code == 0
+    assert seen == {"state": {"a": 2}, "next": "root/s1/chat/3"}
+    checkpoint = next(e for e in events if e["type"] == "checkpoint")
+    assert checkpoint["state"] == {"a": 3, "_agentbox": {"call_ids": {"root/s1/chat": 3}}}
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "after_call"),
+    [
+        pytest.param({"state": {"_agentbox": 1}}, False, id="reserved_key_from_app"),
+        pytest.param({"state": [1, 2]}, True, id="non_object_state_after_call"),
+        pytest.param({"state_ref": "a" * 64}, True, id="state_ref_after_call"),
+    ],
+)
+def test_checkpoint_rejects_states_that_cannot_carry_call_ids(tmp_path, kwargs, after_call):
+    async def app(ctx):
+        if after_call:
+            ctx.gateway.call_ids.next("s1", "chat")
+        await ctx.checkpoint("s1", **kwargs)
+        return Result("never", [])
+
+    code, events = run(app, tmp_path)
+    assert code == 1
+    assert types(events) == ["ready", "error"] and events[1]["code"] == "invalid_field"
+
+
+def test_corrupt_reserved_state_on_resume_fails_before_ready(tmp_path):
+    resume = {
+        "checkpoint_id": "cp-0",
+        "step_id": "s1",
+        "state": {"_agentbox": {"call_ids": {"x": -3}}},
+    }
+    code, events = run(returns_ok, tmp_path, init={"resume": resume})
+    assert code == 1
+    assert types(events) == ["error"] and events[0]["code"] == "invalid_field"
+
+
+# ---- sim-worker 的 Gateway 操作 ----
+
+
+def test_sim_worker_gateway_ops_put_blobs_into_checkpoint_refs(fake_gateway, tmp_path, monkeypatch):
+    monkeypatch.setenv(GATEWAY_SOCKET_ENV, fake_gateway.socket_path)
+    steps = [
+        {"op": "chat", "step_id": "s1", "messages": [{"role": "user", "content": "题目"}]},
+        {"op": "search", "step_id": "s1", "query": "agent", "max_results": 2},
+        {"op": "fetch", "step_id": "s1", "url": "https://example.com/a"},
+        {"op": "checkpoint", "step_id": "s1"},
+        {"op": "chat", "step_id": "s1", "messages": [{"role": "user", "content": "再问"}]},
+        {"op": "checkpoint", "step_id": "s2"},
+    ]
+    code, events = run(
+        sim_app,
+        tmp_path,
+        init={"config": {"steps": steps}},
+        responder=checkpoint_reply("committed"),
+    )
+    assert code == 0 and events[-1]["type"] == "result"
+    shas = list(fake_gateway.calls.values())
+    assert [r.headers["x-agentbox-call-id"] for r in fake_gateway.requests] == [
+        "root/s1/chat/1",
+        "root/s1/search/1",
+        "root/s1/fetch/1",
+        "root/s1/chat/2",
+    ]
+    first, second = [e for e in events if e["type"] == "checkpoint"]
+    assert first["refs"] == shas[:3] and second["refs"] == shas
+    assert first["state"] == {
+        "next_index": 4,
+        "_agentbox": {"call_ids": {"root/s1/chat": 1, "root/s1/search": 1, "root/s1/fetch": 1}},
+    }
+    assert fake_gateway.requests[1].json() == {"query": "agent", "max_results": 2}
+
+    # 从第一个 checkpoint 恢复：refs 延续，call id 续号（重做的第 4 步得到与原来相同的 ID → 重放）
+    resume = {
+        "checkpoint_id": first["checkpoint_id"],
+        "step_id": "s1",
+        "state": first["state"],
+        "refs": first["refs"],
+    }
+    code, events = run(
+        sim_app,
+        tmp_path,
+        init={"attempt_no": 2, "resume": resume, "config": {"steps": steps}},
+        responder=checkpoint_reply("committed"),
+    )
+    assert code == 0
+    assert fake_gateway.requests[-1].headers["x-agentbox-call-id"] == "root/s1/chat/2"
+    (last,) = [e for e in events if e["type"] == "checkpoint"]
+    assert last["refs"] == shas
+
+
+def test_sim_worker_gateway_error_fails_task(fake_gateway, tmp_path, monkeypatch):
+    monkeypatch.setenv(GATEWAY_SOCKET_ENV, fake_gateway.socket_path)
+    fake_gateway.replies.append(error_reply(402, "budget_exhausted"))
+    steps = [{"op": "search", "step_id": "s1", "query": "q"}]
+    code, events = run(sim_app, tmp_path, init={"config": {"steps": steps}})
+    assert code == 1
+    assert events[-1]["type"] == "error" and events[-1]["code"] == "budget_exhausted"

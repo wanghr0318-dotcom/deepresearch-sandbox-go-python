@@ -24,6 +24,7 @@ from agentbox_worker.errors import (
     TransportBroken,
     WorkerFailure,
 )
+from agentbox_worker.gateway import DEFAULT_SOCKET_PATH, CallIds, GatewayClient
 from agentbox_worker.outbox import Outbox, Waiters
 from agentbox_worker.protocol import (
     BOOTSTRAP_VERSION,
@@ -47,6 +48,11 @@ MAX_SHUTDOWN_TIMEOUT = 3600.0  # 超过线程等待的可表示范围会抛异�
 # error 事件中 code 与 message 的上限（UTF-8 字节），保证事件远小于 1 MiB 的事件上限
 MAX_ERROR_CODE_BYTES = 256
 MAX_ERROR_MESSAGE_BYTES = 8 << 10
+
+# Gateway socket 路径的覆盖（测试与沙箱外演练用）；缺省为沙箱内的挂载点
+GATEWAY_SOCKET_ENV = "AGENTBOX_GATEWAY_SOCKET"
+# checkpoint state 中由 SDK 保留的键：{"_agentbox": {"call_ids": {...}}}，应用看不到也不能写
+RESERVED_STATE_KEY = "_agentbox"
 
 
 @dataclass(frozen=True)
@@ -91,16 +97,46 @@ def _log(message: str) -> None:
     print(f"agentbox_worker: {message}", file=sys.stderr)
 
 
-def _resume_info(raw: dict[str, Any] | None) -> ResumeInfo | None:
+def _resume_info(raw: dict[str, Any] | None) -> tuple[ResumeInfo | None, CallIds]:
+    """解析 init.resume；从 state 中取出 SDK 保留键（call id 计数器），应用只看到其余部分。"""
     if raw is None:
-        return None
-    return ResumeInfo(
+        return None, CallIds()
+    state = raw.get("state")
+    call_ids = CallIds()
+    if isinstance(state, dict) and RESERVED_STATE_KEY in state:
+        state = dict(state)
+        reserved = state.pop(RESERVED_STATE_KEY)
+        saved = reserved.get("call_ids") if isinstance(reserved, dict) else None
+        try:
+            call_ids = CallIds.restore(saved if isinstance(saved, dict) else {})
+        except ValueError as exc:
+            raise WorkerFailure(
+                "invalid_field", f"checkpoint 中的 call id 计数器不合法：{exc}"
+            ) from exc
+    info = ResumeInfo(
         checkpoint_id=raw["checkpoint_id"],
         step_id=raw["step_id"],
-        state=raw.get("state"),
+        state=state,
         state_ref=raw.get("state_ref") or None,
         refs=list(raw.get("refs") or []),
     )
+    return info, call_ids
+
+
+def _with_call_ids(state: Any, call_ids: dict[str, int]) -> Any:
+    """把 call id 计数器并入 state 快照的保留键；尚未发起任何 Gateway 调用时 state 原样不变。"""
+    if isinstance(state, dict) and RESERVED_STATE_KEY in state:
+        raise WorkerFailure(
+            "invalid_field", f"checkpoint state 不能使用保留键 {RESERVED_STATE_KEY}"
+        )
+    if not call_ids:
+        return state
+    if not isinstance(state, dict):
+        raise WorkerFailure(
+            "invalid_field",
+            "已发起 Gateway 调用后 checkpoint state 必须是 JSON 对象（以保存 call id 计数器）",
+        )
+    return {**state, RESERVED_STATE_KEY: {"call_ids": call_ids}}
 
 
 def _snapshot(state: Any) -> Any:
@@ -135,7 +171,10 @@ class TaskContext:
         self.attempt_no: int = init["attempt_no"]
         self.config: Any = init.get("config")
         self.out_dir = Path(init["out_dir"])
-        self.resume = _resume_info(init.get("resume"))
+        self.resume, self._call_ids = _resume_info(init.get("resume"))
+        limits = init.get("budget_limits")
+        self.budget_limits: dict[str, int] = dict(limits) if isinstance(limits, dict) else {}
+        self._gateway: GatewayClient | None = None
         self.cancel_reason: str | None = None
         self.control_error: ProtocolError | None = None
         self._outbox = outbox
@@ -145,6 +184,17 @@ class TaskContext:
         self._artifact_results = Waiters()
         self._checkpoint_lock = asyncio.Lock()
         self._pause_requested = False
+
+    @property
+    def gateway(self) -> GatewayClient:
+        """Gateway 客户端，首次访问时创建；与 checkpoint 共用同一个 call id 计数器。
+
+        客户端方法是同步阻塞的，应用应经 asyncio.to_thread 调用。
+        """
+        if self._gateway is None:
+            path = os.environ.get(GATEWAY_SOCKET_ENV) or DEFAULT_SOCKET_PATH
+            self._gateway = GatewayClient(path, call_ids=self._call_ids)
+        return self._gateway
 
     def should_pause(self) -> bool:
         """宿主是否请求了暂停。应用在提交边界检查它（规格 §5.9）。"""
@@ -176,6 +226,9 @@ class TaskContext:
         retryable_error 或 not_found 时用同一 ID 重发。state 在首次提交前按 JSON 归一化
         生成快照（tuple 变为 list，非字符串键变为字符串），无法序列化或含 NaN、Infinity 时
         抛出 WorkerFailure("invalid_field")；之后修改调用方对象不影响重试内容。
+
+        已发起过 Gateway 调用时，SDK 把 call id 计数器并入 state 的保留键 _agentbox.call_ids
+        （state 须为对象，不能用 state_ref），恢复时取出并续号；应用的 resume.state 不含该键。
         """
         async with self._checkpoint_lock:
             checkpoint_id = self._new_id()
@@ -185,8 +238,14 @@ class TaskContext:
                 "scope": "task",
                 "step_id": step_id,
             }
+            call_ids = self._call_ids.snapshot()
             if state_ref is None:
-                body["state"] = _snapshot(state)
+                body["state"] = _snapshot(_with_call_ids(state, call_ids))
+            elif call_ids:
+                raise WorkerFailure(
+                    "invalid_field",
+                    "已发起 Gateway 调用后不能用 state_ref 提交（call id 计数器无处保存）",
+                )
             else:
                 body["state_ref"] = state_ref
             body["refs"] = list(refs)
@@ -364,7 +423,13 @@ async def _run_worker(
     init = await _read_init(transport, outbox)
     if isinstance(init, int):
         return init
-    ctx = TaskContext(init, outbox, timing, new_id or (lambda: uuid.uuid4().hex))
+    try:
+        ctx = TaskContext(init, outbox, timing, new_id or (lambda: uuid.uuid4().hex))
+    except WorkerFailure as exc:  # resume 中的 SDK 保留状态损坏：无法续号，不能安全开始
+        await outbox.emit(
+            {"type": "error", "code": exc.code, "message": exc.message, "retryable": False}
+        )
+        return EXIT_FAILURE
     await outbox.emit(
         {
             "type": "ready",
