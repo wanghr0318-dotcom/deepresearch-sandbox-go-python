@@ -322,6 +322,16 @@ const (
 
 func TestMain(m *testing.M) {
 	switch {
+	case len(os.Args) > 1 && os.Args[1] == sandbox.LaunchArg:
+		// 生产启动器以 /proc/self/exe sandbox-launch 启动的专用启动进程（即本测试二进制）。
+		if err := sandbox.RunLaunch(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	case len(os.Args) > 1 && os.Args[1] == sandbox.InitArg:
+		// 专用启动进程在命名空间中以 /proc/self/exe init 启动的 init（见 Task 9 一节）。
+		os.Exit(runProdTestInit())
 	case os.Getenv(envTestInit) != "":
 		os.Exit(runTestInit())
 	case os.Getenv(envTestHog) != "":
@@ -526,13 +536,19 @@ func removeTestCgroupRoot() {
 // 其全部环境，并删除其 cgroup 与数据目录。
 func newTestProvider(t *testing.T, installID string) *Provider {
 	t.Helper()
+	return newProviderWith(t, installID, testStarter{})
+}
+
+// newProviderWith 同 newTestProvider，但使用给定的启动器。
+func newProviderWith(t *testing.T, installID string, starter EnvStarter) *Provider {
+	t.Helper()
 	requireRoot(t)
 	root := testCgroupRoot(t)
 	data, err := os.MkdirTemp("", "agentbox-data-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := New(Options{DataDir: data, CgroupRoot: root, InstallID: installID, Starter: testStarter{}})
+	p, err := New(Options{DataDir: data, CgroupRoot: root, InstallID: installID, Starter: starter})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -871,4 +887,296 @@ func TestResourceDiagOOM(t *testing.T) {
 	if err != nil || d.OOMKillDelta == 0 || !d.OOMObserved {
 		t.Fatalf("ResourceDiag = %+v, %v；期望 OOMKillDelta > 0", d, err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 9：生产启动器（ProcessStarter）。专用启动进程与 init 都是本测试二进制：TestMain 把
+// sandbox-launch 分流到 sandbox.RunLaunch（生产代码），把 init 分流到 runProdTestInit——它在
+// 命名空间中运行，先自报所在的 cgroup，再按生产的就绪约定（fd 3 控制连接、fd 4 就绪管道）运行
+// sandbox.Serve 与直接 exec 的 testLauncher。init 环境建立（挂载、pivot_root、能力）属 Task 10。
+
+// envInitReport 指向一个目录：init 启动时把 /proc/self/cgroup 写到 <目录>/<宿主 pid>。
+const envInitReport = "AGENTBOX_TEST_INIT_REPORT"
+
+// runProdTestInit 是生产启动器启动的测试 init 的主函数。
+func runProdTestInit() int {
+	if dir := os.Getenv(envInitReport); dir != "" {
+		cg, err := os.ReadFile("/proc/self/cgroup")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "test init: 读取 cgroup: %v\n", err)
+			return 1
+		}
+		// /proc 仍是宿主的 proc 实例（挂载在 Task 10 建立），/proc/self 指向宿主 pid。
+		self, err := os.Readlink("/proc/self")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "test init: 读取宿主 pid: %v\n", err)
+			return 1
+		}
+		if err := os.WriteFile(filepath.Join(dir, self), cg, 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "test init: 写自报: %v\n", err)
+			return 1
+		}
+	}
+	return runTestInit()
+}
+
+// prodStarter 返回生产启动器（本进程成为 child subreaper）与 init 自报目录。
+func prodStarter(t *testing.T) (*ProcessStarter, string) {
+	t.Helper()
+	requireRoot(t)
+	st, err := NewProcessStarter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp("", "agentbox-init-report-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	// init 以映射后的宿主 uid 运行，须能在此创建文件。
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	st.initEnv = []string{envInitReport + "=" + dir}
+	return st, dir
+}
+
+// procStatus 解析 /proc/<pid>/status 为 键 → 值（去掉首尾空白）。
+func procStatus(t *testing.T, pid string) map[string]string {
+	t.Helper()
+	b, err := os.ReadFile("/proc/" + pid + "/status")
+	if err != nil {
+		t.Fatalf("读取 /proc/%s/status: %v", pid, err)
+	}
+	m := make(map[string]string)
+	for _, line := range strings.Split(string(b), "\n") {
+		if k, v, ok := strings.Cut(line, ":"); ok {
+			m[k] = strings.TrimSpace(v)
+		}
+	}
+	return m
+}
+
+// zombieChildren 返回本进程处于僵尸状态的子进程。
+func zombieChildren(t *testing.T) []string {
+	t.Helper()
+	ents, err := os.ReadDir("/proc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	self := fmt.Sprint(os.Getpid())
+	var out []string
+	for _, e := range ents {
+		b, err := os.ReadFile("/proc/" + e.Name() + "/status")
+		if err != nil {
+			continue
+		}
+		var state, ppid string
+		for _, line := range strings.Split(string(b), "\n") {
+			if v, ok := strings.CutPrefix(line, "State:"); ok {
+				state = strings.TrimSpace(v)
+			}
+			if v, ok := strings.CutPrefix(line, "PPid:"); ok {
+				ppid = strings.TrimSpace(v)
+			}
+		}
+		if ppid == self && strings.HasPrefix(state, "Z") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// waitReaped 等待 pid 被收割（/proc/<pid> 消失）；超时仍为僵尸或仍存在则失败。
+func waitReaped(t *testing.T, pid int) {
+	t.Helper()
+	path := fmt.Sprintf("/proc/%d", pid)
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			return
+		}
+	}
+	st, _ := os.ReadFile(path + "/stat")
+	t.Fatalf("init %d 未被收割：%s", pid, st)
+}
+
+// TestProductionStarterIsolation：生产启动器启动若干环境（不同 UID 范围）：
+//   - server（测试进程）的 Groups 前后不变（附加组只在专用启动进程中清空）；
+//   - init：Groups 为空、NSpid 两级（ns 内为 1）、uid/gid 映射与范围一致、setgroups 为 deny、
+//     宿主 uid/gid 为范围基址（ns root）、父进程是 server（启动进程退出后被收养）；
+//   - init 在环境 cgroup 中：cgroup.procs 含 init，且 init 启动时自报的 cgroup 路径即环境 cgroup；
+//   - workload 经该 init 运行并看到命名空间内的身份；
+//   - Stop 后 init 由 server 收割（无僵尸）。
+func TestProductionStarterIsolation(t *testing.T) {
+	install := "p" + randHex(4)
+	st, report := prodStarter(t)
+	p := newProviderWith(t, install, st)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	self := fmt.Sprint(os.Getpid())
+	groupsBefore := procStatus(t, self)["Groups"]
+
+	bases := []uint32{100000, 200000, 300000}
+	pids := make([]int, len(bases))
+	for i, base := range bases {
+		envID := fmt.Sprintf("env-p%d", i)
+		spec := testEnvSpec(install, envID)
+		spec.UIDBase = base
+		if info, err := p.Create(ctx, spec); err != nil || !info.Complete {
+			t.Fatalf("Create %s = %+v, %v", envID, info, err)
+		}
+		pid := p.state(envID).pid
+		pids[i] = pid
+		ps := fmt.Sprint(pid)
+		s := procStatus(t, ps)
+		if s["Groups"] != "" {
+			t.Errorf("%s: init 的 Groups = %q，期望为空", envID, s["Groups"])
+		}
+		if ns := strings.Fields(s["NSpid"]); len(ns) != 2 || ns[0] != ps || ns[1] != "1" {
+			t.Errorf("%s: init 的 NSpid = %q，期望 \"%s 1\"", envID, s["NSpid"], ps)
+		}
+		if s["PPid"] != self {
+			t.Errorf("%s: init 的 PPid = %s，期望 server %s", envID, s["PPid"], self)
+		}
+		b := fmt.Sprint(base)
+		for _, k := range []string{"Uid", "Gid"} {
+			if f := strings.Fields(s[k]); len(f) != 4 || f[0] != b || f[1] != b || f[2] != b || f[3] != b {
+				t.Errorf("%s: init 的 %s = %q，期望全为 %s", envID, k, s[k], b)
+			}
+		}
+		for _, m := range []string{"uid_map", "gid_map"} {
+			raw, err := os.ReadFile("/proc/" + ps + "/" + m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := strings.Fields(string(raw)), []string{"0", b, "4096"}; !reflect.DeepEqual(got, want) {
+				t.Errorf("%s: %s = %q，期望 %q", envID, m, got, want)
+			}
+		}
+		if raw, err := os.ReadFile("/proc/" + ps + "/setgroups"); err != nil || strings.TrimSpace(string(raw)) != "deny" {
+			t.Errorf("%s: setgroups = %q, %v，期望 deny", envID, raw, err)
+		}
+
+		g := mustGroup(t, p, envID)
+		procs, err := g.Procs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, q := range procs {
+			found = found || q == pid
+		}
+		if !found {
+			t.Errorf("%s: cgroup.procs %v 不含 init %d", envID, procs, pid)
+		}
+		rep, err := os.ReadFile(filepath.Join(report, ps))
+		if err != nil {
+			t.Fatalf("%s: 读取 init 自报: %v", envID, err)
+		}
+		if got, want := strings.TrimSpace(string(rep)), "0::"+strings.TrimPrefix(g.Path(), "/sys/fs/cgroup"); got != want {
+			t.Errorf("%s: init 自报的 cgroup = %q，期望 %q", envID, got, want)
+		}
+
+		h, err := p.StartExec(ctx, envID, provider.ExecSpec{ExecID: "id", Argv: []string{"/bin/sh", "-c", "id -u; id -G; echo $$"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.Stdin().Close()
+		go func() { _, _ = io.Copy(io.Discard, h.Stderr()) }()
+		out, _ := io.ReadAll(h.Stdout())
+		if es, err := h.Wait(); err != nil || es.Code != 0 {
+			t.Fatalf("%s: workload = %+v, %v", envID, es, err)
+		}
+		// 命名空间内 uid 0；附加组为空，id -G 只列出主组 0；在 pid 命名空间中 pid 很小（非宿主 pid）。
+		if f := strings.Fields(string(out)); len(f) != 3 || f[0] != "0" || f[1] != "0" || len(f[2]) > 3 {
+			t.Errorf("%s: workload 输出 %q，期望 uid 0、组 0、命名空间内的小 pid", envID, out)
+		}
+	}
+	if after := procStatus(t, self)["Groups"]; after != groupsBefore {
+		t.Fatalf("server 的 Groups 由 %q 变为 %q", groupsBefore, after)
+	}
+
+	for i, pid := range pids {
+		envID := fmt.Sprintf("env-p%d", i)
+		if err := p.Stop(ctx, envID); err != nil {
+			t.Fatalf("Stop %s: %v", envID, err)
+		}
+		waitReaped(t, pid)
+		if err := p.Destroy(ctx, envID); err != nil {
+			t.Fatalf("Destroy %s: %v", envID, err)
+		}
+		layersGone(t, p, envID)
+	}
+	if z := zombieChildren(t); len(z) != 0 {
+		t.Fatalf("server 有僵尸子进程 %v", z)
+	}
+}
+
+// TestLaunchFailureLeavesIncomplete：专用启动进程在 clone 之前、之后各注入失败 → Create 失败并给出
+// 启动进程的原因；没有进程留在环境 cgroup 之外（server 无僵尸子进程，cgroup 中也没有进程）；再次
+// Create 为 ErrIncomplete；Stop + Destroy 后三层不存在，去掉注入后可重建。
+func TestLaunchFailureLeavesIncomplete(t *testing.T) {
+	for _, at := range []string{sandbox.LaunchFailBeforeClone, sandbox.LaunchFailAfterClone} {
+		t.Run(at, func(t *testing.T) {
+			install := "l" + randHex(4)
+			st, _ := prodStarter(t)
+			st.failAt = at
+			p := newProviderWith(t, install, st)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			spec := testEnvSpec(install, "env-l")
+			_, err := p.Create(ctx, spec)
+			if err == nil || !strings.Contains(err.Error(), "launch/"+at) {
+				t.Fatalf("Create = %v，期望启动进程报告 launch/%s", err, at)
+			}
+			if z := zombieChildren(t); len(z) != 0 {
+				t.Fatalf("server 有僵尸子进程 %v", z)
+			}
+			if procs, err := mustGroup(t, p, "env-l").Procs(); err != nil || len(procs) != 0 {
+				t.Fatalf("环境 cgroup 中有进程 %v（%v）", procs, err)
+			}
+			if _, err := p.Create(ctx, spec); !errors.Is(err, provider.ErrIncomplete) {
+				t.Fatalf("再次 Create = %v，期望 ErrIncomplete", err)
+			}
+			if err := p.Stop(ctx, "env-l"); err != nil {
+				t.Fatalf("Stop: %v", err)
+			}
+			if err := p.Destroy(ctx, "env-l"); err != nil {
+				t.Fatalf("Destroy: %v", err)
+			}
+			layersGone(t, p, "env-l")
+			st.failAt = ""
+			if info, err := p.Create(ctx, spec); err != nil || !info.Complete {
+				t.Fatalf("重建 = %+v, %v", info, err)
+			}
+		})
+	}
+}
+
+// TestLocalContractProductionStarter：Provider 契约一致性全集运行在生产启动器上（init 为测试 init）。
+func TestLocalContractProductionStarter(t *testing.T) {
+	requireRoot(t)
+	install := "q" + randHex(4)
+	providertest.Run(t, providertest.Harness{
+		New: func(t *testing.T) provider.Provider {
+			st, _ := prodStarter(t)
+			return newProviderWith(t, install, st)
+		},
+		Spec:       func(envID string) provider.EnvSpec { return testEnvSpec(install, envID) },
+		Echo:       provider.ExecSpec{ExecID: "echo", Argv: []string{"/bin/sh", "-c", "echo hello; exit 3"}},
+		EchoOutput: "hello",
+		EchoCode:   3,
+		Sleep:      provider.ExecSpec{ExecID: "sleep", Argv: []string{"/bin/sleep", "1000"}},
+		Residue: func(t *testing.T, p provider.Provider, envID string) {
+			residue(t, p.(*Provider), testEnvSpec(install, envID))
+		},
+		Foreign: func(t *testing.T, p provider.Provider, envID string) {
+			if err := os.Mkdir(p.(*Provider).envDir(envID), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		BlockStart: func(t *testing.T, p provider.Provider, envID string) (<-chan struct{}, func()) {
+			return blockStart(t, p.(*Provider), envID)
+		},
+	})
 }

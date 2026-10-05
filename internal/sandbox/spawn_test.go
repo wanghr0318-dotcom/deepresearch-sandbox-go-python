@@ -21,17 +21,12 @@ import (
 	"testing"
 	"time"
 	"unsafe"
-
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
 )
 
-// TestMain 让这个测试二进制在被 Spawn 以 "init" re-exec 时，表现得
-// 跟生产的 /proc/self/exe init 一样：直接跑 RunInit 并按它的错误退出，
-// 而不是钻进 go test 自己的框架。
-//
-// 这是 TestSpawnStartsInitProcess 能验证真实 "拼装命令 -> re-exec ->
-// 进入 namespace -> 跑 RunInit" 链路的前提：Spawn 内部硬编码 re-exec
-// /proc/self/exe，从测试里调用时那就是这个测试二进制自己。
+// TestMain 让这个测试二进制在被以 "init" 或 "sandbox-launch" re-exec 时，表现得
+// 跟生产的 /proc/self/exe 一样：直接跑 RunInit / RunLaunch 并按其错误退出，
+// 而不是钻进 go test 自己的框架（LaunchCommand 硬编码 re-exec /proc/self/exe，
+// 从测试里调用时那就是这个测试二进制自己）。
 func TestMain(m *testing.M) {
 	// seccomp 子进程分流：见 TestSeccompOrchestratorFilterInChildProcess。
 	// 放在 TestMain 而不是一个“非子进程时跳过”的辅助用例里，是因为
@@ -54,122 +49,91 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	if len(os.Args) > 1 && os.Args[1] == LaunchArg {
+		if err := RunLaunch(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	os.Exit(m.Run())
 }
 
-// TestNamespacesAreIsolated 验证 clone flags 确实生效：
-// 子进程在自己的 PID namespace 里是 1 号，且改主机名不影响宿主。
-func TestNamespacesAreIsolated(t *testing.T) {
-	testutil.RequireLinuxRoot(t)
-
-	hostBefore, err := os.Hostname()
+// startLaunch 以 LaunchCommand 启动一个专用启动进程（本测试二进制），传入给定的启动规格，
+// 返回它交还的结果与退出状态。cgroup 目录用一个临时目录代替：spec 校验失败时启动进程
+// 不会走到 clone。
+func startLaunch(t *testing.T, spec []byte) (pid, pidfd int, resErr, waitErr error) {
+	t.Helper()
+	ctl, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
-		t.Fatalf("读取宿主 hostname: %v", err)
+		t.Fatal(err)
 	}
-
-	cmd := exec.Command("/bin/sh", "-c", "hostname sandbox-test && echo $$ && hostname")
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: CloneFlags,
-		Setpgid:    true,
-	}
-	out, err := cmd.CombinedOutput()
+	ctlHost, ctlChild := os.NewFile(uintptr(ctl[0]), "ctl-host"), os.NewFile(uintptr(ctl[1]), "ctl-child")
+	defer ctlHost.Close()
+	res, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
-		t.Fatalf("运行隔离进程: %v\n输出:\n%s", err, out)
+		t.Fatal(err)
 	}
-
-	lines := strings.Fields(string(out))
-	if len(lines) < 2 {
-		t.Fatalf("输出格式意外: %q", out)
-	}
-	if lines[0] != "1" {
-		t.Fatalf("子进程 PID = %s, want 1（PID namespace 未生效）", lines[0])
-	}
-	if lines[1] != "sandbox-test" {
-		t.Fatalf("沙箱内 hostname = %s, want sandbox-test", lines[1])
-	}
-
-	hostAfter, err := os.Hostname()
+	defer syscall.Close(res[0])
+	resChild := os.NewFile(uintptr(res[1]), "res-child")
+	specR, specW, err := os.Pipe()
 	if err != nil {
-		t.Fatalf("重新读取宿主 hostname: %v", err)
+		t.Fatal(err)
 	}
-	if hostAfter != hostBefore {
-		t.Fatalf("宿主 hostname 被改成了 %s（UTS namespace 未生效）", hostAfter)
+	if _, err := specW.Write(spec); err != nil {
+		t.Fatal(err)
 	}
+	specW.Close()
+	readyR, readyW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readyR.Close()
+	cgdir, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := LaunchCommand(LaunchFiles{Control: ctlChild, Cgroup: cgdir, Spec: specR, Result: resChild, Ready: readyW})
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []*os.File{ctlChild, cgdir, specR, resChild, readyW} {
+		f.Close()
+	}
+	pid, pidfd, resErr = RecvLaunchResult(res[0])
+	return pid, pidfd, resErr, cmd.Wait()
 }
 
-// TestSpawnRejectsEmptyRoot 覆盖 Spawn 的参数校验：Root 为空必须报错。
-// 校验发生在 fork/exec 之前，不涉及命名空间，不需要 root。
-func TestSpawnRejectsEmptyRoot(t *testing.T) {
-	devNull, err := os.Open(os.DevNull)
-	if err != nil {
-		t.Fatalf("打开 %s: %v", os.DevNull, err)
-	}
-	defer func() {
-		if err := devNull.Close(); err != nil {
-			t.Errorf("关闭 devNull: %v", err)
-		}
-	}()
-
-	if _, err := Spawn(SpawnConfig{Root: "", ControlFD: devNull}); err == nil {
-		t.Fatal("Root 为空时 Spawn 应当返回错误，实际未报错")
-	}
-}
-
-// TestSpawnRejectsNilControlFD 覆盖 Spawn 的参数校验：ControlFD 为 nil
-// 必须报错。同样发生在 fork/exec 之前，不需要 root。
-func TestSpawnRejectsNilControlFD(t *testing.T) {
-	if _, err := Spawn(SpawnConfig{Root: t.TempDir(), ControlFD: nil}); err == nil {
-		t.Fatal("ControlFD 为 nil 时 Spawn 应当返回错误，实际未报错")
-	}
-}
-
-// TestSpawnStartsInitProcess 覆盖 Spawn 本身：参数拼装、ExtraFiles 挂载、
-// SysProcAttr（Cloneflags/Setpgid/Pdeathsig）组合，以及 /proc/self/exe
-// init 的 re-exec 调用方式。借助 TestMain 的拦截，子进程侧真实跑到了
-// RunInit，并按其“init 尚未实现完整”的既定中间态非零退出。
-func TestSpawnStartsInitProcess(t *testing.T) {
-	testutil.RequireLinuxRoot(t)
-
-	devNull, err := os.Open(os.DevNull)
-	if err != nil {
-		t.Fatalf("打开 %s: %v", os.DevNull, err)
-	}
-	defer func() {
-		if err := devNull.Close(); err != nil {
-			t.Errorf("关闭 ControlFD: %v", err)
-		}
-	}()
-
-	proc, err := Spawn(SpawnConfig{
-		Root:      t.TempDir(),
-		Hostname:  "spawn-test",
-		ControlFD: devNull,
-	})
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
-
-	// Spawn 返回裸 *os.Process，调用方必须自己 Wait() 掉它，否则留
-	// 僵尸进程。用 t.Cleanup 兜底，且失败要用 t.Errorf 报出来——
-	// 静默丢弃的话，进程泄漏会伪装成测试通过（本项目在 cgroup 和
-	// rootfs 两个包都踩过这个坑）。
-	var state *os.ProcessState
-	t.Cleanup(func() {
-		if state != nil {
-			return // 已经在测试主体里 Wait 过了
-		}
-		var waitErr error
-		if state, waitErr = proc.Wait(); waitErr != nil {
-			t.Errorf("兜底 Wait 子进程失败: %v", waitErr)
-		}
-	})
-
-	state, err = proc.Wait()
-	if err != nil {
-		t.Fatalf("Wait 子进程失败: %v", err)
-	}
-	if state.ExitCode() == 0 {
-		t.Fatalf("子进程 ExitCode = 0, want 非零（RunInit 应以“init 尚未实现完整”失败退出）")
+// TestLaunchRejectsUnsafeSpec：启动规格中 uid/gid 范围基址为 0（会把命名空间 root 映射为宿主 root）、
+// 范围为空或越界时，启动进程经结果 socket 报告 launch/spec 失败并以非零码退出，不交还 pidfd。
+// 校验发生在 setgroups 与 clone 之前，不需要 root。
+func TestLaunchRejectsUnsafeSpec(t *testing.T) {
+	for name, s := range map[string]LaunchSpec{
+		"uid 基址 0": {UIDBase: 0, UIDSize: 4096, GIDBase: 100000, GIDSize: 4096},
+		"gid 基址 0": {UIDBase: 100000, UIDSize: 4096, GIDBase: 0, GIDSize: 4096},
+		"uid 范围为空": {UIDBase: 100000, UIDSize: 0, GIDBase: 100000, GIDSize: 4096},
+		"gid 范围越界": {UIDBase: 100000, UIDSize: 4096, GIDBase: 1<<32 - 10, GIDSize: 4096},
+		"未知注入点":    {UIDBase: 100000, UIDSize: 4096, GIDBase: 100000, GIDSize: 4096, FailAt: "nope"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b, err := json.Marshal(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, pidfd, resErr, waitErr := startLaunch(t, b)
+			var le *LaunchError
+			if !errors.As(resErr, &le) || !strings.HasPrefix(le.Reason, "launch/spec: ") {
+				if pidfd >= 0 {
+					syscall.Close(pidfd)
+				}
+				t.Fatalf("结果 = %v，期望 launch/spec 失败", resErr)
+			}
+			var ee *exec.ExitError
+			if !errors.As(waitErr, &ee) || ee.ExitCode() == 0 {
+				t.Fatalf("启动进程退出 = %v，期望非零退出码", waitErr)
+			}
+		})
 	}
 }
 
@@ -204,6 +168,16 @@ func TestMainDispatchesInitToRunInit(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "init 尚未实现完整") {
 		t.Fatalf("stderr 未包含预期的“init 尚未实现完整”，实际输出:\n%s", out)
+	}
+
+	// sandbox-launch 分流：没有继承的 FD 时 RunLaunch 立即失败（不触及凭据与命名空间）。
+	cmd = exec.Command(binPath, LaunchArg)
+	out, err = cmd.CombinedOutput()
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("agentbox sandbox-launch 应以退出码 1 失败，err=%v\n输出:\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "sandbox-launch:") {
+		t.Fatalf("输出未包含 sandbox-launch 的失败原因，实际输出:\n%s", out)
 	}
 }
 

@@ -159,6 +159,55 @@ func TestFaultInjectEnabledOnlyByE2E(t *testing.T) {
 	}
 }
 
+// TestCredentialSyscallsOnlyInLauncher：进程级凭据边界（规格 §4.6 实现门槛 1）——server 进程不调用改变
+// 自身凭据的系统调用（setgroups、set*uid/set*gid、capset，以及作用于全部线程的 AllThreadsSyscall）。
+// 以源码检查：这些调用只出现在 internal/sandbox 的专用启动进程（launch.go）与 stage-2 helper（helper.go）中，
+// 二者都运行在 re-exec 出的独立进程里。experiments/ 下的 spike 不进入任何二进制，不检查。
+func TestCredentialSyscallsOnlyInLauncher(t *testing.T) {
+	root := filepath.Join("..", "..")
+	allowed := map[string]bool{"internal/sandbox/launch.go": true, "internal/sandbox/helper.go": true}
+	// 模式本身的写法不匹配自身（名字被拆成 "Set" 与分组）。
+	cred := regexp.MustCompile(`\b(?:Set(?:groups|resuid|resgid|reuid|regid|uid|gid|fsuid|fsgid)|AllThreadsSyscall6?)\(` +
+		`|\bSYS_(?:SET(?:GROUPS|RESUID|RESGID|REUID|REGID|UID|GID|FSUID|FSGID)(?:32)?|CAPSET)\b`)
+	var inLauncher int
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(root, path)
+		rel = filepath.ToSlash(rel)
+		if d.IsDir() {
+			if rel == "worker" || rel == "web" || rel == "experiments" || d.Name() == "node_modules" ||
+				(strings.HasPrefix(d.Name(), ".") && rel != ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(rel, ".go") {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		ms := cred.FindAllString(string(b), -1)
+		if allowed[rel] {
+			inLauncher += len(ms)
+			return nil
+		}
+		if len(ms) > 0 {
+			t.Errorf("%s 调用了改变凭据的系统调用 %q：只允许在 internal/sandbox 的启动进程与 helper 中", rel, ms)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inLauncher == 0 {
+		t.Fatal("internal/sandbox/launch.go 中没有找到 setgroups 的调用：检查本身失效")
+	}
+}
+
 // forbid 断言 pkg 的传递依赖不含 forbidden 中的包及其子包。
 func forbid(t *testing.T, pkg string, forbidden []string) {
 	t.Helper()
