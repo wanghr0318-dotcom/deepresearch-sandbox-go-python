@@ -51,10 +51,7 @@ func finishRequest(ctx context.Context, tx pgx.Tx, requestID, resourceID string,
 
 // CreateTask 创建任务、控制行、进度行、事件序号行与 task_created 事件（实现 api.Store）。
 func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest) (api.CreateTaskResult, error) {
-	if req.RequestID == "" || req.TaskID == "" || len(req.BodyHash) == 0 || len(req.Spec) == 0 {
-		return api.CreateTaskResult{}, invalidf("CreateTask 缺少 request_id、task_id、body_hash 或 spec")
-	}
-	budget, err := budgetLimit(req.Limits)
+	budget, err := createTaskBudget("CreateTask", req)
 	if err != nil {
 		return api.CreateTaskResult{}, err
 	}
@@ -69,40 +66,55 @@ func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest) (api.
 			res.Replayed = true
 			return json.Unmarshal(stored, &res)
 		}
-		var exists bool // 否则 INSERT 的 23505 会被当作可重试错误一直重试到期限
-		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM tasks WHERE task_id = $1)", req.TaskID).Scan(&exists); err != nil {
-			return err
-		}
-		if exists {
-			return conflictf("任务 %s 已存在", req.TaskID)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO tasks (task_id, spec_json, config_version, limits_json, status, max_fault_retries)
-			VALUES ($1, $2, $3, $4, 'queued', $5)`,
-			req.TaskID, []byte(req.Spec), req.ConfigVersion, nullJSON(req.Limits), req.MaxFaultRetries); err != nil {
-			return err
-		}
-		for _, q := range []string{
-			"INSERT INTO task_control (task_id, control_version, desired) VALUES ($1, 1, 'run')",
-			"INSERT INTO task_progress (task_id) VALUES ($1)",
-			"INSERT INTO task_event_seq (task_id) VALUES ($1)",
-		} {
-			if _, err := tx.Exec(ctx, q, req.TaskID); err != nil {
-				return err
-			}
-		}
-		if _, err := tx.Exec(ctx, "INSERT INTO budgets (task_id, limit_micro) VALUES ($1, $2)", req.TaskID, budget); err != nil {
-			return err
-		}
-		if err := lockEventSeq(ctx, tx, req.TaskID); err != nil {
-			return err
-		}
-		if _, err := appendHostEvent(ctx, tx, hostEvent{taskID: req.TaskID, key: "task_created", typ: "task_created"}); err != nil {
+		if err := createTaskTx(ctx, tx, req, budget, 0); err != nil {
 			return err
 		}
 		res.TaskID = req.TaskID
 		return finishRequest(ctx, tx, req.RequestID, req.TaskID, res)
 	})
 	return res, err
+}
+
+// createTaskBudget 校验创建任务的输入并取出 task 层预算上限（CreateTask 与 CreateResearch 共用）。
+func createTaskBudget(op string, req api.CreateTaskRequest) (int64, error) {
+	if req.RequestID == "" || req.TaskID == "" || len(req.BodyHash) == 0 || len(req.Spec) == 0 {
+		return 0, invalidf("%s 缺少 request_id、task_id、body_hash 或 spec", op)
+	}
+	return budgetLimit(req.Limits)
+}
+
+// createTaskTx 是创建任务的事务体（request 已认领且不是重放）：任务行（owner 为 0 时 owner_user_id 为空）、
+// 控制行、进度行、事件序号行、预算行与 task_created 事件。CreateTask 与 CreateResearch 共用。
+func createTaskTx(ctx context.Context, tx pgx.Tx, req api.CreateTaskRequest, budget, owner int64) error {
+	var exists bool // 否则 INSERT 的 23505 会被当作可重试错误一直重试到期限
+	if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM tasks WHERE task_id = $1)", req.TaskID).Scan(&exists); err != nil {
+		return err
+	}
+	if exists {
+		return conflictf("任务 %s 已存在", req.TaskID)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO tasks (task_id, spec_json, config_version, limits_json, status, max_fault_retries, owner_user_id)
+		VALUES ($1, $2, $3, $4, 'queued', $5, NULLIF($6::bigint, 0))`,
+		req.TaskID, []byte(req.Spec), req.ConfigVersion, nullJSON(req.Limits), req.MaxFaultRetries, owner); err != nil {
+		return err
+	}
+	for _, q := range []string{
+		"INSERT INTO task_control (task_id, control_version, desired) VALUES ($1, 1, 'run')",
+		"INSERT INTO task_progress (task_id) VALUES ($1)",
+		"INSERT INTO task_event_seq (task_id) VALUES ($1)",
+	} {
+		if _, err := tx.Exec(ctx, q, req.TaskID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, "INSERT INTO budgets (task_id, limit_micro) VALUES ($1, $2)", req.TaskID, budget); err != nil {
+		return err
+	}
+	if err := lockEventSeq(ctx, tx, req.TaskID); err != nil {
+		return err
+	}
+	_, err := appendHostEvent(ctx, tx, hostEvent{taskID: req.TaskID, key: "task_created", typ: "task_created"})
+	return err
 }
 
 // budgetLimit 取任务 limits.budget_micro 作为 task 层预算上限（微美元）。缺省时为 0（失败关闭：所有

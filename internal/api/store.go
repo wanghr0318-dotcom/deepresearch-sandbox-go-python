@@ -5,9 +5,44 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"time"
 )
+
+// User 是账号的公开视图（不含密码哈希）。
+type User struct {
+	ID        int64     `json:"-"`
+	Username  string    `json:"username"`
+	Role      string    `json:"role"`
+	Disabled  bool      `json:"disabled"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// Accounts 是账号与会话的存储（postgres 实现）。
+type Accounts interface {
+	// CreateUser 以 key 唯一；重复返回 persistence.ErrConflict。
+	CreateUser(ctx context.Context, display, key, passwordHash string) (User, error)
+	// UserForLogin 返回用户与密码哈希；不存在为 persistence.ErrNotFound。
+	UserForLogin(ctx context.Context, key string) (User, string, error)
+	CreateSession(ctx context.Context, idHash []byte, userID int64, expiresAt time.Time) error
+	// SessionUser 返回会话所属用户；会话不存在、已过期或用户停用均为 persistence.ErrNotFound。
+	SessionUser(ctx context.Context, idHash []byte) (User, error)
+	DeleteSession(ctx context.Context, idHash []byte) error
+	// SetDisabled 设置停用状态；停用时同一事务删除其全部会话。用户不存在为 persistence.ErrNotFound。
+	SetDisabled(ctx context.Context, key string, disabled bool) error
+	ListUsers(ctx context.Context) ([]User, error)
+	// CreateResearch 在锁定用户行后检查该用户没有非终态任务，再按 req 创建任务并写 owner_user_id；
+	// 已有非终态任务返回 ErrUserTaskRunning。以 request_id 幂等（同 CreateTask）。
+	CreateResearch(ctx context.Context, userID int64, req CreateTaskRequest) (CreateTaskResult, error)
+	// TaskOwner 返回任务的 owner（无主为 0）；任务不存在为 persistence.ErrNotFound。
+	TaskOwner(ctx context.Context, taskID string) (int64, error)
+	// ListTasksByOwner 同 ListTasks，只含 owner 的任务。
+	ListTasksByOwner(ctx context.Context, ownerID int64, after string, limit int) ([]TaskView, string, error)
+}
+
+// ErrUserTaskRunning 表示用户已有非终态任务（每用户同时最多 1 个；HTTP 409 user_task_running）。
+var ErrUserTaskRunning = errors.New("api: 用户已有运行中的任务")
 
 // Store 是 API 层的窄接口。每个方法是一个完整的事务用例；错误类别见 internal/persistence。
 type Store interface {

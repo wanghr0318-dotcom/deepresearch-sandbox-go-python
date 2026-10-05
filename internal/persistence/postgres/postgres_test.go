@@ -252,7 +252,8 @@ func TestInstallationBootstrapE46(t *testing.T) {
 			t.Fatal(err)
 		}
 		// 还原为只应用了 0001 的旧库
-		if _, err := s.pool.Exec(ctx, `DROP TABLE call_tries, reservations, calls, budgets;
+		if _, err := s.pool.Exec(ctx, `DROP TABLE call_tries, reservations, calls, budgets, sessions;
+			ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
 			ALTER TABLE installation DROP COLUMN bootstrap_token_hash; DELETE FROM schema_migrations WHERE version >= 2`); err != nil {
 			t.Fatal(err)
 		}
@@ -2595,7 +2596,8 @@ func TestMigrationBackfillsBudgets(t *testing.T) {
 	s := newStore(t, Options{})
 	fixture(t, s, "t1")
 	// 还原为只应用了 0001、0002 的旧库：任务 t1 没有预算行
-	if _, err := s.pool.Exec(ctx, `DROP TABLE call_tries, reservations, calls, budgets; DELETE FROM schema_migrations WHERE version >= 3`); err != nil {
+	if _, err := s.pool.Exec(ctx, `DROP TABLE call_tries, reservations, calls, budgets, sessions; ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
+		DELETE FROM schema_migrations WHERE version >= 3`); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Migrate(ctx); err != nil {
@@ -2835,5 +2837,215 @@ func TestGatewayTaskFactsAndInspect(t *testing.T) {
 	}
 	if in, err = s.Inspect(ctx, "t1"); err != nil || len(in.Calls) != 2 || in.Calls[1].Model != "kimi-k2.6" {
 		t.Fatalf("Inspect 的 model：%+v, %v", in.Calls, err)
+	}
+}
+
+// ---- 账号与会话（migration 0005，M3 Plan 11） ----
+
+// TestAccountUsersAndSessions：用户名大小写不敏感唯一；登录读取；会话命中、过期、删除；停用吊销全部会话，
+// 启用后可重新建会话。
+func TestAccountUsersAndSessions(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	alice, err := s.CreateUser(ctx, "Alice", "alice", "hash-a")
+	if err != nil || alice.ID <= 0 || alice.Username != "Alice" || alice.Role != "user" || alice.Disabled {
+		t.Fatalf("CreateUser = %+v, %v", alice, err)
+	}
+	if again, err := s.CreateUser(ctx, "Alice", "alice", "hash-a"); err != nil || again.ID != alice.ID {
+		t.Fatalf("同一密码哈希的重跑应得到已提交的行：%+v, %v", again, err)
+	}
+	if _, err := s.CreateUser(ctx, "ALICE", "alice", "hash-other"); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("大小写不同的重名应为 ErrConflict，得到 %v", err)
+	}
+	if u, hash, err := s.UserForLogin(ctx, "alice"); err != nil || u.ID != alice.ID || hash != "hash-a" {
+		t.Fatalf("UserForLogin = %+v, %q, %v", u, hash, err)
+	}
+	if _, _, err := s.UserForLogin(ctx, "nobody"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("不存在的用户应为 ErrNotFound，得到 %v", err)
+	}
+
+	live, expired, other := []byte("sess-live"), []byte("sess-expired"), []byte("sess-other")
+	for _, c := range []struct {
+		id  []byte
+		exp time.Time
+	}{{live, time.Now().Add(time.Hour)}, {expired, time.Now().Add(-time.Second)}, {other, time.Now().Add(time.Hour)}} {
+		if err := s.CreateSession(ctx, c.id, alice.ID, c.exp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if u, err := s.SessionUser(ctx, live); err != nil || u.ID != alice.ID || u.Username != "Alice" {
+		t.Fatalf("SessionUser = %+v, %v", u, err)
+	}
+	for name, id := range map[string][]byte{"已过期": expired, "不存在": []byte("nope")} {
+		if _, err := s.SessionUser(ctx, id); !errors.Is(err, persistence.ErrNotFound) {
+			t.Fatalf("%s的会话应为 ErrNotFound，得到 %v", name, err)
+		}
+	}
+	if err := s.DeleteSession(ctx, live); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SessionUser(ctx, live); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("删除后的会话应为 ErrNotFound，得到 %v", err)
+	}
+
+	if err := s.SetDisabled(ctx, "alice", true); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM sessions WHERE user_id = $1", alice.ID); n != 0 {
+		t.Fatalf("停用应删除全部会话，剩 %d", n)
+	}
+	if _, err := s.SessionUser(ctx, other); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("停用后会话应为 ErrNotFound，得到 %v", err)
+	}
+	// 停用期间写入的会话行（例如停用与登录并发）也不能通过 SessionUser。
+	if err := s.CreateSession(ctx, []byte("sess-while-disabled"), alice.ID, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SessionUser(ctx, []byte("sess-while-disabled")); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("停用用户的会话应为 ErrNotFound，得到 %v", err)
+	}
+	if err := s.SetDisabled(ctx, "nobody", true); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("停用不存在的用户应为 ErrNotFound，得到 %v", err)
+	}
+	if err := s.SetDisabled(ctx, "alice", false); err != nil {
+		t.Fatal(err)
+	}
+	fresh := []byte("sess-fresh")
+	if err := s.CreateSession(ctx, fresh, alice.ID, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if u, err := s.SessionUser(ctx, fresh); err != nil || u.ID != alice.ID {
+		t.Fatalf("启用后的新会话 = %+v, %v", u, err)
+	}
+
+	if _, err := s.CreateUser(ctx, "bob", "bob", "hash-b"); err != nil {
+		t.Fatal(err)
+	}
+	users, err := s.ListUsers(ctx)
+	if err != nil || len(users) != 2 || users[0].Username != "Alice" || users[1].Username != "bob" {
+		t.Fatalf("ListUsers = %+v, %v", users, err)
+	}
+}
+
+// TestAccountCreateResearch：每用户同时最多 1 个非终态任务；终态后可再提交；request_id 重放不受限制且只属于
+// 原用户；并发提交只有一个成功（用户行锁）；停用用户不能提交；ListTasksByOwner 只含自己的任务；无主任务的
+// owner 为 0。
+func TestAccountCreateResearch(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	alice, err := s.CreateUser(ctx, "alice", "alice", "hash-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := s.CreateUser(ctx, "bob", "bob", "hash-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	research := func(user int64, reqID, taskID string) (api.CreateTaskResult, error) {
+		return s.CreateResearch(ctx, user, api.CreateTaskRequest{RequestID: reqID, BodyHash: []byte("h-" + reqID), TaskID: taskID,
+			Spec: json.RawMessage(`{"topic":"x"}`), Limits: json.RawMessage(`{"budget_micro":100}`)})
+	}
+
+	if r, err := research(alice.ID, "ra1", "a1"); err != nil || r.TaskID != "a1" || r.Replayed {
+		t.Fatalf("第一次 CreateResearch = %+v, %v", r, err)
+	}
+	if owner, err := s.TaskOwner(ctx, "a1"); err != nil || owner != alice.ID {
+		t.Fatalf("TaskOwner(a1) = %d, %v", owner, err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM budgets WHERE task_id = 'a1' AND limit_micro = 100"); n != 1 {
+		t.Fatal("CreateResearch 应与 CreateTask 一样写入预算行")
+	}
+	if _, err := research(alice.ID, "ra2", "a2"); !errors.Is(err, api.ErrUserTaskRunning) {
+		t.Fatalf("已有非终态任务应为 ErrUserTaskRunning，得到 %v", err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM api_requests WHERE request_id = 'ra2'"); n != 0 {
+		t.Fatal("被拒绝的请求不应留下 request 记录")
+	}
+	if r, err := research(alice.ID, "ra1", "a1"); err != nil || r.TaskID != "a1" || !r.Replayed {
+		t.Fatalf("重放（任务仍运行中）应返回原任务：%+v, %v", r, err)
+	}
+	if _, err := s.CreateResearch(ctx, bob.ID, api.CreateTaskRequest{RequestID: "ra1", BodyHash: []byte("h-ra1"), TaskID: "b9",
+		Spec: json.RawMessage(`{}`)}); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("他人的 request_id 重放应为 ErrConflict，得到 %v", err)
+	}
+	if r, err := research(bob.ID, "rb1", "b1"); err != nil || r.TaskID != "b1" {
+		t.Fatalf("另一用户不受影响：%+v, %v", r, err)
+	}
+	if _, err := s.pool.Exec(ctx, "UPDATE tasks SET status = 'succeeded' WHERE task_id = 'a1'"); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := research(alice.ID, "ra3", "a3"); err != nil || r.TaskID != "a3" {
+		t.Fatalf("终态后应可再提交：%+v, %v", r, err)
+	}
+
+	// 并发：两个不同 request_id 同时提交，只有一个成功（用户行 FOR UPDATE 串行化计数与插入）。
+	if _, err := s.pool.Exec(ctx, "UPDATE tasks SET status = 'cancelled' WHERE task_id = 'a3'"); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	start := make(chan struct{})
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, errs[i] = research(alice.ID, fmt.Sprintf("rc%d", i), fmt.Sprintf("c%d", i))
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	ok, running := 0, 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			ok++
+		case errors.Is(err, api.ErrUserTaskRunning):
+			running++
+		default:
+			t.Fatalf("并发提交的意外错误：%v", err)
+		}
+	}
+	if ok != 1 || running != 1 {
+		t.Fatalf("并发提交应恰好一个成功：成功 %d，被拒 %d", ok, running)
+	}
+
+	if err := s.SetDisabled(ctx, "bob", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, "UPDATE tasks SET status = 'failed' WHERE task_id = 'b1'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := research(bob.ID, "rb2", "b2"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("停用用户提交应为 ErrNotFound，得到 %v", err)
+	}
+
+	fixture(t, s, "ops1") // 经 CreateTask 创建的无主任务
+	if owner, err := s.TaskOwner(ctx, "ops1"); err != nil || owner != 0 {
+		t.Fatalf("无主任务的 owner = %d, %v", owner, err)
+	}
+	if _, err := s.TaskOwner(ctx, "missing"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("不存在的任务应为 ErrNotFound，得到 %v", err)
+	}
+	var seen []string
+	cursor := ""
+	for page := 0; page < 4; page++ {
+		views, next, err := s.ListTasksByOwner(ctx, alice.ID, cursor, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, v := range views {
+			seen = append(seen, v.TaskID)
+		}
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	if len(seen) != 3 || seen[1] != "a3" || seen[2] != "a1" || (seen[0] != "c0" && seen[0] != "c1") {
+		t.Fatalf("ListTasksByOwner 应只含 alice 的任务、倒序：%v", seen)
+	}
+	if all, _, err := s.ListTasks(ctx, "", 10); err != nil || len(all) != 5 {
+		t.Fatalf("ListTasks 应含全部任务：%d, %v", len(all), err)
 	}
 }

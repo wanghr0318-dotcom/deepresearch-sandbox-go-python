@@ -11,16 +11,30 @@ import (
 
 // ListTasks 按创建时间倒序 keyset 分页（实现 api.Store）。
 func (s *Store) ListTasks(ctx context.Context, after string, limit int) ([]api.TaskView, string, error) {
+	return s.listTasks(ctx, "ListTasks", 0, after, limit)
+}
+
+// ListTasksByOwner 同 ListTasks，只含 owner_user_id = ownerID 的任务（实现 api.Accounts）。
+func (s *Store) ListTasksByOwner(ctx context.Context, ownerID int64, after string, limit int) ([]api.TaskView, string, error) {
+	if ownerID <= 0 {
+		return nil, "", invalidf("ListTasksByOwner 的 ownerID 必须为正")
+	}
+	return s.listTasks(ctx, "ListTasksByOwner", ownerID, after, limit)
+}
+
+// listTasks 是 ListTasks 与 ListTasksByOwner 的共同实现：owner 为 0 时不按归属过滤。
+func (s *Store) listTasks(ctx context.Context, op string, owner int64, after string, limit int) ([]api.TaskView, string, error) {
 	if limit < 1 {
-		return nil, "", invalidf("ListTasks 的 limit 必须为正")
+		return nil, "", invalidf("%s 的 limit 必须为正", op)
 	}
 	var out []api.TaskView
-	err := s.read(ctx, "ListTasks", func(ctx context.Context, q queryer) error {
+	err := s.read(ctx, op, func(ctx context.Context, q queryer) error {
 		rows, err := q.Query(ctx, `SELECT t.task_id, t.status, t.status_reason, COALESCE(t.current_attempt_id, ''), c.desired,
 				c.control_version, t.applied_control_version, t.attempts_total
 			FROM tasks t JOIN task_control c USING (task_id)
-			WHERE $1 = '' OR (t.created_at, t.task_id) < (SELECT created_at, task_id FROM tasks WHERE task_id = $1)
-			ORDER BY t.created_at DESC, t.task_id DESC LIMIT $2`, after, limit)
+			WHERE ($3::bigint = 0 OR t.owner_user_id = $3::bigint)
+				AND ($1 = '' OR (t.created_at, t.task_id) < (SELECT created_at, task_id FROM tasks WHERE task_id = $1))
+			ORDER BY t.created_at DESC, t.task_id DESC LIMIT $2`, after, limit, owner)
 		if err != nil {
 			return err
 		}
