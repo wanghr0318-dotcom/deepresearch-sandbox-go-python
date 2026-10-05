@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/account"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/jcs"
@@ -531,9 +532,17 @@ func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
 	return ok
 }
 
-// readJSON 严格解码 JSON 请求体；失败时返回带解码细节的消息（不写响应）。
+// readJSON 严格解码 JSON 请求体；失败时返回带解码细节的消息（不写响应）。请求体须为 UTF-8（RFC 8259 §8.1）：
+// encoding/json 会把非法字节静默替换为 U+FFFD，不先检查就会把乱码当作合法输入存下来（例如以 GBK 发送的中文主题）。
 func readJSON(w http.ResponseWriter, r *http.Request, v any) (string, bool) {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		return "请求体读取失败或超过上限: " + err.Error(), false
+	}
+	if !utf8.Valid(body) {
+		return "请求体须为 UTF-8 编码的 JSON", false
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	dec.UseNumber()
 	if err := dec.Decode(v); err != nil {

@@ -1810,6 +1810,9 @@ func TestResearch(t *testing.T) {
 	}
 	st, b, _ := ts.do("POST", "/research", `{"request_id":"r1","topic":"x","spec":{"model":"gpt"}}`, session(ca))
 	expect(t, st, b, 400, "invalid_request") // 用户不能指定 spec
+	// 非 UTF-8 请求体（例如以 GBK 发送的"量子"）被拒绝，而不是被 encoding/json 静默替换为 U+FFFD 后存下乱码。
+	st, b, _ = ts.do("POST", "/research", "{\"request_id\":\"gbk\",\"topic\":\"\xc1\xbf\xd7\xd3\"}", session(ca))
+	expect(t, st, b, 400, "invalid_request")
 
 	st, b, _ = ts.do("POST", "/research", `{"request_id":"r1","topic":"  量子计算  "}`, session(ca))
 	expect(t, st, b, 202, "")
