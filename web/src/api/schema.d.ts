@@ -4,6 +4,96 @@
  */
 
 export interface paths {
+    "/auth/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create a user account and sign in (anonymous; rate limited per IP) */
+        post: operations["register"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Sign in (anonymous; rate limited per IP) */
+        post: operations["login"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Sign out (deletes the session; session only) */
+        post: operations["logout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The signed-in user (session only) */
+        get: operations["me"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/research": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a research task on a topic (session only; idempotent by request_id)
+         * @description The server builds the task spec from the topic (fixed orchestrator and worker models and search
+         *     configuration) and applies the server's default limits; the user cannot choose models, budget or
+         *     limits. The task is owned by the user. A user may have at most one non-terminal task at a time.
+         */
+        post: operations["createResearch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/status": {
         parameters: {
             query?: never;
@@ -11,7 +101,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Health and service mode */
+        /** Health and service mode (anonymous when accounts are enabled) */
         get: operations["getStatus"];
         put?: never;
         post?: never;
@@ -48,7 +138,10 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Current view of a task */
+        /**
+         * Current view of a task
+         * @description A user (session) gets the same view without `current_attempt_id`; `GET /tasks` lists use the same view. The operator view is unchanged.
+         */
         get: operations["getTask"];
         put?: never;
         post?: never;
@@ -130,6 +223,19 @@ export interface paths {
          *     Resume with `Last-Event-ID`; all events are kept in v0.2, so cursors never expire. A heartbeat
          *     comment line (`: heartbeat`) is sent every 15 s and takes no sequence number. The server closes
          *     the stream after `task_terminal`; clients stop reconnecting once they receive it.
+         *
+         *     User view (session caller; the operator sees every event unchanged). Only these events are sent,
+         *     keyed `source/type`, and their `payload` keeps only the listed fields:
+         *     `host/task_created` (none), `host/attempt_created` (`attempt_no`),
+         *     `host/control_accepted` (`desired`, `control_version`), `host/control_applied` (`status`,
+         *     `control_version`), `host/checkpoint_committed` (`checkpoint_id`, `commit_seq`, `step_id`),
+         *     `host/artifact_saved` (`artifact_id`, `version`), `host/attempt_ended` and `host/task_terminal`
+         *     (`task_status`, `status_reason`), `worker/progress` (`step_id`, `kind`, `message`),
+         *     `worker/result` (`summary`, `outputs`). `worker_seq` is omitted. Every other event (for example
+         *     Gateway `replay_divergence`, worker `ready`, `checkpoint`, `checkpoint_query`, `artifact`,
+         *     `paused`, `error`) is not sent, and no cost, budget, model, call, try, usage, token or
+         *     environment field is ever sent. Dropped events keep their task_seq, so ids stay increasing with
+         *     gaps, and any existing task_seq (including a dropped one) is a valid `Last-Event-ID`.
          */
         get: operations["streamTaskEvents"];
         put?: never;
@@ -250,6 +356,20 @@ export interface components {
                 breaker_open?: number;
                 integrity_failure?: number;
             };
+        };
+        Credentials: {
+            username: string;
+            password: string;
+        };
+        User: {
+            username: string;
+            /** @enum {string} */
+            role: "user" | "admin";
+        };
+        ResearchRequest: {
+            request_id: string;
+            /** @description Trimmed of surrounding whitespace before validation */
+            topic: string;
         };
         CreateTaskRequest: {
             request_id: string;
@@ -455,7 +575,7 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description `unauthorized`: missing or wrong Bearer token */
+        /** @description `unauthorized`: missing or wrong Bearer token, or (accounts enabled) no valid session */
         Unauthorized: {
             headers: {
                 [name: string]: unknown;
@@ -464,7 +584,7 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description `forbidden_host` or `forbidden_origin`: Host or Origin is not in the allowlist */
+        /** @description `forbidden_host` or `forbidden_origin`: Host or Origin is not in the allowlist; or `forbidden` (accounts enabled): the operation is not open to this kind of caller (operator-only for a user, session-only for the operator) */
         Forbidden: {
             headers: {
                 [name: string]: unknown;
@@ -473,7 +593,16 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description `task_not_found` */
+        /** @description `rate_limited`: too many attempts from this client IP */
+        RateLimited: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description `task_not_found` (for a user also: another user's task or an unowned task) */
         NotFound: {
             headers: {
                 [name: string]: unknown;
@@ -542,6 +671,187 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    register: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Credentials"];
+            };
+        };
+        responses: {
+            /** @description Account created; the response sets the `agentbox_session` cookie */
+            201: {
+                headers: {
+                    /** @description `agentbox_session=...; Path=/; Max-Age=604800; HttpOnly; SameSite=Strict` (plus `Secure` on TLS) */
+                    "Set-Cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["User"];
+                };
+            };
+            /** @description `invalid_request`, `invalid_username` (3–32 of `[A-Za-z0-9_.-]`) or `invalid_password` (8–128 characters) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description `username_taken`: the username is taken (case-insensitive) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    login: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Credentials"];
+            };
+        };
+        responses: {
+            /** @description Signed in; the response sets the `agentbox_session` cookie */
+            200: {
+                headers: {
+                    /** @description `agentbox_session=...; Path=/; Max-Age=604800; HttpOnly; SameSite=Strict` (plus `Secure` on TLS) */
+                    "Set-Cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["User"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description `invalid_credentials`: the same body for an unknown user, a wrong password and a disabled account; or `unauthorized` (wrong Bearer token) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            403: components["responses"]["Forbidden"];
+            429: components["responses"]["RateLimited"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    logout: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session deleted; the response clears the cookie (`Max-Age=0`) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    me: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The user */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["User"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    createResearch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResearchRequest"];
+            };
+        };
+        responses: {
+            /** @description Research task created, or the first result of the same request replayed */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateTaskResult"];
+                };
+            };
+            /** @description `invalid_request`; or `invalid_topic`: the trimmed topic is empty or longer than 500 characters */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description `user_task_running`: the user already has a non-terminal task; or `request_conflict` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
     getStatus: {
         parameters: {
             query?: never;

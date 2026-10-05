@@ -1,5 +1,7 @@
 // agentbox HTTP API 客户端（规格 §15.1、§15.4；契约 api/openapi.yaml）。
 // - 只用 fetch；token 只放在 Authorization 头，从不进入 URL。
+// - 每个请求都带 credentials: 'same-origin'：用户页不配置 token（不发 Authorization 头），
+//   由浏览器自动携带 HttpOnly 会话 cookie（agentbox_session），脚本从不读写它（见 session.ts）。
 // - 非 2xx 的错误体映射为 ApiError（code/message）。
 // - 写请求带 request_id；可重试错误（网络错误、5xx 除 501 与 503 服务模式错误）按有界退避重试，
 //   请求体在重试间保持不变，所以 request_id 被复用，服务端按幂等语义返回首次结果。
@@ -19,6 +21,9 @@ export type ControlResult = Schemas["ControlResult"];
 export type TaskResult = Schemas["Result"];
 export type Inspection = Schemas["Inspection"];
 export type ErrorBody = Schemas["Error"];
+export type User = Schemas["User"];
+export type Credentials = Schemas["Credentials"];
+export type ResearchRequest = Schemas["ResearchRequest"];
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 

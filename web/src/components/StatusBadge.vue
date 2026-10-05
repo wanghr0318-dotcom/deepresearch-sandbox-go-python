@@ -1,11 +1,12 @@
 <template>
-  <span class="badge" :class="cls" :title="title">{{ status || "unknown" }}</span>
+  <span class="badge" :class="cls" :title="title">{{ label || status || "unknown" }}</span>
 </template>
 
 <script setup lang="ts">
 import { computed } from "vue";
 
-const props = defineProps<{ status: string; title?: string }>();
+// label：显示文字（用户页用中文状态名）；缺省显示原始状态值（工作台）。
+const props = defineProps<{ status: string; title?: string; label?: string }>();
 
 const KNOWN = new Set(["queued", "running", "pausing", "paused", "cancelling", "cancelled", "succeeded", "failed"]);
 

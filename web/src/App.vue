@@ -1,365 +1,168 @@
 <template>
-  <div class="shell">
-    <!-- 左侧边栏（结构与样式沿用 helloagents 工作台） -->
-    <nav class="sidebar">
-      <div class="sidebar-logo">
-        <svg viewBox="0 0 24 24" class="logo-icon" aria-hidden="true">
-          <path
-            d="M12 2.5c-.7 0-1.4.2-2 .6L4.6 7C3.6 7.6 3 8.7 3 9.9v4.2c0 1.2.6 2.3 1.6 2.9l5.4 3.9c1.2.8 2.8.8 4 0l5.4-3.9c1-.7 1.6-1.7 1.6-2.9V9.9c0-1.2-.6-2.3-1.6-2.9L14 3.1a3.6 3.6 0 0 0-2-.6Z"
-          />
-        </svg>
-        <span class="logo-text">agentbox 工作台</span>
-      </div>
+  <!-- 运维工作台：#/admin/...（TokenGate 与全部视图不变） -->
+  <AdminApp v-if="isAdminRoute(route)" :route="route" />
 
-      <div class="sidebar-section-label">导航</div>
-      <div class="nav-links">
-        <a class="nav-link" :class="{ active: route.name === 'tasks' }" :href="tasksHref()">任务列表</a>
-        <a v-if="route.name === 'task'" class="nav-link active mono" :href="taskHref(route.id)" :title="route.id">
-          {{ shortId(route.id, 18) }}
-        </a>
-      </div>
+  <!-- 用户页：DeepResearch 助手（cookie 会话） -->
+  <div v-else class="user-shell">
+    <header v-if="user" class="topbar">
+      <a class="topbar-brand" :href="homeHref()">
+        <BrandMark />
+        <span>DeepResearch 助手</span>
+      </a>
+      <span class="spacer"></span>
+      <span class="topbar-user" data-testid="username">{{ user.username }}</span>
+      <button class="btn small" type="button" data-action="logout" :disabled="signingOut" @click="logout">退出登录</button>
+    </header>
 
-      <div class="sidebar-section-label">访问令牌</div>
-      <div class="token-state">
-        {{ authState.hasToken ? `已设置（${authState.persistence === "session" ? "sessionStorage" : "仅内存"}）` : "未设置" }}
-      </div>
-      <form class="token-form" autocomplete="off" @submit.prevent="saveToken">
-        <input
-          v-model="tokenInput"
-          class="token-input"
-          type="password"
-          autocomplete="off"
-          placeholder="Bearer token（本机访问可留空）"
-          aria-label="API token"
-        />
-        <label class="token-persist">
-          <input v-model="persistSession" type="checkbox" />
-          本标签页内记住（sessionStorage）
-        </label>
-        <div class="token-actions">
-          <button class="new-btn" type="submit">保存</button>
-          <button class="ghost-btn" type="button" @click="clearToken">清除</button>
-        </div>
-      </form>
-
-      <div class="sidebar-footer">
-        <div class="conn-dot" :class="statusClass"></div>
-        <span class="conn-text">{{ statusText }}</span>
-        <button class="ghost-btn small" type="button" @click="refreshStatus">刷新</button>
-      </div>
-    </nav>
-
-    <!-- 主内容区：hash 路由（#/tasks、#/tasks/<id>），不与 API 路径冲突 -->
-    <main class="main">
-      <div v-if="status && status.mode !== 'normal'" class="mode-banner" role="status">
-        {{ MODE_TEXT[status.mode] ?? status.mode }}
-      </div>
-      <TokenGate v-if="!authState.hasToken && !authState.skipped" @done="refreshStatus" />
-      <TaskDetailView v-else-if="route.name === 'task'" :id="route.id" :key="`${route.id}:${authEpoch}`" />
-      <TaskListView v-else :key="`list:${authEpoch}`" />
+    <main class="user-main">
+      <div v-if="!checked" class="empty">加载中…</div>
+      <template v-else-if="route.name === 'login' || route.name === 'register'">
+        <div v-if="connError" class="conn-error user-error" role="alert">{{ connError }}</div>
+        <LoginView v-if="route.name === 'login'" @signed-in="signedIn" />
+        <RegisterView v-else @signed-in="signedIn" />
+      </template>
+      <template v-else-if="user">
+        <ResearchDetailView v-if="route.name === 'research'" :id="route.id" :key="route.id" @unauthorized="signedOut" />
+        <AssistantView v-else @unauthorized="signedOut" />
+      </template>
     </main>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, provide, ref } from "vue";
-import { ApiError } from "./api/client";
-import type { Status } from "./api/client";
-import TokenGate from "./components/TokenGate.vue";
-import { authState, clearToken as clearStoredToken, setToken } from "./lib/authState";
-import { shortId } from "./lib/format";
-import { taskHref, tasksHref, useHashRoute } from "./lib/router";
-import { defaultServices, servicesKey } from "./lib/services";
-import TaskDetailView from "./views/TaskDetailView.vue";
-import TaskListView from "./views/TaskListView.vue";
-
-const services = defaultServices();
-provide(servicesKey, services);
-const api = services.api;
-
-const MODE_TEXT: Record<string, string> = {
-  diagnostic: "服务处于诊断模式：只读，提交与控制会被拒绝（diagnostic_mode）。",
-  ownership_lost: "服务已失去数据目录所有权：不再提交任何写入（ownership_lost）。",
-};
+import { onMounted, ref, watch } from "vue";
+import AdminApp from "./AdminApp.vue";
+import type { User } from "./api/client";
+import BrandMark from "./components/BrandMark.vue";
+import { userErrorMessage } from "./lib/research";
+import { homeHref, isAdminRoute, loginHref, navigate, needsSession, useHashRoute } from "./lib/router";
+import { useUserServices } from "./lib/userServices";
+import AssistantView from "./views/AssistantView.vue";
+import LoginView from "./views/LoginView.vue";
+import RegisterView from "./views/RegisterView.vue";
+import ResearchDetailView from "./views/ResearchDetailView.vue";
 
 const route = useHashRoute();
-// 令牌变化后重建视图，使请求与事件流使用新令牌。
-const authEpoch = ref(0);
-const tokenInput = ref("");
-const persistSession = ref(authState.persistence === "session");
-const status = ref<Status | null>(null);
-const statusError = ref("");
+const { api } = useUserServices();
 
-const statusClass = computed(() => {
-  if (statusError.value) return "err";
-  if (!status.value) return "warn";
-  return status.value.mode === "normal" ? "ok" : "warn";
-});
+// 当前登录用户：只来自 GET /auth/me 与登录/注册的响应；会话 cookie 是 HttpOnly 的，脚本从不接触。
+const user = ref<User | null>(null);
+const checked = ref(false);
+const connError = ref("");
+const signingOut = ref(false);
 
-const statusText = computed(() => {
-  if (statusError.value) return statusError.value;
-  if (!status.value) return "连接中...";
-  return `模式：${status.value.mode}`;
-});
+/** 守卫：未登录访问用户页 → #/login；已登录访问登录/注册页 → #/。 */
+function guard(): void {
+  if (!checked.value || isAdminRoute(route.value)) return;
+  if (!user.value && needsSession(route.value)) navigate(loginHref());
+  else if (user.value && (route.value.name === "login" || route.value.name === "register")) navigate(homeHref());
+}
 
-async function refreshStatus(): Promise<void> {
-  statusError.value = "";
+async function checkSession(): Promise<void> {
   try {
-    status.value = await api.getStatus();
+    user.value = await api.me();
+    connError.value = "";
   } catch (e) {
-    status.value = null;
-    statusError.value = e instanceof ApiError ? `${e.status} ${e.code}` : "无法连接服务";
+    user.value = null;
+    connError.value = userErrorMessage(e);
+  } finally {
+    checked.value = true;
+    guard();
   }
 }
 
-function saveToken(): void {
-  setToken(tokenInput.value, persistSession.value ? "session" : "memory");
-  tokenInput.value = "";
-  authEpoch.value++;
-  void refreshStatus();
+function signedIn(u: User): void {
+  user.value = u;
+  connError.value = "";
+  navigate(homeHref());
 }
 
-function clearToken(): void {
-  clearStoredToken();
-  persistSession.value = false;
-  authEpoch.value++;
-  void refreshStatus();
+function signedOut(): void {
+  user.value = null;
+  navigate(loginHref());
 }
+
+async function logout(): Promise<void> {
+  signingOut.value = true;
+  try {
+    await api.logout();
+  } catch {
+    // 网络失败时本地仍退出；服务端会话到期自然失效。
+  } finally {
+    signingOut.value = false;
+    signedOut();
+  }
+}
+
+watch(route, guard);
 
 onMounted(() => {
-  if (!window.location.hash) window.location.hash = tasksHref().slice(1);
-  void refreshStatus();
+  // 工作台不需要用户会话；只有用户页才查询登录状态。
+  if (isAdminRoute(route.value)) {
+    checked.value = true;
+    return;
+  }
+  void checkSession();
 });
+
+// 从工作台切回用户页时补查一次登录状态。
+watch(
+  () => isAdminRoute(route.value),
+  (admin, wasAdmin) => {
+    if (!admin && wasAdmin && !user.value) {
+      checked.value = false;
+      void checkSession();
+    }
+  },
+);
 </script>
 
 <style scoped>
-.shell {
+.user-shell {
+  min-height: 100vh;
   display: flex;
-  height: 100vh;
-  overflow: hidden;
+  flex-direction: column;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-  background: #f9fafb;
   color: #111827;
+  background:
+    radial-gradient(1200px 420px at 50% -120px, rgba(124, 58, 237, 0.09), transparent 70%),
+    #f9fafb;
 }
-
-.sidebar {
-  width: 240px;
-  flex-shrink: 0;
-  background: #111827;
-  display: flex;
-  flex-direction: column;
-  overflow-y: auto;
-  border-right: 1px solid #1f2937;
-}
-
-.sidebar-logo {
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 20px 16px 12px;
-  border-bottom: 1px solid #1f2937;
+  gap: 12px;
+  padding: 12px 24px;
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid #e5e7eb;
 }
-
-.logo-icon {
-  width: 28px;
-  height: 28px;
-  fill: #7c3aed;
-  flex-shrink: 0;
-}
-
-.logo-text {
+.topbar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
   font-size: 0.95rem;
-  font-weight: 700;
-  color: #f9fafb;
-  letter-spacing: -0.02em;
-}
-
-.sidebar-section-label {
-  padding: 12px 16px 6px;
-  font-size: 0.7rem;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: #4b5563;
-}
-
-.token-form {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 0 12px;
-  flex: 1;
-}
-
-.token-input {
-  width: 100%;
-  padding: 8px 10px;
-  border-radius: 6px;
-  border: 1px solid #374151;
-  background: #1f2937;
-  color: #f9fafb;
-  font-size: 0.82rem;
-}
-
-.nav-links {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 0 8px 6px;
-}
-
-.nav-link {
-  display: block;
-  padding: 7px 10px;
-  border-radius: 6px;
-  color: #9ca3af;
-  font-size: 0.85rem;
-  text-decoration: none;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.nav-link:hover {
-  background: #1f2937;
-  color: #e5e7eb;
-}
-.nav-link.active {
-  background: #1f2937;
-  color: #f9fafb;
-  font-weight: 600;
-}
-.nav-link.mono {
-  font-family: "JetBrains Mono", Consolas, monospace;
-  font-size: 0.76rem;
-  padding-left: 20px;
-}
-
-.token-state {
-  padding: 0 16px 8px;
-  font-size: 0.75rem;
-  color: #9ca3af;
-}
-
-.mode-banner {
-  padding: 10px 32px;
-  background: #fef3c7;
-  color: #78350f;
-  border-bottom: 1px solid #fde68a;
-  font-size: 0.85rem;
-  font-weight: 600;
-}
-
-.token-persist {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.75rem;
-  color: #9ca3af;
-}
-
-.token-actions {
-  display: flex;
-  gap: 8px;
-}
-
-.new-btn {
-  padding: 8px 14px;
-  background: #7c3aed;
-  color: white;
-  border: none;
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 0.85rem;
-  font-weight: 600;
-  transition: background 0.15s;
-}
-.new-btn:hover {
-  background: #6d28d9;
-}
-
-.ghost-btn {
-  padding: 8px 14px;
-  background: transparent;
-  color: #9ca3af;
-  border: 1px solid #374151;
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 0.85rem;
-}
-.ghost-btn:hover {
-  color: #d1d5db;
-  background: #1f2937;
-}
-.ghost-btn.small {
-  margin-left: auto;
-  padding: 2px 8px;
-  font-size: 0.72rem;
-}
-
-.sidebar-footer {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 14px 16px;
-  border-top: 1px solid #1f2937;
-}
-
-.conn-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-.conn-dot.ok {
-  background: #10b981;
-  box-shadow: 0 0 6px rgba(16, 185, 129, 0.5);
-}
-.conn-dot.warn {
-  background: #f59e0b;
-}
-.conn-dot.err {
-  background: #ef4444;
-}
-
-.conn-text {
-  font-size: 0.75rem;
-  color: #6b7280;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.main {
-  flex: 1;
-  overflow-y: auto;
-  background: #ffffff;
-  display: flex;
-  flex-direction: column;
-}
-
-.welcome {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding: 60px 24px 40px;
-  max-width: 760px;
-  margin: 0 auto;
-  width: 100%;
-  gap: 8px;
-}
-
-.welcome-title {
-  font-size: 2rem;
-  font-weight: 700;
   color: #111827;
-  margin: 0;
-  letter-spacing: -0.03em;
+  text-decoration: none;
+  letter-spacing: -0.01em;
 }
-
-.welcome-sub {
-  font-size: 1rem;
-  color: #6b7280;
-  margin: 0;
+.topbar-user {
+  font-size: 0.85rem;
+  color: #4b5563;
+  font-weight: 600;
+}
+.user-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+.conn-error {
+  max-width: 400px;
+  width: calc(100% - 40px);
+  margin: 32px auto -24px;
 }
 </style>

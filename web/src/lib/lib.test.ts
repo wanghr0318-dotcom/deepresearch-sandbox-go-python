@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { ApiError, NetworkError } from "../api/client";
-import { ev } from "../components/testkit";
+import { ev, task } from "../components/testkit";
 import { collectArtifacts } from "./artifacts";
 import { controlAvailability } from "./controls";
 import { describeError } from "./errors";
 import { downloadFilename, previewKindForDownload, previewKindOf } from "./media";
-import { parseHash, taskHref, tasksHref } from "./router";
+import { homeHref, isAdminRoute, loginHref, needsSession, parseHash, registerHref, researchHref, taskHref, tasksHref } from "./router";
+import { canCancel, countEvidence, deriveProgress, reportFilename, reportTitle, statusLabel, userErrorMessage } from "./research";
 import { ROOT_LANE, lanes, mergeEvents } from "./timeline";
 
 describe("mergeEvents", () => {
@@ -92,13 +93,31 @@ describe("collectArtifacts", () => {
 
 describe("hash router", () => {
   it("keeps page routes behind # so they never collide with API paths", () => {
-    expect(tasksHref()).toBe("#/tasks");
-    expect(taskHref("a/b?c")).toBe("#/tasks/a%2Fb%3Fc");
+    expect(tasksHref()).toBe("#/admin/tasks");
+    expect(taskHref("a/b?c")).toBe("#/admin/tasks/a%2Fb%3Fc");
     expect(parseHash(taskHref("a/b?c"))).toEqual({ name: "task", id: "a/b?c" });
-    expect(parseHash("#/tasks")).toEqual({ name: "tasks" });
-    expect(parseHash("")).toEqual({ name: "tasks" });
-    expect(parseHash("#/tasks/x/events")).toEqual({ name: "tasks" });
-    for (const href of [tasksHref(), taskHref("t-1")]) expect(href.startsWith("#")).toBe(true);
+    expect(parseHash("#/admin")).toEqual({ name: "tasks" });
+    expect(parseHash("#/admin/tasks")).toEqual({ name: "tasks" });
+    expect(parseHash("#/tasks/t-1")).toEqual({ name: "task", id: "t-1" }); // 旧链接仍进工作台
+    expect(parseHash("#/admin/tasks/x/events")).toEqual({ name: "tasks" });
+    for (const href of [tasksHref(), taskHref("t-1"), homeHref(), loginHref(), registerHref(), researchHref("r")]) {
+      expect(href.startsWith("#")).toBe(true);
+    }
+  });
+
+  it("routes the user pages", () => {
+    expect(parseHash("")).toEqual({ name: "home" });
+    expect(parseHash("#/")).toEqual({ name: "home" });
+    expect(parseHash("#/nope")).toEqual({ name: "home" });
+    expect(parseHash("#/login")).toEqual({ name: "login" });
+    expect(parseHash("#/register")).toEqual({ name: "register" });
+    expect(researchHref("a/b")).toBe("#/research/a%2Fb");
+    expect(parseHash(researchHref("a/b"))).toEqual({ name: "research", id: "a/b" });
+    expect(needsSession(parseHash("#/"))).toBe(true);
+    expect(needsSession(parseHash("#/research/x"))).toBe(true);
+    expect(needsSession(parseHash("#/login"))).toBe(false);
+    expect(isAdminRoute(parseHash("#/admin"))).toBe(true);
+    expect(isAdminRoute(parseHash("#/research/x"))).toBe(false);
   });
 });
 
@@ -112,5 +131,44 @@ describe("describeError", () => {
     expect(describeError(new ApiError(400, "budget_something_new", "")).title).toBe("预算限制");
     expect(describeError(new ApiError(418, "teapot", "x")).title).toContain("418");
     expect(describeError(new NetworkError("refused")).code).toBe("network");
+  });
+});
+
+describe("research helpers", () => {
+  const ck = (seq: number, step: string) => ev(seq, "checkpoint_committed", { payload: { step_id: step } });
+
+  it("derives plan → 子任务 → 报告 stages from checkpoint step ids", () => {
+    expect(deriveProgress([], "queued")).toEqual({ plan: "pending", tasks: "pending", report: "pending", subtasksDone: 0 });
+    expect(deriveProgress([], "running").plan).toBe("active");
+    const mid = deriveProgress([ck(1, "plan"), ck(2, "task-1"), ck(3, "task-1"), ck(4, "task-2")], "running");
+    expect(mid).toEqual({ plan: "done", tasks: "active", report: "pending", subtasksDone: 2 });
+    expect(deriveProgress([ck(1, "plan"), ck(2, "task-1")], "failed")).toMatchObject({ plan: "done", tasks: "stopped", report: "pending" });
+    expect(deriveProgress([], "succeeded")).toMatchObject({ plan: "done", tasks: "done", report: "done" });
+    // 任务状态尚未刷新时，以 task_terminal 事件为准
+    const term = ev(5, "task_terminal", { payload: { task_status: "cancelled" } });
+    expect(deriveProgress([ck(1, "plan"), term], "running").tasks).toBe("stopped");
+  });
+
+  it("counts evidence entries and reads the report title", () => {
+    const md = "# 主题\n\n正文 [1]\n\n## 证据\n\n- [1] a — https://a — sha256:1\n- [2] b — https://b — sha256:2\n";
+    expect(countEvidence(md)).toBe(2);
+    expect(countEvidence("# t\n\n## 证据\n\n暂无证据。\n")).toBe(0);
+    expect(countEvidence("no section")).toBe(0);
+    expect(reportTitle(md)).toBe("主题");
+    expect(reportFilename('a/b:c*?"<>|', "t-123456789")).toBe("a b c.md");
+    expect(reportFilename("", "t-123456789")).toBe("研究报告-t-123456.md");
+  });
+
+  it("maps errors to friendly copy without codes", () => {
+    expect(userErrorMessage(new ApiError(409, "user_task_running", ""))).toBe("已有研究在进行中，请等它完成后再开始新的研究");
+    expect(userErrorMessage(new ApiError(429, "rate_limited", ""))).toBe("尝试过于频繁，请稍后再试");
+    expect(userErrorMessage(new ApiError(401, "invalid_credentials", ""))).toBe("用户名或密码错误");
+    expect(userErrorMessage(new ApiError(409, "username_taken", ""))).toBe("用户名已被使用");
+    expect(userErrorMessage(new ApiError(402, "budget_exhausted", "budget"))).not.toMatch(/budget|预算/);
+    expect(userErrorMessage(new NetworkError("x"))).toContain("无法连接");
+    expect(statusLabel("succeeded")).toBe("已完成");
+    expect(canCancel(task({ status: "running", desired: "run" }))).toBe(true);
+    expect(canCancel(task({ status: "running", desired: "cancel" }))).toBe(false);
+    expect(canCancel(task({ status: "succeeded" }))).toBe(false);
   });
 });

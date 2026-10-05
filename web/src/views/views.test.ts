@@ -47,7 +47,7 @@ describe("TaskListView", () => {
     const api = fakeApi({ listTasks: vi.fn(async () => ({ tasks: [task({ task_id: "t/1" })] })) });
     const w = mount(TaskListView, { global: services(api) });
     await flushAll();
-    expect(w.get("tr[data-task] a").attributes("href")).toBe("#/tasks/t%2F1");
+    expect(w.get("tr[data-task] a").attributes("href")).toBe("#/admin/tasks/t%2F1");
   });
 
   it("shows a diagnostic_mode error specifically", async () => {
@@ -63,7 +63,7 @@ describe("TaskListView", () => {
     await w.get('[data-action="new"]').trigger("click");
     await w.get("form").trigger("submit");
     await flushAll();
-    expect(window.location.hash).toBe("#/tasks/t-new");
+    expect(window.location.hash).toBe("#/admin/tasks/t-new");
   });
 });
 
