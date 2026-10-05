@@ -406,9 +406,13 @@ if bad:
     sys.exit("模型路由不符：" + "；".join(bad))
 PY
 ok "模型路由：plan/report = $ORCH_MODEL，任务内 chat = $WORKER_MODEL"
-[ "$(json "len(d['calls']) > 0 and all(c['state'] == 'completed' for c in d['calls'])" <"$LOGDIR/inspect.json")" = True ] ||
-  fail "存在未完成的 Gateway 调用"
-ok "全部调用 completed"
+# 每个调用都已结算（completed 或 failed；真实网络下个别抓取不可达是正常的终态），不存在 resolving/in_flight/
+# unknown；模型调用必须全部 completed。
+[ "$(json "len(d['calls']) > 0 and all(c['state'] in ('completed', 'failed') for c in d['calls'])" <"$LOGDIR/inspect.json")" = True ] ||
+  fail "存在未结算的 Gateway 调用（resolving/in_flight/unknown）"
+[ "$(json "all(c['state'] == 'completed' for c in d['calls'] if c['endpoint'] == '/v1/chat/completions')" <"$LOGDIR/inspect.json")" = True ] ||
+  fail "存在未完成的模型调用"
+ok "全部调用已结算：$(json "', '.join(f'{s} {n}' for s, n in sorted(__import__('collections').Counter(c['state'] for c in d['calls']).items()))" <"$LOGDIR/inspect.json")；模型调用全部 completed"
 
 step "研究报告（从 BlobStore 读取并校验 sha256）：前 40 行与证据列表"
 REPORT_SHA=$(jsonl "d['payload']['sha256'] if d['type'] == 'artifact_saved' and d['payload'].get('artifact_id') == 'report' else ''" <"$EVENTS" | grep -v '^$' | tail -n 1 || true)
