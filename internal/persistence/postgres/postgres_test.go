@@ -19,6 +19,7 @@ import (
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/datadir"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/resource"
@@ -250,7 +251,8 @@ func TestInstallationBootstrapE46(t *testing.T) {
 			t.Fatal(err)
 		}
 		// 还原为只应用了 0001 的旧库
-		if _, err := s.pool.Exec(ctx, "ALTER TABLE installation DROP COLUMN bootstrap_token_hash; DELETE FROM schema_migrations WHERE version = 2"); err != nil {
+		if _, err := s.pool.Exec(ctx, `DROP TABLE call_tries, reservations, calls, budgets;
+			ALTER TABLE installation DROP COLUMN bootstrap_token_hash; DELETE FROM schema_migrations WHERE version >= 2`); err != nil {
 			t.Fatal(err)
 		}
 		if st, err := s.InspectInstallation(ctx); err != nil || st.Installation == nil || st.Installation.TokenHash != nil {
@@ -264,8 +266,8 @@ func TestInstallationBootstrapE46(t *testing.T) {
 		if err := s.Migrate(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if n := count(t, s, "SELECT count(*) FROM schema_migrations WHERE version = 2"); n != 1 {
-			t.Fatalf("引导完成后应应用 0002，得到 %d", n)
+		if n := count(t, s, "SELECT count(*) FROM schema_migrations WHERE version IN (2, 3)"); n != 2 {
+			t.Fatalf("引导完成后应应用 0002 与 0003，得到 %d", n)
 		}
 	})
 	t.Run("库中的令牌哈希必须为 32 字节", func(t *testing.T) {
@@ -1964,5 +1966,478 @@ func TestAssignUIDRangeExhausted(t *testing.T) {
 	_, err := s.AssignUIDRange(ctx, "env-t2", "alloc-2")
 	if !errors.Is(err, resource.ErrNoFreeUIDRange) || errors.Is(err, persistence.ErrConflict) {
 		t.Fatalf("池耗尽应为 ErrNoFreeUIDRange，得到 %v", err)
+	}
+}
+
+// ---- Gateway：账本、journal、try 与预留（M2 Plan 7 Task 1；规格 §9.4–§9.7、I3、E11b） ----
+
+// gwFixture 建立一个预算为 budget 微美元的任务及其第一次 attempt（att-<taskID>，环境 env-<taskID>）。
+func gwFixture(t *testing.T, s *Store, taskID string, budget int64) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.CreateTask(ctx, api.CreateTaskRequest{RequestID: "req-" + taskID, BodyHash: []byte("h"), TaskID: taskID,
+		Spec: json.RawMessage(`{"worker":"sim"}`), Limits: json.RawMessage(fmt.Sprintf(`{"budget_micro":%d}`, budget)), MaxFaultRetries: 3}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if _, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: taskID, AttemptID: "att-" + taskID, AttemptNo: 1, EnvID: "env-" + taskID}); err != nil {
+		t.Fatalf("CreateAttempt: %v", err)
+	}
+}
+
+// checkI3 断言账本不变量 I3：每个任务 reserved = Σ held，unknown = Σ charged_unknown，spent = Σ ok try 的实际费用；
+// 每笔 reservation 恰在一个桶中，且与其 try 的结算结果一致。
+func checkI3(t *testing.T, s *Store) {
+	t.Helper()
+	var bad *string
+	if err := s.pool.QueryRow(context.Background(), `SELECT string_agg(v, '; ') FROM (
+		SELECT format('任务 %s：reserved %s / held %s，unknown %s / charged_unknown %s，spent %s / ok %s', b.task_id,
+				b.reserved_micro, h.held, b.unknown_micro, h.unk, b.spent_micro, h.ok) AS v
+			FROM budgets b, LATERAL (SELECT
+				COALESCE((SELECT sum(amount) FROM reservations r WHERE r.task_id = b.task_id AND r.state = 'held'), 0) AS held,
+				COALESCE((SELECT sum(amount) FROM reservations r WHERE r.task_id = b.task_id AND r.state = 'charged_unknown'), 0) AS unk,
+				COALESCE((SELECT sum(cost_micro) FROM call_tries c WHERE c.task_id = b.task_id AND c.outcome = 'ok'), 0) AS ok) h
+			WHERE b.reserved_micro <> h.held OR b.unknown_micro <> h.unk OR b.spent_micro <> h.ok
+		UNION ALL
+		SELECT format('reservation %s 处于 %s，try 结果 %L', r.reservation_id, r.state, c.outcome)
+			FROM reservations r LEFT JOIN call_tries c USING (reservation_id)
+			WHERE c.reservation_id IS NULL OR NOT (
+				(r.state = 'held' AND c.outcome = '') OR (r.state = 'settled' AND c.outcome = 'ok') OR
+				(r.state = 'released' AND c.outcome IN ('retryable', 'fatal')) OR (r.state = 'charged_unknown' AND c.outcome = 'unknown'))
+		) x`).Scan(&bad); err != nil {
+		t.Fatal(err)
+	}
+	if bad != nil {
+		t.Fatalf("违反 I3：%s", *bad)
+	}
+}
+
+func beginCall(t *testing.T, s *Store, taskID, callID string) call.CallRecord {
+	t.Helper()
+	res, err := s.BeginCall(context.Background(), call.BeginCallRequest{TaskID: taskID, CallID: callID, AttemptID: "att-" + taskID,
+		Fingerprint: "fp-" + callID, Endpoint: "chat", Deadline: 120 * time.Second})
+	if err != nil || res.Existing {
+		t.Fatalf("BeginCall %s: %+v / %v", callID, res, err)
+	}
+	checkI3(t, s)
+	return res.Record
+}
+
+func reserve(s *Store, taskID, callID string, est int64) (call.Try, error) {
+	return s.ReserveTry(context.Background(), call.ReserveTryRequest{TaskID: taskID, CallID: callID, AttemptID: "att-" + taskID,
+		EnvID: "env-" + taskID, EstimateMicro: est, MaxTries: 3})
+}
+
+func mustReserve(t *testing.T, s *Store, taskID, callID string, est int64) call.Try {
+	t.Helper()
+	tr, err := reserve(s, taskID, callID, est)
+	if err != nil {
+		t.Fatalf("ReserveTry %s: %v", callID, err)
+	}
+	checkI3(t, s)
+	return tr
+}
+
+func settle(t *testing.T, s *Store, st call.Settlement) call.CallRecord {
+	t.Helper()
+	rec, err := s.SettleTry(context.Background(), st)
+	if err != nil {
+		t.Fatalf("SettleTry %+v: %v", st, err)
+	}
+	checkI3(t, s)
+	return rec
+}
+
+func expectBudget(t *testing.T, s *Store, taskID string, want call.Budget) {
+	t.Helper()
+	got, err := s.LoadBudget(context.Background(), taskID)
+	if err != nil || got != want {
+		t.Fatalf("账本应为 %+v，得到 %+v / %v", want, got, err)
+	}
+}
+
+// TestCreateTaskWritesBudget：CreateTask 在同一事务中写入 budgets（limit 取 limits.budget_micro；缺省为 0，失败关闭）；
+// 负数或非整数为 ErrInvalid 且不建任务。
+func TestCreateTaskWritesBudget(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	create := func(id, limits string) error {
+		_, err := s.CreateTask(ctx, api.CreateTaskRequest{RequestID: "r-" + id, BodyHash: []byte("h"), TaskID: id,
+			Spec: json.RawMessage(`{}`), Limits: json.RawMessage(limits)})
+		return err
+	}
+	if err := create("t1", `{"budget_micro":2000000,"max_run_time_ms":1000}`); err != nil {
+		t.Fatal(err)
+	}
+	expectBudget(t, s, "t1", call.Budget{LimitMicro: 2000000})
+	if err := create("t2", ``); err != nil {
+		t.Fatal(err)
+	}
+	expectBudget(t, s, "t2", call.Budget{})
+	if err := create("t3", `{"max_run_time_ms":1000}`); err != nil {
+		t.Fatal(err)
+	}
+	expectBudget(t, s, "t3", call.Budget{})
+	for i, bad := range []string{`{"budget_micro":-1}`, `{"budget_micro":1.5}`, `{"budget_micro":"5"}`, `[1]`} {
+		if err := create(fmt.Sprintf("bad%d", i), bad); !errors.Is(err, persistence.ErrInvalid) {
+			t.Fatalf("%s 应为 ErrInvalid，得到 %v", bad, err)
+		}
+	}
+	if n := count(t, s, "SELECT count(*) FROM tasks WHERE task_id LIKE 'bad%'"); n != 0 {
+		t.Fatalf("不合法的 limits 不应建任务，得到 %d", n)
+	}
+	// 重放不重复写入
+	if err := create("t1", `{"budget_micro":2000000,"max_run_time_ms":1000}`); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM budgets"); n != 3 {
+		t.Fatalf("应有 3 行预算，得到 %d", n)
+	}
+	// 缺省预算为 0 时付费调用被拒
+	if _, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: "t2", AttemptID: "att-t2", AttemptNo: 1, EnvID: "env-t2"}); err != nil {
+		t.Fatal(err)
+	}
+	beginCall(t, s, "t2", "c1")
+	_, err := reserve(s, "t2", "c1", 1)
+	expectRejected(t, err, persistence.CodeBudgetExhausted)
+}
+
+// TestGatewaySettlementBranches：结算三分支（ok / 释放 / unknown）与赤字；每笔 reservation 只进入一个桶；
+// 重复结算幂等（迟到的不同结果不改变记账）；ok 写入 blobs 与 scope_blobs(task)；每次用例后 I3 成立。
+func TestGatewaySettlementBranches(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	gwFixture(t, s, "t1", 1000)
+	sha := strings.Repeat("ab", 32)
+
+	// ok：实际 500 超出预留 300
+	beginCall(t, s, "t1", "c1")
+	tr := mustReserve(t, s, "t1", "c1", 300)
+	if tr.TryNo != 1 || tr.ReservationID == "" || tr.AttemptID != "att-t1" {
+		t.Fatalf("try 不对：%+v", tr)
+	}
+	expectBudget(t, s, "t1", call.Budget{LimitMicro: 1000, ReservedMicro: 300})
+	ok := call.Settlement{Try: tr, Outcome: "ok", ActualMicro: 500, LatencyMs: 12, UpstreamRequestID: "up-1", ResultSHA256: sha, ResultSize: 42}
+	rec := settle(t, s, ok)
+	if rec.State != call.StateCompleted || rec.ResultRef != sha || rec.CostCharged != 500 || rec.UpstreamRequestID != "up-1" || rec.TriesUsed != 1 {
+		t.Fatalf("ok 结算后调用不对：%+v", rec)
+	}
+	expectBudget(t, s, "t1", call.Budget{LimitMicro: 1000, SpentMicro: 500})
+	if n := count(t, s, "SELECT count(*) FROM scope_blobs WHERE scope_kind = 'task' AND scope_id = 't1' AND sha256 = $1", sha); n != 1 {
+		t.Fatalf("结果 blob 应授权到任务 scope，得到 %d", n)
+	}
+	if n := count(t, s, "SELECT count(*) FROM blobs WHERE sha256 = $1 AND size = 42", sha); n != 1 {
+		t.Fatalf("结果 blob 应已登记，得到 %d", n)
+	}
+	again := settle(t, s, ok)
+	unk := ok
+	unk.Outcome, unk.ActualMicro, unk.ResultSHA256, unk.ResultSize = "unknown", 0, "", 0
+	late := settle(t, s, unk)
+	if fmt.Sprintf("%+v", again) != fmt.Sprintf("%+v", rec) || fmt.Sprintf("%+v", late) != fmt.Sprintf("%+v", rec) {
+		t.Fatalf("重复结算应返回原结果：%+v / %+v", again, late)
+	}
+	expectBudget(t, s, "t1", call.Budget{LimitMicro: 1000, SpentMicro: 500})
+	if _, err := reserve(s, "t1", "c1", 1); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("已完成的调用不能新建 try，得到 %v", err)
+	}
+	wrong := ok
+	wrong.Try.ReservationID = "rsv-other"
+	if _, err := s.SettleTry(ctx, wrong); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("reservation 不符应为冲突，得到 %v", err)
+	}
+	other := ok
+	other.Try = call.Try{}
+	if _, err := s.SettleTry(ctx, call.Settlement{Try: tr, Outcome: "retryable", ActualMicro: 5}); !errors.Is(err, persistence.ErrInvalid) {
+		t.Fatalf("非 ok 结算带费用应为 ErrInvalid，得到 %v", err)
+	}
+
+	// unknown：全额转入 unknown，调用为 unknown 且标记可能的外部重复
+	beginCall(t, s, "t1", "c2")
+	tr = mustReserve(t, s, "t1", "c2", 400)
+	rec = settle(t, s, call.Settlement{Try: tr, Outcome: "unknown", Error: "read timeout"})
+	if rec.State != call.StateUnknown || !rec.PossibleExternalDuplicate || rec.CostCharged != 0 {
+		t.Fatalf("unknown 结算后调用不对：%+v", rec)
+	}
+	expectBudget(t, s, "t1", call.Budget{LimitMicro: 1000, SpentMicro: 500, UnknownMicro: 400})
+
+	// 可用 100：估算 200 → budget_insufficient_for_request；估算 100 可以
+	beginCall(t, s, "t1", "c3")
+	_, err := reserve(s, "t1", "c3", 200)
+	expectRejected(t, err, persistence.CodeBudgetInsufficient)
+	checkI3(t, s)
+	tr = mustReserve(t, s, "t1", "c3", 100)
+	// retryable：释放，调用保持 in_flight，可再 try
+	rec = settle(t, s, call.Settlement{Try: tr, Outcome: "retryable", LatencyMs: 3, Error: "429"})
+	if rec.State != call.StateInFlight || rec.TriesUsed != 1 {
+		t.Fatalf("retryable 后调用应保持 in_flight：%+v", rec)
+	}
+	expectBudget(t, s, "t1", call.Budget{LimitMicro: 1000, SpentMicro: 500, UnknownMicro: 400})
+	tr2 := mustReserve(t, s, "t1", "c3", 100)
+	if tr2.TryNo != 2 {
+		t.Fatalf("第二次 try 应为 2：%+v", tr2)
+	}
+	// fatal：释放，调用 failed
+	rec = settle(t, s, call.Settlement{Try: tr2, Outcome: "fatal", Error: "400 unsupported_field"})
+	if rec.State != call.StateFailed || rec.FailReason != "400 unsupported_field" || rec.TriesUsed != 2 {
+		t.Fatalf("fatal 后调用应为 failed：%+v", rec)
+	}
+	_, tries, err := s.LoadCall(ctx, "t1", "c3")
+	if err != nil || len(tries) != 2 || tries[0].Outcome != "retryable" || tries[0].Error != "429" || tries[0].EnvID != "env-t1" ||
+		tries[1].Outcome != "fatal" || tries[1].State != "settled" {
+		t.Fatalf("try 记录不对：%+v / %v", tries, err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM reservations WHERE call_id = 'c3' AND state = 'released'"); n != 2 {
+		t.Fatalf("两次 try 都应释放，得到 %d", n)
+	}
+
+	// 赤字：可用 100，预留 100，实际 300 → 可用 −200；之后任何付费调用都是 budget_exhausted
+	beginCall(t, s, "t1", "c4")
+	tr = mustReserve(t, s, "t1", "c4", 100)
+	settle(t, s, call.Settlement{Try: tr, Outcome: "ok", ActualMicro: 300, ResultSHA256: strings.Repeat("cd", 32), ResultSize: 1})
+	b, _ := s.LoadBudget(ctx, "t1")
+	if b.Available() != -200 {
+		t.Fatalf("应出现赤字 −200：%+v", b)
+	}
+	beginCall(t, s, "t1", "c5")
+	_, err = reserve(s, "t1", "c5", 0)
+	expectRejected(t, err, persistence.CodeBudgetExhausted)
+	checkI3(t, s)
+
+	calls, err := s.ListCalls(ctx, "t1")
+	if err != nil || len(calls) != 5 {
+		t.Fatalf("应列出 5 个调用：%d / %v", len(calls), err)
+	}
+	// 同一 blob 大小不同为冲突
+	beginCall(t, s, "t1", "c6")
+	if _, err := s.pool.Exec(ctx, "UPDATE budgets SET limit_micro = 10000 WHERE task_id = 't1'"); err != nil {
+		t.Fatal(err)
+	}
+	tr = mustReserve(t, s, "t1", "c6", 10)
+	if _, err := s.SettleTry(ctx, call.Settlement{Try: tr, Outcome: "ok", ResultSHA256: sha, ResultSize: 43}); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("blob 大小不符应为冲突，得到 %v", err)
+	}
+	checkI3(t, s)
+}
+
+// TestReserveTryCommitLostE11b 覆盖 E11b：reservation 的 COMMIT 回复丢失。重跑与之后的再次调用都以同一 try 身份
+// 解析为原记录，不产生第二笔预留。
+func TestReserveTryCommitLostE11b(t *testing.T) {
+	ctx := context.Background()
+	t.Run("一次丢失在期限内解析", func(t *testing.T) {
+		s := newStore(t, Options{})
+		gwFixture(t, s, "t1", 1000)
+		beginCall(t, s, "t1", "c1")
+		var lost atomic.Bool
+		s.hooks.afterCommit = func(op string) error {
+			if op == "ReserveTry" && lost.CompareAndSwap(false, true) {
+				return errors.New("模拟：COMMIT 已执行但回复丢失")
+			}
+			return nil
+		}
+		tr, err := reserve(s, "t1", "c1", 300)
+		if err != nil || !lost.Load() || tr.TryNo != 1 {
+			t.Fatalf("应解析为原 try：%+v / %v（钩子触发 %v）", tr, err, lost.Load())
+		}
+		s.hooks.afterCommit = nil
+		if n := count(t, s, "SELECT count(*) FROM reservations"); n != 1 {
+			t.Fatalf("应只有 1 笔预留，得到 %d", n)
+		}
+		expectBudget(t, s, "t1", call.Budget{LimitMicro: 1000, ReservedMicro: 300})
+		checkI3(t, s)
+	})
+	t.Run("始终丢失返回 ErrCommitUnknown，再次调用得到原记录", func(t *testing.T) {
+		s := newStore(t, Options{OpDeadline: 500 * time.Millisecond})
+		gwFixture(t, s, "t1", 1000)
+		beginCall(t, s, "t1", "c1")
+		s.hooks.afterCommit = func(op string) error {
+			if op == "ReserveTry" {
+				return errors.New("模拟：回复始终丢失")
+			}
+			return nil
+		}
+		_, err := reserve(s, "t1", "c1", 300)
+		var unknown *persistence.CommitUnknownError
+		if !errors.As(err, &unknown) || unknown.Op != "ReserveTry" {
+			t.Fatalf("应为 CommitUnknownError，得到 %v", err)
+		}
+		s.hooks.afterCommit = nil
+		checkI3(t, s)
+		tr, err := reserve(s, "t1", "c1", 300)
+		if err != nil || tr.TryNo != 1 {
+			t.Fatalf("以同一身份再次调用应返回原 try：%+v / %v", tr, err)
+		}
+		var rid string
+		if err := s.pool.QueryRow(ctx, "SELECT reservation_id FROM reservations").Scan(&rid); err != nil || rid != tr.ReservationID {
+			t.Fatalf("应返回已提交的 reservation %s，得到 %+v / %v", rid, tr, err)
+		}
+		if n := count(t, s, "SELECT count(*) FROM reservations"); n != 1 {
+			t.Fatalf("不应产生第二笔预留，得到 %d", n)
+		}
+		if n := count(t, s, "SELECT count(*) FROM calls WHERE tries_used = 1 AND state = 'in_flight'"); n != 1 {
+			t.Fatal("tries_used 不应重复累加")
+		}
+		expectBudget(t, s, "t1", call.Budget{LimitMicro: 1000, ReservedMicro: 300})
+		checkI3(t, s)
+		// 不同身份（其他环境）在 try 仍持有预留时为 call_in_progress
+		_, err = s.ReserveTry(ctx, call.ReserveTryRequest{TaskID: "t1", CallID: "c1", AttemptID: "att-t1", EnvID: "env-x", EstimateMicro: 300, MaxTries: 3})
+		expectRejected(t, err, persistence.CodeCallInProgress)
+		err = s.FailCall(ctx, "t1", "c1", "x")
+		expectRejected(t, err, persistence.CodeCallInProgress)
+		checkI3(t, s)
+	})
+}
+
+// TestBeginCallJournal：BeginCall 的期限按数据库时间写入并在 ReserveTry 中按数据库时间判断；已有记录原样返回
+// （含指纹）；提交回复丢失后的重跑仍是新登记；tries_exhausted；FailCall 幂等。
+func TestBeginCallJournal(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	gwFixture(t, s, "t1", 1000)
+	var lost atomic.Bool
+	s.hooks.afterCommit = func(op string) error {
+		if op == "BeginCall" && lost.CompareAndSwap(false, true) {
+			return errors.New("模拟：COMMIT 已执行但回复丢失")
+		}
+		return nil
+	}
+	rec := beginCall(t, s, "t1", "c1")
+	s.hooks.afterCommit = nil
+	if !lost.Load() || rec.State != call.StateResolving || rec.TriesUsed != 0 || rec.FirstAttemptID != "att-t1" || rec.Source != "upstream" {
+		t.Fatalf("登记的记录不对：%+v（钩子 %v）", rec, lost.Load())
+	}
+	if d := rec.DeadlineAt.Sub(rec.CreatedAt); d != 120*time.Second {
+		t.Fatalf("deadline_at − created_at 应为 120s，得到 %v", d)
+	}
+	var skew float64
+	if err := s.pool.QueryRow(ctx, "SELECT abs(extract(epoch FROM now() - created_at)) FROM calls WHERE call_id = 'c1'").Scan(&skew); err != nil || skew > 5 {
+		t.Fatalf("created_at 应取数据库时间：偏差 %v / %v", skew, err)
+	}
+	res, err := s.BeginCall(ctx, call.BeginCallRequest{TaskID: "t1", CallID: "c1", AttemptID: "att-t1", Fingerprint: "other",
+		Endpoint: "chat", Deadline: time.Hour})
+	if err != nil || !res.Existing || res.Record.Fingerprint != "fp-c1" || !res.Record.DeadlineAt.Equal(rec.DeadlineAt) {
+		t.Fatalf("已有记录应原样返回：%+v / %v", res, err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM calls"); n != 1 {
+		t.Fatalf("应只有 1 条调用，得到 %d", n)
+	}
+	sup, err := s.BeginCall(ctx, call.BeginCallRequest{TaskID: "t1", CallID: "c1b", AttemptID: "att-t1", Fingerprint: "fp",
+		Endpoint: "chat", Deadline: time.Minute, SupersedesCallID: "c1", SupersedeReason: "divergence"})
+	if err != nil || sup.Record.SupersedesCallID != "c1" || sup.Record.SupersedeReason != "divergence" {
+		t.Fatalf("supersede 关联不对：%+v / %v", sup, err)
+	}
+
+	// 数据库时间已到 deadline_at：不再新建 try
+	if _, err := s.pool.Exec(ctx, "UPDATE calls SET created_at = now() - interval '10 seconds', deadline_at = now() - interval '1 second' WHERE call_id = 'c1'"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = reserve(s, "t1", "c1", 10)
+	expectRejected(t, err, persistence.CodeCallDeadlineExceeded)
+	checkI3(t, s)
+	for i := 0; i < 2; i++ {
+		if err := s.FailCall(ctx, "t1", "c1", "call_deadline_exceeded"); err != nil {
+			t.Fatalf("FailCall 第 %d 次：%v", i+1, err)
+		}
+	}
+	r, _, err := s.LoadCall(ctx, "t1", "c1")
+	if err != nil || r.State != call.StateFailed || r.FailReason != "call_deadline_exceeded" {
+		t.Fatalf("应为 failed：%+v / %v", r, err)
+	}
+
+	// 累计 try 上限
+	beginCall(t, s, "t1", "c2")
+	for i := 1; i <= 2; i++ {
+		tr, err := s.ReserveTry(ctx, call.ReserveTryRequest{TaskID: "t1", CallID: "c2", AttemptID: "att-t1", EnvID: "env-t1", EstimateMicro: 10, MaxTries: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		settle(t, s, call.Settlement{Try: tr, Outcome: "retryable"})
+	}
+	_, err = s.ReserveTry(ctx, call.ReserveTryRequest{TaskID: "t1", CallID: "c2", AttemptID: "att-t1", EnvID: "env-t1", EstimateMicro: 10, MaxTries: 2})
+	expectRejected(t, err, persistence.CodeTriesExhausted)
+	if _, _, err := s.LoadCall(ctx, "t1", "missing"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("不存在的调用应为 ErrNotFound，得到 %v", err)
+	}
+	checkI3(t, s)
+}
+
+// TestResetResolving：只复位没有 try 的 resolving；之后同一 call_id 可重新登记；有 try 的调用与账本不变。
+func TestResetResolving(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	gwFixture(t, s, "t1", 1000)
+	beginCall(t, s, "t1", "c1")              // resolving，无 try
+	beginCall(t, s, "t1", "c2")              // in_flight，持有预留
+	tr := mustReserve(t, s, "t1", "c2", 100) //
+	beginCall(t, s, "t1", "c3")              // 有 try 的 resolving（人为构造，防御性检查）
+	tr3 := mustReserve(t, s, "t1", "c3", 50) //
+	settle(t, s, call.Settlement{Try: tr3, Outcome: "retryable"})
+	if _, err := s.pool.Exec(ctx, "UPDATE calls SET state = 'resolving' WHERE call_id = 'c3'"); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.ResetResolving(ctx)
+	if err != nil || n != 1 {
+		t.Fatalf("应复位 1 个调用，得到 %d / %v", n, err)
+	}
+	if got := count(t, s, "SELECT count(*) FROM calls WHERE call_id IN ('c2', 'c3')"); got != 2 {
+		t.Fatalf("有 try 的调用不应被复位，剩 %d", got)
+	}
+	expectBudget(t, s, "t1", call.Budget{LimitMicro: 1000, ReservedMicro: 100})
+	checkI3(t, s)
+	rec := beginCall(t, s, "t1", "c1")
+	if rec.State != call.StateResolving {
+		t.Fatalf("复位后应可重新登记：%+v", rec)
+	}
+	_ = tr
+}
+
+// TestReserveTryAccessRejections：访问撤销、取消、非当前 attempt 分别被 ReserveTry 拒绝，且不留下预留；
+// CheckAccess 报告对应事实。
+func TestReserveTryAccessRejections(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name  string
+		after func(t *testing.T, s *Store)
+		code  string
+		facts call.AccessFacts
+	}{
+		{"撤销", func(t *testing.T, s *Store) {
+			if err := s.RevokeAttemptAccess(ctx, "att-t1", "stopping"); err != nil {
+				t.Fatal(err)
+			}
+		}, persistence.CodeAccessRevoked, call.AccessFacts{TaskID: "t1", AttemptID: "att-t1", Current: true, Desired: "run"}},
+		{"取消", func(t *testing.T, s *Store) {
+			if _, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "c1", BodyHash: []byte("h"), TaskID: "t1", Desired: "cancel"}); err != nil {
+				t.Fatal(err)
+			}
+		}, persistence.CodeCancelRequested, call.AccessFacts{TaskID: "t1", AttemptID: "att-t1", Active: true, Current: true, Desired: "cancel"}},
+		{"非当前 attempt", func(t *testing.T, s *Store) { retryWithNewAttempt(t, s, "t1") },
+			persistence.CodeNotCurrentAttempt, call.AccessFacts{TaskID: "t1", AttemptID: "att-t1", Active: true, Desired: "run"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := newStore(t, Options{})
+			gwFixture(t, s, "t1", 1000)
+			beginCall(t, s, "t1", "c1")
+			f, err := s.CheckAccess(ctx, "t1", "att-t1")
+			if err != nil || f != (call.AccessFacts{TaskID: "t1", AttemptID: "att-t1", Active: true, Current: true, Desired: "run"}) {
+				t.Fatalf("初始访问事实不对：%+v / %v", f, err)
+			}
+			c.after(t, s)
+			if f, err := s.CheckAccess(ctx, "t1", "att-t1"); err != nil || f != c.facts {
+				t.Fatalf("访问事实应为 %+v，得到 %+v / %v", c.facts, f, err)
+			}
+			_, err = reserve(s, "t1", "c1", 10)
+			expectRejected(t, err, c.code)
+			_, err = s.BeginCall(ctx, call.BeginCallRequest{TaskID: "t1", CallID: "c2", AttemptID: "att-t1", Fingerprint: "fp",
+				Endpoint: "chat", Deadline: time.Minute})
+			expectRejected(t, err, c.code)
+			if n := count(t, s, "SELECT count(*) FROM reservations"); n != 0 {
+				t.Fatalf("被拒绝时不应留下预留，得到 %d", n)
+			}
+			checkI3(t, s)
+		})
+	}
+	s := newStore(t, Options{})
+	if _, err := s.CheckAccess(ctx, "missing", "a"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("不存在的任务应为 ErrNotFound，得到 %v", err)
 	}
 }

@@ -44,6 +44,19 @@ const (
 	CodeRefNotAuthorized   = "ref_not_authorized"   // 引用的 blob 不存在或未授权到当前 scope
 )
 
+// Gateway 事务用例（gateway/call 的 Store）的原因码（规格 §9.2、§9.4–§9.7）。
+const (
+	CodeAccessRevoked        = "access_revoked"                  // attempt_access.state ≠ active
+	CodeNotCurrentAttempt    = "not_current_attempt"             // 调用方不是任务的当前 attempt
+	CodeCancelRequested      = "cancel_requested"                // task_control.desired = cancel
+	CodeBudgetExhausted      = "budget_exhausted"                // 预算可用 ≤ 0
+	CodeBudgetInsufficient   = "budget_insufficient_for_request" // 可用 > 0 但小于本次估算
+	CodeTriesExhausted       = "tries_exhausted"                 // 累计 try 已达上限
+	CodeCallDeadlineExceeded = "call_deadline_exceeded"          // 数据库时间已到 deadline_at
+	CodeFingerprintMismatch  = "fingerprint_mismatch"            // 同一 call_id 的指纹不同
+	CodeCallInProgress       = "call_in_progress"                // 该调用已有执行中的 try 或仍在解析
+)
+
 // RejectedError 携带前置条件不满足的原因。
 type RejectedError struct {
 	Code   string

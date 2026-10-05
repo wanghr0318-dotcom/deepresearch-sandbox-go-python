@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/jackc/pgx/v5"
 
@@ -53,8 +54,12 @@ func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest) (api.
 	if req.RequestID == "" || req.TaskID == "" || len(req.BodyHash) == 0 || len(req.Spec) == 0 {
 		return api.CreateTaskResult{}, invalidf("CreateTask 缺少 request_id、task_id、body_hash 或 spec")
 	}
+	budget, err := budgetLimit(req.Limits)
+	if err != nil {
+		return api.CreateTaskResult{}, err
+	}
 	var res api.CreateTaskResult
-	err := s.run(ctx, "CreateTask", req.RequestID, func(ctx context.Context, tx pgx.Tx) error {
+	err = s.run(ctx, "CreateTask", req.RequestID, func(ctx context.Context, tx pgx.Tx) error {
 		res = api.CreateTaskResult{}
 		replayed, stored, err := claimRequest(ctx, tx, req.RequestID, "create_task", req.BodyHash)
 		if err != nil {
@@ -85,6 +90,9 @@ func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest) (api.
 				return err
 			}
 		}
+		if _, err := tx.Exec(ctx, "INSERT INTO budgets (task_id, limit_micro) VALUES ($1, $2)", req.TaskID, budget); err != nil {
+			return err
+		}
 		if err := lockEventSeq(ctx, tx, req.TaskID); err != nil {
 			return err
 		}
@@ -95,6 +103,27 @@ func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest) (api.
 		return finishRequest(ctx, tx, req.RequestID, req.TaskID, res)
 	})
 	return res, err
+}
+
+// budgetLimit 取任务 limits.budget_micro 作为 task 层预算上限（微美元）。缺省时为 0（失败关闭：所有
+// 付费调用都被 budget_exhausted 拒绝）；默认值与上限由 API 层补齐和校验。负数或非整数为 ErrInvalid。
+func budgetLimit(limits json.RawMessage) (int64, error) {
+	if len(limits) == 0 || string(limits) == "null" {
+		return 0, nil
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(limits, &m); err != nil {
+		return 0, invalidf("limits 不是 JSON 对象: %v", err)
+	}
+	raw, ok := m["budget_micro"]
+	if !ok || string(raw) == "null" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(string(raw), 10, 64)
+	if err != nil || n < 0 {
+		return 0, invalidf("limits.budget_micro 必须是非负整数，得到 %s", raw)
+	}
+	return n, nil
 }
 
 // AcceptControl 写入控制意图并递增 control_version（实现 api.Store）。
