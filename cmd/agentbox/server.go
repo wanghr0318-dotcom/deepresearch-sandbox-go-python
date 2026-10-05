@@ -115,6 +115,9 @@ func runServer(args []string, stderr io.Writer) int {
 	// 供应商 Key 只从宿主环境变量读取（不设标志，避免出现在进程参数与 shell 历史中），只交给 Gateway 的
 	// upstream adapter；不写日志、不进入 init 与沙箱环境（§9.9）。
 	model.APIKey = os.Getenv(modelKeyEnv)
+	if w := plaintextListenWarning(*listen, *tlsCert != ""); w != "" {
+		fmt.Fprintln(stderr, w)
+	}
 	// 在取得任何锁、连接数据库之前确认能够安全执行任务。
 	starter, err := prepareIsolation()
 	if err != nil {

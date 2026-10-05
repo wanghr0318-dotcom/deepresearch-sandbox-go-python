@@ -60,3 +60,23 @@ func TestModelFlags(t *testing.T) {
 		t.Fatalf("白名单不含默认模型时 runServer 退出码 %d（%s），期望 2 并拒绝启动", code, stderr.String())
 	}
 }
+
+// TestPlaintextListenWarning：非 loopback 监听且未启用内置 TLS 时 server 在 stderr 打印一行警告。
+func TestPlaintextListenWarning(t *testing.T) {
+	for _, tc := range []struct {
+		listen string
+		tls    bool
+		warn   bool
+	}{
+		{"0.0.0.0:8080", false, true}, {":8080", false, true}, {"10.0.0.5:8080", false, true},
+		{"0.0.0.0:8080", true, false}, {"127.0.0.1:8080", false, false}, {"localhost:8080", false, false}, {"[::1]:8080", false, false},
+	} {
+		got := plaintextListenWarning(tc.listen, tc.tls)
+		if (got != "") != tc.warn {
+			t.Errorf("%s tls=%v: 警告 %q，期望警告 = %v", tc.listen, tc.tls, got, tc.warn)
+		}
+		if tc.warn && (!strings.HasPrefix(got, "warning: ") || !strings.Contains(got, tc.listen) || !strings.Contains(got, "without TLS")) {
+			t.Errorf("警告文本 %q 不含前缀、地址或 without TLS", got)
+		}
+	}
+}

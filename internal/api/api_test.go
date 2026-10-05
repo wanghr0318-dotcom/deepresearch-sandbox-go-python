@@ -1214,6 +1214,14 @@ func TestWebDirStaticAndSPAFallback(t *testing.T) {
 	}
 	st, b, _ := ts.do("POST", "/somewhere", "", nil)
 	expect(t, st, b, 405, "method_not_allowed")
+	// 带扩展名的缺失资源是纯文本 404，不回退到 index.html。
+	for _, p := range []string{"/assets/missing.js", "/favicon.ico", "/deep/route/style.css"} {
+		st, b, h := ts.do("GET", p, "", nil)
+		if st != 404 || strings.Contains(string(b), index) || !strings.HasPrefix(h.Get("Content-Type"), "text/plain") {
+			t.Errorf("GET %s = %d %q (%s)，期望纯文本 404", p, st, b, h.Get("Content-Type"))
+		}
+		checkSecurityHeaders(t, "GET "+p, h)
+	}
 
 	// API 路径不被 SPA 吞掉：需要 token，未知端点为 JSON 404。
 	for _, tc := range []struct {

@@ -334,8 +334,8 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
-// serveStatic 从 WebDir 提供静态文件；不存在的路径回退到根下的 index.html（SPA），目录取其 index.html，
-// 不列目录。
+// serveStatic 从 WebDir 提供静态文件；末段无扩展名的不存在路径回退到根下的 index.html（SPA），带扩展名的
+// 为纯文本 404；目录取其 index.html，不列目录。
 func (h *Handler) serveStatic(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
@@ -343,8 +343,14 @@ func (h *Handler) serveStatic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	root := http.Dir(h.cfg.WebDir) // http.Dir 拒绝越出根目录的路径
-	f, fi, ok := openRegular(root, path.Clean("/"+r.URL.Path))
+	name := path.Clean("/" + r.URL.Path)
+	f, fi, ok := openRegular(root, name)
 	if !ok {
+		// 末段带扩展名的路径是缺失的资源（如 /assets/x.js、/favicon.ico），不回退到 index.html。
+		if path.Ext(name) != "" {
+			http.Error(w, "404 page not found", http.StatusNotFound)
+			return
+		}
 		if f, fi, ok = openRegular(root, "/index.html"); !ok {
 			writeError(w, http.StatusNotFound, "not_found", "没有这个文件")
 			return

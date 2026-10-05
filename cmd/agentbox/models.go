@@ -6,6 +6,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -13,6 +14,19 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/app"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
 )
+
+// plaintextListenWarning 返回非 loopback 监听且未启用内置 TLS 时打印到 stderr 的警告行（§15.3：不拒绝，
+// TLS 可以在外部终止）；不需要警告时返回空串。
+func plaintextListenWarning(listen string, tls bool) string {
+	host, _, err := net.SplitHostPort(listen)
+	if tls || err != nil {
+		return ""
+	}
+	if ip := net.ParseIP(host); strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback()) {
+		return ""
+	}
+	return fmt.Sprintf("warning: listening on %s without TLS; the API token would cross the network in plain text", listen)
+}
 
 // splitList 拆分逗号分隔的列表，忽略空项。
 func splitList(s string) []string {
