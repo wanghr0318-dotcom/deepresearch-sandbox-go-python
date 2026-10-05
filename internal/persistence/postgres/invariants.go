@@ -64,9 +64,24 @@ var invariantQueries = []struct {
 		FROM calls c WHERE c.state = 'completed' AND (NOT EXISTS (SELECT 1 FROM blobs b WHERE b.sha256 = c.result_ref)
 			OR NOT EXISTS (SELECT 1 FROM scope_blobs sb WHERE sb.scope_kind = 'task' AND sb.scope_id = c.task_id AND sb.sha256 = c.result_ref))`},
 	{"I14", "A", `SELECT c.task_id, format('调用 %s 的 result_ref %s 不是结算时记录的结果', c.call_id, c.result_ref)
-		FROM calls c WHERE c.state = 'completed' AND NOT EXISTS (SELECT 1 FROM call_tries t JOIN blob_provenance p
+		FROM calls c WHERE c.state = 'completed' AND c.source NOT IN ('cache', 'coalesced') AND NOT EXISTS (SELECT 1 FROM call_tries t JOIN blob_provenance p
 			ON p.scope_kind = 'task' AND p.scope_id = t.task_id AND p.source = 'gateway' AND p.ref = t.call_id || '#' || t.try_no
 			WHERE t.task_id = c.task_id AND t.call_id = c.call_id AND t.outcome = 'ok' AND p.sha256 = c.result_ref)`},
+	// I14（缓存部分，§11.2、§11.4）：source = cache|coalesced 的调用由 Tx2（CompleteFromCache）完成——结果 blob 的
+	// 来源记录为 <call_id>#<source>（与 result_ref 相同，即结果未被改写），且该调用没有任何 try（命中与合并不访问
+	// 上游、不预留）。登记与授权由上面第一条（对全部 completed 调用）检查。
+	{"I14", "A", `SELECT c.task_id, format('%s 来源的调用 %s 的 result_ref %s 不是 Tx2 记录的结果，或它有 %s 个 try',
+			c.source, c.call_id, c.result_ref, (SELECT count(*) FROM call_tries t WHERE t.task_id = c.task_id AND t.call_id = c.call_id))
+		FROM calls c WHERE c.state = 'completed' AND c.source IN ('cache', 'coalesced') AND (c.tries_used <> 0
+			OR EXISTS (SELECT 1 FROM call_tries t WHERE t.task_id = c.task_id AND t.call_id = c.call_id)
+			OR NOT EXISTS (SELECT 1 FROM blob_provenance p WHERE p.scope_kind = 'task' AND p.scope_id = c.task_id
+				AND p.source = 'gateway' AND p.ref = c.call_id || '#' || c.source AND p.sha256 = c.result_ref))`},
+	// I15（Q）：恢复完成后不存在没有活跃 attempt 的进行中 resolving 调用（resolving_since 非空 = 某个请求正在查缓存
+	// 或预留，§11.2）。调用不记录正在解析它的 attempt，因此以"任务没有 active 的 attempt_access"判定：撤销访问后，
+	// 进行中的 resolving 须已完成、失败，或由启动时的 ResetResolving 复位（resolving_since 为空，可被同指纹接管）。
+	{"I15", "Q", `SELECT c.task_id, format('调用 %s 自 %s 起处于 resolving，任务没有 active 的 attempt', c.call_id, c.resolving_since)
+		FROM calls c WHERE c.state = 'resolving' AND c.resolving_since IS NOT NULL
+			AND NOT EXISTS (SELECT 1 FROM attempt_access a WHERE a.task_id = c.task_id AND a.state = 'active')`},
 	{"I16", "A", `SELECT r.request_id, format('%s 请求对应的资源 %L 不存在', r.kind, r.resource_id)
 		FROM api_requests r WHERE r.resource_id = '' OR NOT EXISTS (SELECT 1 FROM tasks t WHERE t.task_id = r.resource_id)`},
 }

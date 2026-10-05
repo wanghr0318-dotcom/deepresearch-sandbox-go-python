@@ -1,5 +1,7 @@
 // Package invariants 实现 `agentbox verify-invariants` 的检查（规格 §16.3，M1 范围：I1、I2、I4–I8、I16；
-// M2 Gateway：I3 的 task 层账本、I14 的 journal 部分——已完成调用的结果不变且在 blobs 与 scope_blobs(task) 中）。
+// M2 Gateway：I3 的 task 层账本、I14 的 journal 部分——已完成调用的结果不变且在 blobs 与 scope_blobs(task) 中；
+// M3 缓存：I14 的缓存部分——source = cache|coalesced 的调用同样登记并授权到 scope_blobs(task)、结果是 Tx2 记录的
+// blob 且没有 try；I15——恢复完成后不存在没有活跃 attempt 的进行中 resolving 调用）。
 //
 // 资源类检查独立扫描实际资源（provider.Scan）与 BlobStore 内容，不只从数据库推导。每条违反带类别：
 // [A] 始终成立、[B] 期限内成立、[Q] 静止时成立；Q 类只在 quiescent 为真时检查。
@@ -33,7 +35,8 @@ type BlobRef struct {
 
 // Store 是不变量检查需要的数据库读取（实现位于 internal/persistence/postgres）。
 type Store interface {
-	// DBViolations 返回只依赖数据库即可判定的违反：I2、I3、I4、I6（授权与指针）、I7、I8、I14（登记与授权）、I16。
+	// DBViolations 返回只依赖数据库即可判定的违反：I2、I3、I4、I6（授权与指针）、I7、I8、I14（登记与授权，含缓存
+	// 来源）、I15、I16。可以含 Q 类违反：Verify 只在 quiescent 为真时保留它们。
 	DBViolations(ctx context.Context) ([]Violation, error)
 	// CleanedEnvIDs 返回 cleanup_state = done 的环境（I1）。
 	CleanedEnvIDs(ctx context.Context) ([]string, error)
@@ -54,9 +57,15 @@ type Blobs interface {
 
 // Verify 运行全部检查。quiescent 为真时另检查 Q 类（实验结束、清理完成后）。
 func Verify(ctx context.Context, s Store, scan Scanner, blobs Blobs, quiescent bool) ([]Violation, error) {
-	out, err := s.DBViolations(ctx)
+	db, err := s.DBViolations(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("invariants: 数据库检查: %w", err)
+	}
+	var out []Violation
+	for _, v := range db {
+		if v.Class != "Q" || quiescent {
+			out = append(out, v)
+		}
 	}
 	refs, err := s.ReferencedBlobs(ctx)
 	if err != nil {

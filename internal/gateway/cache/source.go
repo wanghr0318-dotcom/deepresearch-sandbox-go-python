@@ -95,20 +95,31 @@ func NewSource(cfg SourceConfig) (*Source, error) {
 	}, nil
 }
 
-// probe 记录一次 Get 是否真的到达了 Redis（熔断放行）以及是否出错；经 ctx 传给 probeKV。
-type probe struct{ reached, failed bool }
+// probe 记录一次 Get 是否真的到达了 Redis（熔断放行）、是否出错，以及 Redis 是否回复了超过 4 KiB 的值；
+// 经 ctx 传给 probeKV。
+type probe struct{ reached, failed, oversized bool }
 
 type probeCtxKey struct{}
 
 // probeKV 位于 Guarded 之内：Guarded 吞掉错误并计数，probe 让 Lookup 区分"真未命中"与"出错或熔断"，
 // 从而每个结局只计一次。
+//
+// Redis 正常回复了一个超过 4 KiB 的值（客户端返回 ErrValueTooLarge）是条目的问题而不是 Redis 故障：按
+// §11.5 视为完整性失败（未命中、删除条目、记 integrity_failure），不计 error、不计入熔断——否则一个超大条目
+// 会让每次查找都失败，连续 5 次后熔断打开，影响全部缓存。
 type probeKV struct{ kv KV }
 
 func (p probeKV) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	v, ok, err := p.kv.Get(ctx, key)
-	if pr, _ := ctx.Value(probeCtxKey{}).(*probe); pr != nil {
-		pr.reached, pr.failed = true, err != nil
+	pr, _ := ctx.Value(probeCtxKey{}).(*probe)
+	if pr == nil {
+		return v, ok, err
 	}
+	if errors.Is(err, ErrValueTooLarge) {
+		pr.reached, pr.oversized = true, true
+		return nil, false, nil
+	}
+	pr.reached, pr.failed = true, err != nil
 	return v, ok, err
 }
 
@@ -130,6 +141,10 @@ func (s *Source) Lookup(ctx context.Context, kind upstream.Kind, provider, ver s
 	pr := &probe{}
 	// Guarded 从不返回错误：Redis 出错或熔断打开都表现为未命中，并已由 Guarded 计数。
 	raw, ok, _ := s.kv.Get(context.WithValue(ctx, probeCtxKey{}, pr), key)
+	if pr.oversized {
+		s.integrityFailure(key)
+		return "", 0, false
+	}
 	if !ok {
 		if pr.reached && !pr.failed {
 			s.m.Miss.Add(1)
@@ -141,15 +156,20 @@ func (s *Source) Lookup(ctx context.Context, kind upstream.Kind, provider, ver s
 		err = s.verifyBlob(v)
 	}
 	if err != nil {
-		s.m.IntegrityFailure.Add(1)
-		dctx, cancel := context.WithTimeout(context.Background(), asyncWriteBudget)
-		defer cancel()
-		// Guarded 的 Del 不返回错误（失败只计数）：删除失败时条目仍会在下次命中时被同样拒绝。
-		_ = s.kv.Del(dctx, key)
+		s.integrityFailure(key)
 		return "", 0, false
 	}
 	s.m.Hit.Add(1)
 	return v.BlobSHA256, v.Size, true
+}
+
+// integrityFailure 记录一次完整性失败并删除条目（§11.5）。
+func (s *Source) integrityFailure(key string) {
+	s.m.IntegrityFailure.Add(1)
+	dctx, cancel := context.WithTimeout(context.Background(), asyncWriteBudget)
+	defer cancel()
+	// Guarded 的 Del 不返回错误（失败只计数）：删除失败时条目仍会在下次命中时被同样拒绝。
+	_ = s.kv.Del(dctx, key)
 }
 
 // verifyBlob 确认条目引用的 blob 存在，且内容的 sha256 与大小与条目一致（§11.5）。

@@ -11,8 +11,11 @@
 //     结果 URL 指向本服务器的 /pages/...，可以继续抓取。Gateway 的 fake 搜索供应商配置了搜索上游地址
 //     （app.Config.SearchBaseURL / --search-base-url = URL()）时访问本端点；Gateway 返回给 Worker 的形状是
 //     results[]{title, url, snippet}。
-//   - GET 其他路径：抓取目标。SetPage 设置的页面按原样返回，否则返回确定性的 text/plain 正文（Gateway 的
-//     fetch adapter 把它包装为 {url, final_url, status, content_type, truncated, encoding, content}）。
+//   - GET 其他路径：抓取目标。SetPage 设置的页面按原样返回（SetPageHeader 另附缓存相关的响应头，M3 缓存实验
+//     E21–E25 用），否则返回确定性的 text/plain 正文、不带新鲜度头（Gateway 的 fetch adapter 把它包装为
+//     {url, final_url, status, content_type, truncated, encoding, content}）。
+//
+// SetLatency 给某类别的正常回复加固定延迟（缓存收益测量用）。
 //
 // 故障注入按类别与"该类别的第 n 次请求"声明（Inject）：返回指定状态（可带 Retry-After）、挂起（直到 Release
 // 或客户端离开）、或发出响应头与部分正文后切断连接（响应中途断开）。
@@ -123,11 +126,14 @@ type Server struct {
 	hanging  int
 	// searchFixed 非零时每次搜索恰返回这么多条结果（不论 max_results；SetResearch 设为 3）。
 	searchFixed int
+	// latency 是各类别正常回复前的固定延迟（SetLatency；缓存收益测量用）。
+	latency map[Kind]time.Duration
 }
 
 type page struct {
 	contentType string
 	body        string
+	header      http.Header // 额外的响应头（缓存相关：Cache-Control、Expires、Age、Vary……），可为 nil
 }
 
 // New 启动一个监听 127.0.0.1 随机端口的 fake upstream；测试结束时调用 Close。
@@ -136,6 +142,7 @@ func New() *Server {
 		counts:   map[Kind]int{},
 		faults:   map[Kind]map[int]Action{},
 		pages:    map[string]page{},
+		latency:  map[Kind]time.Duration{},
 		released: make(chan struct{}),
 		stages: map[string]string{
 			StagePlan:      `{"tasks":[{"title":"fake 任务","intent":"fake 意图","query":"fake 查询"}]}`,
@@ -192,6 +199,21 @@ func (s *Server) SetPage(path, contentType, body string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pages[path] = page{contentType: contentType, body: body}
+}
+
+// SetPageHeader 与 SetPage 相同，并在响应中附加 header 的全部头（同名多值逐行发出，可用来构造重复或冲突的
+// Cache-Control、Expires 等）。header 含 Date 时替代服务器自动生成的 Date。
+func (s *Server) SetPageHeader(path, contentType, body string, header http.Header) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pages[path] = page{contentType: contentType, body: body, header: header.Clone()}
+}
+
+// SetLatency 让类别 kind 的每个正常回复（不含注入的故障）在发出前等待 d（客户端离开时提前结束）。
+func (s *Server) SetLatency(kind Kind, d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.latency[kind] = d
 }
 
 // ResearchTask 是固定研究题目中的一个计划任务（与 deepresearch 计划回复的 JSON 字段一致）。
@@ -368,6 +390,19 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.setOutcome(rec, OutcomeStatus)
 		return
 	}
+	s.mu.Lock()
+	delay := s.latency[kind]
+	s.mu.Unlock()
+	if delay > 0 {
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-r.Context().Done():
+			timer.Stop()
+			s.setOutcome(rec, OutcomeAborted)
+			return
+		}
+	}
 	switch kind {
 	case Chat:
 		s.chat(w, rec, body)
@@ -538,6 +573,9 @@ func (s *Server) fetch(w http.ResponseWriter, r *http.Request, rec *Request) {
 	s.mu.Unlock()
 	if !ok {
 		p = page{contentType: "text/plain; charset=utf-8", body: r.URL.Path + " 的正文"}
+	}
+	for k, vs := range p.header {
+		w.Header()[http.CanonicalHeaderKey(k)] = append([]string(nil), vs...)
 	}
 	w.Header().Set("Content-Type", p.contentType)
 	w.Header().Set("Content-Length", strconv.Itoa(len(p.body)))

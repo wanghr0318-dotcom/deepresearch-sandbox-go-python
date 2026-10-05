@@ -148,6 +148,26 @@ func (e *env) callFixture() blob.Ref {
 	return ref
 }
 
+// cacheFixture 经 Tx1（BeginCall）与 Tx2（CompleteFromCache）完成一次来源为 source（cache 或 coalesced）的调用
+// callID：没有 try、不动账本，结果 blob 在 BlobStore 中并授权到任务 scope。返回结果 blob。
+func (e *env) cacheFixture(callID, source string) blob.Ref {
+	e.t.Helper()
+	ctx := context.Background()
+	if _, err := e.store.BeginCall(ctx, call.BeginCallRequest{TaskID: "t1", CallID: callID, AttemptID: "a1", Fingerprint: "fp-" + callID,
+		Endpoint: "/v1/fetch", Deadline: time.Minute}); err != nil {
+		e.t.Fatal(err)
+	}
+	ref, err := e.blobs.Put(ctx, bytes.NewReader([]byte(`{"url":"https://example.com/`+callID+`"}`)))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	if _, err := e.store.CompleteFromCache(ctx, call.CacheCompletion{TaskID: "t1", CallID: callID, AttemptID: "a1",
+		ResultSHA256: ref.SHA256, ResultSize: ref.Size, Source: source}); err != nil {
+		e.t.Fatal(err)
+	}
+	return ref
+}
+
 type scanner provider.ScanReport
 
 func (s scanner) Scan(context.Context) (provider.ScanReport, error) {
@@ -176,6 +196,18 @@ func TestCleanStatePasses(t *testing.T) {
 	e := newEnv(t)
 	e.fixture()
 	e.callFixture()
+	e.cacheFixture("c-cache", call.SourceCache)
+	e.cacheFixture("c-coalesced", call.SourceCoalesced)
+	// 已由 ResetResolving 复位的 resolving（resolving_since 为空）不是进行中的调用：访问撤销后也不违反 I15。
+	ctx := context.Background()
+	if _, err := e.store.BeginCall(ctx, call.BeginCallRequest{TaskID: "t1", CallID: "c-reset", AttemptID: "a1", Fingerprint: "fp-r",
+		Endpoint: "/v1/search", Deadline: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.ResetResolving(ctx); err != nil {
+		t.Fatal(err)
+	}
+	e.exec("UPDATE attempt_access SET state = 'revoked', revoked_at = now() WHERE attempt_id = 'a1'")
 	if vs := e.verify(scanner{}, true); len(vs) != 0 {
 		t.Fatalf("正常状态不应有违反：%+v", vs)
 	}
@@ -256,6 +288,29 @@ func TestEachInvariantIsReported(t *testing.T) {
 				e.t.Fatal(err)
 			}
 		}, scanner{}, false},
+		{"I14 缓存来源的调用结果未授权到任务 scope", "I14/A", func(e *env, _ blob.Ref) {
+			ref := e.cacheFixture("c-cache", call.SourceCache)
+			e.exec("DELETE FROM scope_blobs WHERE scope_kind = 'task' AND scope_id = 't1' AND sha256 = $1", ref.SHA256)
+		}, scanner{}, false},
+		{"I14 合并来源的调用结果被改写为另一个已授权的 blob", "I14/A", func(e *env, _ blob.Ref) {
+			e.cacheFixture("c-coalesced", call.SourceCoalesced)
+			other := e.cacheFixture("c-other", call.SourceCache)
+			e.exec("UPDATE calls SET result_ref = $1 WHERE task_id = 't1' AND call_id = 'c-coalesced'", other.SHA256)
+		}, scanner{}, false},
+		{"I14 缓存来源的调用带有 try", "I14/A", func(e *env, _ blob.Ref) {
+			e.cacheFixture("c-cache", call.SourceCache)
+			e.exec("UPDATE calls SET tries_used = 1 WHERE task_id = 't1' AND call_id = 'c-cache'")
+		}, scanner{}, false},
+		{"I15 进行中的 resolving 调用没有活跃 attempt（只在静止时检查）", "I15/Q", func(e *env, _ blob.Ref) {
+			if _, err := e.store.BeginCall(context.Background(), call.BeginCallRequest{TaskID: "t1", CallID: "c-stuck", AttemptID: "a1",
+				Fingerprint: "fp-s", Endpoint: "/v1/fetch", Deadline: time.Minute}); err != nil {
+				e.t.Fatal(err)
+			}
+			e.exec("UPDATE attempt_access SET state = 'revoked', revoked_at = now() WHERE attempt_id = 'a1'")
+			if vs := e.verify(scanner{}, false); len(vs) != 0 {
+				e.t.Fatalf("非静止时不应检查 I15：%+v", vs)
+			}
+		}, scanner{}, true},
 		{"I16 请求对应的资源不存在", "I16/A", func(e *env, _ blob.Ref) {
 			e.exec("INSERT INTO api_requests (request_id, kind, body_hash, resource_id, response) VALUES ('r9', 'create_task', 'x', 'missing', 'null')")
 		}, scanner{}, false},

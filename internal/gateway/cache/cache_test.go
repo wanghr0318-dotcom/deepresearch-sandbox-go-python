@@ -1300,6 +1300,51 @@ func TestSourceRedisDown(t *testing.T) {
 	}
 }
 
+// oversizedKV 像 Redis 客户端一样拒绝超过 4 KiB 的 GET 回复（ErrValueTooLarge），其余委托 memKV。
+type oversizedKV struct{ *memKV }
+
+func (k oversizedKV) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	v, ok, err := k.memKV.Get(ctx, key)
+	if ok && len(v) > MaxValueSize {
+		return nil, false, ErrValueTooLarge
+	}
+	return v, ok, err
+}
+
+// 超大条目（E22）：Redis 回复超过 4 KiB 的值是完整性失败——未命中、删除条目、计 integrity_failure；不计 error、
+// 不计入熔断（反复出现也不会打开熔断）。
+func TestSourceOversizedEntryIsIntegrityFailure(t *testing.T) {
+	signer, err := LoadKeys(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	kv := oversizedKV{newMemKV()}
+	m := &Metrics{}
+	b := NewBreaker(nil)
+	src, err := NewSource(SourceConfig{KV: kv, Breaker: b, Metrics: m, Signer: signer, Blobs: &memBlobs{m: map[string][]byte{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := []byte(`{"query":"big"}`)
+	key, err := Key(upstream.KindSearch, "fake", "v/1", params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2*DefaultFailureThreshold; i++ {
+		kv.put(key, []byte(strings.Repeat("x", MaxValueSize+1)))
+		if _, _, hit := src.Lookup(context.Background(), upstream.KindSearch, "fake", "v/1", params, ""); hit {
+			t.Fatal("超大条目不应命中")
+		}
+		if _, _, ok := kv.entry(key); ok {
+			t.Fatal("超大条目应被删除")
+		}
+	}
+	if got := src.Metrics(); got["integrity_failure"] != int64(2*DefaultFailureThreshold) || got["error"] != 0 || got["miss"] != 0 ||
+		got["breaker_open"] != 0 || b.State() != StateClosed {
+		t.Fatalf("指标 %v，熔断 %v", got, b.State())
+	}
+}
+
 // 真实 Redis：写入后命中（经 Seal/Open 与 blob 复核）。
 func TestSourceRealRedis(t *testing.T) {
 	addr := redisAddr(t)
