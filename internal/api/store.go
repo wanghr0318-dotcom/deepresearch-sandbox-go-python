@@ -31,8 +31,9 @@ type Store interface {
 	// TaskResult 读取任务状态与固定的结果（tasks.result_json；规格 §5.6：输出固定为
 	// (artifact_id, version, sha256)）。任务不存在为 persistence.ErrNotFound；没有结果时 Result 为 nil。
 	TaskResult(ctx context.Context, taskID string) (ResultView, error)
-	// PinnedArtifact 读取任务中一个产物的指定版本（version 为 0 时取最新版本）。只返回 blob 已授权到
-	// scope_blobs(task) 的版本。任务不存在为 persistence.ErrNotFound；产物或版本不存在（或未授权）时 found 为 false。
+	// PinnedArtifact 读取任务中一个产物的指定版本（version 为 0 时取最新版本）。只返回 visibility = output 且
+	// blob 已授权到 scope_blobs(task) 的版本。任务不存在为 persistence.ErrNotFound；产物或版本不存在、为 internal
+	// 或未授权时 found 为 false（与不存在不可区分）。
 	PinnedArtifact(ctx context.Context, taskID, artifactID string, version int64) (ArtifactView, bool, error)
 }
 

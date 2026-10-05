@@ -98,7 +98,8 @@ func (s *Store) TaskResult(ctx context.Context, taskID string) (api.ResultView, 
 	return v, err
 }
 
-// PinnedArtifact 读取任务中一个产物的版本（实现 api.Store）：version 为 0 时取最新版本。授权按
+// PinnedArtifact 读取任务中一个产物的版本（实现 api.Store）：version 为 0 时取最新版本。只有
+// visibility = output 的版本可下载（internal 版本视为不存在；inspect 的元数据不受影响）。授权按
 // scope_blobs(task)：blob 未授权到该任务的版本视为不存在。
 func (s *Store) PinnedArtifact(ctx context.Context, taskID, artifactID string, version int64) (api.ArtifactView, bool, error) {
 	if version < 0 {
@@ -114,17 +115,18 @@ func (s *Store) PinnedArtifact(ctx context.Context, taskID, artifactID string, v
 		if !exists {
 			return notFoundf("任务 %s", taskID)
 		}
-		// 先选版本（最新或指定），再核对授权：最新版本未授权时不回退到更早的版本。
-		var authorized bool
+		// 先选版本（最新或指定），再核对可见性与授权：最新版本为 internal 或未授权时不回退到更早的版本。
+		var visible bool
 		err := q.QueryRow(ctx, `SELECT a.version, a.sha256, a.size, a.media_type,
-				EXISTS (SELECT 1 FROM scope_blobs sb WHERE sb.scope_kind = 'task' AND sb.scope_id = a.task_id AND sb.sha256 = a.sha256)
+				a.visibility = 'output' AND EXISTS (SELECT 1 FROM scope_blobs sb
+					WHERE sb.scope_kind = 'task' AND sb.scope_id = a.task_id AND sb.sha256 = a.sha256)
 			FROM artifacts a
 			WHERE a.task_id = $1 AND a.artifact_id = $2 AND ($3::bigint = 0 OR a.version = $3::bigint)
-			ORDER BY a.version DESC LIMIT 1`, taskID, artifactID, version).Scan(&v.Version, &v.SHA256, &v.Size, &v.MediaType, &authorized)
+			ORDER BY a.version DESC LIMIT 1`, taskID, artifactID, version).Scan(&v.Version, &v.SHA256, &v.Size, &v.MediaType, &visible)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
-		found = err == nil && authorized
+		found = err == nil && visible
 		return err
 	})
 	if err != nil || !found {

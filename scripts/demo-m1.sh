@@ -184,7 +184,16 @@ ok "succeeded：attempt 1 crashed_signal（SIGKILL），attempt 2 恢复后 succ
 
 step "result"
 "$BIN" task watch "$T1" | jsonl "'%s: %s' % (d['type'], json.dumps(d['payload'], ensure_ascii=False))" | grep -E '^(checkpoint_committed|result|task_terminal|artifact_saved):' | sed 's/^/         /'
-ok "result 的 summary 与固定输出见上（产物下载端点在 M1 为 501）"
+ok "result 的 summary 与固定输出见上"
+# 经 API 下载固定结果与每个固定版本的产物；CLI 按 ETag 校验 sha256，不符则非零退出。
+RESULT=$("$BIN" task result "$T1") || fail "task result 下载或 sha256 校验失败"
+for a in $(echo "$RESULT" | json "' '.join(o['artifact_id'] for o in d['outputs'])"); do
+  v=$(echo "$RESULT" | json "[o['version'] for o in d['outputs'] if o['artifact_id'] == '$a'][0]")
+  got=$("$BIN" task result "$T1" --artifact "$a" --version "$v") || fail "产物 $a@$v 下载或 sha256 校验失败"
+  info "$a@$v：$got"
+done
+[ "$("$BIN" task result "$T1" --artifact report)" = "# final report" ] || fail "report 最新版本的内容不符"
+ok "agentbox task result 下载结果与固定版本的产物，sha256 校验通过"
 
 step "清理：环境停止、销毁，环境目录删除"
 wait_for "任务 $T1 的环境清理完成" 60 cleaned "$T1"

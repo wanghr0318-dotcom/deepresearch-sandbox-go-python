@@ -216,11 +216,15 @@ paths:
       - {$ref: '#/components/parameters/ArtifactID'}
     get:
       operationId: getArtifact
-      summary: Download an artifact version (the latest unless `version` is given)
+      summary: Download the latest artifact version; `?version=N` is an alias of `/versions/{v}`
+      description: |
+        Only `visibility = output` artifacts are downloadable; an `internal` artifact answers exactly like a
+        missing one (404 `artifact_not_found`). If the latest version is internal or unauthorized the answer is
+        404, never an older version.
       parameters:
         - name: version
           in: query
-          description: The version to download; omit for the latest registered version.
+          description: Alias of `/tasks/{id}/artifacts/{artifact_id}/versions/{v}` (the canonical pinned path, spec §15.1); omit for the latest version.
           schema: {type: integer, format: int64, minimum: 1}
       responses:
         '200': {$ref: '#/components/responses/Blob'}
@@ -240,7 +244,7 @@ paths:
         schema: {type: integer, format: int64, minimum: 1}
     get:
       operationId: getArtifactVersion
-      summary: Download one pinned artifact version (same as `?version=v`)
+      summary: Download one pinned artifact version (canonical path, spec §15.1); only `visibility = output` versions are served
       responses:
         '200': {$ref: '#/components/responses/Blob'}
         '400': {$ref: '#/components/responses/BadRequest'}
@@ -317,7 +321,7 @@ components:
         '*/*':
           schema: {type: string, format: binary}
     ArtifactNotFound:
-      description: '`task_not_found`; or `artifact_not_found`: no such artifact or version in the task'
+      description: '`task_not_found`; or `artifact_not_found`: no such artifact or version in the task, or it is `internal` (indistinguishable from missing)'
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}

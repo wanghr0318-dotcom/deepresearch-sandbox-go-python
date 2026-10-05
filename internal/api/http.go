@@ -658,8 +658,9 @@ func (h *Handler) getResult(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// getArtifact 下载任务中一个产物的版本：`/artifacts/{artifact_id}` 默认最新版本，`?version=N` 指定；
-// `/artifacts/{artifact_id}/versions/{v}` 是指定版本的固定路径。只返回授权到 scope_blobs(task) 的 blob。
+// getArtifact 下载任务中一个产物的版本：`/artifacts/{artifact_id}/versions/{v}` 是固定版本的规范路径（§15.1），
+// `/artifacts/{artifact_id}` 默认最新版本，`?version=N` 是规范路径的别名。只返回 visibility = output 且授权到
+// scope_blobs(task) 的版本（Store 判定）；internal 版本与不存在的返回相同的 404 artifact_not_found。
 // 正文从 BlobStore 流式读取，ETag 为登记的 sha256，Content-Type 为登记的媒体类型；主动内容强制 attachment。
 //
 // 正文边发送边校验：读到的字节与登记的 sha256 或大小不符（blob 被篡改或损坏）时中止连接，使客户端

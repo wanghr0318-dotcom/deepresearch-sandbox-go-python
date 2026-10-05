@@ -1986,6 +1986,21 @@ func TestPinnedOutputReads(t *testing.T) {
 	if _, found, err := s.PinnedArtifact(ctx, "t1", "missing", 0); err != nil || found {
 		t.Fatalf("不存在的产物：found=%v %v", found, err)
 	}
+	// internal 产物对下载不可见：与不存在相同；最新版本为 internal 时也不回退到更早的 output 版本。
+	for i, vis := range []string{"output", "internal"} {
+		if _, err := s.RegisterArtifact(ctx, runner.Artifact{TaskID: "t1", AttemptID: "att-t1", ArtifactID: "scratch",
+			SHA256: strings.Repeat(string(rune('c'+i)), 64), Size: 3, MediaType: "text/plain", Visibility: vis}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []struct {
+		version int64
+		found   bool
+	}{{0, false}, {2, false}, {1, true}} {
+		if _, found, err := s.PinnedArtifact(ctx, "t1", "scratch", c.version); err != nil || found != c.found {
+			t.Fatalf("scratch version %d：found=%v %v，期望 %v", c.version, found, err, c.found)
+		}
+	}
 	if _, _, err := s.PinnedArtifact(ctx, "missing", "report", 0); !errors.Is(err, persistence.ErrNotFound) {
 		t.Fatalf("不存在的任务应为 ErrNotFound，得到 %v", err)
 	}

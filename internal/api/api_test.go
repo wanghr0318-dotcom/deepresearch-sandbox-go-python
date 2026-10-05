@@ -44,12 +44,13 @@ type fakeStore struct {
 	commitThenUnknown bool
 	results           map[string]json.RawMessage // task_id → result_json
 	artifacts         map[string][]ArtifactView  // task_id/artifact_id → 按版本升序
+	internal          map[string]bool            // task_id/artifact_id → visibility = internal（对下载不可见）
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{tasks: map[string]*TaskView{}, events: map[string][]Event{},
 		requests: map[string]RequestRecord{}, inspect: map[string]Inspection{}, limits: map[string]string{},
-		results: map[string]json.RawMessage{}, artifacts: map[string][]ArtifactView{}}
+		results: map[string]json.RawMessage{}, artifacts: map[string][]ArtifactView{}, internal: map[string]bool{}}
 }
 
 func (f *fakeStore) TaskResult(_ context.Context, taskID string) (ResultView, error) {
@@ -69,7 +70,7 @@ func (f *fakeStore) PinnedArtifact(_ context.Context, taskID, artifactID string,
 		return ArtifactView{}, false, persistence.ErrNotFound
 	}
 	vs := f.artifacts[taskID+"/"+artifactID]
-	if len(vs) == 0 {
+	if len(vs) == 0 || f.internal[taskID+"/"+artifactID] {
 		return ArtifactView{}, false, nil
 	}
 	if version == 0 {
@@ -799,6 +800,20 @@ func TestArtifactDownload(t *testing.T) {
 	ts.blobs.mu.Unlock()
 	st, b, _ := ts.do("GET", "/tasks/t1/artifacts/lost", "", nil)
 	expect(t, st, b, 500, "blob_unavailable")
+
+	// internal 产物对下载不可见：响应与不存在的产物逐字节相同（不泄露存在性）。
+	ts.store.addArtifact(ts.blobs, "t1", "scratch", "text/plain", []byte("internal"))
+	ts.store.mu.Lock()
+	ts.store.internal["t1/scratch"] = true
+	ts.store.mu.Unlock()
+	_, missing, _ := ts.do("GET", "/tasks/t1/artifacts/nothing", "", nil)
+	for _, p := range []string{"/tasks/t1/artifacts/scratch", "/tasks/t1/artifacts/scratch?version=1", "/tasks/t1/artifacts/scratch/versions/1"} {
+		st, b, _ := ts.do("GET", p, "", nil)
+		expect(t, st, b, 404, "artifact_not_found")
+		if !bytes.Equal(b, missing) {
+			t.Fatalf("%s：internal 产物的响应 %s 与不存在的 %s 不同", p, b, missing)
+		}
+	}
 }
 
 // TestArtifactTamperedAborts：BlobStore 中的内容与登记的 sha256 不符（篡改或损坏）时中止连接，客户端
