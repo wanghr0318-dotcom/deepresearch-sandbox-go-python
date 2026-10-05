@@ -178,10 +178,9 @@ func (x envAdapter) CreateEnv(ctx context.Context, s task.EnvSpec) (*task.Outcom
 	if err != nil {
 		return classifyCreate(ctx, err), err
 	}
-	ws := workspaceDir(x.dataDir, s.TaskID)
 	// 已知的 M1 缺口：任务 workspace 没有清理所有者，任务结束后不会删除。
-	if err := os.MkdirAll(ws, 0o700); err != nil {
-		err = fmt.Errorf("app: 建立任务 workspace: %w", err)
+	ws, err := makeWorkspace(x.dataDir, s.TaskID)
+	if err != nil {
 		return classifyCreate(ctx, err), err
 	}
 	_, err = x.c.CreateEnv(ctx, resource.EnvRequest{EnvID: s.EnvID, AttemptID: s.AttemptID, Kind: provider.KindTask,
@@ -230,6 +229,39 @@ func workspaceDir(dataDir, taskID string) string {
 	return filepath.Join(dataDir, "workspaces", taskID)
 }
 
+// makeWorkspace 建立任务 workspace（0700）。数据目录与 workspaces 目录须对"其他人"可搜索（o+x，不可列出）：
+// 沙箱 init 在 user namespace 中以映射 root 运行，只有经过它们才能到达 workspace；workspace 本身由
+// provider 在启动环境时 chown 到映射 UID（规格 §4.5）。
+func makeWorkspace(dataDir, taskID string) (string, error) {
+	parent := filepath.Join(dataDir, "workspaces")
+	if err := os.MkdirAll(parent, 0o711); err != nil {
+		return "", fmt.Errorf("app: 建立任务 workspace: %w", err)
+	}
+	fi, err := os.Stat(parent)
+	if err != nil {
+		return "", fmt.Errorf("app: 建立任务 workspace: %w", err)
+	}
+	if err := searchable(parent, fi); err != nil {
+		return "", err
+	}
+	ws := workspaceDir(dataDir, taskID)
+	if err := os.MkdirAll(ws, 0o700); err != nil {
+		return "", fmt.Errorf("app: 建立任务 workspace: %w", err)
+	}
+	return ws, nil
+}
+
+// searchable 为目录补上 o+x（已有时不变）。
+func searchable(dir string, fi os.FileInfo) error {
+	if fi.Mode().Perm()&0o001 != 0 {
+		return nil
+	}
+	if err := os.Chmod(dir, fi.Mode().Perm()|0o001); err != nil {
+		return fmt.Errorf("app: 使 %s 可被沙箱 init 搜索（o+x）: %w", dir, err)
+	}
+	return nil
+}
+
 // ---- runner.Runner → task.AttemptRunner ----
 
 // attemptRunner 是 runner.Runner 中 actor 使用的部分。
@@ -251,9 +283,9 @@ func (x runnerAdapter) Run(ctx context.Context, s task.RunSpec, controls <-chan 
 	if s.StartErr != nil {
 		return startFailure(ctx, s.StartErr)
 	}
-	ws := workspaceDir(x.dataDir, s.Task.TaskID)
-	if err := os.MkdirAll(ws, 0o700); err != nil {
-		return startFailure(ctx, fmt.Errorf("app: 建立任务 workspace: %w", err))
+	ws, err := makeWorkspace(x.dataDir, s.Task.TaskID)
+	if err != nil {
+		return startFailure(ctx, err)
 	}
 	in := protocol.Init{Type: protocol.TypeInit, Bootstrap: protocol.BootstrapVersion,
 		ProtocolVersions: []int64{protocol.Version}, Mode: protocol.ModeTask,

@@ -343,11 +343,14 @@ func (s *server) fail(err error) {
 func (s *server) run(ctx context.Context, deadline <-chan time.Time) error {
 	dir := s.d.DataDir
 	// §14.1 第 1 步：数据目录、flock、advisory lock、安装身份。
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	// 数据目录 0711：沙箱 init 须能经过它到达任务 workspace（见 makeWorkspace）。
+	if err := os.MkdirAll(dir, 0o711); err != nil {
 		return fmt.Errorf("app: 数据目录: %w", err)
 	}
 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 		return fmt.Errorf("app: 数据目录 %s 不可用: %v", dir, err)
+	} else if err := searchable(dir, fi); err != nil {
+		return err
 	}
 	s.step("data_dir")
 	release, err := s.d.LockDataDir(dir)

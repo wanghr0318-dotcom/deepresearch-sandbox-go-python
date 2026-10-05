@@ -65,27 +65,45 @@ func openOutDir(path string) (*outDir, error) {
 		return nil, &os.PathError{Op: "open", Path: root, Err: err}
 	}
 	defer func() { _ = syscall.Close(rootFD) }()
-	outFD, err := openDirBelow(rootFD, outName)
+	// 新建的目录归 workspace 根的属主（provider 已把它 chown 到环境的映射 UID，规格 §4.5），
+	// Worker 才能在其中写产物。
+	var st syscall.Stat_t
+	if err := syscall.Fstat(rootFD, &st); err != nil {
+		return nil, &os.PathError{Op: "fstat", Path: root, Err: err}
+	}
+	outFD, err := openDirBelow(rootFD, outName, int(st.Uid), int(st.Gid))
 	if err != nil {
 		return nil, &os.PathError{Op: "openat2", Path: out, Err: err}
 	}
 	defer func() { _ = syscall.Close(outFD) }()
-	fd, err := openDirBelow(outFD, attemptDir)
+	fd, err := openDirBelow(outFD, attemptDir, int(st.Uid), int(st.Gid))
 	if err != nil {
 		return nil, &os.PathError{Op: "openat2", Path: clean, Err: err}
 	}
 	return &outDir{fd: fd}, nil
 }
 
-// openDirBelow 在 dirfd 下创建（已存在则忽略）并打开单个目录分量，不跟随符号链接。
-func openDirBelow(dirfd int, name string) (int, error) {
-	if err := syscall.Mkdirat(dirfd, name, 0o755); err != nil && !errors.Is(err, syscall.EEXIST) {
+// openDirBelow 在 dirfd 下创建（已存在则忽略）并打开单个目录分量，不跟随符号链接；本次新建的目录
+// 经已打开的 FD 改为 uid/gid 所有（已存在的保持不变）。
+func openDirBelow(dirfd int, name string, uid, gid int) (int, error) {
+	created := true
+	if err := syscall.Mkdirat(dirfd, name, 0o755); errors.Is(err, syscall.EEXIST) {
+		created = false
+	} else if err != nil {
 		return -1, err
 	}
-	return openat2(dirfd, name, &openHow{
+	fd, err := openat2(dirfd, name, &openHow{
 		Flags:   syscall.O_RDONLY | syscall.O_DIRECTORY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC,
 		Resolve: resolveNoSymlinks | resolveNoMagiclinks,
 	})
+	if err != nil || !created {
+		return fd, err
+	}
+	if err := syscall.Fchown(fd, uid, gid); err != nil {
+		_ = syscall.Close(fd)
+		return -1, err
+	}
+	return fd, nil
 }
 
 // open 以 RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_XDEV 与

@@ -24,6 +24,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence/postgres"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider/local"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/rootfs"
 )
 
 const (
@@ -31,14 +32,26 @@ const (
 	defaultCgroupRoot = "/sys/fs/cgroup"
 )
 
-// errNoProductionStarter：生产环境启动器（namespace、UID 映射、挂载、pivot_root、降权；规格 §4.6）
-// 尚未提供。§4.6 的启动序列须经 Plan 1B spike 的结论回写并审阅后才实现；在此之前 server 拒绝启动，
-// 不以未隔离的方式运行任务。
-var errNoProductionStarter = errors.New("没有可用于生产的环境启动器：规格 §4.6 的降权启动序列待 Plan 1B spike 结论审阅后实现；" +
-	"在此之前 server 拒绝启动，不以未隔离的方式运行任务")
+// defaultWorkerEnv 是沙箱内 Worker 的默认环境：worker 包安装在默认模板包含的 rootfs.WorkerDir 中。
+const defaultWorkerEnv = "PYTHONPATH=" + rootfs.WorkerDir
 
-// productionStarter 返回生产 EnvStarter；Plan 1B 结论审阅前不存在。
-func productionStarter() (local.EnvStarter, error) { return nil, errNoProductionStarter }
+// prepareIsolation 在取得任何锁、连接数据库之前确认能够以隔离方式执行任务（规格 §4.5、§4.6）：
+// 默认 rootfs 模板的宿主路径齐全（缺失时报告路径），并构造生产启动器（本进程成为 child subreaper）。
+// 任何一项失败都拒绝启动，不以未隔离的方式运行任务。
+func prepareIsolation() (local.EnvStarter, error) {
+	tpl, err := rootfs.ResolveTemplate(rootfs.DefaultTemplateName)
+	if err != nil {
+		return nil, err
+	}
+	if err := tpl.Ensure(); err != nil {
+		return nil, fmt.Errorf("rootfs 模板 %q 不可用（worker 包须安装在 %s）: %w", rootfs.DefaultTemplateName, rootfs.WorkerDir, err)
+	}
+	starter, err := local.NewProcessStarter()
+	if err != nil {
+		return nil, err
+	}
+	return starter, nil
+}
 
 func runServer(args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("server", flag.ContinueOnError)
@@ -53,6 +66,8 @@ func runServer(args []string, stderr io.Writer) int {
 	defaultRunTime := fs.Duration("default-run-time", time.Hour, "累计运行时限的默认值：创建时未指定 limits.max_run_time_ms 的任务以此存储")
 	runTimeCap := fs.Duration("run-time-cap", 24*time.Hour, "显式累计运行时限的服务端上限")
 	allowedHost := fs.String("allowed-host", "", "非 loopback 监听时 Host 头的允许值（逗号分隔）")
+	workerArgv := fs.String("worker-argv", "python3,-m,sim_worker", "沙箱内启动 Worker 的命令（逗号分隔的 argv）")
+	workerEnv := fs.String("worker-env", defaultWorkerEnv, "沙箱内 Worker 的环境变量（逗号分隔的 KEY=VALUE）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -61,7 +76,7 @@ func runServer(args []string, stderr io.Writer) int {
 		return 2
 	}
 	// 在取得任何锁、连接数据库之前确认能够安全执行任务。
-	starter, err := productionStarter()
+	starter, err := prepareIsolation()
 	if err != nil {
 		fmt.Fprintln(stderr, "agentbox server: 拒绝启动:", err)
 		return 1
@@ -78,6 +93,8 @@ func runServer(args []string, stderr io.Writer) int {
 		DefaultRunTime:     *defaultRunTime,
 		RunTimeCap:         *runTimeCap,
 		AllowedHosts:       splitList(*allowedHost),
+		WorkerArgv:         splitList(*workerArgv),
+		WorkerEnv:          splitList(*workerEnv),
 	}
 	if _, err := os.Stat(filepath.Join(dir, api.TokenFile)); err == nil {
 		if cfg.APIToken, err = api.LoadToken(dir); err != nil {

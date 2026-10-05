@@ -1282,3 +1282,48 @@ func TestWorkloadLimitsApplied(t *testing.T) {
 		t.Errorf("exec workload 的 (NOFILE, FSIZE) = %q，期望 \"128 2048\"", got)
 	}
 }
+
+// TestPrepareWorkspace（Task 13）：workspace 连同其中条目（不跟随符号链接）chown 到映射 uid/gid 1000；
+// 上级目录缺少 o+x 时拒绝启动并指出该目录（沙箱 init 以映射 root 运行，无法经过它）。
+func TestPrepareWorkspace(t *testing.T) {
+	requireRoot(t)
+	base := t.TempDir() // 上级是 os.MkdirTemp 建立的 0700 目录
+	ws := filepath.Join(base, "ws")
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(filepath.Join(ws, "out", "a1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "out", "a1", "f"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, []byte("y"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(ws, "link")); err != nil {
+		t.Fatal(err)
+	}
+	const uidBase = 300000
+	parent := filepath.Dir(base)
+	if err := prepareWorkspace(ws, uidBase+workloadID); err == nil || !strings.Contains(err.Error(), parent) {
+		t.Fatalf("上级目录 %s 为 0700 时 prepareWorkspace = %v，期望指出该目录", parent, err)
+	}
+	if err := os.Chmod(parent, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareWorkspace(ws, uidBase+workloadID); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{ws, filepath.Join(ws, "out"), filepath.Join(ws, "out", "a1"), filepath.Join(ws, "out", "a1", "f"), filepath.Join(ws, "link")} {
+		var st syscall.Stat_t
+		if err := syscall.Lstat(p, &st); err != nil {
+			t.Fatal(err)
+		}
+		if st.Uid != uidBase+workloadID || st.Gid != uidBase+workloadID {
+			t.Fatalf("%s 属主 %d:%d，期望 %d", p, st.Uid, st.Gid, uidBase+workloadID)
+		}
+	}
+	var st syscall.Stat_t
+	if err := syscall.Stat(outside, &st); err != nil || st.Uid != 0 {
+		t.Fatalf("符号链接的目标 %s 被改变属主（%d，%v）", outside, st.Uid, err)
+	}
+}
