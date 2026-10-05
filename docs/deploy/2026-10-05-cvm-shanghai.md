@@ -34,3 +34,18 @@
 - PostgreSQL dump 与 BlobStore：加密压缩后放私有 GitHub Release asset 或对象存储，记录 SHA-256；不进 Git。
 - `.env` 与 API Key 永不进入备份与 Git。
 - 释放前：最终备份 → 实际执行一次恢复验证 → 推送证据 → 释放实例、系统盘与公网 IP。
+
+## 密钥与轮换（均不写进代码，可随时更换）
+
+服务器上所有机密集中在 `~/.agentbox.env`（0600，只有 `ubuntu` 可读）：`AGENTBOX_MODEL_API_KEY`、`AGENTBOX_SEARCH_API_KEY`、`AGENTBOX_DATABASE_URL`（数据库口令为随机生成，旧的开发默认口令已被拒绝）。演示与启动时只读取这几个变量名对应的行，不 source 整个文件、不打印值。
+
+| 机密 | 轮换方法 |
+|---|---|
+| 模型 / 搜索 Key | 在供应商控制台作废并新建 → 改 `~/.agentbox.env` 对应行 → 重启 server |
+| 数据库口令 | `P=$(openssl rand -hex 24)`；`sudo -u postgres psql -c "ALTER ROLE agentbox PASSWORD '$P'"`；改 `AGENTBOX_DATABASE_URL` 行 → 重启 server |
+| API token | 替换 `<data>/api.token`（0600）→ 重启 server；浏览器重新输入 |
+| 缓存签名密钥 | 停止 server → `agentbox cache rotate-key --data-dir <data>` → 启动（上一代 kid 仍可验证一个周期） |
+| TLS 证书 | 替换 `--tls-cert/--tls-key` 指向的文件 → 重启 server |
+| SSH 密钥 | 腾讯云控制台重新绑定密钥对；私钥只在维护者本机 |
+
+本地开发与 CI 的 `agentbox/agentbox` 是只监听本机的开发默认值，不用于服务器。Redis 无口令、只监听 127.0.0.1，缓存条目带 HMAC 签名（篡改即未命中）。释放服务器前删除 `~/.agentbox.env`。
