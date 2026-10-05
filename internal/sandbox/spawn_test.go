@@ -33,6 +33,11 @@ import (
 // 而不是钻进 go test 自己的框架（LaunchCommand 硬编码 re-exec /proc/self/exe，
 // 从测试里调用时那就是这个测试二进制自己）。
 func TestMain(m *testing.M) {
+	// stage-2 helper 分流（init 以 execveat 启动本测试二进制）：成功时 execve workload，不返回。
+	if len(os.Args) > 1 && os.Args[1] == HelperArg {
+		RunHelper()
+		os.Exit(126)
+	}
 	// seccomp 子进程分流：见 TestSeccompOrchestratorFilterInChildProcess。
 	// 放在 TestMain 而不是一个“非子进程时跳过”的辅助用例里，是因为
 	// linux-integration 不允许出现任何 skip。
@@ -51,6 +56,10 @@ func TestMain(m *testing.M) {
 		// init 的测试钩子（只在测试构建中可设置）：经 LaunchSpec.Env 传入的环境变量。
 		initFailAt = os.Getenv(envTestInitFail)
 		forceClassicMounts = os.Getenv(envTestInitClassic) == "1"
+		helperTestHook = os.Getenv(envTestHelperHook)
+		if os.Getenv(envTestLockProbe) == "1" {
+			startLockProbe = lockProbe
+		}
 		if err := RunInit(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -1013,6 +1022,10 @@ var reaperChildren = map[string]func() error{
 	"eintr":  reaperChildEINTR,
 	"orphan": reaperChildOrphan,
 	"outerr": reaperChildOutErr,
+	// Task 11：exec 提交点的边界分类（见 TestCommitBoundaryClassification）。
+	"commit-reap-first-signal": commitChildReapFirstSignal,
+	"commit-reap-first-126":    commitChildReapFirst126,
+	"commit-eof-first":         commitChildEOFFirst,
 }
 
 // runReaperCase 以 envReaperChild=name re-exec 测试二进制，要求子进程报告通过。
@@ -2280,7 +2293,7 @@ func procStatusFields(t *testing.T, path string) map[string]string {
 //     没有 /run（Gateway socket 不可见）也没有 /workspace，/out 的 nr_inodes=1024；
 //   - 每个线程的能力集合为 initCaps，inheritable 与 ambient 为空；
 //   - fd 3、4、5 已关闭，其余 fd（除 0–2）都带 close-on-exec，其中有高位的控制 socket 与指向本二进制的 helper fd；
-//   - init 已进入 Serve：start 得到 start_err（生产 Launcher 尚未实现），不运行 workload。
+//   - init 已进入 Serve：start 经生产 Launcher（stage-2 helper）运行 /bin/true，得到 start_ack 然后 exit 0。
 func TestInitEnvironment(t *testing.T) {
 	testutil.RequireLinuxRoot(t)
 	for _, kind := range []string{KindTask, KindExec} {
@@ -2531,9 +2544,11 @@ func checkInitEnvironment(t *testing.T, kind string, classic bool) {
 	for _, f := range nullFDs {
 		f.Close()
 	}
-	m, _, err := s.conn.Recv()
-	if err != nil || m.Type != MsgStartErr || m.ExecID != "e1" || !strings.Contains(m.Reason, "init/launcher") {
-		t.Fatalf("start 的回复 = %+v, %v；期望 start_err（init/launcher）", m, err)
+	for _, want := range []string{MsgStartAck, MsgExit} {
+		m, _, err := s.conn.Recv()
+		if err != nil || m.Type != want || m.ExecID != "e1" || (want == MsgExit && (m.Exit.Code != 0 || m.Exit.Signal != 0)) {
+			t.Fatalf("start 的回复 = %+v, %v；期望 %s（exit 0）\n%s", m, err, want, s.output())
+		}
 	}
 }
 
@@ -2624,4 +2639,610 @@ func TestInitSpecValidate(t *testing.T) {
 			t.Errorf("%s: validate 通过，期望拒绝", name)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 11：stage-2 helper、init 的生产 Launcher 与 exec 提交点判据（规格 §4.6 helper 段与实现门槛 2）。
+// 除用例 8（判定逻辑的时序边界，在 reaper 子进程中以测试钩子构造）外，都在真实沙箱中运行：init 由 RunLaunch
+// 在 user namespace 中启动，helper 是本测试二进制（TestMain 的 exec-stage2 分流）。
+// ---------------------------------------------------------------------------
+
+// init 的 Task 11 测试钩子环境变量（TestMain 读取后设置 helperTestHook、startLockProbe）。
+const (
+	envTestHelperHook = "AGENTBOX_TEST_HELPER_HOOK"
+	envTestLockProbe  = "AGENTBOX_TEST_LOCK_PROBE"
+)
+
+// lockProbe 是 init 的 startLockProbe：判定等待开始时获取一次 reg.mu，向 stderr 报告等待时长。
+// 若启动路径在等待判定期间持有 reg.mu，等待会长达 helper 的延迟（同一 goroutine 持有则死锁，测试超时）。
+func lockProbe(r *Registry, execID string) {
+	t0 := time.Now()
+	r.mu.Lock()
+	w := time.Since(t0)
+	r.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "lock-probe %s waited_us=%d\n", execID, w.Microseconds())
+}
+
+// helperTestInit 启动一个 exec 环境的 init（生产 Launcher）；env 是附加给 init 的测试钩子，mutate 可修改规格。
+// 返回 init 与其控制连接上的消息流。
+func helperTestInit(t *testing.T, mutate func(*LaunchSpec), env ...string) (*sandboxInit, <-chan Message) {
+	t.Helper()
+	spec := initTestSpec(t, KindExec, false)
+	spec.Env = append(spec.Env, env...)
+	if mutate != nil {
+		mutate(&spec)
+	}
+	s := startSandboxInit(t, spec)
+	if s.ready != nil {
+		t.Fatalf("init 未就绪: %v\n%s", s.ready, s.output())
+	}
+	return s, pumpMessages(s.conn)
+}
+
+// pumpMessages 在单独的 goroutine 中读取 c，直到连接结束（之后关闭返回的 channel）。
+func pumpMessages(c *Conn) <-chan Message {
+	ch := make(chan Message, 256)
+	go func() {
+		defer close(ch)
+		for {
+			m, files, err := c.Recv()
+			closeFiles(files)
+			if err != nil {
+				return
+			}
+			ch <- m
+		}
+	}()
+	return ch
+}
+
+func nextMsg(t *testing.T, s *sandboxInit, ch <-chan Message) Message {
+	t.Helper()
+	select {
+	case m, ok := <-ch:
+		if !ok {
+			t.Fatalf("控制连接在期望的消息之前结束\n%s", s.output())
+		}
+		return m
+	case <-time.After(20 * time.Second):
+		t.Fatalf("等待消息超时\n%s", s.output())
+	}
+	return Message{}
+}
+
+// sendStart 发送 start：stdin、stderr 为 /dev/null，stdout 为 out（nil 时为 /dev/null）。发送后关闭这些子端副本。
+func sendStart(t *testing.T, s *sandboxInit, execID string, out *os.File, argv ...string) {
+	t.Helper()
+	fds, err := devNullFDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := fds[:]
+	if out != nil {
+		fds[1].Close()
+		files = []*os.File{fds[0], out, fds[2]}
+	}
+	err = s.conn.Send(Message{Type: MsgStart, ExecID: execID, Spec: argvSpec(argv...)}, files)
+	closeFiles(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// closeAndDrain 半关闭控制连接（宿主不再发送；init 的 Serve 读到 EOF 后返回），断言此后直到连接结束没有任何
+// 消息，然后等待 init 退出。
+func closeAndDrain(t *testing.T, s *sandboxInit, ch <-chan Message) {
+	t.Helper()
+	if err := s.conn.rc.Control(func(fd uintptr) { _ = syscall.Shutdown(int(fd), syscall.SHUT_WR) }); err != nil {
+		t.Fatal(err)
+	}
+	timeout := time.After(20 * time.Second)
+drain:
+	for {
+		select {
+		case m, ok := <-ch:
+			if !ok {
+				break drain
+			}
+			t.Errorf("半关闭之后收到意外的消息 %+v", m)
+		case <-timeout:
+			t.Fatalf("半关闭之后控制连接未结束\n%s", s.output())
+		}
+	}
+	if !waitPidfdExit(s.pidfd, 10*time.Second) {
+		t.Fatalf("init 未退出\n%s", s.output())
+	}
+}
+
+// inSandbox 返回沙箱内路径 p 在宿主上的路径（经 init 的根）。只在 init 存活时有效。
+func inSandbox(s *sandboxInit, p string) string { return fmt.Sprintf("/proc/%d/root%s", s.pid, p) }
+
+func fileExists(p string) bool {
+	_, err := os.Lstat(p)
+	return err == nil
+}
+
+// expectAckExit 读取 execID 的 start_ack 与随后的 exit（顺序断言），返回 ack 的 pid 与退出状态。
+func expectAckExit(t *testing.T, s *sandboxInit, ch <-chan Message, execID string) (int, ExitInfo) {
+	t.Helper()
+	ack := nextMsg(t, s, ch)
+	if ack.Type != MsgStartAck || ack.ExecID != execID || ack.PID <= 0 {
+		t.Fatalf("第一条消息 = %+v，期望 %s 的 start_ack\n%s", ack, execID, s.output())
+	}
+	ex := nextMsg(t, s, ch)
+	if ex.Type != MsgExit || ex.ExecID != execID || ex.Exit == nil {
+		t.Fatalf("start_ack 之后的消息 = %+v，期望 %s 的 exit\n%s", ex, execID, s.output())
+	}
+	return ack.PID, *ex.Exit
+}
+
+// TestHelperFailurePoints：提交点矩阵 (1)——helper 降权序列的 12 个步骤各自注入失败：start_err 的原因为
+// `helper/<步骤>: <原因>`，workload 未运行（它应写的标记文件不存在），且之后没有 start_ack 与 exit。
+// 另有一个不经注入的真实失败：execve 不存在的路径（ENOENT）。
+func TestHelperFailurePoints(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+	if len(helperSteps) != 12 {
+		t.Fatalf("helper 的注入点有 %d 个，期望 12 个", len(helperSteps))
+	}
+	for _, step := range helperSteps {
+		t.Run(step, func(t *testing.T) {
+			s, ch := helperTestInit(t, nil, envTestHelperHook+"="+hookFailPrefix+step)
+			sendStart(t, s, "e1", nil, "/bin/sh", "-c", "touch /tmp/started")
+			m := nextMsg(t, s, ch)
+			want := "helper/" + step + ": " + errInjected.Error()
+			if m.Type != MsgStartErr || m.ExecID != "e1" || m.Reason != want {
+				t.Fatalf("回复 = %+v，期望 start_err{%s}\n%s", m, want, s.output())
+			}
+			if fileExists(inSandbox(s, "/tmp/started")) {
+				t.Fatal("start_err 之后 workload 的标记文件存在：workload 运行了")
+			}
+			closeAndDrain(t, s, ch)
+		})
+	}
+	t.Run("execve 真实失败", func(t *testing.T) {
+		s, ch := helperTestInit(t, nil)
+		sendStart(t, s, "e1", nil, "/nonexistent/workload")
+		m := nextMsg(t, s, ch)
+		if m.Type != MsgStartErr || !strings.HasPrefix(m.Reason, "helper/execve: ") || !strings.Contains(m.Reason, "no such file") {
+			t.Fatalf("回复 = %+v，期望 start_err{helper/execve: no such file or directory}\n%s", m, s.output())
+		}
+		closeAndDrain(t, s, ch)
+	})
+}
+
+// TestHelperDiedBeforeExec：提交点矩阵 (2)——helper 完成全部降权步骤后、execve 之前 SIGKILL 自身（exec-status
+// 管道同样是"EOF 无字节"）：start_err{helper/died_before_exec: signal killed}，workload 未运行，没有 start_ack
+// 与 exit。重复 5 次，判定确定（不依赖 reaper 与 EOF 的先后）。
+func TestHelperDiedBeforeExec(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+	s, ch := helperTestInit(t, nil, envTestHelperHook+"="+hookSigkill)
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("e%d", i)
+		sendStart(t, s, id, nil, "/bin/sh", "-c", "touch /tmp/started")
+		m := nextMsg(t, s, ch)
+		if m.Type != MsgStartErr || m.ExecID != id || m.Reason != "helper/died_before_exec: signal killed" {
+			t.Fatalf("第 %d 次回复 = %+v，期望 start_err{helper/died_before_exec: signal killed}\n%s", i, m, s.output())
+		}
+	}
+	if fileExists(inSandbox(s, "/tmp/started")) {
+		t.Fatal("workload 的标记文件存在：workload 运行了")
+	}
+	closeAndDrain(t, s, ch)
+}
+
+// TestHelperCommitFastExit：提交点矩阵 (3)——workload /bin/true 立即退出：start_ack 然后 exit 0（顺序断言），
+// 重复 20 次（覆盖观察点上 workload 已在退出、判定等待 reaper 记录的路径）。
+func TestHelperCommitFastExit(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+	s, ch := helperTestInit(t, nil)
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("e%d", i)
+		sendStart(t, s, id, nil, "/bin/true")
+		if _, ex := expectAckExit(t, s, ch, id); ex.Code != 0 || ex.Signal != 0 {
+			t.Fatalf("%s 的退出状态 = %+v，期望 0", id, ex)
+		}
+	}
+	closeAndDrain(t, s, ch)
+}
+
+// TestHelperCommitExit126：提交点矩阵 (4)——已 exec 的 workload 以 126 退出：start_ack 然后 exit 126，不被误判为
+// died_before_exec（126 只对终止不晚于 EOF 观察的情形生效）；标记文件证明 workload 运行过。
+func TestHelperCommitExit126(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+	s, ch := helperTestInit(t, nil)
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("e%d", i)
+		marker := fmt.Sprintf("/tmp/ran126-%d", i)
+		sendStart(t, s, id, nil, "/bin/sh", "-c", "touch "+marker+"; exit 126")
+		if _, ex := expectAckExit(t, s, ch, id); ex.Code != 126 || ex.Signal != 0 {
+			t.Fatalf("%s 的退出状态 = %+v，期望 126", id, ex)
+		}
+		if !fileExists(inSandbox(s, marker)) {
+			t.Fatalf("%s 的标记文件不存在", id)
+		}
+	}
+	closeAndDrain(t, s, ch)
+}
+
+// TestHelperCommitSameName：提交点矩阵 (5)——workload 二进制复制为与 helper 同名（agentbox-helper，进程名与
+// helper 的 PR_SET_NAME 相同）：判定不受影响，start_ack 然后 exit 3。workload 记录自己的进程名以证明同名。
+func TestHelperCommitSameName(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+	s, ch := helperTestInit(t, func(spec *LaunchSpec) {
+		src, err := filepath.EvalSymlinks("/bin/sh")
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(spec.Init.In, helperComm), b, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	})
+	sendStart(t, s, "e1", nil, "/in/"+helperComm, "-c", "read c < /proc/$$/comm; echo \"$c\" > /tmp/same; exit 3")
+	if _, ex := expectAckExit(t, s, ch, "e1"); ex.Code != 3 || ex.Signal != 0 {
+		t.Fatalf("退出状态 = %+v，期望 3", ex)
+	}
+	if b, err := os.ReadFile(inSandbox(s, "/tmp/same")); err != nil || strings.TrimSpace(string(b)) != helperComm {
+		t.Fatalf("workload 的进程名 = %q（%v），期望 %q", b, err, helperComm)
+	}
+	closeAndDrain(t, s, ch)
+}
+
+// TestHelperCommitKilledAfterStart：提交点矩阵 (6)——workload 启动后立即 SIGKILL 自身：start_ack 然后
+// exit{signal killed}；若落入残余竞争窗口（观察点上内核已在退出该进程）则为 start_err{helper/died_before_exec:
+// signal killed} 且没有 exit。两者都接受，记录频次（-v 输出）。
+func TestHelperCommitKilledAfterStart(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+	s, ch := helperTestInit(t, nil)
+	const n = 50
+	acked, died := 0, 0
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("e%d", i)
+		sendStart(t, s, id, nil, "/bin/sh", "-c", "kill -9 $$")
+		m := nextMsg(t, s, ch)
+		switch {
+		case m.Type == MsgStartAck && m.ExecID == id:
+			ex := nextMsg(t, s, ch)
+			if ex.Type != MsgExit || ex.ExecID != id || ex.Exit == nil || ex.Exit.Signal != syscall.SIGKILL {
+				t.Fatalf("start_ack 之后 = %+v，期望 exit{signal killed}", ex)
+			}
+			acked++
+		case m.Type == MsgStartErr && m.ExecID == id && m.Reason == "helper/died_before_exec: signal killed":
+			died++
+		default:
+			t.Fatalf("回复 = %+v，期望 start_ack 或 start_err{helper/died_before_exec: signal killed}\n%s", m, s.output())
+		}
+	}
+	t.Logf("用例 6 频次：start_ack + exit(SIGKILL) %d 次，died_before_exec %d 次（共 %d 次）", acked, died, n)
+	closeAndDrain(t, s, ch) // died_before_exec 的那些没有迟到的 exit
+}
+
+// TestHelperCommitControlLost：提交点矩阵 (7)——判定期间（helper 挂起在 execve 之前）宿主断开控制连接：init 终止
+// 该 pid 的进程组、清理登记，不投递任何消息（宿主侧按 ErrControlLost 处理）。
+func TestHelperCommitControlLost(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+	s, ch := helperTestInit(t, nil, envTestHelperHook+"="+hookPause)
+	sendStart(t, s, "e1", nil, "/bin/sh", "-c", "touch /tmp/started")
+	select {
+	case m := <-ch:
+		t.Fatalf("判定期间收到 %+v\n%s", m, s.output())
+	case <-time.After(time.Second):
+	}
+	if fileExists(inSandbox(s, "/tmp/started")) {
+		t.Fatal("helper 挂起期间 workload 的标记文件存在")
+	}
+	closeAndDrain(t, s, ch)
+	if out := s.output(); !strings.Contains(out, "终止启动中的 exec e1") || !strings.Contains(out, "登记已清理") {
+		t.Fatalf("init 没有报告终止启动中的 exec；输出:\n%s", out)
+	}
+}
+
+// TestCommitBoundaryClassification：提交点矩阵 (8)——判定的时序边界，以测试钩子控制 reaper 记录相对 EOF 观察的
+// 先后（reaper 子进程中运行真实的 Registry、startCommit 与 SIGCHLD 收割；子进程持有 exec-status 写端作为 fd 3）：
+//   - reaper 先于 EOF 观察记录信号终止 → start_err{helper/died_before_exec: signal killed}，没有 exit；
+//   - reaper 先于 EOF 观察记录以 126 退出（管道无字节）→ start_err{helper/died_before_exec: exit 126}；
+//   - EOF 先于终止（观察点之后才 SIGKILL）→ start_ack 然后 exit{signal killed}。
+func TestCommitBoundaryClassification(t *testing.T) {
+	for _, name := range []string{"commit-reap-first-signal", "commit-reap-first-126", "commit-eof-first"} {
+		t.Run(name, func(t *testing.T) { runReaperCase(t, name) })
+	}
+}
+
+// waitRecorded 阻塞直到 reaper 记录了 p 的终止。
+func waitRecorded(r *Registry, p *pending) {
+	r.mu.Lock()
+	for !p.exited {
+		r.cond.Wait()
+	}
+	r.mu.Unlock()
+}
+
+// commitChild 用真实的 Registry 判定一次启动：spawn（在 reg.mu 内）以 exec.Cmd 启动 argv，exec-status 管道的
+// 写端作为其 fd 3；另一个 goroutine 在 SIGCHLD 时 Reap。收集 want 条消息后再等 300ms，确认没有多余的消息。
+func commitChild(argv []string, want int, before, after func(*Registry, *pending)) ([]Message, error) {
+	commitBeforeRead, commitAfterObserve = before, after
+	defer func() { commitBeforeRead, commitAfterObserve = nil, nil }()
+
+	msgs := make(chan Message, 16)
+	reg := NewRegistry(func(m Message) error { msgs <- m; return nil })
+	sigch := make(chan os.Signal, 8)
+	signal.Notify(sigch, syscall.SIGCHLD)
+	defer signal.Stop(sigch)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-sigch:
+				_ = reg.Reap()
+			case <-stop:
+				return
+			}
+		}
+	}()
+
+	err := reg.startCommit("c1", func() (int, *os.File, error) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			return 0, nil, err
+		}
+		defer w.Close()
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.ExtraFiles = []*os.File{w}
+		if err := cmd.Start(); err != nil {
+			r.Close()
+			return 0, nil, err
+		}
+		pid := cmd.Process.Pid
+		_ = cmd.Process.Release()
+		return pid, r, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	var got []Message
+	timeout := time.After(10 * time.Second)
+	for len(got) < want {
+		select {
+		case m := <-msgs:
+			got = append(got, m)
+		case <-timeout:
+			return got, fmt.Errorf("只收到 %d 条消息 %+v，期望 %d 条", len(got), got, want)
+		}
+	}
+	reg.commits.Wait()
+	select {
+	case m := <-msgs:
+		return got, fmt.Errorf("多余的消息 %+v（已收到 %+v）", m, got)
+	case <-time.After(300 * time.Millisecond):
+	}
+	return got, nil
+}
+
+func commitChildReapFirstSignal() error {
+	got, err := commitChild([]string{"/bin/sh", "-c", "kill -9 $$"}, 1, waitRecorded, nil)
+	if err != nil {
+		return err
+	}
+	if m := got[0]; m.Type != MsgStartErr || m.Reason != "helper/died_before_exec: signal killed" {
+		return fmt.Errorf("消息 = %+v，期望 start_err{helper/died_before_exec: signal killed}", m)
+	}
+	return nil
+}
+
+func commitChildReapFirst126() error {
+	got, err := commitChild([]string{"/bin/sh", "-c", "exit 126"}, 1, waitRecorded, nil)
+	if err != nil {
+		return err
+	}
+	if m := got[0]; m.Type != MsgStartErr || m.Reason != "helper/died_before_exec: exit 126" {
+		return fmt.Errorf("消息 = %+v，期望 start_err{helper/died_before_exec: exit 126}", m)
+	}
+	return nil
+}
+
+func commitChildEOFFirst() error {
+	killAfterObserve := func(r *Registry, p *pending) {
+		_ = syscall.Kill(p.pid, syscall.SIGKILL)
+		waitRecorded(r, p)
+	}
+	got, err := commitChild([]string{"/bin/sh", "-c", "exec 3>&-; exec sleep 30"}, 2, nil, killAfterObserve)
+	if err != nil {
+		return err
+	}
+	if m := got[0]; m.Type != MsgStartAck || m.PID <= 0 {
+		return fmt.Errorf("第一条消息 = %+v，期望 start_ack", m)
+	}
+	if m := got[1]; m.Type != MsgExit || m.Exit == nil || m.Exit.Signal != syscall.SIGKILL {
+		return fmt.Errorf("第二条消息 = %+v，期望 exit{signal killed}", m)
+	}
+	return nil
+}
+
+// TestHelperConcurrentStarts：提交点矩阵 (9)——32 次启动并发判定（helper 在 execve 之前延迟 500ms，使全部判定
+// 重叠）：每个 workload 报告的 pid 与其 start_ack 的 pid 一致、互不相同，每个 exec 先 start_ack 后 exit 0；
+// 锁等待钩子在每次判定等待开始时获取 reg.mu，等待均不超过 100ms（启动路径在判定期间不持有 reg.mu），
+// 总耗时远小于串行所需。
+func TestHelperConcurrentStarts(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+	s, ch := helperTestInit(t, nil, envTestHelperHook+"="+hookDelay, envTestLockProbe+"=1")
+	const n = 32
+	outs := make([]*os.File, n)
+	t0 := time.Now()
+	for i := 0; i < n; i++ {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		outs[i] = r
+		defer r.Close()
+		sendStart(t, s, fmt.Sprintf("e%d", i), w, "/bin/sh", "-c", "echo $$")
+	}
+	acks := make(map[string]int)
+	exits := make(map[string]bool)
+	for len(acks) < n || len(exits) < n {
+		m := nextMsg(t, s, ch)
+		switch m.Type {
+		case MsgStartAck:
+			if _, dup := acks[m.ExecID]; dup || exits[m.ExecID] {
+				t.Fatalf("%s 的 start_ack 重复或晚于 exit", m.ExecID)
+			}
+			acks[m.ExecID] = m.PID
+		case MsgExit:
+			if _, ok := acks[m.ExecID]; !ok {
+				t.Fatalf("%s 的 exit 早于 start_ack", m.ExecID)
+			}
+			if m.Exit.Code != 0 || m.Exit.Signal != 0 {
+				t.Fatalf("%s 的退出状态 = %+v", m.ExecID, m.Exit)
+			}
+			exits[m.ExecID] = true
+		default:
+			t.Fatalf("意外的消息 %+v\n%s", m, s.output())
+		}
+	}
+	elapsed := time.Since(t0)
+	seen := make(map[int]string)
+	for i, r := range outs {
+		id := fmt.Sprintf("e%d", i)
+		b, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+		if err != nil || pid != acks[id] {
+			t.Errorf("%s：workload 报告 pid %q，start_ack 的 pid 为 %d（pid 错配）", id, b, acks[id])
+		}
+		if other, dup := seen[pid]; dup {
+			t.Errorf("%s 与 %s 的 pid 相同（%d）", id, other, pid)
+		}
+		seen[pid] = id
+	}
+	closeAndDrain(t, s, ch)
+
+	var probes int
+	var maxWait time.Duration
+	for _, line := range strings.Split(s.output(), "\n") {
+		_, v, ok := strings.Cut(line, "waited_us=")
+		if !strings.HasPrefix(line, "lock-probe ") || !ok {
+			continue
+		}
+		us, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			t.Fatalf("无法解析 %q", line)
+		}
+		probes++
+		maxWait = max(maxWait, time.Duration(us)*time.Microsecond)
+	}
+	t.Logf("32 次并发启动：总耗时 %v，锁等待钩子 %d 次，最长等待 %v", elapsed, probes, maxWait)
+	if probes != n {
+		t.Errorf("锁等待钩子触发 %d 次，期望 %d 次", probes, n)
+	}
+	if maxWait > 100*time.Millisecond {
+		t.Errorf("判定等待期间获取 reg.mu 最长等待 %v：启动路径在判定期间持有 reg.mu", maxWait)
+	}
+	if limit := n * helperHookDelay / 4; elapsed > limit {
+		t.Errorf("32 次启动耗时 %v，超过 %v：判定被串行化", elapsed, limit)
+	}
+}
+
+// identityScript 是 workload 内核验身份与限制的 Python 程序：在导入其他模块、打开任何文件之前探测 fd 3..1023
+// （os 在解释器启动时已加载），再起一个线程读取每个线程的能力集合，输出 JSON。
+const identityScript = `
+import os
+fds = []
+for fd in range(3, 1024):
+    try:
+        os.fstat(fd)
+        fds.append('%d->%s' % (fd, os.readlink('/proc/self/fd/%d' % fd)))
+    except OSError:
+        pass
+import ctypes, json, resource, threading
+ev = threading.Event()
+th = threading.Thread(target=ev.wait)
+th.start()
+tasks = {}
+for tid in os.listdir('/proc/self/task'):
+    d = {}
+    with open('/proc/self/task/%s/status' % tid) as f:
+        for line in f:
+            k, _, v = line.partition(':')
+            d[k] = v.strip()
+    tasks[tid] = {k: d.get(k) for k in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb', 'NoNewPrivs', 'Seccomp')}
+ev.set()
+th.join()
+libc = ctypes.CDLL(None, use_errno=True)
+print(json.dumps({
+    'fds': fds, 'resuid': os.getresuid(), 'resgid': os.getresgid(), 'groups': os.getgroups(), 'tasks': tasks,
+    'securebits': libc.prctl(27, 0, 0, 0, 0),
+    'nofile': resource.getrlimit(resource.RLIMIT_NOFILE), 'core': resource.getrlimit(resource.RLIMIT_CORE),
+    'fsize': resource.getrlimit(resource.RLIMIT_FSIZE),
+}))
+`
+
+// TestHelperWorkloadIdentity：workload 内核验降权结果——uid/gid 均为 1000、无附加组；每个线程的能力集合（含
+// bounding）全 0、NoNewPrivs 1、seccomp 过滤模式；securebits 0x0f（NOROOT、NO_SETUID_FIXUP 及其锁定位）；
+// 除 0/1/2 外没有打开的 fd；RLIMIT_NOFILE、RLIMIT_CORE=0 与 exec 环境的 RLIMIT_FSIZE 为 helper 显式设置的值。
+func TestHelperWorkloadIdentity(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+	s, ch := helperTestInit(t, nil)
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	sendStart(t, s, "id", w, "/usr/bin/python3", "-c", identityScript)
+	if _, ex := expectAckExit(t, s, ch, "id"); ex.Code != 0 || ex.Signal != 0 {
+		t.Fatalf("workload 退出状态 = %+v\n%s", ex, s.output())
+	}
+	b, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		FDs        []string                     `json:"fds"`
+		ResUID     []int                        `json:"resuid"`
+		ResGID     []int                        `json:"resgid"`
+		Groups     []int                        `json:"groups"`
+		Tasks      map[string]map[string]string `json:"tasks"`
+		Securebits int                          `json:"securebits"`
+		NoFile     []uint64                     `json:"nofile"`
+		Core       []uint64                     `json:"core"`
+		FSize      []uint64                     `json:"fsize"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("解析 workload 输出 %q: %v", b, err)
+	}
+	ids := fmt.Sprint(workloadID, workloadID, workloadID)
+	if fmt.Sprint(got.ResUID) != "["+ids+"]" || fmt.Sprint(got.ResGID) != "["+ids+"]" || len(got.Groups) != 0 {
+		t.Errorf("身份 resuid=%v resgid=%v groups=%v，期望 1000 且无附加组", got.ResUID, got.ResGID, got.Groups)
+	}
+	if len(got.Tasks) < 2 {
+		t.Errorf("只检查到 %d 个线程，期望至少 2 个", len(got.Tasks))
+	}
+	for tid, st := range got.Tasks {
+		for _, k := range []string{"CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"} {
+			if st[k] != "0000000000000000" {
+				t.Errorf("线程 %s 的 %s = %s，期望全 0", tid, k, st[k])
+			}
+		}
+		if st["NoNewPrivs"] != "1" || st["Seccomp"] != "2" {
+			t.Errorf("线程 %s：NoNewPrivs=%s Seccomp=%s，期望 1 与 2", tid, st["NoNewPrivs"], st["Seccomp"])
+		}
+	}
+	if got.Securebits != workloadSecurebits {
+		t.Errorf("securebits = %#x，期望 %#x", got.Securebits, workloadSecurebits)
+	}
+	if len(got.FDs) != 0 {
+		t.Errorf("除 0/1/2 外打开的 fd: %v", got.FDs)
+	}
+	fsize := uint64(64 << 20) // initTestSpec：max(TmpBytes 64 MiB, OutBytes 1 MiB)
+	if fmt.Sprint(got.NoFile) != fmt.Sprint([]uint64{workloadNoFile, workloadNoFile}) ||
+		fmt.Sprint(got.Core) != "[0 0]" || fmt.Sprint(got.FSize) != fmt.Sprint([]uint64{fsize, fsize}) {
+		t.Errorf("rlimit nofile=%v core=%v fsize=%v，期望 [%d %d]、[0 0]、[%d %d]",
+			got.NoFile, got.Core, got.FSize, workloadNoFile, workloadNoFile, fsize, fsize)
+	}
+	closeAndDrain(t, s, ch)
 }

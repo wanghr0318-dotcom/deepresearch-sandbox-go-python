@@ -9,6 +9,12 @@ import (
 )
 
 func main() {
+	// stage-2 helper（沙箱 init 以 execveat 启动，降权后 execve workload）：同样早于任何其他初始化。
+	// 成功时不返回；失败时已向 exec-status 管道报告并以 126 退出。
+	if len(os.Args) > 1 && os.Args[1] == "exec-stage2" {
+		runSandboxHelper()
+		os.Exit(126)
+	}
 	// init 分流必须是 main 的第一件事，早于任何其他初始化。
 	// 这个分支是专用启动进程以 /proc/self/exe init 启动的沙箱 1 号进程。
 	if len(os.Args) > 1 && os.Args[1] == "init" {

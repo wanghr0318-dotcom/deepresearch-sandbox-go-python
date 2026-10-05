@@ -128,7 +128,8 @@ func checkFailpoint(step string) error {
 // initEnv 是环境建立的结果：init 此后持有的两个 FD（均为 close-on-exec 且在高位）。
 type initEnv struct {
 	control  *os.File
-	helperFD int // stage-2 helper 二进制（/proc/self/exe）的 O_PATH fd，供生产 Launcher 使用（Task 11）
+	helperFD int      // stage-2 helper 二进制（/proc/self/exe）的 O_PATH fd，供生产 Launcher 使用
+	spec     InitSpec // 已校验的环境输入（生产 Launcher 据此选择 seccomp 配置与 rlimit）
 }
 
 // RunInit 是沙箱内 1 号进程的主函数（规格 §4.6 init 段）。
@@ -155,7 +156,7 @@ func RunInit() error {
 	syscall.Close(InitReadyFD)
 	conn := NewConn(env.control, 64)
 	reg := NewRegistry(func(m Message) error { return conn.Send(m, nil) })
-	return Serve(context.Background(), conn, reg, unavailableLauncher{})
+	return Serve(context.Background(), conn, reg, newHelperLauncher(env.helperFD, env.spec))
 }
 
 // establish 按规格 §4.6 的 init 段逐步建立环境。返回的错误都是 *stepErr。
@@ -218,7 +219,7 @@ func establish() (initEnv, error) {
 		return initEnv{}, &stepErr{stepInitCaps, err}
 	}
 	ok = true
-	return initEnv{control: control, helperFD: helper}, nil
+	return initEnv{control: control, helperFD: helper, spec: spec.Init}, nil
 }
 
 // readInitSpec 从 InitSpecFD 读取 LaunchSpec（读到 EOF 后关闭），校验其中的 InitSpec。
@@ -245,14 +246,6 @@ func readInitSpec() (LaunchSpec, error) {
 	return s, nil
 }
 
-// unavailableLauncher 拒绝每个 start：生产 Launcher（stage-2 helper 降权，Plan 2 Task 11）实现之前，
-// init 不运行任何未降权的 workload（start_err）。
-type unavailableLauncher struct{}
-
-func (unavailableLauncher) Launch(json.RawMessage, *os.File, *os.File, *os.File) (int, error) {
-	return 0, errors.New("init/launcher: 生产 Launcher 尚未实现（Plan 2 Task 11）")
-}
-
 // ReasonDuplicateExecID 是 start 的 exec_id 已登记且尚未退出时 start_err 的 reason。
 const ReasonDuplicateExecID = "duplicate_exec_id"
 
@@ -264,7 +257,8 @@ const reasonInvalidSpec = "invalid_spec"
 //   - start：exec_id 已登记且未退出 → start_err{reason: duplicate_exec_id}；
 //     spec 不能按 StartSpec 严格解码或 argv 为空 → start_err{reason: invalid_spec: …}；
 //     否则清除 3 个 FD 的 O_NONBLOCK，经 reg.Start 用 l 启动（Launch 失败由
-//     Start 回 start_err）。
+//     Start 回 start_err）。l 实现 committer（生产 Launcher）时改经 reg.startCommit：
+//     持锁 clone 并登记"启动中"，按 exec 提交点在锁外判定后投递（launcher.go）。
 //     无论哪种结果，收到的 3 个 FD 都被关闭，且不启动任何被拒绝的 workload。
 //   - terminate{exec_id, grace_ms}：向该 workload 的进程组发 SIGTERM，并设定
 //     grace_ms 的计时器，到期时若该进程仍未被收割则向进程组发 SIGKILL；
@@ -277,8 +271,8 @@ const reasonInvalidSpec = "invalid_spec"
 // 不依赖 Pdeathsig，不解析 workload 输出。
 //
 // 返回条件：宿主关闭连接 → nil；ctx 取消 → ctx.Err()；协议错误、Recv 失败、
-// Reap 或 Start 报告的控制通道故障 → 该错误。Serve 返回前关闭 conn、停止
-// 所有 grace 计时器；环境内残留的进程由 cgroup 回收（规格 §4.4）。
+// Reap、Start 或判定方报告的控制通道故障 → 该错误。Serve 返回前终止判定尚未完成的启动
+// （reg.abort，不投递消息）、关闭 conn、停止所有 grace 计时器；环境内残留的进程由 cgroup 回收（规格 §4.4）。
 //
 // reg 的 out 应向 conn 非阻塞入队（例如 func(m Message) error { return conn.Send(m, nil) }）。
 // 一个进程只能运行一个 Serve：它经 Wait4(-1) 收割本进程的全部子进程。
@@ -314,6 +308,8 @@ func Serve(ctx context.Context, conn *Conn, reg *Registry, l Launcher) error {
 
 	var timers []*time.Timer
 	defer func() {
+		// 判定尚未完成的启动：终止其进程组、清理登记，不投递任何消息（规格 §4.6 门槛 2）。
+		reg.abort(func(format string, a ...any) { fmt.Fprintf(os.Stderr, "sandbox init: "+format+"\n", a...) })
 		for _, tm := range timers {
 			tm.Stop()
 		}
@@ -334,6 +330,8 @@ func Serve(ctx context.Context, conn *Conn, reg *Registry, l Launcher) error {
 			if err := reg.Reap(); err != nil {
 				return err
 			}
+		case err := <-reg.errc:
+			return err // 判定方投递失败：控制通道故障
 		case r := <-recvch:
 			if errors.Is(r.err, io.EOF) {
 				return nil
@@ -350,7 +348,19 @@ func Serve(ctx context.Context, conn *Conn, reg *Registry, l Launcher) error {
 				}
 				gl := guardLauncher{reg: reg, execID: r.m.ExecID, l: l}
 				fds := [3]*os.File{r.files[0], r.files[1], r.files[2]}
-				if err := reg.Start(r.m.ExecID, gl, r.m.Spec, fds); err != nil {
+				if c, ok := l.(committer); ok {
+					// 生产 Launcher：exec 提交点判定（launcher.go），判定在锁外、不阻塞本循环。
+					err := reg.startCommit(r.m.ExecID, func() (int, *os.File, error) {
+						if err := gl.check(r.m.Spec, fds[0], fds[1], fds[2]); err != nil {
+							return 0, nil, err
+						}
+						return c.spawn(r.m.Spec, fds[0], fds[1], fds[2])
+					})
+					closeFiles(fds[:])
+					if err != nil {
+						return err
+					}
+				} else if err := reg.Start(r.m.ExecID, gl, r.m.Spec, fds); err != nil {
 					return err
 				}
 			case MsgTerminate:
@@ -375,28 +385,39 @@ type guardLauncher struct {
 }
 
 func (g guardLauncher) Launch(spec json.RawMessage, stdin, stdout, stderr *os.File) (int, error) {
-	// Registry.Start 在 reg.mu 内调用 Launch，这里可以直接读登记表。
+	if err := g.check(spec, stdin, stdout, stderr); err != nil {
+		return 0, err
+	}
+	return g.l.Launch(spec, stdin, stdout, stderr)
+}
+
+// check 是 Launch 与 exec 提交点启动路径共用的检查。调用方持有 reg.mu（Registry.Start 与 startCommit
+// 都在锁内调用），这里可以直接读登记表；判定尚未完成的启动同样算已登记。
+func (g guardLauncher) check(spec json.RawMessage, stdin, stdout, stderr *os.File) error {
 	if _, ok := g.reg.pidOfLocked(g.execID); ok {
-		return 0, errors.New(ReasonDuplicateExecID)
+		return errors.New(ReasonDuplicateExecID)
+	}
+	if _, ok := g.reg.starting[g.execID]; ok {
+		return errors.New(ReasonDuplicateExecID)
 	}
 	dec := json.NewDecoder(bytes.NewReader(spec))
 	dec.DisallowUnknownFields()
 	var s StartSpec
 	if err := dec.Decode(&s); err != nil {
-		return 0, fmt.Errorf("%s: %v", reasonInvalidSpec, err)
+		return fmt.Errorf("%s: %v", reasonInvalidSpec, err)
 	}
 	if dec.More() {
-		return 0, fmt.Errorf("%s: spec 之后有多余数据", reasonInvalidSpec)
+		return fmt.Errorf("%s: spec 之后有多余数据", reasonInvalidSpec)
 	}
 	if len(s.Argv) == 0 {
-		return 0, fmt.Errorf("%s: argv 为空", reasonInvalidSpec)
+		return fmt.Errorf("%s: argv 为空", reasonInvalidSpec)
 	}
 	for _, f := range []*os.File{stdin, stdout, stderr} {
 		if err := setBlocking(f); err != nil {
-			return 0, err
+			return err
 		}
 	}
-	return g.l.Launch(spec, stdin, stdout, stderr)
+	return nil
 }
 
 // setBlocking 清除 f 的 O_NONBLOCK。

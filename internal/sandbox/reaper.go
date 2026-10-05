@@ -22,9 +22,13 @@ import (
 //     start_ack 必先于对应 exit。
 //   - 未登记的 pid（被收养的孤儿进程）收割后丢弃，不产生 exit。
 //   - 不调用 Process.Wait / exec.Cmd.Wait：Wait4(-1) 是唯一的等待者。
+//   - 经 exec 提交点判定的启动（startCommit，生产 Launcher）：持锁完成 clone 与"启动中"登记后
+//     释放锁，判定在锁外进行；Reap 对启动中 pid 只记录 wait 状态，不投递，由判定方在锁内按序
+//     投递 start_ack → exit（或只投递 start_err），见 launcher.go。
 
-// Launcher 启动一个 workload 并返回其 pid。生产实现是 Plan 1B 之后的
-// stage-2 helper（规格 §4.6），测试用直接 exec。
+// Launcher 启动一个 workload 并返回其 pid（Launch 返回即视为已启动，Registry.Start 立即入队 start_ack）。
+// 测试用直接 exec。init 的生产 Launcher（helperLauncher）另实现 committer，由 Serve 走 exec 提交点判定的
+// 启动路径（Registry.startCommit），不经 Launch。
 //
 // Launch 返回之后进程归 Registry 收割：实现不得等待该进程，也不得保留
 // 会在进程退出后自行 wait 的句柄（使用 exec.Cmd 时只调用 Start，然后
@@ -48,13 +52,37 @@ type Registry struct {
 	pids map[int]string
 	// wait4 默认为 syscall.Wait4；测试替换它以注入 EINTR 等错误。
 	wait4 func(pid int, ws *syscall.WaitStatus, options int, ru *syscall.Rusage) (int, error)
+
+	// 以下服务于经 exec 提交点判定的启动（startCommit，生产 Launcher；见 launcher.go）。
+	//
+	// starting 是判定尚未完成的启动（exec_id → 记录）。这些 pid 同时登记在 pids 中；Reap 收割到它们时
+	// 只把 wait 状态记入 pending、从 pids 删除并 Broadcast，不入队 exit——由判定方按序投递
+	// （start_ack 之后才 exit，或只有 start_err）。
+	starting map[string]*pending
+	cond     *sync.Cond // 基于 mu；starting 中的记录被收割或 aborted 置位时 Broadcast
+	aborted  bool       // abort 之后：不再投递任何判定结果
+	commits  sync.WaitGroup
+	errc     chan error // 判定 goroutine 的 out 失败（控制通道故障），由 Serve 取出
+}
+
+// pending 是一次判定尚未完成的启动。字段由 Registry.mu 保护。
+type pending struct {
+	execID string
+	pid    int
+	exited bool               // reaper 已收割该 pid
+	ws     syscall.WaitStatus // exited 时的 wait 状态
 }
 
 // NewRegistry 返回一个空登记表。out 必须是非阻塞入队（例如 Conn.Send），
 // 它在 reg.mu 内被调用；返回错误视为控制通道故障，由 Start/Reap 原样
 // （包装后）返回给调用方，调用方应终止环境。
 func NewRegistry(out func(Message) error) *Registry {
-	return &Registry{out: out, pids: make(map[int]string), wait4: syscall.Wait4}
+	r := &Registry{
+		out: out, pids: make(map[int]string), wait4: syscall.Wait4,
+		starting: make(map[string]*pending), errc: make(chan error, 1),
+	}
+	r.cond = sync.NewCond(&r.mu)
+	return r
 }
 
 // Start 在 reg.mu 内启动 workload、登记 pid → execID 并入队 start_ack。
@@ -118,9 +146,15 @@ func (r *Registry) Reap() error {
 
 		execID, ok := r.pids[pid]
 		if !ok {
-			continue // 被收养的孤儿：已收割，丢弃
+			continue // 被收养的孤儿（或判定为 start_err 后不再登记的 pid）：已收割，丢弃
 		}
 		delete(r.pids, pid)
+		if p := r.starting[execID]; p != nil && p.pid == pid {
+			// 启动中：只记录不投递（非阻塞），由判定方按序投递。
+			p.exited, p.ws = true, ws
+			r.cond.Broadcast()
+			continue
+		}
 		if err := r.out(Message{Type: MsgExit, ExecID: execID, Exit: exitInfo(ws)}); err != nil {
 			return fmt.Errorf("sandbox: 入队 exit(%s): %w", execID, err)
 		}
