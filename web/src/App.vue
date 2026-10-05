@@ -11,7 +11,18 @@
         <span class="logo-text">agentbox 工作台</span>
       </div>
 
+      <div class="sidebar-section-label">导航</div>
+      <div class="nav-links">
+        <a class="nav-link" :class="{ active: route.name === 'tasks' }" :href="tasksHref()">任务列表</a>
+        <a v-if="route.name === 'task'" class="nav-link active mono" :href="taskHref(route.id)" :title="route.id">
+          {{ shortId(route.id, 18) }}
+        </a>
+      </div>
+
       <div class="sidebar-section-label">访问令牌</div>
+      <div class="token-state">
+        {{ authState.hasToken ? `已设置（${authState.persistence === "session" ? "sessionStorage" : "仅内存"}）` : "未设置" }}
+      </div>
       <form class="token-form" autocomplete="off" @submit.prevent="saveToken">
         <input
           v-model="tokenInput"
@@ -38,24 +49,44 @@
       </div>
     </nav>
 
-    <!-- 主内容区：任务列表、事件时间线等视图在后续任务中接入 -->
+    <!-- 主内容区：hash 路由（#/tasks、#/tasks/<id>），不与 API 路径冲突 -->
     <main class="main">
-      <div class="welcome">
-        <h1 class="welcome-title">agentbox</h1>
-        <p class="welcome-sub">任务视图即将接入。</p>
+      <div v-if="status && status.mode !== 'normal'" class="mode-banner" role="status">
+        {{ MODE_TEXT[status.mode] ?? status.mode }}
       </div>
+      <TokenGate v-if="!authState.hasToken && !authState.skipped" @done="refreshStatus" />
+      <TaskDetailView v-else-if="route.name === 'task'" :id="route.id" :key="`${route.id}:${authEpoch}`" />
+      <TaskListView v-else :key="`list:${authEpoch}`" />
     </main>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
-import { api, tokenStore } from "./api";
+import { computed, onMounted, provide, ref } from "vue";
 import { ApiError } from "./api/client";
 import type { Status } from "./api/client";
+import TokenGate from "./components/TokenGate.vue";
+import { authState, clearToken as clearStoredToken, setToken } from "./lib/authState";
+import { shortId } from "./lib/format";
+import { taskHref, tasksHref, useHashRoute } from "./lib/router";
+import { defaultServices, servicesKey } from "./lib/services";
+import TaskDetailView from "./views/TaskDetailView.vue";
+import TaskListView from "./views/TaskListView.vue";
 
+const services = defaultServices();
+provide(servicesKey, services);
+const api = services.api;
+
+const MODE_TEXT: Record<string, string> = {
+  diagnostic: "服务处于诊断模式：只读，提交与控制会被拒绝（diagnostic_mode）。",
+  ownership_lost: "服务已失去数据目录所有权：不再提交任何写入（ownership_lost）。",
+};
+
+const route = useHashRoute();
+// 令牌变化后重建视图，使请求与事件流使用新令牌。
+const authEpoch = ref(0);
 const tokenInput = ref("");
-const persistSession = ref(tokenStore.persistence() === "session");
+const persistSession = ref(authState.persistence === "session");
 const status = ref<Status | null>(null);
 const statusError = ref("");
 
@@ -82,18 +113,21 @@ async function refreshStatus(): Promise<void> {
 }
 
 function saveToken(): void {
-  tokenStore.set(tokenInput.value, persistSession.value ? "session" : "memory");
+  setToken(tokenInput.value, persistSession.value ? "session" : "memory");
   tokenInput.value = "";
+  authEpoch.value++;
   void refreshStatus();
 }
 
 function clearToken(): void {
-  tokenStore.clear();
+  clearStoredToken();
   persistSession.value = false;
+  authEpoch.value++;
   void refreshStatus();
 }
 
 onMounted(() => {
+  if (!window.location.hash) window.location.hash = tasksHref().slice(1);
   void refreshStatus();
 });
 </script>
@@ -165,6 +199,54 @@ onMounted(() => {
   background: #1f2937;
   color: #f9fafb;
   font-size: 0.82rem;
+}
+
+.nav-links {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 8px 6px;
+}
+
+.nav-link {
+  display: block;
+  padding: 7px 10px;
+  border-radius: 6px;
+  color: #9ca3af;
+  font-size: 0.85rem;
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nav-link:hover {
+  background: #1f2937;
+  color: #e5e7eb;
+}
+.nav-link.active {
+  background: #1f2937;
+  color: #f9fafb;
+  font-weight: 600;
+}
+.nav-link.mono {
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 0.76rem;
+  padding-left: 20px;
+}
+
+.token-state {
+  padding: 0 16px 8px;
+  font-size: 0.75rem;
+  color: #9ca3af;
+}
+
+.mode-banner {
+  padding: 10px 32px;
+  background: #fef3c7;
+  color: #78350f;
+  border-bottom: 1px solid #fde68a;
+  font-size: 0.85rem;
+  font-weight: 600;
 }
 
 .token-persist {
