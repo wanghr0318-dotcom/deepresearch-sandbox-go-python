@@ -2701,6 +2701,10 @@ func pumpMessages(c *Conn) <-chan Message {
 	return ch
 }
 
+// msgDeadline 是等待 init 回复的总期限：只是失败上限，不是时序余量。§16.2 检查器在沙箱内启动 python3，CI 的 2 核 runner
+// 同时运行 e2e 时曾超过 20 s（2026-10-05），故取 60 s。
+const msgDeadline = 60 * time.Second
+
 func nextMsg(t *testing.T, s *sandboxInit, ch <-chan Message) Message {
 	t.Helper()
 	select {
@@ -2709,7 +2713,7 @@ func nextMsg(t *testing.T, s *sandboxInit, ch <-chan Message) Message {
 			t.Fatalf("控制连接在期望的消息之前结束\n%s", s.output())
 		}
 		return m
-	case <-time.After(20 * time.Second):
+	case <-time.After(msgDeadline):
 		t.Fatalf("等待消息超时\n%s", s.output())
 	}
 	return Message{}
@@ -2741,7 +2745,7 @@ func closeAndDrain(t *testing.T, s *sandboxInit, ch <-chan Message) {
 	if err := s.conn.rc.Control(func(fd uintptr) { _ = syscall.Shutdown(int(fd), syscall.SHUT_WR) }); err != nil {
 		t.Fatal(err)
 	}
-	timeout := time.After(20 * time.Second)
+	timeout := time.After(msgDeadline)
 drain:
 	for {
 		select {
