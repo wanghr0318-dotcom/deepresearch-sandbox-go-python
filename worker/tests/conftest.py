@@ -59,7 +59,14 @@ class FakeGateway:
         self.replies: list[Reply] = []
         self.blobs: dict[str, bytes] = {}
         self.calls: dict[str, str] = {}  # call id → 结果 blob sha
-        self.budget = {"budget_micro": 1_000_000, "remaining_micro": 750_000}
+        # 与 Go edge 的 /v1/budget 响应体一致（中心契约）。
+        self.budget = {
+            "limit_micro": 1_000_000,
+            "reserved_micro": 50_000,
+            "spent_micro": 200_000,
+            "unknown_micro": 0,
+            "available_micro": 750_000,
+        }
         self.delay = 0.0
         self.release = threading.Event()
         # 可选：按 (kind, 请求体) 生成计费调用的结果体；缺省时结果体回显请求
@@ -90,7 +97,8 @@ class FakeGateway:
             data = self.blobs.get(req.path.removeprefix("/blobs/"))
             if data is None:
                 return error_reply(404, "not_found")
-            return Reply(200, data, {"ETag": req.path.removeprefix("/blobs/")})
+            sha = req.path.removeprefix("/blobs/")
+            return Reply(200, data, {"ETag": f'"{sha}"'})  # RFC 7232：带引号
         kind = ENDPOINT_KINDS.get(req.path)
         if req.method != "POST" or kind is None:
             return error_reply(404, "not_found")
