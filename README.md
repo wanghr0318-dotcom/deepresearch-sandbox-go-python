@@ -83,7 +83,7 @@ sudo ./bin/agentbox doctor
 
 # 3. 安装 worker 包到默认 rootfs 模板中的 /opt/agentbox（server 启动时检查它存在）
 sudo install -d -m 0755 /opt/agentbox
-sudo cp -r worker/agentbox_worker worker/sim_worker /opt/agentbox/
+sudo cp -r worker/agentbox_worker worker/sim_worker worker/deepresearch /opt/agentbox/
 
 # 4. 终端 1：启动 server（前台运行，Ctrl-C 停止）
 sudo sh -c 'set -a; . deploy/agentbox.env.example; exec ./bin/agentbox server $AGENTBOX_SERVER_FLAGS'

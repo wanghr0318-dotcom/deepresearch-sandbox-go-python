@@ -38,6 +38,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -3144,9 +3145,9 @@ var (
 	workerErr  error
 )
 
-// installWorker 把仓库中的 worker 包（agentbox_worker、sim_worker）复制到 rootfs.WorkerDir（每次 go test
-// 一次；不复制 __pycache__），返回该目录。等价于 README 快速开始中的
-// `sudo install -d /opt/agentbox && sudo cp -r worker/agentbox_worker worker/sim_worker /opt/agentbox/`。
+// installWorker 把仓库中的 worker 包（agentbox_worker、sim_worker、deepresearch）复制到 rootfs.WorkerDir
+// （每次 go test 一次；不复制 __pycache__），返回该目录。等价于 README 快速开始中的
+// `sudo install -d /opt/agentbox && sudo cp -r worker/agentbox_worker worker/sim_worker worker/deepresearch /opt/agentbox/`。
 func installWorker(t *testing.T) string {
 	t.Helper()
 	src := workerPath(t)
@@ -3161,7 +3162,7 @@ func copyWorker(src, dst string) error {
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
 	}
-	for _, pkg := range []string{"agentbox_worker", "sim_worker"} {
+	for _, pkg := range []string{"agentbox_worker", "sim_worker", "deepresearch"} {
 		err := filepath.WalkDir(filepath.Join(src, pkg), func(p string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -3309,10 +3310,12 @@ func (h *harness) envCgroup(envID string) string {
 	return filepath.Join(h.cgRoot, "agentbox-"+h.installID, "env-"+envID)
 }
 
-// killWorker 从宿主以 SIGKILL 杀死环境 cgroup 中的 sim_worker 进程（不经平台：分类为 crashed_signal）。
+// killWorker 从宿主以 SIGKILL 杀死环境 cgroup 中的 Worker 进程（sim_worker 或 python3 -m deepresearch；
+// 不经平台：分类为 crashed_signal）。
 func (h *harness) killWorker(envID string) {
 	for _, pid := range cgroupPids(h.envCgroup(envID)) {
-		if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil && bytes.Contains(b, []byte("sim_worker")) {
+		if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil &&
+			(bytes.Contains(b, []byte("sim_worker")) || bytes.Contains(b, []byte("-m\x00deepresearch"))) {
 			_ = syscall.Kill(pid, syscall.SIGKILL)
 		}
 	}
@@ -4513,4 +4516,612 @@ func TestE11bReservationCommitLost(t *testing.T) {
 	assertKeyOnlyUpstream(t, key, p.logs.tail(1<<30), s.events(id), fu.Requests(fakeupstream.Chat))
 	t.Logf("E11b：预留 %d 笔；try %+v；账本 spent=%d；上游请求 %d 个", reservations, tries[0], spent, fu.Count(fakeupstream.Chat))
 	s.finish()
+}
+
+// ---- M2：Gateway 真实沙箱冒烟与 G3（Plan 8 Task 4）----
+//
+// 真实沙箱（provider/local + 生产启动器，newRealHarness）中运行 sim_worker：chat 经沙箱内的
+// /run/agentbox/gateway.sock 到达进程内 Gateway，再到 fake upstream。Worker 暂停在 checkpoint 上（Hold）时，
+// 测试从宿主读取环境 cgroup 中各进程，并在同一环境中另起一个 workload 进程（与 E3 相同的 provider StartExec，
+// uid 1000、同一 namespace）从沙箱内部观察。sim_worker 的 print 操作只能输出固定文本，无法输出环境，因此
+// 沙箱内的 env 与 /proc/<pid>/environ 由该进程输出（G3 见 TestRealNoCredentialsInSandbox）。
+
+const searchKeyEnv = "AGENTBOX_SEARCH_API_KEY" // 宿主上搜索供应商 Key 的环境变量（cmd/agentbox 只从这里读取）
+
+// sandboxProcs 返回环境 cgroup 中的全部进程：宿主 pid → cmdline（NUL 换成空格）。
+func (h *harness) sandboxProcs(envID string) map[int]string {
+	out := map[int]string{}
+	for _, pid := range cgroupPids(h.envCgroup(envID)) {
+		if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil {
+			out[pid] = strings.TrimSpace(string(bytes.ReplaceAll(b, []byte{0}, []byte{' '})))
+		}
+	}
+	return out
+}
+
+// workerPid 返回环境中 Worker 主进程（python3 -m <module>）的宿主 pid。
+func (h *harness) workerPid(envID, module string) int {
+	h.t.Helper()
+	for pid, cmd := range h.sandboxProcs(envID) {
+		if strings.Contains(cmd, "-m "+module) {
+			return pid
+		}
+	}
+	h.t.Fatalf("环境 %s 中没有 %s 进程：%v", envID, module, h.sandboxProcs(envID))
+	return 0
+}
+
+// procUID 返回宿主进程 pid 的真实 uid（/proc/<pid>/status 的 Uid 行）。
+func procUID(t *testing.T, pid int) uint32 {
+	t.Helper()
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if f := strings.Fields(line); len(f) >= 2 && f[0] == "Uid:" {
+			n, err := strconv.ParseUint(f[1], 10, 32)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return uint32(n)
+		}
+	}
+	t.Fatalf("/proc/%d/status 没有 Uid 行", pid)
+	return 0
+}
+
+// sandboxExec 在环境中以 workload 身份（与 Worker 相同的沙箱）运行 python3 -c script，返回 stdout；
+// 退出状态非 0 时失败。
+func (h *harness) sandboxExec(envID, execID string, env []string, script string) string {
+	h.t.Helper()
+	hd, err := h.local.StartExec(context.Background(), envID, provider.ExecSpec{ExecID: execID, Dir: "/tmp", Env: env,
+		Argv: []string{"python3", "-c", script}})
+	if err != nil {
+		h.t.Fatalf("在环境中启动 %s: %v", execID, err)
+	}
+	if err := hd.Stdin().Close(); err != nil {
+		h.t.Fatal(err)
+	}
+	var stdout, stderr lockedBuffer
+	done := make(chan struct{}, 2)
+	for _, p := range []struct {
+		dst *lockedBuffer
+		src io.Reader
+	}{{&stdout, hd.Stdout()}, {&stderr, hd.Stderr()}} {
+		go func() {
+			_, _ = io.Copy(p.dst, p.src) // 读到 EOF 或管道关闭为止；内容由下方断言检查
+			done <- struct{}{}
+		}()
+	}
+	st, err := hd.Wait()
+	for range 2 {
+		select {
+		case <-done:
+		case <-time.After(waitLimit):
+			h.t.Fatalf("%s 的输出未结束", execID)
+		}
+	}
+	if err != nil || st.Code != 0 || st.Signal != 0 {
+		h.t.Fatalf("%s 退出 %+v %v；stderr：\n%s", execID, st, err, stderr.tail(4<<10))
+	}
+	return stdout.tail(1 << 30)
+}
+
+// checkpointRefs 返回任务 scope 中 step_id 的 checkpoint 的 refs。
+func (h *harness) checkpointRefs(taskID, stepID string) []string {
+	h.t.Helper()
+	var raw []byte
+	h.queryRow("SELECT refs_json FROM checkpoints WHERE scope_kind = 'task' AND scope_id = $1 AND step_id = $2",
+		[]any{taskID, stepID}, &raw)
+	var refs []string
+	if err := json.Unmarshal(raw, &refs); err != nil {
+		h.t.Fatalf("checkpoint %s 的 refs_json %s: %v", stepID, raw, err)
+	}
+	return refs
+}
+
+// assertNoSecret：text 中不含任何 secret（只报告位置，不在失败信息中回显 Key）。
+func assertNoSecret(t *testing.T, where, text string, secrets ...string) {
+	t.Helper()
+	for i, s := range secrets {
+		if s == "" {
+			t.Fatalf("第 %d 个 Key 为空：G3 须在配置了非空 Key 时验证", i+1)
+		}
+		if strings.Contains(text, s) {
+			t.Fatalf("第 %d 个 Key 出现在%s中", i+1, where)
+		}
+	}
+}
+
+// TestRealGatewayChat：Gateway 真实沙箱冒烟——sim_worker 的 chat 经沙箱内 /run/agentbox/gateway.sock → Gateway →
+// fake upstream 返回脚本化回复 → checkpoint 的 refs 带该结果 blob → result。socket 在宿主上属主为 Worker 的映射
+// uid、0600，沙箱内为 uid 1000、0600 的 socket；inspect 显示 1 个 completed 调用、1 次 ok try。
+func TestRealGatewayChat(t *testing.T) {
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	h := newRealHarness(t)
+	key := gwSecret()
+	h.start(gatewayCfg(fu, key, call.Limits{}))
+	id := h.submit("gw-chat", spec(&directives{Hold: &holdSpec{Type: protocol.TypeCheckpoint, Nth: 1}}, "gw chat", nil,
+		chatStep("s1"), checkpointStep("c1"), progressStep("after chat")))
+	h.waitHeld(id)
+	in1, _ := h.rec(id).init(1)
+	envID := attemptByNo(h.inspect(id), 1).EnvID
+	wuid := procUID(t, h.workerPid(envID, "sim_worker"))
+	fi, err := os.Lstat(h.gwSocket(in1.AttemptID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || fi.Mode().Type() != fs.ModeSocket || fi.Mode().Perm() != 0o600 || st.Uid != wuid || wuid == 0 {
+		t.Fatalf("宿主上的 Gateway socket mode %v uid %v；期望 Worker 的映射 uid %d、0600 的 socket", fi.Mode(), fi.Sys(), wuid)
+	}
+	inside := strings.TrimSpace(h.sandboxExec(envID, "gw-stat", nil,
+		"import os, stat\ns = os.stat('/run/agentbox/gateway.sock')\n"+
+			"print(os.getuid(), s.st_uid, oct(stat.S_IMODE(s.st_mode)), stat.S_ISSOCK(s.st_mode))"))
+	if inside != "1000 1000 0o600 True" {
+		t.Fatalf("沙箱内 /run/agentbox/gateway.sock：%q；期望 uid 1000 的进程看到属主 1000、0600 的 socket", inside)
+	}
+	h.rec(id).releaseHold()
+
+	if v := h.waitTerminal(id); v.Status != "succeeded" {
+		t.Fatalf("任务 %+v", v)
+	}
+	in := h.inspect(id)
+	if len(in.Calls) != 1 {
+		t.Fatalf("inspect 中有 %d 个调用：%+v", len(in.Calls), in.Calls)
+	}
+	c := in.Calls[0]
+	if c.CallID != e2eCallID || c.Endpoint != "/v1/chat/completions" || c.State != "completed" || c.TriesUsed != 1 ||
+		len(c.Tries) != 1 || c.Tries[0].Outcome != "ok" || c.Tries[0].AttemptID != in1.AttemptID || c.ResultRef == "" {
+		t.Fatalf("调用 %+v；期望 1 个 completed 调用、1 次 ok try", c)
+	}
+	if refs := h.checkpointRefs(id, "c1"); !slices.Contains(refs, c.ResultRef) {
+		t.Fatalf("checkpoint c1 的 refs %v 不含结果 blob %s", refs, c.ResultRef)
+	}
+	var reply fakeupstream.ChatReply
+	if err := json.Unmarshal(h.readBlob(c.ResultRef), &reply); err != nil {
+		t.Fatal(err)
+	}
+	if len(reply.Choices) != 1 || !strings.Contains(reply.Choices[0].Message.Content, "fake 任务") {
+		t.Fatalf("结果 blob 中的回复 %+v，期望 fake upstream 的计划阶段脚本回复", reply)
+	}
+	if fu.Count(fakeupstream.Chat) != 1 {
+		t.Fatalf("上游收到 %d 个 chat 请求", fu.Count(fakeupstream.Chat))
+	}
+	assertKeyOnlyUpstream(t, key, h.logs.tail(1<<30), h.events(id), fu.Requests(fakeupstream.Chat))
+	t.Logf("Gateway 冒烟：宿主 socket uid %d 0600，沙箱内 %q；调用 %s → %s（try %+v），blob %s 在 checkpoint c1 的 refs 中",
+		wuid, inside, c.CallID, c.State, c.Tries[0], c.ResultRef)
+	h.finish()
+}
+
+// g3Script 在沙箱内输出自身的环境（os.environ 即 env）、/proc/self/environ，以及沙箱内可见的每个进程的
+// cmdline 与 /proc/<pid>/environ（Worker 与该进程同为 uid 1000，可读；不可读的记录错误）。
+const g3Script = `import os
+print("ENV", sorted(os.environ.items()))
+print("SELF", open("/proc/self/environ", "rb").read().split(b"\0"))
+for p in sorted(os.listdir("/proc")):
+    if not p.isdigit():
+        continue
+    try:
+        cmd = open(f"/proc/{p}/cmdline", "rb").read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        env = open(f"/proc/{p}/environ", "rb").read().split(b"\0")
+        print("PROC", p, "[" + cmd + "]", len(env), env)
+    except OSError as e:
+        print("PROC", p, "unreadable", e.errno)
+`
+
+// TestRealNoCredentialsInSandbox：G3（§9.9）——配置了非空的模型与搜索 Key（宿主环境变量 AGENTBOX_MODEL_API_KEY、
+// AGENTBOX_SEARCH_API_KEY 也设为同一值，与 cmd/agentbox 的来源相同；Worker 启动器继承本进程环境时会泄漏）时，
+// Worker 经 Gateway 完成 chat 与搜索，而：
+//   - 环境 cgroup 中每个进程（init、helper、Worker）的 /proc/<pid>/environ 与 cmdline（宿主读取）不含 Key 的值，
+//     也没有这两个变量名；
+//   - 沙箱内 uid 1000 进程输出的 env、/proc/self/environ 与可见进程（含 Worker）的 /proc/<pid>/environ 不含 Key；
+//   - server 日志与整个事件表（payload）不含 Key；Key 只出现在发往模型上游的 Authorization 头中。
+func TestRealNoCredentialsInSandbox(t *testing.T) {
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	h := newRealHarness(t)
+	modelKey, searchKey := gwSecret(), gwSecret()
+	t.Setenv(modelKeyEnv, modelKey)
+	t.Setenv(searchKeyEnv, searchKey)
+	cfg := gatewayCfg(fu, modelKey, call.Limits{})
+	cfg.SearchAPIKey = searchKey
+	h.start(cfg)
+	id := h.submit("g3", spec(&directives{Hold: &holdSpec{Type: protocol.TypeCheckpoint, Nth: 1}}, "g3", nil,
+		chatStep("s1"),
+		step{"op": "search", "step_id": "q1", "query": "固态电池", "max_results": 3},
+		step{"op": "print", "message": "g3: 已完成 chat 与搜索"},
+		checkpointStep("c1")))
+	h.waitHeld(id)
+	envID := attemptByNo(h.inspect(id), 1).EnvID
+	wpid := h.workerPid(envID, "sim_worker")
+	procs := h.sandboxProcs(envID)
+	var workerEnv []string
+	for pid, cmd := range procs {
+		b, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+		if err != nil {
+			t.Fatalf("读取沙箱进程 %d（%s）的 environ: %v", pid, cmd, err)
+		}
+		where := fmt.Sprintf("沙箱进程 %d（%s）的 environ 或 cmdline", pid, cmd)
+		assertNoSecret(t, where, string(b)+"\n"+cmd, modelKey, searchKey)
+		if bytes.Contains(b, []byte(modelKeyEnv)) || bytes.Contains(b, []byte(searchKeyEnv)) {
+			t.Fatalf("%s 含 Key 的变量名", where)
+		}
+		if pid == wpid {
+			workerEnv = strings.Split(strings.TrimRight(string(b), "\x00"), "\x00")
+		}
+	}
+	// 沙箱内部：以 Worker 的环境运行观察进程（它看到的就是沙箱给 workload 的全部环境）。
+	out := h.sandboxExec(envID, "g3-env", workerEnv, g3Script)
+	assertNoSecret(t, "沙箱内的 env、/proc/self/environ 或进程 environ", out, modelKey, searchKey)
+	var sawWorker bool
+	for _, line := range strings.Split(out, "\n") {
+		sawWorker = sawWorker || (strings.HasPrefix(line, "PROC ") && strings.Contains(line, "-m sim_worker]") &&
+			strings.Contains(line, "PYTHONPATH="))
+	}
+	if !strings.HasPrefix(out, "ENV ") || !strings.Contains(out, "\nSELF ") || !sawWorker {
+		t.Fatalf("沙箱内的观察输出缺少 env、/proc/self/environ 或 Worker 的 environ：\n%s", out)
+	}
+	h.rec(id).releaseHold()
+
+	if v := h.waitTerminal(id); v.Status != "succeeded" {
+		t.Fatalf("任务 %+v", v)
+	}
+	in := h.inspect(id)
+	if len(in.Calls) != 2 || in.Calls[0].State != "completed" || in.Calls[1].State != "completed" ||
+		fu.Count(fakeupstream.Chat) != 1 || fu.Count(fakeupstream.Search) != 1 {
+		t.Fatalf("调用 %+v；上游 chat %d、search %d 个请求", in.Calls, fu.Count(fakeupstream.Chat), fu.Count(fakeupstream.Search))
+	}
+	assertNoSecret(t, "server 日志", h.logs.tail(1<<30), modelKey, searchKey)
+	var leaked, total int
+	for _, k := range []string{modelKey, searchKey} {
+		var n int
+		h.queryRow("SELECT count(*) FROM events WHERE strpos(payload::text, $1) > 0", []any{k}, &n)
+		leaked += n
+	}
+	h.queryRow("SELECT count(*) FROM events", nil, &total)
+	if leaked != 0 || total == 0 {
+		t.Fatalf("事件表 %d 行中有 %d 行含 Key", total, leaked)
+	}
+	assertKeyOnlyUpstream(t, modelKey, h.logs.tail(1<<30), h.events(id), fu.Requests(fakeupstream.Chat))
+	t.Logf("G3：沙箱进程 %d 个（%v）的 environ 与 cmdline、沙箱内观察输出 %d 字节、server 日志 %d 字节、事件表 %d 行均不含 Key；"+
+		"Worker 环境 %v", len(procs), slices.Collect(maps.Values(procs)), len(out), len(h.logs.tail(1<<30)), total, workerEnv)
+	h.finish()
+}
+
+// ---- M2：DeepResearch 业务验收（fake upstream，真实沙箱；Plan 8 Task 5，§16.4 自动化业务验收）----
+//
+// 真实沙箱中运行 python3 -m deepresearch，fake upstream 按阶段标记回复固定研究题目（2 个任务、每次搜索 3 条
+// 结果、固定页面）。断言研究步骤（checkpoint plan、task-1、task-2、report）、report 产物、报告引用 ↔ 已保存的
+// 证据 blob，以及杀死 Worker 后从已提交的 checkpoint 恢复且已完成的调用不再到达上游。每条用例以 finish（静止时
+// 的不变量检查，即 verify-invariants --quiescent 的同一检查，含 I3、I14）结束。
+
+const researchTopic = "固态电池的产业化进展"
+
+var researchTasks = []fakeupstream.ResearchTask{
+	{Title: "电解质路线", Intent: "比较硫化物、氧化物与聚合物电解质", Query: "固态电解质 技术路线"},
+	{Title: "量产与成本", Intent: "梳理量产时间表与成本结构", Query: "固态电池 量产 成本"},
+}
+
+// researchMaxResults 是研究配置的 max_results（搜索请求体的一部分；直接重放探针须发送同一请求体）。
+const researchMaxResults = 3
+
+// researchCfg 是 deepresearch Worker 的 Gateway 配置（WorkerArgv 为 python3 -m deepresearch）。
+func researchCfg(fu *fakeupstream.Server) app.Config {
+	fu.SetResearch(researchTasks)
+	cfg := gatewayCfg(fu, gwSecret(), call.Limits{})
+	cfg.WorkerArgv = []string{"python3", "-m", "deepresearch"}
+	return cfg
+}
+
+func researchSpec(d *directives) string {
+	m := map[string]any{"topic": researchTopic, "max_tasks": 4, "max_results": researchMaxResults, "max_fetch": 3}
+	if d != nil {
+		m["e2e"] = d
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+// upstreamCounts 是 fake upstream 的计数快照：阶段（plan、summarize、report）与类别（search、fetch）。
+type upstreamCounts struct{ Plan, Summarize, Report, Search, Fetch int }
+
+func countsOf(fu *fakeupstream.Server) upstreamCounts {
+	return upstreamCounts{Plan: fu.StageCount(fakeupstream.StagePlan), Summarize: fu.StageCount(fakeupstream.StageSummarize),
+		Report: fu.StageCount(fakeupstream.StageReport), Search: fu.Count(fakeupstream.Search), Fetch: fu.Count(fakeupstream.Fetch)}
+}
+
+// 完整研究的上游请求：1 次计划、每个任务 1 次搜索 + 3 次抓取 + 1 次摘要、1 次报告。
+var researchFull = upstreamCounts{Plan: 1, Summarize: 2, Report: 1, Search: 2, Fetch: 6}
+
+func stepOrder(in api.Inspection) (steps, attempts []string) {
+	cps := slices.Clone(in.Checkpoints)
+	slices.SortFunc(cps, func(a, b api.CheckpointView) int { return int(a.CommitSeq - b.CommitSeq) })
+	for _, c := range cps {
+		steps = append(steps, c.StepID)
+		attempts = append(attempts, c.AttemptID)
+	}
+	return steps, attempts
+}
+
+// citation 是报告"证据"列表中的一项：[N] → 证据 blob 的 sha256 与来源 URL。
+type citation struct {
+	N        int
+	URL, SHA string
+}
+
+var (
+	evidenceLine = regexp.MustCompile(`^- \[(\d+)\] .+ — (\S+) — sha256:([0-9a-f]{64})$`)
+	citeRef      = regexp.MustCompile(`\[(\d+)\]`)
+)
+
+// assertResearchReport：report 产物已保存（事件 artifact_saved(report) 与最新版本一致）；报告非空，正文中的每个 [n]
+// 都在末尾"证据"列表中；列表恰为全部 6 条证据（编号 1..6、URL 是固定题目的搜索结果），每个 sha 的 blob 存在
+// （BlobStore 内容哈希一致、blobs 表有记录）、授权到任务 scope（scope_blobs）、是抓取该 URL 的结果，并在 report
+// checkpoint 的 refs 中。返回列表与正文中引用的编号。
+func (h *harness) assertResearchReport(fu *fakeupstream.Server, taskID string) ([]citation, []int) {
+	t := h.t
+	t.Helper()
+	av, err := h.store.LatestArtifact(context.Background(), taskID, "report")
+	if err != nil {
+		t.Fatalf("report 产物: %v", err)
+	}
+	var saved bool
+	for _, e := range h.events(taskID) {
+		var p struct {
+			ArtifactID string `json:"artifact_id"`
+			SHA256     string `json:"sha256"`
+		}
+		if e.Type == "artifact_saved" && json.Unmarshal(e.Payload, &p) == nil && p.ArtifactID == "report" && p.SHA256 == av.SHA256 {
+			saved = true
+		}
+	}
+	if !saved {
+		t.Fatalf("事件中没有 artifact_saved(report, %s)", av.SHA256)
+	}
+	report := string(h.readBlob(av.SHA256))
+	body, list, ok := strings.Cut(report, "\n## 证据\n")
+	if !ok || !strings.HasPrefix(report, "# "+researchTopic+"\n") || strings.Contains(body, "参考来源") {
+		t.Fatalf("报告结构不符（标题、证据节、模型自写的来源节应被替换）：\n%s", report)
+	}
+	urls := map[string]bool{}
+	for _, task := range researchTasks {
+		for i := 1; i <= 3; i++ {
+			urls[fu.ResultURL(task.Query, i)] = true
+		}
+	}
+	refs := h.checkpointRefs(taskID, "report")
+	var cites []citation
+	listed := map[int]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(list), "\n") {
+		m := evidenceLine.FindStringSubmatch(line)
+		if m == nil {
+			t.Fatalf("证据列表行 %q 不符合 `- [n] 标题 — URL — sha256:<sha>`", line)
+		}
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := citation{N: n, URL: m[2], SHA: m[3]}
+		if c.N != len(cites)+1 || !urls[c.URL] {
+			t.Fatalf("证据 %+v：编号应连续、URL 应是固定题目的搜索结果", c)
+		}
+		var fetched struct {
+			URL     string `json:"url"`
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(h.readBlob(c.SHA), &fetched); err != nil {
+			t.Fatalf("证据 [%d] 的 blob 不是抓取结果: %v", c.N, err)
+		}
+		var inBlobs, inScope int
+		h.queryRow("SELECT count(*) FROM blobs WHERE sha256 = $1", []any{c.SHA}, &inBlobs)
+		h.queryRow("SELECT count(*) FROM scope_blobs WHERE scope_kind = 'task' AND scope_id = $1 AND sha256 = $2",
+			[]any{taskID, c.SHA}, &inScope)
+		if fetched.URL != c.URL || !strings.Contains(fetched.Content, c.URL) || inBlobs != 1 || inScope != 1 || !slices.Contains(refs, c.SHA) {
+			t.Fatalf("证据 [%d] %s：抓取 URL %q、blobs %d、scope_blobs %d、在 report refs 中 %v",
+				c.N, c.SHA, fetched.URL, inBlobs, inScope, slices.Contains(refs, c.SHA))
+		}
+		listed[c.N] = true
+		cites = append(cites, c)
+	}
+	if len(cites) != 3*len(researchTasks) {
+		t.Fatalf("证据列表 %d 条，期望 %d", len(cites), 3*len(researchTasks))
+	}
+	var cited []int
+	for _, m := range citeRef.FindAllStringSubmatch(body, -1) {
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !listed[n] {
+			t.Fatalf("正文引用 [%d] 不在证据列表中：\n%s", n, report)
+		}
+		cited = append(cited, n)
+	}
+	if len(cited) == 0 {
+		t.Fatalf("报告正文没有引用：\n%s", report)
+	}
+	return cites, cited
+}
+
+// assertCallsSettled：全部调用 completed，每个恰 1 次 ok try；返回 call_id → 调用。
+func assertCallsSettled(t *testing.T, in api.Inspection, want int) map[string]api.CallView {
+	t.Helper()
+	calls := map[string]api.CallView{}
+	for _, c := range in.Calls {
+		if c.State != "completed" || c.TriesUsed != 1 || len(c.Tries) != 1 || c.Tries[0].Outcome != "ok" || c.ResultRef == "" {
+			t.Fatalf("调用 %+v；期望 completed、恰 1 次 ok try", c)
+		}
+		calls[c.CallID] = c
+	}
+	if len(calls) != want {
+		t.Fatalf("inspect 中 %d 个调用，期望 %d：%+v", len(calls), want, in.Calls)
+	}
+	return calls
+}
+
+// researchCalls 是完整研究的调用 ID：计划 1 个，每个任务 1 次搜索、3 次抓取、1 次摘要，报告 1 个。
+func researchCalls() []string {
+	ids := []string{"root/plan/chat/1"}
+	for i := range researchTasks {
+		step := fmt.Sprintf("root/task-%d", i+1)
+		ids = append(ids, step+"/search/1", step+"/fetch/1", step+"/fetch/2", step+"/fetch/3", step+"/chat/1")
+	}
+	return append(ids, "root/report/chat/1")
+}
+
+// TestRealDeepResearchFixedTopic：固定题目的完整研究——checkpoint 依次为 plan、task-1、task-2、report；
+// 事件含 artifact_saved(report)；报告引用均对应已保存、已授权到任务的证据 blob；每个调用恰到达上游一次。
+func TestRealDeepResearchFixedTopic(t *testing.T) {
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	h := newRealHarness(t)
+	h.start(researchCfg(fu))
+	id := h.submit("dr-fixed", researchSpec(nil))
+	if v := h.waitTerminal(id); v.Status != "succeeded" {
+		t.Fatalf("任务 %+v", v)
+	}
+	in := h.inspect(id)
+	steps, _ := stepOrder(in)
+	if !slices.Equal(steps, []string{"plan", "task-1", "task-2", "report"}) || len(in.Attempts) != 1 {
+		t.Fatalf("checkpoints %v，attempts %+v；期望 plan、task-1、task-2、report 与 1 个 attempt", steps, in.Attempts)
+	}
+	calls := assertCallsSettled(t, in, len(researchCalls()))
+	for _, cid := range researchCalls() {
+		if _, ok := calls[cid]; !ok {
+			t.Fatalf("缺少调用 %s：%v", cid, slices.Collect(maps.Keys(calls)))
+		}
+	}
+	cites, cited := h.assertResearchReport(fu, id)
+	got := countsOf(fu)
+	for _, k := range []fakeupstream.Kind{fakeupstream.Chat, fakeupstream.Search, fakeupstream.Fetch} {
+		if fu.Count(k) != fu.Distinct(k) {
+			t.Fatalf("%s：上游 %d 个请求、%d 个不同请求（不应重发）", k, fu.Count(k), fu.Distinct(k))
+		}
+	}
+	if got != researchFull {
+		t.Fatalf("上游计数 %+v，期望 %+v", got, researchFull)
+	}
+	if _, outs, _ := h.pinnedResult(id, in.Attempts[0].AttemptID); len(outs) != 1 || outs[0].ArtifactID != "report" {
+		t.Fatalf("result 的固定输出 %+v", outs)
+	}
+	t.Logf("固定题目：checkpoints %v；上游计数 %+v；报告引用 %v；证据 %+v", steps, got, cited, cites)
+	h.finish()
+}
+
+// TestRealDeepResearchKillAndResume：task-1 的 checkpoint 提交后、结果送达 Worker 之前杀死 Worker →
+// 新 attempt 的 init.resume.checkpoint_id 为 task-1 的 checkpoint；计划调用的上游计数仍为 1；恢复后任务 1 的
+// search、fetch、summarize 不再到达上游：attempt 2 不重发它们（上游计数与 tries 不变），测试在 attempt 2 的
+// Gateway socket 上以同 ID、同请求体重发它们得到重放（X-Agentbox-Replayed，blob 与 journal 相同），上游计数不变。
+//
+// 观察点：上游第 2 次搜索（attempt 2 的 task-2 搜索）挂起，此时 attempt 2 的 Worker 存活、socket 可用。
+func TestRealDeepResearchKillAndResume(t *testing.T) {
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	h := newRealHarness(t)
+	fu.Inject(fakeupstream.Search, 2, fakeupstream.Action{Hang: true})
+	h.start(researchCfg(fu))
+	// committed 的 checkpoint_result 依次为 plan（第 1 个）、task-1（第 2 个）。
+	id := h.submit("dr-kill", researchSpec(&directives{KillAfterCommitted: 2}))
+	r := h.rec(id)
+	eventually(t, "attempt 2 的 task-2 搜索到达上游并挂起", func() bool { return fu.Hanging() == 1 })
+	in2, ok := r.init(2)
+	cp1 := checkpointByStep(h.inspect(id), "task-1")
+	if !ok || in2.Resume == nil || in2.Resume.StepID != "task-1" || in2.Resume.CheckpointID != cp1.CheckpointID || cp1.CheckpointID == "" {
+		t.Fatalf("attempt 2 的 init.resume %+v；期望 task-1 的 checkpoint %+v", in2.Resume, cp1)
+	}
+	before := countsOf(fu)
+	if want := (upstreamCounts{Plan: 1, Summarize: 1, Search: 2, Fetch: 3}); before != want {
+		t.Fatalf("恢复后、task-2 搜索挂起时上游计数 %+v，期望 %+v（任务 1 未重发）", before, want)
+	}
+
+	// 直接重放探针：任务 1 的 5 个调用以同 ID、同请求体经 attempt 2 的 socket 发出。
+	in := h.inspect(id)
+	t1 := map[string]api.CallView{}
+	for _, c := range in.Calls {
+		if strings.HasPrefix(c.CallID, "root/task-1/") {
+			t1[c.CallID] = c
+		}
+	}
+	var summarizeBody map[string]json.RawMessage
+	for _, rq := range fu.Requests(fakeupstream.Chat) {
+		if rq.Stage == fakeupstream.StageSummarize {
+			if err := json.Unmarshal([]byte(rq.Body), &summarizeBody); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	delete(summarizeBody, "model") // Gateway 补上的配置模型名；Worker 的请求体只有 messages 与 max_tokens
+	chatProbe, err := json.Marshal(summarizeBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q1 := researchTasks[0].Query
+	probes := []struct{ callID, path, body string }{
+		{"root/task-1/search/1", "/v1/search", fmt.Sprintf(`{"query":%q,"max_results":%d}`, q1, researchMaxResults)},
+		{"root/task-1/fetch/1", "/v1/fetch", fmt.Sprintf(`{"url":%q}`, fu.ResultURL(q1, 1))},
+		{"root/task-1/fetch/2", "/v1/fetch", fmt.Sprintf(`{"url":%q}`, fu.ResultURL(q1, 2))},
+		{"root/task-1/fetch/3", "/v1/fetch", fmt.Sprintf(`{"url":%q}`, fu.ResultURL(q1, 3))},
+		{"root/task-1/chat/1", "/v1/chat/completions", string(chatProbe)},
+	}
+	if len(t1) != len(probes) {
+		t.Fatalf("任务 1 的调用 %v，期望 %d 个", slices.Collect(maps.Keys(t1)), len(probes))
+	}
+	sock2 := h.gwSocket(in2.AttemptID)
+	var replays []string
+	for _, p := range probes {
+		got, err := gwDo(sock2, http.MethodPost, p.path, p.callID, p.body)
+		c := t1[p.callID]
+		if err != nil || got.Status != http.StatusOK || !got.Replayed || got.Blob != c.ResultRef || c.ResultRef == "" {
+			t.Fatalf("attempt 2 上重发 %s 得到 %+v %v；期望 200 重放、blob %s", p.callID, got, err, c.ResultRef)
+		}
+		replays = append(replays, fmt.Sprintf("%s → Replayed blob %.12s", p.callID, got.Blob))
+	}
+	if after := countsOf(fu); after != before {
+		t.Fatalf("重放探针之后上游计数 %+v，之前 %+v：重放不应访问上游", after, before)
+	}
+	fu.Release()
+
+	if v := h.waitTerminal(id); v.Status != "succeeded" {
+		t.Fatalf("任务 %+v", v)
+	}
+	in = h.inspect(id)
+	a1, a2 := attemptByNo(in, 1), attemptByNo(in, 2)
+	steps, cpAttempts := stepOrder(in)
+	if len(in.Attempts) != 2 || a1.OutcomeClass != runner.ClassCrashedSignal || a2.OutcomeClass != runner.ClassSucceeded ||
+		!slices.Equal(steps, []string{"plan", "task-1", "task-2", "report"}) ||
+		!slices.Equal(cpAttempts, []string{a1.AttemptID, a1.AttemptID, a2.AttemptID, a2.AttemptID}) {
+		t.Fatalf("attempts %s；checkpoints %v（attempt %v）；期望 attempt 1 被杀死于 task-1 之后、attempt 2 提交 task-2 与 report",
+			attemptClasses(in), steps, cpAttempts)
+	}
+	// 计划与任务 1 的调用只有 attempt 1 的那一次 try；任务 2 与报告的调用由 attempt 2 首次发起。
+	calls := assertCallsSettled(t, in, len(researchCalls()))
+	for cid, c := range calls {
+		want := a2.AttemptID
+		if cid == "root/plan/chat/1" || strings.HasPrefix(cid, "root/task-1/") {
+			want = a1.AttemptID
+		}
+		if c.FirstAttemptID != want || c.Tries[0].AttemptID != want {
+			t.Fatalf("调用 %s 的首个 attempt %s、try 的 attempt %s，期望 %s", cid, c.FirstAttemptID, c.Tries[0].AttemptID, want)
+		}
+	}
+	final := countsOf(fu)
+	for _, k := range []fakeupstream.Kind{fakeupstream.Chat, fakeupstream.Search, fakeupstream.Fetch} {
+		if fu.Count(k) != fu.Distinct(k) {
+			t.Fatalf("%s：上游 %d 个请求、%d 个不同请求（不应重发）", k, fu.Count(k), fu.Distinct(k))
+		}
+	}
+	if final != researchFull {
+		t.Fatalf("上游计数 %+v，期望 %+v（计划 1 次、任务 1 不重发）", final, researchFull)
+	}
+	cites, cited := h.assertResearchReport(fu, id)
+	t.Logf("杀死并恢复：attempts %s；init.resume = %s（%s）；checkpoints %v；上游计数 恢复挂起时 %+v → 重放探针后 %+v → 结束 %+v；"+
+		"重放 %q；报告引用 %v；证据 %+v", attemptClasses(in), in2.Resume.CheckpointID, in2.Resume.StepID, steps, before, before, final,
+		replays, cited, cites)
+	h.finish()
 }

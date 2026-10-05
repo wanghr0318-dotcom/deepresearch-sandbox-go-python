@@ -20,7 +20,10 @@
 // 计数：Count 是该类别收到的请求数（含注入故障的请求）；Distinct 按调用身份去重——请求带 X-Agentbox-Call-Id
 // 时以它为身份，否则以请求体的 sha256 为身份（Gateway 不把 call id 转发给上游，因此经 Gateway 的请求按请求体
 // 去重：同一逻辑调用的每次 try 请求体相同）。Requests 返回每个请求的记录（到达时间、注入动作、结局），测试据此
-// 等待可观察的条件而不是时间。
+// 等待可观察的条件而不是时间。StageCount 按阶段标记统计 chat 请求。
+//
+// 固定研究题目（Plan 8 Task 5，SetResearch）：计划阶段回复给定任务的 JSON；每个查询的搜索恰返回 3 条固定结果
+// （URL 为 ResultURL(query, 1..3)），抓取它们返回各自固定的 HTML 页面；摘要与报告阶段回复带 [n] 引用的固定文本。
 package fakeupstream
 
 import (
@@ -98,6 +101,8 @@ type Request struct {
 	Key           string    // 调用身份（X-Agentbox-Call-Id，或 "sha256:<请求体哈希>"）
 	Path          string    // 请求路径
 	Authorization string    // Authorization 头（测试据此确认 Key 只在上游请求头中出现）
+	Stage         string    // chat 请求的阶段标记（第一条 system 消息以它开头时）；其他为空
+	Body          string    // 请求体（测试据此重建 Worker 发给 Gateway 的同一请求）
 	Action        Action    // 注入的动作
 	At            time.Time // 到达时间
 	Outcome       string    // 结局；处理中为空
@@ -116,6 +121,8 @@ type Server struct {
 	pages    map[string]page
 	released chan struct{} // Release 时关闭，随后换新
 	hanging  int
+	// searchFixed 非零时每次搜索恰返回这么多条结果（不论 max_results；SetResearch 设为 3）。
+	searchFixed int
 }
 
 type page struct {
@@ -185,6 +192,66 @@ func (s *Server) SetPage(path, contentType, body string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pages[path] = page{contentType: contentType, body: body}
+}
+
+// ResearchTask 是固定研究题目中的一个计划任务（与 deepresearch 计划回复的 JSON 字段一致）。
+type ResearchTask struct {
+	Title  string `json:"title"`
+	Intent string `json:"intent"`
+	Query  string `json:"query"`
+}
+
+// 固定研究题目的摘要与报告回复。报告回复自带一个"参考来源"节与一个越界编号 [99]：Worker 须删去越界编号，
+// 并以系统生成的"证据"列表替换模型自写的来源节。
+const (
+	ResearchSummary = "## 任务总结\n- 关键发现一 [1]\n- 关键发现二 [2][3]"
+	ResearchReport  = "## 核心洞见\n固态电解质提升了安全性 [1][4]，界面阻抗仍是瓶颈 [2][5][99]。\n\n" +
+		"## 关键发现\n- 量产成本 [3]\n- 车企路线 [6]\n\n## 参考来源\n- 模型自编的来源 [7]"
+)
+
+// SetResearch 安装固定研究题目的脚本：计划阶段回复 tasks 的 JSON，摘要与报告阶段回复 ResearchSummary、
+// ResearchReport；每次搜索恰返回 3 条结果（ResultURL(query, 1..3)），每个结果页面是内容互不相同的固定 HTML。
+func (s *Server) SetResearch(tasks []ResearchTask) {
+	plan, err := json.Marshal(map[string]any{"tasks": tasks})
+	if err != nil {
+		panic(err) // 只编码本包的结构体
+	}
+	s.SetStageReply(StagePlan, string(plan))
+	s.SetStageReply(StageSummarize, ResearchSummary)
+	s.SetStageReply(StageReport, ResearchReport)
+	for _, t := range tasks {
+		for i := 1; i <= researchResults; i++ {
+			u := s.ResultURL(t.Query, i)
+			body := fmt.Sprintf("<html><head><title>%s %d</title><style>p{}</style></head><body><p>%s 的固定页面 %d：%s</p></body></html>",
+				t.Query, i, t.Title, i, u)
+			s.SetPage(strings.TrimPrefix(u, s.srv.URL), "text/html; charset=utf-8", body)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.searchFixed = researchResults
+}
+
+// researchResults 是固定研究题目中每次搜索的结果数。
+const researchResults = 3
+
+// ResultURL 是查询 query 的第 i 条搜索结果（从 1 开始）的 URL（指向本服务器，可继续抓取）。
+func (s *Server) ResultURL(query string, i int) string {
+	sum := sha256.Sum256([]byte(query))
+	return fmt.Sprintf("%s/pages/%s/%d", s.srv.URL, hex.EncodeToString(sum[:4]), i)
+}
+
+// StageCount 返回第一条 system 消息以阶段标记 stage 开头的 chat 请求数。
+func (s *Server) StageCount(stage string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, r := range s.reqs {
+		if r.Kind == Chat && r.Stage == stage {
+			n++
+		}
+	}
+	return n
 }
 
 // Release 放行当前全部挂起的请求（它们随后正常回复）。之后到达的挂起请求等待下一次 Release。
@@ -263,11 +330,16 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		sum := sha256.Sum256(append([]byte(r.Method+" "+r.URL.RequestURI()+"\n"), body...))
 		key = "sha256:" + hex.EncodeToString(sum[:])
 	}
+	var stage string
+	if kind == Chat {
+		stage = stageOf(body)
+	}
 	s.mu.Lock()
 	s.seq++
 	s.counts[kind]++
 	rec := &Request{Seq: s.seq, Kind: kind, N: s.counts[kind], Key: key, Path: r.URL.Path,
-		Authorization: r.Header.Get("Authorization"), Action: s.faults[kind][s.counts[kind]], At: time.Now()}
+		Authorization: r.Header.Get("Authorization"), Stage: stage, Body: string(body),
+		Action: s.faults[kind][s.counts[kind]], At: time.Now()}
 	s.reqs = append(s.reqs, rec)
 	released := s.released
 	if rec.Action.Hang {
@@ -304,6 +376,20 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		s.fetch(w, r, rec)
 	}
+}
+
+// stageOf 返回 chat 请求体第一条 system 消息开头的阶段标记；没有时为空。
+func stageOf(body []byte) string {
+	var req chatRequest
+	if err := json.Unmarshal(body, &req); err != nil || len(req.Messages) == 0 || req.Messages[0].Role != "system" {
+		return ""
+	}
+	for _, st := range []string{StagePlan, StageSummarize, StageReport} {
+		if strings.HasPrefix(req.Messages[0].Content, st) {
+			return st
+		}
+	}
+	return ""
 }
 
 func (s *Server) finishHang(rec *Request, outcome string) {
@@ -431,13 +517,16 @@ func (s *Server) search(w http.ResponseWriter, rec *Request, body []byte) {
 	if req.MaxResults <= 0 {
 		req.MaxResults = 5
 	}
-	sum := sha256.Sum256([]byte(req.Query))
-	slug := hex.EncodeToString(sum[:4])
+	s.mu.Lock()
+	if s.searchFixed > 0 {
+		req.MaxResults = s.searchFixed
+	}
+	s.mu.Unlock()
 	results := make([]SearchResult, 0, req.MaxResults)
 	for i := 1; i <= req.MaxResults; i++ {
 		text := fmt.Sprintf("关于 %s 的第 %d 条片段", req.Query, i)
 		results = append(results, SearchResult{Title: fmt.Sprintf("%s %d", req.Query, i),
-			URL: fmt.Sprintf("%s/pages/%s/%d", s.srv.URL, slug, i), Content: text, Snippet: text})
+			URL: s.ResultURL(req.Query, i), Content: text, Snippet: text})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"request_id": fmt.Sprintf("fake-search-%d", rec.Seq), "results": results})
 	s.setOutcome(rec, OutcomeOK)
