@@ -4091,8 +4091,8 @@ func TestE17UpstreamFaults(t *testing.T) {
 }
 
 // TestE19AttemptReplacedDuringCall：E19——上游调用在途时杀死 Worker（新 attempt 取代旧 attempt）→ 旧 try 不被
-// 取消，继续至完成并写入 journal；新 attempt 以同一调用 ID 得到 409 call_in_progress；完成后同 ID 请求命中重放
-// （X-Agentbox-Replayed，结果 blob 相同），上游计数不增。
+// 取消，继续至完成并写入 journal；新 attempt 以同一调用 ID 得到 409 call_in_progress；完成后新 attempt 的 Worker
+// 命中重放（tries_used 仍为 1、上游计数不增、它的 checkpoint refs 含同一结果 blob），任务成功。
 func TestE19AttemptReplacedDuringCall(t *testing.T) {
 	fu := fakeupstream.New()
 	t.Cleanup(fu.Close)
@@ -4100,7 +4100,7 @@ func TestE19AttemptReplacedDuringCall(t *testing.T) {
 	fu.Inject(fakeupstream.Chat, 1, fakeupstream.Action{Hang: true})
 	key := gwSecret()
 	h.start(gatewayCfg(fu, key, call.Limits{}))
-	id := h.submit("e19", spec(nil, "e19", nil, chatStep("s1")))
+	id := h.submit("e19", spec(nil, "e19", nil, chatStep("s1"), checkpointStep("c1")))
 	eventually(t, "调用到达上游并挂起", func() bool { return fu.Hanging() == 1 })
 	r := h.rec(id)
 	in1, _ := r.init(1)
@@ -4118,8 +4118,9 @@ func TestE19AttemptReplacedDuringCall(t *testing.T) {
 		_, err := os.Stat(h.gwSocket(in2.AttemptID))
 		return err == nil
 	})
-	sock2 := h.gwSocket(in2.AttemptID)
-	got, err := gwDo(sock2, http.MethodPost, "/v1/chat/completions", e2eCallID, chatBody(gwMessages))
+	// 旧 try 仍挂起在上游：attempt 2 的 Worker 在它完成之前无法结束（其同 ID 请求得到 call_in_progress 并重试），
+	// 因此此时从测试侧发出的同 ID 请求所在的入口一定存活。
+	got, err := gwDo(h.gwSocket(in2.AttemptID), http.MethodPost, "/v1/chat/completions", e2eCallID, chatBody(gwMessages))
 	if err != nil || got.Status != http.StatusConflict || got.Code != "call_in_progress" {
 		t.Fatalf("旧 try 在途时新 attempt 的同 ID 请求得到 %+v %v，期望 409 call_in_progress", got, err)
 	}
@@ -4127,31 +4128,41 @@ func TestE19AttemptReplacedDuringCall(t *testing.T) {
 		t.Fatalf("旧 attempt 的 socket 应已撤销：%v", err)
 	}
 
+	// 放行旧 try：它结算并写入 journal；attempt 2 的 Worker（SDK 对 call_in_progress 以同一 ID 有界重试）随后
+	// 命中重放，提交 checkpoint c1（refs 含结果 blob）并结束。此后不再从测试侧发请求：attempt 2 结束时入口被撤销。
 	fu.Release()
-	eventually(t, "旧 try 完成并写入 journal", func() bool { return gwCallRow(t, h.dsn, id, e2eCallID).State == "completed" })
-	c := gwCallRow(t, h.dsn, id, e2eCallID)
-	// journal 已是 completed，但旧 try 的执行者在结算事务提交之后才释放进程内的调用占用：在此之间到达的同 ID
-	// 请求得到 call_in_progress（契约：可重试，Worker SDK 同样以同一 ID 有界重试）。等待的条件是同 ID 请求本身
-	// 不再是 call_in_progress（期限只决定失败），之后断言它是重放。
-	eventually(t, "旧 try 的执行者释放调用占用（同 ID 请求不再是 call_in_progress）", func() bool {
-		got, err = gwDo(sock2, http.MethodPost, "/v1/chat/completions", e2eCallID, chatBody(gwMessages))
-		return err != nil || got.Code != "call_in_progress"
-	})
-	if err != nil || got.Status != http.StatusOK || !got.Replayed || got.Blob != c.ResultRef {
-		t.Fatalf("完成后的同 ID 请求得到 %+v %v，期望 200 重放、blob %s", got, err, c.ResultRef)
-	}
 	v := h.waitTerminal(id)
+	c := gwCallRow(t, h.dsn, id, e2eCallID)
 	tries := gwTries(t, h.dsn, id, e2eCallID)
 	if v.Status != "succeeded" || len(tries) != 1 || tries[0].AttemptID != in1.AttemptID || tries[0].Outcome != "ok" ||
-		tries[0].Reservation != "settled" || c.FirstAttempt != in1.AttemptID || c.Tries != 1 {
-		t.Fatalf("任务 %s；调用 %+v；tries %+v；期望旧 attempt 的唯一 try 以 ok 结算", v.Status, c, tries)
+		tries[0].Reservation != "settled" || c.State != "completed" || c.FirstAttempt != in1.AttemptID || c.Tries != 1 {
+		t.Fatalf("任务 %s；调用 %+v；tries %+v；期望旧 attempt 的唯一 try 以 ok 结算、调用 completed", v.Status, c, tries)
 	}
 	if fu.Count(fakeupstream.Chat) != 1 {
 		t.Fatalf("上游收到 %d 个请求，重放不应访问上游", fu.Count(fakeupstream.Chat))
 	}
 	in := h.inspect(id)
-	if a1 := attemptByNo(in, 1); a1.OutcomeClass != runner.ClassCrashedSignal || attemptByNo(in, 2).OutcomeClass != runner.ClassSucceeded {
+	a2 := attemptByNo(in, 2)
+	if a1 := attemptByNo(in, 1); a1.OutcomeClass != runner.ClassCrashedSignal || a2.OutcomeClass != runner.ClassSucceeded {
 		t.Fatalf("attempts %+v", in.Attempts)
+	}
+	// inspect 的调用审计：completed、source upstream、1 个 try（旧 attempt 的），结果为同一 blob。
+	var cv api.CallView
+	for _, x := range in.Calls {
+		if x.CallID == e2eCallID {
+			cv = x
+		}
+	}
+	if cv.State != "completed" || cv.Source != "upstream" || cv.TriesUsed != 1 || len(cv.Tries) != 1 ||
+		cv.Tries[0].AttemptID != in1.AttemptID || cv.ResultRef != c.ResultRef {
+		t.Fatalf("inspect 的调用 %+v", cv)
+	}
+	// 重放：attempt 2 的 Worker 得到同一结果 blob（它在 checkpoint c1 的 refs 中），而没有新 try。
+	var refs []string
+	var refsJSON string
+	pgQueryRow(t, h.dsn, "SELECT refs_json::text FROM checkpoints WHERE attempt_id = $1 AND step_id = 'c1'", []any{a2.AttemptID}, &refsJSON)
+	if err := json.Unmarshal([]byte(refsJSON), &refs); err != nil || !slices.Contains(refs, c.ResultRef) {
+		t.Fatalf("attempt 2 的 checkpoint refs %s 应含结果 blob %s（%v）", refsJSON, c.ResultRef, err)
 	}
 	reserved, spent, unknown := gwBudget(t, h.dsn, id)
 	if reserved != 0 || unknown != 0 || spent != tries[0].Cost {
