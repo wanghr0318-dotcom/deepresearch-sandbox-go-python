@@ -22,9 +22,12 @@ func TestModelFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 	m, err := modelConfig(modelFlags{BaseURL: url, Name: "kimi-k2.6", Prices: prices, PriceIn: 5, PriceOut: 6,
-		Models: "kimi-k2.6, kimi-k2.7-code,kimi-k2.7-code-highspeed,kimi-k3"})
+		Models: "kimi-k2.6, kimi-k2.7-code,kimi-k2.7-code-highspeed,kimi-k3", MaxTokensCap: 32768})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if m.MaxTokensCap != 32768 {
+		t.Fatalf("MaxTokensCap = %d，期望 32768", m.MaxTokensCap)
 	}
 	if strings.Join(m.Models, ",") != "kimi-k2.6,kimi-k2.7-code,kimi-k2.7-code-highspeed,kimi-k3" ||
 		m.Pricing != (upstream.Pricing{InputMicroPerMTok: 5, OutputMicroPerMTok: 6}) ||
@@ -37,15 +40,16 @@ func TestModelFlags(t *testing.T) {
 		t.Fatalf("无白名单：%+v %v", m, err)
 	}
 	for name, f := range map[string]modelFlags{
-		"白名单不含默认模型":  {BaseURL: url, Name: "kimi-k2.6", Models: "kimi-k3"},
-		"白名单重复":      {BaseURL: url, Name: "a", Models: "a,b,a"},
-		"单价的模型未声明":   {BaseURL: url, Name: "a", Models: "a", Prices: []string{"b=1:1"}},
-		"单价重复":       {BaseURL: url, Name: "a", Prices: []string{"a=1:1", "a=2:2"}},
-		"单价格式":       {BaseURL: url, Name: "a", Prices: []string{"a=1"}},
-		"单价为负":       {BaseURL: url, Name: "a", Prices: []string{"a=-1:1"}},
-		"默认单价为负":     {BaseURL: url, Name: "a", PriceIn: -1},
-		"无上游地址的白名单":  {Name: "a", Models: "a"},
-		"有上游地址无默认模型": {BaseURL: url, Models: "a"},
+		"白名单不含默认模型":       {BaseURL: url, Name: "kimi-k2.6", Models: "kimi-k3"},
+		"白名单重复":           {BaseURL: url, Name: "a", Models: "a,b,a"},
+		"单价的模型未声明":        {BaseURL: url, Name: "a", Models: "a", Prices: []string{"b=1:1"}},
+		"单价重复":            {BaseURL: url, Name: "a", Prices: []string{"a=1:1", "a=2:2"}},
+		"单价格式":            {BaseURL: url, Name: "a", Prices: []string{"a=1"}},
+		"单价为负":            {BaseURL: url, Name: "a", Prices: []string{"a=-1:1"}},
+		"默认单价为负":          {BaseURL: url, Name: "a", PriceIn: -1},
+		"max_tokens 上限为负": {BaseURL: url, Name: "a", MaxTokensCap: -1},
+		"无上游地址的白名单":       {Name: "a", Models: "a"},
+		"有上游地址无默认模型":      {BaseURL: url, Models: "a"},
 	} {
 		if _, err := modelConfig(f); err == nil {
 			t.Errorf("%s：应拒绝", name)

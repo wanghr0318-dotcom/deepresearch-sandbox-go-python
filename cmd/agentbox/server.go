@@ -87,6 +87,7 @@ func runServer(args []string, stderr io.Writer) int {
 	fs.Var(&modelPrices, "model-price", "按模型的单价 model=IN:OUT（每百万 token 的微美元；可重复或逗号分隔；模型须已声明）")
 	searchBaseURL := fs.String("search-base-url", "", "搜索供应商地址覆盖（空时取供应商默认）；与 --search-provider fake 同用时 fake 搜索向 <地址>/search 发出请求（测试用 fake upstream，主机须在 --upstream-allow-private 中）")
 	searchProvider := fs.String("search-provider", upstream.SearchDDGLite, "搜索供应商：ddg_lite | tavily | serper | fake（tavily 与 serper 的 Key 只读环境变量 "+searchKeyEnv+"；serper 为经 Serper.dev 的 Google 结果；fake 只用于测试，须同时设置 --upstream-allow-private）")
+	maxTokensCap := fs.Int("model-max-tokens-cap", 32768, "模型请求 max_tokens 的上限（超出者截断并进入 applied_defaults）；推理模型先消耗推理 token，过低会得到空回答")
 	allowPrivate := fs.String("upstream-allow-private", "", "显式放行的私有上游主机（逗号分隔的 host 或 host:port；例如本机模型服务或测试用 fake upstream）")
 	redisAddr := fs.String("redis-addr", "", "共享缓存的 Redis 地址 host:port（例如 deploy/docker-compose.yml 的 127.0.0.1:6379）；为空时缓存不启用")
 	cacheMode := fs.String("cache", "on", "搜索与抓取的共享缓存：on | off（on 且配置了 --redis-addr 时生效；Redis 不可用时视为未命中）")
@@ -106,7 +107,7 @@ func runServer(args []string, stderr io.Writer) int {
 		return 2
 	}
 	model, err := modelConfig(modelFlags{BaseURL: *modelBaseURL, Name: *modelName, Models: *models,
-		Prices: modelPrices, PriceIn: *priceIn, PriceOut: *priceOut})
+		Prices: modelPrices, PriceIn: *priceIn, PriceOut: *priceOut, MaxTokensCap: *maxTokensCap})
 	if err != nil {
 		fmt.Fprintln(stderr, "agentbox server:", err)
 		return 2
