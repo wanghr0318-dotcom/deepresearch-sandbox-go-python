@@ -332,7 +332,18 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	case len(os.Args) > 1 && os.Args[1] == sandbox.InitArg:
 		// 专用启动进程在命名空间中以 /proc/self/exe init 启动的 init（见 Task 9 一节）。
+		// 设置 envRealInit（经 ProcessStarter.initEnv 注入）时运行生产 init，走完整的 init + stage-2 helper 链。
+		if os.Getenv(envRealInit) != "" {
+			if err := sandbox.RunInit(); err != nil {
+				fmt.Fprintln(os.Stderr, "init:", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		}
 		os.Exit(runProdTestInit())
+	case len(os.Args) > 1 && os.Args[1] == sandbox.HelperArg:
+		sandbox.RunHelper() // 生产 init 经 execveat 启动的 stage-2 helper；不返回
+		os.Exit(1)
 	case os.Getenv(envTestInit) != "":
 		os.Exit(runTestInit())
 	case os.Getenv(envTestHog) != "":
@@ -342,6 +353,9 @@ func TestMain(m *testing.M) {
 	removeTestCgroupRoot()
 	os.Exit(code)
 }
+
+// envRealInit 让本测试二进制作为 init 时运行生产 sandbox.RunInit（而非测试 init）。
+const envRealInit = "AGENTBOX_TEST_REAL_INIT"
 
 // runTestInit 是测试 init 的主函数：fd 3 是控制连接，fd 4 是就绪管道（写一个字节后关闭）。
 // 设为 child subreaper，使双重 fork 脱离的后代仍由它收割（与沙箱内 init 的处境相同）。
@@ -1214,5 +1228,57 @@ func TestLaunchSpecForFillsInit(t *testing.T) {
 	}
 	if _, err := launchSpecFor(provider.EnvSpec{Kind: provider.KindTask, UIDBase: 100000, UIDSize: 4096, Template: "no-such"}); err == nil {
 		t.Fatal("未知模板应报错")
+	}
+}
+
+// TestWorkloadLimitsApplied：生产启动路径（真实 init + stage-2 helper，无测试钩子）把 EnvSpec.Limits 的
+// NoFile/FSize 真正施加到 workload：workload 自报 `ulimit -n` / `ulimit -f` 与配置一致（规格 §4.5）。
+// 这是 provider 层第一条走完整生产链的用例；需要 root 与默认模板的宿主路径。
+func TestWorkloadLimitsApplied(t *testing.T) {
+	requireRoot(t)
+	st, err := NewProcessStarter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.initEnv = []string{envRealInit + "=1"} // 真实 init + helper（TestMain 据此分流）
+	install := "l" + randHex(4)
+	p := newProviderWith(t, install, st)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	run := func(envID string, spec provider.EnvSpec, script string) string {
+		t.Helper()
+		if info, err := p.Create(ctx, spec); err != nil || !info.Complete {
+			t.Fatalf("Create %s = %+v, %v", envID, info, err)
+		}
+		t.Cleanup(func() { _ = p.Stop(context.Background(), envID); _ = p.Destroy(context.Background(), envID) })
+		h, err := p.StartExec(ctx, envID, provider.ExecSpec{ExecID: "lim", Argv: []string{"/usr/bin/sh", "-c", script}})
+		if err != nil {
+			t.Fatalf("StartExec %s: %v", envID, err)
+		}
+		h.Stdin().Close()
+		var stderr strings.Builder
+		go func() { _, _ = io.Copy(&stderr, h.Stderr()) }()
+		out, _ := io.ReadAll(h.Stdout())
+		if es, err := h.Wait(); err != nil || es.Code != 0 {
+			t.Fatalf("%s: workload = %+v, %v; stderr %q", envID, es, err, stderr.String())
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	task := testEnvSpec(install, "env-lim-task")
+	task.Limits.NoFile = 256
+	if got := run("env-lim-task", task, "ulimit -n"); got != "256" {
+		t.Errorf("task workload 的 RLIMIT_NOFILE = %q，期望 256", got)
+	}
+
+	ex := testEnvSpec(install, "env-lim-exec")
+	ex.Kind = provider.KindExec
+	ex.UIDBase = 200000
+	ex.Limits.NoFile = 128
+	ex.Limits.FSize = 1 << 20 // 1 MiB = 2048 个 512 字节块（sh 的 ulimit -f 单位）
+	ex.Mounts = provider.Mounts{OutBytes: 4 << 20}
+	if got := run("env-lim-exec", ex, "echo $(ulimit -n) $(ulimit -f)"); got != "128 2048" {
+		t.Errorf("exec workload 的 (NOFILE, FSIZE) = %q，期望 \"128 2048\"", got)
 	}
 }
