@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -64,7 +65,14 @@ type Config struct {
 	// 127.0.0.1:<port>、localhost:<port>、[::1]:<port>。
 	AllowedHosts []string
 	// AllowedOrigins 是浏览器 Origin 的显式允许列表（不使用通配）；不带 Origin 的请求（CLI）不受限。
+	// 为空时取 <scheme>://ListenAddr 与 <scheme>://<每个允许的 Host>（scheme 由 TLS 决定）。
 	AllowedOrigins []string
+	// TLS 表示监听端由内置 TLS 终止：决定默认 Origin 的 scheme。非 loopback 监听且 TLS 为 false 时
+	// New 记录一条警告（规格 §15.3 要求可信 TLS 终止，但可以在外部完成，故不拒绝启动）。
+	TLS bool
+	// WebDir 非空时在 API 之外的路径上提供该目录下的静态文件（同源工作台），不存在的路径回退到
+	// index.html（SPA）。API 路径（/status、/tasks…、/events…）从不由静态文件应答。静态文件不需要 token。
+	WebDir string
 	// Logger 记录请求的方法、路径与状态；不记录请求头与查询串。nil 时不记录。
 	Logger *slog.Logger
 	// ConfigVersion 与 MaxFaultRetries 写入新建的任务；MaxFaultRetries 为 0 时取 3（规格默认值）。
@@ -161,7 +169,18 @@ func New(cfg Config) (*Handler, error) {
 		}
 		h.hosts[strings.ToLower(v)] = true
 	}
-	for _, v := range cfg.AllowedOrigins {
+	origins := cfg.AllowedOrigins
+	if len(origins) == 0 {
+		scheme := "http://"
+		if cfg.TLS {
+			scheme = "https://"
+		}
+		origins = []string{scheme + strings.ToLower(cfg.ListenAddr)}
+		for v := range h.hosts {
+			origins = append(origins, scheme+v)
+		}
+	}
+	for _, v := range origins {
 		if v == "*" || v == "" || v == "null" {
 			return nil, fmt.Errorf("api: Origin 允许列表不能含通配、空值或 null")
 		}
@@ -169,6 +188,10 @@ func New(cfg Config) (*Handler, error) {
 	}
 	if cfg.Token != "" {
 		h.token = []byte(cfg.Token)
+	}
+	if !loopback && !cfg.TLS && cfg.Logger != nil {
+		cfg.Logger.Warn("api: 非 loopback 监听未启用内置 TLS；远程访问须经可信 TLS 终止（--tls-cert/--tls-key 或外部代理），否则 token 以明文传输",
+			"listen", cfg.ListenAddr)
 	}
 	if h.cfg.Mode == nil {
 		h.cfg.Mode = func() Mode { return ModeNormal }
@@ -237,7 +260,32 @@ func randomTaskID() string {
 	return "task_" + hex.EncodeToString(b[:])
 }
 
-// ServeHTTP 依次校验 Host、Origin 与 token，再分派到操作。
+// securityHeaders 加在每个响应上（静态文件与 API）：工作台只从同源加载脚本与连接，且不可被嵌入。
+var securityHeaders = map[string]string{
+	"Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
+		"connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+	"X-Content-Type-Options": "nosniff",
+	"Referrer-Policy":        "no-referrer",
+}
+
+// apiPrefixes 是保留给 API 的首段路径（routes 的首段，加上为 SSE 保留的 events）：这些路径总由 API
+// 处理（未知端点为 JSON 404），从不由静态文件或 SPA 回退应答。
+var apiPrefixes = func() map[string]bool {
+	m := map[string]bool{"events": true}
+	for _, rt := range routes {
+		seg, _, _ := strings.Cut(strings.TrimPrefix(rt.path, "/"), "/")
+		m[seg] = true
+	}
+	return m
+}()
+
+func isAPIPath(p string) bool {
+	seg, _, _ := strings.Cut(strings.TrimPrefix(path.Clean("/"+p), "/"), "/")
+	return apiPrefixes[seg]
+}
+
+// ServeHTTP 依次校验 Host、Origin 与 token，再分派到操作。访问日志只记录方法、路径、状态与耗时：
+// 不记录任何请求头（包括 Authorization）与查询串。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	sw := &statusWriter{ResponseWriter: w}
@@ -250,8 +298,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
+	for k, v := range securityHeaders {
+		w.Header().Set(k, v)
+	}
 	if !h.hosts[strings.ToLower(r.Host)] {
 		writeError(w, http.StatusForbidden, "forbidden_host", "Host 不在允许列表中")
+		return
+	}
+	if h.cfg.WebDir != "" && !isAPIPath(r.URL.Path) {
+		h.serveStatic(w, r)
 		return
 	}
 	if origin := r.Header.Get("Origin"); origin != "" {
@@ -277,6 +332,49 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	h.mux.ServeHTTP(w, r)
+}
+
+// serveStatic 从 WebDir 提供静态文件；不存在的路径回退到根下的 index.html（SPA），目录取其 index.html，
+// 不列目录。
+func (h *Handler) serveStatic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "静态文件只支持 GET 与 HEAD")
+		return
+	}
+	root := http.Dir(h.cfg.WebDir) // http.Dir 拒绝越出根目录的路径
+	f, fi, ok := openRegular(root, path.Clean("/"+r.URL.Path))
+	if !ok {
+		if f, fi, ok = openRegular(root, "/index.html"); !ok {
+			writeError(w, http.StatusNotFound, "not_found", "没有这个文件")
+			return
+		}
+	}
+	defer func() { _ = f.Close() }() // 只读，关闭错误不影响已发送的内容
+	if fi.Name() == "index.html" {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
+	http.ServeContent(w, r, fi.Name(), fi.ModTime(), f)
+}
+
+// openRegular 打开普通文件；目录取其 index.html。
+func openRegular(root http.FileSystem, name string) (http.File, os.FileInfo, bool) {
+	for range 2 {
+		f, err := root.Open(name)
+		if err != nil {
+			return nil, nil, false
+		}
+		fi, err := f.Stat()
+		if err == nil && fi.Mode().IsRegular() {
+			return f, fi, true
+		}
+		_ = f.Close() // 只读且未发送内容，关闭错误无影响
+		if err != nil || !fi.IsDir() {
+			return nil, nil, false
+		}
+		name = path.Join(name, "index.html")
+	}
+	return nil, nil, false
 }
 
 func (h *Handler) modeAllows(a access) (code, msg string, ok bool) {

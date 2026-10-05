@@ -4,13 +4,20 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1259,6 +1266,103 @@ func TestGatewayChatCallThroughSocket(t *testing.T) {
 	// 任务结束后入口已撤销：socket 文件已删除。
 	if _, err := os.Stat(filepath.Join(gatewayDir(h.dir), att.AttemptID+".sock")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("attempt 结束后 socket 仍存在：%v", err)
+	}
+	h.cancel()
+	if err := h.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
+}
+
+// writeTestCert 在 dir 中生成 127.0.0.1 的自签名证书与私钥（PEM），返回路径与可信根池。
+func writeTestCert(t *testing.T, dir string) (certFile, keyFile string, roots *x509.CertPool) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "agentbox-test"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, KeyUsage: x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true, IsCA: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certFile, keyFile = filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots = x509.NewCertPool()
+	roots.AddCert(cert)
+	return certFile, keyFile, roots
+}
+
+// TestTLSListenerAndWebDir：配置 TLS 证书后 API 以 HTTPS 监听（明文请求不被应答为 API），并同源提供工作台
+// 静态文件；证书与私钥只设置其一时拒绝启动。
+func TestTLSListenerAndWebDir(t *testing.T) {
+	cfg := testConfig()
+	cfg.TLSCertFile = "cert.pem"
+	if err := Run(context.Background(), cfg, Deps{}); err == nil || !strings.Contains(err.Error(), "TLS") {
+		t.Fatalf("只设置证书时 Run = %v，期望 TLS 配置错误", err)
+	}
+
+	h := newHarness(t)
+	web := t.TempDir()
+	if err := os.WriteFile(filepath.Join(web, "index.html"), []byte("<!doctype html>workbench"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg = testConfig()
+	var roots *x509.CertPool
+	cfg.TLSCertFile, cfg.TLSKeyFile, roots = writeTestCert(t, t.TempDir())
+	cfg.WebDir = web
+	h.start(cfg, task.SystemClock())
+	addr := strings.TrimPrefix(h.waitAddr(), "http://")
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}}}
+	get := func(path string, hdr map[string]string) (int, []byte, http.Header) {
+		t.Helper()
+		req, err := http.NewRequest("GET", "https://"+addr+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("HTTPS GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode, b, resp.Header
+	}
+	if st, b, _ := get("/status", map[string]string{"Origin": "https://" + addr}); st != http.StatusOK || !strings.Contains(string(b), `"mode"`) {
+		t.Fatalf("HTTPS /status（同源 https Origin）= %d %s", st, b)
+	}
+	if st, b, _ := get("/status", map[string]string{"Origin": "http://" + addr}); st != http.StatusForbidden {
+		t.Fatalf("TLS 下 http Origin 得到 %d %s，期望 403", st, b)
+	}
+	st, b, hdr := get("/some/view", nil)
+	if st != http.StatusOK || string(b) != "<!doctype html>workbench" || hdr.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("HTTPS SPA 回退 = %d %s %v", st, b, hdr)
+	}
+	if st, b := httpDo(t, "GET", "http://"+addr+"/status", ""); st == http.StatusOK {
+		t.Fatalf("明文 HTTP 请求被应答为 API: %d %s", st, b)
 	}
 	h.cancel()
 	if err := h.wait(); err != nil {

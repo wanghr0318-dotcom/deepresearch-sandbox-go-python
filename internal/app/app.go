@@ -9,6 +9,7 @@ package app
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -83,7 +84,11 @@ type Config struct {
 	APIToken       string
 	AllowedHosts   []string
 	AllowedOrigins []string
-	// Runner 是 AttemptRunner 的选项（零值取 §19 默认值）。
+	// WebDir 非空时同源提供工作台静态文件（见 api.Config.WebDir）。
+	WebDir string
+	// TLSCertFile 与 TLSKeyFile（PEM）须同时设置或同时为空；设置时 API 以内置 TLS 监听（§15.3）。
+	TLSCertFile, TLSKeyFile string
+	// Runner是 AttemptRunner 的选项（零值取 §19 默认值）。
 	Runner runner.Options
 	// RetryBackoff 是恢复与报警标记失败后的重试退避；默认 resource.DefaultBackoff（基数 2 s，上限 60 s）。
 	RetryBackoff func(try int) time.Duration
@@ -217,6 +222,8 @@ func (c Config) withDefaults() Config {
 
 func (c Config) validate() error {
 	switch {
+	case (c.TLSCertFile == "") != (c.TLSKeyFile == ""):
+		return errors.New("app: TLS 证书与私钥须同时设置")
 	case c.Capacity.RunSlots < 1 || c.Capacity.MemoryBytes <= 0:
 		return fmt.Errorf("app: 容量须至少 1 个 run slot 且内存为正：%+v", c.Capacity)
 	case c.DefaultRunTime > c.RunTimeCap:
@@ -940,6 +947,14 @@ func (s *server) startAPI() error {
 	if s.apiSrv != nil {
 		return nil
 	}
+	var tlsCfg *tls.Config
+	if s.cfg.TLSCertFile != "" {
+		cert, err := tls.LoadX509KeyPair(s.cfg.TLSCertFile, s.cfg.TLSKeyFile)
+		if err != nil {
+			return fmt.Errorf("app: 加载 TLS 证书: %w", err)
+		}
+		tlsCfg = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	}
 	ln, err := s.d.Listen(s.cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("app: API 监听 %s: %w", s.cfg.Listen, err)
@@ -947,6 +962,7 @@ func (s *server) startAPI() error {
 	h, err := api.New(api.Config{
 		Store: notifyingStore{Store: s.store, s: s}, Blobs: s.blobs, Mode: s.currentMode, ListenAddr: ln.Addr().String(),
 		Token: s.cfg.APIToken, AllowedHosts: s.cfg.AllowedHosts, AllowedOrigins: s.cfg.AllowedOrigins,
+		TLS: tlsCfg != nil, WebDir: s.cfg.WebDir,
 		Logger: s.log, ConfigVersion: s.cfg.ConfigVersion, MaxFaultRetries: s.cfg.MaxFaultRetries,
 		EffectiveLimits: s.cfg.effectiveLimits,
 	})
@@ -955,9 +971,13 @@ func (s *server) startAPI() error {
 		return fmt.Errorf("app: API: %w", err)
 	}
 	s.apiSrv = &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second,
-		BaseContext: func(net.Listener) context.Context { return s.apiCtx }}
+		BaseContext: func(net.Listener) context.Context { return s.apiCtx }, TLSConfig: tlsCfg}
 	go func() {
-		if err := s.apiSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		serve := s.apiSrv.Serve
+		if tlsCfg != nil {
+			serve = func(l net.Listener) error { return s.apiSrv.ServeTLS(l, "", "") } // 证书已在 TLSConfig 中
+		}
+		if err := serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.fail(fmt.Errorf("app: API 服务: %w", err))
 		}
 	}()

@@ -70,6 +70,10 @@ func runServer(args []string, stderr io.Writer) int {
 	defaultRunTime := fs.Duration("default-run-time", time.Hour, "累计运行时限的默认值：创建时未指定 limits.max_run_time_ms 的任务以此存储")
 	runTimeCap := fs.Duration("run-time-cap", 24*time.Hour, "显式累计运行时限的服务端上限")
 	allowedHost := fs.String("allowed-host", "", "非 loopback 监听时 Host 头的允许值（逗号分隔）")
+	allowedOrigin := fs.String("allowed-origin", "", "浏览器 Origin 的允许值（逗号分隔，不允许通配）；默认为 <scheme>://监听地址 与 <scheme>://每个允许的 Host")
+	webDir := fs.String("web-dir", "", "同源提供的工作台静态文件目录（SPA 回退到 index.html；不影响 API 路径）")
+	tlsCert := fs.String("tls-cert", "", "内置 TLS 的证书（PEM，须与 --tls-key 同用）；非 loopback 监听且未设置时启动警告")
+	tlsKey := fs.String("tls-key", "", "内置 TLS 的私钥（PEM，须与 --tls-cert 同用）")
 	workerArgv := fs.String("worker-argv", "python3,-m,sim_worker", "沙箱内启动 Worker 的命令（逗号分隔的 argv）")
 	workerEnv := fs.String("worker-env", defaultWorkerEnv, "沙箱内 Worker 的环境变量（逗号分隔的 KEY=VALUE；键须在白名单中，如 PYTHONPATH）")
 	defaultBudget := fs.Int64("default-budget-micro", 2_000_000, "task 层预算的默认值（微美元）：创建时未指定 limits.budget_micro 的任务以此存储")
@@ -129,6 +133,10 @@ func runServer(args []string, stderr io.Writer) int {
 		DefaultRunTime:       *defaultRunTime,
 		RunTimeCap:           *runTimeCap,
 		AllowedHosts:         splitList(*allowedHost),
+		AllowedOrigins:       splitList(*allowedOrigin),
+		WebDir:               *webDir,
+		TLSCertFile:          *tlsCert,
+		TLSKeyFile:           *tlsKey,
 		WorkerArgv:           splitList(*workerArgv),
 		WorkerEnv:            splitList(*workerEnv),
 		DefaultBudgetMicro:   *defaultBudget,

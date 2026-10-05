@@ -1115,3 +1115,142 @@ func TestLoadToken(t *testing.T) {
 		t.Fatal("0644 的 token 文件应拒绝")
 	}
 }
+
+// ---- 浏览器安全与静态提供（E26） ----
+
+const wantCSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
+	"connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+
+func checkSecurityHeaders(t *testing.T, what string, h http.Header) {
+	t.Helper()
+	for k, want := range map[string]string{"Content-Security-Policy": wantCSP, "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"} {
+		if got := h.Get(k); got != want {
+			t.Errorf("%s: %s = %q，期望 %q", what, k, got, want)
+		}
+	}
+}
+
+// TestBrowserOriginAndHost：默认 Origin 允许列表等于监听地址（同源）；外部 Origin 的 POST 在到达 Store 之前被拒，
+// 错误 Host 被拒；不带 Origin 的请求（CLI）照常。
+func TestBrowserOriginAndHost(t *testing.T) {
+	ts := newTestServer(t, nil)
+	st, b, _ := ts.do("POST", "/tasks", `{"request_id":"evil","spec":{}}`, map[string]string{"Origin": "http://evil.example"})
+	expect(t, st, b, 403, "forbidden_origin")
+	st, b, _ = ts.do("POST", "/tasks", `{"request_id":"null","spec":{}}`, map[string]string{"Origin": "null"})
+	expect(t, st, b, 403, "forbidden_origin")
+	st, b, _ = ts.do("POST", "/tasks", `{"request_id":"host","spec":{}}`, map[string]string{"Host": "evil.example"})
+	expect(t, st, b, 403, "forbidden_host")
+	ts.store.mu.Lock()
+	n := len(ts.store.order)
+	ts.store.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("被拒的请求创建了 %d 个任务", n)
+	}
+	st, b, h := ts.do("POST", "/tasks", `{"request_id":"same","spec":{}}`, map[string]string{"Origin": ts.srv.URL})
+	expect(t, st, b, 201, "")
+	checkSecurityHeaders(t, "API 响应", h)
+	st, b, _ = ts.do("POST", "/tasks", `{"request_id":"cli","spec":{}}`, nil)
+	expect(t, st, b, 201, "")
+
+	// TLS 时默认 Origin 的 scheme 为 https。
+	ts2 := newTestServer(t, func(c *Config) { c.TLS = true })
+	st, b, _ = ts2.do("GET", "/status", "", map[string]string{"Origin": ts2.srv.URL})
+	expect(t, st, b, 403, "forbidden_origin")
+	st, b, _ = ts2.do("GET", "/status", "", map[string]string{"Origin": "https://" + ts2.srv.Listener.Addr().String()})
+	expect(t, st, b, 200, "")
+}
+
+// TestNonLoopbackWithoutTLSWarns：非 loopback 监听未启用内置 TLS 时启动警告但不拒绝；启用后不警告。
+func TestNonLoopbackWithoutTLSWarns(t *testing.T) {
+	for _, tc := range []struct {
+		listen string
+		tls    bool
+		warn   bool
+	}{{"0.0.0.0:8080", false, true}, {"0.0.0.0:8080", true, false}, {"127.0.0.1:8080", false, false}} {
+		var buf bytes.Buffer
+		_, err := New(Config{Store: newFakeStore(), Blobs: &fakeBlobs{}, ListenAddr: tc.listen, Token: "x", TLS: tc.tls,
+			AllowedHosts: []string{"box:8080"}, Logger: slog.New(slog.NewJSONHandler(&buf, nil))})
+		if err != nil {
+			t.Fatalf("%+v: New: %v", tc, err)
+		}
+		if got := strings.Contains(buf.String(), `"level":"WARN"`); got != tc.warn {
+			t.Errorf("%+v: 警告 = %v，期望 %v；日志 %s", tc, got, tc.warn, buf.String())
+		}
+	}
+}
+
+// TestWebDirStaticAndSPAFallback：静态文件与 SPA 回退带安全头且不需要 token；API 路径（/status、/tasks…、
+// /events…）从不由静态文件应答，未知 API 端点保持 JSON 404；访问日志不含 token 与 Authorization。
+func TestWebDirStaticAndSPAFallback(t *testing.T) {
+	const token = "web-s3cret-token-0123456789"
+	dir := t.TempDir()
+	const index = "<!doctype html><title>agentbox</title>"
+	if err := os.MkdirAll(filepath.Join(dir, "assets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte(index), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "assets", "app.js"), []byte("console.log(1)"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ts := newTestServer(t, func(c *Config) { c.WebDir = dir; c.Token = token })
+	ts.store.addTask("t1", "running", "run")
+	auth := map[string]string{"Authorization": "Bearer " + token}
+
+	for _, tc := range []struct{ path, body, ctype string }{
+		{"/", index, "text/html"},
+		{"/index.html", index, "text/html"},
+		{"/assets/app.js", "console.log(1)", "javascript"},
+		{"/tasks-view/t1", index, "text/html"}, // 首段不是 API 前缀
+		{"/runs/t1/timeline", index, "text/html"},
+		{"/assets", index, "text/html"}, // 目录无 index.html → SPA 回退，不列目录
+	} {
+		st, b, h := ts.do("GET", tc.path, "", nil)
+		if st != 200 || string(b) != tc.body || !strings.Contains(h.Get("Content-Type"), tc.ctype) {
+			t.Errorf("GET %s = %d %q (%s)，期望 200 %q", tc.path, st, b, h.Get("Content-Type"), tc.body)
+		}
+		checkSecurityHeaders(t, "GET "+tc.path, h)
+	}
+	st, b, _ := ts.do("POST", "/somewhere", "", nil)
+	expect(t, st, b, 405, "method_not_allowed")
+
+	// API 路径不被 SPA 吞掉：需要 token，未知端点为 JSON 404。
+	for _, tc := range []struct {
+		path string
+		hdr  map[string]string
+		st   int
+		code string
+	}{
+		{"/status", nil, 401, "unauthorized"},
+		{"/tasks", nil, 401, "unauthorized"},
+		{"/tasks/t1/nope", auth, 404, "not_found"},
+		{"/tasks/t1/events/extra", auth, 404, "not_found"},
+		{"/events", auth, 404, "not_found"},
+		{"/events/t1", auth, 404, "not_found"},
+		{"/status/x", auth, 404, "not_found"},
+	} {
+		st, b, h := ts.do("GET", tc.path, "", tc.hdr)
+		expect(t, st, b, tc.st, tc.code)
+		if !strings.HasPrefix(h.Get("Content-Type"), "application/json") {
+			t.Errorf("GET %s 的 Content-Type = %q，期望 JSON", tc.path, h.Get("Content-Type"))
+		}
+	}
+	st, b, _ = ts.do("GET", "/tasks/t1", "", auth)
+	expect(t, st, b, 200, "")
+
+	// 访问日志：记录了请求，但从不出现 token 或 Authorization 头。
+	ts.do("GET", "/assets/app.js", "", auth)
+	ts.do("GET", "/tasks/t1?access_token="+token, "", map[string]string{"Authorization": "Bearer " + token + "x"})
+	ts.mu.Lock()
+	logs := ts.logs.String()
+	ts.mu.Unlock()
+	if !strings.Contains(logs, `"path":"/assets/app.js"`) || !strings.Contains(logs, `"path":"/tasks/t1"`) {
+		t.Fatalf("访问日志未记录请求: %s", logs)
+	}
+	for _, secret := range []string{token, "Bearer", "Authorization", "authorization"} {
+		if strings.Contains(logs, secret) {
+			t.Fatalf("访问日志中出现 %q: %s", secret, logs)
+		}
+	}
+}
