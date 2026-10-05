@@ -28,7 +28,7 @@
 
 Go、Docker 与 PostgreSQL 命令已在 WSL2（内核 6.6）上验证；Python 测试已在 Windows（uv）与 CI 的 Linux 作业上验证。没有列出的命令尚不能使用。
 
-**依赖**：Linux（cgroup v2）或 Windows 下的 WSL2；Go 1.23+；Python 3.11+ 与 [uv](https://docs.astral.sh/uv/)；Docker（运行 PostgreSQL）。
+**依赖**：Linux（cgroup v2）或 Windows 下的 WSL2；Go 1.24+；Python 3.11+ 与 [uv](https://docs.astral.sh/uv/)；Docker（运行 PostgreSQL）。
 
 ```bash
 stat -fc %T /sys/fs/cgroup            # 应输出 cgroup2fs

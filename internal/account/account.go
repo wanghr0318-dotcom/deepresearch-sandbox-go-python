@@ -3,7 +3,7 @@
 package account
 
 import (
-	"crypto/hmac"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -92,29 +92,14 @@ func VerifyPassword(stored, pw string) bool {
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
-// pbkdf2SHA256 是 RFC 8018 §5.2 的 PBKDF2，PRF 为 HMAC-SHA256。
-// 不用 crypto/pbkdf2：它要求 go1.24，而 go.mod 声明 go 1.23（CI 按 go.mod 选工具链）；不引入新模块。
+// pbkdf2SHA256 是 PBKDF2-HMAC-SHA256（RFC 8018），使用标准库 crypto/pbkdf2，不自行实现密码学原语。
+// 参数在此之前已校验（iter 在 1..maxIterations，keyLen 为正），标准库只会在参数越界时返回错误。
 func pbkdf2SHA256(pw string, salt []byte, iter, keyLen int) []byte {
-	prf := hmac.New(sha256.New, []byte(pw))
-	out := make([]byte, 0, keyLen+sha256.Size)
-	var u, t []byte
-	for block := uint32(1); len(out) < keyLen; block++ {
-		prf.Reset()
-		prf.Write(salt)
-		prf.Write([]byte{byte(block >> 24), byte(block >> 16), byte(block >> 8), byte(block)})
-		u = prf.Sum(u[:0])
-		t = append(t[:0], u...)
-		for i := 1; i < iter; i++ {
-			prf.Reset()
-			prf.Write(u)
-			u = prf.Sum(u[:0])
-			for j := range t {
-				t[j] ^= u[j]
-			}
-		}
-		out = append(out, t...)
+	key, err := pbkdf2.Key(sha256.New, pw, salt, iter, keyLen)
+	if err != nil {
+		panic(fmt.Sprintf("account: pbkdf2 参数无效：%v", err))
 	}
-	return out[:keyLen]
+	return key
 }
 
 // dummyHash 是 DummyVerify 使用的固定哈希，首次使用时生成一次（固定盐，与真实哈希同参数）。

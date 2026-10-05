@@ -1,6 +1,6 @@
 module github.com/wanghr0318-dotcom/go-agentbox
 
-go 1.23.0
+go 1.24.0
 
 require github.com/jackc/pgx/v5 v5.7.6
 
