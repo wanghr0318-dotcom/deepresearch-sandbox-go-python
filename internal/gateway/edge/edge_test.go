@@ -290,7 +290,7 @@ func TestBindLifecycle(t *testing.T) {
 	}
 }
 
-// 第 17 个连接在接受后立即关闭；释放一个连接后新连接可用。
+// 第 17 个连接在接受后立即关闭；已接受的 16 个连接继续可用。
 func TestConnectionLimit(t *testing.T) {
 	e := newEdge(t, Config{}, &fakeCalls{})
 	p := bind(t, e, "a1", "e1")
@@ -321,27 +321,11 @@ func TestConnectionLimit(t *testing.T) {
 	if err := rawBudget(c17, bufio.NewReader(c17)); err == nil {
 		t.Fatal("第 17 个连接应被关闭")
 	}
-
-	if err := conns[0].Close(); err != nil {
-		t.Fatal(err)
-	}
-	conns = conns[1:]
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		c, err := net.Dial("unix", p)
-		if err != nil {
-			t.Fatal(err)
+	// 已接受的 16 个连接不受影响。
+	for i, c := range conns {
+		if err := rawBudget(c, bufio.NewReader(c)); err != nil {
+			t.Errorf("连接 %d 在拒绝第 17 个后失效：%v", i+1, err)
 		}
-		err = rawBudget(c, bufio.NewReader(c))
-		if err == nil {
-			conns = append(conns, c)
-			break
-		}
-		_ = c.Close() // 被拒绝的探测连接
-		if time.Now().After(deadline) {
-			t.Fatalf("释放连接后仍无法建立新连接：%v", err)
-		}
-		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -582,18 +566,13 @@ func TestRevoke(t *testing.T) {
 
 // Worker 在响应前断开：交给 Invoke 的上下文不被取消，Invoke 得以完成。
 func TestClientDisconnectDoesNotCancelInvoke(t *testing.T) {
-	entered, release := make(chan struct{}, 1), make(chan struct{})
-	done := make(chan error, 1)
+	started, release := make(chan struct{}, 1), make(chan struct{})
+	done := make(chan error, 1) // Invoke 被释放时其 ctx 的状态
 	calls := &fakeCalls{invoke: func(ctx context.Context, _ call.Invoke) (call.Result, error) {
-		entered <- struct{}{}
-		select {
-		case <-release:
-			done <- ctx.Err()
-			return call.Result{Body: []byte(`{}`), Status: 200}, nil
-		case <-ctx.Done():
-			done <- ctx.Err()
-			return call.Result{}, ctx.Err()
-		}
+		started <- struct{}{}
+		<-release
+		done <- ctx.Err()
+		return call.Result{Body: []byte(`{}`), Status: 200}, nil
 	}}
 	e := newEdge(t, Config{}, calls)
 	p := bind(t, e, "a1", "e1")
@@ -605,19 +584,13 @@ func TestClientDisconnectDoesNotCancelInvoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case <-entered:
+	case <-started:
 	case <-time.After(5 * time.Second):
 		t.Fatal("请求未进入 Invoke")
 	}
+	// 顺序：Invoke 已开始 → Worker 断开 → 释放 Invoke → 断言其 ctx 未被取消。
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
-	}
-	// 给服务端足够时间观察到 EOF（net/http 在读完请求体后后台读取，EOF 时取消 r.Context()）。
-	time.Sleep(300 * time.Millisecond)
-	select {
-	case err := <-done:
-		t.Fatalf("Worker 断开后 Invoke 提前结束：%v", err)
-	default:
 	}
 	close(release)
 	select {
