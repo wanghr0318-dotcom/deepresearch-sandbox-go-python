@@ -227,7 +227,7 @@ func Classify(in ClassifyInput) (class string, retry string) // retry 取值 ""�
 ```
 
 **规则：**
-- `Classify` 是 §5.8 与 §14.3 的唯一实现：（执行中修订）有效 result 在 cancel/pause 生效期间仍分类为 `succeeded`（或 `oom_observed_in_attempt`），由 `Decide` 据 desired 记 `completed_during_cancel`/`completed_during_pause`；`crashed_signal`（不含平台主动终止）、`control_lost`、`ready_timeout`、`worker_oom_likely`（SIGKILL 且 `OOMKillDelta > 0`）、`oom_observed_in_attempt`（正常结束但 delta > 0，按 Worker 结果裁决）、`worker_error`（`retryable` 与拒绝列表 `budget_exhausted`、`protocol_*`）、`protocol_violation`、`output_limit_exceeded`、`exit_after_result`、`store_unavailable` 等；平台主动终止按原因分类并置 `platform_killed`。
+- `Classify` 是 §5.8 与 §14.3 的唯一实现：（执行中修订）有效 result 在 cancel/pause 生效期间仍分类为 `succeeded`（或 `oom_observed_in_attempt`），由 `Decide` 据 desired 记 `completed_during_cancel`/`completed_during_pause`；`crashed_signal`（不含平台主动终止）、`control_lost`、`ready_timeout`、`worker_oom_likely`（SIGKILL 且 `OOMKillDelta > 0`）、`oom_observed_in_attempt`（正常结束但 delta > 0，按 Worker 结果裁决）、`worker_error`（`retryable` 与拒绝列表 `budget_exhausted`、`protocol_*`）、`protocol_violation`、`output_limit_exceeded`、`exit_after_result`、`store_unavailable` 等（执行中修订：另有 `exited_without_proposal`、`output_incomplete`（屏障超时），均不重试；ctx 取消原因为 `ErrRunTimeExceeded` 或截止 → `task_deadline_exceeded`，其他取消（服务关闭）→ `lost_on_restart`（fault 重试，与重启恢复一致）；artifact 暂时性失败回复 §5.4 的 `save_timeout`）；平台主动终止按原因分类并置 `platform_killed`。
 - 屏障（§5.7）：进程退出后 A：管道收尾（5 s，超时终止执行树、`output_incomplete`、丢弃末尾半行）；B：处理全部已完整接收的事件（120 s）；然后返回 `Outcome`。
 - 期限：`T_ready` 内无 `ready` → 终止、`ready_timeout`；终态提议后 `exit_grace` 内未退出 → 终止后按提议与退出原因分类。
 - 控制：`controls` 收到 cancel/pause → 发送协议 `cancel`/`pause{grace_ms}`；到期 → `Terminate`。
@@ -259,7 +259,7 @@ type Scheduler struct{ /* 管理 actor 集合；ListActiveTasks 启动；新任�
 
 **依赖方向：** `decide.go` 只使用本包类型；actor 文件可导入 `runner`、`resource`、`admission`、`provider` 以声明窄接口并把 `runner.Outcome` 转换为 `task.Outcome`（规则 2 的直接依赖边不含驱动、HTTP、进程与文件系统包）。
 
-**规则：** actor 循环：（执行中修订）待定的重试类别不单独持久化：queued 任务的 `StatusReason` 即上一次 attempt 的 outcome class，actor 以纯函数据此推出下一次 `CreateAttempt` 的 `Retry`（`worker_oom_likely` → oom，§14.3 可重试的故障类 → fault，其余 → none），重启后同样成立；`LoadTask` 建立 `State` → 对每个事件调用 `Decide` → 依次执行 `Effects`（异步操作在独立 goroutine 中执行，结果以带 `attempt_id` 的事件回到收件箱）→ 持久化经 Store 用例；运行时间每 10 s `PersistRunTime`（§14.4）；`RevokeAccess` 在停止前执行（DB 撤销 + `Access.Revoke`）；Store 写失败按退避重试并保留待提交事实（§14.5 在线补偿）；actor 不关闭 socket、不写 cgroup、不重试数据库连接（代码组织 §5）。
+**规则：** actor 循环：（执行中修订）待定的重试类别不单独持久化：queued 任务的 `StatusReason` 即上一次 attempt 的 outcome class，actor 以纯函数据此推出下一次 `CreateAttempt` 的 `Retry`（执行中再修订：`worker_error` 是否可重试取决于 Worker 的 `retryable` 与错误码，不能由类别名推出；而 `Decide` 只在 `Outcome.Retry` 非空时才把任务置为 queued 并以类别为 `StatusReason`，因此规则改为：queued 且 `StatusReason` 为 outcome class → `worker_oom_likely` 为 oom、其他类别为 fault；`StatusReason` 不是 outcome class（新建、resume 等）→ none。actor 包内以已知类别集合判定，测试覆盖 `worker_error`），重启后同样成立；`LoadTask` 建立 `State` → 对每个事件调用 `Decide` → 依次执行 `Effects`（异步操作在独立 goroutine 中执行，结果以带 `attempt_id` 的事件回到收件箱）→ 持久化经 Store 用例；运行时间每 10 s `PersistRunTime`（§14.4）；`RevokeAccess` 在停止前执行（DB 撤销 + `Access.Revoke`）；Store 写失败按退避重试并保留待提交事实（§14.5 在线补偿）；actor 不关闭 socket、不写 cgroup、不重试数据库连接（代码组织 §5）。
 
 **Tests**（fake 依赖：内存 Store 替身、fake Coordinator、fake AttemptRunner；不需要数据库）：正常路径的副作用顺序（申请槽位 → 创建 attempt → 创建环境 → 启动 → 裁决 → 停止 → 归还槽位）；过期结果不改变状态；控制变化在各阶段的处理（含 starting 阶段直接停止）；`stop_blocked` 阻止替代执行；Store 写失败后恢复由同一 actor 补提交。
 
@@ -305,3 +305,22 @@ type Scheduler struct{ /* 管理 actor 集合；ListActiveTasks 启动；新任�
 - **单一权威实现**：控制转换表从 `persistence/postgres` 移入 `internal/task`（Task 3），Store 与 `Decide` 共用；裁决分类只在 `runner.Classify`。
 - **接口新增**：Task 1 的事务用例与字段是对 Plan 4 窄接口的扩展，需随本批计划一并审阅。
 - **占位符**：无。
+
+### 执行中修订（Task 7 之后）
+
+- **累计运行时限的来源（规格 §14.4 只定义计量，未给出上限来源与默认值）**：上限取任务 `limits.max_run_time_ms`；缺省时取服务配置的默认值（由 Plan 6 Task 6 的配置定义）。actor 选项 `RunTimeLimit`（0 = 不限）；跨 attempt 累计、不因新 attempt 重置；运行中达到上限 → 以 `context.DeadlineExceeded` 取消 run ctx，runner 分类为 `task_deadline_exceeded`。
+- **恢复的 stop_blocked attempt 的运行时间**：actor 选项 `OnStopRecorded`，由装配接到 `recovery.Store.AccountUnrecordedRunTime`；停止确认（`Recorded`）后、裁决前调用一次，失败退避重试并保留事实。
+- **永远无法满足的 limits**：在 API 创建时拒绝（400），actor 不处理；`Admission` 的非取消错误保持致命并在注释中说明。
+- **超限任务的终止（不改 `Decide`/Store）**：attempt 结束时累计运行时间已达上限且 Outcome 可重试 → actor 在调用 `Decide` 前改为 `task_deadline_exceeded`、不重试；queued 任务启动时已超限（重启记账或配置调低）→ 照常走创建路径，但 run ctx 以 `context.DeadlineExceeded` 预先取消，runner 立即分类为 `task_deadline_exceeded`，经既有裁决路径终止（接受一次环境创建的代价）。`RunTimeLimit` 为 `func(TaskState) time.Duration`，由装配按任务计算。
+
+## 验收记录（2026-10-05）——状态：已验收（控制面层；Draft PR #11，未合并）
+
+- 本地 WSL2 联合验收：`go vet`、`GOOS=windows go build`、真实 PostgreSQL 上 `CI=true go test ./...`、`tests/e2e` 连续三次（约 96 s）、root 下 `provider/local`/`sandbox`/`cgroup`/`rootfs`、pytest 335 项；Linux CI 全绿（run 37232687123：correctness 含 `-race` 与 golangci-lint、linux-integration 以 root 运行且无非预期 skip、python 3.11/3.13）。
+- 验收归属：E1、E4（1000 次随机交错）、E7、E8、E10 与首个切片，以进程型 fake provider 与真实 Python sim_worker 运行（`tests/e2e`）。
+- 执行中发现并修复：UID 范围池耗尽此前使任务永久失败（`create_failed_env`），现为等待归还的暂时性情况，停止记录后立即唤醒清理。
+- 不在本次验收内：以生产启动器（真实隔离）运行上述用例、E2/E3——依赖 Plan 1B 与 Plan 2 生产启动器。
+- 留待最终评审的次要项见 `.superpowers/sdd/progress.md`（负载下取消偶发 `503 contention`、E7 受 SDK 固定 10 s 确认超时影响等）。
+
+### 执行中修订（用户审阅后，2026-10-05）
+
+- **累计运行时限按规格 §14.4（已回写）落实**：创建任务时确定有效时限并随任务存储在 `limits.max_run_time_ms`（`api.Config.EffectiveLimits` 取代 `ValidateLimits`）；省略时补入默认 3600 s，显式值须为正整数且不超过服务端上限（默认 24 h），否则 `400 invalid_limits`；actor 只读取存储值，修改服务配置不影响已创建任务。此前"运行时由配置推出"的做法作废。
