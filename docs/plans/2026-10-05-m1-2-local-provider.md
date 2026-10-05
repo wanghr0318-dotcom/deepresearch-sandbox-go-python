@@ -310,6 +310,12 @@ Task 11 第一步以测试验证这一点；验证不成立则停止并报告，
 
 **验证：** 同 Task 9。
 
+**执行中修订（Task 10 之后，中心决定）：**
+- **launcher→init 规格通道**：init 的输入经 `LaunchSpec.Init`（类型 `InitSpec`，含 hostname、模板、UID/GID 范围等），由启动进程写入 fd 5 的管道（`InitSpecFD = 5`）；`AGENTBOX_ROOT`/`AGENTBOX_HOSTNAME` 环境变量作废。测试 init 忽略 fd 5。
+- **模板**：`rootfs.Template`（`DefaultTemplate`/`ResolveTemplate`/`Validate`/`Ensure`）描述 M1 的宿主路径集合模板；旧的 `EnsureTemplate(dir)`（目录形态）保留但生产不再调用。生产装配需要宿主存在 `/opt/agentbox` 并在启动时 `Ensure()`——归入 Task 13 装配。
+- 规格留白的取值：`/run` 用 1777（§4.5 列为可写）；exec 环境无 `/run`；新根为暂存在 `/tmp` 的 tmpfs，所有源在挂载前 `O_PATH` 打开；模板路径不得与 init 自身挂载点重叠；init 自身校验 Gateway socket 属主为映射 uid 1000、0600。
+- **start 暂被拒**：Task 11 之前，init 就绪后以桩 Launcher 回 `start_err{init/launcher}`，不会运行未降权的 workload；Task 11 用 `initEnv.helperFD` 替换。
+
 ### Task 11：stage-2 helper、生产 `Launcher` 与启动成功判据
 
 **Files:** Create `internal/sandbox/helper.go`（`exec-stage2` 子命令）、`internal/sandbox/rawfork_linux.go`（raw clone + `execveat`，移植 spike 的 `rawfork.go`）、`internal/sandbox/launcher.go`（init 的生产 `Launcher`）；Modify `internal/sandbox/reaper.go`（ptrace 停止事件交给启动路径）、`internal/sandbox/spawn_test.go`、`cmd/agentbox/main.go`（分流 `exec-stage2`）。
