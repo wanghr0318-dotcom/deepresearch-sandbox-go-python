@@ -5,12 +5,19 @@ SDK 只提供运行协议与执行能力：握手、事件、checkpoint、产物
 """
 
 from agentbox_worker.errors import (
+    AccessRevoked,
     ArtifactRejected,
+    BudgetExhausted,
+    CallDeadlineExceeded,
+    CallDivergence,
+    CallInProgress,
     CheckpointRejected,
     CheckpointUnresolved,
+    GatewayError,
     TransportBroken,
     WorkerFailure,
 )
+from agentbox_worker.gateway import CallIds, GatewayClient, GatewayResult
 from agentbox_worker.runtime import (
     EXIT_FAILURE,
     EXIT_HANDSHAKE,
@@ -46,4 +53,13 @@ __all__ = [
     "WorkerFailure",
     "main",
     "run_worker",
+    "AccessRevoked",
+    "BudgetExhausted",
+    "CallDeadlineExceeded",
+    "CallDivergence",
+    "CallInProgress",
+    "GatewayError",
+    "CallIds",
+    "GatewayClient",
+    "GatewayResult",
 ]
