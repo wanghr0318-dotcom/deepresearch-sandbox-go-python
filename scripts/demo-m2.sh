@@ -276,11 +276,13 @@ if [ -n "${AGENTBOX_DEMO_DATABASE_URL:-}" ]; then
   export AGENTBOX_DATABASE_URL="$AGENTBOX_DEMO_DATABASE_URL"
   ok "使用给定的数据库连接串（须为空库）"
 else
-  # 依次尝试：本机 psql → docker（compose 服务 postgres，或容器 agentbox-pg）→ Docker Desktop 的 docker.exe。
+  # with_db <库名>：把 PG_ADMIN_URL 的库名换成给定值（用户、口令、主机、端口与参数不变；口令不写死在脚本里）。
+  with_db() { python3 -c "import sys,urllib.parse as u; p=u.urlparse(sys.argv[1]); print(u.urlunparse(p._replace(path='/'+sys.argv[2])))" "$PG_ADMIN_URL" "$1"; }
+  # 依次尝试：本机 psql（凭据取自 PG_ADMIN_URL）→ docker（compose 服务 postgres，或容器 agentbox-pg）→ Docker Desktop 的 docker.exe。
   pg_sql() {
     local sql="$1" dk
     if command -v psql >/dev/null 2>&1; then
-      PGPASSWORD=agentbox psql -v ON_ERROR_STOP=1 -h "$pghost" -p "$pgport" -U agentbox -d postgres -qc "$sql" >/dev/null 2>&1 && return 0
+      psql -v ON_ERROR_STOP=1 "$(with_db postgres)" -qc "$sql" >/dev/null 2>&1 && return 0
     fi
     for dk in docker "/mnt/c/Program Files/Docker/Docker/resources/bin/docker.exe"; do
       { command -v "$dk" >/dev/null 2>&1 || [ -x "$dk" ]; } || continue
@@ -291,7 +293,8 @@ else
   }
   pg_sql "DROP DATABASE IF EXISTS $DEMO_DB WITH (FORCE)" || fail "无法新建演示数据库：需要 psql 或 docker（PostgreSQL 由 deploy/docker-compose.yml 启动），或设置 AGENTBOX_DEMO_DATABASE_URL 指向一个空库"
   pg_sql "CREATE DATABASE $DEMO_DB" || fail "无法创建 $DEMO_DB"
-  export AGENTBOX_DATABASE_URL="postgres://agentbox:agentbox@$pghost:$pgport/$DEMO_DB?sslmode=disable"
+  AGENTBOX_DATABASE_URL="$(with_db "$DEMO_DB")"
+  export AGENTBOX_DATABASE_URL
   ok "已新建空库 $DEMO_DB"
 fi
 ok "数据目录已清空：$DATA"
