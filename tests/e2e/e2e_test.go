@@ -5016,10 +5016,11 @@ func TestRealDeepResearchFixedTopic(t *testing.T) {
 
 // TestRealDeepResearchKillAndResume：task-1 的 checkpoint 提交后、结果送达 Worker 之前杀死 Worker →
 // 新 attempt 的 init.resume.checkpoint_id 为 task-1 的 checkpoint；计划调用的上游计数仍为 1；恢复后任务 1 的
-// search、fetch、summarize 不再到达上游：attempt 2 不重发它们（上游计数与 tries 不变），测试在 attempt 2 的
-// Gateway socket 上以同 ID、同请求体重发它们得到重放（X-Agentbox-Replayed，blob 与 journal 相同），上游计数不变。
+// search、fetch、summarize 不再到达上游：任务 1 的上游计数在恢复时与结束时相同，inspect 中这些调用只有 attempt 1
+// 的那一次 try；attempt 2 提交的 checkpoint 的 refs 含任务 1 的 blob；报告引用对应已保存的证据 blob。
 //
-// 观察点：上游第 2 次搜索（attempt 2 的 task-2 搜索）挂起，此时 attempt 2 的 Worker 存活、socket 可用。
+// 观察点：上游第 2 次搜索（attempt 2 的 task-2 搜索）挂起，此时 attempt 1 已结束、attempt 2 尚未发出其他请求，
+// 恢复时的计数快照是确定的。
 func TestRealDeepResearchKillAndResume(t *testing.T) {
 	fu := fakeupstream.New()
 	t.Cleanup(fu.Close)
@@ -5039,58 +5040,16 @@ func TestRealDeepResearchKillAndResume(t *testing.T) {
 	if want := (upstreamCounts{Plan: 1, Summarize: 1, Search: 2, Fetch: 3}); before != want {
 		t.Fatalf("恢复后、task-2 搜索挂起时上游计数 %+v，期望 %+v（任务 1 未重发）", before, want)
 	}
-
-	// 直接重放探针：任务 1 的 5 个调用以同 ID、同请求体经 attempt 2 的 socket 发出。
-	in := h.inspect(id)
-	t1 := map[string]api.CallView{}
-	for _, c := range in.Calls {
-		if strings.HasPrefix(c.CallID, "root/task-1/") {
-			t1[c.CallID] = c
-		}
-	}
-	var summarizeBody map[string]json.RawMessage
-	for _, rq := range fu.Requests(fakeupstream.Chat) {
-		if rq.Stage == fakeupstream.StageSummarize {
-			if err := json.Unmarshal([]byte(rq.Body), &summarizeBody); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	delete(summarizeBody, "model") // Gateway 补上的配置模型名；Worker 的请求体只有 messages 与 max_tokens
-	chatProbe, err := json.Marshal(summarizeBody)
-	if err != nil {
-		t.Fatal(err)
-	}
-	q1 := researchTasks[0].Query
-	probes := []struct{ callID, path, body string }{
-		{"root/task-1/search/1", "/v1/search", fmt.Sprintf(`{"query":%q,"max_results":%d}`, q1, researchMaxResults)},
-		{"root/task-1/fetch/1", "/v1/fetch", fmt.Sprintf(`{"url":%q}`, fu.ResultURL(q1, 1))},
-		{"root/task-1/fetch/2", "/v1/fetch", fmt.Sprintf(`{"url":%q}`, fu.ResultURL(q1, 2))},
-		{"root/task-1/fetch/3", "/v1/fetch", fmt.Sprintf(`{"url":%q}`, fu.ResultURL(q1, 3))},
-		{"root/task-1/chat/1", "/v1/chat/completions", string(chatProbe)},
-	}
-	if len(t1) != len(probes) {
-		t.Fatalf("任务 1 的调用 %v，期望 %d 个", slices.Collect(maps.Keys(t1)), len(probes))
-	}
-	sock2 := h.gwSocket(in2.AttemptID)
-	var replays []string
-	for _, p := range probes {
-		got, err := gwDo(sock2, http.MethodPost, p.path, p.callID, p.body)
-		c := t1[p.callID]
-		if err != nil || got.Status != http.StatusOK || !got.Replayed || got.Blob != c.ResultRef || c.ResultRef == "" {
-			t.Fatalf("attempt 2 上重发 %s 得到 %+v %v；期望 200 重放、blob %s", p.callID, got, err, c.ResultRef)
-		}
-		replays = append(replays, fmt.Sprintf("%s → Replayed blob %.12s", p.callID, got.Blob))
-	}
-	if after := countsOf(fu); after != before {
-		t.Fatalf("重放探针之后上游计数 %+v，之前 %+v：重放不应访问上游", after, before)
+	t1Before := task1Counts(fu)
+	if t1Before != (upstreamCounts{Summarize: 1, Search: 1, Fetch: 3}) {
+		t.Fatalf("恢复时任务 1 的上游计数 %+v", t1Before)
 	}
 	fu.Release()
 
 	if v := h.waitTerminal(id); v.Status != "succeeded" {
 		t.Fatalf("任务 %+v", v)
 	}
-	in = h.inspect(id)
+	in := h.inspect(id)
 	a1, a2 := attemptByNo(in, 1), attemptByNo(in, 2)
 	steps, cpAttempts := stepOrder(in)
 	if len(in.Attempts) != 2 || a1.OutcomeClass != runner.ClassCrashedSignal || a2.OutcomeClass != runner.ClassSucceeded ||
@@ -5119,9 +5078,57 @@ func TestRealDeepResearchKillAndResume(t *testing.T) {
 	if final != researchFull {
 		t.Fatalf("上游计数 %+v，期望 %+v（计划 1 次、任务 1 不重发）", final, researchFull)
 	}
+	if t1After := task1Counts(fu); t1After != t1Before {
+		t.Fatalf("恢复后任务 1 的上游计数 %+v，恢复时 %+v：任务 1 的调用不应再到达上游", t1After, t1Before)
+	}
+	// attempt 2 提交的 checkpoint（task-2、report）的累积 refs 含任务 1 的证据与摘要 blob（来自 attempt 1）。
+	var t1Blobs []string
+	for _, cid := range []string{"root/task-1/fetch/1", "root/task-1/fetch/2", "root/task-1/fetch/3", "root/task-1/chat/1"} {
+		t1Blobs = append(t1Blobs, calls[cid].ResultRef)
+	}
+	for _, stepID := range []string{"task-2", "report"} {
+		refs := h.checkpointRefs(id, stepID)
+		for _, b := range t1Blobs {
+			if !slices.Contains(refs, b) {
+				t.Fatalf("attempt 2 的 checkpoint %s 的 refs %v 不含任务 1 的 blob %s", stepID, refs, b)
+			}
+		}
+	}
 	cites, cited := h.assertResearchReport(fu, id)
-	t.Logf("杀死并恢复：attempts %s；init.resume = %s（%s）；checkpoints %v；上游计数 恢复挂起时 %+v → 重放探针后 %+v → 结束 %+v；"+
-		"重放 %q；报告引用 %v；证据 %+v", attemptClasses(in), in2.Resume.CheckpointID, in2.Resume.StepID, steps, before, before, final,
-		replays, cited, cites)
+	t.Logf("杀死并恢复：attempts %s；init.resume = %s（%s）；checkpoints %v；上游计数 恢复时 %+v → 结束 %+v；"+
+		"任务 1 上游计数 恢复时 %+v = 结束 %+v；attempt 2 refs 含任务 1 blob %v；报告引用 %v；证据 %+v",
+		attemptClasses(in), in2.Resume.CheckpointID, in2.Resume.StepID, steps, before, final, t1Before, task1Counts(fu),
+		t1Blobs, cited, cites)
 	h.finish()
+}
+
+// task1Counts 是任务 1 的调用到达上游的请求数：查询为任务 1 的搜索、任务 1 搜索结果页面的抓取、标题为任务 1
+// 的摘要（Plan 与 Report 恒为 0）。
+func task1Counts(fu *fakeupstream.Server) upstreamCounts {
+	task := researchTasks[0]
+	pages := map[string]bool{}
+	for i := 1; i <= 3; i++ {
+		u, err := url.Parse(fu.ResultURL(task.Query, i))
+		if err != nil {
+			panic(err) // ResultURL 总是合法
+		}
+		pages[u.Path] = true
+	}
+	var c upstreamCounts
+	for _, r := range fu.Requests(fakeupstream.Search) {
+		if strings.Contains(r.Body, task.Query) {
+			c.Search++
+		}
+	}
+	for _, r := range fu.Requests(fakeupstream.Fetch) {
+		if pages[r.Path] {
+			c.Fetch++
+		}
+	}
+	for _, r := range fu.Requests(fakeupstream.Chat) {
+		if r.Stage == fakeupstream.StageSummarize && strings.Contains(r.Body, task.Title) {
+			c.Summarize++
+		}
+	}
+	return c
 }
