@@ -17,7 +17,10 @@
 | 启动恢复、REST/SSE API、CLI、不变量检查、故障注入（Plan 6） | **已验收**（控制面层） | `internal/reconcile`、`recovery`、`api`、`cli`、`app`、`invariants`、`faultinject`；E5、E6、E13–E16 |
 | Provider 契约、cgroup 扩展、宿主自检、init 服务循环、环境生命周期（Plan 2 Task 1–8） | **已验收**（Plan 2 联合验收，2026-10-05） | `internal/provider`、`provider/local`、`sandbox`、`cgroup`、`hostcheck`；`agentbox doctor` |
 | 沙箱生产启动器、init 环境建立、stage-2 helper、启用 server（Plan 2 Task 9–13） | **已验收**（Plan 2 联合验收，2026-10-05） | `local.NewProcessStarter`；首个切片、E1–E5（E5 为物理回收部分）、E7、E8、E10 与累计运行时限跨重启，在真实沙箱中以 root 通过（`tests/e2e` 的 `TestReal*`） |
-| Gateway、DeepResearch、Redis、Vue、会话、exec 沙箱、sub-run | 未开始 | M2–M4 |
+| Gateway：每 attempt 的 Unix socket 入口、调用 journal 与 task 层预算、OpenAI 兼容 chat / 搜索 / 抓取 adapter、SSRF 验证 dialer、启动账本转换（M2 Plan 7） | **已验收**（2026-10-05） | `internal/gateway/{edge,call,upstream}`；E11b、E17–E20、E48、I3、I14（journal）；供应商 Key 只在宿主进程内，沙箱中不可见（G3，真实沙箱验证） |
+| Worker SDK Gateway 客户端与 DeepResearch 接入（M2 Plan 8 Task 1–5） | **已验收**（以 fake upstream 自动化验收） | `worker/agentbox_worker/gateway.py`、`worker/deepresearch`（零运行时依赖）；计划 → 检索 → 阅读 → 总结 → 报告，checkpoint 可恢复，引用对应已保存证据 blob |
+| 真实模型研究演示（M2 Plan 8 Task 6） | 待执行 | 需要 OpenAI 兼容端点的 base URL 与模型名 |
+| Redis 缓存、Vue、会话、exec 沙箱、sub-run | 未开始 | M3–M4 |
 
 ## 现在可以运行的命令
 
@@ -124,6 +127,7 @@ uv run pytest -q
 | [持久化设计](docs/design/2026-10-04-m1-4-persistence-design.md)、[安装身份修订](docs/design/2026-10-05-installation-identity-amendment.md) | Plan 4 的设计依据 |
 | [Provider 契约](docs/design/2026-10-05-provider-contract.md) | 环境生命周期的 Go 接口、错误、并发边界 |
 | [Plan 2](docs/plans/2026-10-05-m1-2-local-provider.md)、[Plan 5](docs/plans/2026-10-05-m1-5-control-plane.md)、[Plan 6](docs/plans/2026-10-05-m1-6-recovery-entry.md) | M1 第 2 批计划、执行中修订与验收记录 |
+| [M2 计划索引](docs/plans/2026-10-05-m2-index.md)、[Plan 7 Gateway](docs/plans/2026-10-05-m2-7-gateway.md)、[Plan 8 DeepResearch](docs/plans/2026-10-05-m2-8-deepresearch.md) | M2 计划、执行中修订与验收记录 |
 | [REST API（OpenAPI）](api/openapi.yaml) | 任务提交、控制、查询与 SSE 事件流的契约 |
 | [Plan 1B spike 记录](docs/experiments/2026-10-05-spike-1b.md)、[§4.6 回写提案](docs/design/2026-10-05-spec-4.6-writeback-proposal.md) | 降权启动序列的实验结论（待审阅） |
 | [Worker 协议](protocol/README.md) | 协议 v1 的语义与 fixtures |

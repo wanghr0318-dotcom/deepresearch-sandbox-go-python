@@ -182,3 +182,19 @@ def parse_tasks(text: str) -> list[ResearchTask]  # 容错 JSON 提取（移植 
 - **待审批的取值**：默认 `max_tasks=4, max_results=5, max_fetch=3, max_loops=1`；演示题目参数化；`ddg_lite` 作为无 Key 搜索源。
 - **接口新增（中心）**：`TaskContext.gateway`、`TaskContext.budget_limits`、checkpoint state 保留键 `_agentbox.call_ids`（SDK 内部，应用不可见）。
 - **占位符**：证据文件名中的 `XX` 在运行当日填写。
+
+## 验收记录（2026-10-05）——状态：Task 1–5 已验收；Task 6（真实模型人工演示）待用户提供模型 base URL 与模型名
+
+### 1. 本地测试结果
+- Python：Windows `uv run pytest` 358 passed / 35 skipped（AF_UNIX 用例）、ruff、ruff format、lint-imports（3 份契约，含 `deepresearch` 禁止导入与 TID251）；WSL `AGENTBOX_REQUIRE_UNIX_TESTS=1` 116 passed（含全部 deepresearch 与 SDK socket 用例）。
+- 本地 WSL2 6.6 x86_64：`go vet`、`GOOS=windows go build`、真实 PostgreSQL 上 `CI=true go test ./...`、root `tests/e2e` 36 PASS / 0 FAIL / 0 SKIP、无 cgroup 残留。
+
+### 2. 真实沙箱与 CI
+- CI run 37312414529（commit a1b19ab）全绿：correctness 含 `-race` 与 golangci-lint、linux-integration 以 root 运行且无非预期 skip、python 3.11/3.13。root 作业实际运行并通过：`TestRealGatewayChat`、`TestRealNoCredentialsInSandbox`、`TestRealDeepResearchFixedTopic`、`TestRealDeepResearchKillAndResume`。
+- **G3**：配置了非空测试 Key 时，宿主读取沙箱内每个进程的 `/proc/<pid>/environ` 与命令行、沙箱内 uid 1000 进程的 `env` 与 `/proc/self/environ`、server 日志与整张事件表，均不含 Key 值或 Key 变量名。
+- **自动化业务验收（§16.4）**：checkpoint 序列为 `plan, task-1, task-2, report`；报告中每个 `[n]` 映射到 `blobs` 且授权到 `scope_blobs(task)` 的证据 sha；在 `task-1` 提交后杀死 Worker，新 attempt 以 `task-1` 恢复，计划调用计数仍为 1；恢复前后任务 1 的上游计数完全相同（1 次 summarize、1 次 search、3 次 fetch），任务 1 的每个调用只有 attempt 1 的 try，attempt 2 的 checkpoint refs 含任务 1 的 blob。
+
+### 3. 剩余限制
+- 研究循环只跑一轮（`max_loops` 已校验但只执行一次）；sub-run 并行研究属 M4。
+- 有 Gateway 调用后，checkpoint state 必须是内联 JSON 对象（不能用 `state_ref`，应用不能使用 `_agentbox` 键）。
+- 真实模型演示（Task 6）未执行：需要 OpenAI 兼容端点的 base URL 与模型名（Key 已在 `F:\go-agentbox\.env`）。
