@@ -2,7 +2,7 @@
 
 单执行主机上的 Agent Runtime：Go 负责执行与权限边界，Python 负责研究编排。
 
-> **状态：开发中（v0.2 内部里程碑 M1）。** 控制面（调度、恢复、API、CLI）已在测试环境中端到端验证，但**尚不能作为服务运行任务**：`agentbox server` 在沙箱生产启动器完成前拒绝启动。下文"已实现"只列出已经通过验收的部分；"这是什么"描述的是设计目标，每项保证在对应验收通过前都不成立。
+> **状态：开发中（v0.2 内部里程碑 M1）。** `agentbox server` 已能在单台 Linux 主机（含 WSL2）上以真实沙箱（命名空间、映射 UID、只读 rootfs 模板、seccomp、降权）运行 sim-worker 任务，见下文"快速开始"；Plan 2 联合验收与 M1 门槛尚待判定。下文"已实现"只列出已经通过验收的部分；"这是什么"描述的是设计目标，每项保证在对应验收通过前都不成立。
 
 ---
 
@@ -15,13 +15,13 @@
 | `internal/runtime` 改名为 `internal/sandbox`（Plan 1A） | **已验收** | 纯改名 |
 | 控制面：准入、资源 coordinator 与清理、AttemptRunner、task actor 与调度（Plan 5） | **已验收**（控制面层） | `internal/admission`、`resource`、`runner`、`task`；E1、E4、E7、E8、E10 以进程型 fake provider 与真实 sim_worker 验证 |
 | 启动恢复、REST/SSE API、CLI、不变量检查、故障注入（Plan 6） | **已验收**（控制面层） | `internal/reconcile`、`recovery`、`api`、`cli`、`app`、`invariants`、`faultinject`；E5、E6、E13–E16 |
-| Provider 契约、cgroup 扩展、宿主自检、init 服务循环、环境生命周期（Plan 2 Task 1–8） | 已实现，所在计划未验收 | `internal/provider`、`provider/local`（以测试启动器验证）、`sandbox`、`cgroup`、`hostcheck`；`agentbox doctor` |
-| 沙箱生产启动器（Plan 1B 结论 + Plan 2 后续任务） | spike 已完成，待审阅 | WSL2 上 §16.2 全部通过；规格 §4.6 回写提案待审阅，之后实现 |
+| Provider 契约、cgroup 扩展、宿主自检、init 服务循环、环境生命周期（Plan 2 Task 1–8） | 已实现，Plan 2 联合验收待判定 | `internal/provider`、`provider/local`、`sandbox`、`cgroup`、`hostcheck`；`agentbox doctor` |
+| 沙箱生产启动器、init 环境建立、stage-2 helper、启用 server（Plan 2 Task 9–13） | 已实现，Plan 2 联合验收待判定 | `local.NewProcessStarter`；首个切片、E1–E5（E5 为物理回收部分）、E7、E8、E10 与累计运行时限跨重启，在真实沙箱中以 root 通过（`tests/e2e` 的 `TestReal*`） |
 | Gateway、DeepResearch、Redis、Vue、会话、exec 沙箱、sub-run | 未开始 | M2–M4 |
 
 ## 现在可以运行的命令
 
-Go、Docker 与 PostgreSQL 命令已在 WSL2（内核 6.6）上验证；Python 测试已在 Windows（uv）与 CI 的 Linux 作业上验证。没有列出的命令尚不能使用：`agentbox server` 在生产启动器完成前拒绝启动，因此 `agentbox task …`、`agentbox status` 与 `verify-invariants` 还没有可连接的服务。
+Go、Docker 与 PostgreSQL 命令已在 WSL2（内核 6.6）上验证；Python 测试已在 Windows（uv）与 CI 的 Linux 作业上验证。没有列出的命令尚不能使用。
 
 **依赖**：Linux（cgroup v2）或 Windows 下的 WSL2；Go 1.23+；Python 3.11+ 与 [uv](https://docs.astral.sh/uv/)；Docker（运行 PostgreSQL）。
 
@@ -53,14 +53,54 @@ docker compose -f deploy/docker-compose.yml down
 CI=true go test -count=1 ./tests/e2e/...
 ```
 
+以 root 运行时（WSL 中用 `wsl -u root`，同样设置上面的 `AGENTBOX_TEST_DATABASE_URL`），`TestReal*` 用例另在真实沙箱中重跑首个切片、E1–E5、E7、E8、E10 与累计运行时限（provider/local + 生产启动器；测试会把 `worker/` 复制到 `/opt/agentbox`；非 root 时这些用例跳过）。须以 `CGO_ENABLED=0` 构建（cgo 构建的 stage-2 helper 拒绝启动 workload），约 2.5 分钟：
+
+```bash
+CI=true CGO_ENABLED=0 go test -count=1 ./tests/e2e/...      # 以 root 运行
+```
+
 **需要 root 的测试**（cgroup、环境生命周期等）：以 root 运行 `go test ./internal/cgroup/ ./internal/rootfs/ ./internal/sandbox/ ./internal/provider/local/`（WSL 中可用 `wsl -u root`）。
 
 **宿主自检**（需要 root）：
 
 ```bash
-go build -o bin/agentbox ./cmd/agentbox
+CGO_ENABLED=0 go build -o bin/agentbox ./cmd/agentbox
 sudo ./bin/agentbox doctor             # 通过时输出"宿主环境检查通过"
 ```
+
+## 快速开始：在真实沙箱中运行一个任务
+
+需要 root（cgroup、命名空间与 UID 映射）、cgroup v2、`python3`（3.11+，沙箱内用宿主的 `/usr`）与上文的 PostgreSQL。配置示例 [`deploy/agentbox.env.example`](deploy/agentbox.env.example) 列出 `agentbox server` 的全部标志与环境变量，下面的命令按原样载入它（数据目录 `/var/lib/agentbox`，监听 `127.0.0.1:8080`）。数据目录与数据库一一绑定（安装身份）：换数据库须换数据目录。
+
+```bash
+# 1. PostgreSQL：按上文"PostgreSQL 与数据库测试"的 docker compose 命令启动（连接串见配置示例）
+
+# 2. 构建并自检（生产二进制固定 CGO_ENABLED=0）
+CGO_ENABLED=0 go build -o bin/agentbox ./cmd/agentbox
+sudo ./bin/agentbox doctor
+
+# 3. 安装 worker 包到默认 rootfs 模板中的 /opt/agentbox（server 启动时检查它存在）
+sudo install -d -m 0755 /opt/agentbox
+sudo cp -r worker/agentbox_worker worker/sim_worker /opt/agentbox/
+
+# 4. 终端 1：启动 server（前台运行，Ctrl-C 停止）
+sudo sh -c 'set -a; . deploy/agentbox.env.example; exec ./bin/agentbox server $AGENTBOX_SERVER_FLAGS'
+```
+
+```bash
+# 5. 终端 2：提交任务、观察事件、查看 attempt 与 checkpoint
+set -a; . deploy/agentbox.env.example; set +a
+./bin/agentbox status
+./bin/agentbox task submit --spec '{"steps":[{"op":"progress","message":"hello from the sandbox"},{"op":"artifact","artifact_id":"report","path":"report.md","content":"# quick start"},{"op":"checkpoint","step_id":"written"}],"summary":"quick start done","outputs":["report"]}'
+./bin/agentbox task watch <task_id>      # 事件流：ready → progress → artifact_saved → checkpoint_committed → result → task_terminal
+./bin/agentbox task inspect <task_id>    # status succeeded；attempt 的退出码、OOM 诊断、环境清理状态；checkpoint
+
+# 6. 不变量检查（运行中可查 A/B 类；终端 1 Ctrl-C 停止 server 后加 --quiescent）
+sudo sh -c 'set -a; . deploy/agentbox.env.example; exec ./bin/agentbox verify-invariants --data-dir /var/lib/agentbox'
+sudo sh -c 'set -a; . deploy/agentbox.env.example; exec ./bin/agentbox verify-invariants --quiescent --data-dir /var/lib/agentbox'
+```
+
+Worker 在沙箱中以映射 UID 运行，只读看到宿主的 `/usr`、`/etc` 的子集与 `/opt/agentbox`，可写的只有 `/workspace`（宿主 `<data>/workspaces/<task_id>`）与限额 tmpfs。M1 的结果下载端点尚未实现（`agentbox task result` 返回 501）：产物按固定版本保存在 `<data>/blobs`，版本与 sha256 见 `task watch` 的 `artifact_saved` 事件。
 
 **Python Worker SDK 测试**：
 
