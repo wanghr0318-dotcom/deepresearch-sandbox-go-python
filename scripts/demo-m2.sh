@@ -408,11 +408,14 @@ for c in d["calls"]:
     total += c["cost_charged_micro"]
     model = "-"
     if c["endpoint"] == "/v1/chat/completions":
+        # journal 记录的模型（未完成的调用也有）；没有时退回结果 blob 中上游回复的 model 字段
+        model = c.get("model") or ""
         ref = c.get("result_ref") or ""
-        try:
-            model = json.load(open(os.path.join(blobs, ref[:2], ref[2:]))).get("model") or "?"
-        except (OSError, ValueError, AttributeError):
-            model = "?"
+        if not model:
+            try:
+                model = json.load(open(os.path.join(blobs, ref[:2], ref[2:]))).get("model") or "?"
+            except (OSError, ValueError, AttributeError):
+                model = "?"
         step = c["call_id"].split("/")[1]
         want = orch if step in ("plan", "report") else worker
         if model != want and not model.startswith(want + "-"):
@@ -424,13 +427,14 @@ if bad:
     sys.exit("模型路由不符：" + "；".join(bad))
 PY
 ok "模型路由：plan/report = $ORCH_MODEL，任务内 chat = $WORKER_MODEL"
-# 每个调用都已结算（completed 或 failed；真实网络下个别抓取不可达是正常的终态），不存在 resolving/in_flight/
-# unknown；模型调用必须全部 completed。
-[ "$(json "len(d['calls']) > 0 and all(c['state'] in ('completed', 'failed') for c in d['calls'])" <"$LOGDIR/inspect.json")" = True ] ||
-  fail "存在未结算的 Gateway 调用（resolving/in_flight/unknown）"
-[ "$(json "all(c['state'] == 'completed' for c in d['calls'] if c['endpoint'] == '/v1/chat/completions')" <"$LOGDIR/inspect.json")" = True ] ||
-  fail "存在未完成的模型调用"
-ok "全部调用已结算：$(json "', '.join(f'{s} {n}' for s, n in sorted(__import__('collections').Counter(c['state'] for c in d['calls']).items()))" <"$LOGDIR/inspect.json")；模型调用全部 completed"
+# 每个调用都处于终态：completed、failed（例如网页不可达）或 unknown（结果不确定、可能已计费，例如超过调用
+# 期限）；不存在 resolving/in_flight。每个模型步骤（call_id 去掉末尾序号）的最后一次调用必须 completed——
+# worker 对超时的调用以新 ID 重做，重做成功即该步骤完成。
+[ "$(json "len(d['calls']) > 0 and all(c['state'] in ('completed', 'failed', 'unknown') for c in d['calls'])" <"$LOGDIR/inspect.json")" = True ] ||
+  fail "存在未结算的 Gateway 调用（resolving/in_flight）"
+[ "$(json "all(c['state'] == 'completed' for c in {c['call_id'].rsplit('/', 1)[0]: c for c in sorted((c for c in d['calls'] if c['endpoint'] == '/v1/chat/completions'), key=lambda c: (c['call_id'].rsplit('/', 1)[0], int(c['call_id'].rsplit('/', 1)[1])))}.values())" <"$LOGDIR/inspect.json")" = True ] ||
+  fail "存在最终未完成的模型步骤"
+ok "全部调用处于终态：$(json "', '.join(f'{s} {n}' for s, n in sorted(__import__('collections').Counter(c['state'] for c in d['calls']).items()))" <"$LOGDIR/inspect.json")；每个模型步骤的最后一次调用 completed"
 if [ -n "${AGENTBOX_DEMO_REDIS_ADDR:-}" ]; then
   ok "调用来源：$(json "', '.join(f'{s} {n}' for s, n in sorted(__import__('collections').Counter(c.get('source', 'upstream') for c in d['calls']).items()))" <"$LOGDIR/inspect.json")"
   ok "缓存计数（/status）：$(curl -fsS "$AGENTBOX_ADDR/status" | json "d.get('cache')")"
