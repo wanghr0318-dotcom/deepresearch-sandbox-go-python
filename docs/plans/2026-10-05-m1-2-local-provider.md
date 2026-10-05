@@ -398,6 +398,7 @@ func New(opt Options) (*Provider, error) // Starter 为 nil 时返回错误（�
 - 演示脚本第 12–15 步复现同一流程（attempt 1 `lost_on_restart`，attempt 2 从 checkpoint s1 恢复并 `succeeded`）。
 
 ### 4. 剩余限制与环境假设
+- **残余 exec 边界竞争窗口——补充（2026-10-05，M2 执行中）**：CI ubuntu-24.04 上 `TestHelperCommitExit126` 一次得到 `start_err{helper/died_before_exec: exit 126}`（workload 以 126 快速退出，早于 init 的状态读取）。该结局与 SIGKILL 窗口同属规格 §4.6 门槛 2 的残余窗口，测试改为接受两种结局并记录频次；规格原文已补充。
 - **残余 exec 边界竞争窗口**（规格 §4.6 门槛 2，原文）：helper 在写完最后一步与 `execve` 返回之间被 SIGKILL，与 workload 在 `execve` 返回后立即被 SIGKILL，在"EOF 无字节 + 信号终止"上不可区分；按提交点归为 `died_before_exec`。实测：Task 11 第一轮 150/150 ack，修复轮 300 次中 2 次（约 0.7%）落入该窗口；12b 的 50 次中 0 次。`start_ack` 只表示到达提交点，不表示 workload 首条指令已执行。
 - 宿主假设：Linux cgroup v2、内核 ≥ 5.14、新挂载 API 与 `close_range` 可用、可创建 user namespace（`agentbox doctor` 逐项检查）；默认 rootfs 模板要求宿主存在 `/opt/agentbox`（worker 包）并复用宿主 `/usr`、`/etc` 子集与 `/lib*`；沙箱内 `python3 ≥ 3.11` 来自宿主 `/usr`；生产二进制与 helper 须 `CGO_ENABLED=0`（cgo 构建的 helper 拒绝启动 workload）。
 - 保真度：E3 的 OOM 受害者是同一环境中的另一个 exec，不是 Worker 的子进程；E5 中 server 被杀会连带 init 与 PID 命名空间退出，恢复只遇到孤儿目录与 cgroup，不会遇到存活进程。

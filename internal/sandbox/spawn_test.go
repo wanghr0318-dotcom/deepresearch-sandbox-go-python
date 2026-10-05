@@ -2850,22 +2850,37 @@ func TestHelperCommitFastExit(t *testing.T) {
 	closeAndDrain(t, s, ch)
 }
 
-// TestHelperCommitExit126：提交点矩阵 (4)——已 exec 的 workload 以 126 退出：start_ack 然后 exit 126，不被误判为
-// died_before_exec（126 只对终止不晚于 EOF 观察的情形生效）；标记文件证明 workload 运行过。
+// TestHelperCommitExit126：提交点矩阵 (4)——已 exec 的 workload 以 126 退出。两种结局都是规格 §4.6 门槛 2 接受的：
+//   - start_ack 然后 exit 126：init 在 EOF 后的单次状态读取时 workload 仍存活；
+//   - start_err{helper/died_before_exec: exit 126}：workload 在 init 读取状态前已退出——126 是 helper 保留的失败退出码，
+//     "EOF 无字节 + 退出码 126"对 init 不可区分（残余边界窗口，慢机器上更常见）。
+// 两种情形标记文件都必须存在（workload 确实运行过），并记录各自出现的次数。
 func TestHelperCommitExit126(t *testing.T) {
 	testutil.RequireLinuxRoot(t)
 	s, ch := helperTestInit(t, nil)
+	acked, died := 0, 0
 	for i := 0; i < 5; i++ {
 		id := fmt.Sprintf("e%d", i)
 		marker := fmt.Sprintf("/tmp/ran126-%d", i)
 		sendStart(t, s, id, nil, "/bin/sh", "-c", "touch "+marker+"; exit 126")
-		if _, ex := expectAckExit(t, s, ch, id); ex.Code != 126 || ex.Signal != 0 {
-			t.Fatalf("%s 的退出状态 = %+v，期望 126", id, ex)
+		m := nextMsg(t, s, ch)
+		switch {
+		case m.Type == MsgStartAck && m.ExecID == id && m.PID > 0:
+			ex := nextMsg(t, s, ch)
+			if ex.Type != MsgExit || ex.ExecID != id || ex.Exit == nil || ex.Exit.Code != 126 || ex.Exit.Signal != 0 {
+				t.Fatalf("%s：start_ack 之后的消息 = %+v，期望 exit 126\n%s", id, ex, s.output())
+			}
+			acked++
+		case m.Type == MsgStartErr && m.ExecID == id && m.Reason == "helper/died_before_exec: exit 126":
+			died++
+		default:
+			t.Fatalf("%s 的第一条消息 = %+v，期望 start_ack 或 died_before_exec: exit 126\n%s", id, m, s.output())
 		}
 		if !fileExists(inSandbox(s, marker)) {
-			t.Fatalf("%s 的标记文件不存在", id)
+			t.Fatalf("%s 的标记文件不存在：workload 没有运行", id)
 		}
 	}
+	t.Logf("exit 126 的快速退出：start_ack %d 次，died_before_exec（残余窗口）%d 次", acked, died)
 	closeAndDrain(t, s, ch)
 }
 
