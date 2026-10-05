@@ -392,6 +392,7 @@ class LoopScript:
     """2 个任务；每个查询 2 条搜索结果（max_fetch=1 时只抓取第 1 条）；chat 按阶段标记回复。"""
 
     def __init__(self) -> None:
+        self.hits = 2
         self.chat = {
             prompts.STAGE_PLAN: json.dumps({"tasks": PLAN_TASKS}, ensure_ascii=False),
             prompts.STAGE_SUMMARIZE: "## 任务总结\n- 关键发现 [1]",
@@ -412,7 +413,7 @@ class LoopScript:
                     "title": f"{query} {i}",
                     "snippet": f"片段 {i}",
                 }
-                for i in (1, 2)
+                for i in range(1, self.hits + 1)
             ]
             return {"query": query, "results": results[: body["max_results"]]}
         url = body["url"]
@@ -885,3 +886,266 @@ def test_loop_refs_are_cumulative_and_reproduced_after_resume(loop_gw, tmp_path)
     # 即使 resume.refs 为空（如旧 checkpoint），状态中的证据 sha 仍进入累积 refs
     code, events = run_loop(tmp_path, resume={**resume_from(cp1), "refs": []})
     assert set(cp1["state"]["evidence"]) <= set(checkpoints(events)["task-2"]["refs"])
+
+
+# ---- 推理模型的空回复与单个抓取失败（M2 真实运行发现的两个缺陷） ----
+
+from agentbox_worker import AccessRevoked, BudgetExhausted, CallDivergence
+
+
+class ReasoningScript(LoopScript):
+    """模拟推理模型：max_tokens 小于该阶段所需时隐藏推理耗尽上限，正文为空（length）。"""
+
+    def __init__(self, need: dict[str, int]) -> None:
+        super().__init__()
+        self.need = need
+
+    def __call__(self, kind: str, body: dict) -> dict:
+        if kind == "chat":
+            system = body["messages"][0]["content"]
+            stage = next(s for s in self.chat if system.startswith(s))
+            if body["max_tokens"] < self.need.get(stage, 0):
+                n = body["max_tokens"]
+                return {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "<think>推理…</think>\n"},
+                            "finish_reason": "length",
+                        }
+                    ],
+                    "usage": {
+                        "completion_tokens": n,
+                        "completion_tokens_details": {"reasoning_tokens": n},
+                    },
+                }
+        return super().__call__(kind, body)
+
+
+def chat_max_tokens(gw: FakeGateway, start: int = 0) -> dict[str, int]:
+    return {
+        r.headers["x-agentbox-call-id"]: r.json()["max_tokens"]
+        for r in gw.requests[start:]
+        if r.path == "/v1/chat/completions"
+    }
+
+
+def test_default_max_tokens_sized_for_reasoning_models():
+    assert (steps.PLAN_MAX_TOKENS, steps.SUMMARY_MAX_TOKENS, steps.REPORT_MAX_TOKENS) == (
+        4096,
+        8192,
+        16384,
+    )
+    cfg = dr_app.parse_config({"topic": "t"})
+    assert (cfg.plan_max_tokens, cfg.summary_max_tokens, cfg.report_max_tokens) == (
+        4096,
+        8192,
+        16384,
+    )
+
+
+@pytest.mark.parametrize("key", ["plan_max_tokens", "summary_max_tokens", "report_max_tokens"])
+@pytest.mark.parametrize("value", [0, -1, True, "4096", 1.5, dr_app.MAX_TOKENS_LIMIT + 1])
+def test_parse_config_rejects_bad_max_tokens(key, value):
+    with pytest.raises(dr_app.WorkerFailure) as info:
+        dr_app.parse_config({"topic": "t", key: value})
+    assert info.value.code == "invalid_config" and key in info.value.message
+
+
+def test_loop_max_tokens_come_from_config(loop_gw, tmp_path):
+    config = {"plan_max_tokens": 1000, "summary_max_tokens": 2000, "report_max_tokens": 3000}
+    code, _ = run_loop(tmp_path, config=config)
+    assert code == 0
+    assert chat_max_tokens(loop_gw) == {
+        "root/plan/chat/1": 1000,
+        "root/task-1/chat/1": 2000,
+        "root/task-2/chat/1": 2000,
+        "root/report/chat/1": 3000,
+    }
+
+
+def test_summarize_empty_completion_retries_with_doubled_max_tokens(loop_gw, tmp_path):
+    """总结被推理耗尽（length）→ 以 2 × max_tokens、新 call id 重试一次后成功；恢复后重放。"""
+    loop_gw.responder = ReasoningScript({prompts.STAGE_SUMMARIZE: 2 * steps.SUMMARY_MAX_TOKENS})
+    code, events = run_loop(tmp_path, app=kill_after("task-1"))
+    assert code == 1  # 在 task-1 之后"杀死"，用于检验恢复后的重放
+    assert call_ids(loop_gw) == [
+        "root/plan/chat/1",
+        "root/task-1/search/1", "root/task-1/fetch/1", "root/task-1/chat/1", "root/task-1/chat/2",
+    ]  # fmt: skip
+    assert chat_max_tokens(loop_gw) == {
+        "root/plan/chat/1": steps.PLAN_MAX_TOKENS,
+        "root/task-1/chat/1": steps.SUMMARY_MAX_TOKENS,
+        "root/task-1/chat/2": 2 * steps.SUMMARY_MAX_TOKENS,
+    }
+    cps = checkpoints(events)
+    state = cps["task-1"]["state"]
+    assert state["tasks"][0]["status"] == "done"
+    assert state["tasks"][0]["summary"] == "## 任务总结\n- 关键发现 [1]"
+    (note,) = [f for f in state["failures"] if "empty_completion" in f]
+    assert "root/task-1/chat/1" in note and "finish_reason=length" in note
+    assert f"max_tokens={2 * steps.SUMMARY_MAX_TOKENS}" in note
+    assert "reasoning_tokens=" in note
+    # 从计划 checkpoint 恢复：任务 1 的调用以相同 ID、相同请求体重发（重放，不会指纹冲突）
+    first = {r.headers["x-agentbox-call-id"]: r.body for r in loop_gw.requests}
+    before = len(loop_gw.requests)
+    code, events = run_loop(tmp_path, resume=resume_from(cps["plan"]))
+    assert code == 0 and events[-1]["type"] == "result"
+    again = loop_gw.requests[before:]
+    task1 = [r for r in again if r.headers["x-agentbox-call-id"].startswith("root/task-1/")]
+    assert [r.headers["x-agentbox-call-id"] for r in task1] == [
+        "root/task-1/search/1", "root/task-1/fetch/1", "root/task-1/chat/1", "root/task-1/chat/2",
+    ]  # fmt: skip
+    assert all(r.body == first[r.headers["x-agentbox-call-id"]] for r in task1)
+    assert not any("x-agentbox-supersedes" in r.headers for r in again)
+
+
+def test_summarize_still_empty_fails_task_with_finish_reason(loop_gw, tmp_path):
+    loop_gw.responder = ReasoningScript({prompts.STAGE_SUMMARIZE: 10**9})
+    code, events = run_loop(tmp_path)
+    # 两个任务都失败：没有完成的任务 → 整个研究失败，不写"暂无可用信息"的报告
+    assert code == 1
+    error = events[-1]
+    assert error["type"] == "error" and error["code"] == "research_failed"
+    state = checkpoints(events)["task-2"]["state"]
+    assert [t["status"] for t in state["tasks"]] == ["failed", "failed"]
+    assert all(t.get("summary") is None for t in state["tasks"])  # 不写"暂无可用信息"
+    failed = [f for f in state["failures"] if f.startswith("task-1:") and "任务失败" in f]
+    (msg,) = failed
+    assert "empty_completion" in msg and "finish_reason=length" in msg
+    assert "root/task-1/chat/2" in msg
+    assert [c for c in call_ids(loop_gw) if c.startswith("root/task-1/chat/")] == [
+        "root/task-1/chat/1",
+        "root/task-1/chat/2",
+    ]  # 只重试一次；空回复不是瞬时错误，任务不重做
+
+
+def test_empty_plan_fails_visibly_and_empty_report_degrades(loop_gw, tmp_path):
+    loop_gw.responder = ReasoningScript({prompts.STAGE_PLAN: 10**9})
+    code, events = run_loop(tmp_path)
+    assert code == 1
+    error = events[-1]
+    assert error["code"] == "plan_failed" and "finish_reason=length" in error["message"]
+    # 报告为空：降级报告（已完成任务的摘要拼接），失败原因记入 failures
+    loop_gw.responder = ReasoningScript({prompts.STAGE_REPORT: 10**9})
+    loop_gw.calls.clear()  # 视为新任务：不重放上一次运行以同一 ID 记录的空计划
+    code, events = run_loop(tmp_path)
+    assert code == 0
+    assert events[-1]["summary"].startswith(dr_app.REPORT_FAILED_NOTE)
+    state = checkpoints(events)["report"]["state"]
+    assert state["report_sha256"] is None
+    assert any(f.startswith("report:") and "finish_reason=length" in f for f in state["failures"])
+
+
+def test_search_and_fetch_skips_a_failed_fetch(research):
+    fake, gw, script = research
+    script.search = [
+        {"url": f"https://{h}.example/", "title": h.upper(), "snippet": f"片段 {h}"}
+        for h in ("a", "b", "c")
+    ]
+    script.pages = {
+        f"https://{h}.example/": {"content_type": "text/plain", "text": f"{h} 正文"}
+        for h in ("a", "b", "c")
+    }
+
+    def blocked(req: Recorded) -> Reply | None:
+        if req.headers.get("x-agentbox-call-id") == "root/task-1/fetch/2":
+            return error_reply(502, "upstream_unreachable", "dial tcp: i/o timeout")
+        return None
+
+    fake.interceptor = blocked
+    calls: list[GatewayResult] = []
+    failures: list[str] = []
+    task = ResearchTask(1, "材料", "电解质", "固态电解质")
+    evidence = search_and_fetch(
+        gw, task, max_results=5, max_fetch=3, step_id="task-1", calls=calls, failures=failures
+    )
+    assert [e.url for e in evidence] == ["https://a.example/", "https://c.example/"]
+    assert [c.call_id for c in calls] == [
+        "root/task-1/search/1", "root/task-1/fetch/1", "root/task-1/fetch/3",
+    ]  # fmt: skip
+    (note,) = failures
+    assert "https://b.example/" in note and "upstream_unreachable" in note
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "exc_type"),
+    [
+        (402, "budget_exhausted", BudgetExhausted),
+        (403, "access_revoked", AccessRevoked),
+        (409, "fingerprint_mismatch", CallDivergence),
+    ],
+)
+def test_search_and_fetch_fatal_errors_propagate(research, status, code, exc_type):
+    fake, gw, script = research
+    script.search = [
+        {"url": f"https://{h}.example/", "title": h, "snippet": h} for h in ("a", "b", "c")
+    ]
+    script.pages = {f"https://{h}.example/": {"text": h} for h in ("a", "b", "c")}
+
+    def fatal(req: Recorded) -> Reply | None:
+        if req.headers.get("x-agentbox-call-id") == "root/task-1/fetch/2":
+            return error_reply(status, code)
+        return None
+
+    fake.interceptor = fatal
+    failures: list[str] = []
+    task = ResearchTask(1, "材料", "电解质", "固态电解质")
+    with pytest.raises(exc_type):
+        search_and_fetch(gw, task, max_results=5, max_fetch=3, step_id="task-1", failures=failures)
+    assert failures == []
+    assert [r.headers["x-agentbox-call-id"] for r in fake.requests][-1] == "root/task-1/fetch/2"
+
+
+def test_loop_one_failed_fetch_among_three_keeps_task(loop_gw, tmp_path):
+    loop_gw.responder.hits = 3
+
+    def blocked(req: Recorded) -> Reply | None:
+        if req.headers.get("x-agentbox-call-id") == "root/task-1/fetch/3":
+            return error_reply(502, "upstream_unreachable")
+        return None
+
+    loop_gw.interceptor = blocked
+    code, events = run_loop(tmp_path, config={"max_fetch": 3})
+    assert code == 0 and events[-1]["type"] == "result"
+    assert [c for c in call_ids(loop_gw) if c.startswith("root/task-1/")] == [
+        "root/task-1/search/1",
+        "root/task-1/fetch/1",
+        "root/task-1/fetch/2",
+        "root/task-1/fetch/3",
+        "root/task-1/chat/1",
+    ]  # fmt: skip — 不重做任务
+    state = checkpoints(events)["task-1"]["state"]
+    task1 = state["tasks"][0]
+    assert task1["status"] == "done" and len(task1["evidence"]) == 2
+    assert task1["summary"] == "## 任务总结\n- 关键发现 [1]"
+    assert task1["evidence"] == [
+        loop_gw.calls["root/task-1/fetch/1"],
+        loop_gw.calls["root/task-1/fetch/2"],
+    ]
+    assert any("upstream_unreachable" in f and "跳过" in f for f in state["failures"])
+    # 摘要提示词只编号两条成功的证据
+    summary_req = next(
+        r for r in loop_gw.requests if r.headers.get("x-agentbox-call-id") == "root/task-1/chat/1"
+    )
+    user = summary_req.json()["messages"][1]["content"]
+    assert "[2] 标题" in user and "[3] 标题" not in user
+
+
+def test_loop_all_fetches_failing_fails_task(loop_gw, tmp_path):
+    loop_gw.responder.hits = 3
+
+    def blocked(req: Recorded) -> Reply | None:
+        if req.headers.get("x-agentbox-call-id", "").startswith("root/task-1/fetch/"):
+            return error_reply(502, "upstream_unreachable")
+        return None
+
+    loop_gw.interceptor = blocked
+    code, events = run_loop(tmp_path, config={"max_fetch": 3})
+    assert code == 0 and events[-1]["outputs"] == ["report"]
+    state = checkpoints(events)["report"]["state"]
+    assert [t["status"] for t in state["tasks"]] == ["failed", "done"]
+    # 502 属于瞬时错误：任务以新 ID 重做一次（共 6 次抓取），之后判失败；从不调用总结
+    task1_calls = [c for c in call_ids(loop_gw) if c.startswith("root/task-1/")]
+    assert sum(1 for c in task1_calls if "/fetch/" in c) == 6
+    assert not any("/chat/" in c for c in task1_calls)
+    assert any(f.startswith("task-1:") and "任务失败" in f for f in state["failures"])

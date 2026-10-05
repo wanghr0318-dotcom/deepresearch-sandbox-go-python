@@ -14,6 +14,12 @@ resume.refs（上一 checkpoint 的累积集合）与状态中的证据 sha 重�
 - CallDivergence：以新 ID + X-Agentbox-Supersedes 显式重发一次并记入 failures；再冲突则任务失败。
 - CallDeadlineExceeded / 5xx：该任务以新 ID 重做一次，再失败则任务失败，继续其余任务。
 - BudgetExhausted：不再发起调用；已有完成的任务时用已有摘要拼接降级报告，否则任务失败。
+- 单个抓取失败：记入 failures 并跳过该来源；任务只在最终没有任何证据时才按上面的规则重做或失败。
+- 模型空回复（steps.EmptyCompletion，消息含 finish_reason）：总结先以加倍 max_tokens 重试一次，
+  仍为空则任务失败；计划为空则整个任务失败；报告为空则写降级报告。全部记入 failures。
+
+max_tokens（计划/总结/报告）取自 config 的 plan_max_tokens / summary_max_tokens /
+report_max_tokens，缺省见 steps 中的常量（按推理模型的隐藏推理开销取值）。
 """
 
 from __future__ import annotations
@@ -67,6 +73,15 @@ class Config:
     # 白名单中。config 在每个 attempt 的 init 中不变，恢复后同一步骤重发同一模型（指纹稳定）。
     orchestrator_model: str | None = None
     worker_model: str | None = None
+    # 每次 chat 的 max_tokens（推理模型的隐藏推理也计入输出 token）。Gateway 按
+    # max_tokens × 输出单价预留预算，并把超过其上限（MaxTokensCap）的值截断。
+    plan_max_tokens: int = steps.PLAN_MAX_TOKENS
+    summary_max_tokens: int = steps.SUMMARY_MAX_TOKENS
+    report_max_tokens: int = steps.REPORT_MAX_TOKENS
+
+
+MAX_TOKENS_KEYS = ("plan_max_tokens", "summary_max_tokens", "report_max_tokens")
+MAX_TOKENS_LIMIT = 131_072
 
 
 def parse_config(raw: Any) -> Config:
@@ -82,6 +97,17 @@ def parse_config(raw: Any) -> Config:
         value = raw.get(key, getattr(defaults, key))
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
             raise WorkerFailure("invalid_config", f"config.{key} 必须是 1–100 的整数：{value!r}")
+        ints[key] = value
+    for key in MAX_TOKENS_KEYS:
+        value = raw.get(key, getattr(defaults, key))
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= MAX_TOKENS_LIMIT
+        ):
+            raise WorkerFailure(
+                "invalid_config", f"config.{key} 必须是 1–{MAX_TOKENS_LIMIT} 的整数：{value!r}"
+            )
         ints[key] = value
     artifact_id = raw.get("report_artifact_id", defaults.report_artifact_id)
     if not isinstance(artifact_id, str) or not artifact_id:
@@ -249,6 +275,7 @@ class _Loop:
                     self.cfg.topic,
                     max_tasks=self.cfg.max_tasks,
                     model=self.cfg.orchestrator_model,
+                    max_tokens=self.cfg.plan_max_tokens,
                     calls=calls,
                 )
                 break
@@ -280,6 +307,7 @@ class _Loop:
                     max_results=self.cfg.max_results,
                     max_fetch=self.cfg.max_fetch,
                     step_id=step,
+                    failures=self.state.failures,
                 )
                 summary = await asyncio.to_thread(
                     steps.summarize,
@@ -288,7 +316,9 @@ class _Loop:
                     evidence,
                     step_id=step,
                     model=self.cfg.worker_model,
+                    max_tokens=self.cfg.summary_max_tokens,
                     calls=summary_calls,
+                    failures=self.state.failures,
                 )
             except (BudgetExhausted, AccessRevoked):
                 raise
@@ -324,6 +354,7 @@ class _Loop:
                     self.state,
                     step_id=REPORT_STEP,
                     model=self.cfg.orchestrator_model,
+                    max_tokens=self.cfg.report_max_tokens,
                     calls=calls,
                 )
                 break
@@ -371,8 +402,12 @@ class _Loop:
             except (GatewayError, ValueError) as exc:
                 raise WorkerFailure("report_unavailable", f"读取报告 blob 失败：{exc}") from exc
             replay = _ReplayChat(GatewayResult("", body, sha, True, 200))
-            text = steps.write_report(replay, self.state, step_id=REPORT_STEP)
-            summary = first_paragraph(text)
+            try:
+                text = steps.write_report(replay, self.state, step_id=REPORT_STEP)
+                summary = first_paragraph(text)
+            except steps.EmptyCompletion:  # 旧版本把空报告回复也记作 report_sha256
+                text = template_report(self.state, REPORT_FAILED_NOTE)
+                summary = f"{REPORT_FAILED_NOTE}：{first_paragraph(text)}"
         await self.publish(text)
         return Result(summary=summary, outputs=[self.cfg.report_artifact_id])
 
