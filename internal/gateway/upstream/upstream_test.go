@@ -259,6 +259,52 @@ func TestFetchTruncatesAfterDecompression(t *testing.T) {
 	}
 }
 
+// 目标站点的 4xx/5xx 是确定答案：ok，Body 带 status、截短正文与 error；传输层失败保持原类别。
+func TestFetchTargetHTTPErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/404":
+			http.Error(w, "not here", http.StatusNotFound)
+		case "/503":
+			w.Header().Set("Retry-After", "5")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write(bytes.Repeat([]byte("x"), 10_000))
+		case "/private":
+			http.Redirect(w, r, "http://10.0.0.1/", http.StatusFound)
+		}
+	}))
+	defer srv.Close()
+	h := newHooks(srv.Listener.Addr().String(), map[string][]string{"pub.test": {"93.184.216.34"}})
+	f := NewFetch(FetchConfig{Dialer: h.dialer()})
+	for _, c := range []struct {
+		path      string
+		status    int
+		n         int
+		truncated bool
+		bytes     int64
+	}{{"/404", 404, len("not here\n"), false, 9}, {"/503", 503, fetchErrorBodyMax, true, 10_000}} {
+		resp, e := f.Do(context.Background(), mustResolve(t, f, `{"url":"http://pub.test`+c.path+`"}`))
+		if e != nil {
+			t.Fatalf("%s：应为 ok，得到 %v", c.path, e)
+		}
+		var res FetchResult
+		json.Unmarshal(resp.Body, &res)
+		if res.Status != c.status || res.Error != "http_status" || len(res.Content) != c.n || res.Truncated != c.truncated ||
+			resp.Usage != (Usage{Requests: 1, ResponseBytes: c.bytes}) {
+			t.Fatalf("%s：%+v usage %+v", c.path, res, resp.Usage)
+		}
+	}
+	_, e := f.Do(context.Background(), mustResolve(t, f, `{"url":"http://pub.test/private"}`))
+	wantErr(t, e, OutcomeFatal, CodeEgressBlocked)
+
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	refused := newHooks(l.Addr().String(), map[string][]string{"pub.test": {"93.184.216.34"}})
+	l.Close()
+	g := NewFetch(FetchConfig{Dialer: refused.dialer()})
+	_, e = g.Do(context.Background(), mustResolve(t, g, `{"url":"http://pub.test/"}`))
+	wantErr(t, e, OutcomeRetryable, CodeUpstreamUnreachable)
+}
+
 // 规则 1：抓取只接受 {url}，拒绝 userinfo、非 http(s)、非默认端口、禁止的 IP 字面量。
 func TestFetchResolveRejects(t *testing.T) {
 	f := NewFetch(FetchConfig{Dialer: newHooks("", nil).dialer()})
@@ -342,6 +388,15 @@ func TestChatResolveAndEstimate(t *testing.T) {
 	_, defaults, _ = a.Resolve([]byte(`{"model":"m-1","max_tokens":10,"messages":` + msgs + `}`))
 	if len(defaults) != 0 {
 		t.Fatalf("显式值不应进入 applied_defaults：%v", defaults)
+	}
+	// 超过上限（默认 4096）的 max_tokens 截断到上限、进入 applied_defaults，估算按截断后的值。
+	out, defaults, err = a.Resolve([]byte(`{"model":"m-1","max_tokens":100000,"messages":` + msgs + `}`))
+	json.Unmarshal(out, &obj)
+	if err != nil || string(obj["max_tokens"]) != "4096" || defaults["max_tokens"] != 4096 {
+		t.Fatalf("截断：resolved %s defaults %v err %v", out, defaults, err)
+	}
+	if got, _ := a.Estimate(out); got != in*3+4096*15 {
+		t.Fatalf("截断后估算 = %d，期望 %d", got, in*3+4096*15)
 	}
 	for body, code := range map[string]string{
 		`{"messages":` + msgs + `,"stream":true}`:                               CodeUnsupportedField,

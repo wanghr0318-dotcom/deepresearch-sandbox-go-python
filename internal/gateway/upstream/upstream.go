@@ -126,6 +126,8 @@ const (
 	DefaultFetchTimeout   = 20 * time.Second
 	DefaultMaxRedirects   = 5
 	defaultMaxTokens      = 1024
+	defaultMaxTokensCap   = 4096
+	fetchErrorBodyMax     = 4 << 10 // 目标站点返回 HTTP 错误时保留的正文上限
 	defaultSearchResults  = 5
 	maxSearchResults      = 20
 	maxRetryAfter         = 24 * time.Hour

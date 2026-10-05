@@ -87,9 +87,12 @@ type FetchResult struct {
 	Truncated   bool   `json:"truncated"`
 	Encoding    string `json:"encoding"`
 	Content     string `json:"content"`
+	Error       string `json:"error,omitempty"` // 目标站点返回 4xx/5xx 时为 "http_status"
 }
 
 // Do 发出 GET；请求头固定（User-Agent、Accept、Accept-Encoding: gzip），正文按解压后字节截断并置 truncated。
+// 目标站点返回的 4xx/5xx 是确定、可重放的答案：结果为 ok，Body 带 status、截短的正文与 error: "http_status"。
+// 只有传输层失败（拨号、TLS、超时、重定向被拒、读响应失败）按 roundTrip 的类别归类。
 func (a *fetchAdapter) Do(ctx context.Context, resolved []byte) (Response, *Error) {
 	var in struct {
 		URL string `json:"url"`
@@ -103,21 +106,28 @@ func (a *fetchAdapter) Do(ctx context.Context, resolved []byte) (Response, *Erro
 	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "*/*")
-	r, e := exchange(ctx, a.http, req, false)
+	r, e := roundTrip(ctx, a.http, req)
 	if e != nil {
-		return Response{RetryAfter: r.retryAfter}, e
+		return Response{}, e
 	}
+	content, truncated := r.body, r.truncated
 	res := FetchResult{
 		URL:         in.URL,
 		FinalURL:    r.resp.Request.URL.String(),
 		Status:      r.resp.StatusCode,
 		ContentType: r.resp.Header.Get("Content-Type"),
-		Truncated:   r.truncated,
 	}
-	if utf8.Valid(r.body) && !strings.ContainsRune(string(r.body), 0) {
-		res.Encoding, res.Content = "utf-8", string(r.body)
+	if sc := r.resp.StatusCode; sc < 200 || sc >= 300 {
+		res.Error = "http_status"
+		if len(content) > fetchErrorBodyMax {
+			content, truncated = content[:fetchErrorBodyMax], true
+		}
+	}
+	res.Truncated = truncated
+	if utf8.Valid(content) && !strings.ContainsRune(string(content), 0) {
+		res.Encoding, res.Content = "utf-8", string(content)
 	} else {
-		res.Encoding, res.Content = "base64", base64.StdEncoding.EncodeToString(r.body)
+		res.Encoding, res.Content = "base64", base64.StdEncoding.EncodeToString(content)
 	}
 	body, _ := json.Marshal(res)
 	return Response{Body: body, Usage: Usage{Requests: 1, ResponseBytes: int64(len(r.body))}}, nil

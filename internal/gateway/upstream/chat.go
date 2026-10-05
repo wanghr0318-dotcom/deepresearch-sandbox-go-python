@@ -15,7 +15,8 @@ type ChatConfig struct {
 	Model            string // 唯一声明的模型
 	APIKey           string // 来自宿主环境变量 AGENTBOX_MODEL_API_KEY；只放在 Authorization 头
 	Pricing          Pricing
-	MaxTokensDefault int          // max_tokens 缺省值；≤ 0 时取 1024
+	MaxTokensDefault int          // max_tokens 缺省值；≤ 0 时取 1024（不超过 MaxTokensCap）
+	MaxTokensCap     int          // max_tokens 上限，超出者截断（§9.6）；≤ 0 时取 4096
 	HTTP             *http.Client // 须来自验证 Dialer.HTTPClient；nil 时用默认 Dialer（8 MiB）
 }
 
@@ -26,9 +27,13 @@ type chatAdapter struct {
 
 // NewChat 构造 OpenAI 兼容的 chat adapter（§9.3 子集：仅声明的模型、纯文本消息、非流式）。
 func NewChat(cfg ChatConfig) Adapter {
+	if cfg.MaxTokensCap <= 0 {
+		cfg.MaxTokensCap = defaultMaxTokensCap
+	}
 	if cfg.MaxTokensDefault <= 0 {
 		cfg.MaxTokensDefault = defaultMaxTokens
 	}
+	cfg.MaxTokensDefault = min(cfg.MaxTokensDefault, cfg.MaxTokensCap)
 	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
 	return &chatAdapter{cfg: cfg, http: defaultClient(cfg.HTTP, DefaultModelMaxBody)}
 }
@@ -47,7 +52,7 @@ var (
 )
 
 // Resolve：stream 只能缺省或 false（删去）；messages 非空且每条 content 为字符串；model 缺省补配置模型、
-// 显式时须等于配置模型；max_tokens 缺省补 MaxTokensDefault。补上的值进入 applied_defaults。
+// 显式时须等于配置模型；max_tokens 缺省补 MaxTokensDefault，超过 MaxTokensCap 时截断。补上或截断的值进入 applied_defaults。
 func (a *chatAdapter) Resolve(body []byte) ([]byte, map[string]any, error) {
 	obj, e := decodeObject(body)
 	if e != nil {
@@ -83,8 +88,14 @@ func (a *chatAdapter) Resolve(body []byte) ([]byte, map[string]any, error) {
 		defaults["model"] = a.cfg.Model
 	}
 	if raw, ok := obj["max_tokens"]; ok {
-		if _, e := positiveInt(raw, "max_tokens"); e != nil {
+		n, e := positiveInt(raw, "max_tokens")
+		if e != nil {
 			return nil, nil, e
+		}
+		if n > int64(a.cfg.MaxTokensCap) {
+			// 截断到上限并记入 applied_defaults，使指纹反映生效值。
+			obj["max_tokens"], _ = json.Marshal(a.cfg.MaxTokensCap)
+			defaults["max_tokens"] = a.cfg.MaxTokensCap
 		}
 	} else {
 		obj["max_tokens"], _ = json.Marshal(a.cfg.MaxTokensDefault)
