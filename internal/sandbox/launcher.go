@@ -67,11 +67,15 @@ var _ committer = (*helperLauncher)(nil)
 
 // newHelperLauncher 按环境建立的结果构造生产 Launcher。
 //
-// RLIMIT_FSIZE（仅 exec 环境）取可写 tmpfs 中最大者的大小（/tmp 与 /out）：单个文件不会合法地超过它。
+// RLIMIT_NOFILE 与 RLIMIT_FSIZE 来自 InitSpec（provider.Limits）；exec 环境未给 FSize 时取可写 tmpfs 中
+// 最大者的大小（/tmp 与 /out）：单个文件不会合法地超过它。
 func newHelperLauncher(helperFD int, s InitSpec) *helperLauncher {
-	l := &helperLauncher{helperFD: helperFD, kind: s.Kind, noFile: workloadNoFile}
+	l := &helperLauncher{helperFD: helperFD, kind: s.Kind, noFile: s.NoFile}
 	if s.Kind == KindExec {
-		l.fsize = uint64(max(s.TmpBytes, s.OutBytes))
+		l.fsize = s.FSize
+		if l.fsize == 0 {
+			l.fsize = uint64(max(s.TmpBytes, s.OutBytes))
+		}
 	}
 	return l
 }

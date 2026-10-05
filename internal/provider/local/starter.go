@@ -15,6 +15,7 @@ import (
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/cgroup"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/rootfs"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/sandbox"
 )
 
@@ -57,6 +58,45 @@ func NewProcessStarter() (*ProcessStarter, error) {
 	return &ProcessStarter{}, nil
 }
 
+// 规格未给出时的默认值：RLIMIT_NOFILE 1024（Go 运行时会把自身软限调高，workload 不继承）；/tmp tmpfs 64 MiB。
+const (
+	defaultNoFile   = 1024
+	defaultTmpBytes = 64 << 20
+)
+
+// launchSpecFor 由 provider.EnvSpec 构造启动进程转交给 init 的 LaunchSpec（规格 §4.5 的隔离配置）：
+// GID 范围与 UID 范围相同；模板按名称解析（空为默认模板）；rlimit 与挂载来自 Limits/Mounts。
+// 只做形状校验（rootfs.Template.Validate）；宿主路径是否存在由装配在启动时 Ensure。
+func launchSpecFor(spec provider.EnvSpec) (sandbox.LaunchSpec, error) {
+	name := spec.Template
+	if name == "" {
+		name = rootfs.DefaultTemplateName
+	}
+	tpl, err := rootfs.ResolveTemplate(name)
+	if err != nil {
+		return sandbox.LaunchSpec{}, fmt.Errorf("local: 模板 %q: %w", name, err)
+	}
+	tmp := spec.Limits.TmpBytes
+	if tmp <= 0 {
+		tmp = defaultTmpBytes
+	}
+	nofile := spec.Limits.NoFile
+	if nofile == 0 {
+		nofile = defaultNoFile
+	}
+	return sandbox.LaunchSpec{
+		UIDBase: spec.UIDBase, UIDSize: spec.UIDSize,
+		GIDBase: spec.UIDBase, GIDSize: spec.UIDSize,
+		Hostname: envHostname,
+		Init: sandbox.InitSpec{
+			Kind: string(spec.Kind), Template: tpl, TmpBytes: tmp,
+			Workspace: spec.Mounts.Workspace, GatewaySocket: spec.Mounts.GatewaySocket,
+			In: spec.Mounts.In, OutBytes: spec.Mounts.OutBytes,
+			NoFile: nofile, FSize: spec.Limits.FSize,
+		},
+	}, nil
+}
+
 func isSubreaper() bool {
 	var v int32
 	_, _, e := syscall.RawSyscall6(syscall.SYS_PRCTL, prGetChildSubreaper, uintptr(unsafe.Pointer(&v)), 0, 0, 0, 0)
@@ -69,13 +109,12 @@ func (s *ProcessStarter) StartInit(ctx context.Context, spec provider.EnvSpec, _
 		// 否则 init 会被收养到 server 之外，starter 无法收割它。
 		return nil, 0, errors.New("local: 本进程不是 child subreaper（须经 NewProcessStarter 构造启动器）")
 	}
-	b, err := json.Marshal(sandbox.LaunchSpec{
-		UIDBase: spec.UIDBase, UIDSize: spec.UIDSize,
-		GIDBase: spec.UIDBase, GIDSize: spec.UIDSize,
-		Hostname: envHostname,
-		Env:      s.initEnv,
-		FailAt:   s.failAt,
-	})
+	ls, err := launchSpecFor(spec)
+	if err != nil {
+		return nil, 0, err
+	}
+	ls.Env, ls.FailAt = s.initEnv, s.failAt
+	b, err := json.Marshal(ls)
 	if err != nil {
 		return nil, 0, err
 	}

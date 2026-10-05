@@ -23,6 +23,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/cgroup"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider/providertest"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/rootfs"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/sandbox"
 )
 
@@ -573,7 +574,7 @@ func newProviderWith(t *testing.T, installID string, starter EnvStarter) *Provid
 func testEnvSpec(installID, envID string) provider.EnvSpec {
 	return provider.EnvSpec{
 		EnvID: envID, InstallID: installID, Kind: provider.KindTask,
-		UIDBase: 100000, UIDSize: 4096, Template: "test",
+		UIDBase: 100000, UIDSize: 4096, Template: rootfs.DefaultTemplateName, // 测试 init 忽略模板内容；名称须可解析
 		Limits: provider.Limits{MemoryMax: 256 << 20, PidsMax: 512, CPUQuotaUs: 100000},
 	}
 }
@@ -1179,4 +1180,39 @@ func TestLocalContractProductionStarter(t *testing.T) {
 			return blockStart(t, p.(*Provider), envID)
 		},
 	})
+}
+
+// TestLaunchSpecForFillsInit：生产启动器把 EnvSpec 的 Limits/Mounts/Template 填入 LaunchSpec.Init（规格 §4.5）；
+// 规格未给出时取默认值（nofile 1024、/tmp 64 MiB、默认模板）；未知模板名报错。不需要 root。
+func TestLaunchSpecForFillsInit(t *testing.T) {
+	ls, err := launchSpecFor(provider.EnvSpec{
+		EnvID: "e1", Kind: provider.KindExec, UIDBase: 100000, UIDSize: 4096,
+		Limits: provider.Limits{NoFile: 256, FSize: 1 << 20, TmpBytes: 8 << 20},
+		Mounts: provider.Mounts{In: "/srv/in", OutBytes: 4 << 20},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := ls.Init
+	if ls.GIDBase != 100000 || ls.GIDSize != 4096 || ls.Hostname != envHostname {
+		t.Fatalf("LaunchSpec = %+v", ls)
+	}
+	if in.Kind != "exec" || in.NoFile != 256 || in.FSize != 1<<20 || in.TmpBytes != 8<<20 || in.In != "/srv/in" || in.OutBytes != 4<<20 {
+		t.Fatalf("Init = %+v", in)
+	}
+	if len(in.Template.Paths) == 0 {
+		t.Fatal("默认模板未解析")
+	}
+
+	ls, err = launchSpecFor(provider.EnvSpec{Kind: provider.KindTask, UIDBase: 100000, UIDSize: 4096,
+		Mounts: provider.Mounts{Workspace: "/var/ws", GatewaySocket: "/run/gw.sock"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ls.Init.NoFile != defaultNoFile || ls.Init.TmpBytes != defaultTmpBytes || ls.Init.Workspace != "/var/ws" || ls.Init.GatewaySocket != "/run/gw.sock" {
+		t.Fatalf("默认值未填充：%+v", ls.Init)
+	}
+	if _, err := launchSpecFor(provider.EnvSpec{Kind: provider.KindTask, UIDBase: 100000, UIDSize: 4096, Template: "no-such"}); err == nil {
+		t.Fatal("未知模板应报错")
+	}
 }

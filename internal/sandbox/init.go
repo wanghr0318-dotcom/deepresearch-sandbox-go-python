@@ -40,6 +40,10 @@ type InitSpec struct {
 	// exec 环境：/in 只读输入目录（可为空）；/out tmpfs 的大小（必须为正，nr_inodes=1024）。
 	In       string `json:"in,omitempty"`
 	OutBytes int64  `json:"out_bytes,omitempty"`
+	// NoFile 是 workload 的 RLIMIT_NOFILE（软、硬限相同），0 由 validate 填为 workloadNoFile；FSize 是 exec 环境 workload 的 RLIMIT_FSIZE，
+	// 0 表示由 init 取可写 tmpfs（/tmp、/out）中最大者。二者来自 provider.Limits（规格 §4.5）。
+	NoFile uint64 `json:"nofile"`
+	FSize  uint64 `json:"fsize,omitempty"`
 }
 
 func (s *InitSpec) validate() error {
@@ -48,6 +52,9 @@ func (s *InitSpec) validate() error {
 	}
 	if s.TmpBytes <= 0 {
 		return fmt.Errorf("tmp_bytes 必须为正（实际 %d）", s.TmpBytes)
+	}
+	if s.NoFile == 0 {
+		s.NoFile = workloadNoFile // 规格 §4.5 的默认值；launcher 据此设置 RLIMIT_NOFILE
 	}
 	abs := func(what, p string) error {
 		if p != "" && (!filepath.IsAbs(p) || filepath.Clean(p) != p) {
