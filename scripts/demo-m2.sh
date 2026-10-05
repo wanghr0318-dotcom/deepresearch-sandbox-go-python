@@ -152,6 +152,7 @@ env_file_value() {
 secrets() {
   [ -z "$MODEL_KEY" ] || printf '%s\n' "$MODEL_KEY"
   [ -z "$SEARCH_KEY" ] || printf '%s\n' "$SEARCH_KEY"
+  [ -z "${AGENTBOX_TOKEN:-}" ] || printf '%s\n' "$AGENTBOX_TOKEN"
 }
 
 # no_secret <描述> <文件...>：文件中不含任何 Key 的值（只报告位置，不回显 Key）。
@@ -310,6 +311,13 @@ else
   ok "已新建空库 $DEMO_DB"
 fi
 ok "数据目录已清空：$DATA"
+# 配置了模型上游时 server 启用用户账号，运维调用必须带 Bearer token：生成随机 api.token（0600），
+# CLI 经环境变量 AGENTBOX_TOKEN 读取（不出现在命令行，不打印）。
+mkdir -p "$DATA"
+(umask 077; od -An -N24 -tx1 /dev/urandom | tr -d ' \n' >"$DATA/api.token")
+AGENTBOX_TOKEN=$(cat "$DATA/api.token")
+export AGENTBOX_TOKEN
+ok "运维 token 已生成：$DATA/api.token（0600）"
 
 step "安装 worker 包到 $WORKER_DIR（agentbox_worker、deepresearch）"
 install -d -m 0755 "$WORKER_DIR"
@@ -354,7 +362,7 @@ fi
 
 step "启动 agentbox server（生产启动器、Gateway、Worker = python3 -m deepresearch）"
 info "agentbox server ${FLAGS[*]}"
-AGENTBOX_MODEL_API_KEY="$MODEL_KEY" AGENTBOX_SEARCH_API_KEY="$SEARCH_KEY" "$BIN" server "${FLAGS[@]}" >"$SERVER_LOG" 2>&1 &
+env -u AGENTBOX_TOKEN AGENTBOX_MODEL_API_KEY="$MODEL_KEY" AGENTBOX_SEARCH_API_KEY="$SEARCH_KEY" "$BIN" server "${FLAGS[@]}" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 wait_for "server 进入 normal 模式" 60 server_ready
 ok "server pid $SERVER_PID 已就绪（$AGENTBOX_ADDR，日志 $SERVER_LOG）"
