@@ -104,6 +104,8 @@ sudo sh -c 'set -a; . deploy/agentbox.env.example; exec ./bin/agentbox verify-in
 
 Worker 在沙箱中以映射 UID 运行，只读看到宿主的 `/usr`、`/etc` 的子集与 `/opt/agentbox`，可写的只有 `/workspace`（宿主 `<data>/workspaces/<task_id>`）与限额 tmpfs。M1 的结果下载端点尚未实现（`agentbox task result` 返回 501）：产物按固定版本保存在 `<data>/blobs`，版本与 sha256 见 `task watch` 的 `artifact_saved` 事件。
 
+**Gateway 配置**：每个 attempt 在 `<data>/gateway/<attempt_id>.sock` 有一个 Gateway 入口，挂载到沙箱内的 `/run/agentbox/gateway.sock`（属主为环境映射 uid 1000、0600）；attempt 结束或取消生效时先在数据库撤销访问、再关闭入口。供应商 Key 只从宿主环境变量 `AGENTBOX_MODEL_API_KEY`、`AGENTBOX_SEARCH_API_KEY` 读取，不进入 Worker 的 init、沙箱环境变量与日志；`--worker-env` 的键须在白名单中（如 `PYTHONPATH`）。相关标志（含义与默认值见配置示例）：`--default-budget-micro` / `--budget-cap-micro`（task 层预算，微美元；任务可用 `limits.budget_micro` 指定，超过上限返回 `400 invalid_limits`）、`--model-base-url` / `--model-name` / `--model-price-in-micro-per-mtok` / `--model-price-out-micro-per-mtok`（OpenAI 兼容模型上游；不设 `--model-base-url` 时不提供模型端点）、`--search-provider ddg_lite|tavily|fake`、`--upstream-allow-private`（显式放行的私有上游，例如本机模型服务）。`agentbox task inspect` 除 attempt 与 checkpoint 外列出每个 Gateway 调用及其 try（端点、状态、费用、延迟、上游请求 ID；不含请求与响应正文）。
+
 **Python Worker SDK 测试**：
 
 ```bash

@@ -1090,11 +1090,27 @@ func (m *memStore) PersistRunTime(_ context.Context, taskID, attemptID string, t
 	return ts.RunTimeMs, nil
 }
 
-func (m *memStore) RevokeAttemptAccess(_ context.Context, attemptID, _ string) error {
+func (m *memStore) RevokeAttemptAccess(_ context.Context, attemptID, reason string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.log.add("revoke_db:%s", attemptID)
+	m.log.add("revoke_db:%s:%s", attemptID, reason)
 	return m.enter("RevokeAttemptAccess")
+}
+
+func (m *memStore) LookupAttempt(_ context.Context, attemptID string) (string, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if at, ok := m.attempts[attemptID]; ok {
+		return at.TaskID, at.EnvID, nil
+	}
+	return "", "", persistence.ErrNotFound
+}
+
+func (m *memStore) AppendHostEvent(_ context.Context, taskID, attemptID, typ string, _ json.RawMessage) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.log.add("host_event:%s:%s:%s", taskID, attemptID, typ)
+	return nil
 }
 
 func (m *memStore) task(id string) TaskState {
@@ -1162,8 +1178,31 @@ type fkEnv struct {
 }
 
 func (f *fkEnv) CreateEnv(_ context.Context, s EnvSpec) (*Outcome, error) {
-	f.log.add("create_env:%s", s.EnvID)
+	f.log.add("create_env:%s sock=%s", s.EnvID, s.GatewaySocket)
+	if s.BindErr != nil { // 与适配器的约定相同：绑定失败不创建环境，按创建失败分类
+		return &Outcome{Class: "create_failed_env"}, s.BindErr
+	}
 	return nil, nil
+}
+
+// logAccess 把 Gateway 入口的绑定与撤销记入日志（以断言与 Store 撤销的先后），再交给 FakeAccess。
+type logAccess struct {
+	*FakeAccess
+	log     *fkLog
+	bindErr error
+}
+
+func (a logAccess) Bind(ctx context.Context, attemptID, envID string) (string, error) {
+	a.log.add("bind:%s:%s", attemptID, envID)
+	if a.bindErr != nil {
+		return "", a.bindErr
+	}
+	return a.FakeAccess.Bind(ctx, attemptID, envID)
+}
+
+func (a logAccess) Revoke(ctx context.Context, attemptID, reason string) error {
+	a.log.add("revoke_gw:%s:%s", attemptID, reason)
+	return a.FakeAccess.Revoke(ctx, attemptID, reason)
 }
 
 func (f *fkEnv) StopEnv(_ context.Context, envID string) (StopReport, error) {
@@ -1194,7 +1233,7 @@ type fkRun struct {
 }
 
 func (r *fkRunner) Run(ctx context.Context, spec RunSpec, controls <-chan Control) Outcome {
-	r.log.add("run:%s sock=%s", spec.AttemptID, spec.GatewaySocket)
+	r.log.add("run:%s", spec.AttemptID)
 	h := &fkRun{spec: spec, controls: controls, result: make(chan Outcome, 1), cause: make(chan error, 1)}
 	select {
 	case r.runs <- h:
@@ -1244,6 +1283,7 @@ type actorHarness struct {
 	fatal  chan error
 
 	limit       time.Duration // Deps.RunTimeLimit 的返回值
+	bindErr     error         // 非 nil 时 Access.Bind 返回它
 	accountMu   sync.Mutex
 	accounts    []string // OnStopRecorded 的调用：attempt@stoppedAt
 	accountFail []error
@@ -1255,6 +1295,9 @@ func (h *actorHarness) accountCalls() []string {
 	return append([]string(nil), h.accounts...)
 }
 
+// testGatewaySocket 是测试中 Access.Bind 返回的宿主侧 socket 路径。
+const testGatewaySocket = "/data/gateway/att.sock"
+
 func queuedTask(id string) TaskState {
 	return TaskState{TaskID: id, Status: "queued", Desired: "run", ControlVersion: 1, AppliedControlVersion: 1,
 		MaxFaultRetries: 3, Limits: json.RawMessage(`{}`), Spec: json.RawMessage(`{}`)}
@@ -1262,7 +1305,7 @@ func queuedTask(id string) TaskState {
 
 func newActorHarness(t *testing.T, tasks ...TaskState) *actorHarness {
 	clk, log := &fkClock{now: t0}, &fkLog{}
-	acc := &FakeAccess{}
+	acc := &FakeAccess{Socket: testGatewaySocket}
 	h := &actorHarness{t: t, clk: clk, log: log, st: newMemStore(log, clk, tasks...),
 		adm: &fkAdmission{log: log, clk: clk, held: map[uint64]bool{}},
 		env: &fkEnv{log: log, clk: clk, acc: acc}, rn: &fkRunner{log: log, runs: make(chan *fkRun, 8)},
@@ -1284,7 +1327,7 @@ func newActorHarness(t *testing.T, tasks ...TaskState) *actorHarness {
 func (h *actorHarness) deps() Deps {
 	var mu sync.Mutex
 	n := 0
-	return Deps{Store: h.st, Admission: h.adm, Env: h.env, Runner: h.rn, Access: h.acc, Clock: h.clk,
+	return Deps{Store: h.st, Admission: h.adm, Env: h.env, Runner: h.rn, Access: logAccess{h.acc, h.log, h.bindErr}, Clock: h.clk,
 		IDs: func() string {
 			mu.Lock()
 			defer mu.Unlock()
@@ -1387,7 +1430,7 @@ func TestActorHappyPathEffectOrder(t *testing.T) {
 	h := newActorHarness(t, queuedTask("t1"))
 	h.spawn("t1")
 	r := h.nextRun()
-	if r.attemptID() != "id-1" || r.attemptNo() != 1 || r.spec.EnvID != "id-2" || r.spec.GatewaySocket != FakeGatewaySocket {
+	if r.attemptID() != "id-1" || r.attemptNo() != 1 || r.spec.EnvID != "id-2" {
 		t.Fatalf("RunSpec 不符: %+v", r.spec)
 	}
 	if r.taskStatus() != "running" {
@@ -1397,10 +1440,13 @@ func TestActorHappyPathEffectOrder(t *testing.T) {
 	r.finish(success())
 	h.waitDone() // 终态且资源已归还：actor 自行退出
 
-	// 申请槽位 → 创建 attempt → 创建环境 → 启动 → 撤销访问 → 停止 → 归还槽位；裁决在 Worker 结束之后。
+	// 申请槽位 → 创建 attempt → 绑定 Gateway 入口 → 创建环境（挂载该 socket）→ 启动 → 撤销访问（DB 先提交、
+	// 再关连接）→ 停止 → 归还槽位；裁决在 Worker 结束之后。
 	for _, pair := range [][2]string{
-		{"acquire:1", "create_attempt:id-1"}, {"create_attempt:id-1", "create_env:id-2"},
-		{"create_env:id-2", "run:id-1"}, {"run:id-1", "revoke_db:id-1"}, {"revoke_db:id-1", "stop:id-2 revoked=true"},
+		{"acquire:1", "create_attempt:id-1"}, {"create_attempt:id-1", "bind:id-1:id-2"},
+		{"bind:id-1:id-2", "create_env:id-2 sock=" + testGatewaySocket},
+		{"create_env:id-2", "run:id-1"}, {"run:id-1", "revoke_db:id-1:attempt_stopping"},
+		{"revoke_db:id-1", "revoke_gw:id-1:attempt_stopping"}, {"revoke_gw:id-1", "stop:id-2 revoked=true"},
 		{"stop:id-2", "release:1"}, {"run:id-1", "finalize:id-1:succeeded"},
 	} {
 		h.before(pair[0], pair[1])
@@ -1552,6 +1598,61 @@ func TestActorCancelAfterReadyUsesProtocol(t *testing.T) {
 	if ts := h.st.task("t1"); ts.Status != "cancelled" {
 		t.Errorf("任务应 cancelled: %+v", ts)
 	}
+}
+
+// ---- Gateway 入口：绑定与撤销顺序（§9.1） ----
+
+// Store 撤销暂时失败时不关闭 Gateway 入口（它在 Store 中仍是 active，持久化检查才是执行点）；物理停止
+// 不等待撤销；Store 队列补提交成功之后才关闭入口。
+func TestActorRevokesGatewayOnlyAfterStoreCommit(t *testing.T) {
+	h := newActorHarness(t, queuedTask("t1"))
+	h.st.setFail("RevokeAttemptAccess", persistence.ErrUnavailable)
+	h.spawn("t1")
+	r := h.nextRun()
+	r.ready()
+	r.finish(success())
+	h.waitDone()
+	if i := h.log.index("stop:id-2 revoked=false", 1); i < 0 {
+		t.Fatalf("Store 撤销失败时应先物理停止、不关闭入口；日志: %v", h.log.all())
+	}
+	db2, gw := h.log.index("revoke_db:id-1", 2), h.log.index("revoke_gw:id-1", 1)
+	if db2 < 0 || gw < 0 || gw < db2 || h.log.count("revoke_gw:") != 1 {
+		t.Fatalf("入口应在 Store 补提交成功之后关闭且只关闭一次；日志: %v", h.log.all())
+	}
+	if got := h.acc.Revoked(); !reflect.DeepEqual(got, []string{"id-1"}) {
+		t.Errorf("Gateway 撤销 = %v", got)
+	}
+}
+
+// 取消生效时撤销原因为 cancel（Gateway 据此取消在途上游 try），Store 与 Gateway 使用同一原因。
+func TestActorCancelRevokesWithCancelReason(t *testing.T) {
+	h := newActorHarness(t, queuedTask("t1"))
+	a := h.spawn("t1")
+	r := h.nextRun()
+	h.st.setControl("t1", "cancel")
+	a.Notify()
+	h.waitFor("停止环境", h.logged("stop:id-2", 1))
+	h.before("revoke_db:id-1:"+RevokeReasonCancel, "revoke_gw:id-1:"+RevokeReasonCancel)
+	r.finish(crash())
+	h.waitDone()
+	if got := h.acc.RevokeReasons(); !reflect.DeepEqual(got, []string{RevokeReasonCancel}) {
+		t.Errorf("撤销原因 = %v，期望 [cancel]", got)
+	}
+}
+
+// 绑定失败：不创建环境、不启动 Worker，按创建失败裁决；仍撤销访问（清理可能残留的入口）。
+func TestActorBindFailureFailsAttempt(t *testing.T) {
+	h := newActorHarness(t, queuedTask("t1"))
+	h.bindErr = errors.New("socket 目录不可写")
+	h.spawn("t1")
+	h.waitDone()
+	if ts := h.st.task("t1"); ts.Status != "failed" || ts.StatusReason != "create_failed_env" {
+		t.Errorf("绑定失败应裁决为 create_failed_env: %+v", ts)
+	}
+	if h.log.count("run:") != 0 {
+		t.Errorf("绑定失败不应启动 Worker；日志: %v", h.log.all())
+	}
+	h.before("revoke_db:id-1", "revoke_gw:id-1")
 }
 
 func TestActorPauseThenResume(t *testing.T) {

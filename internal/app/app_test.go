@@ -11,9 +11,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -27,6 +30,8 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/admission"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/datadir"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence/postgres"
@@ -918,20 +923,28 @@ func countOf(xs []string, x string) int {
 // 服务端上限；其余键原样保留；永远无法满足容量的 memory_max 被拒绝。
 func TestEffectiveLimits(t *testing.T) {
 	c := Config{DefaultRunTime: time.Hour, RunTimeCap: 24 * time.Hour, DefaultMemoryBytes: 1 << 30,
-		Capacity: admission.Capacity{RunSlots: 4, MemoryBytes: 8 << 30}}
+		Capacity: admission.Capacity{RunSlots: 4, MemoryBytes: 8 << 30}, DefaultBudgetMicro: 2_000_000, BudgetCapMicro: 50_000_000}
+	const b = `"budget_micro":2000000,`
 	cases := []struct {
 		in, want, err string
 	}{
-		{in: ``, want: `{"max_run_time_ms":3600000}`},
-		{in: `{}`, want: `{"max_run_time_ms":3600000}`},
-		{in: `{"memory_max":1024,"x":"keep"}`, want: `{"max_run_time_ms":3600000,"memory_max":1024,"x":"keep"}`},
-		{in: `{"max_run_time_ms":60000}`, want: `{"max_run_time_ms":60000}`},
-		{in: `{"max_run_time_ms":86400000}`, want: `{"max_run_time_ms":86400000}`},
+		{in: ``, want: `{` + b + `"max_run_time_ms":3600000}`},
+		{in: `{}`, want: `{` + b + `"max_run_time_ms":3600000}`},
+		{in: `{"memory_max":1024,"x":"keep"}`, want: `{` + b + `"max_run_time_ms":3600000,"memory_max":1024,"x":"keep"}`},
+		{in: `{"max_run_time_ms":60000}`, want: `{` + b + `"max_run_time_ms":60000}`},
+		{in: `{"max_run_time_ms":86400000}`, want: `{` + b + `"max_run_time_ms":86400000}`},
 		{in: `{"max_run_time_ms":0}`, err: "max_run_time_ms"},
 		{in: `{"max_run_time_ms":-5}`, err: "负数"},
 		{in: `{"max_run_time_ms":86400001}`, err: "max_run_time_ms"},
 		{in: `{"max_run_time_ms":1.5}`, err: "不合法"},
 		{in: `{"memory_max":17179869184}`, err: "永远无法被授予"},
+		// budget_micro（§9.6）：显式值须为正整数且不超过上限，随任务存储。
+		{in: `{"budget_micro":5000}`, want: `{"budget_micro":5000,"max_run_time_ms":3600000}`},
+		{in: `{"budget_micro":50000000}`, want: `{"budget_micro":50000000,"max_run_time_ms":3600000}`},
+		{in: `{"budget_micro":0}`, err: "budget_micro"},
+		{in: `{"budget_micro":50000001}`, err: "budget_micro"},
+		{in: `{"budget_micro":-1}`, err: "负数"},
+		{in: `{"budget_micro":1.5}`, err: "不合法"},
 	}
 	for _, tc := range cases {
 		got, err := c.effectiveLimits(json.RawMessage(tc.in))
@@ -954,5 +967,228 @@ func TestEffectiveLimits(t *testing.T) {
 	bad.DefaultRunTime, bad.RunTimeCap = 48*time.Hour, 24*time.Hour
 	if err := bad.validate(); err == nil || !strings.Contains(err.Error(), "运行时限") {
 		t.Fatal("默认时限超过上限的配置应被拒绝")
+	}
+	// init.budget_limits 取存储的 budget_micro。
+	l, err := parseLimits(stored)
+	if err != nil || string(budgetLimits(l)) != `{"budget_micro":2000000}` {
+		t.Fatalf("budget_limits = %s, %v", budgetLimits(l), err)
+	}
+	bad = c.withDefaults()
+	bad.DefaultBudgetMicro, bad.BudgetCapMicro = 60_000_000, 50_000_000
+	if err := bad.validate(); err == nil || !strings.Contains(err.Error(), "默认预算") {
+		t.Fatalf("默认预算超过上限的配置应被拒绝，得到 %v", err)
+	}
+}
+
+// TestGatewayConfigValidation：搜索供应商只能是 fake | tavily | ddg_lite（fake 须同时设置 upstream_allow_private，
+// tavily 须有 Key）；Worker 环境变量只允许白名单中的键（凭据不得经环境变量进入沙箱）。
+func TestGatewayConfigValidation(t *testing.T) {
+	base := testConfig().withDefaults()
+	cases := []struct {
+		name string
+		mod  func(c *Config)
+		err  string
+	}{
+		{"默认 ddg_lite", func(*Config) {}, ""},
+		{"未知供应商", func(c *Config) { c.SearchProvider = "google" }, "fake、tavily 或 ddg_lite"},
+		{"fake 无 allow-private", func(c *Config) { c.SearchProvider = "fake" }, "upstream_allow_private"},
+		{"fake 有 allow-private", func(c *Config) { c.SearchProvider, c.UpstreamAllowPrivate = "fake", []string{"127.0.0.1"} }, ""},
+		{"tavily 无 Key", func(c *Config) { c.SearchProvider = "tavily" }, "AGENTBOX_SEARCH_API_KEY"},
+		{"tavily 有 Key", func(c *Config) { c.SearchProvider, c.SearchAPIKey = "tavily", "k" }, ""},
+		{"模型无名", func(c *Config) { c.Model.BaseURL = "https://m.example/v1" }, "模型名"},
+		{"Worker 环境变量含 Key", func(c *Config) { c.WorkerEnv = []string{"PYTHONPATH=/opt", "OPENAI_API_KEY=x"} }, "OPENAI_API_KEY"},
+		{"Worker 环境变量白名单", func(c *Config) { c.WorkerEnv = []string{"PYTHONPATH=/opt", "PYTHONUNBUFFERED=1"} }, ""},
+	}
+	for _, tc := range cases {
+		c := base
+		tc.mod(&c)
+		err := c.validate()
+		switch {
+		case tc.err == "" && err != nil:
+			t.Errorf("%s：应通过，得到 %v", tc.name, err)
+		case tc.err != "" && (err == nil || !strings.Contains(err.Error(), tc.err)):
+			t.Errorf("%s：应拒绝（含 %q），得到 %v", tc.name, tc.err, err)
+		}
+	}
+	if task.RevokeReasonCancel != call.ReasonCancel {
+		t.Fatalf("task.RevokeReasonCancel = %q 与 call.ReasonCancel = %q 不一致", task.RevokeReasonCancel, call.ReasonCancel)
+	}
+}
+
+// ---- Gateway 装配 ----
+
+// gatewayWorker 是经 Gateway 发起一次模型调用的 Worker：读取 init（交给 inits）、发出 ready，经本 attempt 的
+// Unix socket（<data>/gateway/<attempt_id>.sock，fake provider 的 Worker 在宿主进程内运行）POST
+// /v1/chat/completions，把响应状态交给 replies，然后发出 result。envs 收到 Worker 的环境变量。
+func gatewayWorker(dataDir string, inits, replies chan<- string, envs chan<- []string) fake.Program {
+	return func(ctx context.Context, spec provider.ExecSpec, stdin io.Reader, stdout, _ io.Writer) provider.ExitStatus {
+		envs <- spec.Env
+		line, err := bufio.NewReader(stdin).ReadBytes('\n')
+		if err != nil {
+			return provider.ExitStatus{Code: 2}
+		}
+		inits <- string(line)
+		var in protocol.Init
+		if err := json.Unmarshal(line, &in); err != nil {
+			return provider.ExitStatus{Code: 2}
+		}
+		emit := func(m map[string]any) {
+			b, _ := json.Marshal(m)
+			_, _ = stdout.Write(append(b, '\n'))
+		}
+		emit(map[string]any{"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "task",
+			"worker": map[string]any{"name": "app-gateway-test", "version": "0"}, "capabilities": []string{}})
+		sock := filepath.Join(gatewayDir(dataDir), in.AttemptID+".sock")
+		client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", sock)
+		}}}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://gateway/v1/chat/completions",
+			strings.NewReader(`{"messages":[{"role":"user","content":"ping"}]}`))
+		if err != nil {
+			return provider.ExitStatus{Code: 2}
+		}
+		req.Header.Set("X-Agentbox-Call-Id", "root/s1/chat/1")
+		resp, err := client.Do(req)
+		if err != nil {
+			replies <- "error: " + err.Error()
+		} else {
+			b, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			replies <- fmt.Sprintf("%d %s blob=%s", resp.StatusCode, b, resp.Header.Get("X-Agentbox-Blob"))
+		}
+		emit(map[string]any{"type": "result", "v": 1, "seq": 2, "summary": "done", "outputs": []string{}})
+		return provider.ExitStatus{Code: 0}
+	}
+}
+
+// TestGatewayChatCallThroughSocket（Plan 7 Task 5 装配）：真实的 edge、call 协调器与 chat adapter 装配在 app 中，
+// Worker 经本 attempt 的 Unix socket 调用 /v1/chat/completions，请求经验证 dialer 到达进程内 fake 模型上游
+// （upstream_allow_private 放行），结算后 inspect 汇总该调用与 try（G11：task_id → attempt_id → call_id → try_no）。
+// 供应商 Key 只出现在上游请求的 Authorization 头中：不在 init、Worker 环境变量、服务日志、事件与 inspect 中。
+func TestGatewayChatCallThroughSocket(t *testing.T) {
+	key := "sk-agentbox-test-" + randomHex()
+	var upstreamCalls atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		if r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer "+key {
+			http.Error(w, "unexpected request", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, `{"id":"chatcmpl-test-1","object":"chat.completion","choices":[{"index":0,`+
+			`"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":7}}`); err != nil {
+			t.Errorf("fake 上游写响应: %v", err)
+		}
+	}))
+	defer up.Close()
+	upURL, err := url.Parse(up.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h := newHarness(t)
+	inits, replies, envs := make(chan string, 4), make(chan string, 4), make(chan []string, 4)
+	h.prov = fake.New(gatewayWorker(h.dir, inits, replies, envs))
+	cfg := testConfig()
+	cfg.Model = ModelConfig{BaseURL: up.URL + "/v1", Name: "m-test", APIKey: key,
+		Pricing: upstream.Pricing{InputMicroPerMTok: 1_000_000, OutputMicroPerMTok: 2_000_000}}
+	cfg.SearchProvider, cfg.UpstreamAllowPrivate = upstream.SearchFake, []string{upURL.Host}
+	cfg.WorkerEnv = []string{"PYTHONPATH=/opt/agentbox"}
+	h.start(cfg, task.SystemClock())
+	base := h.waitAddr()
+
+	id := submit(t, base, "gw-1", `{}`)
+	var reply string
+	select {
+	case reply = <-replies:
+	case <-time.After(60 * time.Second):
+		t.Fatal("Worker 未完成 Gateway 调用")
+	}
+	if !strings.HasPrefix(reply, "200 ") || !strings.Contains(reply, "pong") {
+		t.Fatalf("Gateway 调用 = %s", reply)
+	}
+	eventually(t, "任务到达终态", nil, func() bool {
+		st, _ := h.taskStatus(id)
+		return task.IsTerminal(st)
+	})
+	if st, _ := h.taskStatus(id); st != "succeeded" {
+		t.Fatalf("任务结束为 %s", st)
+	}
+	if n := upstreamCalls.Load(); n != 1 {
+		t.Fatalf("上游收到 %d 次请求，期望 1", n)
+	}
+
+	st, body := httpDo(t, "GET", base+"/tasks/"+id+"/inspect", "")
+	var in struct {
+		Attempts []struct {
+			AttemptID string `json:"attempt_id"`
+			EnvID     string `json:"env_id"`
+		} `json:"attempts"`
+		Calls []struct {
+			CallID            string `json:"call_id"`
+			Endpoint          string `json:"endpoint"`
+			State             string `json:"state"`
+			FirstAttemptID    string `json:"first_attempt_id"`
+			TriesUsed         int64  `json:"tries_used"`
+			CostChargedMicro  int64  `json:"cost_charged_micro"`
+			UpstreamRequestID string `json:"upstream_request_id"`
+			ResultRef         string `json:"result_ref"`
+			Tries             []struct {
+				TryNo     int64  `json:"try_no"`
+				AttemptID string `json:"attempt_id"`
+				EnvID     string `json:"env_id"`
+				Outcome   string `json:"outcome"`
+				CostMicro int64  `json:"cost_micro"`
+			} `json:"tries"`
+		} `json:"calls"`
+	}
+	if st != http.StatusOK || json.Unmarshal(body, &in) != nil || len(in.Attempts) != 1 || len(in.Calls) != 1 {
+		t.Fatalf("inspect = %d %s", st, body)
+	}
+	c, att := in.Calls[0], in.Attempts[0]
+	// 5 个输入 token × 1 µ$ + 7 个输出 token × 2 µ$ = 19 µ$（按 usage 结算）。
+	if c.CallID != "root/s1/chat/1" || c.Endpoint != "/v1/chat/completions" || c.State != "completed" ||
+		c.FirstAttemptID != att.AttemptID || c.TriesUsed != 1 || c.CostChargedMicro != 19 ||
+		c.UpstreamRequestID != "chatcmpl-test-1" || len(c.ResultRef) != 64 || !strings.Contains(reply, "blob="+c.ResultRef) {
+		t.Fatalf("inspect 中的调用 = %+v（attempt %s，回复 %s）", c, att.AttemptID, reply)
+	}
+	if len(c.Tries) != 1 || c.Tries[0].TryNo != 1 || c.Tries[0].AttemptID != att.AttemptID || c.Tries[0].EnvID != att.EnvID ||
+		c.Tries[0].Outcome != "ok" || c.Tries[0].CostMicro != 19 {
+		t.Fatalf("inspect 中的 try = %+v", c.Tries)
+	}
+	if strings.Contains(string(body), "ping") || strings.Contains(string(body), "pong") {
+		t.Errorf("inspect 不应包含请求或响应正文：%s", body)
+	}
+
+	// init 带 budget_limits（默认预算）；凭据不在 init 与 Worker 环境变量中。
+	initLine := <-inits
+	if !strings.Contains(initLine, `"budget_limits":{"budget_micro":2000000}`) {
+		t.Errorf("init 缺少 budget_limits：%s", initLine)
+	}
+	env := <-envs
+	var events string
+	h.queryRow("SELECT COALESCE(string_agg(type || ' ' || payload::text, E'\n'), '') FROM events WHERE task_id = $1",
+		[]any{id}, &events)
+	h.mu.Lock()
+	logs := h.logs.String()
+	h.mu.Unlock()
+	for name, s := range map[string]string{"init": initLine, "Worker 环境变量": strings.Join(env, "\n"), "服务日志": logs,
+		"事件": events, "inspect": string(body)} {
+		if strings.Contains(s, key) {
+			t.Errorf("供应商 Key 出现在%s中", name)
+		}
+	}
+	if !strings.Contains(logs, `"call_id":"root/s1/chat/1"`) {
+		t.Errorf("服务日志应记录调用元数据（检查本身有效）")
+	}
+
+	// 任务结束后入口已撤销：socket 文件已删除。
+	if _, err := os.Stat(filepath.Join(gatewayDir(h.dir), att.AttemptID+".sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("attempt 结束后 socket 仍存在：%v", err)
+	}
+	h.cancel()
+	if err := h.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
 	}
 }

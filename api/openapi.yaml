@@ -220,7 +220,7 @@ paths:
       summary: Diagnostic timeline (§14.6); also served in diagnostic mode
       responses:
         '200':
-          description: Attempts with outcome, exit and OOM diagnosis, environment and cleanup state, checkpoints
+          description: Attempts with outcome, exit and OOM diagnosis, environment and cleanup state, checkpoints, and Gateway calls with their tries (task_id → attempt_id → call_id → try_no)
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Inspection'}
@@ -406,9 +406,45 @@ components:
         attempt_id: {type: string}
         commit_seq: {type: integer, format: int64}
         committed_at: {type: string, format: date-time}
+    CallTry:
+      type: object
+      description: One host-managed try of a Gateway call (audit metadata only)
+      required: [try_no, attempt_id, state, latency_ms, cost_micro]
+      properties:
+        try_no: {type: integer, format: int64}
+        attempt_id: {type: string}
+        env_id: {type: string}
+        state: {type: string, enum: [in_flight, settled]}
+        outcome: {type: string, enum: [ok, retryable, fatal, unknown]}
+        latency_ms: {type: integer, format: int64}
+        cost_micro: {type: integer, format: int64, description: Settled cost in micro-USD (ok tries only)}
+        error: {type: string}
+    Call:
+      type: object
+      description: A Gateway logical call (journal entry). Metadata only — no request or response bodies, prompts or credentials.
+      required: [call_id, endpoint, state, source, first_attempt_id, tries_used, cost_charged_micro, possible_external_duplicate, created_at, deadline_at, tries]
+      properties:
+        call_id: {type: string}
+        endpoint: {type: string}
+        state: {type: string, enum: [resolving, in_flight, completed, failed, unknown]}
+        source: {type: string}
+        first_attempt_id: {type: string}
+        tries_used: {type: integer, format: int64}
+        cost_charged_micro: {type: integer, format: int64}
+        upstream_request_id: {type: string}
+        result_ref: {type: string, description: sha256 of the result blob (completed calls only)}
+        fail_reason: {type: string}
+        supersedes_call_id: {type: string}
+        supersede_reason: {type: string}
+        possible_external_duplicate: {type: boolean}
+        created_at: {type: string, format: date-time}
+        deadline_at: {type: string, format: date-time}
+        tries:
+          type: array
+          items: {$ref: '#/components/schemas/CallTry'}
     Inspection:
       type: object
-      required: [task, attempts, checkpoints]
+      required: [task, attempts, checkpoints, calls]
       properties:
         task: {$ref: '#/components/schemas/Task'}
         attempts:
@@ -417,3 +453,6 @@ components:
         checkpoints:
           type: array
           items: {$ref: '#/components/schemas/Checkpoint'}
+        calls:
+          type: array
+          items: {$ref: '#/components/schemas/Call'}

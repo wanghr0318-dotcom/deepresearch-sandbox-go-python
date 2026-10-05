@@ -132,6 +132,23 @@ func prepareWorkspace(ws string, id uint32) error {
 	return nil
 }
 
+// prepareGatewaySocket 是 Gateway socket 的宿主侧一步（规格 §9.1）：把 Gateway 建立的 socket（0600）的属主
+// 改为本环境的映射 uid/gid 1000（宿主 UIDBase+1000），init 挂载前核对"属主 uid 1000、0600 的 socket"。
+// 只改 socket 本身（Lchown，不跟随符号链接）；路径不是 socket 时拒绝。上级目录的 o+x 由 init 的打开检查报告。
+func prepareGatewaySocket(path string, id uint32) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("local: Gateway socket %s: %w", path, err)
+	}
+	if fi.Mode().Type() != fs.ModeSocket {
+		return fmt.Errorf("local: Gateway socket %s 不是 socket（%v）", path, fi.Mode().Type())
+	}
+	if err := os.Lchown(path, int(id), int(id)); err != nil {
+		return fmt.Errorf("local: chown Gateway socket %s: %w", path, err)
+	}
+	return nil
+}
+
 func isSubreaper() bool {
 	var v int32
 	_, _, e := syscall.RawSyscall6(syscall.SYS_PRCTL, prGetChildSubreaper, uintptr(unsafe.Pointer(&v)), 0, 0, 0, 0)
@@ -151,6 +168,11 @@ func (s *ProcessStarter) StartInit(ctx context.Context, spec provider.EnvSpec, _
 	ls.Env, ls.FailAt = s.initEnv, s.failAt
 	if spec.Mounts.Workspace != "" {
 		if err := prepareWorkspace(spec.Mounts.Workspace, spec.UIDBase+workloadID); err != nil {
+			return nil, 0, err
+		}
+	}
+	if spec.Mounts.GatewaySocket != "" {
+		if err := prepareGatewaySocket(spec.Mounts.GatewaySocket, spec.UIDBase+workloadID); err != nil {
 			return nil, 0, err
 		}
 	}

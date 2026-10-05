@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1280,6 +1281,55 @@ func TestWorkloadLimitsApplied(t *testing.T) {
 	ex.Mounts = provider.Mounts{OutBytes: 4 << 20}
 	if got := run("env-lim-exec", ex, "echo $(ulimit -n) $(ulimit -f)"); got != "128 2048" {
 		t.Errorf("exec workload 的 (NOFILE, FSIZE) = %q，期望 \"128 2048\"", got)
+	}
+}
+
+// TestPrepareGatewaySocket（Plan 7 Task 5）：Gateway socket（Mounts.GatewaySocket）chown 到映射 uid/gid 1000、
+// 权限保持 0600；经符号链接给出的路径与非 socket 被拒绝，链接目标的属主不变。
+func TestPrepareGatewaySocket(t *testing.T) {
+	requireRoot(t)
+	dir := t.TempDir()
+	listen := func(name string) string {
+		p := filepath.Join(dir, name)
+		ln, err := net.Listen("unix", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = ln.Close() })
+		if err := os.Chmod(p, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	const uidBase = 300000
+	sock := listen("a1.sock")
+	if err := prepareGatewaySocket(sock, uidBase+workloadID); err != nil {
+		t.Fatal(err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Lstat(sock, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Uid != uidBase+workloadID || st.Gid != uidBase+workloadID || st.Mode&0o7777 != 0o600 {
+		t.Fatalf("socket 属主 %d:%d 权限 %#o，期望 %d、0600", st.Uid, st.Gid, st.Mode&0o7777, uidBase+workloadID)
+	}
+	other := listen("b.sock")
+	link := filepath.Join(dir, "link.sock")
+	if err := os.Symlink(other, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareGatewaySocket(link, uidBase+workloadID); err == nil {
+		t.Fatal("符号链接应被拒绝")
+	}
+	if err := syscall.Stat(other, &st); err != nil || st.Uid != 0 {
+		t.Fatalf("符号链接的目标 %s 被改变属主（%d，%v）", other, st.Uid, err)
+	}
+	plain := filepath.Join(dir, "plain")
+	if err := os.WriteFile(plain, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareGatewaySocket(plain, uidBase+workloadID); err == nil || !strings.Contains(err.Error(), "不是 socket") {
+		t.Fatalf("普通文件应被拒绝，得到 %v", err)
 	}
 }
 

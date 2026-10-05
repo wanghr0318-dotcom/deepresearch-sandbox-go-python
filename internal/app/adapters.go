@@ -16,6 +16,9 @@ import (
 	"time"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/admission"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/edge"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
@@ -35,6 +38,7 @@ type taskLimits struct {
 	NoFile       int64 `json:"nofile"`          // RLIMIT_NOFILE
 	TmpBytes     int64 `json:"tmp_bytes"`       // /tmp、/run tmpfs 限额
 	MaxRunTimeMs int64 `json:"max_run_time_ms"` // 累计运行时限（§14.4）
+	BudgetMicro  int64 `json:"budget_micro"`    // task 层预算上限（微美元，§9.6）；创建时写入 budgets.limit_micro
 }
 
 // parseLimits 解析 limits；空为全部未设置。字段类型不符或为负数是错误。
@@ -47,7 +51,7 @@ func parseLimits(raw json.RawMessage) (taskLimits, error) {
 		return taskLimits{}, fmt.Errorf("limits 不合法: %w", err)
 	}
 	for name, v := range map[string]int64{"memory_max": l.MemoryMax, "pids_max": l.PidsMax, "cpu_quota_us": l.CPUQuotaUs,
-		"nofile": l.NoFile, "tmp_bytes": l.TmpBytes, "max_run_time_ms": l.MaxRunTimeMs} {
+		"nofile": l.NoFile, "tmp_bytes": l.TmpBytes, "max_run_time_ms": l.MaxRunTimeMs, "budget_micro": l.BudgetMicro} {
 		if v < 0 {
 			return taskLimits{}, fmt.Errorf("limits.%s 不能为负数", name)
 		}
@@ -69,7 +73,9 @@ func (c Config) memory(l taskLimits) int64 {
 // effectiveLimits 是 api.Config.EffectiveLimits：由请求中的 limits 得出随任务存储的有效 limits（规格 §14.4）。
 //   - 拒绝格式错误与永远无法满足容量的 limits，使 actor 申请槽位时不会遇到 admission.ErrExceedsCapacity
 //     （该错误在 actor 中是致命的）；
-//   - max_run_time_ms：省略时补入 DefaultRunTime；显式值须为正整数且不超过 RunTimeCap（0 也是错误）。
+//   - max_run_time_ms：省略时补入 DefaultRunTime；显式值须为正整数且不超过 RunTimeCap（0 也是错误）；
+//   - budget_micro（task 层预算，微美元，§9.6）：省略时补入 DefaultBudgetMicro；显式值须为正整数且不超过
+//     BudgetCapMicro。随任务存储，CreateTask 在同一事务中据此写入 budgets.limit_micro。
 //
 // 其余键原样保留。
 func (c Config) effectiveLimits(raw json.RawMessage) (json.RawMessage, error) {
@@ -94,7 +100,20 @@ func (c Config) effectiveLimits(raw json.RawMessage) (json.RawMessage, error) {
 	} else {
 		fields["max_run_time_ms"] = json.RawMessage(fmt.Sprint(c.DefaultRunTime.Milliseconds()))
 	}
+	if _, set := fields["budget_micro"]; set {
+		if l.BudgetMicro <= 0 || l.BudgetMicro > c.BudgetCapMicro {
+			return nil, fmt.Errorf("limits.budget_micro 须为 1..%d 之间的整数（微美元，服务端上限）", c.BudgetCapMicro)
+		}
+	} else {
+		fields["budget_micro"] = json.RawMessage(fmt.Sprint(c.DefaultBudgetMicro))
+	}
 	return json.Marshal(fields)
+}
+
+// budgetLimits 是 init.budget_limits：{"budget_micro": <limits.budget_micro>}（创建时已补默认值并校验）。
+func budgetLimits(l taskLimits) json.RawMessage {
+	b, _ := json.Marshal(map[string]int64{"budget_micro": l.BudgetMicro}) // map[string]int64 的编码不会失败
+	return b
 }
 
 // runTimeLimit 是 task.Deps.RunTimeLimit：创建时存储的 limits.max_run_time_ms。缺失或无法解析时
@@ -174,6 +193,9 @@ var _ task.EnvController = envAdapter{}
 // CreateEnv 建立任务 workspace 并经 coordinator 创建环境。失败时返回非 nil 的已分类结果（actor 的约定：
 // nil 会使 Decide 返回 ErrInvalid，成为致命错误）。
 func (x envAdapter) CreateEnv(ctx context.Context, s task.EnvSpec) (*task.Outcome, error) {
+	if s.BindErr != nil { // Gateway 入口未建立：不创建环境（init 无法挂载不存在的 socket）
+		return classifyCreate(ctx, s.BindErr), s.BindErr
+	}
 	l, err := parseLimits(s.Limits)
 	if err != nil {
 		return classifyCreate(ctx, err), err
@@ -184,7 +206,7 @@ func (x envAdapter) CreateEnv(ctx context.Context, s task.EnvSpec) (*task.Outcom
 		return classifyCreate(ctx, err), err
 	}
 	_, err = x.c.CreateEnv(ctx, resource.EnvRequest{EnvID: s.EnvID, AttemptID: s.AttemptID, Kind: provider.KindTask,
-		Template: x.cfg.Template, Limits: x.cfg.envLimits(l), Mounts: provider.Mounts{Workspace: ws}})
+		Template: x.cfg.Template, Limits: x.cfg.envLimits(l), Mounts: provider.Mounts{Workspace: ws, GatewaySocket: s.GatewaySocket}})
 	if err != nil {
 		return classifyCreate(ctx, err), err
 	}
@@ -283,14 +305,20 @@ func (x runnerAdapter) Run(ctx context.Context, s task.RunSpec, controls <-chan 
 	if s.StartErr != nil {
 		return startFailure(ctx, s.StartErr)
 	}
+	l, err := parseLimits(s.Task.Limits)
+	if err != nil {
+		return startFailure(ctx, err)
+	}
 	ws, err := makeWorkspace(x.dataDir, s.Task.TaskID)
 	if err != nil {
 		return startFailure(ctx, err)
 	}
+	// init 不含任何凭据：供应商 Key 只在 Gateway 的 upstream adapter 中（§9.9、G3）。
 	in := protocol.Init{Type: protocol.TypeInit, Bootstrap: protocol.BootstrapVersion,
 		ProtocolVersions: []int64{protocol.Version}, Mode: protocol.ModeTask,
 		TaskID: s.Task.TaskID, AttemptID: s.AttemptID, AttemptNo: s.AttemptNo,
-		Config: s.Task.Spec, ConfigVersion: s.Task.ConfigVersion, OutDir: "/workspace/out/" + s.AttemptID}
+		Config: s.Task.Spec, ConfigVersion: s.Task.ConfigVersion, BudgetLimits: budgetLimits(l),
+		OutDir: "/workspace/out/" + s.AttemptID}
 	if cp := s.Task.Latest; cp != nil {
 		in.Resume = &protocol.Resume{CheckpointID: cp.CheckpointID, StepID: cp.StepID, State: cp.State,
 			StateRef: cp.StateRef, Refs: cp.Refs}
@@ -357,4 +385,63 @@ func outcome(o runner.Outcome) task.Outcome {
 		}
 	}
 	return out
+}
+
+// ---- Gateway ----
+
+// attemptLookup 把 task.Store.LookupAttempt 适配为 edge.Attempts（入口绑定时核对 attempt 的任务与环境）。
+type attemptLookup struct{ s task.Store }
+
+var _ edge.Attempts = attemptLookup{}
+
+func (x attemptLookup) Lookup(ctx context.Context, attemptID string) (string, string, error) {
+	return x.s.LookupAttempt(ctx, attemptID)
+}
+
+// hostEvents 把 task.Store.AppendHostEvent 适配为 call.HostEvents：指纹分歧写入 host 事件 replay_divergence
+// （§9.4），payload 只含调用 ID 与指纹摘要，不含请求正文。
+type hostEvents struct{ s task.Store }
+
+var _ call.HostEvents = hostEvents{}
+
+// EventReplayDivergence 是指纹分歧的 host 事件类型（§9.4）。
+const EventReplayDivergence = "replay_divergence"
+
+func (x hostEvents) ReplayDivergence(ctx context.Context, taskID, attemptID, callID, detail string) error {
+	payload, err := json.Marshal(map[string]string{"call_id": callID, "detail": detail})
+	if err != nil {
+		return err
+	}
+	return x.s.AppendHostEvent(ctx, taskID, attemptID, EventReplayDivergence, payload)
+}
+
+// searchPricing 是各搜索供应商的价格表（adapter 声明的按次计价，§9.6）。Tavily 按每次基础搜索 1 credit
+// 约 0.008 USD 保守计价；fake 与 ddg_lite 不收费。
+func searchPricing(provider string) upstream.Pricing {
+	if provider == upstream.SearchTavily {
+		return upstream.Pricing{Version: "tavily/2026-10", SearchMicroPerRequest: 8_000}
+	}
+	return upstream.Pricing{Version: provider + "/free"}
+}
+
+// gatewayAdapters 构造 Gateway 的上游 adapter 与按类别的价格表（与 adapter 使用的价格表相同，交给
+// call 由 usage 计算实际费用）。所有 adapter 共用一个验证 dialer（§9.8）。模型 adapter 只在配置了
+// Model.BaseURL 时提供（否则 /v1/chat/completions 为 endpoint_not_configured）。供应商 Key 只交给 adapter，
+// 由它放在 Authorization 头中，不进入日志、init 或沙箱环境（§9.9）。
+func (c Config) gatewayAdapters(d *upstream.Dialer) ([]upstream.Adapter, map[upstream.Kind]upstream.Pricing) {
+	pricing := map[upstream.Kind]upstream.Pricing{
+		upstream.KindSearch: searchPricing(c.SearchProvider),
+		upstream.KindFetch:  {Version: "fetch/free"},
+	}
+	adapters := []upstream.Adapter{
+		upstream.NewSearch(upstream.SearchConfig{Provider: c.SearchProvider, APIKey: c.SearchAPIKey,
+			Pricing: pricing[upstream.KindSearch], HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0)}),
+		upstream.NewFetch(upstream.FetchConfig{Dialer: d, Pricing: pricing[upstream.KindFetch]}),
+	}
+	if c.Model.BaseURL != "" {
+		pricing[upstream.KindChat] = c.Model.Pricing
+		adapters = append(adapters, upstream.NewChat(upstream.ChatConfig{BaseURL: c.Model.BaseURL, Model: c.Model.Name,
+			APIKey: c.Model.APIKey, Pricing: c.Model.Pricing, HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0)}))
+	}
+	return adapters, pricing
 }

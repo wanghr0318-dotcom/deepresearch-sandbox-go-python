@@ -24,7 +24,8 @@ type Store interface {
 	// ListTasks 按创建时间倒序 keyset 分页：after 为上一页最后一个 task_id（首页为空）；
 	// 返回的游标为本页最后一个 task_id，没有下一页时为空。
 	ListTasks(ctx context.Context, after string, limit int) ([]TaskView, string, error)
-	// Inspect 读取任务的诊断时间线：attempt 与 outcome、退出与 OOM、环境与清理、checkpoint（规格 §14.6）。
+	// Inspect 读取任务的诊断时间线：attempt 与 outcome、退出与 OOM、环境与清理、checkpoint（规格 §14.6），
+	// 以及 Gateway 调用与每次 try 的审计元数据（§9.9、G11：task_id → attempt_id → call_id → try_no）。
 	Inspect(ctx context.Context, taskID string) (Inspection, error)
 }
 
@@ -33,6 +34,29 @@ type Inspection struct {
 	Task        TaskView
 	Attempts    []AttemptView
 	Checkpoints []CheckpointView
+	Calls       []CallView
+}
+
+// CallView 是一个 Gateway 逻辑调用的审计视图（§9.9）：只有元数据——端点、状态、费用、上游请求 ID 与
+// 每次 try 的 attempt、结果、延迟、费用；不含请求或响应正文、提示词与凭据。ResultRef 是结果 blob 的
+// sha256（只在 completed 时非空）。
+type CallView struct {
+	CallID, Endpoint, State, Source   string
+	FirstAttemptID, UpstreamRequestID string
+	ResultRef, FailReason             string
+	SupersedesCallID, SupersedeReason string
+	TriesUsed, CostChargedMicro       int64
+	PossibleExternalDuplicate         bool
+	CreatedAt, DeadlineAt             time.Time
+	Tries                             []TryView
+}
+
+// TryView 是一次 try 的审计视图（call_tries）。
+type TryView struct {
+	TryNo                 int64
+	AttemptID, EnvID      string
+	State, Outcome, Error string
+	LatencyMs, CostMicro  int64
 }
 
 // AttemptView 是一个 attempt 及其环境的诊断视图。

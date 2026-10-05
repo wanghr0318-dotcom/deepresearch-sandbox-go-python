@@ -120,6 +120,9 @@ type Store interface {
 	LoadBudget(ctx context.Context, taskID string) (Budget, error)
 	LoadCall(ctx context.Context, taskID, callID string) (CallRecord, []TryRecord, error)
 	ListCalls(ctx context.Context, taskID string) ([]CallRecord, error)
+	// BlobAuthorized 报告 sha 是否在任务 scope 内（scope_blobs(task)：已完成调用的结果、产物与 checkpoint
+	// 引用等），供 GET /blobs/{sha} 授权（§9.3"按 scope 授权"）。
+	BlobAuthorized(ctx context.Context, taskID, sha string) (bool, error)
 }
 
 // TryRecord 是 call_tries 中的一行（审计元数据，§9.9）。

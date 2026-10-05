@@ -38,14 +38,16 @@ type fakeStore struct {
 	calls      map[callKey]*CallRecord
 	tries      map[callKey][]*fakeTry
 	nRes       int
-	begun      chan string // 每次新登记调用时发送 call_id
-	settled    chan string // 每次 SettleTry 改变账本后发送 call_id
-	reserveErr error       // 下一次 ReserveTry 返回的存储故障（一次性）
+	begun      chan string      // 每次新登记调用时发送 call_id
+	settled    chan string      // 每次 SettleTry 改变账本后发送 call_id
+	reserveErr error            // 下一次 ReserveTry 返回的存储故障（一次性）
+	scoped     map[callKey]bool // (task_id, sha256) → 以其他来源登记到 scope_blobs(task)
 }
 
 func newFakeStore(t *testing.T) *fakeStore {
 	return &fakeStore{t: t, revoked: map[string]bool{}, desired: map[string]string{}, budgets: map[string]*Budget{},
-		calls: map[callKey]*CallRecord{}, tries: map[callKey][]*fakeTry{}, begun: make(chan string, 64), settled: make(chan string, 64)}
+		calls: map[callKey]*CallRecord{}, tries: map[callKey][]*fakeTry{}, begun: make(chan string, 64), settled: make(chan string, 64),
+		scoped: map[callKey]bool{}}
 }
 
 func (s *fakeStore) budget(taskID string) *Budget {
@@ -281,6 +283,28 @@ func (s *fakeStore) LoadCall(_ context.Context, taskID, callID string) (CallReco
 		out = append(out, ft.rec)
 	}
 	return *rec, out, nil
+}
+
+// BlobAuthorized 模拟 scope_blobs(task)：本任务 completed 调用的结果，加上测试以 scope 登记的其他 blob
+// （例如产物与 checkpoint 引用）。
+func (s *fakeStore) BlobAuthorized(_ context.Context, taskID, sha string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.scoped[callKey{taskID, sha}] {
+		return true, nil
+	}
+	for k, r := range s.calls {
+		if k.taskID == taskID && r.State == StateCompleted && r.ResultRef == sha {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *fakeStore) scope(taskID, sha string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scoped[callKey{taskID, sha}] = true
 }
 
 func (s *fakeStore) ListCalls(_ context.Context, taskID string) ([]CallRecord, error) {
@@ -974,7 +998,8 @@ func TestReserveStoreFailure(t *testing.T) {
 
 // ---- blob 授权与日志 ----
 
-// OpenBlob 只开放本任务 completed 调用的结果 blob；其他任务或未登记的 blob 一律 ErrNotFound。
+// OpenBlob 按 scope_blobs(task) 授权：本任务 completed 调用的结果与以其他来源登记到本任务 scope 的 blob
+// 可读；其他任务或未登记的 blob 一律 ErrNotFound。
 func TestOpenBlobScope(t *testing.T) {
 	h := newHarness(t, testLimits(), newAdapter("p"))
 	r := h.invoke(t, inv("c1", chatBody))
@@ -994,6 +1019,12 @@ func TestOpenBlobScope(t *testing.T) {
 	if _, err := h.c.OpenBlob(context.Background(), "t1", stray.SHA256); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("未授权的 blob：%v", err)
 	}
+	h.store.scope("t1", stray.SHA256) // 例如 checkpoint 引用的产物
+	rc, err = h.c.OpenBlob(context.Background(), "t1", stray.SHA256)
+	if err != nil {
+		t.Fatalf("scope 内的非调用 blob：%v", err)
+	}
+	rc.Close()
 }
 
 // 日志含规定字段，不含提示词。

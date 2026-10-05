@@ -11,11 +11,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/blob"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/invariants"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence/postgres"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
@@ -120,6 +122,32 @@ func (e *env) fixture() blob.Ref {
 	return ref
 }
 
+// callFixture 给任务 t1 预算，经 Gateway 的事务用例完成一次调用 c1（结果 blob 在 BlobStore 中，按 usage 结算），
+// 返回结果 blob。
+func (e *env) callFixture() blob.Ref {
+	e.t.Helper()
+	ctx := context.Background()
+	e.exec("UPDATE budgets SET limit_micro = 1000000 WHERE task_id = 't1'")
+	if _, err := e.store.BeginCall(ctx, call.BeginCallRequest{TaskID: "t1", CallID: "c1", AttemptID: "a1", Fingerprint: "fp1",
+		Endpoint: "/v1/chat/completions", Deadline: time.Minute}); err != nil {
+		e.t.Fatal(err)
+	}
+	try, err := e.store.ReserveTry(ctx, call.ReserveTryRequest{TaskID: "t1", CallID: "c1", AttemptID: "a1", EnvID: "e1",
+		EstimateMicro: 500, MaxTries: 3})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	ref, err := e.blobs.Put(ctx, bytes.NewReader([]byte(`{"choices":[]}`)))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	if _, err := e.store.SettleTry(ctx, call.Settlement{Try: try, Outcome: "ok", ActualMicro: 120, LatencyMs: 5,
+		ResultSHA256: ref.SHA256, ResultSize: ref.Size}); err != nil {
+		e.t.Fatal(err)
+	}
+	return ref
+}
+
 type scanner provider.ScanReport
 
 func (s scanner) Scan(context.Context) (provider.ScanReport, error) {
@@ -147,6 +175,7 @@ func ids(vs []invariants.Violation) string {
 func TestCleanStatePasses(t *testing.T) {
 	e := newEnv(t)
 	e.fixture()
+	e.callFixture()
 	if vs := e.verify(scanner{}, true); len(vs) != 0 {
 		t.Fatalf("正常状态不应有违反：%+v", vs)
 	}
@@ -188,6 +217,44 @@ func TestEachInvariantIsReported(t *testing.T) {
 		}, scanner{}, false},
 		{"I8 隔离资源超期未报警", "I8/B", func(e *env, _ blob.Ref) {
 			e.exec("INSERT INTO quarantined_resources (resource_path, kind, reason, detected_at) VALUES ('envs/x', 'env_dir', '无 owner.json', now() - interval '2 minutes')")
+		}, scanner{}, false},
+		{"I3 账本 reserved 不等于 held 之和", "I3/A", func(e *env, _ blob.Ref) {
+			e.callFixture()
+			e.exec("UPDATE budgets SET reserved_micro = reserved_micro + 7 WHERE task_id = 't1'")
+		}, scanner{}, false},
+		{"I3 持有中的 reservation 对应已结算的 try（不在唯一的桶中）", "I3/A", func(e *env, _ blob.Ref) {
+			e.callFixture()
+			ctx := context.Background()
+			if _, err := e.store.BeginCall(ctx, call.BeginCallRequest{TaskID: "t1", CallID: "c2", AttemptID: "a1", Fingerprint: "fp2",
+				Endpoint: "/v1/search", Deadline: time.Minute}); err != nil {
+				e.t.Fatal(err)
+			}
+			if _, err := e.store.ReserveTry(ctx, call.ReserveTryRequest{TaskID: "t1", CallID: "c2", AttemptID: "a1", EnvID: "e1",
+				EstimateMicro: 30, MaxTries: 3}); err != nil {
+				e.t.Fatal(err)
+			}
+			e.exec("UPDATE call_tries SET state = 'settled', outcome = 'retryable' WHERE task_id = 't1' AND call_id = 'c2'")
+		}, scanner{}, false},
+		{"I14 已记录的调用结果被改写为另一个已授权的 blob", "I14/A", func(e *env, _ blob.Ref) {
+			e.callFixture()
+			other, err := e.blobs.Put(context.Background(), bytes.NewReader([]byte("another result")))
+			if err != nil {
+				e.t.Fatal(err)
+			}
+			e.exec("INSERT INTO blobs (sha256, size) VALUES ($1, $2)", other.SHA256, other.Size)
+			e.exec("INSERT INTO scope_blobs (scope_kind, scope_id, sha256) VALUES ('task', 't1', $1)", other.SHA256)
+			e.exec("UPDATE calls SET result_ref = $1 WHERE task_id = 't1' AND call_id = 'c1'", other.SHA256)
+		}, scanner{}, false},
+		{"I14 调用结果未授权到任务 scope", "I14/A", func(e *env, _ blob.Ref) {
+			ref := e.callFixture()
+			e.exec("DELETE FROM scope_blobs WHERE scope_kind = 'task' AND scope_id = 't1' AND sha256 = $1", ref.SHA256)
+		}, scanner{}, false},
+		{"I14 调用结果的内容被改写", "I14/A", func(e *env, _ blob.Ref) {
+			ref := e.callFixture()
+			path := filepath.Join(e.root, "sha256", ref.SHA256[:2], ref.SHA256[2:])
+			if err := os.WriteFile(path, []byte(`{"choices":[1]}`), 0o600); err != nil {
+				e.t.Fatal(err)
+			}
 		}, scanner{}, false},
 		{"I16 请求对应的资源不存在", "I16/A", func(e *env, _ blob.Ref) {
 			e.exec("INSERT INTO api_requests (request_id, kind, body_hash, resource_id, response) VALUES ('r9', 'create_task', 'x', 'missing', 'null')")

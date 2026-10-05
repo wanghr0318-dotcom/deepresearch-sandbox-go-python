@@ -632,10 +632,41 @@ type checkpointJSON struct {
 	CommittedAt  time.Time `json:"committed_at"`
 }
 
+type tryJSON struct {
+	TryNo     int64  `json:"try_no"`
+	AttemptID string `json:"attempt_id"`
+	EnvID     string `json:"env_id,omitempty"`
+	State     string `json:"state"`
+	Outcome   string `json:"outcome,omitempty"`
+	LatencyMs int64  `json:"latency_ms"`
+	CostMicro int64  `json:"cost_micro"`
+	Error     string `json:"error,omitempty"`
+}
+
+type callJSON struct {
+	CallID                    string    `json:"call_id"`
+	Endpoint                  string    `json:"endpoint"`
+	State                     string    `json:"state"`
+	Source                    string    `json:"source"`
+	FirstAttemptID            string    `json:"first_attempt_id"`
+	TriesUsed                 int64     `json:"tries_used"`
+	CostChargedMicro          int64     `json:"cost_charged_micro"`
+	UpstreamRequestID         string    `json:"upstream_request_id,omitempty"`
+	ResultRef                 string    `json:"result_ref,omitempty"`
+	FailReason                string    `json:"fail_reason,omitempty"`
+	SupersedesCallID          string    `json:"supersedes_call_id,omitempty"`
+	SupersedeReason           string    `json:"supersede_reason,omitempty"`
+	PossibleExternalDuplicate bool      `json:"possible_external_duplicate"`
+	CreatedAt                 time.Time `json:"created_at"`
+	DeadlineAt                time.Time `json:"deadline_at"`
+	Tries                     []tryJSON `json:"tries"`
+}
+
 type inspectionJSON struct {
 	Task        taskJSON         `json:"task"`
 	Attempts    []attemptJSON    `json:"attempts"`
 	Checkpoints []checkpointJSON `json:"checkpoints"`
+	Calls       []callJSON       `json:"calls"`
 }
 
 func (h *Handler) inspect(w http.ResponseWriter, r *http.Request) {
@@ -644,7 +675,7 @@ func (h *Handler) inspect(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	out := inspectionJSON{Task: toTaskJSON(in.Task), Attempts: []attemptJSON{}, Checkpoints: []checkpointJSON{}}
+	out := inspectionJSON{Task: toTaskJSON(in.Task), Attempts: []attemptJSON{}, Checkpoints: []checkpointJSON{}, Calls: []callJSON{}}
 	for _, a := range in.Attempts {
 		out.Attempts = append(out.Attempts, attemptJSON{
 			AttemptID: a.AttemptID, AttemptNo: a.AttemptNo, Status: a.Status, OutcomeClass: a.OutcomeClass,
@@ -655,6 +686,17 @@ func (h *Handler) inspect(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, c := range in.Checkpoints {
 		out.Checkpoints = append(out.Checkpoints, checkpointJSON(c))
+	}
+	for _, c := range in.Calls {
+		cj := callJSON{CallID: c.CallID, Endpoint: c.Endpoint, State: c.State, Source: c.Source, FirstAttemptID: c.FirstAttemptID,
+			TriesUsed: c.TriesUsed, CostChargedMicro: c.CostChargedMicro, UpstreamRequestID: c.UpstreamRequestID,
+			ResultRef: c.ResultRef, FailReason: c.FailReason, SupersedesCallID: c.SupersedesCallID, SupersedeReason: c.SupersedeReason,
+			PossibleExternalDuplicate: c.PossibleExternalDuplicate, CreatedAt: c.CreatedAt, DeadlineAt: c.DeadlineAt, Tries: []tryJSON{}}
+		for _, t := range c.Tries {
+			cj.Tries = append(cj.Tries, tryJSON{TryNo: t.TryNo, AttemptID: t.AttemptID, EnvID: t.EnvID, State: t.State,
+				Outcome: t.Outcome, LatencyMs: t.LatencyMs, CostMicro: t.CostMicro, Error: t.Error})
+		}
+		out.Calls = append(out.Calls, cj)
 	}
 	writeJSON(w, http.StatusOK, out)
 }

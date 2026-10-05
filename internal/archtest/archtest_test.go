@@ -34,9 +34,30 @@ func TestConsumersDoNotDependOnPostgres(t *testing.T) {
 	for _, pkg := range []string{
 		"internal/api", "internal/task", "internal/runner", "internal/resource",
 		"internal/ownership", "internal/persistence", "internal/datadir", "internal/blob",
+		"internal/gateway/call", "internal/gateway/edge", "internal/gateway/upstream",
 	} {
 		forbid(t, pkg, forbidden)
 	}
+}
+
+// TestGatewayLayering：Gateway 内部的依赖方向（Plan 7 全局约束）与 task 对 Gateway 的隔离。
+//   - gateway/call 是唯一的记账与 journal 所有者，不知道供应商协议：不直接导入 net/http（它经 upstream
+//     间接依赖 net/http，只能按直接导入检查）；除标准库与本模块之外不依赖任何包（供应商 SDK 只能在 upstream 中）。
+//   - gateway/upstream 只做协议适配，不记账：不依赖 persistence，也不依赖 call 与 edge。
+//   - gateway/edge 不导入 persistence（只调用 call 与 task 定义的窄接口），传递上也不依赖 PostgreSQL 实现。
+//   - task 不依赖 gateway/*：task.Access 由 edge 实现，装配在 internal/app。
+func TestGatewayLayering(t *testing.T) {
+	forbidDirect(t, "internal/gateway/call", []string{"net/http"})
+	for _, d := range deps(t, "internal/gateway/call") {
+		if first, _, _ := strings.Cut(d, "/"); strings.Contains(first, ".") && !strings.HasPrefix(d, module+"/") {
+			t.Errorf("internal/gateway/call 依赖了标准库与本模块之外的包 %s", d)
+		}
+	}
+	forbid(t, "internal/gateway/upstream", []string{
+		module + "/internal/persistence", module + "/internal/gateway/call", module + "/internal/gateway/edge",
+	})
+	forbidDirect(t, "internal/gateway/edge", []string{module + "/internal/persistence"})
+	forbid(t, "internal/task", []string{module + "/internal/gateway"})
 }
 
 // TestControlPlaneUsesProviderContractOnly：控制面包只依赖 internal/provider（契约），不依赖 provider/local、
@@ -208,6 +229,29 @@ func TestCredentialSyscallsOnlyInLauncher(t *testing.T) {
 	}
 	if inLauncher == 0 {
 		t.Fatal("internal/sandbox/launch.go 中没有找到 setgroups 的调用：检查本身失效")
+	}
+}
+
+// forbidDirect 断言 pkg 的直接导入（不含测试文件，GOOS=linux）不含 forbidden 中的包及其子包。用于只能按
+// 直接导入表达的规则（例如 gateway/call 经 upstream 间接依赖 net/http）。
+func forbidDirect(t *testing.T, pkg string, forbidden []string) {
+	t.Helper()
+	cmd := exec.Command("go", "list", "-f", "{{join .Imports \" \"}}", module+"/"+pkg)
+	cmd.Env = append(cmd.Environ(), "GOOS=linux")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go list %s: %v", pkg, err)
+	}
+	imports := strings.Fields(string(out))
+	if len(imports) == 0 {
+		t.Fatalf("go list %s 没有返回任何导入：检查本身失效", pkg)
+	}
+	for _, d := range imports {
+		for _, f := range forbidden {
+			if d == f || strings.HasPrefix(d, f+"/") {
+				t.Errorf("%s 直接导入了 %s", pkg, d)
+			}
+		}
 	}
 }
 

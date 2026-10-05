@@ -537,3 +537,13 @@ func (s *Store) ListCalls(ctx context.Context, taskID string) ([]call.CallRecord
 	})
 	return out, err
 }
+
+// BlobAuthorized 报告 sha 是否在任务 scope 内（实现 call.Store；scope_blobs(task)，§9.3"按 scope 授权"）。
+func (s *Store) BlobAuthorized(ctx context.Context, taskID, sha string) (bool, error) {
+	var ok bool
+	err := s.read(ctx, "BlobAuthorized", func(ctx context.Context, q queryer) error {
+		return q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM scope_blobs WHERE scope_kind = 'task' AND scope_id = $1 AND sha256 = $2)`,
+			taskID, sha).Scan(&ok)
+	})
+	return ok, err
+}

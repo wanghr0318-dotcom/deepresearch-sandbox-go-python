@@ -73,7 +73,61 @@ func (s *Store) Inspect(ctx context.Context, taskID string) (api.Inspection, err
 			err := r.Scan(&v.CheckpointID, &v.StepID, &v.AttemptID, &v.CommitSeq, &v.CommittedAt)
 			return v, err
 		})
+		if err != nil {
+			return err
+		}
+		in.Calls, err = inspectCalls(ctx, q, taskID)
 		return err
 	})
 	return in, err
+}
+
+// inspectCalls 读取任务的 Gateway 调用与每次 try 的审计元数据（§9.9；不含正文）。调用按登记时间排序，
+// try 按 try_no 排序。
+func inspectCalls(ctx context.Context, q queryer, taskID string) ([]api.CallView, error) {
+	rows, err := q.Query(ctx, `SELECT call_id, endpoint, state, source, first_attempt_id, upstream_request_id,
+			COALESCE(result_ref, ''), fail_reason, COALESCE(supersedes_call_id, ''), COALESCE(supersede_reason, ''),
+			tries_used, cost_charged, possible_external_duplicate, created_at, deadline_at
+		FROM calls WHERE task_id = $1 ORDER BY created_at, call_id`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	calls, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (api.CallView, error) {
+		var v api.CallView
+		err := r.Scan(&v.CallID, &v.Endpoint, &v.State, &v.Source, &v.FirstAttemptID, &v.UpstreamRequestID,
+			&v.ResultRef, &v.FailReason, &v.SupersedesCallID, &v.SupersedeReason,
+			&v.TriesUsed, &v.CostChargedMicro, &v.PossibleExternalDuplicate, &v.CreatedAt, &v.DeadlineAt)
+		return v, err
+	})
+	if err != nil || len(calls) == 0 {
+		return calls, err
+	}
+	rows, err = q.Query(ctx, `SELECT call_id, try_no, attempt_id, COALESCE(env_id, ''), state, outcome, latency_ms, cost_micro, error
+		FROM call_tries WHERE task_id = $1 ORDER BY call_id, try_no`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	type tryRow struct {
+		callID string
+		try    api.TryView
+	}
+	tries, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (tryRow, error) {
+		var t tryRow
+		err := r.Scan(&t.callID, &t.try.TryNo, &t.try.AttemptID, &t.try.EnvID, &t.try.State, &t.try.Outcome,
+			&t.try.LatencyMs, &t.try.CostMicro, &t.try.Error)
+		return t, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	idx := make(map[string]int, len(calls))
+	for i, c := range calls {
+		idx[c.CallID] = i
+	}
+	for _, t := range tries {
+		if i, ok := idx[t.callID]; ok {
+			calls[i].Tries = append(calls[i].Tries, t.try)
+		}
+	}
+	return calls, nil
 }

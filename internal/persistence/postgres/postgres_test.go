@@ -2519,3 +2519,64 @@ func TestReserveTryAccessRejections(t *testing.T) {
 		t.Fatalf("不存在的任务应为 ErrNotFound，得到 %v", err)
 	}
 }
+
+// TestGatewayTaskFactsAndInspect（Plan 7 Task 5）：LookupAttempt 给出 attempt 的任务与环境；AppendHostEvent 经
+// task_seq 追加 host 事件且以内容幂等；BlobAuthorized 按 scope_blobs(task) 授权；Inspect 汇总调用与每次 try
+// （G11：task_id → attempt_id → call_id → try_no）。
+func TestGatewayTaskFactsAndInspect(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	gwFixture(t, s, "t1", 1000)
+	if taskID, envID, err := s.LookupAttempt(ctx, "att-t1"); err != nil || taskID != "t1" || envID != "env-t1" {
+		t.Fatalf("LookupAttempt = %s, %s, %v", taskID, envID, err)
+	}
+	if _, _, err := s.LookupAttempt(ctx, "missing"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("不存在的 attempt 应为 ErrNotFound，得到 %v", err)
+	}
+
+	before := count(t, s, "SELECT count(*) FROM events WHERE task_id = 't1'")
+	for i := 0; i < 2; i++ { // 同一内容（提交结果未知后的重跑）只追加一次
+		if err := s.AppendHostEvent(ctx, "t1", "att-t1", "replay_divergence", json.RawMessage(`{"call_id":"c1","detail":"x"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.AppendHostEvent(ctx, "t1", "att-t1", "replay_divergence", json.RawMessage(`{"call_id":"c2","detail":"y"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM events WHERE task_id = 't1' AND type = 'replay_divergence' AND source = 'host'"); n != 2 {
+		t.Fatalf("replay_divergence 事件 %d 条，期望 2", n)
+	}
+	if n := count(t, s, "SELECT max(task_seq) FROM events WHERE task_id = 't1'"); n != before+2 {
+		t.Fatalf("task_seq 应连续分配：max = %d，之前 %d 条", n, before)
+	}
+	if err := s.AppendHostEvent(ctx, "t1", "att-t1", "replay_divergence", json.RawMessage(`[1]`)); !errors.Is(err, persistence.ErrInvalid) {
+		t.Fatalf("非对象 payload 应为 ErrInvalid，得到 %v", err)
+	}
+
+	beginCall(t, s, "t1", "c1")
+	tr := mustReserve(t, s, "t1", "c1", 100)
+	sha := strings.Repeat("a", 64)
+	settle(t, s, call.Settlement{Try: tr, Outcome: "ok", ActualMicro: 40, LatencyMs: 12, UpstreamRequestID: "req-1",
+		ResultSHA256: sha, ResultSize: 3})
+	for _, c := range []struct {
+		task, sha string
+		want      bool
+	}{{"t1", sha, true}, {"t2", sha, false}, {"t1", strings.Repeat("b", 64), false}} {
+		if ok, err := s.BlobAuthorized(ctx, c.task, c.sha); err != nil || ok != c.want {
+			t.Fatalf("BlobAuthorized(%s, %s…) = %v, %v，期望 %v", c.task, c.sha[:4], ok, err, c.want)
+		}
+	}
+	in, err := s.Inspect(ctx, "t1")
+	if err != nil || len(in.Calls) != 1 {
+		t.Fatalf("Inspect = %+v, %v", in.Calls, err)
+	}
+	c := in.Calls[0]
+	if c.CallID != "c1" || c.State != "completed" || c.FirstAttemptID != "att-t1" || c.TriesUsed != 1 || c.CostChargedMicro != 40 ||
+		c.UpstreamRequestID != "req-1" || c.ResultRef != sha || c.DeadlineAt.Sub(c.CreatedAt) != 120*time.Second {
+		t.Fatalf("调用视图 = %+v", c)
+	}
+	want := api.TryView{TryNo: 1, AttemptID: "att-t1", EnvID: "env-t1", State: "settled", Outcome: "ok", LatencyMs: 12, CostMicro: 40}
+	if len(c.Tries) != 1 || c.Tries[0] != want {
+		t.Fatalf("try 视图 = %+v，期望 %+v", c.Tries, want)
+	}
+}

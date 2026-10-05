@@ -1,4 +1,5 @@
-// Package invariants 实现 `agentbox verify-invariants` 的检查（规格 §16.3，M1 范围：I1、I2、I4–I8、I16）。
+// Package invariants 实现 `agentbox verify-invariants` 的检查（规格 §16.3，M1 范围：I1、I2、I4–I8、I16；
+// M2 Gateway：I3 的 task 层账本、I14 的 journal 部分——已完成调用的结果不变且在 blobs 与 scope_blobs(task) 中）。
 //
 // 资源类检查独立扫描实际资源（provider.Scan）与 BlobStore 内容，不只从数据库推导。每条违反带类别：
 // [A] 始终成立、[B] 期限内成立、[Q] 静止时成立；Q 类只在 quiescent 为真时检查。
@@ -11,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
 )
@@ -31,11 +33,12 @@ type BlobRef struct {
 
 // Store 是不变量检查需要的数据库读取（实现位于 internal/persistence/postgres）。
 type Store interface {
-	// DBViolations 返回只依赖数据库即可判定的违反：I2、I4、I6（授权与指针）、I7、I8、I16。
+	// DBViolations 返回只依赖数据库即可判定的违反：I2、I3、I4、I6（授权与指针）、I7、I8、I14（登记与授权）、I16。
 	DBViolations(ctx context.Context) ([]Violation, error)
 	// CleanedEnvIDs 返回 cleanup_state = done 的环境（I1）。
 	CleanedEnvIDs(ctx context.Context) ([]string, error)
-	// ReferencedBlobs 返回已登记产物与已提交 checkpoint 引用的 blob（I5、I6 的内容部分）。
+	// ReferencedBlobs 返回已登记产物、已提交 checkpoint 引用与已完成调用结果的 blob（I5、I6、I14 的内容部分；
+	// Origin 分别以 "artifact"、"checkpoint"、"call" 开头）。
 	ReferencedBlobs(ctx context.Context) ([]BlobRef, error)
 }
 
@@ -75,11 +78,15 @@ func Verify(ctx context.Context, s Store, scan Scanner, blobs Blobs, quiescent b
 	return out, nil
 }
 
-// checkBlob 复算 blob 内容的哈希与大小（I5：固定输出以正确哈希存在；I6：checkpoint 引用的内容完整）。
+// checkBlob 复算 blob 内容的哈希与大小（I5：固定输出以正确哈希存在；I6：checkpoint 引用的内容完整；
+// I14：已记录的调用结果不改变）。
 func checkBlob(blobs Blobs, r BlobRef) *Violation {
 	id := "I5"
-	if len(r.Origin) >= 10 && r.Origin[:10] == "checkpoint" {
+	switch {
+	case strings.HasPrefix(r.Origin, "checkpoint"):
 		id = "I6"
+	case strings.HasPrefix(r.Origin, "call"):
+		id = "I14"
 	}
 	rc, err := blobs.Open(r.SHA256)
 	if err != nil {

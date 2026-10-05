@@ -155,6 +155,12 @@ func (w *world) PersistRunTime(context.Context, string, string, int64) (int64, e
 func (w *world) RevokeAttemptAccess(context.Context, string, string) error {
 	return errors.New("未使用")
 }
+func (w *world) LookupAttempt(context.Context, string) (string, string, error) {
+	return "", "", errors.New("未使用")
+}
+func (w *world) AppendHostEvent(context.Context, string, string, string, json.RawMessage) error {
+	return errors.New("未使用")
+}
 
 // ---- resource.Store ----
 

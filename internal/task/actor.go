@@ -53,10 +53,14 @@ type Admission interface {
 	Release(g SlotGrant)
 }
 
-// EnvSpec 是创建任务环境的输入；适配器据 Spec 与 Limits 构造 resource.EnvRequest。
+// EnvSpec 是创建任务环境的输入；适配器据 Spec 与 Limits 构造 resource.EnvRequest。GatewaySocket 是
+// Access.Bind 返回的宿主侧 socket（空为不挂载），适配器把它放入 Mounts.GatewaySocket。BindErr 非 nil
+// 表示 Gateway 入口绑定失败：适配器不创建环境，按创建失败分类返回（与 RunSpec.StartErr 的约定相同）。
 type EnvSpec struct {
 	TaskID, AttemptID, EnvID string
 	Spec, Limits             json.RawMessage
+	GatewaySocket            string
+	BindErr                  error
 }
 
 // StopReport 是停止环境报告的事实（resource.StopResult 的对应）。**只有 Recorded 为真时 actor 才认为
@@ -74,14 +78,14 @@ type EnvController interface {
 	StopEnv(ctx context.Context, envID string) (StopReport, error)
 }
 
-// RunSpec 是一次执行的输入。Task 是启动前重新读取的任务事实（含 init.resume 所需的最新 checkpoint）。
-// StartErr 非 nil 表示启动前的准备（读取任务、Gateway 绑定）失败：适配器不启动 Worker，按启动失败
-// 分类返回。OnReady 在合法的 ready 处理完毕后同步调用恰好一次（runner.Attempt.OnReady），不阻塞。
+// RunSpec 是一次执行的输入。Task 是启动前重新读取的任务事实（含 init.resume 所需的最新 checkpoint 与
+// init.budget_limits 所需的 limits）。StartErr 非 nil 表示启动前的准备（读取任务）失败：适配器不启动
+// Worker，按启动失败分类返回。Gateway 入口在创建环境之前绑定（EnvSpec.GatewaySocket）。OnReady 在合法的
+// ready 处理完毕后同步调用恰好一次（runner.Attempt.OnReady），不阻塞。
 type RunSpec struct {
 	Task             TaskState
 	AttemptID, EnvID string
 	AttemptNo        int64
-	GatewaySocket    string
 	StartErr         error
 	OnReady          func()
 }
@@ -529,6 +533,10 @@ func (a *Actor) exec(eff Effect) {
 	case CreateEnvironment:
 		spec := EnvSpec{TaskID: a.taskID, AttemptID: f.AttemptID, EnvID: f.EnvID, Spec: a.spec, Limits: a.limits}
 		a.async(func(ctx context.Context) any {
+			// Gateway 入口先于环境建立：socket 须在 init 挂载它时已存在（§9.1）。绑定失败交给适配器分类。
+			if spec.GatewaySocket, spec.BindErr = a.d.Access.Bind(ctx, f.AttemptID, f.EnvID); spec.BindErr != nil {
+				spec.BindErr = fmt.Errorf("task: 绑定 attempt %s 的 Gateway 入口: %w", f.AttemptID, spec.BindErr)
+			}
 			o, err := a.d.Env.CreateEnv(ctx, spec)
 			if err == nil {
 				o = nil
@@ -564,7 +572,7 @@ func (a *Actor) exec(eff Effect) {
 	}
 }
 
-// startWorker 在独立 goroutine 中重新读取任务事实（init.resume）、绑定 Gateway 入口并运行 attempt。
+// startWorker 在独立 goroutine 中重新读取任务事实（init.resume、init.budget_limits）并运行 attempt。
 // OnReady 以 WorkerStarted 回到收件箱；Run 返回后以 AttemptFinished 回到收件箱。
 func (a *Actor) startWorker(f StartWorker) {
 	ch := make(chan Control, 4)
@@ -582,9 +590,6 @@ func (a *Actor) startWorker(f StartWorker) {
 		spec.Task, spec.StartErr = readRetry(ctx, a.d, func(ctx context.Context) (TaskState, error) {
 			return a.d.Store.LoadTask(ctx, taskID)
 		})
-		if spec.StartErr == nil {
-			spec.GatewaySocket, spec.StartErr = a.d.Access.Bind(ctx, f.AttemptID)
-		}
 		spec.OnReady = func() { a.post(ctx, WorkerStarted{AttemptID: f.AttemptID, EnvID: f.EnvID}) }
 		return AttemptFinished{AttemptID: f.AttemptID, EnvID: f.EnvID, Outcome: a.d.Runner.Run(runCtx, spec, ch)}
 	})
@@ -599,17 +604,25 @@ func (a *Actor) stopRunForLimit(attemptID string) {
 	}
 }
 
-// stopEnv：先撤销访问（Gateway 入口与 Store 中的 attempt_access），再经 coordinator 停止环境。
+// stopEnv：先撤销访问，再经 coordinator 停止环境。撤销顺序是 **DB 先提交、再关连接**（§9.1"持久化
+// 检查才是执行点"）：Store.RevokeAttemptAccess 提交（或被确定拒绝）之后才 Access.Revoke；Store 暂时失败时
+// 不关闭入口（它在 Store 中仍是 active），由 Store 队列补提交后再关闭（见 opRevoke），物理停止不等待它。
+// 取消生效时（desired = cancel）原因为 RevokeReasonCancel，使 Gateway 取消该 attempt 的在途上游 try。
 func (a *Actor) stopEnv(f StopEnvironment) {
 	reason, revoke := a.revoking[f.AttemptID]
 	delete(a.revoking, f.AttemptID)
+	if revoke && a.s.Desired == "cancel" {
+		reason = RevokeReasonCancel
+	}
 	a.async(func(ctx context.Context) any {
 		r := stopDone{attemptID: f.AttemptID, envID: f.EnvID, reason: reason}
 		if revoke {
-			r.accessErr = a.d.Access.Revoke(ctx, f.AttemptID)
 			rctx, cancel := context.WithTimeout(ctx, revokeTimeout)
 			r.revokeErr = a.d.Store.RevokeAttemptAccess(rctx, f.AttemptID, reason)
 			cancel()
+			if r.revokeErr == nil || definitive(r.revokeErr) {
+				r.accessErr = a.d.Access.Revoke(ctx, f.AttemptID, reason)
+			}
 		}
 		r.report, r.err = a.d.Env.StopEnv(ctx, f.EnvID)
 		return r
@@ -823,7 +836,12 @@ func (a *Actor) pumpStore() {
 		case opPersistRunTime:
 			_, r.err = a.d.Store.PersistRunTime(ctx, taskID, cp.attemptID, cp.totalMs)
 		case opRevoke:
+			// 补提交的撤销：提交（或被确定拒绝）之后才关闭 Gateway 入口（与 stopEnv 相同的顺序）。
 			r.err = a.d.Store.RevokeAttemptAccess(ctx, cp.attemptID, cp.reason)
+			if r.err == nil || definitive(r.err) {
+				// 关闭入口只是清理：失败（例如删除 socket 文件失败）不影响已提交的撤销，也不重试。
+				_ = a.d.Access.Revoke(ctx, cp.attemptID, cp.reason)
+			}
 		case opAccountRunTime:
 			if r.err = a.d.OnStopRecorded(ctx, cp.attemptID, cp.stoppedAt); r.err == nil {
 				if ts, err := a.d.Store.LoadTask(ctx, taskID); err == nil { // 限额以计入后的累计为准

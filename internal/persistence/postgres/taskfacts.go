@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 
@@ -101,6 +103,44 @@ func (s *Store) RevokeAttemptAccess(ctx context.Context, attemptID, reason strin
 		}
 		_, err := tx.Exec(ctx, `UPDATE attempt_access SET state = 'revoked', revoked_at = now(), reason = $2
 			WHERE attempt_id = $1 AND state = 'active'`, attemptID, reason)
+		return err
+	})
+}
+
+// LookupAttempt 返回 attempt 所属的任务与环境（实现 task.Store；Gateway 入口绑定时核对归属）。
+func (s *Store) LookupAttempt(ctx context.Context, attemptID string) (string, string, error) {
+	if attemptID == "" {
+		return "", "", invalidf("LookupAttempt 缺少 attempt_id")
+	}
+	var taskID, envID string
+	err := s.read(ctx, "LookupAttempt", func(ctx context.Context, q queryer) error {
+		err := q.QueryRow(ctx, "SELECT task_id, env_id FROM attempts WHERE attempt_id = $1", attemptID).Scan(&taskID, &envID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("attempt %s", attemptID)
+		}
+		return err
+	})
+	return taskID, envID, err
+}
+
+// AppendHostEvent 追加一条 host 事件（实现 task.Store；例如 Gateway 的 replay_divergence，§9.4）：与其他
+// host 事件同一路径（lockEventSeq → appendHostEvent 分配 task_seq）。event_key 由类型、attempt 与 payload
+// 的哈希确定，提交结果未知后的重跑以同一身份幂等；内容完全相同的两次报告视为同一事件。
+func (s *Store) AppendHostEvent(ctx context.Context, taskID, attemptID, typ string, payload json.RawMessage) error {
+	if taskID == "" || typ == "" {
+		return invalidf("AppendHostEvent 缺少 task_id 或事件类型")
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &obj); err != nil || obj == nil {
+		return invalidf("host 事件 %s 的 payload 须为 JSON 对象", typ)
+	}
+	sum := sha256.Sum256(payload)
+	key := typ + ":" + attemptID + ":" + hex.EncodeToString(sum[:16])
+	return s.run(ctx, "AppendHostEvent", taskID+"/"+key, func(ctx context.Context, tx pgx.Tx) error {
+		if err := lockEventSeq(ctx, tx, taskID); err != nil {
+			return err
+		}
+		_, err := appendHostEvent(ctx, tx, hostEvent{taskID: taskID, key: key, attemptID: attemptID, typ: typ, payload: payload})
 		return err
 	})
 }

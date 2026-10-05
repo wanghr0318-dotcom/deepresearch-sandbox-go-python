@@ -320,19 +320,17 @@ func (c *Coordinator) Budget(ctx context.Context, taskID string) (Budget, error)
 	return c.store.LoadBudget(ctx, taskID)
 }
 
-// OpenBlob 只读打开任务 scope 内的调用结果 blob：sha 须是该任务某个 completed 调用的 result_ref
-// （它们由结算事务加入 scope_blobs(task)）。不存在与未授权都返回 blob.ErrNotFound，不泄露存在性。
+// OpenBlob 只读打开任务 scope 内的 blob：sha 须在 scope_blobs(task) 中（Store.BlobAuthorized；调用结果由
+// 结算事务加入）。不存在与未授权都返回 blob.ErrNotFound，不泄露存在性。
 func (c *Coordinator) OpenBlob(ctx context.Context, taskID, sha string) (io.ReadCloser, error) {
-	calls, err := c.store.ListCalls(ctx, taskID)
+	ok, err := c.store.BlobAuthorized(ctx, taskID, sha)
 	if err != nil {
 		return nil, err
 	}
-	for _, r := range calls {
-		if r.State == StateCompleted && r.ResultRef == sha {
-			return c.blobs.Open(sha)
-		}
+	if !ok {
+		return nil, blob.ErrNotFound
 	}
-	return nil, blob.ErrNotFound
+	return c.blobs.Open(sha)
 }
 
 // CancelAttempt 由 edge 在撤销 attempt 时调用。只有 reason == ReasonCancel 取消该 attempt 的在途 try

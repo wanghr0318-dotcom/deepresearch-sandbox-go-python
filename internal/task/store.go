@@ -31,6 +31,11 @@ type Store interface {
 	PersistRunTime(ctx context.Context, taskID, attemptID string, totalMs int64) (int64, error)
 	// RevokeAttemptAccess 把 attempt 的访问置为 revoked（幂等）；此后该 attempt 的提交以 stale_attempt 拒绝。
 	RevokeAttemptAccess(ctx context.Context, attemptID, reason string) error
+	// LookupAttempt 返回 attempt 所属的任务与环境（Gateway 入口绑定时核对归属）；不存在为 persistence.ErrNotFound。
+	LookupAttempt(ctx context.Context, attemptID string) (taskID, envID string, err error)
+	// AppendHostEvent 追加一条 host 事件（经 task_event_seq 分配 task_seq，与其他 host 事件同一路径）；
+	// payload 须为 JSON 对象。以 (type, attempt, payload) 为事件身份幂等：提交结果未知后的重跑不重复追加。
+	AppendHostEvent(ctx context.Context, taskID, attemptID, typ string, payload json.RawMessage) error
 }
 
 // RetryKind 是创建 attempt 的重试类别（规格 §8.1"重试计数"、§14.2）。

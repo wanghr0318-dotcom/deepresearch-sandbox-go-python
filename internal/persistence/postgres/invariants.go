@@ -21,6 +21,25 @@ var invariantQueries = []struct {
 	{"I2", "A", `SELECT a.task_id, count(*)::text || ' 个 attempt 的环境未确认停止'
 		FROM attempts a JOIN environments e ON e.attempt_id = a.attempt_id
 		WHERE e.stopped_at IS NULL GROUP BY a.task_id HAVING count(*) > 1`},
+	// I3（task 层）：reserved = Σ held、unknown = Σ charged_unknown、spent = Σ settled try 的实际费用。
+	{"I3", "A", `SELECT b.task_id, format('reserved=%s（held 之和 %s），unknown=%s（charged_unknown 之和 %s），spent=%s（settled 之和 %s）',
+			b.reserved_micro, COALESCE(r.held, 0), b.unknown_micro, COALESCE(r.unk, 0), b.spent_micro, COALESCE(s.spent, 0))
+		FROM budgets b
+		LEFT JOIN (SELECT task_id, sum(amount) FILTER (WHERE state = 'held') AS held,
+				sum(amount) FILTER (WHERE state = 'charged_unknown') AS unk
+			FROM reservations GROUP BY task_id) r ON r.task_id = b.task_id
+		LEFT JOIN (SELECT t.task_id, sum(t.cost_micro) AS spent FROM call_tries t
+				JOIN reservations x ON x.reservation_id = t.reservation_id WHERE x.state = 'settled' GROUP BY t.task_id) s
+			ON s.task_id = b.task_id
+		WHERE b.reserved_micro <> COALESCE(r.held, 0) OR b.unknown_micro <> COALESCE(r.unk, 0) OR b.spent_micro <> COALESCE(s.spent, 0)`},
+	// I3：每笔 reservation 恰在一个桶中，且与其 try 的结算一致（held ↔ 在途；settled ↔ ok；released ↔ retryable/fatal；
+	// charged_unknown ↔ unknown）。
+	{"I3", "A", `SELECT r.task_id, format('reservation %s（%s#%s）为 %s，try 为 %s/%s', r.reservation_id, r.call_id, r.try_no,
+			r.state, COALESCE(t.state, '∅'), COALESCE(NULLIF(t.outcome, ''), '∅'))
+		FROM reservations r LEFT JOIN call_tries t ON t.reservation_id = r.reservation_id
+		WHERE t.reservation_id IS NULL OR NOT ((r.state = 'held' AND t.state = 'in_flight')
+			OR (r.state = 'settled' AND t.outcome = 'ok') OR (r.state = 'released' AND t.outcome IN ('retryable', 'fatal'))
+			OR (r.state = 'charged_unknown' AND t.outcome = 'unknown'))`},
 	{"I4", "A", `SELECT task_id, format('事件 %s 条，task_seq 范围 %s..%s', count(*), min(task_seq), max(task_seq))
 		FROM events GROUP BY task_id HAVING count(*) <> max(task_seq) OR min(task_seq) <> 1`},
 	{"I6", "A", `SELECT c.scope_id, format('checkpoint %s 引用的 %s 未授权到当前 scope', c.checkpoint_id, refs.r)
@@ -39,6 +58,15 @@ var invariantQueries = []struct {
 		FROM attempt_access WHERE state = 'active' GROUP BY task_id HAVING count(*) > 1`},
 	{"I8", "B", `SELECT resource_path, format('%s 自 %s 起隔离，超过期限仍未报警', kind, detected_at)
 		FROM quarantined_resources WHERE NOT alerted AND detected_at < now() - interval '` + quarantineAlertDeadline + `'`},
+	// I14（journal 部分）：completed 调用的结果登记在 blobs 并授权到 scope_blobs(task)；result_ref 等于结算时
+	// 记录的结果（ok try 的 blob_provenance），即已记录的结果没有被改写。内容完整性由 ReferencedBlobs 复算。
+	{"I14", "A", `SELECT c.task_id, format('调用 %s 的结果 %s 未登记到 blobs 或 scope_blobs(task)', c.call_id, c.result_ref)
+		FROM calls c WHERE c.state = 'completed' AND (NOT EXISTS (SELECT 1 FROM blobs b WHERE b.sha256 = c.result_ref)
+			OR NOT EXISTS (SELECT 1 FROM scope_blobs sb WHERE sb.scope_kind = 'task' AND sb.scope_id = c.task_id AND sb.sha256 = c.result_ref))`},
+	{"I14", "A", `SELECT c.task_id, format('调用 %s 的 result_ref %s 不是结算时记录的结果', c.call_id, c.result_ref)
+		FROM calls c WHERE c.state = 'completed' AND NOT EXISTS (SELECT 1 FROM call_tries t JOIN blob_provenance p
+			ON p.scope_kind = 'task' AND p.scope_id = t.task_id AND p.source = 'gateway' AND p.ref = t.call_id || '#' || t.try_no
+			WHERE t.task_id = c.task_id AND t.call_id = c.call_id AND t.outcome = 'ok' AND p.sha256 = c.result_ref)`},
 	{"I16", "A", `SELECT r.request_id, format('%s 请求对应的资源 %L 不存在', r.kind, r.resource_id)
 		FROM api_requests r WHERE r.resource_id = '' OR NOT EXISTS (SELECT 1 FROM tasks t WHERE t.task_id = r.resource_id)`},
 }
@@ -82,7 +110,7 @@ func (s *Store) CleanedEnvIDs(ctx context.Context) ([]string, error) {
 	return out, err
 }
 
-// ReferencedBlobs 返回已登记产物与已提交 checkpoint 引用的 blob（实现 invariants.Store）；
+// ReferencedBlobs 返回已登记产物、已提交 checkpoint 引用与 completed 调用结果的 blob（实现 invariants.Store）；
 // 未在 blobs 中登记的引用以大小 -1 返回，由内容检查报告。
 func (s *Store) ReferencedBlobs(ctx context.Context) ([]invariants.BlobRef, error) {
 	var out []invariants.BlobRef
@@ -94,6 +122,10 @@ func (s *Store) ReferencedBlobs(ctx context.Context) ([]invariants.BlobRef, erro
 				FROM checkpoints c,
 					LATERAL (SELECT jsonb_array_elements_text(c.refs_json) AS r UNION ALL SELECT c.state_ref WHERE c.state_ref IS NOT NULL) refs
 				LEFT JOIN blobs b ON b.sha256 = refs.r
+			UNION ALL
+			SELECT c.result_ref, COALESCE(b.size, -1), format('call %s/%s', c.task_id, c.call_id)
+				FROM calls c LEFT JOIN blobs b ON b.sha256 = c.result_ref
+				WHERE c.state = 'completed'
 			ORDER BY 3, 1`)
 		if err != nil {
 			return err

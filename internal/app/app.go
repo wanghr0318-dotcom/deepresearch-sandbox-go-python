@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,9 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/blob"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/datadir"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/edge"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
@@ -81,6 +85,38 @@ type Config struct {
 	Runner runner.Options
 	// RetryBackoff 是恢复与报警标记失败后的重试退避；默认 resource.DefaultBackoff（基数 2 s，上限 60 s）。
 	RetryBackoff func(try int) time.Duration
+
+	// DefaultBudgetMicro 是 task 层预算（微美元，§9.6）的默认值：创建任务时未指定 limits.budget_micro 则以此
+	// 补入并随任务存储。默认 2_000_000（2.00 USD，待审批的默认值）；须为正且不超过 BudgetCapMicro。
+	DefaultBudgetMicro int64
+	// BudgetCapMicro 是显式 limits.budget_micro 的服务端上限；默认 50_000_000（50.00 USD）。
+	BudgetCapMicro int64
+	// Model 是唯一声明的模型上游（OpenAI 兼容）；BaseURL 为空时不提供 /v1/chat/completions。
+	Model ModelConfig
+	// SearchProvider 是搜索供应商：fake | tavily | ddg_lite（默认 ddg_lite）。fake 只用于测试，要求设置
+	// UpstreamAllowPrivate（指向本机 fake upstream）；tavily 要求 SearchAPIKey。
+	SearchProvider string
+	// SearchAPIKey 是搜索供应商的 Key（只从宿主环境变量 AGENTBOX_SEARCH_API_KEY 加载，§9.9）。
+	SearchAPIKey string
+	// UpstreamAllowPrivate 是显式放行的私有上游主机（§9.8 规则 2；"host" 或 "host:port"），所有 adapter 共用。
+	UpstreamAllowPrivate []string
+	// Gateway 是调用限额（零值取 §19 默认值）。
+	Gateway call.Limits
+}
+
+// ModelConfig 是模型上游的配置。APIKey 只从宿主环境变量 AGENTBOX_MODEL_API_KEY 加载，只交给 chat adapter
+// （放在 Authorization 头中），不进入日志、init 或沙箱环境（§9.9、G3）。
+type ModelConfig struct {
+	BaseURL string           // 例如 https://api.openai.com/v1
+	Name    string           // 唯一声明的模型名
+	Pricing upstream.Pricing // 按每百万 token 的微美元单价；Version 为空时由单价生成
+	APIKey  string
+}
+
+// workerEnvAllowed 是沙箱内 Worker 环境变量的白名单（Config.WorkerEnv 的键）：凭据不能经由环境变量进入沙箱。
+var workerEnvAllowed = map[string]bool{
+	"PYTHONPATH": true, "PYTHONUNBUFFERED": true, "PYTHONDONTWRITEBYTECODE": true, "PYTHONHASHSEED": true,
+	"PYTHONIOENCODING": true, "LANG": true, "LC_ALL": true, "TZ": true,
 }
 
 func (c Config) withDefaults() Config {
@@ -135,6 +171,18 @@ func (c Config) withDefaults() Config {
 	if c.RetryBackoff == nil {
 		c.RetryBackoff = resource.DefaultBackoff
 	}
+	if c.DefaultBudgetMicro <= 0 {
+		c.DefaultBudgetMicro = 2_000_000
+	}
+	if c.BudgetCapMicro <= 0 {
+		c.BudgetCapMicro = 50_000_000
+	}
+	if c.SearchProvider == "" {
+		c.SearchProvider = upstream.SearchDDGLite
+	}
+	if p := &c.Model.Pricing; p.Version == "" {
+		p.Version = fmt.Sprintf("config/in=%d,out=%d", p.InputMicroPerMTok, p.OutputMicroPerMTok)
+	}
 	return c
 }
 
@@ -146,6 +194,31 @@ func (c Config) validate() error {
 		return fmt.Errorf("app: 默认运行时限 %s 超过服务端上限 %s", c.DefaultRunTime, c.RunTimeCap)
 	case c.DefaultMemoryBytes > c.Capacity.MemoryBytes:
 		return fmt.Errorf("app: 默认内存 %d 超过总容量 %d", c.DefaultMemoryBytes, c.Capacity.MemoryBytes)
+	case c.DefaultBudgetMicro > c.BudgetCapMicro:
+		return fmt.Errorf("app: 默认预算 %d 超过服务端上限 %d（微美元）", c.DefaultBudgetMicro, c.BudgetCapMicro)
+	case c.Model.BaseURL != "" && c.Model.Name == "":
+		return errors.New("app: 配置了模型上游地址但没有模型名")
+	case c.Model.Pricing.InputMicroPerMTok < 0 || c.Model.Pricing.OutputMicroPerMTok < 0:
+		return errors.New("app: 模型单价不能为负数")
+	}
+	switch c.SearchProvider {
+	case upstream.SearchFake:
+		if len(c.UpstreamAllowPrivate) == 0 {
+			return errors.New("app: 搜索供应商 fake 只用于测试，须同时设置 upstream_allow_private 指向本机 fake upstream")
+		}
+	case upstream.SearchTavily:
+		if c.SearchAPIKey == "" {
+			return errors.New("app: 搜索供应商 tavily 需要宿主环境变量 AGENTBOX_SEARCH_API_KEY")
+		}
+	case upstream.SearchDDGLite:
+	default:
+		return fmt.Errorf("app: 搜索供应商须为 fake、tavily 或 ddg_lite，得到 %q", c.SearchProvider)
+	}
+	for _, kv := range c.WorkerEnv {
+		k, _, _ := strings.Cut(kv, "=")
+		if !workerEnvAllowed[k] {
+			return fmt.Errorf("app: Worker 环境变量 %q 不在白名单中（凭据不得进入沙箱）", k)
+		}
 	}
 	return nil
 }
@@ -164,6 +237,7 @@ type Store interface {
 	resource.Store
 	runner.Store
 	api.Store
+	call.Store
 	// Migrate 执行尚未应用的迁移（安装引导之后）。
 	Migrate(ctx context.Context) error
 	Close()
@@ -299,6 +373,8 @@ type server struct {
 	adm       *admission.Admission
 	coord     *resource.Coordinator
 	taskDeps  task.Deps
+	calls     *call.Coordinator // Gateway 的记账与 journal 所有者
+	edge      *edge.Edge        // Gateway 的每 attempt 入口（task.Access）
 
 	mode    atomic.Value // api.Mode
 	sched   atomic.Pointer[task.Scheduler]
@@ -389,7 +465,7 @@ func (s *server) run(ctx context.Context, deadline <-chan time.Time) error {
 	return s.serve(ctx, deadline)
 }
 
-// assemble 构造 provider、BlobStore、admission、coordinator、runner 与 actor 的依赖。
+// assemble 构造 provider、BlobStore、admission、coordinator、runner、Gateway 与 actor 的依赖。
 func (s *server) assemble() error {
 	prov, err := s.d.NewProvider(s.installID)
 	if err != nil {
@@ -404,12 +480,15 @@ func (s *server) assemble() error {
 	s.coord = resource.NewCoordinator(s.store, prov, resource.Options{InstallID: s.installID,
 		UIDBase: s.cfg.UIDBase, UIDCount: s.cfg.UIDCount, Backoff: s.cfg.RetryBackoff})
 	run := runner.New(s.store, blobs, prov, prov.ResourceDiag, s.cfg.Runner)
+	if err := s.assembleGateway(blobs); err != nil {
+		return err
+	}
 	s.taskDeps = task.Deps{
 		Store:     s.store,
 		Admission: admissionAdapter{a: s.adm, cfg: s.cfg},
 		Env:       envAdapter{c: s.coord, cfg: s.cfg, dataDir: s.d.DataDir},
 		Runner:    runnerAdapter{r: run, cfg: s.cfg, dataDir: s.d.DataDir},
-		Access:    &task.FakeAccess{}, // M1 没有 Gateway
+		Access:    s.edge,
 		Clock:     s.d.Clock,
 		IDs:       s.d.NewID,
 		OnFatal: func(taskID string, err error) {
@@ -425,6 +504,37 @@ func (s *server) assemble() error {
 			return s.store.AccountUnrecordedRunTime(ctx, att.TaskID, attemptID, stoppedAt)
 		},
 	}
+	return nil
+}
+
+// gatewayDir 是 Gateway socket 的目录 <data>/gateway（每个 attempt 一个 <attempt_id>.sock，规格 §9.1 按
+// Plan 7 执行中修订：不在环境目录内，不作为 listener intent 记录）。
+func gatewayDir(dataDir string) string { return filepath.Join(dataDir, "gateway") }
+
+// assembleGateway 构造 Gateway：共用的验证 dialer（§9.8）→ 上游 adapter → call 协调器 → edge。
+// 启动时清空 <data>/gateway：上一次运行的 socket 都已失效（重启时全部访问已撤销），edge 只为本次运行的
+// attempt 建立入口。目录为 0711：沙箱 init 在 user namespace 中以映射 root 运行，须能经过它到达 socket
+// （socket 本身 0600、属主为环境映射 uid 1000，由 provider 启动环境时 chown）。
+func (s *server) assembleGateway(blobs blob.Store) error {
+	dir := gatewayDir(s.d.DataDir)
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("app: 清空 Gateway socket 目录: %w", err)
+	}
+	if err := os.Mkdir(dir, 0o711); err != nil {
+		return fmt.Errorf("app: 建立 Gateway socket 目录: %w", err)
+	}
+	if err := os.Chmod(dir, 0o711); err != nil { // 不受 umask 影响
+		return fmt.Errorf("app: 设置 Gateway socket 目录权限: %w", err)
+	}
+	dialer := upstream.NewDialer(upstream.DialerConfig{AllowPrivate: s.cfg.UpstreamAllowPrivate})
+	adapters, pricing := s.cfg.gatewayAdapters(dialer)
+	calls, err := call.New(call.Config{Store: s.store, Adapters: adapters, Pricing: pricing, Blobs: blobs,
+		Events: hostEvents{s: s.store}, Limits: s.cfg.Gateway, Logger: s.log})
+	if err != nil {
+		return fmt.Errorf("app: Gateway 调用协调器: %w", err)
+	}
+	s.calls = calls
+	s.edge = edge.New(edge.Config{SocketDir: dir, Logger: s.log}, calls, attemptLookup{s: s.store})
 	return nil
 }
 
@@ -527,6 +637,12 @@ func (s *server) recoverOnce(ctx context.Context) (recovery.Report, error) {
 		return recovery.Report{}, fmt.Errorf("撤销 active 访问: %w", err)
 	}
 	s.log.Info("已撤销 active 访问", "count", n)
+	// 第 4 步（M2 的 journal 部分）：遗留的 resolving 调用（无 try）复位为可重新解析，期限不变（§9.7、§11.2）。
+	reset, err := s.store.ResetResolving(ctx)
+	if err != nil {
+		return recovery.Report{}, fmt.Errorf("复位 resolving 调用: %w", err)
+	}
+	s.log.Info("已复位遗留的 resolving 调用", "count", reset)
 	s.step("revoke_access")
 	// 第 5 步：provider.List 与独立原始扫描，逐层报告。
 	envs, err := s.prov.List(ctx)
@@ -836,6 +952,15 @@ func (s *server) shutdown(reason error) error {
 		}
 		s.bg.Wait()
 	}, func() { s.log.Error("等待 actor 与后台任务退出超时") })
+	// Gateway：关闭全部入口（删除 socket），再让 call 协调器取消在途 try 并等待其结算（有期限）。
+	if s.edge != nil {
+		if err := s.edge.Close(); err != nil {
+			s.log.Error("关闭 Gateway 入口失败", "error", err.Error())
+		}
+	}
+	if s.calls != nil {
+		waitOrTimeout(ctx, s.calls.Close, func() { s.log.Error("等待 Gateway 在途调用结算超时") })
+	}
 	return reason
 }
 
