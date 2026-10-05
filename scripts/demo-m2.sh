@@ -48,6 +48,8 @@
 #                                        /var/lib/agentbox-demo-m2、监听 127.0.0.1:8080）
 #   AGENTBOX_DEMO_WEB_DIR                可选：工作台构建产物目录（例如 <仓库>/web/dist）；设置后 server 以
 #                                        --web-dir 同源提供工作台，可在浏览器中观察研究任务；不设置时行为不变
+#   AGENTBOX_DEMO_REDIS_ADDR             可选：共享缓存的 Redis 地址（例如 127.0.0.1:6379）→ --redis-addr；设置后
+#                                        inspect 一步打印 /status 的缓存计数与各调用的来源（upstream|cache|coalesced）
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -348,6 +350,7 @@ else
 fi
 [ -z "$MODEL_PRICES" ] || FLAGS+=(--model-price "$MODEL_PRICES")
 [ -z "${AGENTBOX_DEMO_WEB_DIR:-}" ] || FLAGS+=(--web-dir "$AGENTBOX_DEMO_WEB_DIR")
+[ -z "${AGENTBOX_DEMO_REDIS_ADDR:-}" ] || FLAGS+=(--redis-addr "$AGENTBOX_DEMO_REDIS_ADDR")
 
 step "启动 agentbox server（生产启动器、Gateway、Worker = python3 -m deepresearch）"
 info "agentbox server ${FLAGS[*]}"
@@ -428,6 +431,10 @@ ok "模型路由：plan/report = $ORCH_MODEL，任务内 chat = $WORKER_MODEL"
 [ "$(json "all(c['state'] == 'completed' for c in d['calls'] if c['endpoint'] == '/v1/chat/completions')" <"$LOGDIR/inspect.json")" = True ] ||
   fail "存在未完成的模型调用"
 ok "全部调用已结算：$(json "', '.join(f'{s} {n}' for s, n in sorted(__import__('collections').Counter(c['state'] for c in d['calls']).items()))" <"$LOGDIR/inspect.json")；模型调用全部 completed"
+if [ -n "${AGENTBOX_DEMO_REDIS_ADDR:-}" ]; then
+  ok "调用来源：$(json "', '.join(f'{s} {n}' for s, n in sorted(__import__('collections').Counter(c.get('source', 'upstream') for c in d['calls']).items()))" <"$LOGDIR/inspect.json")"
+  ok "缓存计数（/status）：$(curl -fsS "$AGENTBOX_ADDR/status" | json "d.get('cache')")"
+fi
 
 step "研究报告（从 BlobStore 读取并校验 sha256）：前 40 行与证据列表"
 REPORT_SHA=$(jsonl "d['payload']['sha256'] if d['type'] == 'artifact_saved' and d['payload'].get('artifact_id') == 'report' else ''" <"$EVENTS" | grep -v '^$' | tail -n 1 || true)
