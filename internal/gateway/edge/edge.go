@@ -115,6 +115,10 @@ type Edge struct {
 	mu       sync.Mutex
 	closed   bool
 	bindings map[string]*binding
+
+	// connStateHook 是只供测试的观察点（生产中为 nil）：连接状态变化时在 edge 已更新自身连接集合之后调用；
+	// StateClosed 时该连接已从 attempt 的连接集合中移除。须在 Bind 之前设置。
+	connStateHook func(attemptID string, state http.ConnState)
 }
 
 // New 创建 Edge。
@@ -268,8 +272,12 @@ type binding struct {
 func newBinding(e *Edge, attemptID, taskID, envID, path string, ul *net.UnixListener) *binding {
 	b := &binding{
 		e: e, attemptID: attemptID, taskID: taskID, envID: envID, path: path,
-		ln:     &limitListener{Listener: ul, max: e.cfg.MaxConns, conns: make(map[*trackedConn]struct{})},
 		served: make(chan struct{}),
+	}
+	hook := e.connStateHook
+	b.ln = &limitListener{Listener: ul, max: e.cfg.MaxConns, conns: make(map[*trackedConn]struct{})}
+	if hook != nil {
+		b.ln.onRemove = func() { hook(attemptID, http.StateClosed) }
 	}
 	b.ctx, b.cancel = context.WithCancel(context.Background())
 	b.srv = &http.Server{
@@ -278,6 +286,21 @@ func newBinding(e *Edge, attemptID, taskID, envID, path string, ul *net.UnixList
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          slog.NewLogLogger(e.log.Handler(), slog.LevelDebug),
+		// 处理函数经请求上下文取得自己的连接（见 invoke：Worker 断开时立即释放连接名额）。
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if tc, ok := c.(*trackedConn); ok {
+				return context.WithValue(ctx, connKey{}, tc)
+			}
+			return ctx
+		},
+	}
+	if hook != nil {
+		b.srv.ConnState = func(_ net.Conn, s http.ConnState) {
+			// StateClosed/StateHijacked 由 trackedConn 在移出连接集合之后报告（onRemove）。
+			if s != http.StateClosed && s != http.StateHijacked {
+				hook(attemptID, s)
+			}
+		}
 	}
 	return b
 }
@@ -362,6 +385,14 @@ func (b *binding) invoke(w http.ResponseWriter, r *http.Request, kind upstream.K
 		Retry:           strings.EqualFold(strings.TrimSpace(r.Header.Get(HeaderRetry)), "true"),
 		Supersedes:      r.Header.Get(HeaderSupersedes),
 		SupersedeReason: r.Header.Get(HeaderSupersedeReason),
+	}
+	// Worker 在响应前断开（net/http 读到 EOF 后取消 r.Context()）：立即关闭服务端连接、释放连接名额，
+	// Invoke 不受影响，响应写入失败即丢弃。处理函数返回前 stop，正常结束不会触发。
+	if tc, ok := r.Context().Value(connKey{}).(*trackedConn); ok {
+		stop := context.AfterFunc(r.Context(), func() {
+			_ = tc.Close() // Worker 已断开，关闭错误无关紧要
+		})
+		defer stop()
 	}
 	// 以 binding 的上下文而非 r.Context() 调用：Worker 断开不取消 Invoke（见 binding.ctx）。
 	res, err := b.e.calls.Invoke(b.ctx, in)
@@ -505,7 +536,8 @@ func (b *binding) writeJSON(w http.ResponseWriter, status int, v any) {
 // limitListener 跟踪已接受的连接：超过 max 的新连接在接受后立即关闭；closeAll 关闭 listener 与全部连接。
 type limitListener struct {
 	net.Listener
-	max int
+	max      int
+	onRemove func() // 连接移出集合之后调用（只供测试，见 Edge.connStateHook）
 
 	mu     sync.Mutex
 	closed bool
@@ -555,7 +587,13 @@ func (l *limitListener) remove(c *trackedConn) {
 	l.mu.Lock()
 	delete(l.conns, c)
 	l.mu.Unlock()
+	if l.onRemove != nil {
+		l.onRemove()
+	}
 }
+
+// connKey 是请求上下文中 *trackedConn 的键。
+type connKey struct{}
 
 // trackedConn 在关闭时从 limitListener 的集合中移除。
 type trackedConn struct {

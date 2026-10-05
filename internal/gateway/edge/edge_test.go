@@ -173,6 +173,29 @@ func errCode(t *testing.T, r reply) string {
 	return eb.Error.Code
 }
 
+// watchClosed 设置 connStateHook（须在 Bind 之前），返回 StateClosed 事件（attempt_id）的通道。
+func watchClosed(e *Edge) <-chan string {
+	ch := make(chan string, 64)
+	e.connStateHook = func(attemptID string, s http.ConnState) {
+		if s == http.StateClosed {
+			ch <- attemptID
+		}
+	}
+	return ch
+}
+
+func waitClosed(t *testing.T, ch <-chan string, attemptID string) {
+	t.Helper()
+	select {
+	case id := <-ch:
+		if id != attemptID {
+			t.Fatalf("StateClosed 来自 %s，期望 %s", id, attemptID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("等待连接关闭超时")
+	}
+}
+
 func callHdr(id string) map[string]string { return map[string]string{HeaderCallID: id} }
 
 // 原始 keep-alive 连接：发一个 GET /v1/budget 并读完响应，连接保持打开。
@@ -290,9 +313,10 @@ func TestBindLifecycle(t *testing.T) {
 	}
 }
 
-// 第 17 个连接在接受后立即关闭；已接受的 16 个连接继续可用。
+// 第 17 个连接在接受后立即关闭；已接受的 16 个连接继续可用；释放一个连接后新连接可用。
 func TestConnectionLimit(t *testing.T) {
 	e := newEdge(t, Config{}, &fakeCalls{})
+	closed := watchClosed(e)
 	p := bind(t, e, "a1", "e1")
 	var conns []net.Conn
 	defer func() {
@@ -326,6 +350,23 @@ func TestConnectionLimit(t *testing.T) {
 		if err := rawBudget(c, bufio.NewReader(c)); err != nil {
 			t.Errorf("连接 %d 在拒绝第 17 个后失效：%v", i+1, err)
 		}
+	}
+	// 关闭一个已接受的连接；edge 将其移出连接集合（StateClosed）后，新连接被接受并可服务。
+	if err := conns[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+	conns = conns[1:]
+	waitClosed(t, closed, "a1")
+	c, err := net.Dial("unix", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns = append(conns, c)
+	if err := c.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := rawBudget(c, bufio.NewReader(c)); err != nil {
+		t.Fatalf("释放连接后新连接未被接受：%v", err)
 	}
 }
 
@@ -575,6 +616,7 @@ func TestClientDisconnectDoesNotCancelInvoke(t *testing.T) {
 		return call.Result{Body: []byte(`{}`), Status: 200}, nil
 	}}
 	e := newEdge(t, Config{}, calls)
+	closed := watchClosed(e)
 	p := bind(t, e, "a1", "e1")
 	c, err := net.Dial("unix", p)
 	if err != nil {
@@ -588,10 +630,12 @@ func TestClientDisconnectDoesNotCancelInvoke(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("请求未进入 Invoke")
 	}
-	// 顺序：Invoke 已开始 → Worker 断开 → 释放 Invoke → 断言其 ctx 未被取消。
+	// 顺序：Invoke 已开始 → Worker 断开 → edge 观察到断开并释放该连接（StateClosed；此时 net/http 已
+	// 取消 r.Context()，若误把它交给 Invoke 则下方断言失败）→ 释放 Invoke → 断言其 ctx 未被取消。
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
 	}
+	waitClosed(t, closed, "a1")
 	close(release)
 	select {
 	case err := <-done:
