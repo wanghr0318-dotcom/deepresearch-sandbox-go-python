@@ -403,10 +403,11 @@ func (c *Coordinator) Invoke(ctx context.Context, in Invoke) (Result, error) {
 	done := make(chan outcome, 1)
 	go func() {
 		defer c.wg.Done()
-		defer c.unclaim(key)
-		defer c.unregister(j)
-		defer j.cancel(nil)
 		r, err := c.run(j)
+		// 先释放进程内占用，再交付结果：调用方收到结果后立即以同 ID 重放不会得到 call_in_progress。
+		j.cancel(nil)
+		c.unregister(j)
+		c.unclaim(key)
 		done <- outcome{r, err}
 	}()
 	select {
