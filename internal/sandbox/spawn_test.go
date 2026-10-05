@@ -2854,6 +2854,7 @@ func TestHelperCommitFastExit(t *testing.T) {
 //   - start_ack 然后 exit 126：init 在 EOF 后的单次状态读取时 workload 仍存活；
 //   - start_err{helper/died_before_exec: exit 126}：workload 在 init 读取状态前已退出——126 是 helper 保留的失败退出码，
 //     "EOF 无字节 + 退出码 126"对 init 不可区分（残余边界窗口，慢机器上更常见）。
+//
 // 两种情形标记文件都必须存在（workload 确实运行过），并记录各自出现的次数。
 func TestHelperCommitExit126(t *testing.T) {
 	testutil.RequireLinuxRoot(t)
