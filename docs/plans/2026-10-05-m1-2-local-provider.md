@@ -361,6 +361,15 @@ func New(opt Options) (*Provider, error) // Starter 为 nil 时返回错误（�
 
 **M1 门槛**：Task 13 通过后，Plan 2 联合验收（含本节）与 M1 门槛一并判定。
 
+**执行中修订（Task 13，中心裁定）：**
+- **§4.5 workspace 准备缺失**：真实沙箱第一次运行任务在 `init/mount_workspace: permission denied` 失败——此前没有任何代码实现"宿主创建并 chown 到映射 UID"。裁定接受 Files 之外的四处修改：`provider/local/starter.go` `prepareWorkspace`（递归 Lchown 到 UIDBase+1000、校验上级 o+x）；`runner/artifact.go` 新建 out 目录 Fchown 给 workspace 属主；`internal/app` 数据目录与 `workspaces` 以 0711 建立（已有 0700 补 o+x）；`local_test.go` `TestPrepareWorkspace`。已回写规格 §4.5。
+- **server 装配**：`prepareIsolation` 在取锁、连库之前校验默认模板宿主路径（`Template.Ensure`）并构造 `NewProcessStarter`；新增 `--worker-argv`（默认 `python3,-m,sim_worker`）与 `--worker-env`（默认 `PYTHONPATH=/opt/agentbox`）。
+- **`allowed-skips.txt` 不加入 `TestReal*`**：该清单只作用于 root 的 `linux-integration`，正是这些用例必须运行的作业；非 root 的 `correctness` 不查该清单，`TestReal*` 在那里按设计跳过。本计划 Task 13 补充第 5 条的写法作废。
+- **保真度（写入验收记录）**：E3 的 OOM 受害者是同一环境 cgroup 中的另一个 exec，而非 Worker 的子进程（sim_worker 没有派生子进程的步骤）；E5 中 server 被杀会连带 init 与其 PID 命名空间退出，恢复只会遇到孤儿环境目录与 cgroup，不会遇到存活进程；`agentbox task result` 在 M1 返回 501，快速开始改用 `task watch/inspect`。
+- **演示脚本 `scripts/demo-m1.sh`**（用户要求）：每次运行使用全新数据目录（默认 `/var/lib/agentbox-demo`）与全新数据库（默认 `agentbox_demo`，经 psql / docker / Docker Desktop `docker.exe` 任一可用者新建），18 步逐步打印、失败即非零退出、末尾泄漏检查。
+- **留待最终评审**：环境停止并清理后 `env_status` 仍为 `creating`；任务因时限结束时 `run_time_ms` 未再持久化；空的安装级 cgroup 会在 `/sys/fs/cgroup` 下累积（演示脚本末尾删除本安装的）。
+
+
 ## 自查记录
 
 - **契约覆盖**：契约第 2 节类型 → Task 1；第 3 节各操作 → Task 7（StartExec）、Task 8（其余）；第 4 节错误 → Task 1 定义、Task 7–8 产生；第 5 节闸门与测试 → Task 7、Task 8、providertest；第 6 节归属 → Task 8（owner.json、命名）。
