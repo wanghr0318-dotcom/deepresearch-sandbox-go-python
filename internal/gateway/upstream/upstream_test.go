@@ -462,6 +462,46 @@ func TestChatResolveAndEstimate(t *testing.T) {
 	}
 }
 
+// 按调用选择模型（M2）：白名单内原样保留、不进 applied_defaults；缺省补默认模型并记入 applied_defaults；
+// 白名单外 400 unsupported_model；估算按解析后模型的价格表（缺项回退默认价格）。
+func TestChatModelAllowlistAndPerModelPricing(t *testing.T) {
+	a := NewChat(ChatConfig{BaseURL: "http://127.0.0.1:1/v1", Model: "kimi-k2.6",
+		Models:           []string{"kimi-k2.6", "kimi-k3", "kimi-k2.7-code"},
+		Pricing:          Pricing{InputMicroPerMTok: 1_000_000, OutputMicroPerMTok: 1_000_000},
+		PricingByModel:   map[string]Pricing{"kimi-k3": {InputMicroPerMTok: 4_000_000, OutputMicroPerMTok: 16_000_000}},
+		MaxTokensDefault: 100})
+	msgs := `[{"role":"user","content":"abcd"}]`
+	in := (int64(len(msgs)) + 3) / 4
+	for _, c := range []struct {
+		body, model string
+		defaulted   bool
+		want        int64
+	}{
+		{`{"model":"kimi-k3","messages":` + msgs + `}`, "kimi-k3", false, in*4 + 100*16},
+		{`{"model":"kimi-k2.7-code","messages":` + msgs + `}`, "kimi-k2.7-code", false, in + 100}, // 无专属价格 → 默认
+		{`{"messages":` + msgs + `}`, "kimi-k2.6", true, in + 100},
+	} {
+		out, defaults, err := a.Resolve([]byte(c.body))
+		if err != nil {
+			t.Fatalf("%s: %v", c.body, err)
+		}
+		var obj struct {
+			Model string `json:"model"`
+		}
+		unmarshal(t, out, &obj)
+		if _, has := defaults["model"]; obj.Model != c.model || has != c.defaulted || (has && defaults["model"] != c.model) {
+			t.Errorf("%s: resolved model %q, applied_defaults %v", c.body, obj.Model, defaults)
+		}
+		if got, err := a.Estimate(out); err != nil || got != c.want {
+			t.Errorf("%s: Estimate = %d, %v；期望 %d", c.body, got, err, c.want)
+		}
+	}
+	_, _, err := a.Resolve([]byte(`{"model":"kimi-k2.7-code-highspeed","messages":` + msgs + `}`))
+	if e := asErr(t, err); e.Status != http.StatusBadRequest || e.Code != CodeUnsupportedModel {
+		t.Fatalf("白名单外的模型：%v", e)
+	}
+}
+
 // chat Do 的结果归类：ok（解析 usage 与请求 ID）、429 + Retry-After、5xx、4xx、中途断开、发送前失败；
 // 并断言任何错误文本与日志都不含 Key。
 func TestChatOutcomesAndNoKeyLeak(t *testing.T) {
@@ -532,7 +572,7 @@ func TestChatOutcomesAndNoKeyLeak(t *testing.T) {
 		t.Fatalf("ok：%+v %v", resp.Usage, e)
 	}
 	resp, e = run("nousage")
-	in, maxTok, ie := chatInputs(resolved)
+	in, maxTok, _, ie := chatInputs(resolved)
 	if ie != nil {
 		t.Fatal(ie)
 	}

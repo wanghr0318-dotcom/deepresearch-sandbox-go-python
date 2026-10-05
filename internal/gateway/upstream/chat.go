@@ -11,22 +11,38 @@ import (
 
 // ChatConfig 配置 OpenAI 兼容的 chat adapter。
 type ChatConfig struct {
-	BaseURL          string // 例如 https://api.openai.com/v1；请求发往 BaseURL + "/chat/completions"
-	Model            string // 唯一声明的模型
-	APIKey           string // 来自宿主环境变量 AGENTBOX_MODEL_API_KEY；只放在 Authorization 头
-	Pricing          Pricing
+	BaseURL string   // 例如 https://api.openai.com/v1；请求发往 BaseURL + "/chat/completions"
+	Model   string   // 默认模型：请求未给 model 时使用（记入 applied_defaults）；总在白名单中
+	Models  []string // 声明的模型白名单（§9.3）；空时只有 Model
+	APIKey  string   // 来自宿主环境变量 AGENTBOX_MODEL_API_KEY；只放在 Authorization 头
+	Pricing Pricing  // 默认价格表
+	// PricingByModel 是按模型的价格表；缺项的模型用 Pricing。
+	PricingByModel   map[string]Pricing
 	MaxTokensDefault int          // max_tokens 缺省值；≤ 0 时取 1024（不超过 MaxTokensCap）
 	MaxTokensCap     int          // max_tokens 上限，超出者截断（§9.6）；≤ 0 时取 4096
 	HTTP             *http.Client // 须来自验证 Dialer.HTTPClient；nil 时用默认 Dialer（8 MiB）
 }
 
+// PricingFor 返回模型的价格表：PricingByModel 中有该模型时取它，否则取默认 Pricing。
+func (c ChatConfig) PricingFor(model string) Pricing {
+	if p, ok := c.PricingByModel[model]; ok {
+		return p
+	}
+	return c.Pricing
+}
+
 type chatAdapter struct {
-	cfg  ChatConfig
-	http *http.Client
+	cfg     ChatConfig
+	allowed map[string]bool // Model ∪ Models
+	http    *http.Client
 }
 
 // NewChat 构造 OpenAI 兼容的 chat adapter（§9.3 子集：仅声明的模型、纯文本消息、非流式）。
 func NewChat(cfg ChatConfig) Adapter {
+	allowed := map[string]bool{cfg.Model: true}
+	for _, m := range cfg.Models {
+		allowed[m] = true
+	}
 	if cfg.MaxTokensCap <= 0 {
 		cfg.MaxTokensCap = defaultMaxTokensCap
 	}
@@ -35,7 +51,7 @@ func NewChat(cfg ChatConfig) Adapter {
 	}
 	cfg.MaxTokensDefault = min(cfg.MaxTokensDefault, cfg.MaxTokensCap)
 	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
-	return &chatAdapter{cfg: cfg, http: defaultClient(cfg.HTTP, DefaultModelMaxBody)}
+	return &chatAdapter{cfg: cfg, allowed: allowed, http: defaultClient(cfg.HTTP, DefaultModelMaxBody)}
 }
 
 func (a *chatAdapter) Kind() Kind       { return KindChat }
@@ -51,8 +67,8 @@ var (
 	chatMessageFields = []string{"role", "content", "name", "tool_call_id", "tool_calls"}
 )
 
-// Resolve：stream 只能缺省或 false（删去）；messages 非空且每条 content 为字符串；model 缺省补配置模型、
-// 显式时须等于配置模型；max_tokens 缺省补 MaxTokensDefault，超过 MaxTokensCap 时截断。补上或截断的值进入 applied_defaults。
+// Resolve：stream 只能缺省或 false（删去）；messages 非空且每条 content 为字符串；model 缺省补默认模型、
+// 显式时须在声明的白名单中（否则 unsupported_model）；max_tokens 缺省补 MaxTokensDefault，超过 MaxTokensCap 时截断。补上或截断的值进入 applied_defaults。
 func (a *chatAdapter) Resolve(body []byte) ([]byte, map[string]any, error) {
 	obj, e := decodeObject(body)
 	if e != nil {
@@ -80,7 +96,7 @@ func (a *chatAdapter) Resolve(body []byte) ([]byte, map[string]any, error) {
 		if json.Unmarshal(raw, &m) != nil {
 			return nil, nil, fatalf(http.StatusBadRequest, CodeInvalidRequest, "model 须为字符串")
 		}
-		if m != a.cfg.Model {
+		if !a.allowed[m] {
 			return nil, nil, fatalf(http.StatusBadRequest, CodeUnsupportedModel, "模型 %q 未声明", m)
 		}
 	} else {
@@ -133,31 +149,36 @@ func checkMessages(raw json.RawMessage) *Error {
 	return nil
 }
 
-// chatInputs 从规范化请求中取出 input_estimate 与 max_tokens。
+// chatInputs 从规范化请求中取出 input_estimate、max_tokens 与（解析后的）model。
 // input_estimate = ceil((bytes(messages) + bytes(tools)) / 4)：按每 4 字节一个 token 保守估计，含工具定义（§9.6）。
-func chatInputs(resolved []byte) (inputEst, maxTokens int64, e *Error) {
+func chatInputs(resolved []byte) (inputEst, maxTokens int64, model string, e *Error) {
 	obj, e := decodeObject(resolved)
 	if e != nil {
-		return 0, 0, e
+		return 0, 0, "", e
 	}
 	if maxTokens, e = positiveInt(obj["max_tokens"], "max_tokens"); e != nil {
-		return 0, 0, e
+		return 0, 0, "", e
+	}
+	if json.Unmarshal(obj["model"], &model) != nil {
+		return 0, 0, "", fatalf(http.StatusBadRequest, CodeInvalidRequest, "model 须为字符串")
 	}
 	n := int64(len(obj["messages"]) + len(obj["tools"]))
-	return (n + 3) / 4, maxTokens, nil
+	return (n + 3) / 4, maxTokens, model, nil
 }
 
 // Estimate = input_estimate × 输入单价 + max_tokens × 输出单价（单价按每百万 token 微美元，各项向上取整）。
+// 单价取解析后模型的价格表（PricingFor）。
 func (a *chatAdapter) Estimate(resolved []byte) (int64, error) {
-	in, maxTok, e := chatInputs(resolved)
+	in, maxTok, model, e := chatInputs(resolved)
 	if e != nil {
 		return 0, e
 	}
-	ci, err := mulCeil(in, a.cfg.Pricing.InputMicroPerMTok, microPerMillionTokens)
+	p := a.cfg.PricingFor(model)
+	ci, err := mulCeil(in, p.InputMicroPerMTok, microPerMillionTokens)
 	if err != nil {
 		return 0, err
 	}
-	co, err := mulCeil(maxTok, a.cfg.Pricing.OutputMicroPerMTok, microPerMillionTokens)
+	co, err := mulCeil(maxTok, p.OutputMicroPerMTok, microPerMillionTokens)
 	if err != nil {
 		return 0, err
 	}
@@ -178,7 +199,7 @@ type chatReply struct {
 // Do 发出非流式请求。2xx 且可解析 → ok（Body 为上游原文）；上游未返回 usage 时按保守估算计量
 // （input_estimate、max_tokens）；2xx 但无法解析 → unknown（已发出、用量无法确认）。
 func (a *chatAdapter) Do(ctx context.Context, resolved []byte) (Response, *Error) {
-	in, maxTok, e := chatInputs(resolved)
+	in, maxTok, _, e := chatInputs(resolved)
 	if e != nil {
 		return Response{}, e
 	}

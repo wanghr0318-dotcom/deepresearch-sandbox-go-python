@@ -615,6 +615,67 @@ def test_loop_resume_after_kill_skips_plan_and_done_tasks(loop_gw, tmp_path):
     assert len(state["evidence"]) == 2
 
 
+MODELS = {"orchestrator_model": "kimi-k3", "worker_model": "kimi-k2.6"}
+
+
+def chat_models(gw: FakeGateway, start: int = 0) -> dict[str, str | None]:
+    """call id → 请求体中的 model（未带 model 时为 None）；只看 chat 调用。"""
+    return {
+        r.headers["x-agentbox-call-id"]: r.json().get("model")
+        for r in gw.requests[start:]
+        if r.path == "/v1/chat/completions"
+    }
+
+
+def test_loop_routes_orchestrator_and_worker_models(loop_gw, tmp_path):
+    """计划与报告用 orchestrator_model，任务内的总结用 worker_model；未配置时请求不带 model。"""
+    code, events = run_loop(tmp_path, app=kill_after("task-1"), config=MODELS)
+    assert code == 1
+    assert chat_models(loop_gw) == {
+        "root/plan/chat/1": "kimi-k3",
+        "root/task-1/chat/1": "kimi-k2.6",
+    }
+    # 恢复后（同一 config）同一路由：任务 2 的总结用 worker 模型，报告用编排模型
+    before = len(loop_gw.requests)
+    code, events = run_loop(
+        tmp_path, config=MODELS, resume=resume_from(checkpoints(events)["task-1"])
+    )
+    assert code == 0 and events[-1]["type"] == "result"
+    assert chat_models(loop_gw, before) == {
+        "root/task-2/chat/1": "kimi-k2.6",
+        "root/report/chat/1": "kimi-k3",
+    }
+    # 未配置模型：任何 chat 请求体都不含 model 键
+    before = len(loop_gw.requests)
+    code, _ = run_loop(tmp_path)
+    assert code == 0
+    models = chat_models(loop_gw, before)
+    assert len(models) == 4 and set(models.values()) == {None}
+
+
+def test_loop_supersede_resends_same_model(loop_gw, tmp_path):
+    def diverge(req: Recorded) -> Reply | None:
+        if req.headers.get("x-agentbox-call-id") == "root/plan/chat/1":
+            return error_reply(409, "fingerprint_mismatch")
+        return None
+
+    loop_gw.interceptor = diverge
+    code, events = run_loop(tmp_path, config=MODELS)
+    assert code == 0
+    first, superseding = loop_gw.requests[0], loop_gw.requests[1]
+    assert superseding.headers["x-agentbox-supersedes"] == "root/plan/chat/1"
+    assert superseding.json() == first.json() and first.json()["model"] == "kimi-k3"
+
+
+@pytest.mark.parametrize("value", ["", "  ", 3, ["kimi-k3"]])
+def test_parse_config_rejects_bad_models(value):
+    with pytest.raises(dr_app.WorkerFailure) as info:
+        dr_app.parse_config({"topic": "t", "worker_model": value})
+    assert info.value.code == "invalid_config"
+    cfg = dr_app.parse_config({"topic": "t", **MODELS, "worker_model": None})
+    assert (cfg.orchestrator_model, cfg.worker_model) == ("kimi-k3", None)
+
+
 def test_loop_resume_retry_continues_call_ids(loop_gw, tmp_path):
     """恢复后的任务失败重做时，新 ID 在计数器之上递增，不回退、不复用失败的 ID。"""
     code, events = run_loop(tmp_path, app=kill_after("task-1"))

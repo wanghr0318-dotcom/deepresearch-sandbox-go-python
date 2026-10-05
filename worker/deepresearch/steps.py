@@ -4,6 +4,8 @@
 GatewayError 原样上抛，由研究循环（Task 3）决定重试、取代或降级。
 
 提示词只由参数与研究状态确定性地生成（不含时间、随机数），恢复后重发同一调用时请求体不变。
+chat 步骤可选接收 model：None 时请求不带 model（Gateway 用服务端默认模型），否则原样写入请求体
+（模型名进入调用指纹）。
 
 每个步骤可选接收 calls 列表：本步骤发起的每个 Gateway 调用结果按发起顺序追加其中，供调用方
 把结果 blob 放入 checkpoint 的 refs（summarize/write_report 的返回值只有文本）。
@@ -46,6 +48,7 @@ def plan(
     topic: str,
     *,
     max_tasks: int,
+    model: str | None = None,
     calls: list[GatewayResult] | None = None,
 ) -> tuple[list[ResearchTask], GatewayResult]:
     """请模型把主题拆成 ≤ max_tasks 个任务；输出无法解析或为空时回退为单任务。"""
@@ -55,7 +58,7 @@ def plan(
         {"role": "system", "content": prompts.PLAN_PROMPT.format(max_tasks=max_tasks)},
         {"role": "user", "content": prompts.PLAN_USER.format(topic=topic)},
     ]
-    res = gw.chat(PLAN_STEP_ID, messages, max_tokens=PLAN_MAX_TOKENS)
+    res = gw.chat(PLAN_STEP_ID, messages, model=model, max_tokens=PLAN_MAX_TOKENS)
     _record(calls, res)
     tasks = parse_tasks(_chat_text(res))[:max_tasks]
     return (tasks or [fallback_task(topic)]), res
@@ -236,6 +239,7 @@ def summarize(
     evidence: list[Evidence],
     *,
     step_id: str,
+    model: str | None = None,
     calls: list[GatewayResult] | None = None,
 ) -> str:
     """基于编号证据为任务写摘要；摘要中的 [n] 指 evidence[n-1]。
@@ -255,7 +259,7 @@ def summarize(
         {"role": "system", "content": prompts.SUMMARIZE_PROMPT},
         {"role": "user", "content": user},
     ]
-    res = gw.chat(step_id, messages, max_tokens=SUMMARY_MAX_TOKENS)
+    res = gw.chat(step_id, messages, model=model, max_tokens=SUMMARY_MAX_TOKENS)
     _record(calls, res)
     return strip_thinking(_chat_text(res)).strip() or NO_INFO
 
@@ -276,6 +280,7 @@ def write_report(
     state: ResearchState,
     *,
     step_id: str,
+    model: str | None = None,
     calls: list[GatewayResult] | None = None,
 ) -> str:
     """综合各任务摘要写 Markdown 报告，末尾附"证据"列表：[n] → 证据 blob sha256 与来源 URL。
@@ -310,7 +315,7 @@ def write_report(
         {"role": "system", "content": prompts.REPORT_PROMPT},
         {"role": "user", "content": user},
     ]
-    res = gw.chat(step_id, messages, max_tokens=REPORT_MAX_TOKENS)
+    res = gw.chat(step_id, messages, model=model, max_tokens=REPORT_MAX_TOKENS)
     _record(calls, res)
     body = strip_thinking(_chat_text(res))
     heading = _EVIDENCE_HEADING.search(body)

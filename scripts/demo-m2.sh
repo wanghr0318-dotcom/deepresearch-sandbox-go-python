@@ -2,28 +2,40 @@
 # M2 真实研究演示：真实沙箱 + 真实 Gateway 运行一个 DeepResearch 任务，逐步打印每一步及其结果。以 root 在
 # Linux（cgroup v2）或 WSL2 中运行。
 #
-#   真实模型（OpenAI 兼容端点；Key 只从环境变量或仓库根的 .env 读取 AGENTBOX_MODEL_API_KEY 这一行）：
-#     sudo AGENTBOX_DEMO_MODEL_BASE_URL='https://<端点>/v1' AGENTBOX_DEMO_MODEL_NAME='<模型名>' bash scripts/demo-m2.sh
+#   真实模型（OpenAI 兼容端点，默认 Moonshot；Key 只从环境变量或仓库根的 .env 读取 AGENTBOX_MODEL_API_KEY 这一行）：
+#     sudo bash scripts/demo-m2.sh
 #   演练（fake upstream 扮演模型、搜索与网页，不访问外网，其余流程完全相同）：
 #     sudo AGENTBOX_DEMO_FAKE=1 bash scripts/demo-m2.sh
+#
+# 模型路由（multi-agent）：主 agent（编排：计划与报告）用 AGENTBOX_DEMO_ORCHESTRATOR_MODEL（默认 kimi-k3），任务内的
+# worker（总结）用 AGENTBOX_DEMO_WORKER_MODEL（默认 kimi-k2.6）。server 以 --model-name <worker 模型>
+# --models <白名单> 启动，任务 config 带 orchestrator_model 与 worker_model；inspect 明细显示每个调用的模型（取自
+# 结果 blob 中上游回复的 model 字段；fake upstream 原样回显请求的 model）并检查路由。费用按配置的单价估算与结算，
+# 不代表供应商的实际计费。
 #
 # 步骤：环境检查（root、cgroup v2、PostgreSQL、python3、模型与搜索配置、Key 已设置——只报告"已设置"，从不打印）
 # → 全新的数据目录与数据库 → 安装 worker 包（含 deepresearch）到 /opt/agentbox → 构建、doctor → 启动 server
 # （--worker-argv python3,-m,deepresearch）→ 提交研究任务 → G3：Worker 运行中从宿主读取沙箱内每个进程的
-# /proc/<pid>/environ 与 cmdline，不含 Key 的值与变量名 → 等待 task_terminal → inspect 的调用明细（端点、tries、
-# 费用、延迟；不含正文）与总费用 → 报告前 40 行与证据列表（报告从 BlobStore 读取并校验 sha256）→ 环境清理 →
+# /proc/<pid>/environ 与 cmdline，不含 Key 的值与变量名 → 等待 task_terminal → inspect 的调用明细（端点、模型、
+# tries、费用、延迟；不含正文）与总费用 → 报告前 40 行与证据列表（报告从 BlobStore 读取并校验 sha256）→ 环境清理 →
 # 正常停止 → verify-invariants --quiescent → 泄漏检查（cgroup、环境目录、沙箱进程）→ Key 不出现在 server 日志、
 # 事件流与 inspect 输出中。任何一步失败即以非零状态退出，并打印失败的步骤名。
 #
 # 环境变量：
 #   AGENTBOX_DEMO_FAKE=1                 演练模式（启动 tests/e2e/fakeupstream 的独立进程；不读取 .env，未设置
 #                                        AGENTBOX_MODEL_API_KEY 时使用随机生成的假 Key）
-#   AGENTBOX_DEMO_MODEL_BASE_URL         真实模式必填：OpenAI 兼容模型上游地址（--model-base-url）
-#   AGENTBOX_DEMO_MODEL_NAME             真实模式必填：模型名（--model-name）
+#   AGENTBOX_DEMO_MODEL_BASE_URL         真实模式：OpenAI 兼容模型上游地址（--model-base-url；默认
+#                                        https://api.moonshot.cn/v1）
+#   AGENTBOX_DEMO_ORCHESTRATOR_MODEL     编排模型（计划与报告；默认 kimi-k3）
+#   AGENTBOX_DEMO_WORKER_MODEL           worker 模型（任务内总结；默认 kimi-k2.6；也是 server 的 --model-name）
+#   AGENTBOX_DEMO_MODELS                 声明的模型白名单（--models，逗号分隔；默认
+#                                        kimi-k2.6,kimi-k2.7-code,kimi-k2.7-code-highspeed,kimi-k3；须包含上面两个）
 #   AGENTBOX_DEMO_SEARCH_PROVIDER        ddg_lite（默认，无 Key）| tavily（需要 AGENTBOX_SEARCH_API_KEY）
 #   AGENTBOX_DEMO_TOPIC                  研究题目（默认见下方 TOPIC）
 #   AGENTBOX_DEMO_PRICE_IN_MICRO_PER_MTOK / AGENTBOX_DEMO_PRICE_OUT_MICRO_PER_MTOK
-#                                        可选：模型输入、输出单价（每百万 token 的微美元）
+#                                        可选：默认模型输入、输出单价（每百万 token 的微美元）
+#   AGENTBOX_DEMO_MODEL_PRICES           可选：按模型的单价（--model-price，model=IN:OUT，逗号分隔；演练模式默认
+#                                        <编排模型>=2000000:2000000，其余模型 1000000:1000000）
 #   AGENTBOX_DEMO_BUDGET_MICRO           可选：该任务的 limits.budget_micro（默认取 server 的 2000000）
 #   AGENTBOX_DEMO_UPSTREAM_ALLOW_PRIVATE 可选：显式放行的私有上游（例如本机模型服务的 host:port）
 #   AGENTBOX_DEMO_ENV_FILE               Key 文件（默认 <仓库根>/.env；只读取 AGENTBOX_MODEL_API_KEY 与
@@ -45,6 +57,11 @@ export AGENTBOX_ADDR="http://$LISTEN"
 FAKE="${AGENTBOX_DEMO_FAKE:-}"
 TOPIC="${AGENTBOX_DEMO_TOPIC:-固态电池的产业化进展与主要技术瓶颈}"
 SEARCH_PROVIDER="${AGENTBOX_DEMO_SEARCH_PROVIDER:-ddg_lite}"
+MODEL_BASE_URL="${AGENTBOX_DEMO_MODEL_BASE_URL:-https://api.moonshot.cn/v1}"
+ORCH_MODEL="${AGENTBOX_DEMO_ORCHESTRATOR_MODEL:-kimi-k3}"
+WORKER_MODEL="${AGENTBOX_DEMO_WORKER_MODEL:-kimi-k2.6}"
+MODELS="${AGENTBOX_DEMO_MODELS:-kimi-k2.6,kimi-k2.7-code,kimi-k2.7-code-highspeed,kimi-k3}"
+MODEL_PRICES="${AGENTBOX_DEMO_MODEL_PRICES:-}"
 TIMEOUT="${AGENTBOX_DEMO_TIMEOUT:-1800}"
 ENV_FILE="${AGENTBOX_DEMO_ENV_FILE:-$REPO/.env}"
 WORKER_DIR=/opt/agentbox
@@ -229,9 +246,7 @@ else
   [ -n "$MODEL_KEY" ] || MODEL_KEY=$(env_file_value AGENTBOX_MODEL_API_KEY)
   [ -n "$MODEL_KEY" ] || fail "AGENTBOX_MODEL_API_KEY 未设置（环境变量或 $ENV_FILE 中的 AGENTBOX_MODEL_API_KEY=...）"
   ok "AGENTBOX_MODEL_API_KEY 已设置"
-  [ -n "${AGENTBOX_DEMO_MODEL_BASE_URL:-}" ] || fail "需要 AGENTBOX_DEMO_MODEL_BASE_URL（OpenAI 兼容端点，例如 https://<端点>/v1）"
-  [ -n "${AGENTBOX_DEMO_MODEL_NAME:-}" ] || fail "需要 AGENTBOX_DEMO_MODEL_NAME"
-  ok "模型：${AGENTBOX_DEMO_MODEL_NAME} @ ${AGENTBOX_DEMO_MODEL_BASE_URL}"
+  ok "模型上游：$MODEL_BASE_URL"
   case "$SEARCH_PROVIDER" in
     ddg_lite) ok "搜索：ddg_lite（无 Key）" ;;
     tavily)
@@ -245,6 +260,14 @@ else
 fi
 # Key 不留在导出的环境中：只经环境变量前缀交给 server。
 unset AGENTBOX_MODEL_API_KEY AGENTBOX_SEARCH_API_KEY
+for m in "$ORCH_MODEL" "$WORKER_MODEL"; do
+  case ",$MODELS," in *",$m,"*) ;; *) fail "模型 $m 不在白名单 AGENTBOX_DEMO_MODELS=$MODELS 中" ;; esac
+done
+if [ -n "$FAKE" ] && [ -z "$MODEL_PRICES" ]; then
+  MODEL_PRICES="$ORCH_MODEL=2000000:2000000"
+fi
+ok "模型路由：编排（计划、报告）= $ORCH_MODEL；worker（总结）= $WORKER_MODEL（server 默认模型）；白名单 $MODELS"
+[ -z "$MODEL_PRICES" ] || ok "按模型的单价（配置值，不代表供应商实际计费）：$MODEL_PRICES"
 ok "题目：$TOPIC"
 
 step "准备全新的数据目录 $DATA 与数据库 $DEMO_DB"
@@ -299,17 +322,18 @@ if [ -n "$FAKE" ]; then
   wait_for "fake upstream 打印地址" 30 grep -q '^url=' "$LOGDIR/fakeupstream.log"
   read -r fu_url fu_model fu_hostport < <(sed -nE 's/^url=(\S+) model_base_url=(\S+) hostport=(\S+)$/\1 \2 \3/p' "$LOGDIR/fakeupstream.log")
   ok "pid $FU_PID：$fu_url"
-  FLAGS+=(--model-base-url "$fu_model" --model-name fake-model
+  FLAGS+=(--model-base-url "$fu_model" --model-name "$WORKER_MODEL" --models "$MODELS"
     --model-price-in-micro-per-mtok "${AGENTBOX_DEMO_PRICE_IN_MICRO_PER_MTOK:-1000000}"
     --model-price-out-micro-per-mtok "${AGENTBOX_DEMO_PRICE_OUT_MICRO_PER_MTOK:-1000000}"
     --search-provider fake --search-base-url "$fu_url" --upstream-allow-private "$fu_hostport")
 else
-  FLAGS+=(--model-base-url "$AGENTBOX_DEMO_MODEL_BASE_URL" --model-name "$AGENTBOX_DEMO_MODEL_NAME"
+  FLAGS+=(--model-base-url "$MODEL_BASE_URL" --model-name "$WORKER_MODEL" --models "$MODELS"
     --search-provider "$SEARCH_PROVIDER")
   [ -z "${AGENTBOX_DEMO_PRICE_IN_MICRO_PER_MTOK:-}" ] || FLAGS+=(--model-price-in-micro-per-mtok "$AGENTBOX_DEMO_PRICE_IN_MICRO_PER_MTOK")
   [ -z "${AGENTBOX_DEMO_PRICE_OUT_MICRO_PER_MTOK:-}" ] || FLAGS+=(--model-price-out-micro-per-mtok "$AGENTBOX_DEMO_PRICE_OUT_MICRO_PER_MTOK")
   [ -z "${AGENTBOX_DEMO_UPSTREAM_ALLOW_PRIVATE:-}" ] || FLAGS+=(--upstream-allow-private "$AGENTBOX_DEMO_UPSTREAM_ALLOW_PRIVATE")
 fi
+[ -z "$MODEL_PRICES" ] || FLAGS+=(--model-price "$MODEL_PRICES")
 
 step "启动 agentbox server（生产启动器、Gateway、Worker = python3 -m deepresearch）"
 info "agentbox server ${FLAGS[*]}"
@@ -319,7 +343,7 @@ wait_for "server 进入 normal 模式" 60 server_ready
 ok "server pid $SERVER_PID 已就绪（$AGENTBOX_ADDR，日志 $SERVER_LOG）"
 
 step "提交研究任务"
-SPEC=$(python3 -c 'import json,sys; print(json.dumps({"topic": sys.argv[1]}, ensure_ascii=False))' "$TOPIC")
+SPEC=$(python3 -c 'import json,sys; print(json.dumps({"topic": sys.argv[1], "orchestrator_model": sys.argv[2], "worker_model": sys.argv[3]}, ensure_ascii=False))' "$TOPIC" "$ORCH_MODEL" "$WORKER_MODEL")
 SUBMIT=(task submit --spec "$SPEC")
 [ -z "${AGENTBOX_DEMO_BUDGET_MICRO:-}" ] || SUBMIT+=(--limits "{\"budget_micro\":$AGENTBOX_DEMO_BUDGET_MICRO}")
 T=$("$BIN" "${SUBMIT[@]}" | json "d['task_id']")
@@ -351,20 +375,37 @@ status=$(task_field "$T" status)
 [ "$status" = succeeded ] || fail "任务结束为 $status（$(task_field "$T" status_reason 2>/dev/null || true)）"
 ok "succeeded；checkpoints：$(inspect_task "$T" | json "' → '.join(c['step_id'] for c in sorted(d['checkpoints'], key=lambda c: c['commit_seq']))")"
 
-step "inspect：Gateway 调用明细（端点、tries、费用、延迟；不含请求与响应正文）"
+step "inspect：Gateway 调用明细（端点、模型、tries、费用、延迟；不含请求与响应正文）"
 inspect_task "$T" >"$LOGDIR/inspect.json"
-python3 - "$LOGDIR/inspect.json" <<'PY' | sed 's/^/         /'
-import json, sys
+# 模型取自 chat 结果 blob（上游回复的 model 字段，只读这一个字段，不打印正文）；检查路由：计划与报告调用为编排
+# 模型，任务内的 chat 为 worker 模型（允许上游在模型名后附加 "-<版本>"）。
+python3 - "$LOGDIR/inspect.json" "$DATA/blobs/sha256" "$ORCH_MODEL" "$WORKER_MODEL" <<'PY' | sed 's/^/         /'
+import json, os, sys
 d = json.load(open(sys.argv[1]))
-total = 0
+blobs, orch, worker = sys.argv[2:5]
+total, bad = 0, []
 for c in d["calls"]:
     lat = sum(t["latency_ms"] for t in c["tries"])
     outs = ",".join(t.get("outcome") or t["state"] for t in c["tries"])
     total += c["cost_charged_micro"]
-    print(f"{c['call_id']:<24} {c['endpoint']:<22} {c['state']:<10} tries={c['tries_used']}({outs}) "
+    model = "-"
+    if c["endpoint"] == "/v1/chat/completions":
+        ref = c.get("result_ref") or ""
+        try:
+            model = json.load(open(os.path.join(blobs, ref[:2], ref[2:]))).get("model") or "?"
+        except (OSError, ValueError, AttributeError):
+            model = "?"
+        step = c["call_id"].split("/")[1]
+        want = orch if step in ("plan", "report") else worker
+        if model != want and not model.startswith(want + "-"):
+            bad.append(f"{c['call_id']}: 期望 {want}，得到 {model}")
+    print(f"{c['call_id']:<24} {c['endpoint']:<22} {model:<12} {c['state']:<10} tries={c['tries_used']}({outs}) "
           f"cost={c['cost_charged_micro']}µ$ latency={lat}ms")
-print(f"调用 {len(d['calls'])} 个；总费用 {total} 微美元（{total / 1e6:.6f} USD）")
+print(f"调用 {len(d['calls'])} 个；总费用 {total} 微美元（{total / 1e6:.6f} USD，按配置价格估算）")
+if bad:
+    sys.exit("模型路由不符：" + "；".join(bad))
 PY
+ok "模型路由：plan/report = $ORCH_MODEL，任务内 chat = $WORKER_MODEL"
 [ "$(json "len(d['calls']) > 0 and all(c['state'] == 'completed' for c in d['calls'])" <"$LOGDIR/inspect.json")" = True ] ||
   fail "存在未完成的 Gateway 调用"
 ok "全部调用 completed"

@@ -416,7 +416,9 @@ func (a *fakeAdapter) Resolve(body []byte) ([]byte, map[string]any, error) {
 		obj["max_tokens"] = 64
 		defaults["max_tokens"] = 64
 	}
-	obj["model"] = "m1"
+	if _, ok := obj["model"]; !ok {
+		obj["model"] = "m1"
+	}
 	out, _ := json.Marshal(obj)
 	return out, defaults, nil
 }
@@ -483,12 +485,13 @@ func unavailable() *upstream.Error {
 // ---- 装配 ----
 
 type harness struct {
-	c      *Coordinator
-	store  *fakeStore
-	ad     *fakeAdapter
-	blobs  *fakeBlobs
-	events *fakeEvents
-	logs   *syncBuffer
+	c           *Coordinator
+	store       *fakeStore
+	ad          *fakeAdapter
+	blobs       *fakeBlobs
+	events      *fakeEvents
+	logs        *syncBuffer
+	chatPricing map[string]upstream.Pricing
 }
 
 type syncBuffer struct {
@@ -524,8 +527,9 @@ func (h *harness) newCoordinator(t *testing.T, lim Limits) *Coordinator {
 	t.Helper()
 	c, err := New(Config{
 		Store: h.store, Adapters: []upstream.Adapter{h.ad}, Blobs: h.blobs, Events: h.events, Limits: lim,
-		Pricing: map[upstream.Kind]upstream.Pricing{upstream.KindChat: {InputMicroPerMTok: 1_000_000, OutputMicroPerMTok: 2_000_000}},
-		Logger:  slog.New(slog.NewJSONHandler(h.logs, nil)),
+		Pricing:     map[upstream.Kind]upstream.Pricing{upstream.KindChat: {InputMicroPerMTok: 1_000_000, OutputMicroPerMTok: 2_000_000}},
+		ChatPricing: h.chatPricing,
+		Logger:      slog.New(slog.NewJSONHandler(h.logs, nil)),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -651,6 +655,28 @@ func TestReplayReturnsSameBlob(t *testing.T) {
 	// 实际费用 = 10 × 1 + 20 × 2 微美元（按用量，而非估算 100）。
 	if b := h.budget(t, "t1"); b.SpentMicro != 50 || b.ReservedMicro != 0 {
 		t.Fatalf("账本 %+v", b)
+	}
+}
+
+// 实际费用按解析后的模型取价格表（M2 按调用选择模型）：有专属价格的模型按它结算，其余模型用类别价格表。
+func TestCostUsesPerModelPricing(t *testing.T) {
+	usage := upstream.Usage{InputTokens: 10, OutputTokens: 20}
+	h := newHarness(t, testLimits(), newAdapter("p", step{body: `{}`, usage: usage}, step{body: `{}`, usage: usage}))
+	h.chatPricing = map[string]upstream.Pricing{"big": {InputMicroPerMTok: 3_000_000, OutputMicroPerMTok: 5_000_000}}
+	h.c = h.newCoordinator(t, testLimits())
+	if r := h.invoke(t, inv("c1", `{"model":"big","messages":[{"role":"user","content":"x"}]}`)); r.Status != 200 {
+		t.Fatalf("c1 %+v", r)
+	}
+	// 10 × 3 + 20 × 5 = 130
+	if b := h.budget(t, "t1"); b.SpentMicro != 130 {
+		t.Fatalf("按模型 big 的价格结算：%+v", b)
+	}
+	if r := h.invoke(t, inv("c2", `{"messages":[{"role":"user","content":"x"}]}`)); r.Status != 200 {
+		t.Fatalf("c2 %+v", r)
+	}
+	// 默认模型 m1 无专属价格 → 类别价格表：10 × 1 + 20 × 2 = 50
+	if b := h.budget(t, "t1"); b.SpentMicro != 180 {
+		t.Fatalf("默认模型按类别价格结算：%+v", b)
 	}
 }
 

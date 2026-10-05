@@ -882,6 +882,18 @@ def test_three_endpoints_send_call_id_and_body(fake_gateway):
         assert res.body["kind"] == kind and res.body["call_id"] == res.call_id
 
 
+def test_chat_model_is_written_only_when_given(fake_gateway):
+    gw = client(fake_gateway)
+    messages = [{"role": "user", "content": "x"}]
+    gw.chat("plan", messages, model="kimi-k3", max_tokens=8)
+    gw.chat("task-1", messages, model=None)
+    bodies = [r.json() for r in fake_gateway.requests]
+    assert bodies == [
+        {"messages": messages, "model": "kimi-k3", "max_tokens": 8},
+        {"messages": messages},
+    ]
+
+
 def test_retry_replay_and_supersede_headers(fake_gateway):
     gw = client(fake_gateway)
     first = gw.search("s1", "q")

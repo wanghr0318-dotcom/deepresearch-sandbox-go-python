@@ -166,15 +166,33 @@ class GatewayClient:
         step_id: str,
         messages: list[dict[str, str]],
         *,
+        model: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
     ) -> GatewayResult:
+        """model 为 None 时不写入请求体（Gateway 用服务端默认模型）；给出时须在服务端
+        声明的白名单中，否则为 400 unsupported_model。模型名进入调用指纹：恢复后重发
+        同一调用须给出同一模型。"""
+        body = self.chat_body(messages, model=model, max_tokens=max_tokens, temperature=temperature)
+        return self._call("chat", self.call_ids.next(step_id, "chat"), body, {})
+
+    @staticmethod
+    def chat_body(
+        messages: list[dict[str, str]],
+        *,
+        model: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> dict[str, Any]:
+        """chat 的请求体（取代重发须发送与原调用相同的请求体）。"""
         body: dict[str, Any] = {"messages": messages}
+        if model is not None:
+            body["model"] = model
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
         if temperature is not None:
             body["temperature"] = temperature
-        return self._call("chat", self.call_ids.next(step_id, "chat"), body, {})
+        return body
 
     def search(self, step_id: str, query: str, *, max_results: int = 5) -> GatewayResult:
         body = {"query": query, "max_results": max_results}

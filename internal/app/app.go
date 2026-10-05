@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,7 +93,7 @@ type Config struct {
 	DefaultBudgetMicro int64
 	// BudgetCapMicro 是显式 limits.budget_micro 的服务端上限；默认 50_000_000（50.00 USD）。
 	BudgetCapMicro int64
-	// Model 是唯一声明的模型上游（OpenAI 兼容）；BaseURL 为空时不提供 /v1/chat/completions。
+	// Model 是模型上游（OpenAI 兼容，默认模型 + 声明的白名单）；BaseURL 为空时不提供 /v1/chat/completions。
 	Model ModelConfig
 	// SearchProvider 是搜索供应商：fake | tavily | ddg_lite（默认 ddg_lite）。fake 只用于测试，要求设置
 	// UpstreamAllowPrivate（指向本机 fake upstream）；tavily 要求 SearchAPIKey。
@@ -112,10 +113,23 @@ type Config struct {
 // ModelConfig 是模型上游的配置。APIKey 只从宿主环境变量 AGENTBOX_MODEL_API_KEY 加载，只交给 chat adapter
 // （放在 Authorization 头中），不进入日志、init 或沙箱环境（§9.9、G3）。
 type ModelConfig struct {
-	BaseURL string           // 例如 https://api.openai.com/v1
-	Name    string           // 唯一声明的模型名
-	Pricing upstream.Pricing // 按每百万 token 的微美元单价；Version 为空时由单价生成
-	APIKey  string
+	BaseURL string           // 例如 https://api.moonshot.cn/v1
+	Name    string           // 默认模型名：请求未指定 model 时使用
+	Models  []string         // 声明的模型白名单（§9.3）；空时只有 Name，非空时须包含 Name
+	Pricing upstream.Pricing // 默认单价（每百万 token 的微美元）；Version 为空时由单价生成
+	// PricingByModel 是按模型的单价（键须为声明的模型）；缺项的模型用 Pricing。Version 为空时由单价生成。
+	// 价格只是配置，用于预留估算与结算，不代表供应商的实际计费。
+	PricingByModel map[string]upstream.Pricing
+	APIKey         string
+}
+
+// declared 报告模型是否在声明的白名单中（Models 为空时只有 Name）。
+func (m ModelConfig) declared(name string) bool {
+	return name == m.Name || slices.Contains(m.Models, name)
+}
+
+func configPricingVersion(p upstream.Pricing) string {
+	return fmt.Sprintf("config/in=%d,out=%d", p.InputMicroPerMTok, p.OutputMicroPerMTok)
 }
 
 // workerEnvAllowed 是沙箱内 Worker 环境变量的白名单（Config.WorkerEnv 的键）：凭据不能经由环境变量进入沙箱。
@@ -186,7 +200,17 @@ func (c Config) withDefaults() Config {
 		c.SearchProvider = upstream.SearchDDGLite
 	}
 	if p := &c.Model.Pricing; p.Version == "" {
-		p.Version = fmt.Sprintf("config/in=%d,out=%d", p.InputMicroPerMTok, p.OutputMicroPerMTok)
+		p.Version = configPricingVersion(*p)
+	}
+	if len(c.Model.PricingByModel) > 0 {
+		byModel := make(map[string]upstream.Pricing, len(c.Model.PricingByModel)) // 不改调用方的 map
+		for m, p := range c.Model.PricingByModel {
+			if p.Version == "" {
+				p.Version = configPricingVersion(p)
+			}
+			byModel[m] = p
+		}
+		c.Model.PricingByModel = byModel
 	}
 	return c
 }
@@ -205,6 +229,16 @@ func (c Config) validate() error {
 		return errors.New("app: 配置了模型上游地址但没有模型名")
 	case c.Model.Pricing.InputMicroPerMTok < 0 || c.Model.Pricing.OutputMicroPerMTok < 0:
 		return errors.New("app: 模型单价不能为负数")
+	case len(c.Model.Models) > 0 && !slices.Contains(c.Model.Models, c.Model.Name):
+		return fmt.Errorf("app: 模型白名单 %v 不含默认模型 %q", c.Model.Models, c.Model.Name)
+	}
+	for m, p := range c.Model.PricingByModel {
+		if !c.Model.declared(m) {
+			return fmt.Errorf("app: 模型 %q 有单价但未声明", m)
+		}
+		if p.InputMicroPerMTok < 0 || p.OutputMicroPerMTok < 0 {
+			return fmt.Errorf("app: 模型 %q 的单价不能为负数", m)
+		}
 	}
 	switch c.SearchProvider {
 	case upstream.SearchFake:
@@ -537,9 +571,9 @@ func (s *server) assembleGateway(blobs blob.Store) error {
 		return fmt.Errorf("app: 设置 Gateway socket 目录权限: %w", err)
 	}
 	dialer := upstream.NewDialer(upstream.DialerConfig{AllowPrivate: s.cfg.UpstreamAllowPrivate})
-	adapters, pricing := s.cfg.gatewayAdapters(dialer)
-	calls, err := call.New(call.Config{Store: s.store, Adapters: adapters, Pricing: pricing, Blobs: blobs,
-		Events: hostEvents{s: s.store}, Limits: s.cfg.Gateway, Logger: s.log})
+	adapters, pricing, chatPricing := s.cfg.gatewayAdapters(dialer)
+	calls, err := call.New(call.Config{Store: s.store, Adapters: adapters, Pricing: pricing, ChatPricing: chatPricing,
+		Blobs: blobs, Events: hostEvents{s: s.store}, Limits: s.cfg.Gateway, Logger: s.log})
 	if err != nil {
 		return fmt.Errorf("app: Gateway 调用协调器: %w", err)
 	}

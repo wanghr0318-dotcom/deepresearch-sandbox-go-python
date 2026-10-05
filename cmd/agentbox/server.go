@@ -75,9 +75,12 @@ func runServer(args []string, stderr io.Writer) int {
 	defaultBudget := fs.Int64("default-budget-micro", 2_000_000, "task 层预算的默认值（微美元）：创建时未指定 limits.budget_micro 的任务以此存储")
 	budgetCap := fs.Int64("budget-cap-micro", 50_000_000, "显式 limits.budget_micro 的服务端上限（微美元）")
 	modelBaseURL := fs.String("model-base-url", "", "OpenAI 兼容模型上游地址（例如 https://api.openai.com/v1）；为空时不提供 /v1/chat/completions。Key 只读环境变量 "+modelKeyEnv)
-	modelName := fs.String("model-name", "", "唯一声明的模型名（配置了 --model-base-url 时必填）")
-	priceIn := fs.Int64("model-price-in-micro-per-mtok", 3_000_000, "模型输入单价（每百万 token 的微美元），用于预留估算与结算")
-	priceOut := fs.Int64("model-price-out-micro-per-mtok", 15_000_000, "模型输出单价（每百万 token 的微美元），用于预留估算与结算")
+	modelName := fs.String("model-name", "", "默认模型名：请求未指定 model 时使用（配置了 --model-base-url 时必填）")
+	models := fs.String("models", "", "声明的模型白名单（逗号分隔；须包含 --model-name）；请求可在其中选择 model，白名单外为 400 unsupported_model。空时只声明 --model-name")
+	priceIn := fs.Int64("model-price-in-micro-per-mtok", 3_000_000, "默认模型输入单价（每百万 token 的微美元），用于预留估算与结算；未在 --model-price 中给出的模型用它")
+	priceOut := fs.Int64("model-price-out-micro-per-mtok", 15_000_000, "默认模型输出单价（每百万 token 的微美元），用于预留估算与结算；未在 --model-price 中给出的模型用它")
+	var modelPrices listFlag
+	fs.Var(&modelPrices, "model-price", "按模型的单价 model=IN:OUT（每百万 token 的微美元；可重复或逗号分隔；模型须已声明）")
 	searchBaseURL := fs.String("search-base-url", "", "搜索供应商地址覆盖（空时取供应商默认）；与 --search-provider fake 同用时 fake 搜索向 <地址>/search 发出请求（测试用 fake upstream，主机须在 --upstream-allow-private 中）")
 	searchProvider := fs.String("search-provider", upstream.SearchDDGLite, "搜索供应商：fake | tavily | ddg_lite（tavily 的 Key 只读环境变量 "+searchKeyEnv+"；fake 只用于测试，须同时设置 --upstream-allow-private）")
 	allowPrivate := fs.String("upstream-allow-private", "", "显式放行的私有上游主机（逗号分隔的 host 或 host:port；例如本机模型服务或测试用 fake upstream）")
@@ -99,6 +102,15 @@ func runServer(args []string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "agentbox server: --search-provider 须为 fake、tavily 或 ddg_lite，得到 %q\n", *searchProvider)
 		return 2
 	}
+	model, err := modelConfig(modelFlags{BaseURL: *modelBaseURL, Name: *modelName, Models: *models,
+		Prices: modelPrices, PriceIn: *priceIn, PriceOut: *priceOut})
+	if err != nil {
+		fmt.Fprintln(stderr, "agentbox server:", err)
+		return 2
+	}
+	// 供应商 Key 只从宿主环境变量读取（不设标志，避免出现在进程参数与 shell 历史中），只交给 Gateway 的
+	// upstream adapter；不写日志、不进入 init 与沙箱环境（§9.9）。
+	model.APIKey = os.Getenv(modelKeyEnv)
 	// 在取得任何锁、连接数据库之前确认能够安全执行任务。
 	starter, err := prepareIsolation()
 	if err != nil {
@@ -111,20 +123,17 @@ func runServer(args []string, stderr io.Writer) int {
 		return 1
 	}
 	cfg := app.Config{
-		Listen:             *listen,
-		Capacity:           admission.Capacity{RunSlots: *runSlots, MemoryBytes: *memory},
-		DefaultMemoryBytes: *defaultMemory,
-		DefaultRunTime:     *defaultRunTime,
-		RunTimeCap:         *runTimeCap,
-		AllowedHosts:       splitList(*allowedHost),
-		WorkerArgv:         splitList(*workerArgv),
-		WorkerEnv:          splitList(*workerEnv),
-		DefaultBudgetMicro: *defaultBudget,
-		BudgetCapMicro:     *budgetCap,
-		// 供应商 Key 只从宿主环境变量读取（不设标志，避免出现在进程参数与 shell 历史中），只交给 Gateway 的
-		// upstream adapter；不写日志、不进入 init 与沙箱环境（§9.9）。
-		Model: app.ModelConfig{BaseURL: *modelBaseURL, Name: *modelName, APIKey: os.Getenv(modelKeyEnv),
-			Pricing: upstream.Pricing{InputMicroPerMTok: *priceIn, OutputMicroPerMTok: *priceOut}},
+		Listen:               *listen,
+		Capacity:             admission.Capacity{RunSlots: *runSlots, MemoryBytes: *memory},
+		DefaultMemoryBytes:   *defaultMemory,
+		DefaultRunTime:       *defaultRunTime,
+		RunTimeCap:           *runTimeCap,
+		AllowedHosts:         splitList(*allowedHost),
+		WorkerArgv:           splitList(*workerArgv),
+		WorkerEnv:            splitList(*workerEnv),
+		DefaultBudgetMicro:   *defaultBudget,
+		BudgetCapMicro:       *budgetCap,
+		Model:                model,
 		SearchProvider:       *searchProvider,
 		SearchBaseURL:        *searchBaseURL,
 		SearchAPIKey:         os.Getenv(searchKeyEnv),
@@ -171,15 +180,4 @@ func runServer(args []string, stderr io.Writer) int {
 		return 1
 	}
 	return 0
-}
-
-// splitList 拆分逗号分隔的列表，忽略空项。
-func splitList(s string) []string {
-	var out []string
-	for _, v := range strings.Split(s, ",") {
-		if v = strings.TrimSpace(v); v != "" {
-			out = append(out, v)
-		}
-	}
-	return out
 }

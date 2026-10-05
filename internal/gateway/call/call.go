@@ -98,11 +98,14 @@ type Config struct {
 	// Pricing 按类别给出价格表，用于由 Response.Usage 计算 ok 结算的实际费用（应与 adapter 的价格表一致）；
 	// 缺少某类别时按该次估算结算（保守）。
 	Pricing map[upstream.Kind]upstream.Pricing
-	Blobs   BlobStore
-	Events  HostEvents
-	Limits  Limits
-	Logger  *slog.Logger     // nil 时不输出
-	Now     func() time.Time // nil 时为 time.Now
+	// ChatPricing 是 chat 按（解析后的）模型的价格表（与 chat adapter 的 PricingByModel 为同一份）；
+	// 缺项的模型用 Pricing[KindChat]。
+	ChatPricing map[string]upstream.Pricing
+	Blobs       BlobStore
+	Events      HostEvents
+	Limits      Limits
+	Logger      *slog.Logger     // nil 时不输出
+	Now         func() time.Time // nil 时为 time.Now
 	// StoreTimeout 是每个 Store 事务与 blob 写入的超时；≤ 0 时取 30 s。
 	StoreTimeout time.Duration
 }
@@ -132,6 +135,7 @@ type Coordinator struct {
 	store        Store
 	adapters     map[upstream.Kind]upstream.Adapter
 	pricing      map[upstream.Kind]upstream.Pricing
+	chatPricing  map[string]upstream.Pricing
 	blobs        BlobStore
 	events       HostEvents
 	limits       Limits
@@ -162,6 +166,7 @@ type job struct {
 	in       Invoke
 	ad       upstream.Adapter
 	resolved []byte
+	model    string // 解析后的模型（chat）；按它取价格表结算
 	fp       string
 	est      int64
 	ctx      context.Context // Coordinator 自有；CancelAttempt 以 errCancelRequested 取消
@@ -177,6 +182,7 @@ func New(cfg Config) (*Coordinator, error) {
 		store:        cfg.Store,
 		adapters:     map[upstream.Kind]upstream.Adapter{},
 		pricing:      cfg.Pricing,
+		chatPricing:  cfg.ChatPricing,
 		blobs:        cfg.Blobs,
 		events:       cfg.Events,
 		limits:       cfg.Limits.withDefaults(),
@@ -375,7 +381,8 @@ func (c *Coordinator) Invoke(ctx context.Context, in Invoke) (Result, error) {
 		}
 		return reject(upstream.CodeInvalidRequest), nil
 	}
-	fp, err := Fingerprint(endpointOf(in.Kind), ad.Version(), ad.Provider(), modelOf(resolved), defaults, in.Body)
+	model := modelOf(resolved)
+	fp, err := Fingerprint(endpointOf(in.Kind), ad.Version(), ad.Provider(), model, defaults, in.Body)
 	if err != nil {
 		return reject(upstream.CodeInvalidRequest), nil
 	}
@@ -388,7 +395,7 @@ func (c *Coordinator) Invoke(ctx context.Context, in Invoke) (Result, error) {
 	if !c.claim(key) {
 		return c.contended(ctx, in, fp)
 	}
-	j := &job{in: in, ad: ad, resolved: resolved, fp: fp, est: est}
+	j := &job{in: in, ad: ad, resolved: resolved, model: model, fp: fp, est: est}
 	j.ctx, j.cancel = context.WithCancelCause(c.root)
 	if !c.register(j) {
 		j.cancel(nil)
@@ -686,7 +693,7 @@ func (c *Coordinator) complete(j *job, try Try, resp upstream.Response, latency 
 		return Result{}, fmt.Errorf("call: 保存调用 %s 的结果 blob: %w", j.in.CallID, err)
 	}
 	if _, err := c.settle(Settlement{
-		Try: try, Outcome: "ok", ActualMicro: c.cost(j.in.Kind, resp.Usage, j.est), LatencyMs: latency.Milliseconds(),
+		Try: try, Outcome: "ok", ActualMicro: c.cost(j.in.Kind, j.model, resp.Usage, j.est), LatencyMs: latency.Milliseconds(),
 		UpstreamRequestID: resp.UpstreamRequestID, ResultSHA256: ref.SHA256, ResultSize: ref.Size,
 	}); err != nil {
 		return Result{}, err
@@ -714,8 +721,14 @@ func (c *Coordinator) backoff(n int, retryAfter time.Duration) time.Duration {
 }
 
 // cost 由用量与价格表计算 ok 结算的实际费用（微美元，向上取整）；没有价格表或溢出时按估算。
-func (c *Coordinator) cost(kind upstream.Kind, u upstream.Usage, est int64) int64 {
+// chat 先取该模型的价格表（ChatPricing），缺项时用类别价格表。
+func (c *Coordinator) cost(kind upstream.Kind, model string, u upstream.Usage, est int64) int64 {
 	p, ok := c.pricing[kind]
+	if kind == upstream.KindChat {
+		if mp, has := c.chatPricing[model]; has {
+			p, ok = mp, true
+		}
+	}
 	if !ok {
 		return est
 	}

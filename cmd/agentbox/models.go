@@ -1,0 +1,107 @@
+package main
+
+// 本文件解析 `agentbox server` 的模型标志：--model-name（默认模型）、--models（声明的白名单）、
+// --model-price model=IN:OUT（按模型的单价）。与平台无关，便于在任何平台上测试。
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/app"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
+)
+
+// splitList 拆分逗号分隔的列表，忽略空项。
+func splitList(s string) []string {
+	var out []string
+	for _, v := range strings.Split(s, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// listFlag 是可重复的标志；每次的值再按逗号拆分。
+type listFlag []string
+
+func (l *listFlag) String() string { return strings.Join(*l, ",") }
+
+func (l *listFlag) Set(v string) error {
+	*l = append(*l, splitList(v)...)
+	return nil
+}
+
+// modelFlags 是模型相关标志的原始值。
+type modelFlags struct {
+	BaseURL, Name, Models string
+	Prices                []string // model=IN:OUT（每百万 token 的微美元）
+	PriceIn, PriceOut     int64    // 未在 Prices 中给出的模型的单价
+}
+
+// modelConfig 校验模型标志并构造 app.ModelConfig（不含 Key）：
+//   - 未给 --model-base-url 时不提供模型端点，--models 与 --model-price 不能使用；
+//   - --models 非空时须包含 --model-name，且不能重复；空时只声明 --model-name；
+//   - --model-price 的模型须已声明，每个模型至多一项，单价为非负整数。
+func modelConfig(f modelFlags) (app.ModelConfig, error) {
+	m := app.ModelConfig{BaseURL: f.BaseURL, Name: f.Name,
+		Pricing: upstream.Pricing{InputMicroPerMTok: f.PriceIn, OutputMicroPerMTok: f.PriceOut}}
+	if f.PriceIn < 0 || f.PriceOut < 0 {
+		return app.ModelConfig{}, errors.New("--model-price-in/out-micro-per-mtok 不能为负数")
+	}
+	models := splitList(f.Models)
+	if f.BaseURL == "" {
+		if len(models) > 0 || len(f.Prices) > 0 {
+			return app.ModelConfig{}, errors.New("--models 与 --model-price 需要 --model-base-url")
+		}
+		return m, nil
+	}
+	if f.Name == "" {
+		return app.ModelConfig{}, errors.New("配置了 --model-base-url 时须给出 --model-name（默认模型）")
+	}
+	for i, name := range models {
+		if slices.Contains(models[:i], name) {
+			return app.ModelConfig{}, fmt.Errorf("--models 中模型 %q 重复", name)
+		}
+	}
+	if len(models) > 0 && !slices.Contains(models, f.Name) {
+		return app.ModelConfig{}, fmt.Errorf("--models %s 不含 --model-name %q（默认模型须在白名单中）", f.Models, f.Name)
+	}
+	m.Models = models
+	for _, entry := range f.Prices {
+		name, p, err := parseModelPrice(entry)
+		if err != nil {
+			return app.ModelConfig{}, err
+		}
+		if name != f.Name && !slices.Contains(models, name) {
+			return app.ModelConfig{}, fmt.Errorf("--model-price %q：模型 %q 未声明（--model-name / --models）", entry, name)
+		}
+		if _, dup := m.PricingByModel[name]; dup {
+			return app.ModelConfig{}, fmt.Errorf("--model-price：模型 %q 的单价给出了多次", name)
+		}
+		if m.PricingByModel == nil {
+			m.PricingByModel = map[string]upstream.Pricing{}
+		}
+		m.PricingByModel[name] = p
+	}
+	return m, nil
+}
+
+// parseModelPrice 解析 model=IN:OUT（每百万 token 的微美元，非负整数）。
+func parseModelPrice(entry string) (string, upstream.Pricing, error) {
+	name, prices, ok := strings.Cut(entry, "=")
+	in, out, ok2 := strings.Cut(prices, ":")
+	name = strings.TrimSpace(name)
+	if !ok || !ok2 || name == "" {
+		return "", upstream.Pricing{}, fmt.Errorf("--model-price %q 须为 model=IN:OUT", entry)
+	}
+	pi, err1 := strconv.ParseInt(strings.TrimSpace(in), 10, 64)
+	po, err2 := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err1 != nil || err2 != nil || pi < 0 || po < 0 {
+		return "", upstream.Pricing{}, fmt.Errorf("--model-price %q：单价须为非负整数（每百万 token 的微美元）", entry)
+	}
+	return name, upstream.Pricing{InputMicroPerMTok: pi, OutputMicroPerMTok: po}, nil
+}

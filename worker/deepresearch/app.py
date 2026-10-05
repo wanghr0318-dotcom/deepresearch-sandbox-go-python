@@ -7,6 +7,9 @@
 resume.refs（上一 checkpoint 的累积集合）与状态中的证据 sha 重建，恢复后的下一个 checkpoint
 得到与未中断运行相同的集合。
 
+模型路由：config.orchestrator_model 用于计划与报告（编排），config.worker_model 用于任务内的
+总结；未配置时请求不带 model，由 Gateway 用服务端默认模型。
+
 失败处理（Plan 8 Task 3 规则 4–6）：
 - CallDivergence：以新 ID + X-Agentbox-Supersedes 显式重发一次并记入 failures；再冲突则任务失败。
 - CallDeadlineExceeded / 5xx：该任务以新 ID 重做一次，再失败则任务失败，继续其余任务。
@@ -59,6 +62,11 @@ class Config:
     max_fetch: int = 3
     max_loops: int = 1
     report_artifact_id: str = "report"
+    # 主/从模型路由：编排（plan、write_report）用 orchestrator_model，任务内的 chat（summarize）用
+    # worker_model；None 表示不在请求中写 model（Gateway 用服务端默认模型）。两者都须在服务端声明的
+    # 白名单中。config 在每个 attempt 的 init 中不变，恢复后同一步骤重发同一模型（指纹稳定）。
+    orchestrator_model: str | None = None
+    worker_model: str | None = None
 
 
 def parse_config(raw: Any) -> Config:
@@ -78,7 +86,15 @@ def parse_config(raw: Any) -> Config:
     artifact_id = raw.get("report_artifact_id", defaults.report_artifact_id)
     if not isinstance(artifact_id, str) or not artifact_id:
         raise WorkerFailure("invalid_config", "config.report_artifact_id 必须是非空字符串")
-    return Config(topic=topic.strip(), report_artifact_id=artifact_id, **ints)
+    models = {}
+    for key in ("orchestrator_model", "worker_model"):
+        value = raw.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise WorkerFailure(
+                "invalid_config", f"config.{key} 必须是非空字符串或 null：{value!r}"
+            )
+        models[key] = value.strip() if value is not None else None
+    return Config(topic=topic.strip(), report_artifact_id=artifact_id, **ints, **models)
 
 
 def task_step(task: ResearchTask) -> str:
@@ -103,20 +119,19 @@ class _Superseding:
         step_id: str,
         messages: list[dict[str, str]],
         *,
+        model: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
     ) -> GatewayResult:
-        body: dict[str, Any] = {"messages": messages}
-        if max_tokens is not None:
-            body["max_tokens"] = max_tokens
-        if temperature is not None:
-            body["temperature"] = temperature
+        body = GatewayClient.chat_body(
+            messages, model=model, max_tokens=max_tokens, temperature=temperature
+        )
         return self._guard(
             step_id,
             "chat",
             body,
             lambda: self._gw.chat(
-                step_id, messages, max_tokens=max_tokens, temperature=temperature
+                step_id, messages, model=model, max_tokens=max_tokens, temperature=temperature
             ),
         )
 
@@ -229,7 +244,12 @@ class _Loop:
         for attempt in (1, 2):
             try:
                 tasks, _ = await asyncio.to_thread(
-                    steps.plan, self.gw, self.cfg.topic, max_tasks=self.cfg.max_tasks, calls=calls
+                    steps.plan,
+                    self.gw,
+                    self.cfg.topic,
+                    max_tasks=self.cfg.max_tasks,
+                    model=self.cfg.orchestrator_model,
+                    calls=calls,
                 )
                 break
             except BudgetExhausted as exc:
@@ -262,7 +282,13 @@ class _Loop:
                     step_id=step,
                 )
                 summary = await asyncio.to_thread(
-                    steps.summarize, self.gw, task, evidence, step_id=step, calls=summary_calls
+                    steps.summarize,
+                    self.gw,
+                    task,
+                    evidence,
+                    step_id=step,
+                    model=self.cfg.worker_model,
+                    calls=summary_calls,
                 )
             except (BudgetExhausted, AccessRevoked):
                 raise
@@ -293,7 +319,12 @@ class _Loop:
         for attempt in (1, 2):
             try:
                 text = await asyncio.to_thread(
-                    steps.write_report, self.gw, self.state, step_id=REPORT_STEP, calls=calls
+                    steps.write_report,
+                    self.gw,
+                    self.state,
+                    step_id=REPORT_STEP,
+                    model=self.cfg.orchestrator_model,
+                    calls=calls,
                 )
                 break
             except BudgetExhausted as exc:

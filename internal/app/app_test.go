@@ -1005,6 +1005,21 @@ func TestGatewayConfigValidation(t *testing.T) {
 		}, ""},
 		{"搜索上游地址不是 URL", func(c *Config) { c.SearchBaseURL = "127.0.0.1:9/search" }, "绝对 URL"},
 		{"模型无名", func(c *Config) { c.Model.BaseURL = "https://m.example/v1" }, "模型名"},
+		{"白名单含默认模型", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Models: []string{"a", "b"},
+				PricingByModel: map[string]upstream.Pricing{"b": {InputMicroPerMTok: 1}}}
+		}, ""},
+		{"白名单不含默认模型", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Models: []string{"b"}}
+		}, "不含默认模型"},
+		{"未声明模型的单价", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a",
+				PricingByModel: map[string]upstream.Pricing{"b": {InputMicroPerMTok: 1}}}
+		}, "未声明"},
+		{"模型单价为负", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Models: []string{"a", "b"},
+				PricingByModel: map[string]upstream.Pricing{"b": {OutputMicroPerMTok: -1}}}
+		}, "不能为负数"},
 		{"Worker 环境变量含 Key", func(c *Config) { c.WorkerEnv = []string{"PYTHONPATH=/opt", "OPENAI_API_KEY=x"} }, "OPENAI_API_KEY"},
 		{"Worker 环境变量白名单", func(c *Config) { c.WorkerEnv = []string{"PYTHONPATH=/opt", "PYTHONUNBUFFERED=1"} }, ""},
 	}
@@ -1025,6 +1040,55 @@ func TestGatewayConfigValidation(t *testing.T) {
 }
 
 // ---- Gateway 装配 ----
+
+// gatewayAdapters 把模型白名单与按模型的价格表交给 chat adapter，并把同一份价格表（补上 Version）交给 call
+// 结算：白名单内的模型按其价格估算，未给价格的模型用默认价格，白名单外的模型被拒绝。
+func TestGatewayAdaptersPerModelPricing(t *testing.T) {
+	cfg := testConfig()
+	cfg.Model = ModelConfig{BaseURL: "http://127.0.0.1:1/v1", Name: "kimi-k2.6", Models: []string{"kimi-k2.6", "kimi-k3"},
+		Pricing:        upstream.Pricing{InputMicroPerMTok: 1_000_000, OutputMicroPerMTok: 1_000_000},
+		PricingByModel: map[string]upstream.Pricing{"kimi-k3": {InputMicroPerMTok: 2_000_000, OutputMicroPerMTok: 8_000_000}}}
+	cfg = cfg.withDefaults()
+	if err := cfg.validate(); err != nil {
+		t.Fatal(err)
+	}
+	adapters, pricing, chatPricing := cfg.gatewayAdapters(upstream.NewDialer(upstream.DialerConfig{}))
+	if p := chatPricing["kimi-k3"]; p.OutputMicroPerMTok != 8_000_000 || p.Version != "config/in=2000000,out=8000000" {
+		t.Fatalf("chat 按模型价格表 %+v", chatPricing)
+	}
+	if pricing[upstream.KindChat].InputMicroPerMTok != 1_000_000 {
+		t.Fatalf("chat 默认价格表 %+v", pricing[upstream.KindChat])
+	}
+	var chat upstream.Adapter
+	for _, a := range adapters {
+		if a.Kind() == upstream.KindChat {
+			chat = a
+		}
+	}
+	if chat == nil {
+		t.Fatal("没有 chat adapter")
+	}
+	estimate := func(model string) (int64, error) {
+		body := `{"messages":[{"role":"user","content":"x"}],"max_tokens":1000000}`
+		if model != "" {
+			body = `{"model":"` + model + `",` + body[1:]
+		}
+		out, _, err := chat.Resolve([]byte(body))
+		if err != nil {
+			return 0, err
+		}
+		return chat.Estimate(out)
+	}
+	// max_tokens 截断到 4096：输出项 4096 × 单价；输入项很小，这里只比较量级。
+	k3, err1 := estimate("kimi-k3")
+	def, err2 := estimate("")
+	if err1 != nil || err2 != nil || k3 < 4096*8 || def >= 4096*2 {
+		t.Fatalf("估算 kimi-k3=%d（%v）默认=%d（%v）", k3, err1, def, err2)
+	}
+	if _, err := estimate("kimi-k2.7-code"); err == nil {
+		t.Fatal("白名单外的模型应被拒绝")
+	}
+}
 
 // gatewayWorker 是经 Gateway 发起一次模型调用的 Worker：读取 init（交给 inits）、发出 ready，经本 attempt 的
 // Unix socket（<data>/gateway/<attempt_id>.sock，fake provider 的 Worker 在宿主进程内运行）POST

@@ -424,11 +424,11 @@ func searchPricing(provider string) upstream.Pricing {
 	return upstream.Pricing{Version: provider + "/free"}
 }
 
-// gatewayAdapters 构造 Gateway 的上游 adapter 与按类别的价格表（与 adapter 使用的价格表相同，交给
-// call 由 usage 计算实际费用）。所有 adapter 共用一个验证 dialer（§9.8）。模型 adapter 只在配置了
-// Model.BaseURL 时提供（否则 /v1/chat/completions 为 endpoint_not_configured）。供应商 Key 只交给 adapter，
-// 由它放在 Authorization 头中，不进入日志、init 或沙箱环境（§9.9）。
-func (c Config) gatewayAdapters(d *upstream.Dialer) ([]upstream.Adapter, map[upstream.Kind]upstream.Pricing) {
+// gatewayAdapters 构造 Gateway 的上游 adapter、按类别的价格表与 chat 按模型的价格表（与 adapter 使用的
+// 价格表相同，交给 call 由 usage 计算实际费用）。所有 adapter 共用一个验证 dialer（§9.8）。模型 adapter 只在
+// 配置了 Model.BaseURL 时提供（否则 /v1/chat/completions 为 endpoint_not_configured）。供应商 Key 只交给
+// adapter，由它放在 Authorization 头中，不进入日志、init 或沙箱环境（§9.9）。
+func (c Config) gatewayAdapters(d *upstream.Dialer) ([]upstream.Adapter, map[upstream.Kind]upstream.Pricing, map[string]upstream.Pricing) {
 	pricing := map[upstream.Kind]upstream.Pricing{
 		upstream.KindSearch: searchPricing(c.SearchProvider),
 		upstream.KindFetch:  {Version: "fetch/free"},
@@ -438,10 +438,13 @@ func (c Config) gatewayAdapters(d *upstream.Dialer) ([]upstream.Adapter, map[ups
 			Pricing: pricing[upstream.KindSearch], HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0)}),
 		upstream.NewFetch(upstream.FetchConfig{Dialer: d, Pricing: pricing[upstream.KindFetch]}),
 	}
+	var chatPricing map[string]upstream.Pricing
 	if c.Model.BaseURL != "" {
 		pricing[upstream.KindChat] = c.Model.Pricing
+		chatPricing = c.Model.PricingByModel
 		adapters = append(adapters, upstream.NewChat(upstream.ChatConfig{BaseURL: c.Model.BaseURL, Model: c.Model.Name,
-			APIKey: c.Model.APIKey, Pricing: c.Model.Pricing, HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0)}))
+			Models: c.Model.Models, APIKey: c.Model.APIKey, Pricing: c.Model.Pricing, PricingByModel: chatPricing,
+			HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0)}))
 	}
-	return adapters, pricing
+	return adapters, pricing, chatPricing
 }
