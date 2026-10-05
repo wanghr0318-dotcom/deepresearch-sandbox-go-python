@@ -1907,14 +1907,23 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// goBinary 返回用于构建测试二进制的 go 命令：优先 PATH 中的 go；找不到时（例如 sudo 重置了 PATH）用 go 命令
+// 传给测试进程的 GOROOT 环境变量（runtime.GOROOT 自 Go 1.24 起已弃用）。
+func goBinary() string {
+	if p, err := exec.LookPath("go"); err == nil {
+		return p
+	}
+	if root := os.Getenv("GOROOT"); root != "" {
+		return filepath.Join(root, "bin", "go")
+	}
+	return "go"
+}
+
 // serverBinary 构建 agentbox-e2e（每次 go test 一次）。
 func serverBinary(t *testing.T) string {
 	t.Helper()
 	serverBinOnce.Do(func() {
-		goBin, err := exec.LookPath("go")
-		if err != nil {
-			goBin = filepath.Join(runtime.GOROOT(), "bin", "go")
-		}
+		goBin := goBinary()
 		if serverBinDir, serverBinErr = os.MkdirTemp("", "agentbox-e2e-bin-"); serverBinErr != nil {
 			return
 		}
@@ -3592,10 +3601,7 @@ var (
 func agentboxBinary(t *testing.T) string {
 	t.Helper()
 	agentboxOnce.Do(func() {
-		goBin, err := exec.LookPath("go")
-		if err != nil {
-			goBin = filepath.Join(runtime.GOROOT(), "bin", "go")
-		}
+		goBin := goBinary()
 		if agentboxBinDir, agentboxErr = os.MkdirTemp("", "agentbox-bin-"); agentboxErr != nil {
 			return
 		}
