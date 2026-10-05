@@ -280,7 +280,15 @@ func (r *Registry) terminationBegun(p *pending) (bool, error) {
 // pfExiting 是 task_struct.flags 的 PF_EXITING（include/linux/sched.h）。
 const pfExiting = 0x4
 
-// taskExiting 读一次 /proc/<pid>/stat：状态为 Z/X 或 flags 含 PF_EXITING → true；pid 不存在 → true。
+// taskExiting 在观察点上读**一次** /proc/<pid>/stat，报告内核是否已开始终止该进程：状态为 Z/X，或 flags 含
+// PF_EXITING → true。
+//
+// 内核顺序（do_exit）：先置 PF_EXITING，再关闭进程的 FD（exec-status 管道由此 EOF），最后才使进程成为可被 wait
+// 的僵尸并发送 SIGCHLD。因此 EOF 无字节而 reaper 尚无记录时，"exec 之前死亡"的进程在观察点上必已带
+// PF_EXITING。本函数只读这一次，不循环；返回 true 后调用方在条件变量上等待 reaper 的记录（reaper 仍是唯一的
+// wait 者），按 wait 状态分类。不读进程名（comm）：解析只取最后一个 ')' 之后的 state 与 flags 两个字段。
+//
+// ENOENT/ESRCH：pid 已被 reaper 收割 → true，调用方使用 reaper 的记录。
 func taskExiting(pid int) (bool, error) {
 	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
@@ -289,23 +297,31 @@ func taskExiting(pid int) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("读取 /proc/%d/stat: %w", pid, err)
 	}
-	// 格式：pid (comm) state ppid pgrp session tty_nr tpgid flags ...；comm 可含空格与括号，从最后一个 ')' 之后解析。
+	state, flags, err := parseStatStateFlags(b)
+	if err != nil {
+		return false, fmt.Errorf("/proc/%d/stat: %w", pid, err)
+	}
+	return state == 'Z' || state == 'X' || flags&pfExiting != 0, nil
+}
+
+// parseStatStateFlags 从 /proc/<pid>/stat 的内容中只取 state 与 flags。
+//
+// 格式：`pid (comm) state ppid pgrp session tty_nr tpgid flags ...`。comm 在括号中，可含空格与 ')'，而内核在其后
+// 恰好输出 ") "，因此从**最后一个** ')' 之后解析：第 1 个字段是 state，第 7 个是 flags。不返回、不检查 comm。
+func parseStatStateFlags(b []byte) (state byte, flags uint64, err error) {
 	i := bytes.LastIndexByte(b, ')')
 	if i < 0 {
-		return false, fmt.Errorf("无法解析 /proc/%d/stat", pid)
+		return 0, 0, errors.New("无法解析：没有 ')'")
 	}
 	f := bytes.Fields(b[i+1:])
-	if len(f) < 7 {
-		return false, fmt.Errorf("无法解析 /proc/%d/stat", pid)
+	if len(f) < 7 || len(f[0]) != 1 {
+		return 0, 0, errors.New("无法解析：字段不足")
 	}
-	if s := f[0]; len(s) == 1 && (s[0] == 'Z' || s[0] == 'X') {
-		return true, nil
-	}
-	flags, err := strconv.ParseUint(string(f[6]), 10, 64)
+	flags, err = strconv.ParseUint(string(f[6]), 10, 64)
 	if err != nil {
-		return false, fmt.Errorf("解析 /proc/%d/stat 的 flags: %w", pid, err)
+		return 0, 0, fmt.Errorf("解析 flags: %w", err)
 	}
-	return flags&pfExiting != 0, nil
+	return f[0][0], flags, nil
 }
 
 // diedBeforeExec 按 reaper 记录的 wait 状态分类"终止不晚于观察点"的启动：以信号终止或以 126 退出 →

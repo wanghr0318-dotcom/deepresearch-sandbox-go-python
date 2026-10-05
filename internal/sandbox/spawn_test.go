@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
@@ -3245,4 +3246,50 @@ func TestHelperWorkloadIdentity(t *testing.T) {
 			got.NoFile, got.Core, got.FSize, workloadNoFile, workloadNoFile, fsize, fsize)
 	}
 	closeAndDrain(t, s, ch)
+}
+
+// TestParseStatStateFlags：观察点的 /proc/<pid>/stat 解析只取最后一个 ')' 之后的 state 与 flags（不需要 root）：
+// 存活（S/R，flags 不含 PF_EXITING）、僵尸 Z、R 但 PF_EXITING 已置位、comm 含空格与括号（`) ) weird name (`）
+// 且状态为 Z——都按 state/flags 正确分类；签名只返回 state、flags 与错误（不读取、不返回 comm）。
+func TestParseStatStateFlags(t *testing.T) {
+	if ft := reflect.TypeOf(parseStatStateFlags); ft.NumOut() != 3 || ft.Out(0).Kind() != reflect.Uint8 ||
+		ft.Out(1).Kind() != reflect.Uint64 || ft.Out(2) != reflect.TypeOf((*error)(nil)).Elem() {
+		t.Fatalf("parseStatStateFlags 的签名 = %v，期望只返回 (state byte, flags uint64, error)", ft)
+	}
+	// 字段：state ppid pgrp session tty_nr tpgid flags ...（flags 为十进制）
+	line := func(comm string, state byte, flags uint64) []byte {
+		return []byte(fmt.Sprintf("42 (%s) %c 1 42 42 0 -1 %d 0 0 0 0 1 2 3 4 20 0 1 0 100 0 0\n", comm, state, flags))
+	}
+	const otherFlags = 0x40 | 0x400000 // PF_FORKNOEXEC | PF_RANDOMIZE：不含 PF_EXITING
+	cases := []struct {
+		name    string
+		b       []byte
+		exiting bool
+	}{
+		{"存活 S", line("sh", 'S', otherFlags), false},
+		{"存活 R", line("agentbox-helper", 'R', otherFlags), false},
+		{"僵尸 Z", line("sh", 'Z', otherFlags), true},
+		{"R 且 PF_EXITING", line("sh", 'R', otherFlags|pfExiting), true},
+		{"comm 含括号与空格，状态 Z", line(") ) weird name (", 'Z', otherFlags), true},
+		{"comm 含括号与空格，存活 S", line(") ) Z 1 2 3 4 5 4 (", 'S', otherFlags), false},
+	}
+	for _, c := range cases {
+		state, flags, err := parseStatStateFlags(c.b)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		if got := state == 'Z' || state == 'X' || flags&pfExiting != 0; got != c.exiting {
+			t.Errorf("%s: state=%c flags=%#x → 终止已开始 = %v，期望 %v", c.name, state, flags, got, c.exiting)
+		}
+	}
+	for _, bad := range []string{"", "42 sh S 1", "42 (sh) S 1 2", "42 (sh) S 1 2 3 4 5 notanumber"} {
+		if _, _, err := parseStatStateFlags([]byte(bad)); err == nil {
+			t.Errorf("%q: 解析成功，期望错误", bad)
+		}
+	}
+	// 本进程（存活）：真实的 /proc/self/stat 可解析，且终止未开始。
+	if exiting, err := taskExiting(os.Getpid()); err != nil || exiting {
+		t.Errorf("taskExiting(self) = %v, %v；期望 false", exiting, err)
+	}
 }
