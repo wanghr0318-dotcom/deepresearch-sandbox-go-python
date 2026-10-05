@@ -100,6 +100,12 @@ jobs:
           go-version-file: go.mod
       - name: 验证 runner 能力（cgroup v2、挂载、namespace、新挂载 API、close_range）
         run: sudo bash scripts/ci/check-runner.sh
+      # 默认 rootfs 模板要求宿主存在 /opt/agentbox（worker 包目录，规格 §4.5）；真实沙箱用例在其中运行 sim_worker。
+      - name: 安装 worker 包到 /opt/agentbox（默认模板的必需路径）
+        run: |
+          sudo mkdir -p /opt/agentbox
+          sudo cp -r worker/agentbox_worker worker/sim_worker /opt/agentbox/
+          ls /opt/agentbox
       # 生产二进制与 helper 固定 CGO_ENABLED=0（静态、无 libc 线程初始化）；doctor 逐项输出宿主能力。
       # correctness 作业的 -race 需要 cgo，保持默认，不受此约束。
       - name: 构建生产二进制（CGO_ENABLED=0）并运行 doctor
