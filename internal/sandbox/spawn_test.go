@@ -34,6 +34,10 @@ import (
 // 而不是钻进 go test 自己的框架（LaunchCommand 硬编码 re-exec /proc/self/exe，
 // 从测试里调用时那就是这个测试二进制自己）。
 func TestMain(m *testing.M) {
+	// §16.2 检查器分流（在沙箱内作为 workload 运行，见 Task 12 一节）：必须先于任何打开文件的操作（FD 快照）。
+	if len(os.Args) > 1 && os.Args[1] == isolationCheckArg {
+		os.Exit(runIsolationCheck())
+	}
 	// stage-2 helper 分流（init 以 execveat 启动本测试二进制）：成功时 execve workload，不返回。
 	if len(os.Args) > 1 && os.Args[1] == HelperArg {
 		RunHelper()
@@ -3292,4 +3296,922 @@ func TestParseStatStateFlags(t *testing.T) {
 	if exiting, err := taskExiting(os.Getpid()); err != nil || exiting {
 		t.Errorf("taskExiting(self) = %v, %v；期望 false", exiting, err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 12（12b）：cgo 守卫（规格 §4.6 实现门槛 3）与 §16.2 生产验收。
+// 检查器是本测试二进制的 isolation-check 子命令（移植自 experiments/spike-1b/check.go）：复制进沙箱后，经生产启动
+// 路径——专用启动进程（RunLaunch）→ init（RunInit：命名空间、挂载、pivot_root、init 能力集）→ 生产 Launcher
+// （rawfork + execveat）→ stage-2 helper（降权、seccomp）→ execve——作为 workload 运行，在 workload 内核验并逐项输出
+// `CHECK <名称> PASS|FAIL <细节>`；宿主侧按 §16.2 条目汇总，每个条目一个子测试。
+// ---------------------------------------------------------------------------
+
+// TestHelperRejectsCgoBuild：helper 的第一步是 cgo 守卫（不需要 root）。以 exec-stage2 子命令直接运行本测试
+// 二进制（fd 3 为 exec-status 管道，规格为空对象）：cgo 构建中原因为 helper/cgo_enabled，先于规格解析；
+// CGO_ENABLED=0 构建中守卫不存在，原因为规格解析失败（helper/spec）。两者都以 126 退出。
+func TestHelperRejectsCgoBuild(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	cmd := exec.Command(exe, HelperArg, "{}")
+	cmd.ExtraFiles = []*os.File{w}
+	runErr := cmd.Run()
+	w.Close()
+	b, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "helper/" + hStepSpec + ": argv 为空"
+	if cgoBuild {
+		want = "helper/" + hStepCgo + ": " + errCgoBuild.Error()
+	}
+	var ee *exec.ExitError
+	if !errors.As(runErr, &ee) || ee.ExitCode() != 126 || string(b) != want {
+		t.Fatalf("helper 退出 %v，exec-status = %q；期望 126 与 %q", runErr, b, want)
+	}
+	t.Logf("cgo 构建 = %v；helper 回报 %q", cgoBuild, b)
+}
+
+// isolationCheckArg 是检查器子命令（os.Args[1]）；os.Args[2] 是 JSON 的 checkConfig。
+const isolationCheckArg = "isolation-check"
+
+// checkerName 是检查器复制进沙箱后的文件名（exec 环境 /in 下，编排环境 /workspace 下）。
+const checkerName = "agentbox-check"
+
+// checkConfig 是宿主交给检查器的期望值。
+type checkConfig struct {
+	Kind     string   `json:"kind"`
+	Baseline int      `json:"baseline"` // 宿主同法读取的 Seccomp_filters 基线
+	Template []string `json:"template"` // rootfs 模板路径（允许的只读挂载点）
+	Gateway  bool     `json:"gateway"`  // 编排环境：Gateway socket 应对 uid 1000 可访问（回复 pong）
+	WSPhase  string   `json:"ws_phase,omitempty"`
+	// WSWritable：/workspace 应可写（保留范围）；外来范围下为 false。
+	WSWritable bool `json:"ws_writable"`
+}
+
+// checker 汇总检查结果（输出到 stdout，宿主解析）。
+type checker struct {
+	cfg   checkConfig
+	fails int
+}
+
+func (c *checker) check(name string, ok bool, format string, a ...any) {
+	res := "PASS"
+	if !ok {
+		res = "FAIL"
+		c.fails++
+	}
+	fmt.Printf("CHECK %s %s %s\n", name, res, strings.ReplaceAll(fmt.Sprintf(format, a...), "\n", " "))
+}
+
+func chkErr(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	return err.Error()
+}
+
+// runIsolationCheck 是检查器主函数。FD 快照必须是第一步（在打开任何文件之前）。
+func runIsolationCheck() int {
+	fds := chkListFDs()
+	var c checker
+	if len(os.Args) != 3 || json.Unmarshal([]byte(os.Args[2]), &c.cfg) != nil {
+		c.check("config", false, "参数 %q", os.Args[1:])
+		return 1
+	}
+	fmt.Printf("WORKLOAD_STARTED pid=%d\n", os.Getpid())
+	c.checkFDs(fds)
+	c.checkThreads()
+	c.checkSecurebits()
+	c.checkIDs()
+	c.checkSyscalls()
+	c.checkMounts()
+	c.checkMisc()
+	c.checkEnvSpecific()
+	c.checkPython()
+	fmt.Printf("CHECK_SUMMARY fail=%d\n", c.fails)
+	if c.fails > 0 {
+		return 1
+	}
+	return 0
+}
+
+// chkListFDs 列出本进程打开的 FD（`名->目标`），排除列举自身打开的目录 fd。
+func chkListFDs() []string {
+	dfd, err := syscall.Open("/proc/self/fd", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return []string{"open /proc/self/fd: " + err.Error()}
+	}
+	defer syscall.Close(dfd)
+	var names []string
+	buf := make([]byte, 8192)
+	for {
+		n, err := syscall.ReadDirent(dfd, buf)
+		if err != nil || n <= 0 {
+			break
+		}
+		_, _, names = syscall.ParseDirent(buf[:n], -1, names)
+	}
+	var out []string
+	for _, nm := range names {
+		if fd, err := strconv.Atoi(nm); err != nil || fd == dfd {
+			continue
+		}
+		target, _ := os.Readlink("/proc/self/fd/" + nm)
+		out = append(out, nm+"->"+target)
+	}
+	return out
+}
+
+// checkFDs：除 0/1/2 外无继承 FD；0/1/2 逐个解析，都是宿主交来的管道（不是宿主路径、控制 socket 或 helper 二进制）。
+func (c *checker) checkFDs(fds []string) {
+	var extra, std []string
+	stdOK := true
+	for _, l := range fds {
+		nm, target, _ := strings.Cut(l, "->")
+		if nm == "0" || nm == "1" || nm == "2" {
+			std = append(std, l)
+			stdOK = stdOK && strings.HasPrefix(target, "pipe:[")
+			continue
+		}
+		extra = append(extra, l)
+	}
+	c.check("fds_no_extra", len(extra) == 0, "extra=%q", extra)
+	c.check("fds_012_pipes", stdOK && len(std) == 3, "std=%q", std)
+}
+
+func chkStatus(path string) map[string]string {
+	b, _ := os.ReadFile(path)
+	m := make(map[string]string)
+	for _, line := range strings.Split(string(b), "\n") {
+		if k, v, ok := strings.Cut(line, ":"); ok {
+			m[k] = strings.TrimSpace(v)
+		}
+	}
+	return m
+}
+
+// checkThreads：逐线程（另起 4 个锁定 OS 线程的 goroutine，保证有多个线程可查）能力集合全 0、NoNewPrivs 1、
+// Seccomp 2 且 Seccomp_filters ≥ 宿主基线 + 1。
+func (c *checker) checkThreads() {
+	var ready sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		ready.Add(1)
+		go func() {
+			runtime.LockOSThread()
+			ready.Done()
+			<-stop
+		}()
+	}
+	ready.Wait()
+	defer close(stop)
+
+	ents, err := os.ReadDir("/proc/self/task")
+	if err != nil {
+		c.check("threads", false, "%v", err)
+		return
+	}
+	capsOK, nnpOK, scOK := true, true, true
+	var bad, filters []string
+	for _, e := range ents {
+		f := chkStatus("/proc/self/task/" + e.Name() + "/status")
+		for _, k := range []string{"CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"} {
+			if f[k] != "0000000000000000" {
+				capsOK = false
+				bad = append(bad, fmt.Sprintf("tid %s %s=%s", e.Name(), k, f[k]))
+			}
+		}
+		if f["NoNewPrivs"] != "1" {
+			nnpOK = false
+			bad = append(bad, fmt.Sprintf("tid %s NoNewPrivs=%s", e.Name(), f["NoNewPrivs"]))
+		}
+		n, err := strconv.Atoi(f["Seccomp_filters"])
+		if f["Seccomp"] != "2" || err != nil || n < c.cfg.Baseline+1 {
+			scOK = false
+			bad = append(bad, fmt.Sprintf("tid %s Seccomp=%s filters=%s", e.Name(), f["Seccomp"], f["Seccomp_filters"]))
+		}
+		filters = append(filters, f["Seccomp_filters"])
+	}
+	c.check("threads_caps_all_zero", capsOK && len(ents) >= 5, "threads=%d bad=%q", len(ents), bad)
+	c.check("threads_no_new_privs", nnpOK, "threads=%d", len(ents))
+	c.check("threads_seccomp_filter", scOK, "threads=%d Seccomp=2 filters=%v（宿主基线 %d，要求 ≥ %d）",
+		len(ents), filters, c.cfg.Baseline, c.cfg.Baseline+1)
+}
+
+// checkSecurebits：PR_GET_SECUREBITS 为 0x0f（NOROOT、NO_SETUID_FIXUP 及其锁定位），且清除被拒绝。
+func (c *checker) checkSecurebits() {
+	const prGetSecurebits = 27
+	r, _, e := syscall.RawSyscall(syscall.SYS_PRCTL, prGetSecurebits, 0, 0)
+	c.check("securebits_value", e == 0 && r == workloadSecurebits, "got=%#x want=%#x errno=%v", r, workloadSecurebits, e)
+	const lockBits = 1<<1 | 1<<3 // SECBIT_NOROOT_LOCKED | SECBIT_NO_SETUID_FIXUP_LOCKED
+	_, _, e2 := syscall.RawSyscall(syscall.SYS_PRCTL, prSetSecurebits, 0, 0)
+	c.check("securebits_locked", r&lockBits == lockBits && e2 != 0, "锁定位=%v；清除尝试 -> %v", r&lockBits == lockBits, e2)
+}
+
+// checkIDs：resuid/resgid 均为 1000，附加组为空。
+func (c *checker) checkIDs() {
+	var ru, eu, su, rg, eg, sg uint32
+	syscall.RawSyscall(syscall.SYS_GETRESUID, uintptr(unsafe.Pointer(&ru)), uintptr(unsafe.Pointer(&eu)), uintptr(unsafe.Pointer(&su)))
+	syscall.RawSyscall(syscall.SYS_GETRESGID, uintptr(unsafe.Pointer(&rg)), uintptr(unsafe.Pointer(&eg)), uintptr(unsafe.Pointer(&sg)))
+	groups, gerr := syscall.Getgroups()
+	c.check("uid", ru == workloadID && eu == workloadID && su == workloadID, "resuid=%d,%d,%d", ru, eu, su)
+	c.check("gid", rg == workloadID && eg == workloadID && sg == workloadID, "resgid=%d,%d,%d", rg, eg, sg)
+	st := chkStatus("/proc/self/status")
+	c.check("groups_empty", gerr == nil && len(groups) == 0 && st["Groups"] == "", "getgroups=%v err=%v status.Groups=%q", groups, gerr, st["Groups"])
+}
+
+// checkSyscalls：clone3 → ENOSYS；拒绝列表（seccompDenyProbes，与 seccomp 子进程用例同一组无害无效调用）全部 EPERM；
+// socket(AF_UNIX) 允许。
+func (c *checker) checkSyscalls() {
+	const sysClone3 = 435
+	_, _, e := syscall.RawSyscall(sysClone3, 0, 0, 0)
+	c.check("clone3_enosys", e == syscall.ENOSYS, "clone3(NULL,0) -> %v（无过滤器时内核返回 EINVAL）", errnoName(e))
+	arch, err := NativeArch()
+	if err != nil {
+		c.check("seccomp_denylist_eperm", false, "%v", err)
+		return
+	}
+	runtime.LockOSThread()
+	allEPERM := true
+	var res []string
+	for _, p := range seccompDenyProbes(arch) {
+		got := p.call()
+		if got != syscall.EPERM {
+			allEPERM = false
+			res = append(res, p.name+"="+errnoName(got))
+		}
+	}
+	runtime.UnlockOSThread()
+	c.check("seccomp_denylist_eperm", allEPERM, "probes=%d 非 EPERM=%q", len(seccompDenyProbes(arch)), res)
+	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err == nil {
+		syscall.Close(fd)
+	}
+	c.check("seccomp_allows_af_unix", err == nil, "socket(AF_UNIX) -> %s", chkErr(err))
+}
+
+type chkMount struct {
+	point, fstype string
+	opts          []string
+	optional      []string
+}
+
+func chkMountinfo() []chkMount {
+	b, _ := os.ReadFile("/proc/self/mountinfo")
+	var out []chkMount
+	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		pre, post, _ := strings.Cut(l, " - ")
+		f, g := strings.Fields(pre), strings.Fields(post)
+		if len(f) < 6 || len(g) < 1 {
+			out = append(out, chkMount{point: "<无法解析> " + l})
+			continue
+		}
+		out = append(out, chkMount{point: unescapeMountinfo(f[4]), opts: strings.Split(f[5], ","), optional: f[6:], fstype: g[0]})
+	}
+	return out
+}
+
+// checkMounts：私有传播；旧根已脱离（只有一个 / 且为只读 tmpfs，挂载点全部属于预期集合）；模板与 /in 为
+// ro,nosuid,nodev；无 /sys 与 cgroupfs；/proc 掩蔽与只读路径。
+func (c *checker) checkMounts() {
+	ms := chkMountinfo()
+	allowed := []string{"/tmp", "/dev", "/proc"}
+	if c.cfg.Kind == KindExec {
+		allowed = append(allowed, "/out", "/in")
+	} else {
+		allowed = append(allowed, "/run", "/workspace")
+	}
+	allowed = append(allowed, c.cfg.Template...)
+	private := true
+	var roots, foreign, notPrivate []string
+	byPoint := map[string]chkMount{}
+	for _, m := range ms {
+		if len(m.optional) != 0 {
+			private = false
+			notPrivate = append(notPrivate, m.point+":"+strings.Join(m.optional, " "))
+		}
+		byPoint[m.point] = m
+		if m.point == "/" {
+			roots = append(roots, m.fstype+":"+strings.Join(m.opts, ","))
+			if m.fstype != "tmpfs" || !hasAll(m.opts, "ro", "nosuid", "nodev") {
+				foreign = append(foreign, "/("+m.fstype+")")
+			}
+			continue
+		}
+		ok := false
+		for _, a := range allowed {
+			ok = ok || under(m.point, a)
+		}
+		if !ok {
+			foreign = append(foreign, m.point)
+		}
+	}
+	c.check("mounts_private_propagation", private, "entries=%d 非私有=%q", len(ms), notPrivate)
+	c.check("old_root_detached", len(roots) == 1 && len(foreign) == 0, "挂载点 / = %q（期望 1 个只读 tmpfs）；意外挂载点=%q", roots, foreign)
+
+	roOK := true
+	var roBad []string
+	n := 0
+	for _, m := range ms {
+		ro := c.cfg.Kind == KindExec && under(m.point, "/in")
+		for _, p := range c.cfg.Template {
+			ro = ro || under(m.point, p)
+		}
+		if ro {
+			n++
+			if !hasAll(m.opts, "ro", "nosuid", "nodev") {
+				roOK = false
+				roBad = append(roBad, m.point+"="+strings.Join(m.opts, ","))
+			}
+		}
+	}
+	c.check("rootfs_ro_nosuid_nodev", roOK && n > 0, "模板/只读挂载 %d 个，不合格=%q", n, roBad)
+
+	sysEnts, _ := os.ReadDir("/sys")
+	noSys := len(sysEnts) == 0
+	for _, m := range ms {
+		noSys = noSys && m.fstype != "sysfs" && m.fstype != "cgroup2" && m.fstype != "cgroup"
+	}
+	c.check("no_sys_no_cgroupfs", noSys, "/sys entries=%d", len(sysEnts))
+
+	maskOK := true
+	var maskRes []string
+	for _, p := range procMaskPaths {
+		st, err := os.Stat(p)
+		if err != nil {
+			maskRes = append(maskRes, p+"=absent")
+			continue
+		}
+		if st.IsDir() {
+			ents, _ := os.ReadDir(p)
+			m := byPoint[p]
+			ok := len(ents) == 0 && m.fstype == "tmpfs" && hasAll(m.opts, "ro")
+			maskOK = maskOK && ok
+			maskRes = append(maskRes, fmt.Sprintf("%s=空只读tmpfs:%v", p, ok))
+			continue
+		}
+		sys := st.Sys().(*syscall.Stat_t)
+		ok := st.Mode()&os.ModeCharDevice != 0 && sys.Rdev == 1<<8|3
+		if ok { // 只读一个字节：未掩蔽的 /proc/kcore 等可能极大
+			f, err := os.Open(p)
+			n := 0
+			if err == nil {
+				n, _ = f.Read(make([]byte, 1))
+				f.Close()
+			}
+			ok = err == nil && n == 0
+		}
+		maskOK = maskOK && ok
+		maskRes = append(maskRes, fmt.Sprintf("%s=devnull:%v", p, ok))
+	}
+	c.check("proc_masked", maskOK, "%s", strings.Join(maskRes, " "))
+	roOK = true
+	var roRes []string
+	for _, p := range procReadonlyPaths {
+		if _, err := os.Stat(p); err != nil {
+			roRes = append(roRes, p+"=absent")
+			continue
+		}
+		m, ok := byPoint[p]
+		good := ok && hasAll(m.opts, "ro")
+		roOK = roOK && good
+		roRes = append(roRes, fmt.Sprintf("%s=ro:%v", p, good))
+	}
+	c.check("proc_readonly", roOK, "%s", strings.Join(roRes, " "))
+}
+
+// checkMisc：可写区域、netns 只有 lo、信号掩码与忽略集为空。
+func (c *checker) checkMisc() {
+	var res []string
+	ok := true
+	try := func(path string, wantOK bool) {
+		err := os.WriteFile(path, []byte("x"), 0o644)
+		res = append(res, fmt.Sprintf("%s=%s", path, chkErr(err)))
+		if (err == nil) != wantOK {
+			ok = false
+		}
+		if err == nil {
+			os.Remove(path)
+		}
+	}
+	try("/tmp/w", true)
+	try("/w", false)
+	try("/usr/w", false)
+	if c.cfg.Kind == KindExec {
+		try("/out/w", true)
+		try("/in/w", false)
+	} else {
+		try("/run/w", true)
+		try("/workspace/w", c.cfg.WSWritable)
+	}
+	c.check("writable_areas", ok, "%s", strings.Join(res, " "))
+
+	b, _ := os.ReadFile("/proc/net/dev")
+	var ifs []string
+	lines := strings.Split(string(b), "\n")
+	for i, l := range lines {
+		if i < 2 {
+			continue
+		}
+		if n, _, found := strings.Cut(strings.TrimSpace(l), ":"); found {
+			ifs = append(ifs, n)
+		}
+	}
+	c.check("netns_only_lo", len(ifs) == 1 && ifs[0] == "lo", "interfaces=%v", ifs)
+
+	st := chkStatus("/proc/self/status")
+	c.check("signal_mask_clean", st["SigBlk"] == "0000000000000000" && st["SigIgn"] == "0000000000000000", "SigBlk=%s SigIgn=%s", st["SigBlk"], st["SigIgn"])
+}
+
+// checkEnvSpecific：Gateway socket（编排环境对 uid 1000 可访问、exec 环境不可见）与 session workspace 的三个阶段。
+func (c *checker) checkEnvSpecific() {
+	if c.cfg.Kind == KindExec {
+		_, err := os.Stat(gatewaySocket)
+		_, err2 := os.Stat(gatewayDir)
+		c.check("gateway_socket_absent_in_exec", errors.Is(err, os.ErrNotExist) && errors.Is(err2, os.ErrNotExist),
+			"stat %s -> %v；%s -> %v", gatewaySocket, err, gatewayDir, err2)
+	} else if c.cfg.Gateway {
+		owner := ""
+		if st, err := os.Stat(gatewaySocket); err == nil {
+			s := st.Sys().(*syscall.Stat_t)
+			owner = fmt.Sprintf("uid=%d gid=%d mode=%v", s.Uid, s.Gid, st.Mode())
+		}
+		reply := ""
+		fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+		if err == nil {
+			err = syscall.Connect(fd, &syscall.SockaddrUnix{Name: gatewaySocket})
+			if err == nil {
+				_, err = syscall.Write(fd, []byte("ping\n"))
+			}
+			if err == nil {
+				b := make([]byte, 64)
+				n, rerr := syscall.Read(fd, b)
+				if n > 0 {
+					reply = strings.TrimSpace(string(b[:n]))
+				}
+				err = rerr
+			}
+			syscall.Close(fd)
+		}
+		c.check("gateway_socket_uid1000", err == nil && reply == "pong", "%s；connect/ping -> %s reply=%q", owner, chkErr(err), reply)
+	}
+	const state = "/workspace/state.txt"
+	switch c.cfg.WSPhase {
+	case "1":
+		err := os.WriteFile(state, []byte("written in phase 1\n"), 0o600)
+		c.check("session_workspace_write", err == nil, "write %s -> %s", state, chkErr(err))
+	case "2":
+		b, err := os.ReadFile(state)
+		var err2 error
+		if err == nil {
+			err2 = os.WriteFile(state, append(b, []byte("appended in phase 2\n")...), 0o600)
+		}
+		c.check("session_workspace_resume", err == nil && err2 == nil && strings.HasPrefix(string(b), "written in phase 1"),
+			"read -> %s %q；rewrite -> %s", chkErr(err), b, chkErr(err2))
+	case "2-foreign":
+		_, err := os.ReadFile(state)
+		c.check("session_workspace_foreign_range_denied", errors.Is(err, os.ErrPermission), "以不同的 UID 范围读取 -> %v", err)
+	}
+}
+
+// chkPython 在 workload 内（同一 seccomp 过滤器下）运行：clone3 → ENOSYS 时线程、subprocess、posix_spawn、fork 正常，
+// 且 Python 进程的每个线程同样满足能力、NoNewPrivs 与 seccomp 条件。
+const chkPython = `
+import os, sys, threading, subprocess, ctypes, errno
+def check(name, ok, detail):
+    print("CHECK %s %s %s" % (name, "PASS" if ok else "FAIL", detail), flush=True)
+base = int(os.environ["AGENTBOX_BASELINE_FILTERS"])
+libc = ctypes.CDLL(None, use_errno=True)
+r = libc.syscall(435, None, 0); e = ctypes.get_errno()
+check("py_clone3_enosys", r == -1 and e == errno.ENOSYS, "r=%d errno=%s" % (r, errno.errorcode.get(e, e)))
+out = []
+ts = [threading.Thread(target=out.append, args=(i,)) for i in range(16)]
+[t.start() for t in ts]; [t.join() for t in ts]
+check("py_threads", sorted(out) == list(range(16)), "16 threads ran")
+ev = threading.Event()
+hs = [threading.Thread(target=ev.wait) for _ in range(4)]
+[h.start() for h in hs]
+bad = []
+tids = os.listdir("/proc/self/task")
+for tid in tids:
+    d = {}
+    for l in open("/proc/self/task/%s/status" % tid):
+        k, _, v = l.partition(":")
+        d[k] = v.strip()
+    for k in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"):
+        if d[k] != "0000000000000000": bad.append((tid, k, d[k]))
+    if d["NoNewPrivs"] != "1" or d["Seccomp"] != "2" or int(d["Seccomp_filters"]) < base + 1: bad.append((tid, "nnp/seccomp", d["Seccomp_filters"]))
+ev.set(); [h.join() for h in hs]
+check("py_thread_status", not bad and len(tids) >= 5, "threads=%d bad=%r" % (len(tids), bad))
+p = subprocess.run(["/usr/bin/echo", "sub-ok"], capture_output=True, text=True)
+check("py_subprocess_run", p.returncode == 0 and p.stdout.strip() == "sub-ok", "rc=%d out=%r" % (p.returncode, p.stdout.strip()))
+p = subprocess.run("echo shell-ok | tr a-z A-Z", shell=True, capture_output=True, text=True)
+check("py_subprocess_shell", p.returncode == 0 and p.stdout.strip() == "SHELL-OK", "rc=%d out=%r" % (p.returncode, p.stdout.strip()))
+pid = os.posix_spawn("/usr/bin/true", ["true"], {})
+_, st = os.waitpid(pid, 0)
+check("py_posix_spawn", st == 0, "status=%d" % st)
+pid = os.fork()
+if pid == 0:
+    os._exit(7)
+_, st = os.waitpid(pid, 0)
+check("py_fork", os.waitstatus_to_exitcode(st) == 7, "exit=%d" % os.waitstatus_to_exitcode(st))
+try:
+    import concurrent.futures as cf
+    with cf.ThreadPoolExecutor(8) as ex:
+        res = list(ex.map(lambda x: x * x, range(32)))
+    check("py_threadpool", res == [x * x for x in range(32)], "ok")
+except Exception as ex:
+    check("py_threadpool", False, repr(ex))
+`
+
+func (c *checker) checkPython() {
+	cmd := exec.Command("/usr/bin/python3", "-c", chkPython)
+	cmd.Env = []string{"PATH=/usr/bin:/bin", fmt.Sprintf("AGENTBOX_BASELINE_FILTERS=%d", c.cfg.Baseline)}
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	err := cmd.Run()
+	c.check("py_ran", err == nil, "python3 -> %s（由 Go os/exec 在同一过滤器下启动）", chkErr(err))
+}
+
+// ---- 宿主侧 ----
+
+// checkResult 是检查器输出的一行 CHECK。
+type checkResult struct {
+	pass   bool
+	detail string
+}
+
+// hostSeccompBaseline 以与检查器相同的方法（/proc/<self>/task/*/status 的 Seccomp_filters）读取宿主进程（本测试
+// 进程）的过滤器数，取各线程的最大值：WSL2 的 init 给每个进程预装 1 个，GitHub runner 上为 0。
+func hostSeccompBaseline(t *testing.T) int {
+	t.Helper()
+	ents, err := os.ReadDir("/proc/self/task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := -1
+	for _, e := range ents {
+		f := chkStatus("/proc/self/task/" + e.Name() + "/status")
+		v, ok := f["Seccomp_filters"]
+		if !ok {
+			continue // 线程已退出
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			t.Fatalf("线程 %s 的 Seccomp_filters = %q", e.Name(), v)
+		}
+		base = max(base, n)
+	}
+	if base < 0 {
+		t.Fatal("宿主 /proc/self/task/*/status 没有 Seccomp_filters 字段（内核过旧），无法确定基线")
+	}
+	return base
+}
+
+// serverCreds 返回本进程（扮演 server）各线程凭据的去重集合：Uid、Gid、Groups、CapEff。
+func serverCreds(t *testing.T) []string {
+	t.Helper()
+	ents, err := os.ReadDir("/proc/self/task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := map[string]bool{}
+	for _, e := range ents {
+		f := chkStatus("/proc/self/task/" + e.Name() + "/status")
+		if _, ok := f["Uid"]; !ok {
+			continue // 线程已退出
+		}
+		set[fmt.Sprintf("Uid=%s Gid=%s Groups=%q CapEff=%s", f["Uid"], f["Gid"], f["Groups"], f["CapEff"])] = true
+	}
+	var out []string
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// installChecker 把本测试二进制复制为 dir/agentbox-check（0755）。
+func installChecker(t *testing.T, dir string) {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, checkerName)
+	if err := os.WriteFile(p, b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// pongSocket 在 dir 下建一个 unix socket（属主宿主 uid、0600），每个连接读到 "ping" 回复 "pong"。
+func pongSocket(t *testing.T, dir string, uid int) string {
+	t.Helper()
+	path := filepath.Join(dir, "gw-pong.sock")
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	if err := os.Chown(path, uid, uid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+				b := make([]byte, 64)
+				n, _ := conn.Read(b)
+				if strings.TrimSpace(string(b[:n])) == "ping" {
+					_, _ = conn.Write([]byte("pong\n"))
+				}
+			}()
+		}
+	}()
+	return path
+}
+
+// runChecker 经生产启动路径启动 spec 的环境，在其中以 workload 运行检查器（stdin 为管道，stdout 与 stderr 为同一
+// 管道），断言 start_ack 后 exit，返回每个 CHECK 的结果。环境随后关闭（init 退出）。
+func runChecker(t *testing.T, spec LaunchSpec, cfg checkConfig, path string) map[string]checkResult {
+	t.Helper()
+	s := startSandboxInit(t, spec)
+	if s.ready != nil {
+		t.Fatalf("init 未就绪: %v\n%s", s.ready, s.output())
+	}
+	ch := pumpMessages(s.conn)
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outR.Close()
+	cfgJSON, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s.conn.Send(Message{Type: MsgStart, ExecID: "check", Spec: argvSpec(path, isolationCheckArg, string(cfgJSON))},
+		[]*os.File{inR, outW, outW})
+	inR.Close()
+	outW.Close()
+	inW.Close() // workload 的 stdin 读到 EOF
+	if err != nil {
+		t.Fatal(err)
+	}
+	outc := make(chan []byte, 1)
+	go func() {
+		b, _ := io.ReadAll(outR)
+		outc <- b
+	}()
+	_, ex := expectAckExit(t, s, ch, "check")
+	var out []byte
+	select {
+	case out = <-outc:
+	case <-time.After(20 * time.Second):
+		t.Fatal("检查器输出未结束")
+	}
+	closeAndDrain(t, s, ch)
+
+	res := map[string]checkResult{}
+	for _, line := range strings.Split(string(out), "\n") {
+		rest, ok := strings.CutPrefix(line, "CHECK ")
+		if !ok {
+			continue
+		}
+		f := strings.SplitN(rest, " ", 3)
+		if len(f) < 2 {
+			t.Errorf("无法解析检查器输出 %q", line)
+			continue
+		}
+		if len(f) == 2 {
+			f = append(f, "")
+		}
+		if _, dup := res[f[0]]; dup {
+			t.Errorf("检查 %s 重复输出", f[0])
+		}
+		res[f[0]] = checkResult{pass: f[1] == "PASS", detail: f[2]}
+	}
+	if ex.Code != 0 || ex.Signal != 0 || !strings.Contains(string(out), "CHECK_SUMMARY fail=0") {
+		t.Errorf("检查器退出状态 %+v（期望 0 且全部通过）；输出:\n%s", ex, out)
+	}
+	return res
+}
+
+// acceptItem 是 §16.2 的一个条目：要求的 (场景, 检查) 全部 PASS。
+type acceptItem struct {
+	title string
+	need  [][2]string
+}
+
+// TestIsolationAcceptance16_2：§16.2 生产验收（每个条目一个子测试，-v 逐项输出）。检查器在生产启动路径启动的
+// workload 内运行，五个场景：exec 环境（/in、/out）；task 编排环境（workspace、Gateway socket）；session 的三个
+// 阶段（同一 workspace：阶段 1 写入；关闭后以同一 UID 范围重新启动，阶段 2 读回并追加；以另一 UID 范围启动，读取
+// 被拒绝）。另外两个条目在宿主侧判定：启动成功判据（提交点语义，经生产 Launcher 与 helper 的测试钩子）；
+// server（本测试进程）各线程的凭据在全部启动前后不变。
+func TestIsolationAcceptance16_2(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+	if cgoBuild {
+		t.Fatal("§16.2 验收须以 CGO_ENABLED=0 构建运行（cgo 构建中 helper 拒绝运行）")
+	}
+	baseline := hostSeccompBaseline(t)
+	credsBefore := serverCreds(t)
+	t.Logf("宿主 Seccomp_filters 基线 = %d（workload 要求 ≥ %d）；server 凭据 %q", baseline, baseline+1, credsBefore)
+	hostWorkload := initTestIDBase + workloadID
+	results := map[string]map[string]checkResult{}
+
+	// exec 环境。
+	{
+		spec := initTestSpec(t, KindExec, false)
+		installChecker(t, spec.Init.In)
+		results["exec"] = runChecker(t, spec, checkConfig{Kind: KindExec, Baseline: baseline, Template: spec.Init.Template.Paths},
+			"/in/"+checkerName)
+	}
+	// task 编排环境：Gateway socket 换成回复 pong 的 socket。
+	{
+		spec := initTestSpec(t, KindTask, false)
+		spec.Init.GatewaySocket = pongSocket(t, filepath.Dir(spec.Init.Workspace), hostWorkload)
+		installChecker(t, spec.Init.Workspace)
+		results["task"] = runChecker(t, spec, checkConfig{Kind: KindTask, Baseline: baseline, Template: spec.Init.Template.Paths,
+			Gateway: true, WSWritable: true}, "/workspace/"+checkerName)
+	}
+	// session：同一 workspace 的三个阶段。
+	{
+		spec := initTestSpec(t, KindSession, false)
+		spec.Init.GatewaySocket = pongSocket(t, filepath.Dir(spec.Init.Workspace), hostWorkload)
+		installChecker(t, spec.Init.Workspace)
+		cfg := checkConfig{Kind: KindSession, Baseline: baseline, Template: spec.Init.Template.Paths, Gateway: true, WSWritable: true}
+		cfg.WSPhase = "1"
+		results["session-1"] = runChecker(t, spec, cfg, "/workspace/"+checkerName)
+		cfg.WSPhase = "2"
+		results["session-2"] = runChecker(t, spec, cfg, "/workspace/"+checkerName)
+		// 另一 UID 范围：Gateway socket 的属主在该范围中未映射（init 会拒绝），不挂载；workspace 不可写。
+		foreign := spec
+		foreign.UIDBase, foreign.GIDBase = initTestIDBase+10000, initTestIDBase+10000
+		foreign.Init.GatewaySocket = ""
+		cfg.WSPhase, cfg.Gateway, cfg.WSWritable = "2-foreign", false, false
+		results["session-foreign"] = runChecker(t, foreign, cfg, "/workspace/"+checkerName)
+	}
+
+	all := []string{"exec", "task", "session-1", "session-2", "session-foreign"}
+	every := func(checks ...string) [][2]string {
+		var out [][2]string
+		for _, sc := range all {
+			for _, c := range checks {
+				out = append(out, [2]string{sc, c})
+			}
+		}
+		return out
+	}
+	items := []acceptItem{
+		{"01 逐线程 Cap*=0、NoNewPrivs=1、Seccomp=2 且 filters≥基线+1",
+			every("threads_caps_all_zero", "threads_no_new_privs", "threads_seccomp_filter", "py_thread_status")},
+		{"02 securebits 预期位且已锁定", every("securebits_value", "securebits_locked")},
+		{"03 uid、gid、附加组", every("uid", "gid", "groups_empty")},
+		{"04 FD 无继承且目标逐个解析", every("fds_no_extra", "fds_012_pipes")},
+		{"05 clone3=ENOSYS 时 Python 线程与 subprocess 正常", every("clone3_enosys", "py_clone3_enosys", "py_threads",
+			"py_subprocess_run", "py_subprocess_shell", "py_posix_spawn", "py_fork", "py_threadpool", "py_ran")},
+		{"06 私有传播、旧根已脱离", every("mounts_private_propagation", "old_root_detached")},
+		{"07 Gateway socket：编排环境 uid 1000 可访问、exec 环境不可见", [][2]string{
+			{"task", "gateway_socket_uid1000"}, {"session-1", "gateway_socket_uid1000"}, {"session-2", "gateway_socket_uid1000"},
+			{"exec", "gateway_socket_absent_in_exec"}}},
+		{"08 session 恢复后以保留的 UID 范围访问 workspace", [][2]string{
+			{"session-1", "session_workspace_write"}, {"session-2", "session_workspace_resume"},
+			{"session-foreign", "session_workspace_foreign_range_denied"}}},
+		{"补充 §4.5 隔离配置（移植自 spike）", every("seccomp_denylist_eperm", "seccomp_allows_af_unix", "rootfs_ro_nosuid_nodev",
+			"no_sys_no_cgroupfs", "proc_masked", "proc_readonly", "writable_areas", "netns_only_lo", "signal_mask_clean")},
+	}
+	used := map[[2]string]bool{}
+	for _, it := range items {
+		t.Run(it.title, func(t *testing.T) {
+			for _, k := range it.need {
+				used[k] = true
+				r, ok := results[k[0]][k[1]]
+				switch {
+				case !ok:
+					t.Errorf("%s/%s：检查器没有输出该项", k[0], k[1])
+				case !r.pass:
+					t.Errorf("%s/%s FAIL：%s", k[0], k[1], r.detail)
+				default:
+					t.Logf("%s/%s PASS：%s", k[0], k[1], r.detail)
+				}
+			}
+		})
+	}
+	for sc, rs := range results {
+		for name, r := range rs {
+			if !used[[2]string{sc, name}] {
+				t.Errorf("检查器输出了未归入任何条目的检查 %s/%s（pass=%v）", sc, name, r.pass)
+			}
+		}
+	}
+
+	t.Run("09 启动成功判据（提交点语义）", func(t *testing.T) {
+		t.Run("快速退出报告为 start_ack 与退出状态", func(t *testing.T) {
+			s, ch := helperTestInit(t, nil)
+			for i, c := range []int{0, 0, 0, 7, 0} {
+				id := fmt.Sprintf("e%d", i)
+				sendStart(t, s, id, nil, "/bin/sh", "-c", fmt.Sprintf("exit %d", c))
+				if _, ex := expectAckExit(t, s, ch, id); ex.Code != c || ex.Signal != 0 {
+					t.Fatalf("%s 的退出状态 = %+v，期望 %d", id, ex, c)
+				}
+			}
+			closeAndDrain(t, s, ch)
+			t.Logf("5 次快速退出：均为 start_ack 然后 exit（含退出码 7）")
+		})
+		t.Run("helper 在 execve 前失败报告为 start_err，workload 未运行", func(t *testing.T) {
+			for _, step := range []string{hStepSetName, hStepSetresuid, hStepSeccomp, hStepExecve} {
+				s, ch := helperTestInit(t, nil, envTestHelperHook+"="+hookFailPrefix+step)
+				sendStart(t, s, "e1", nil, "/bin/sh", "-c", "touch /tmp/started")
+				m := nextMsg(t, s, ch)
+				if want := "helper/" + step + ": " + errInjected.Error(); m.Type != MsgStartErr || m.Reason != want {
+					t.Fatalf("回复 = %+v，期望 start_err{%s}", m, want)
+				}
+				if fileExists(inSandbox(s, "/tmp/started")) {
+					t.Fatalf("%s：workload 运行了", step)
+				}
+				closeAndDrain(t, s, ch)
+				t.Logf("注入 %s 失败：start_err{%s}，workload 未运行，此后无消息", step, m.Reason)
+			}
+			s, ch := helperTestInit(t, nil)
+			sendStart(t, s, "e1", nil, "/nonexistent/workload")
+			m := nextMsg(t, s, ch)
+			if m.Type != MsgStartErr || !strings.HasPrefix(m.Reason, "helper/execve: ") {
+				t.Fatalf("回复 = %+v，期望 start_err{helper/execve: …}", m)
+			}
+			closeAndDrain(t, s, ch)
+			t.Logf("真实 execve 失败：start_err{%s}", m.Reason)
+		})
+		t.Run("helper 在 execve 前被 SIGKILL 报告为 start_err，workload 未运行", func(t *testing.T) {
+			s, ch := helperTestInit(t, nil, envTestHelperHook+"="+hookSigkill)
+			for i := 0; i < 3; i++ {
+				id := fmt.Sprintf("e%d", i)
+				sendStart(t, s, id, nil, "/bin/sh", "-c", "touch /tmp/started")
+				if m := nextMsg(t, s, ch); m.Type != MsgStartErr || m.Reason != "helper/died_before_exec: signal killed" {
+					t.Fatalf("回复 = %+v，期望 start_err{helper/died_before_exec: signal killed}", m)
+				}
+			}
+			if fileExists(inSandbox(s, "/tmp/started")) {
+				t.Fatal("workload 运行了")
+			}
+			closeAndDrain(t, s, ch)
+			t.Logf("3 次 execve 前 SIGKILL：均为 start_err{helper/died_before_exec: signal killed}，workload 未运行")
+		})
+		t.Run("workload 与 helper 同名不影响判定", func(t *testing.T) {
+			s, ch := helperTestInit(t, func(spec *LaunchSpec) {
+				src, err := filepath.EvalSymlinks("/bin/sh")
+				if err != nil {
+					t.Fatal(err)
+				}
+				b, err := os.ReadFile(src)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(spec.Init.In, helperComm), b, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			})
+			sendStart(t, s, "e1", nil, "/in/"+helperComm, "-c", "read c < /proc/$$/comm; echo \"$c\" > /tmp/same; exit 3")
+			if _, ex := expectAckExit(t, s, ch, "e1"); ex.Code != 3 || ex.Signal != 0 {
+				t.Fatalf("退出状态 = %+v，期望 3", ex)
+			}
+			b, err := os.ReadFile(inSandbox(s, "/tmp/same"))
+			if err != nil || strings.TrimSpace(string(b)) != helperComm {
+				t.Fatalf("workload 的进程名 = %q（%v），期望 %q", b, err, helperComm)
+			}
+			closeAndDrain(t, s, ch)
+			t.Logf("workload 进程名 %q（与 helper 相同）：start_ack 然后 exit 3", helperComm)
+		})
+	})
+
+	t.Run("10 专用启动进程之外的 server 凭据不变", func(t *testing.T) {
+		after := serverCreds(t)
+		if !reflect.DeepEqual(after, credsBefore) {
+			t.Fatalf("server 各线程凭据由 %q 变为 %q", credsBefore, after)
+		}
+		t.Logf("全部启动（5 个检查器环境与条目 09 的环境）前后 server 各线程凭据相同：%q", after)
+	})
 }

@@ -41,6 +41,7 @@ const helperComm = "agentbox-helper"
 
 // helper 的步骤名；失败原因为 `helper/<步骤>: <原因>`。
 const (
+	hStepCgo          = "cgo_enabled"
 	hStepSpec         = "spec"
 	hStepSetName      = "set_name"
 	hStepFDHygiene    = "fd_hygiene"
@@ -99,6 +100,12 @@ type helperSpec struct {
 	Hook   string `json:"hook,omitempty"`
 }
 
+// cgoBuild 只在 cgo 构建中为 true（cgo_guard.go 的 init）；helper 据此在任何其他步骤之前拒绝运行
+// （规格 §4.6 实现门槛 3）。
+var cgoBuild bool
+
+var errCgoBuild = errors.New("以 cgo 构建运行（AllThreadsSyscall 不可用），须以 CGO_ENABLED=0 构建")
+
 // sockFprog 与内核 struct sock_fprog 布局一致。
 type sockFprog struct {
 	Len    uint16
@@ -110,6 +117,9 @@ type sockFprog struct {
 // 不返回；失败时向 fd 3 报告原因并以 126 退出，也不返回。
 func RunHelper() {
 	runtime.LockOSThread()
+	if cgoBuild {
+		helperFail(hStepCgo, errCgoBuild)
+	}
 
 	var s helperSpec
 	if len(os.Args) != 3 {
