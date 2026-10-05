@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SessionTopicStore } from "../lib/research";
 import { ApiError } from "./client";
 import { SessionApi, runeLength, validateLogin, validateRegistration, validateTopic } from "./session";
 import { frame, jsonResponse, scriptedFetch, sseResponse } from "./testutil";
@@ -35,13 +34,11 @@ describe("SessionApi (cookie mode)", () => {
     const cookieGetter = vi.spyOn(Document.prototype, "cookie", "get");
     const f = scriptedFetch((c) => respond(c.url, c.init.method ?? "GET"));
     const api = new SessionApi({ fetch: f.fn, backoffBaseMs: 0 });
-    const topics = new SessionTopicStore();
 
     await api.register("alice", "password123");
     await api.login("alice", "password123");
     expect(await api.me()).toEqual({ username: "alice", role: "user" });
     const { task_id } = await api.createResearch("  固态电池  ");
-    topics.set(task_id, "固态电池");
     await api.listTasks({ limit: 20 });
     await api.getTask(task_id);
     await api.cancelTask(task_id);

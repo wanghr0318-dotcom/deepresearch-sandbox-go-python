@@ -233,15 +233,17 @@ func (s *Store) GetTask(ctx context.Context, taskID string) (api.TaskView, error
 	err := s.read(ctx, "GetTask", func(ctx context.Context, q queryer) error {
 		var current *string
 		err := q.QueryRow(ctx, `SELECT t.status, t.status_reason, t.current_attempt_id, c.desired, c.control_version,
-				t.applied_control_version, t.attempts_total
+				t.applied_control_version, t.attempts_total, t.created_at, COALESCE(t.spec_json->>'topic', '')
 			FROM tasks t JOIN task_control c USING (task_id) WHERE t.task_id = $1`, taskID).
-			Scan(&v.Status, &v.StatusReason, &current, &v.Desired, &v.ControlVersion, &v.AppliedControlVersion, &v.AttemptsTotal)
+			Scan(&v.Status, &v.StatusReason, &current, &v.Desired, &v.ControlVersion, &v.AppliedControlVersion, &v.AttemptsTotal,
+				&v.CreatedAt, &v.Topic)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return notFoundf("任务 %s", taskID)
 		}
 		if current != nil {
 			v.CurrentAttemptID = *current
 		}
+		v.CreatedAt = v.CreatedAt.UTC()
 		return err
 	})
 	return v, err

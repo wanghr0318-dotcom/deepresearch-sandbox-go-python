@@ -619,16 +619,18 @@ components:
         control_version: {type: integer, format: int64}
     Task:
       type: object
-      required: [task_id, status, desired, control_version, applied_control_version, attempts_total]
+      required: [task_id, status, desired, control_version, applied_control_version, attempts_total, created_at]
       properties:
         task_id: {type: string}
         status: {type: string}
         status_reason: {type: string}
-        current_attempt_id: {type: string}
+        current_attempt_id: {type: string, description: Operator view only; omitted for users}
         desired: {type: string, enum: [run, pause, cancel]}
         control_version: {type: integer, format: int64}
         applied_control_version: {type: integer, format: int64}
         attempts_total: {type: integer, format: int64}
+        topic: {type: string, description: "The spec's `topic` field (the research topic); omitted when the spec has none"}
+        created_at: {type: string, format: date-time}
     TaskList:
       type: object
       required: [tasks]

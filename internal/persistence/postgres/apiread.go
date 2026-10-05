@@ -30,7 +30,7 @@ func (s *Store) listTasks(ctx context.Context, op string, owner int64, after str
 	var out []api.TaskView
 	err := s.read(ctx, op, func(ctx context.Context, q queryer) error {
 		rows, err := q.Query(ctx, `SELECT t.task_id, t.status, t.status_reason, COALESCE(t.current_attempt_id, ''), c.desired,
-				c.control_version, t.applied_control_version, t.attempts_total
+				c.control_version, t.applied_control_version, t.attempts_total, t.created_at, COALESCE(t.spec_json->>'topic', '')
 			FROM tasks t JOIN task_control c USING (task_id)
 			WHERE ($3::bigint = 0 OR t.owner_user_id = $3::bigint)
 				AND ($1 = '' OR (t.created_at, t.task_id) < (SELECT created_at, task_id FROM tasks WHERE task_id = $1))
@@ -41,7 +41,8 @@ func (s *Store) listTasks(ctx context.Context, op string, owner int64, after str
 		out, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (api.TaskView, error) {
 			var v api.TaskView
 			err := r.Scan(&v.TaskID, &v.Status, &v.StatusReason, &v.CurrentAttemptID, &v.Desired,
-				&v.ControlVersion, &v.AppliedControlVersion, &v.AttemptsTotal)
+				&v.ControlVersion, &v.AppliedControlVersion, &v.AttemptsTotal, &v.CreatedAt, &v.Topic)
+			v.CreatedAt = v.CreatedAt.UTC()
 			return v, err
 		})
 		return err

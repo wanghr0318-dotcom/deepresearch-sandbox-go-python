@@ -46,7 +46,10 @@
       <ul v-else class="research-list">
         <li v-for="t in tasks" :key="t.task_id" class="research-item" :data-task="t.task_id">
           <a class="research-link" :href="researchHref(t.task_id)">
-            <span class="research-topic">{{ titleOf(t.task_id) }}</span>
+            <span class="research-text">
+              <span class="research-topic">{{ researchTitle(t) }}</span>
+              <span v-if="t.created_at" class="research-date" data-testid="created">{{ formatCreated(t.created_at) }}</span>
+            </span>
             <StatusBadge :status="t.status" :label="statusLabel(t.status)" />
           </a>
         </li>
@@ -64,7 +67,7 @@ import { ApiError, NetworkError, newRequestId } from "../api/client";
 import type { Task } from "../api/client";
 import { TOPIC_MAX, runeLength, validateTopic } from "../api/session";
 import StatusBadge from "../components/StatusBadge.vue";
-import { isActive, isUnauthorized, statusLabel, userErrorMessage } from "../lib/research";
+import { formatCreated, isActive, isUnauthorized, researchTitle, statusLabel, userErrorMessage } from "../lib/research";
 import { navigate, researchHref } from "../lib/router";
 import { useUserServices } from "../lib/userServices";
 
@@ -73,7 +76,7 @@ const emit = defineEmits<{ unauthorized: [] }>();
 
 const EXAMPLES = ["大语言模型智能体的沙箱隔离方案对比", "钠离子电池的产业化现状", "2026 年开源向量数据库选型"];
 
-const { api, topics } = useUserServices();
+const { api } = useUserServices();
 
 const topic = ref("");
 const busy = ref(false);
@@ -89,10 +92,6 @@ let timer: ReturnType<typeof setInterval> | undefined;
 
 const topicLength = computed(() => runeLength(topic.value.trim()));
 const active = computed(() => tasks.value.find(isActive) ?? null);
-
-function titleOf(id: string): string {
-  return topics.get(id) || `研究 ${id.slice(0, 8)}`;
-}
 
 function handle(e: unknown): string {
   if (isUnauthorized(e)) emit("unauthorized");
@@ -139,7 +138,6 @@ async function submit(): Promise<void> {
   try {
     const res = await api.createResearch(t, requestId);
     pendingRequest = null;
-    topics.set(res.task_id, t);
     topic.value = "";
     navigate(researchHref(res.task_id));
   } catch (e) {
@@ -284,9 +282,18 @@ onBeforeUnmount(() => clearInterval(timer));
   border-color: #c4b5fd;
   box-shadow: 0 4px 14px rgba(124, 58, 237, 0.08);
 }
-.research-topic {
+.research-text {
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.research-date {
+  font-size: 0.75rem;
+  color: #9ca3af;
+}
+.research-topic {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

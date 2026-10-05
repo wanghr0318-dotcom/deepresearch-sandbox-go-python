@@ -3045,7 +3045,32 @@ func TestAccountCreateResearch(t *testing.T) {
 	if len(seen) != 3 || seen[1] != "a3" || seen[2] != "a1" || (seen[0] != "c0" && seen[0] != "c1") {
 		t.Fatalf("ListTasksByOwner 应只含 alice 的任务、倒序：%v", seen)
 	}
-	if all, _, err := s.ListTasks(ctx, "", 10); err != nil || len(all) != 5 {
+	all, _, err := s.ListTasks(ctx, "", 10)
+	if err != nil || len(all) != 5 {
 		t.Fatalf("ListTasks 应含全部任务：%d, %v", len(all), err)
+	}
+
+	// 任务视图带 spec 的 topic（没有时为空）与 created_at（UTC，与 tasks.created_at 一致）。
+	var dbCreated time.Time
+	if err := s.pool.QueryRow(ctx, "SELECT created_at FROM tasks WHERE task_id = 'a1'").Scan(&dbCreated); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := s.GetTask(ctx, "a1"); err != nil || v.Topic != "x" || !v.CreatedAt.Equal(dbCreated) || v.CreatedAt.Location() != time.UTC {
+		t.Fatalf("GetTask(a1) 的 topic/created_at = %q, %v（库中 %v）, %v", v.Topic, v.CreatedAt, dbCreated, err)
+	}
+	if v, err := s.GetTask(ctx, "ops1"); err != nil || v.Topic != "" || v.CreatedAt.IsZero() {
+		t.Fatalf("GetTask(ops1) 的 topic/created_at = %q, %v, %v", v.Topic, v.CreatedAt, err)
+	}
+	for _, v := range all {
+		want := "x"
+		if v.TaskID == "ops1" {
+			want = ""
+		}
+		if v.Topic != want || v.CreatedAt.IsZero() || v.CreatedAt.Location() != time.UTC {
+			t.Fatalf("ListTasks 中 %s 的 topic/created_at = %q, %v", v.TaskID, v.Topic, v.CreatedAt)
+		}
+	}
+	if views, _, err := s.ListTasksByOwner(ctx, alice.ID, "", 10); err != nil || len(views) != 3 || views[2].Topic != "x" || !views[2].CreatedAt.Equal(dbCreated) {
+		t.Fatalf("ListTasksByOwner 的 topic/created_at = %+v, %v", views, err)
 	}
 }

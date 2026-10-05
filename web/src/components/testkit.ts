@@ -13,6 +13,7 @@ export function task(over: Partial<Task> = {}): Task {
     control_version: 0,
     applied_control_version: 0,
     attempts_total: 1,
+    created_at: "2026-10-06T08:30:00Z",
     ...over,
   };
 }

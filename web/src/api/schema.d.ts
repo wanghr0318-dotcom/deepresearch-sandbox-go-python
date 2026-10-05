@@ -394,6 +394,7 @@ export interface components {
             task_id: string;
             status: string;
             status_reason?: string;
+            /** @description Operator view only; omitted for users */
             current_attempt_id?: string;
             /** @enum {string} */
             desired: "run" | "pause" | "cancel";
@@ -403,6 +404,10 @@ export interface components {
             applied_control_version: number;
             /** Format: int64 */
             attempts_total: number;
+            /** @description The spec's `topic` field (the research topic); omitted when the spec has none */
+            topic?: string;
+            /** Format: date-time */
+            created_at: string;
         };
         TaskList: {
             tasks: components["schemas"]["Task"][];

@@ -180,7 +180,13 @@ func (f *fakeStore) CreateTask(_ context.Context, req CreateTaskRequest) (Create
 	if req.TaskID == "" || len(req.Spec) == 0 || req.MaxFaultRetries != 3 {
 		return CreateTaskResult{}, errors.New("fake: 缺少字段")
 	}
-	f.tasks[req.TaskID] = &TaskView{TaskID: req.TaskID, Status: "queued", Desired: "run", ControlVersion: 1}
+	var spec struct {
+		Topic string `json:"topic"`
+	}
+	// 错误无关紧要：spec 已校验为 JSON 对象；topic 缺失时视图中为空（与 postgres 的 COALESCE 一致）。
+	_ = json.Unmarshal(req.Spec, &spec)
+	f.tasks[req.TaskID] = &TaskView{TaskID: req.TaskID, Status: "queued", Desired: "run", ControlVersion: 1,
+		Topic: spec.Topic, CreatedAt: time.Date(2026, 10, 6, 8, 30, 0, 0, time.UTC)}
 	f.limits[req.RequestID] = string(req.Limits)
 	f.order = append(f.order, req.TaskID)
 	f.events[req.TaskID] = []Event{{TaskSeq: 1, Source: "host", Type: "task_created"}}
@@ -1976,5 +1982,52 @@ func TestUserEventRedaction(t *testing.T) {
 	expect(t, st, body, 200, "")
 	if !strings.Contains(string(body), `"current_attempt_id":"att_1"`) {
 		t.Fatalf("运维的任务视图 = %s", body)
+	}
+}
+
+// TestTaskViewTopicAndCreatedAt：任务视图带 spec 中的 topic 与 created_at（RFC 3339）；用户与运维都能看到，
+// 用户视图仍不含 attempt、费用或模型；spec 没有 topic 时省略该字段。
+func TestTaskViewTopicAndCreatedAt(t *testing.T) {
+	ts, acc := newAccountServer(t, nil)
+	_, ca := acc.seedUser(t, "hana")
+	st, b, _ := ts.do("POST", "/research", `{"request_id":"rt1","topic":"  钠离子电池  "}`, session(ca))
+	expect(t, st, b, 202, "")
+	var res CreateTaskResult
+	if err := json.Unmarshal(b, &res); err != nil {
+		t.Fatalf("研究响应 = %s: %v", b, err)
+	}
+	ts.store.mu.Lock()
+	ts.store.tasks[res.TaskID].CurrentAttemptID = "att_9"
+	ts.store.mu.Unlock()
+
+	const topic, created = `"topic":"钠离子电池"`, `"created_at":"2026-10-06T08:30:00Z"`
+	for _, path := range []string{"/tasks/" + res.TaskID, "/tasks"} {
+		st, body, _ := ts.do("GET", path, "", session(ca))
+		expect(t, st, body, 200, "")
+		s := string(body)
+		if !strings.Contains(s, topic) || !strings.Contains(s, created) {
+			t.Fatalf("用户 %s 缺 topic/created_at: %s", path, s)
+		}
+		for _, bad := range []string{"att_9", "current_attempt_id", "cost", "model", "kimi", "budget"} {
+			if strings.Contains(s, bad) {
+				t.Fatalf("用户 %s 含 %q: %s", path, bad, s)
+			}
+		}
+		st, body, _ = ts.do("GET", path, "", adminAuth)
+		expect(t, st, body, 200, "")
+		if s := string(body); !strings.Contains(s, topic) || !strings.Contains(s, created) || !strings.Contains(s, `"current_attempt_id":"att_9"`) {
+			t.Fatalf("运维 %s = %s", path, s)
+		}
+	}
+
+	st, b, _ = ts.do("POST", "/tasks", `{"request_id":"rt2","spec":{"app":"other"}}`, adminAuth)
+	expect(t, st, b, 201, "")
+	if err := json.Unmarshal(b, &res); err != nil {
+		t.Fatalf("创建响应 = %s: %v", b, err)
+	}
+	st, b, _ = ts.do("GET", "/tasks/"+res.TaskID, "", adminAuth)
+	expect(t, st, b, 200, "")
+	if strings.Contains(string(b), `"topic"`) || !strings.Contains(string(b), created) {
+		t.Fatalf("spec 无 topic 的任务视图 = %s", b)
 	}
 }

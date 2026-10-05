@@ -6,7 +6,6 @@ import type { User } from "../api/client";
 import type { SessionApiLike } from "../api/session";
 import { ev, fakeApi, fakeWatch, flushAll, task } from "../components/testkit";
 import type { FakeWatch } from "../components/testkit";
-import { MemoryTopicStore } from "../lib/research";
 import { servicesKey } from "../lib/services";
 import type { Services } from "../lib/services";
 import { userServicesKey } from "../lib/userServices";
@@ -43,7 +42,6 @@ interface Kit {
   api: Mocked<SessionApiLike>;
   watch: FakeWatch;
   saveBlob: ReturnType<typeof vi.fn>;
-  topics: MemoryTopicStore;
   global: { provide: Record<symbol, unknown> };
 }
 
@@ -51,11 +49,10 @@ function kit(over: Partial<SessionApiLike> = {}, admin?: Services): Kit {
   const api = fakeSessionApi(over);
   const watch = fakeWatch();
   const saveBlob = vi.fn();
-  const topics = new MemoryTopicStore();
-  const us: UserServices = { api, watch: watch.fn, saveBlob, topics };
+  const us: UserServices = { api, watch: watch.fn, saveBlob };
   const provide: Record<symbol, unknown> = { [userServicesKey as symbol]: us };
   if (admin) provide[servicesKey as symbol] = admin;
-  return { api, watch, saveBlob, topics, global: { provide } };
+  return { api, watch, saveBlob, global: { provide } };
 }
 
 async function fill(w: ReturnType<typeof mount>, values: Record<string, string>): Promise<void> {
@@ -143,8 +140,7 @@ describe("RegisterView", () => {
 describe("App routing and session guard", () => {
   it("redirects a signed-out visitor to #/login, then to the assistant after login", async () => {
     const me = vi.fn(async () => null);
-    const k = kit({ me, listTasks: vi.fn(async () => ({ tasks: [task({ task_id: "t-1", status: "succeeded" })] })) });
-    k.topics.set("t-1", "钠离子电池");
+    const k = kit({ me, listTasks: vi.fn(async () => ({ tasks: [task({ task_id: "t-1", status: "succeeded", topic: "钠离子电池" })] })) });
     const w = mount(App, { global: k.global });
     await flushAll();
     expect(me).toHaveBeenCalledTimes(1);
@@ -160,6 +156,7 @@ describe("App routing and session guard", () => {
     expect(w.get('[data-testid="username"]').text()).toBe("alice");
     expect(w.get('li[data-task="t-1"]').text()).toContain("钠离子电池");
     expect(w.get('li[data-task="t-1"] .badge').text()).toBe("已完成");
+    expect(w.get('li[data-task="t-1"] [data-testid="created"]').text()).toMatch(/^\d+月\d+日 \d\d:\d\d$/);
     w.unmount();
   });
 
@@ -227,7 +224,6 @@ describe("AssistantView", () => {
     expect(k.api.createResearch).toHaveBeenCalledTimes(1);
     expect(k.api.createResearch.mock.calls[0]![0]).toBe("固态电池的商业化进展");
     expect(typeof k.api.createResearch.mock.calls[0]![1]).toBe("string");
-    expect(k.topics.get("t-new")).toBe("固态电池的商业化进展");
     expect(window.location.hash).toBe("#/research/t-new");
     w.unmount();
   });
@@ -239,6 +235,7 @@ describe("AssistantView", () => {
     await flushAll();
     expect(w.get(".running-note a").attributes("href")).toBe("#/research/t-run");
     expect(w.get('li[data-task="t-run"] .badge').text()).toBe("研究中");
+    expect(w.get('li[data-task="t-run"] .research-topic').text()).toBe("研究 t-run"); // 服务端没有 topic 时的回退
 
     await w.get("form").trigger("submit");
     expect(w.get('[data-testid="submit-error"]').text()).toContain("主题");
@@ -286,8 +283,7 @@ const HOSTILE_REPORT = [
 
 describe("ResearchDetailView", () => {
   it("subscribes to events and shows plan → 子任务 → 报告 progress", async () => {
-    const k = kit({ getTask: vi.fn(async () => task({ task_id: "t-1", status: "running" })) });
-    k.topics.set("t-1", "固态电池");
+    const k = kit({ getTask: vi.fn(async () => task({ task_id: "t-1", status: "running", topic: "固态电池" })) });
     const w = mount(ResearchDetailView, { props: { id: "t-1" }, global: k.global });
     await flushAll();
     expect(k.watch.opts().taskId).toBe("t-1");

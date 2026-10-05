@@ -14,6 +14,7 @@
           <h1 class="r-title" data-testid="topic">{{ title }}</h1>
           <div class="r-meta">
             <StatusBadge v-if="task" :status="task.status" :label="statusLabel(task.status)" />
+            <span v-if="task?.created_at" class="created" data-testid="created">创建于 {{ formatCreated(task.created_at) }}</span>
             <span v-if="live" class="live" :class="streamState" data-testid="live">{{ live }}</span>
           </div>
         </div>
@@ -96,6 +97,7 @@ import {
   canCancel,
   countEvidence,
   deriveProgress,
+  formatCreated,
   isTerminalStatus,
   isUnauthorized,
   reportFilename,
@@ -111,7 +113,7 @@ import { useUserServices } from "../lib/userServices";
 const props = defineProps<{ id: string }>();
 const emit = defineEmits<{ unauthorized: [] }>();
 
-const { api, watch: watchEvents, saveBlob, topics } = useUserServices();
+const { api, watch: watchEvents, saveBlob } = useUserServices();
 
 const task = ref<Task | null>(null);
 const events = ref<TaskEvent[]>([]);
@@ -123,7 +125,7 @@ const reportHtml = ref("");
 const reportBlob = ref<Blob | null>(null);
 const reportText = ref("");
 const endNote = ref("");
-const topic = ref("");
+const reportTopic = ref("");
 
 let stream: EventStream | null = null;
 let generation = 0;
@@ -133,6 +135,8 @@ let reportLoading = false;
 const terminal = computed(() => isTerminalStatus(task.value?.status));
 const progress = computed(() => deriveProgress(events.value, task.value?.status));
 const evidenceCount = computed(() => (reportText.value ? countEvidence(reportText.value) : null));
+// 主题来自服务端任务视图（spec.topic）；缺失时退回报告的一级标题。
+const topic = computed(() => task.value?.topic?.trim() || reportTopic.value);
 const title = computed(() => topic.value || (task.value ? `研究 ${props.id.slice(0, 8)}` : "加载中…"));
 
 const LIVE: Record<string, string> = {
@@ -233,10 +237,7 @@ async function loadReport(): Promise<void> {
       reportText.value = text;
       reportHtml.value = renderMarkdown(text);
       const h1 = reportTitle(text);
-      if (h1 && !topic.value) {
-        topic.value = h1;
-        topics.set(props.id, h1);
-      }
+      if (h1) reportTopic.value = h1;
     }
   } catch (e) {
     if (gen === generation) fail(e);
@@ -301,7 +302,7 @@ function start(): void {
   reportText.value = "";
   endNote.value = "";
   reportLoading = false;
-  topic.value = topics.get(props.id);
+  reportTopic.value = "";
   streamState.value = "connecting";
   void refreshTask();
   const s = watchEvents({
@@ -366,6 +367,10 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 12px;
+}
+.created {
+  font-size: 0.78rem;
+  color: #9ca3af;
 }
 .live {
   font-size: 0.78rem;

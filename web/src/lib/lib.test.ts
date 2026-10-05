@@ -6,7 +6,7 @@ import { controlAvailability } from "./controls";
 import { describeError } from "./errors";
 import { downloadFilename, previewKindForDownload, previewKindOf } from "./media";
 import { homeHref, isAdminRoute, loginHref, needsSession, parseHash, registerHref, researchHref, taskHref, tasksHref } from "./router";
-import { canCancel, countEvidence, deriveProgress, reportFilename, reportTitle, statusLabel, userErrorMessage } from "./research";
+import { canCancel, countEvidence, deriveProgress, formatCreated, reportFilename, researchTitle, reportTitle, statusLabel, userErrorMessage } from "./research";
 import { ROOT_LANE, lanes, mergeEvents } from "./timeline";
 
 describe("mergeEvents", () => {
@@ -157,6 +157,12 @@ describe("research helpers", () => {
     expect(reportTitle(md)).toBe("主题");
     expect(reportFilename('a/b:c*?"<>|', "t-123456789")).toBe("a b c.md");
     expect(reportFilename("", "t-123456789")).toBe("研究报告-t-123456.md");
+    const local = new Date(2026, 9, 6, 16, 5);
+    expect(formatCreated(local.toISOString(), new Date(2026, 0, 1))).toBe("10月6日 16:05");
+    expect(formatCreated(local.toISOString(), new Date(2027, 0, 1))).toBe("2026年10月6日 16:05");
+    expect(formatCreated("bad")).toBe("");
+    expect(researchTitle({ task_id: "t-123456789", topic: "  主题 " })).toBe("主题");
+    expect(researchTitle({ task_id: "t-123456789" })).toBe("研究 t-123456");
   });
 
   it("maps errors to friendly copy without codes", () => {

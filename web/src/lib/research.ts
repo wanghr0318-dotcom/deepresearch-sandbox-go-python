@@ -1,4 +1,4 @@
-// DeepResearch 助手页的展示逻辑：状态文案、阶段进度、证据计数、主题缓存与用户可见的错误文案。
+// DeepResearch 助手页的展示逻辑：状态文案、阶段进度、证据计数、列表标题与用户可见的错误文案。
 // 用户只看到主题、状态、阶段进度、证据数量与报告；从不展示费用、模型、预算或调用明细。
 
 import { ApiError, NetworkError } from "../api/client";
@@ -121,56 +121,21 @@ export function reportFilename(topic: string, taskId: string): string {
   return `${base || `研究报告-${taskId.slice(0, 8)}`}.md`;
 }
 
-// ---- 主题缓存 ----
-// 任务视图里没有主题字段，所以提交时把"任务 ID → 主题"记在本标签页（sessionStorage，关闭即清除）；
-// 只存主题文本，从不存会话 ID 或任何凭据。
+// ---- 列表展示 ----
 
-export interface TopicStore {
-  get(taskId: string): string;
-  set(taskId: string, topic: string): void;
+/** 研究标题：服务端任务视图中的主题（spec.topic）；缺失时用 ID 前缀。 */
+export function researchTitle(t: Pick<Task, "task_id" | "topic">): string {
+  return t.topic?.trim() || `研究 ${t.task_id.slice(0, 8)}`;
 }
 
-const TOPICS_KEY = "agentbox.research_topics";
-
-export class SessionTopicStore implements TopicStore {
-  private cache: Record<string, string> = {};
-
-  constructor() {
-    try {
-      const raw = typeof sessionStorage === "undefined" ? null : sessionStorage.getItem(TOPICS_KEY);
-      const parsed: unknown = raw ? JSON.parse(raw) : null;
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        for (const [k, v] of Object.entries(parsed)) if (typeof v === "string") this.cache[k] = v;
-      }
-    } catch {
-      // 存储不可用时只用内存。
-    }
-  }
-
-  get(taskId: string): string {
-    return this.cache[taskId] ?? "";
-  }
-
-  set(taskId: string, topic: string): void {
-    const t = topic.trim();
-    if (!t || this.cache[taskId] === t) return;
-    this.cache[taskId] = t;
-    try {
-      sessionStorage.setItem(TOPICS_KEY, JSON.stringify(this.cache));
-    } catch {
-      // 忽略：主题仍在内存中。
-    }
-  }
-}
-
-export class MemoryTopicStore implements TopicStore {
-  private readonly cache = new Map<string, string>();
-  get(taskId: string): string {
-    return this.cache.get(taskId) ?? "";
-  }
-  set(taskId: string, topic: string): void {
-    if (topic.trim()) this.cache.set(taskId, topic.trim());
-  }
+/** 创建时间的本地简短格式：今年内 "10月6日 16:30"，否则带年份。 */
+export function formatCreated(ts: string | undefined | null, now: Date = new Date()): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return "";
+  const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const md = `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`;
+  return d.getFullYear() === now.getFullYear() ? md : `${d.getFullYear()}年${md}`;
 }
 
 // ---- 用户可见的错误文案（不暴露错误码、预算或内部细节） ----

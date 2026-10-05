@@ -574,14 +574,16 @@ func (h *Handler) getStatus(w http.ResponseWriter, _ *http.Request) {
 }
 
 type taskJSON struct {
-	TaskID                string `json:"task_id"`
-	Status                string `json:"status"`
-	StatusReason          string `json:"status_reason,omitempty"`
-	CurrentAttemptID      string `json:"current_attempt_id,omitempty"`
-	Desired               string `json:"desired"`
-	ControlVersion        int64  `json:"control_version"`
-	AppliedControlVersion int64  `json:"applied_control_version"`
-	AttemptsTotal         int64  `json:"attempts_total"`
+	TaskID                string    `json:"task_id"`
+	Status                string    `json:"status"`
+	StatusReason          string    `json:"status_reason,omitempty"`
+	CurrentAttemptID      string    `json:"current_attempt_id,omitempty"`
+	Desired               string    `json:"desired"`
+	ControlVersion        int64     `json:"control_version"`
+	AppliedControlVersion int64     `json:"applied_control_version"`
+	AttemptsTotal         int64     `json:"attempts_total"`
+	Topic                 string    `json:"topic,omitempty"`
+	CreatedAt             time.Time `json:"created_at"`
 }
 
 func toTaskJSON(v TaskView) taskJSON {

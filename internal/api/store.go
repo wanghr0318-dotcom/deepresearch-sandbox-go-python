@@ -196,6 +196,9 @@ type TaskView struct {
 	ControlVersion        int64
 	AppliedControlVersion int64
 	AttemptsTotal         int64
+	// Topic 是 spec 中的 topic 字段（DeepResearch 的研究主题；没有时为空）。
+	Topic     string
+	CreatedAt time.Time
 }
 
 // Event 是事件流中的一条；host 事件的 WorkerSeq 为 0。
