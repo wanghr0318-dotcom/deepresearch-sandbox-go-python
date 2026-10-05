@@ -264,6 +264,11 @@ func New(opt Options) (*Provider, error) // Starter 为 nil 时返回错误（�
 新的 permitted 限制在原 permitted 之内（tracer 无 `CAP_SYS_PTRACE` 时），init 若只保留 `{KILL}`，helper 将拿不到降权所需的能力。
 Task 11 第一步以测试验证这一点；验证不成立则停止并报告，不退回到基于名称或轮询的判据。
 
+**用户审阅（2026-10-05）对上述增量与 Task 11 的约束（有界授权，先于实现）：**
+- permitted 集合扩展只为有界的 ptrace 实验**有条件授权**：先以测试验证，再采纳进生产；不得把 `effective = {KILL}` 描述为"阻止其余 permitted 能力被重新启用"（持有 permitted 的进程可以自行将其提升为 effective，真正的收缩发生在 helper 的降权序列中）。
+- 实现被跟踪的启动路径前先写明：等待 ptrace 事件**之前释放 `reg.mu`**；reaper 在持有登记表锁时的事件投递保持**非阻塞**；成功 detach 后保证 **`start_ack` 先于 `exit`** 投递；**detach 失败视为启动失败**，须终止并清理；**exec 成功与 Worker 就绪握手是两回事**，不得合并。
+- 实验失败或需要契约变更时，报告证据与所需决定；不退回基于名称或轮询的判定。
+
 | 任务 | 内容 | 依赖 |
 |---|---|---|
 | 9 | 专用启动进程与生产 `EnvStarter`（user namespace、ID 映射、`CLONE_INTO_CGROUP`、pidfd 交还、server 为 subreaper） | 8 |
