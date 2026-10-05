@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wanghr0318-dotcom/go-agentbox/protocol/v1/event.schema.json",
+  "title": "Worker → 宿主事件（task 模式）",
+  "oneOf": [
+    {"$ref": "#/$defs/ready"},
+    {"$ref": "#/$defs/progress"},
+    {"$ref": "#/$defs/artifact"},
+    {"$ref": "#/$defs/checkpoint"},
+    {"$ref": "#/$defs/checkpoint_query"},
+    {"$ref": "#/$defs/paused"},
+    {"$ref": "#/$defs/result"},
+    {"$ref": "#/$defs/error"},
+    {"$ref": "#/$defs/handshake_error"}
+  ],
+  "$defs": {
+    "nonEmpty": {"type": "string", "minLength": 1},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifactPath": {
+      "type": "string",
+      "pattern": "^(?!/)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))(?![\\s\\S]*//)(?![\\s\\S]*/$)[^\\u0000]+$"
+    },
+    "event": {
+      "type": "object",
+      "required": ["type", "v", "seq"],
+      "properties": {
+        "v": {"const": 1},
+        "seq": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
+        "ts": {"type": "string"}
+      }
+    },
+    "ready": {
+      "allOf": [{"$ref": "#/$defs/event"}],
+      "required": ["protocol_version", "mode", "worker"],
+      "properties": {
+        "type": {"const": "ready"},
+        "protocol_version": {"const": 1},
+        "mode": {"enum": ["task", "session"]},
+        "worker": {
+          "type": "object",
+          "required": ["name"],
+          "properties": {"name": {"$ref": "#/$defs/nonEmpty"}, "version": {"type": "string"}}
+        },
+        "capabilities": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "progress": {
+      "allOf": [{"$ref": "#/$defs/event"}],
+      "required": ["kind"],
+      "properties": {
+        "type": {"const": "progress"},
+        "step_id": {"type": "string"},
+        "kind": {"$ref": "#/$defs/nonEmpty"},
+        "message": {"type": "string"}
+      }
+    },
+    "artifact": {
+      "allOf": [{"$ref": "#/$defs/event"}],
+      "required": ["artifact_id", "path", "declared_sha256", "media_type", "visibility"],
+      "properties": {
+        "type": {"const": "artifact"},
+        "artifact_id": {"$ref": "#/$defs/nonEmpty"},
+        "path": {"$ref": "#/$defs/artifactPath"},
+        "declared_sha256": {"$ref": "#/$defs/sha256"},
+        "declared_size": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+        "media_type": {"$ref": "#/$defs/nonEmpty"},
+        "visibility": {"enum": ["output", "internal"]}
+      }
+    },
+    "checkpoint": {
+      "allOf": [{"$ref": "#/$defs/event"}],
+      "required": ["checkpoint_id", "scope", "step_id"],
+      "properties": {
+        "type": {"const": "checkpoint"},
+        "checkpoint_id": {"$ref": "#/$defs/nonEmpty"},
+        "scope": {"const": "task"},
+        "step_id": {"$ref": "#/$defs/nonEmpty"},
+        "state_ref": {"$ref": "#/$defs/sha256"},
+        "refs": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/sha256"}}
+      },
+      "oneOf": [
+        {"required": ["state"], "not": {"required": ["state_ref"]}},
+        {"required": ["state_ref"], "not": {"required": ["state"]}}
+      ]
+    },
+    "checkpoint_query": {
+      "allOf": [{"$ref": "#/$defs/event"}],
+      "required": ["checkpoint_id", "scope"],
+      "properties": {
+        "type": {"const": "checkpoint_query"},
+        "checkpoint_id": {"$ref": "#/$defs/nonEmpty"},
+        "scope": {"enum": ["task", "session"]}
+      }
+    },
+    "paused": {
+      "allOf": [{"$ref": "#/$defs/event"}],
+      "required": ["checkpoint_id"],
+      "properties": {"type": {"const": "paused"}, "checkpoint_id": {"$ref": "#/$defs/nonEmpty"}}
+    },
+    "result": {
+      "allOf": [{"$ref": "#/$defs/event"}],
+      "properties": {
+        "type": {"const": "result"},
+        "summary": {"type": "string"},
+        "outputs": {"type": "array", "items": {"$ref": "#/$defs/nonEmpty"}}
+      }
+    },
+    "error": {
+      "allOf": [{"$ref": "#/$defs/event"}],
+      "required": ["code"],
+      "properties": {
+        "type": {"const": "error"},
+        "code": {"$ref": "#/$defs/nonEmpty"},
+        "message": {"type": "string"},
+        "retryable": {"type": "boolean"}
+      }
+    },
+    "handshake_error": {
+      "type": "object",
+      "required": ["type", "bootstrap", "code"],
+      "properties": {
+        "type": {"const": "handshake_error"},
+        "bootstrap": {"const": 1},
+        "code": {"$ref": "#/$defs/nonEmpty"}
+      }
+    }
+  }
+}

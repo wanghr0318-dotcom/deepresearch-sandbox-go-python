@@ -1,0 +1,67 @@
+<template>
+  <div class="auth-page">
+    <div class="auth-card">
+      <div class="auth-brand">
+        <BrandMark />
+        <span>DeepResearch 助手</span>
+      </div>
+      <h1 class="auth-title">创建账号</h1>
+      <p class="auth-sub">输入一个主题，助手会规划子任务、检索资料，并写成带引用的研究报告。</p>
+
+      <form class="auth-form" novalidate @submit.prevent="submit">
+        <label class="field">
+          用户名
+          <input v-model="username" name="username" autocomplete="username" maxlength="32" placeholder="3–32 位字母、数字、_ . -" />
+        </label>
+        <label class="field">
+          密码
+          <input v-model="password" name="password" type="password" autocomplete="new-password" maxlength="128" placeholder="8–128 个字符" />
+        </label>
+        <label class="field">
+          确认密码
+          <input v-model="confirm" name="confirm" type="password" autocomplete="new-password" maxlength="128" placeholder="再输入一次密码" />
+        </label>
+        <div v-if="error" class="auth-error" role="alert">{{ error }}</div>
+        <button class="btn primary auth-submit" type="submit" :disabled="busy">{{ busy ? "注册中…" : "注册并登录" }}</button>
+      </form>
+
+      <p class="auth-switch">已有账号？<a class="link" :href="loginHref()">去登录</a></p>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref } from "vue";
+import type { User } from "../api/client";
+import { validateRegistration } from "../api/session";
+import BrandMark from "../components/BrandMark.vue";
+import { userErrorMessage } from "../lib/research";
+import { loginHref } from "../lib/router";
+import { useUserServices } from "../lib/userServices";
+
+const emit = defineEmits<{ "signed-in": [user: User] }>();
+
+const { api } = useUserServices();
+const username = ref("");
+const password = ref("");
+const confirm = ref("");
+const error = ref("");
+const busy = ref(false);
+
+async function submit(): Promise<void> {
+  if (busy.value) return;
+  error.value = validateRegistration(username.value, password.value, confirm.value);
+  if (error.value) return;
+  busy.value = true;
+  try {
+    const user = await api.register(username.value, password.value);
+    password.value = "";
+    confirm.value = "";
+    emit("signed-in", user);
+  } catch (e) {
+    error.value = userErrorMessage(e);
+  } finally {
+    busy.value = false;
+  }
+}
+</script>

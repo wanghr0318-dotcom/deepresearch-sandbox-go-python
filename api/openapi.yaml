@@ -1,0 +1,744 @@
+openapi: 3.0.3
+info:
+  title: agentbox API
+  version: 0.2.0-m1
+  description: |
+    The single contract for the agentbox HTTP API (design spec §15). M1 scope: tasks and status.
+    Sessions endpoints belong to M4 and are not part of this version.
+
+    Access (§15.3): the server binds 127.0.0.1 by default. Any other address requires the static
+    Bearer token from `<data>/api.token` (0600) on every request. The `Host` header and, when present,
+    the `Origin` header must match explicit allowlists; there is no wildcard CORS. The token never
+    appears in URLs or logs.
+
+    Modes (`GET /status`): `normal` serves everything; `diagnostic` serves only `/status` and
+    `/tasks/{id}/inspect` (other operations return 503 `diagnostic_mode`); `ownership_lost` refuses
+    write operations with 503 `ownership_lost`.
+
+    Idempotency: every write carries `request_id`. `body_hash` is the SHA-256 of the canonical JSON
+    request body (sorted keys, no whitespace; control requests also include the task id and the
+    action). The same `request_id` with the same content returns the first result; different content
+    returns 409 `request_conflict`.
+
+    User accounts (M3): when the server enables accounts, `/auth/*` and `/research` are served and a
+    second credential is accepted, the `agentbox_session` cookie (`HttpOnly; SameSite=Strict; Path=/`,
+    plus `Secure` on a TLS listener; valid 7 days, not renewed). A request with an `Authorization`
+    header is judged by the Bearer token only (wrong token is 401, never a fallback to the cookie);
+    the Bearer caller is the operator and keeps full access. Otherwise the session cookie identifies a
+    user. Anonymous callers may use only `POST /auth/register`, `POST /auth/login`, `GET /status` and
+    static files; everything else is 401 `unauthorized`. A user may call `POST /research`, `GET /tasks`
+    (own tasks only), `GET /tasks/{id}`, `/events`, `/result`, `/artifacts/...` and
+    `POST /tasks/{id}/cancel`; another user's task, an unowned task and a missing task all answer the
+    same 404 `task_not_found`. Every other operation answers a user with 403 `forbidden`, and the
+    session-only operations (`/auth/logout`, `/auth/me`, `/research`) answer the operator with 403
+    `forbidden`. Register and login are rate limited per client IP (5 and 10 per minute; 429
+    `rate_limited`). With accounts enabled the operator always needs a valid Bearer token: if no token
+    is configured, any `Authorization` header is 401 and credential-less requests are anonymous. Users
+    get a redacted view of tasks and events (see `GET /tasks/{id}` and `GET /tasks/{id}/events`).
+    Without accounts only the Bearer token applies, exactly as above.
+servers:
+  - url: http://127.0.0.1:8080
+security:
+  - bearerAuth: []
+  - cookieAuth: []
+paths:
+  /auth/register:
+    post:
+      operationId: register
+      summary: Create a user account and sign in (anonymous; rate limited per IP)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Credentials'}
+      responses:
+        '201':
+          description: Account created; the response sets the `agentbox_session` cookie
+          headers:
+            Set-Cookie:
+              description: '`agentbox_session=...; Path=/; Max-Age=604800; HttpOnly; SameSite=Strict` (plus `Secure` on TLS)'
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/User'}
+        '400':
+          description: '`invalid_request`, `invalid_username` (3–32 of `[A-Za-z0-9_.-]`) or `invalid_password` (8–128 characters)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409':
+          description: '`username_taken`: the username is taken (case-insensitive)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /auth/login:
+    post:
+      operationId: login
+      summary: Sign in (anonymous; rate limited per IP)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Credentials'}
+      responses:
+        '200':
+          description: Signed in; the response sets the `agentbox_session` cookie
+          headers:
+            Set-Cookie:
+              description: '`agentbox_session=...; Path=/; Max-Age=604800; HttpOnly; SameSite=Strict` (plus `Secure` on TLS)'
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/User'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401':
+          description: '`invalid_credentials`: the same body for an unknown user, a wrong password and a disabled account; or `unauthorized` (wrong Bearer token)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /auth/logout:
+    post:
+      operationId: logout
+      summary: Sign out (deletes the session; session only)
+      security:
+        - cookieAuth: []
+      responses:
+        '204':
+          description: Session deleted; the response clears the cookie (`Max-Age=0`)
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /auth/me:
+    get:
+      operationId: me
+      summary: The signed-in user (session only)
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: The user
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/User'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /research:
+    post:
+      operationId: createResearch
+      summary: Start a research task on a topic (session only; idempotent by request_id)
+      description: |
+        The server builds the task spec from the topic (fixed orchestrator and worker models and search
+        configuration) and applies the server's default limits; the user cannot choose models, budget or
+        limits. The task is owned by the user. A user may have at most one non-terminal task at a time.
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ResearchRequest'}
+      responses:
+        '202':
+          description: Research task created, or the first result of the same request replayed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CreateTaskResult'}
+        '400':
+          description: '`invalid_request`; or `invalid_topic`: the trimmed topic is empty or longer than 500 characters'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409':
+          description: '`user_task_running`: the user already has a non-terminal task; or `request_conflict`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /status:
+    get:
+      operationId: getStatus
+      summary: Health and service mode (anonymous when accounts are enabled)
+      responses:
+        '200':
+          description: Current mode
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Status'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+  /tasks:
+    get:
+      operationId: listTasks
+      summary: List tasks, newest first (keyset pagination)
+      parameters:
+        - name: after
+          in: query
+          description: The `next` cursor of the previous page; omit for the first page.
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: One page of tasks
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TaskList'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      operationId: createTask
+      summary: Create a task (idempotent by request_id)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateTaskRequest'}
+      responses:
+        '201':
+          description: Task created, or the first result of the same request replayed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CreateTaskResult'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+    get:
+      operationId: getTask
+      summary: Current view of a task
+      description: A user (session) gets the same view without `current_attempt_id`; `GET /tasks` lists use the same view. The operator view is unchanged.
+      responses:
+        '200':
+          description: The task
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Task'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/cancel:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+    post:
+      operationId: cancelTask
+      summary: Request cancellation (idempotent by request_id)
+      requestBody: {$ref: '#/components/requestBodies/Control'}
+      responses:
+        '200': {$ref: '#/components/responses/ControlAccepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/ControlRejected'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/pause:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+    post:
+      operationId: pauseTask
+      summary: Request a pause (idempotent by request_id)
+      requestBody: {$ref: '#/components/requestBodies/Control'}
+      responses:
+        '200': {$ref: '#/components/responses/ControlAccepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/ControlRejected'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/resume:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+    post:
+      operationId: resumeTask
+      summary: Resume a paused task (idempotent by request_id)
+      requestBody: {$ref: '#/components/requestBodies/Control'}
+      responses:
+        '200': {$ref: '#/components/responses/ControlAccepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/ControlRejected'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/events:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+    get:
+      operationId: streamTaskEvents
+      summary: Server-sent event stream of a task (§15.2)
+      description: |
+        Each event has `id` = task_seq, `event` = the event type and `data` = an Event JSON object.
+        Resume with `Last-Event-ID`; all events are kept in v0.2, so cursors never expire. A heartbeat
+        comment line (`: heartbeat`) is sent every 15 s and takes no sequence number. The server closes
+        the stream after `task_terminal`; clients stop reconnecting once they receive it.
+
+        User view (session caller; the operator sees every event unchanged). Only these events are sent,
+        keyed `source/type`, and their `payload` keeps only the listed fields:
+        `host/task_created` (none), `host/attempt_created` (`attempt_no`),
+        `host/control_accepted` (`desired`, `control_version`), `host/control_applied` (`status`,
+        `control_version`), `host/checkpoint_committed` (`checkpoint_id`, `commit_seq`, `step_id`),
+        `host/artifact_saved` (`artifact_id`, `version`), `host/attempt_ended` and `host/task_terminal`
+        (`task_status`, `status_reason`), `worker/progress` (`step_id`, `kind`, `message`),
+        `worker/result` (`summary`, `outputs`). `worker_seq` is omitted. Every other event (for example
+        Gateway `replay_divergence`, worker `ready`, `checkpoint`, `checkpoint_query`, `artifact`,
+        `paused`, `error`) is not sent, and no cost, budget, model, call, try, usage, token or
+        environment field is ever sent. Dropped events keep their task_seq, so ids stay increasing with
+        gaps, and any existing task_seq (including a dropped one) is a valid `Last-Event-ID`.
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          description: Resume after this task_seq. Must be a non-negative integer not beyond the latest event.
+          schema: {type: integer, format: int64, minimum: 0}
+      responses:
+        '200':
+          description: Event stream
+          content:
+            text/event-stream:
+              schema: {type: string}
+        '400':
+          description: Malformed request or `invalid_cursor` (malformed, or beyond the latest event)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/result:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+    get:
+      operationId: getTaskResult
+      summary: The pinned result of a terminal task
+      description: |
+        The result recorded when the task ended, with its outputs pinned to `(artifact_id, version, sha256)`
+        (spec §5.6). The body is canonical JSON (sorted keys, no whitespace) and `ETag` is the quoted SHA-256
+        of the body; clients verify it.
+      responses:
+        '200':
+          description: The pinned result
+          headers:
+            ETag:
+              description: The quoted SHA-256 of the body
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Result'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404':
+          description: '`task_not_found`; or `not_ready`: the task is terminal but recorded no result (failed, or cancelled before completing)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: '`task_not_terminal`: the task has not ended yet'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/artifacts/{artifact_id}:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+      - {$ref: '#/components/parameters/ArtifactID'}
+    get:
+      operationId: getArtifact
+      summary: Download the latest artifact version; `?version=N` is an alias of `/versions/{v}`
+      description: |
+        Only `visibility = output` artifacts are downloadable; an `internal` artifact answers exactly like a
+        missing one (404 `artifact_not_found`). If the latest version is internal or unauthorized the answer is
+        404, never an older version.
+      parameters:
+        - name: version
+          in: query
+          description: Alias of `/tasks/{id}/artifacts/{artifact_id}/versions/{v}` (the canonical pinned path, spec §15.1); omit for the latest version.
+          schema: {type: integer, format: int64, minimum: 1}
+      responses:
+        '200': {$ref: '#/components/responses/Blob'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/ArtifactNotFound'}
+        '500': {$ref: '#/components/responses/BlobUnavailable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/artifacts/{artifact_id}/versions/{v}:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+      - {$ref: '#/components/parameters/ArtifactID'}
+      - name: v
+        in: path
+        required: true
+        schema: {type: integer, format: int64, minimum: 1}
+    get:
+      operationId: getArtifactVersion
+      summary: Download one pinned artifact version (canonical path, spec §15.1); only `visibility = output` versions are served
+      responses:
+        '200': {$ref: '#/components/responses/Blob'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/ArtifactNotFound'}
+        '500': {$ref: '#/components/responses/BlobUnavailable'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /tasks/{id}/inspect:
+    parameters:
+      - {$ref: '#/components/parameters/TaskID'}
+    get:
+      operationId: inspectTask
+      summary: Diagnostic timeline (§14.6); also served in diagnostic mode
+      responses:
+        '200':
+          description: Attempts with outcome, exit and OOM diagnosis, environment and cleanup state, checkpoints, and Gateway calls with their tries (task_id → attempt_id → call_id → try_no)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Inspection'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: The operator credential. Required when the server binds a non-loopback address. Never put the token in a URL.
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: agentbox_session
+      description: A user session (accounts enabled), set by `/auth/register` and `/auth/login`. Ignored when an `Authorization` header is present.
+  parameters:
+    TaskID:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    ArtifactID:
+      name: artifact_id
+      in: path
+      required: true
+      schema: {type: string}
+  requestBodies:
+    Control:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ControlRequest'}
+  responses:
+    ControlAccepted:
+      description: Control intent accepted, or the first result of the same request replayed
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ControlResult'}
+    Blob:
+      description: |
+        The artifact content, streamed from the blob store. Readable with read access; only blobs authorized
+        to the task (`scope_blobs`) are served. `Content-Type` is the media type registered with the
+        artifact. Active content (anything other than text/plain, text/markdown, application/json, image/png,
+        image/jpeg and application/pdf — notably text/html and image/svg+xml) is always sent with
+        `Content-Disposition: attachment`. The content is verified while it is sent; if it does not match the
+        registered SHA-256 the connection is aborted, so the response is never complete.
+      headers:
+        ETag:
+          description: The quoted SHA-256 of the content (as registered)
+          schema: {type: string}
+        X-Content-Type-Options:
+          description: Always `nosniff`
+          schema: {type: string}
+        Content-Disposition:
+          description: '`attachment; filename=...` for active content; absent for the inline-safe types'
+          schema: {type: string}
+      content:
+        '*/*':
+          schema: {type: string, format: binary}
+    ArtifactNotFound:
+      description: '`task_not_found`; or `artifact_not_found`: no such artifact or version in the task, or it is `internal` (indistinguishable from missing)'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    BlobUnavailable:
+      description: '`internal`; or `blob_unavailable`: the registered content cannot be read from the blob store'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    BadRequest:
+      description: '`invalid_request`: malformed body, missing request_id or invalid parameter; `invalid_limits` (POST /tasks): limits that can never fit the configured capacity, or max_run_time_ms not a positive integer within the server cap (omitted max_run_time_ms is filled with the default and stored with the task)'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unauthorized:
+      description: '`unauthorized`: missing or wrong Bearer token, or (accounts enabled) no valid session'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Forbidden:
+      description: '`forbidden_host` or `forbidden_origin`: Host or Origin is not in the allowlist; or `forbidden` (accounts enabled): the operation is not open to this kind of caller (operator-only for a user, session-only for the operator)'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    RateLimited:
+      description: '`rate_limited`: too many attempts from this client IP'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    NotFound:
+      description: '`task_not_found` (for a user also: another user''s task or an unowned task)'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Conflict:
+      description: '`request_conflict`: request_id already used with different content'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    ControlRejected:
+      description: |
+        `request_conflict`; or the control is rejected by the latest task facts:
+        `task_ended` (task is terminal), `cancel_pending` (an accepted cancel cannot be overridden),
+        `not_paused` (resume requires a paused task)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Internal:
+      description: '`internal`'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unavailable:
+      description: |
+        `diagnostic_mode`, `ownership_lost`, `store_unavailable`, `contention`, or `commit_unknown`
+        (retry with the same request_id)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: {type: string}
+        message: {type: string}
+    Status:
+      type: object
+      required: [mode]
+      properties:
+        mode: {type: string, enum: [normal, diagnostic, ownership_lost]}
+        cache:
+          type: object
+          description: >-
+            Gateway shared-cache counters since server start (spec §11.5); absent when the cache is
+            off (no --redis-addr, or --cache=off).
+          properties:
+            hit: {type: integer}
+            miss: {type: integer}
+            bypass: {type: integer}
+            coalesced: {type: integer}
+            error: {type: integer}
+            breaker_open: {type: integer}
+            integrity_failure: {type: integer}
+    Credentials:
+      type: object
+      additionalProperties: false
+      required: [username, password]
+      properties:
+        username: {type: string, minLength: 3, maxLength: 32, pattern: '^[A-Za-z0-9_.-]+$'}
+        password: {type: string, minLength: 8, maxLength: 128}
+    User:
+      type: object
+      required: [username, role]
+      properties:
+        username: {type: string}
+        role: {type: string, enum: [user, admin]}
+    ResearchRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id, topic]
+      properties:
+        request_id: {type: string, minLength: 1, maxLength: 128}
+        topic: {type: string, minLength: 1, maxLength: 500, description: Trimmed of surrounding whitespace before validation}
+    CreateTaskRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id, spec]
+      properties:
+        request_id: {type: string, minLength: 1, maxLength: 128}
+        spec: {type: object, description: Task specification passed to the worker}
+        limits: {type: object, description: Resource limits for the task}
+    CreateTaskResult:
+      type: object
+      required: [task_id]
+      properties:
+        task_id: {type: string}
+    ControlRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id]
+      properties:
+        request_id: {type: string, minLength: 1, maxLength: 128}
+        reason: {type: string}
+    ControlResult:
+      type: object
+      required: [task_id, control_version]
+      properties:
+        task_id: {type: string}
+        control_version: {type: integer, format: int64}
+    Task:
+      type: object
+      required: [task_id, status, desired, control_version, applied_control_version, attempts_total, created_at]
+      properties:
+        task_id: {type: string}
+        status: {type: string}
+        status_reason: {type: string}
+        current_attempt_id: {type: string, description: Operator view only; omitted for users}
+        desired: {type: string, enum: [run, pause, cancel]}
+        control_version: {type: integer, format: int64}
+        applied_control_version: {type: integer, format: int64}
+        attempts_total: {type: integer, format: int64}
+        topic: {type: string, description: "The spec's `topic` field (the research topic); omitted when the spec has none"}
+        created_at: {type: string, format: date-time}
+    TaskList:
+      type: object
+      required: [tasks]
+      properties:
+        tasks:
+          type: array
+          items: {$ref: '#/components/schemas/Task'}
+        next: {type: string, description: Cursor for the next page; absent on the last page}
+    Event:
+      type: object
+      required: [task_seq, source, type, ts]
+      properties:
+        task_seq: {type: integer, format: int64}
+        attempt_id: {type: string}
+        source: {type: string}
+        type: {type: string}
+        worker_seq: {type: integer, format: int64}
+        payload: {type: object}
+        ts: {type: string, format: date-time}
+    Attempt:
+      type: object
+      properties:
+        attempt_id: {type: string}
+        attempt_no: {type: integer, format: int64}
+        status: {type: string}
+        outcome_class: {type: string}
+        exit_code: {type: integer, format: int64}
+        exit_signal: {type: integer, format: int64}
+        oom_kill_delta: {type: integer, format: int64}
+        platform_killed: {type: boolean}
+        env_id: {type: string}
+        env_status: {type: string}
+        cleanup_state: {type: string}
+        stopped_at: {type: string, format: date-time}
+        cleanup_tries: {type: integer, format: int64}
+        cleanup_error: {type: string}
+    Checkpoint:
+      type: object
+      properties:
+        checkpoint_id: {type: string}
+        step_id: {type: string}
+        attempt_id: {type: string}
+        commit_seq: {type: integer, format: int64}
+        committed_at: {type: string, format: date-time}
+    CallTry:
+      type: object
+      description: One host-managed try of a Gateway call (audit metadata only)
+      required: [try_no, attempt_id, state, latency_ms, cost_micro]
+      properties:
+        try_no: {type: integer, format: int64}
+        attempt_id: {type: string}
+        env_id: {type: string}
+        state: {type: string, enum: [in_flight, settled]}
+        outcome: {type: string, enum: [ok, retryable, fatal, unknown]}
+        latency_ms: {type: integer, format: int64}
+        cost_micro: {type: integer, format: int64, description: Settled cost in micro-USD (ok tries only)}
+        error: {type: string}
+    Call:
+      type: object
+      description: A Gateway logical call (journal entry). Metadata only — no request or response bodies, prompts or credentials.
+      required: [call_id, endpoint, state, source, first_attempt_id, tries_used, cost_charged_micro, possible_external_duplicate, created_at, deadline_at, tries]
+      properties:
+        call_id: {type: string}
+        endpoint: {type: string}
+        model: {type: string, description: The resolved model the call used (from the journal). Omitted for non-chat calls.}
+        state: {type: string, enum: [resolving, in_flight, completed, failed, unknown]}
+        source: {type: string}
+        first_attempt_id: {type: string}
+        tries_used: {type: integer, format: int64}
+        cost_charged_micro: {type: integer, format: int64}
+        upstream_request_id: {type: string}
+        result_ref: {type: string, description: sha256 of the result blob (completed calls only)}
+        fail_reason: {type: string}
+        supersedes_call_id: {type: string}
+        supersede_reason: {type: string}
+        possible_external_duplicate: {type: boolean}
+        created_at: {type: string, format: date-time}
+        deadline_at: {type: string, format: date-time}
+        tries:
+          type: array
+          items: {$ref: '#/components/schemas/CallTry'}
+    PinnedOutput:
+      type: object
+      description: An output pinned when the result was processed; version and sha256 are absent if the artifact was never saved
+      required: [artifact_id]
+      properties:
+        artifact_id: {type: string}
+        version: {type: integer, format: int64}
+        sha256: {type: string}
+    Result:
+      type: object
+      required: [summary, outputs]
+      properties:
+        summary: {type: string}
+        outputs:
+          type: array
+          items: {$ref: '#/components/schemas/PinnedOutput'}
+    Inspection:
+      type: object
+      required: [task, attempts, checkpoints, calls]
+      properties:
+        task: {$ref: '#/components/schemas/Task'}
+        attempts:
+          type: array
+          items: {$ref: '#/components/schemas/Attempt'}
+        checkpoints:
+          type: array
+          items: {$ref: '#/components/schemas/Checkpoint'}
+        calls:
+          type: array
+          items: {$ref: '#/components/schemas/Call'}

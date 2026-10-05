@@ -1,0 +1,21 @@
+# 正确性检查：CI 中必须通过（见 docs/design/2026-10-03-code-organization.md §9.1）。
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - gosimple
+    - ineffassign
+    - unused
+
+issues:
+  # experiments/ 是一次性实验的原始记录（Plan 1B spike 的证据），保持实验时的原样，不作为产品代码检查。
+  exclude-dirs:
+    - experiments
+  max-issues-per-linter: 0
+  max-same-issues: 0

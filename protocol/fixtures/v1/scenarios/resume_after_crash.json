@@ -1,0 +1,13 @@
+{
+  "name": "resume_after_crash",
+  "description": "新 attempt 从已提交 checkpoint 的 next_index 继续",
+  "layers": ["protocol", "sdk"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "task", "task_id": "t-1", "attempt_id": "a-2", "attempt_no": 2, "out_dir": "/workspace/out/a-2", "config": {"steps": [{"op": "progress", "step_id": "s1", "kind": "step_started", "message": "开始"}, {"op": "checkpoint", "step_id": "s1"}, {"op": "progress", "step_id": "s2", "kind": "step_finished", "message": "完成"}], "summary": "完成", "outputs": []}, "resume": {"checkpoint_id": "cp-1", "step_id": "s1", "state": {"next_index": 2}}}},
+    {"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "task", "worker": {"name": "sim-worker", "version": "0.1.0"}, "capabilities": []}},
+    {"from": "worker", "message": {"type": "progress", "v": 1, "seq": 2, "step_id": "s2", "kind": "step_finished", "message": "完成"}},
+    {"from": "worker", "message": {"type": "result", "v": 1, "seq": 3, "summary": "完成", "outputs": []}}
+  ],
+  "expect": {"stream": "ok"},
+  "sdk": {"exit_code": 0}
+}

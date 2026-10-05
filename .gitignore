@@ -29,3 +29,18 @@ go.work.sum
 .vscode/
 .DS_Store
 Thumbs.db
+
+# SDD 执行期的脚手架：任务简报、报告、diff 包、进度 ledger
+.superpowers/
+
+# Python（worker/）
+worker/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.pytest-tmp/
+.ruff_cache/
+
+# 前端（web/）
+web/node_modules/
+web/dist/

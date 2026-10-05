@@ -1,0 +1,126 @@
+[launch] launcher supplementary groups before: [0]
+[launch] launcher cleared its supplementary groups before clone: []
+[launch] init started, host pid 3221
+[init] pid=1; fd 3 (control socket from ExtraFiles) inherited with FD_CLOEXEC=false
+[init] proc mask: /proc/asound absent on this kernel, skipped
+[init] proc mask: /proc/timer_stats absent on this kernel, skipped
+[init] proc mask: /proc/sched_debug absent on this kernel, skipped
+[init] helper binary fd 200 opened from /tmp/spike-1b/rootfs/opt/spike/spike1b (mode="newroot") -> /tmp/spike-1b/rootfs/opt/spike/spike1b
+[init] after pivot_root, helper binary fd 200 -> /opt/spike/spike1b
+[launch] from init: init thread: tid=1 Uid=[0 0 0 0] Gid=[0 0 0 0] Groups=[] CapInh=0000000000000000 CapPrm=0000000000000020 CapEff=0000000000000020 CapBnd=00000000000001e0 CapAmb=0000000000000000 NoNewPrivs=0 Seccomp=2 Seccomp_filters=1
+[launch] from init: init thread: tid=2 Uid=[0 0 0 0] Gid=[0 0 0 0] Groups=[] CapInh=0000000000000000 CapPrm=0000000000000020 CapEff=0000000000000020 CapBnd=00000000000001e0 CapAmb=0000000000000000 NoNewPrivs=0 Seccomp=2 Seccomp_filters=1
+[launch] from init: init thread: tid=3 Uid=[0 0 0 0] Gid=[0 0 0 0] Groups=[] CapInh=0000000000000000 CapPrm=0000000000000020 CapEff=0000000000000020 CapBnd=00000000000001e0 CapAmb=0000000000000000 NoNewPrivs=0 Seccomp=2 Seccomp_filters=1
+[launch] from init: init thread: tid=4 Uid=[0 0 0 0] Gid=[0 0 0 0] Groups=[] CapInh=0000000000000000 CapPrm=0000000000000020 CapEff=0000000000000020 CapBnd=00000000000001e0 CapAmb=0000000000000000 NoNewPrivs=0 Seccomp=2 Seccomp_filters=1
+[launch] from init: init mountinfo: 535 487 8:80 /tmp/spike-1b/rootfs / ro,nosuid,nodev,relatime - ext4 /dev/sdf rw,discard,errors=remount-ro,data=ordered
+[launch] from init: init mountinfo: 536 535 8:80 /usr /usr ro,nosuid,nodev,relatime - ext4 /dev/sdf rw,discard,errors=remount-ro,data=ordered
+[launch] from init: init mountinfo: 537 536 0:34 / /usr/lib/wsl/drivers ro,nosuid,nodev,noatime - 9p drivers ro,aname=drivers;fmask=222;dmask=222,cache=5,access=client,msize=65536,trans=fd,rfd=8,wfd=8
+[launch] from init: init mountinfo: 538 536 0:112 / /usr/lib/wsl/lib ro,nosuid,nodev,noatime - overlay none rw,lowerdir=/gpu_lib_packaged:/gpu_lib_inbox,upperdir=/gpu_lib/rw/upper,workdir=/gpu_lib/rw/work,uuid=on
+[launch] from init: init mountinfo: 539 536 0:29 / /usr/lib/modules/6.6.87.2-microsoft-standard-WSL2 ro,nosuid,nodev,noatime - overlay none rw,lowerdir=/modules,upperdir=/lib/modules/6.6.87.2-microsoft-standard-WSL2/rw/upper,workdir=/lib/modules/6.6.87.2-microsoft-standard-WSL2/rw/work,uuid=on
+[launch] from init: init mountinfo: 540 535 8:80 /etc /etc ro,nosuid,nodev,relatime - ext4 /dev/sdf rw,discard,errors=remount-ro,data=ordered
+[launch] from init: init mountinfo: 541 535 8:80 /tmp/spike-1b/in /in ro,nosuid,nodev,relatime - ext4 /dev/sdf rw,discard,errors=remount-ro,data=ordered
+[launch] from init: init mountinfo: 542 535 0:132 / /tmp rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=65536k,uid=300000,gid=300000
+[launch] from init: init mountinfo: 543 535 0:133 / /run rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=16384k,mode=755,uid=300000,gid=300000
+[launch] from init: init mountinfo: 544 535 0:134 / /out rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=65536k,nr_inodes=1024,mode=755,uid=301000,gid=301000
+[launch] from init: init mountinfo: 545 535 0:135 / /dev ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs ro,size=64k,mode=755,uid=300000,gid=300000
+[launch] from init: init mountinfo: 546 545 0:5 /null /dev/null rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[launch] from init: init mountinfo: 547 545 0:5 /zero /dev/zero rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[launch] from init: init mountinfo: 548 545 0:5 /random /dev/random rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[launch] from init: init mountinfo: 549 545 0:5 /urandom /dev/urandom rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[launch] from init: init mountinfo: 550 535 0:142 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+[launch] from init: init mountinfo: 551 550 0:143 / /proc/acpi ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs ro,size=0k,uid=300000,gid=300000
+[launch] from init: init mountinfo: 552 550 0:5 /null /proc/kcore rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[launch] from init: init mountinfo: 553 550 0:5 /null /proc/keys rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[launch] from init: init mountinfo: 554 550 0:5 /null /proc/latency_stats rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[launch] from init: init mountinfo: 555 550 0:5 /null /proc/timer_list rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[launch] from init: init mountinfo: 556 550 0:144 / /proc/scsi ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs ro,size=0k,uid=300000,gid=300000
+[launch] from init: init mountinfo: 557 550 0:142 /bus /proc/bus ro,nosuid,nodev,noexec,relatime - proc proc rw
+[launch] from init: init mountinfo: 558 550 0:142 /fs /proc/fs ro,nosuid,nodev,noexec,relatime - proc proc rw
+[launch] from init: init mountinfo: 559 550 0:142 /irq /proc/irq ro,nosuid,nodev,noexec,relatime - proc proc rw
+[launch] from init: init mountinfo: 560 550 0:142 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw
+[launch] from init: init mountinfo: 561 550 0:142 /sysrq-trigger /proc/sysrq-trigger ro,nosuid,nodev,noexec,relatime - proc proc rw
+[launch] from init: init fds: 0->/dev/null cloexec=false | 1->/mnt/f/go-agentbox-1b/experiments/spike-1b/results/b2-self-newroot.log cloexec=false | 2->/mnt/f/go-agentbox-1b/experiments/spike-1b/results/b2-self-newroot.log cloexec=false | 4->anon_inode:[eventpoll] cloexec=true | 5->anon_inode:[eventfd] cloexec=true | 10->socket:[838796] cloexec=true | 200->/opt/spike/spike1b cloexec=true
+[launch] host view of init: Uid=[300000 300000 300000 300000] Gid=[300000 300000 300000 300000] Groups=[] CapEff=0000000000000020 CapBnd=00000000000001e0
+[launch] host view of init uid_map: 0 300000 4096
+[launch] host view of init gid_map: 0 300000 4096
+[launch] host view of init setgroups: deny
+[launch] host mountinfo entries under /tmp/spike-1b while the sandbox runs: 0
+[launch] host baseline: launcher Seccomp=2 Seccomp_filters=1
+[launch] start_ack pid=8 (sandbox pid)
+[wl:out] WORKLOAD_STARTED pid=8
+[wl:out] CHECK fds_no_extra PASS extra=[]
+[wl:out] CHECK fds_012_pipes PASS std=["0->pipe:[838818] cloexec=false" "1->pipe:[838819] cloexec=false" "2->pipe:[838820] cloexec=false"]
+[wl:out] INFO thread tid=14 Uid=[1000 1000 1000 1000] Gid=[1000 1000 1000 1000] Groups=[] CapInh=0000000000000000 CapPrm=0000000000000000 CapEff=0000000000000000 CapBnd=0000000000000000 CapAmb=0000000000000000 NoNewPrivs=1 Seccomp=2 Seccomp_filters=2
+[wl:out] INFO thread tid=15 Uid=[1000 1000 1000 1000] Gid=[1000 1000 1000 1000] Groups=[] CapInh=0000000000000000 CapPrm=0000000000000000 CapEff=0000000000000000 CapBnd=0000000000000000 CapAmb=0000000000000000 NoNewPrivs=1 Seccomp=2 Seccomp_filters=2
+[wl:out] INFO thread tid=16 Uid=[1000 1000 1000 1000] Gid=[1000 1000 1000 1000] Groups=[] CapInh=0000000000000000 CapPrm=0000000000000000 CapEff=0000000000000000 CapBnd=0000000000000000 CapAmb=0000000000000000 NoNewPrivs=1 Seccomp=2 Seccomp_filters=2
+[wl:out] INFO thread tid=17 Uid=[1000 1000 1000 1000] Gid=[1000 1000 1000 1000] Groups=[] CapInh=0000000000000000 CapPrm=0000000000000000 CapEff=0000000000000000 CapBnd=0000000000000000 CapAmb=0000000000000000 NoNewPrivs=1 Seccomp=2 Seccomp_filters=2
+[wl:out] INFO thread tid=18 Uid=[1000 1000 1000 1000] Gid=[1000 1000 1000 1000] Groups=[] CapInh=0000000000000000 CapPrm=0000000000000000 CapEff=0000000000000000 CapBnd=0000000000000000 CapAmb=0000000000000000 NoNewPrivs=1 Seccomp=2 Seccomp_filters=2
+[wl:out] INFO thread tid=19 Uid=[1000 1000 1000 1000] Gid=[1000 1000 1000 1000] Groups=[] CapInh=0000000000000000 CapPrm=0000000000000000 CapEff=0000000000000000 CapBnd=0000000000000000 CapAmb=0000000000000000 NoNewPrivs=1 Seccomp=2 Seccomp_filters=2
+[wl:out] INFO thread tid=20 Uid=[1000 1000 1000 1000] Gid=[1000 1000 1000 1000] Groups=[] CapInh=0000000000000000 CapPrm=0000000000000000 CapEff=0000000000000000 CapBnd=0000000000000000 CapAmb=0000000000000000 NoNewPrivs=1 Seccomp=2 Seccomp_filters=2
+[wl:out] INFO thread tid=21 Uid=[1000 1000 1000 1000] Gid=[1000 1000 1000 1000] Groups=[] CapInh=0000000000000000 CapPrm=0000000000000000 CapEff=0000000000000000 CapBnd=0000000000000000 CapAmb=0000000000000000 NoNewPrivs=1 Seccomp=2 Seccomp_filters=2
+[wl:out] INFO thread tid=8 Uid=[1000 1000 1000 1000] Gid=[1000 1000 1000 1000] Groups=[] CapInh=0000000000000000 CapPrm=0000000000000000 CapEff=0000000000000000 CapBnd=0000000000000000 CapAmb=0000000000000000 NoNewPrivs=1 Seccomp=2 Seccomp_filters=2
+[wl:out] CHECK threads_caps_all_zero PASS threads=9 bad=[]
+[wl:out] CHECK threads_no_new_privs PASS threads=9
+[wl:out] CHECK threads_seccomp_filter PASS threads=9
+[wl:out] CHECK securebits_value PASS got=0xf want=0xf err=<nil>
+[wl:out] CHECK securebits_locked PASS lock bits set=true; clearing attempt -> operation not permitted
+[wl:out] CHECK uid PASS resuid=1000,1000,1000
+[wl:out] CHECK gid PASS resgid=1000,1000,1000
+[wl:out] CHECK groups_empty PASS getgroups=[] err=<nil> status.Groups=""
+[wl:out] INFO /proc/self/uid_map: 0 300000 4096
+[wl:out] INFO /proc/self/gid_map: 0 300000 4096
+[wl:out] INFO /proc/self/setgroups: deny
+[wl:out] CHECK clone3_enosys PASS clone3(NULL,0) -> function not implemented (without seccomp the kernel returns EINVAL)
+[wl:out] CHECK seccomp_denylist_eperm PASS mount=operation not permitted; unshare(CLONE_NEWUSER)=operation not permitted; clone(CLONE_NEWNS)=operation not permitted; socket(AF_INET)=operation not permitted; io_uring_setup=operation not permitted; keyctl(GET_KEYRING_ID)=operation not permitted; ptrace(PTRACE_TRACEME)=operation not permitted
+[wl:out] CHECK seccomp_allows_af_unix PASS socket(AF_UNIX) -> ok
+[wl:out] INFO mountinfo 535 487 8:80 /tmp/spike-1b/rootfs / ro,nosuid,nodev,relatime - ext4 /dev/sdf rw,discard,errors=remount-ro,data=ordered
+[wl:out] INFO mountinfo 536 535 8:80 /usr /usr ro,nosuid,nodev,relatime - ext4 /dev/sdf rw,discard,errors=remount-ro,data=ordered
+[wl:out] INFO mountinfo 537 536 0:34 / /usr/lib/wsl/drivers ro,nosuid,nodev,noatime - 9p drivers ro,aname=drivers;fmask=222;dmask=222,cache=5,access=client,msize=65536,trans=fd,rfd=8,wfd=8
+[wl:out] INFO mountinfo 538 536 0:112 / /usr/lib/wsl/lib ro,nosuid,nodev,noatime - overlay none rw,lowerdir=/gpu_lib_packaged:/gpu_lib_inbox,upperdir=/gpu_lib/rw/upper,workdir=/gpu_lib/rw/work,uuid=on
+[wl:out] INFO mountinfo 539 536 0:29 / /usr/lib/modules/6.6.87.2-microsoft-standard-WSL2 ro,nosuid,nodev,noatime - overlay none rw,lowerdir=/modules,upperdir=/lib/modules/6.6.87.2-microsoft-standard-WSL2/rw/upper,workdir=/lib/modules/6.6.87.2-microsoft-standard-WSL2/rw/work,uuid=on
+[wl:out] INFO mountinfo 540 535 8:80 /etc /etc ro,nosuid,nodev,relatime - ext4 /dev/sdf rw,discard,errors=remount-ro,data=ordered
+[wl:out] INFO mountinfo 541 535 8:80 /tmp/spike-1b/in /in ro,nosuid,nodev,relatime - ext4 /dev/sdf rw,discard,errors=remount-ro,data=ordered
+[wl:out] INFO mountinfo 542 535 0:132 / /tmp rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=65536k,uid=300000,gid=300000
+[wl:out] INFO mountinfo 543 535 0:133 / /run rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=16384k,mode=755,uid=300000,gid=300000
+[wl:out] INFO mountinfo 544 535 0:134 / /out rw,nosuid,nodev,relatime - tmpfs tmpfs rw,size=65536k,nr_inodes=1024,mode=755,uid=301000,gid=301000
+[wl:out] INFO mountinfo 545 535 0:135 / /dev ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs ro,size=64k,mode=755,uid=300000,gid=300000
+[wl:out] INFO mountinfo 546 545 0:5 /null /dev/null rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[wl:out] INFO mountinfo 547 545 0:5 /zero /dev/zero rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[wl:out] INFO mountinfo 548 545 0:5 /random /dev/random rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[wl:out] INFO mountinfo 549 545 0:5 /urandom /dev/urandom rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[wl:out] INFO mountinfo 550 535 0:142 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+[wl:out] INFO mountinfo 551 550 0:143 / /proc/acpi ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs ro,size=0k,uid=300000,gid=300000
+[wl:out] INFO mountinfo 552 550 0:5 /null /proc/kcore rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[wl:out] INFO mountinfo 553 550 0:5 /null /proc/keys rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[wl:out] INFO mountinfo 554 550 0:5 /null /proc/latency_stats rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[wl:out] INFO mountinfo 555 550 0:5 /null /proc/timer_list rw,nosuid,relatime - devtmpfs none rw,size=8035484k,nr_inodes=2008871,mode=755
+[wl:out] INFO mountinfo 556 550 0:144 / /proc/scsi ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs ro,size=0k,uid=300000,gid=300000
+[wl:out] INFO mountinfo 557 550 0:142 /bus /proc/bus ro,nosuid,nodev,noexec,relatime - proc proc rw
+[wl:out] INFO mountinfo 558 550 0:142 /fs /proc/fs ro,nosuid,nodev,noexec,relatime - proc proc rw
+[wl:out] INFO mountinfo 559 550 0:142 /irq /proc/irq ro,nosuid,nodev,noexec,relatime - proc proc rw
+[wl:out] INFO mountinfo 560 550 0:142 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw
+[wl:out] INFO mountinfo 561 550 0:142 /sysrq-trigger /proc/sysrq-trigger ro,nosuid,nodev,noexec,relatime - proc proc rw
+[wl:out] CHECK mounts_private_propagation PASS entries=27 (no shared:/master:/propagate_from tags)
+[wl:out] CHECK old_root_detached PASS mounts at /=1 root="/tmp/spike-1b/rootfs" unexpected mountpoints=[]
+[wl:out] CHECK rootfs_ro_nosuid_nodev PASS /=ro,nosuid,nodev,relatime /usr=ro,nosuid,nodev,relatime /usr/lib/wsl/drivers=ro,nosuid,nodev,noatime /usr/lib/wsl/lib=ro,nosuid,nodev,noatime /usr/lib/modules/6.6.87.2-microsoft-standard-WSL2=ro,nosuid,nodev,noatime /etc=ro,nosuid,nodev,relatime /in=ro,nosuid,nodev,relatime
+[wl:out] CHECK no_sys_no_cgroupfs PASS /sys entries=0
+[wl:out] CHECK proc_masked PASS /proc/acpi=dir(tmpfs ro empty:true) /proc/asound=absent /proc/kcore=devnull:true /proc/keys=devnull:true /proc/latency_stats=devnull:true /proc/timer_list=devnull:true /proc/timer_stats=absent /proc/sched_debug=absent /proc/scsi=dir(tmpfs ro empty:true)
+[wl:out] CHECK proc_readonly PASS /proc/bus=true /proc/fs=true /proc/irq=true /proc/sys=true /proc/sysrq-trigger=true
+[wl:out] CHECK writable_areas PASS /tmp/w=ok /out/w=ok /w=open /w: read-only file system /usr/w=open /usr/w: read-only file system /in/w=open /in/w: read-only file system
+[wl:out] CHECK netns_only_lo PASS interfaces=[lo]
+[wl:out] CHECK signal_mask_clean PASS SigBlk=0000000000000000 SigIgn=0000000000000000
+[wl:out] INFO hostname=agentbox-spike pid=8 ppid=1 RLIMIT_NOFILE=1048575/1048576
+[wl:out] CHECK gateway_socket_absent_in_exec PASS stat /run/agentbox/gateway.sock -> stat /run/agentbox/gateway.sock: no such file or directory; /run/agentbox -> stat /run/agentbox: no such file or directory
+[wl:out] CHECK py_clone3_enosys PASS r=-1 errno=ENOSYS
+[wl:out] CHECK py_threads PASS 16 threads ran
+[wl:out] CHECK py_thread_status PASS threads=5 bad=[]
+[wl:out] CHECK py_subprocess_run PASS rc=0 out='sub-ok'
+[wl:out] CHECK py_subprocess_shell PASS rc=0 out='SHELL-OK'
+[wl:out] CHECK py_posix_spawn PASS status=0
+[wl:out] CHECK py_fork PASS exit=7
+[wl:out] CHECK py_threadpool PASS ok
+[wl:out] INFO py_multiprocessing_fork_pool error FileNotFoundError(2, 'No such file or directory')
+[wl:out] CHECK py_ran PASS python3 -> ok (Go os/exec also starts it under the same filter)
+[wl:out] CHECK_SUMMARY go_fail=0
+[init] control channel closed (n=0 err=<nil>)
+[launch] init exited: ok
+RESULT label=b2-self-newroot outcome=start_ack workload_started=yes pass=32 fail=0 exit=code=0,signal=0 reason=""

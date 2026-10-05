@@ -1,0 +1,10 @@
+{
+  "name": "artifact_before_ready",
+  "description": "ready 之前登记产物是协议错误",
+  "layers": ["protocol"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "task", "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}},
+    {"from": "worker", "message": {"type": "artifact", "v": 1, "seq": 1, "artifact_id": "report", "path": "report.md", "declared_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "declared_size": 1, "media_type": "text/markdown", "visibility": "output"}}
+  ],
+  "expect": {"stream": "violation", "violation": "before_ready", "at": 1}
+}

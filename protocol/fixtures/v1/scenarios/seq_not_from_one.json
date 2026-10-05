@@ -1,0 +1,10 @@
+{
+  "name": "seq_not_from_one",
+  "description": "第一条事件的 seq 必须是 1",
+  "layers": ["protocol"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "task", "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}},
+    {"from": "worker", "message": {"type": "ready", "v": 1, "seq": 2, "protocol_version": 1, "mode": "task", "worker": {"name": "sim-worker", "version": "0.1.0"}, "capabilities": []}}
+  ],
+  "expect": {"stream": "violation", "violation": "seq_invalid", "at": 1}
+}

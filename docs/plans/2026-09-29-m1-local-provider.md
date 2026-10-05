@@ -1,5 +1,7 @@
 # M1: LocalProvider 最小可用 实施计划
 
+> **⚠ 历史计划，不可直接执行。** Task 1–5 已按本计划完成。Task 6–11 的正文与现行设计冲突（阻塞式 `Exec`、`Wait4(-1)` 与 `exec.Cmd.Wait` 并存的收割方式、可写 overlay 主线、未启用 user namespace 等），已被 [v0.2 规格](../design/2026-10-03-v0.2-first-release-design.md) 第 4 节与第 18 节、以及 [代码组织设计](../design/2026-10-03-code-organization.md) 取代。后续工作以新的实施计划为准；本文仅保留为 Task 1–5 的实施记录。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 实现一个能建箱、在箱内执行命令、正确销毁且不留残留的本地沙箱 Provider。
@@ -15,7 +17,14 @@
 - 仅支持 Linux。开发环境为 WSL2 Ubuntu（内核 6.6.87.2）；Windows 侧无法运行任何本任务的测试
 - **WSL 无外网**：直连超时，经 Windows 代理（`127.0.0.1:7897`）亦不通 —— WSL2 有独立网络栈，其 `127.0.0.1` 并非 Windows 的。所有外部依赖一律在 Windows 侧下载到 `F:\wsl-assets\`，WSL 通过 `/mnt/f/wsl-assets/` 读取。本计划不引入任何第三方 Go 依赖，故无需 `go mod download`
 - 仓库工作副本在 WSL 原生文件系统（`~/go-agentbox`），**不可在 `/mnt/f` 上开发** —— 那是 9p，不支持 overlayfs
-- sudo 需要密码，涉及 root 的命令须在 WSL 终端手工执行
+- **取得 root 的方式**：`wsl -d Ubuntu -u root -- ...` 免密直接以 root 运行，这是代理执行 root 测试的唯一可行途径。
+  交互式 `sudo` 需要密码，代理跑不了；在 WSL 终端里人工操作时才用 `sudo -E env "PATH=$PATH" go test`。
+  从 Windows 侧调用时必须带 `MSYS_NO_PATHCONV=1` 前缀，否则 Git Bash 会把 `/usr/...` 改写成 `D:/Git/usr/...`：
+  ```bash
+  MSYS_NO_PATHCONV=1 wsl -d Ubuntu -u root -- bash -lc "cd /home/wanghr/go-agentbox && /usr/local/go/bin/go test ./... -v"
+  ```
+- `go.mod` 的 `go` 指令写 `go 1.23`，**不要写三段式精确版本**。Go 1.21+ 会按该指令自动切换工具链：
+  写成 `go 1.27.1` 会让任何本地 Go 低于该版本的人被迫下载工具链，而本机 WSL 无外网，直接卡死
 - 必须 cgroup v2（`stat -fc %T /sys/fs/cgroup` 输出 `cgroup2fs`）
 - **M1 以 root 运行**，不启用 `CLONE_NEWUSER`。rootless 是 spec §9 待定项 #7，不在本计划范围
 - 沙箱根目录：`/var/lib/agentbox`
@@ -610,16 +619,28 @@ func New(root, name string) (*Group, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("创建 cgroup 根 %s: %w", root, err)
 	}
-	// 子组要能设 cpu/memory/pids，父组必须先在 subtree_control 里启用它们。
-	// 已启用时重复写不会报错；父组不支持某控制器时才会失败，此处容忍。
-	_ = os.WriteFile(filepath.Join(filepath.Dir(root), "cgroup.subtree_control"),
-		[]byte("+cpu +memory +pids"), 0o644)
-	_ = os.WriteFile(filepath.Join(root, "cgroup.subtree_control"),
-		[]byte("+cpu +memory +pids"), 0o644)
+	// 子组要能设 cpu/memory/pids，祖先组必须逐级在 subtree_control 里启用它们：
+	// /sys/fs/cgroup 启用后 root 才有这些文件，root 启用后子组才有。
+	// 已启用时重复写不报错，故这里容忍写入失败——真正的判据是下面文件是否出现。
+	for _, dir := range []string{filepath.Dir(root), root} {
+		_ = os.WriteFile(filepath.Join(dir, "cgroup.subtree_control"),
+			[]byte("+cpu +memory +pids"), 0o644)
+	}
 
 	path := filepath.Join(root, name)
 	if err := os.Mkdir(path, 0o755); err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("创建 cgroup %s: %w", path, err)
+	}
+	// 控制器未委派时，子组里根本不会出现这几个限额文件（实测：WSL2 的
+	// /sys/fs/cgroup/cgroup.subtree_control 默认为空）。此时若不早报，
+	// 失败会推迟到 Apply 写文件，错误只剩一句 no such file，
+	// 完全看不出病根是控制器没启用。
+	for _, f := range []string{"cpu.max", "memory.max", "pids.max"} {
+		if _, err := os.Stat(filepath.Join(path, f)); err != nil {
+			return nil, fmt.Errorf(
+				"cgroup %s 缺少 %s：控制器未委派，请确认 %s/cgroup.subtree_control 已启用 cpu/memory/pids",
+				path, f, root)
+		}
 	}
 	return &Group{path: path}, nil
 }
@@ -964,7 +985,6 @@ Unmount 幂等，且 EBUSY 时退化为 MNT_DETACH lazy 卸载，
 - Consumes: 无
 - Produces:
   - `rootfs.EnsureTemplate(dir string) error`
-  - `rootfs.ExtractTarGz(tarPath, dstDir string) error`
 
 - [ ] **Step 1: 手工准备模板**
 
@@ -984,6 +1004,11 @@ sudo chroot /var/lib/agentbox/templates/default /bin/sh -c "echo ok"
 ```
 
 Expected: `ok`
+
+> 这一步需交互式输入 sudo 密码，只能在 WSL 终端手工执行，代理代跑不了。
+> 注意 `bin/sh` 是指向 `/bin/busybox` 的**绝对**符号链接——在宿主上它是悬空的，
+> 只有 chroot 或 pivot_root 之后才解析正确。这正是 `EnsureTemplate`
+> 不能用 `os.Stat` 的原因。
 
 - [ ] **Step 2: 写失败测试**
 
@@ -1032,6 +1057,44 @@ func TestEnsureTemplateAcceptsCompleteRootfs(t *testing.T) {
 		t.Fatalf("EnsureTemplate 对完整模板应当通过，实际: %v", err)
 	}
 }
+
+// TestEnsureTemplateAcceptsAbsoluteShellSymlink 覆盖 alpine 的真实形态：
+// bin/sh 是指向 /bin/busybox 的绝对符号链接。在宿主上该链接悬空
+// （宿主没有 /bin/busybox），跟随它会把好模板误判为损坏。
+func TestEnsureTemplateAcceptsAbsoluteShellSymlink(t *testing.T) {
+	dir := t.TempDir()
+	for _, d := range requiredTemplateDirs {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bin", "busybox"), []byte("ELF"), 0o755); err != nil {
+		t.Fatalf("写 bin/busybox: %v", err)
+	}
+	if err := os.Symlink("/bin/busybox", filepath.Join(dir, "bin", "sh")); err != nil {
+		t.Fatalf("创建 bin/sh 符号链接: %v", err)
+	}
+	if err := EnsureTemplate(dir); err != nil {
+		t.Fatalf("EnsureTemplate 对含绝对 sh 链接的模板应当通过，实际: %v", err)
+	}
+}
+
+// TestEnsureTemplateRejectsDanglingShellSymlink 确认真正损坏的模板仍被拒：
+// bin/sh 指向模板内并不存在的目标。
+func TestEnsureTemplateRejectsDanglingShellSymlink(t *testing.T) {
+	dir := t.TempDir()
+	for _, d := range requiredTemplateDirs {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	if err := os.Symlink("/bin/busybox", filepath.Join(dir, "bin", "sh")); err != nil {
+		t.Fatalf("创建 bin/sh 符号链接: %v", err)
+	}
+	if err := EnsureTemplate(dir); err == nil {
+		t.Fatal("bin/sh 的目标在模板内不存在时，EnsureTemplate 应当报错")
+	}
+}
 ```
 
 - [ ] **Step 3: 跑测试确认失败**
@@ -1077,9 +1140,36 @@ func EnsureTemplate(dir string) error {
 			return fmt.Errorf("模板 %s 缺少必需目录 %s（模板可能未解包完整）: %w", dir, d, err)
 		}
 	}
+	return checkShell(dir)
+}
+
+// checkShell 校验模板内存在可用的 /bin/sh。
+//
+// 不能直接用 os.Stat：alpine 的 bin/sh 是指向 /bin/busybox 的【绝对】
+// 符号链接。在宿主上 os.Stat 会把它解析成宿主的 /bin/busybox——那个
+// 文件通常不存在，于是一个完全正确的模板会被判为损坏。绝对链接只有
+// 在 pivot_root 之后才解析正确，所以这里必须按模板根重新解析它。
+func checkShell(dir string) error {
 	shell := filepath.Join(dir, "bin", "sh")
-	if _, err := os.Stat(shell); err != nil {
+	fi, err := os.Lstat(shell)
+	if err != nil {
 		return fmt.Errorf("模板 %s 缺少 /bin/sh: %w", dir, err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		return nil // 普通文件，直接可用
+	}
+	target, err := os.Readlink(shell)
+	if err != nil {
+		return fmt.Errorf("读取 %s 的链接目标: %w", shell, err)
+	}
+	// 绝对链接按模板根解析，相对链接按所在目录解析。
+	resolved := filepath.Join(filepath.Dir(shell), target)
+	if filepath.IsAbs(target) {
+		resolved = filepath.Join(dir, target)
+	}
+	if _, err := os.Stat(resolved); err != nil {
+		return fmt.Errorf("模板 %s 的 /bin/sh 指向 %s，该目标在模板内不存在: %w",
+			dir, target, err)
 	}
 	return nil
 }
@@ -1093,7 +1183,7 @@ func EnsureTemplate(dir string) error {
 go test ./internal/rootfs/ -v
 ```
 
-Expected: 六个用例全部 PASS（Task 3 的三个 + 本任务的三个）
+Expected: 八个用例全部 PASS（Task 3 的三个 + 本任务的五个）
 
 - [ ] **Step 6: 提交**
 
@@ -2518,6 +2608,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -2711,29 +2803,18 @@ func (b *box) oomOccurred() bool {
 	if err != nil {
 		return false
 	}
-	for _, line := range splitLines(string(data)) {
-		var key string
-		var n int
-		if _, err := fmt.Sscanf(line, "%s %d", &key, &n); err == nil && key == "oom_kill" && n > 0 {
+	// memory.events 每行形如 "oom_kill 3"。
+	for _, line := range strings.Split(string(data), "
+") {
+		key, count, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok || key != "oom_kill" {
+			continue
+		}
+		if n, err := strconv.Atoi(count); err == nil && n > 0 {
 			return true
 		}
 	}
 	return false
-}
-
-func splitLines(s string) []string {
-	var out []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			out = append(out, s[start:i])
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		out = append(out, s[start:])
-	}
-	return out
 }
 
 func newID() (string, error) {
@@ -3061,6 +3142,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -3377,7 +3460,7 @@ func (p *Provider) List(ctx context.Context, prefix string) ([]*provider.Instanc
 }
 ```
 
-import 块补上 `strings`。
+import 块已在 Task 9 含 `strings`，无需再补。
 
 - [ ] **Step 5: 跑测试确认通过**
 

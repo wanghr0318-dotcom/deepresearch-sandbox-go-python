@@ -1,0 +1,14 @@
+{
+  "name": "artifact_registered",
+  "description": "写入并登记产物，result 引用其 artifact_id",
+  "layers": ["protocol", "sdk"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "task", "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1", "config": {"steps": [{"op": "artifact", "artifact_id": "report", "path": "report.md", "content": "# 报告\n", "media_type": "text/markdown"}], "summary": "完成", "outputs": ["report"]}}},
+    {"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "task", "worker": {"name": "sim-worker", "version": "0.1.0"}, "capabilities": []}},
+    {"from": "worker", "message": {"type": "artifact", "v": 1, "seq": 2, "artifact_id": "report", "path": "report.md", "declared_sha256": "f43f2ea1c219e0f4ef34c65f4184e1d8fcecc360ca5b7a477318ec35fc0e107e", "declared_size": 9, "media_type": "text/markdown", "visibility": "output"}},
+    {"from": "host", "message": {"type": "artifact_result", "v": 1, "artifact_id": "report", "status": "saved", "version": 1, "sha256": "f43f2ea1c219e0f4ef34c65f4184e1d8fcecc360ca5b7a477318ec35fc0e107e"}},
+    {"from": "worker", "message": {"type": "result", "v": 1, "seq": 3, "summary": "完成", "outputs": ["report"]}}
+  ],
+  "expect": {"stream": "ok"},
+  "sdk": {"exit_code": 0}
+}

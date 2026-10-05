@@ -1,0 +1,103 @@
+[project]
+name = "agentbox-worker"
+version = "0.1.0"
+description = "go-agentbox 的 Python Worker SDK 与 sim-worker"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "jsonschema>=4.23",
+  "ruff>=0.6",
+  "import-linter>=2.1",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentbox_worker", "sim_worker", "deepresearch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 协程未被等待等 RuntimeWarning 一律视为失败：本地演练与 CI 判定一致
+filterwarnings = ["error::RuntimeWarning"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# C90（复杂度）不在阻断检查中；CI 另行以 --exit-zero 报告。
+select = ["E", "F", "W", "I", "B", "UP", "TID251"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"subprocess".msg = "Worker 不直接创建子进程；代码执行经 Gateway 的 /v1/exec"
+"os.system".msg = "Worker 不直接创建子进程"
+"os.popen".msg = "Worker 不直接创建子进程"
+"os.fork".msg = "Worker 不直接创建子进程"
+"os.execv".msg = "Worker 不直接替换进程映像"
+"os.execve".msg = "Worker 不直接替换进程映像"
+"os.execvp".msg = "Worker 不直接替换进程映像"
+"os.execvpe".msg = "Worker 不直接替换进程映像"
+"os.execl".msg = "Worker 不直接替换进程映像"
+"os.execle".msg = "Worker 不直接替换进程映像"
+"os.execlp".msg = "Worker 不直接替换进程映像"
+"os.execlpe".msg = "Worker 不直接替换进程映像"
+"asyncio.create_subprocess_exec".msg = "Worker 不直接创建子进程"
+"asyncio.create_subprocess_shell".msg = "Worker 不直接创建子进程"
+"os.posix_spawn".msg = "Worker 不直接创建子进程"
+"os.posix_spawnp".msg = "Worker 不直接创建子进程"
+"os.spawnl".msg = "Worker 不直接创建子进程"
+"os.spawnle".msg = "Worker 不直接创建子进程"
+"os.spawnlp".msg = "Worker 不直接创建子进程"
+"os.spawnlpe".msg = "Worker 不直接创建子进程"
+"os.spawnv".msg = "Worker 不直接创建子进程"
+"os.spawnve".msg = "Worker 不直接创建子进程"
+"os.spawnvp".msg = "Worker 不直接创建子进程"
+"os.spawnvpe".msg = "Worker 不直接创建子进程"
+"os.forkpty".msg = "Worker 不直接创建子进程"
+"pty.spawn".msg = "Worker 不直接创建子进程"
+"multiprocessing".msg = "Worker 不直接创建子进程"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["TID251", "E402"]  # 测试文件按关注点分节，各节在节首导入
+
+[tool.importlinter]
+root_packages = ["agentbox_worker", "sim_worker", "deepresearch"]
+# 让标准库与第三方模块进入导入图，forbidden 契约才能约束 socket、sqlite3 等外部模块
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "SDK 不依赖具体 Worker"
+type = "forbidden"
+source_modules = ["agentbox_worker"]
+forbidden_modules = ["sim_worker", "deepresearch"]
+
+[[tool.importlinter.contracts]]
+name = "deepresearch 不碰数据库、HTTP 客户端与子进程（含间接导入）"
+type = "forbidden"
+source_modules = ["deepresearch"]
+forbidden_modules = [
+  "sqlite3",
+  "psycopg",
+  "redis",
+  "requests",
+  "httpx",
+  "urllib",
+  "subprocess",
+  "multiprocessing",
+]
+
+[[tool.importlinter.contracts]]
+# SDK 的 Gateway 客户端经 AF_UNIX 访问 Gateway，故只禁止直接导入
+name = "deepresearch 不直接使用 socket（网络只经 SDK 的 Gateway 客户端）"
+type = "forbidden"
+source_modules = ["deepresearch"]
+forbidden_modules = ["socket"]
+allow_indirect_imports = true

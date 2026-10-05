@@ -1,0 +1,7 @@
+# Linux 集成测试中允许跳过的用例，格式："<包路径> <用例名>"，每行一条。
+# 每条必须在上方注释写明原因（例如该用例只在非 root 环境下有意义）。
+# 除下列条目外，在已通过能力检查的 runner 上，所有用例都必须实际运行。
+
+# 缓存收益测量（§16.6）是测量而不是正确性用例：耗时长、结果写入证据文件，只由 bench/cache/run.sh
+# 设置 AGENTBOX_CACHE_BENCH_OUT 后运行；缓存的正确性由 E21–E25 与 I14/I15 用例覆盖，它们必须运行。
+github.com/wanghr0318-dotcom/go-agentbox/tests/e2e TestCacheBenefit
