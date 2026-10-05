@@ -30,7 +30,9 @@
 #   AGENTBOX_DEMO_WORKER_MODEL           worker 模型（任务内总结；默认 kimi-k2.6；也是 server 的 --model-name）
 #   AGENTBOX_DEMO_MODELS                 声明的模型白名单（--models，逗号分隔；默认
 #                                        kimi-k2.6,kimi-k2.7-code,kimi-k2.7-code-highspeed,kimi-k3；须包含上面两个）
-#   AGENTBOX_DEMO_SEARCH_PROVIDER        ddg_lite（默认，无 Key）| tavily（需要 AGENTBOX_SEARCH_API_KEY）
+#   AGENTBOX_DEMO_SEARCH_PROVIDER        ddg_lite（默认，无 Key）| tavily（需要 AGENTBOX_SEARCH_API_KEY）|
+#                                        serper（Google 结果，需要 AGENTBOX_SERPER_API_KEY；脚本把它作为
+#                                        AGENTBOX_SEARCH_API_KEY 交给 server，因此 Tavily 与 Serper 的 Key 可并存于 .env）
 #   AGENTBOX_DEMO_TOPIC                  研究题目（默认见下方 TOPIC）
 #   AGENTBOX_DEMO_PRICE_IN_MICRO_PER_MTOK / AGENTBOX_DEMO_PRICE_OUT_MICRO_PER_MTOK
 #                                        可选：默认模型输入、输出单价（每百万 token 的微美元）
@@ -38,8 +40,8 @@
 #                                        <编排模型>=2000000:2000000，其余模型 1000000:1000000）
 #   AGENTBOX_DEMO_BUDGET_MICRO           可选：该任务的 limits.budget_micro（默认取 server 的 2000000）
 #   AGENTBOX_DEMO_UPSTREAM_ALLOW_PRIVATE 可选：显式放行的私有上游（例如本机模型服务的 host:port）
-#   AGENTBOX_DEMO_ENV_FILE               Key 文件（默认 <仓库根>/.env；只读取 AGENTBOX_MODEL_API_KEY 与
-#                                        AGENTBOX_SEARCH_API_KEY 两行，不 source 整个文件）
+#   AGENTBOX_DEMO_ENV_FILE               Key 文件（默认 <仓库根>/.env；只读取 AGENTBOX_MODEL_API_KEY 与所选搜索供应商
+#                                        的 Key 行（AGENTBOX_SEARCH_API_KEY 或 AGENTBOX_SERPER_API_KEY），不 source 整个文件）
 #   AGENTBOX_DEMO_TIMEOUT                等待任务结束的秒数（默认 1800）
 #   AGENTBOX_DATABASE_URL、AGENTBOX_DEMO_DB、AGENTBOX_DEMO_DATA_DIR、AGENTBOX_DEMO_DATABASE_URL、
 #   AGENTBOX_DEMO_LISTEN                 与 scripts/demo-m1.sh 相同（默认库 agentbox_demo_m2、数据目录
@@ -189,7 +191,7 @@ env_procs() {
 worker_running() { env_procs | grep -qE '^[0-9]+ python3 -m deepresearch'; }
 
 # g3_probe：宿主读取环境 cgroup 中每个进程的 /proc/<pid>/environ 与 cmdline：不含 Key 的值，也不含
-# AGENTBOX_MODEL_API_KEY / AGENTBOX_SEARCH_API_KEY 变量名；须包含 Worker 进程。打印每个进程的 pid、uid、
+# AGENTBOX_MODEL_API_KEY / AGENTBOX_SEARCH_API_KEY / AGENTBOX_SERPER_API_KEY 变量名；须包含 Worker 进程。打印每个进程的 pid、uid、
 # cmdline 与环境变量名（不打印值）。
 g3_probe() {
   local pids
@@ -201,7 +203,7 @@ import sys
 keys = [k.encode() for k in sys.stdin.read().split("\n") if k]
 if not keys:
     sys.exit("G3 须在配置了非空 Key 时验证")
-names = (b"AGENTBOX_MODEL_API_KEY", b"AGENTBOX_SEARCH_API_KEY")
+names = (b"AGENTBOX_MODEL_API_KEY", b"AGENTBOX_SEARCH_API_KEY", b"AGENTBOX_SERPER_API_KEY")
 worker = False
 for pid in sys.argv[1:]:
     try:
@@ -257,11 +259,17 @@ else
       [ -n "$SEARCH_KEY" ] || fail "--search-provider tavily 需要 AGENTBOX_SEARCH_API_KEY"
       ok "搜索：tavily；AGENTBOX_SEARCH_API_KEY 已设置"
       ;;
-    *) fail "AGENTBOX_DEMO_SEARCH_PROVIDER 须为 ddg_lite 或 tavily，得到 $SEARCH_PROVIDER" ;;
+    serper)
+      SEARCH_KEY="${AGENTBOX_SERPER_API_KEY:-}"
+      [ -n "$SEARCH_KEY" ] || SEARCH_KEY=$(env_file_value AGENTBOX_SERPER_API_KEY)
+      [ -n "$SEARCH_KEY" ] || fail "--search-provider serper 需要 AGENTBOX_SERPER_API_KEY（环境变量或 $ENV_FILE 中的 AGENTBOX_SERPER_API_KEY=...）"
+      ok "搜索：serper；AGENTBOX_SERPER_API_KEY 已设置（作为 AGENTBOX_SEARCH_API_KEY 交给 server）"
+      ;;
+    *) fail "AGENTBOX_DEMO_SEARCH_PROVIDER 须为 ddg_lite、tavily 或 serper，得到 $SEARCH_PROVIDER" ;;
   esac
 fi
 # Key 不留在导出的环境中：只经环境变量前缀交给 server。
-unset AGENTBOX_MODEL_API_KEY AGENTBOX_SEARCH_API_KEY
+unset AGENTBOX_MODEL_API_KEY AGENTBOX_SEARCH_API_KEY AGENTBOX_SERPER_API_KEY
 for m in "$ORCH_MODEL" "$WORKER_MODEL"; do
   case ",$MODELS," in *",$m,"*) ;; *) fail "模型 $m 不在白名单 AGENTBOX_DEMO_MODELS=$MODELS 中" ;; esac
 done
@@ -358,7 +366,7 @@ WATCH_PID=$!
 step "G3：Worker 运行中，宿主读取沙箱内每个进程的 environ 与 cmdline"
 wait_for "Worker（python3 -m deepresearch）在环境中运行" 120 worker_running
 g3_probe | sed 's/^/         /' # 检查失败时 pipefail 使脚本在此退出
-ok "沙箱进程的 environ 与 cmdline 不含 Key 的值，也没有 AGENTBOX_MODEL_API_KEY / AGENTBOX_SEARCH_API_KEY"
+ok "沙箱进程的 environ 与 cmdline 不含 Key 的值，也没有 AGENTBOX_MODEL_API_KEY / AGENTBOX_SEARCH_API_KEY / AGENTBOX_SERPER_API_KEY"
 if [ -n "$FAKE" ]; then
   kill -USR1 "$FU_PID"
   info "已放行 fake upstream 挂起的第一次 chat"

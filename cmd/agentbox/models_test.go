@@ -61,6 +61,39 @@ func TestModelFlags(t *testing.T) {
 	}
 }
 
+// TestSearchProviderFlag：tavily / serper 没有 AGENTBOX_SEARCH_API_KEY 时拒绝启动（退出码 2，在取得锁与
+// 连接数据库之前）；fake 须同时设置 --upstream-allow-private；未知供应商被拒。
+func TestSearchProviderFlag(t *testing.T) {
+	for _, tc := range []struct {
+		provider, allowPrivate string
+		hasKey                 bool
+		err                    string
+	}{
+		{"ddg_lite", "", false, ""},
+		{"tavily", "", true, ""},
+		{"serper", "", true, ""},
+		{"tavily", "", false, "AGENTBOX_SEARCH_API_KEY"},
+		{"serper", "", false, "AGENTBOX_SEARCH_API_KEY"},
+		{"fake", "", false, "--upstream-allow-private"},
+		{"fake", "127.0.0.1", false, ""},
+		{"google", "", true, "ddg_lite、tavily、serper 或 fake"},
+	} {
+		err := checkSearchProvider(tc.provider, tc.allowPrivate, tc.hasKey)
+		if (err == nil) != (tc.err == "") || (err != nil && !strings.Contains(err.Error(), tc.err)) {
+			t.Errorf("%s key=%v：%v，期望 %q", tc.provider, tc.hasKey, err, tc.err)
+		}
+	}
+	if runtime.GOOS != "linux" {
+		return // 其他平台的 runServer 只报告不支持
+	}
+	t.Setenv("AGENTBOX_SEARCH_API_KEY", "")
+	var stderr strings.Builder
+	if code := runServer([]string{"--data-dir", t.TempDir(), "--database-url", "postgres://x", "--search-provider", "serper"}, &stderr); code != 2 ||
+		!strings.Contains(stderr.String(), "AGENTBOX_SEARCH_API_KEY") {
+		t.Fatalf("serper 无 Key 时 runServer 退出码 %d（%s），期望 2 并拒绝启动", code, stderr.String())
+	}
+}
+
 // TestPlaintextListenWarning：非 loopback 监听且未启用内置 TLS 时 server 在 stderr 打印一行警告。
 func TestPlaintextListenWarning(t *testing.T) {
 	for _, tc := range []struct {

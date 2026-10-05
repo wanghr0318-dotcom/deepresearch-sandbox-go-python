@@ -762,3 +762,96 @@ func TestSearchProviders(t *testing.T) {
 		t.Fatalf("未知供应商：%v", e)
 	}
 }
+
+// serper：请求形状（POST /search、X-API-KEY 头、JSON 体只有 q/num）、organic 映射（跳过非 http(s) 链接、
+// 截断到 max_results、忽略 answerBox）、401/403 fatal、429/503 可重试、非法 JSON fatal、错误文本不含 Key。
+func TestSearchSerper(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ok/search":
+			var in map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+				t.Errorf("serper 请求体：%v", err)
+			}
+			if r.Method != http.MethodPost || r.Header.Get("X-API-KEY") != testKey || r.Header.Get("Authorization") != "" ||
+				!strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") ||
+				len(in) != 2 || in["q"] != "golang context" || in["num"] != float64(3) {
+				t.Errorf("serper 请求不合规：%s %v %v", r.Method, r.Header, in)
+			}
+			writeStr(t, w, `{"searchParameters":{"q":"golang context"},"answerBox":{"title":"AB","link":"https://ab.example/"},
+"organic":[{"title":"A","link":"https://a.example/1","snippet":"SA","position":1},
+{"title":"Bad","link":"javascript:alert(1)","snippet":"x","position":2},
+{"title":"Rel","link":"/relative","snippet":"x","position":3},
+{"title":"B","link":"http://b.example/2","snippet":"SB","position":4},
+{"title":"C","link":"https://c.example/3","snippet":"SC","position":5},
+{"title":"D","link":"https://d.example/4","snippet":"SD","position":6}]}`)
+		case "/401/search":
+			w.WriteHeader(http.StatusUnauthorized)
+			writeStr(t, w, `{"message":"Unauthorized."}`)
+		case "/403/search":
+			w.WriteHeader(http.StatusForbidden)
+		case "/429/search":
+			w.Header().Set("Retry-After", "3")
+			w.WriteHeader(http.StatusTooManyRequests)
+		case "/503/search":
+			w.WriteHeader(http.StatusServiceUnavailable)
+		case "/bad/search":
+			writeStr(t, w, `<html>not json</html>`)
+		default:
+			t.Errorf("意外路径 %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	client := NewDialer(DialerConfig{AllowPrivate: []string{"127.0.0.1"}}).HTTPClient(DefaultModelMaxBody, 5*time.Second)
+	mk := func(path string) Adapter {
+		return NewSearch(SearchConfig{Provider: SearchSerper, APIKey: testKey, BaseURL: srv.URL + path, HTTP: client})
+	}
+
+	ok := mk("/ok")
+	if ok.Version() != "search/serper/1" {
+		t.Fatalf("Version %q", ok.Version())
+	}
+	resp, e := ok.Do(ctx, mustResolve(t, ok, `{"query":"golang context","max_results":3}`))
+	if e != nil {
+		t.Fatalf("serper：%v", e)
+	}
+	var reply searchReply
+	unmarshal(t, resp.Body, &reply)
+	want := []SearchResult{
+		{Title: "A", URL: "https://a.example/1", Snippet: "SA"},
+		{Title: "B", URL: "http://b.example/2", Snippet: "SB"},
+		{Title: "C", URL: "https://c.example/3", Snippet: "SC"},
+	}
+	if len(reply.Results) != len(want) {
+		t.Fatalf("serper 结果 %+v", reply.Results)
+	}
+	for i := range want {
+		if reply.Results[i] != want[i] {
+			t.Errorf("serper[%d] = %+v，期望 %+v", i, reply.Results[i], want[i])
+		}
+	}
+
+	cases := []struct {
+		path    string
+		outcome Outcome
+		code    string
+	}{
+		{"/401", OutcomeFatal, CodeUpstreamRejected},
+		{"/403", OutcomeFatal, CodeUpstreamRejected},
+		{"/429", OutcomeRetryable, CodeUpstreamRateLimited},
+		{"/503", OutcomeRetryable, CodeUpstreamUnavailable},
+		{"/bad", OutcomeFatal, CodeUpstreamBadResponse},
+	}
+	for _, c := range cases {
+		a := mk(c.path)
+		resp, e := a.Do(ctx, mustResolve(t, a, `{"query":"q"}`))
+		wantErr(t, e, c.outcome, c.code)
+		if strings.Contains(e.Error(), testKey) {
+			t.Errorf("%s 的错误文本含 Key：%v", c.path, e)
+		}
+		if c.path == "/429" && resp.RetryAfter != 3*time.Second {
+			t.Errorf("serper 429 的 Retry-After = %s", resp.RetryAfter)
+		}
+	}
+}

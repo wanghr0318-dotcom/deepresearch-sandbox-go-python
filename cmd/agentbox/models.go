@@ -1,7 +1,7 @@
 package main
 
 // 本文件解析 `agentbox server` 的模型标志：--model-name（默认模型）、--models（声明的白名单）、
-// --model-price model=IN:OUT（按模型的单价）。与平台无关，便于在任何平台上测试。
+// --model-price model=IN:OUT（按模型的单价），并校验 --search-provider。与平台无关，便于在任何平台上测试。
 
 import (
 	"errors"
@@ -46,6 +46,26 @@ func (l *listFlag) String() string { return strings.Join(*l, ",") }
 
 func (l *listFlag) Set(v string) error {
 	*l = append(*l, splitList(v)...)
+	return nil
+}
+
+// checkSearchProvider 校验 --search-provider（在取得锁、连接数据库之前）：fake 只用于测试，须同时设置
+// --upstream-allow-private；tavily 与 serper 须有宿主环境变量 AGENTBOX_SEARCH_API_KEY（hasKey 只表示是否
+// 设置，Key 的值不进入本函数与错误文本）。
+func checkSearchProvider(provider, allowPrivate string, hasKey bool) error {
+	switch provider {
+	case upstream.SearchDDGLite:
+	case upstream.SearchTavily, upstream.SearchSerper:
+		if !hasKey {
+			return fmt.Errorf("--search-provider %s 需要宿主环境变量 AGENTBOX_SEARCH_API_KEY", provider)
+		}
+	case upstream.SearchFake:
+		if strings.TrimSpace(allowPrivate) == "" {
+			return errors.New("--search-provider fake 只用于测试，须同时设置 --upstream-allow-private 指向本机 fake upstream")
+		}
+	default:
+		return fmt.Errorf("--search-provider 须为 ddg_lite、tavily、serper 或 fake，得到 %q", provider)
+	}
 	return nil
 }
 

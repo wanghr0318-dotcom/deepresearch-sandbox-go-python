@@ -993,8 +993,8 @@ func TestEffectiveLimits(t *testing.T) {
 	}
 }
 
-// TestGatewayConfigValidation：搜索供应商只能是 fake | tavily | ddg_lite（fake 须同时设置 upstream_allow_private，
-// tavily 须有 Key）；Worker 环境变量只允许白名单中的键（凭据不得经环境变量进入沙箱）。
+// TestGatewayConfigValidation：搜索供应商只能是 fake | tavily | ddg_lite | serper（fake 须同时设置 upstream_allow_private，
+// tavily 与 serper 须有 Key）；Worker 环境变量只允许白名单中的键（凭据不得经环境变量进入沙箱）。
 func TestGatewayConfigValidation(t *testing.T) {
 	base := testConfig().withDefaults()
 	cases := []struct {
@@ -1003,7 +1003,9 @@ func TestGatewayConfigValidation(t *testing.T) {
 		err  string
 	}{
 		{"默认 ddg_lite", func(*Config) {}, ""},
-		{"未知供应商", func(c *Config) { c.SearchProvider = "google" }, "fake、tavily 或 ddg_lite"},
+		{"未知供应商", func(c *Config) { c.SearchProvider = "google" }, "fake、tavily、serper 或 ddg_lite"},
+		{"serper 无 Key", func(c *Config) { c.SearchProvider = "serper" }, "AGENTBOX_SEARCH_API_KEY"},
+		{"serper 有 Key", func(c *Config) { c.SearchProvider, c.SearchAPIKey = "serper", "k" }, ""},
 		{"fake 无 allow-private", func(c *Config) { c.SearchProvider = "fake" }, "upstream_allow_private"},
 		{"fake 有 allow-private", func(c *Config) { c.SearchProvider, c.UpstreamAllowPrivate = "fake", []string{"127.0.0.1"} }, ""},
 		{"tavily 无 Key", func(c *Config) { c.SearchProvider = "tavily" }, "AGENTBOX_SEARCH_API_KEY"},

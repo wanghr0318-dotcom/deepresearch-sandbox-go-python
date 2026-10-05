@@ -101,8 +101,8 @@ type Config struct {
 	BudgetCapMicro int64
 	// Model 是模型上游（OpenAI 兼容，默认模型 + 声明的白名单）；BaseURL 为空时不提供 /v1/chat/completions。
 	Model ModelConfig
-	// SearchProvider 是搜索供应商：fake | tavily | ddg_lite（默认 ddg_lite）。fake 只用于测试，要求设置
-	// UpstreamAllowPrivate（指向本机 fake upstream）；tavily 要求 SearchAPIKey。
+	// SearchProvider 是搜索供应商：fake | tavily | ddg_lite | serper（默认 ddg_lite）。fake 只用于测试，要求设置
+	// UpstreamAllowPrivate（指向本机 fake upstream）；tavily 与 serper 要求 SearchAPIKey。
 	SearchProvider string
 	// SearchBaseURL 覆盖搜索供应商地址（http/https；空时取供应商默认）。供应商为 fake 时设置它，fake 搜索经
 	// 验证 dialer 向 <SearchBaseURL>/search 发出 HTTP 请求（测试用 fake upstream，主机须在 UpstreamAllowPrivate
@@ -262,13 +262,13 @@ func (c Config) validate() error {
 		if len(c.UpstreamAllowPrivate) == 0 {
 			return errors.New("app: 搜索供应商 fake 只用于测试，须同时设置 upstream_allow_private 指向本机 fake upstream")
 		}
-	case upstream.SearchTavily:
+	case upstream.SearchTavily, upstream.SearchSerper:
 		if c.SearchAPIKey == "" {
-			return errors.New("app: 搜索供应商 tavily 需要宿主环境变量 AGENTBOX_SEARCH_API_KEY")
+			return fmt.Errorf("app: 搜索供应商 %s 需要宿主环境变量 AGENTBOX_SEARCH_API_KEY", c.SearchProvider)
 		}
 	case upstream.SearchDDGLite:
 	default:
-		return fmt.Errorf("app: 搜索供应商须为 fake、tavily 或 ddg_lite，得到 %q", c.SearchProvider)
+		return fmt.Errorf("app: 搜索供应商须为 fake、tavily、serper 或 ddg_lite，得到 %q", c.SearchProvider)
 	}
 	if c.SearchBaseURL != "" {
 		if u, err := url.Parse(c.SearchBaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {

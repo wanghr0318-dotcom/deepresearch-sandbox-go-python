@@ -416,10 +416,14 @@ func (x hostEvents) ReplayDivergence(ctx context.Context, taskID, attemptID, cal
 }
 
 // searchPricing 是各搜索供应商的价格表（adapter 声明的按次计价，§9.6）。Tavily 按每次基础搜索 1 credit
-// 约 0.008 USD 保守计价；fake 与 ddg_lite 不收费。
+// 约 0.008 USD 保守计价；Serper 按每次 2 credit（num 较大时可能计 2 credit）、每 credit 约 0.001 USD 保守计价
+// （只是配置，未与供应商账单核对）；fake 与 ddg_lite 不收费。
 func searchPricing(provider string) upstream.Pricing {
-	if provider == upstream.SearchTavily {
+	switch provider {
+	case upstream.SearchTavily:
 		return upstream.Pricing{Version: "tavily/2026-10", SearchMicroPerRequest: 8_000}
+	case upstream.SearchSerper:
+		return upstream.Pricing{Version: "serper/2026-10", SearchMicroPerRequest: 2_000}
 	}
 	return upstream.Pricing{Version: provider + "/free"}
 }

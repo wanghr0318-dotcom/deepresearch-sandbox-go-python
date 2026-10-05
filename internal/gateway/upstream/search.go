@@ -18,6 +18,7 @@ const (
 	SearchFake    = "fake"
 	SearchTavily  = "tavily"
 	SearchDDGLite = "ddg_lite" // 脆弱、仅演示：解析 DuckDuckGo Lite 的 HTML，页面改版即失效
+	SearchSerper  = "serper"   // Google 结果，经 Serper.dev（POST /search，Key 在 X-API-KEY 头）
 )
 
 // SearchResult 是一条规范化的搜索结果。
@@ -29,10 +30,12 @@ type SearchResult struct {
 
 // SearchConfig 配置搜索 adapter。
 type SearchConfig struct {
-	Provider string // fake | tavily | ddg_lite
-	APIKey   string // tavily：来自宿主环境变量 AGENTBOX_SEARCH_API_KEY；只放在 Authorization 头
-	// BaseURL 覆盖供应商地址（测试或自托管）；空时 tavily 为 https://api.tavily.com，ddg_lite 为
-	// https://lite.duckduckgo.com/lite/。fake 供应商设置了 BaseURL（且没有注入 Fake）时，向 <BaseURL>/search
+	Provider string // fake | tavily | ddg_lite | serper
+	// APIKey：tavily / serper 的 Key，来自宿主环境变量 AGENTBOX_SEARCH_API_KEY；只放在请求头
+	// （tavily 为 Authorization: Bearer，serper 为 X-API-KEY），不进请求体、日志与错误文本。
+	APIKey string
+	// BaseURL 覆盖供应商地址（测试或自托管）；空时 tavily 为 https://api.tavily.com，serper 为
+	// https://google.serper.dev，ddg_lite 为 https://lite.duckduckgo.com/lite/。fake 供应商设置了 BaseURL（且没有注入 Fake）时，向 <BaseURL>/search
 	// POST {query, max_results} 并取响应的 {"results":[{title, url, snippet}]}（测试用 fake upstream）。
 	BaseURL string
 	Pricing Pricing
@@ -55,10 +58,12 @@ func NewSearch(cfg SearchConfig) Adapter {
 			cfg.BaseURL = "https://api.tavily.com"
 		case SearchDDGLite:
 			cfg.BaseURL = "https://lite.duckduckgo.com/lite/"
+		case SearchSerper:
+			cfg.BaseURL = "https://google.serper.dev"
 		}
 	}
 	a := &searchAdapter{cfg: cfg}
-	if cfg.Provider == SearchTavily || cfg.Provider == SearchDDGLite || (cfg.Provider == SearchFake && cfg.BaseURL != "") {
+	if cfg.Provider == SearchTavily || cfg.Provider == SearchDDGLite || cfg.Provider == SearchSerper || (cfg.Provider == SearchFake && cfg.BaseURL != "") {
 		a.http = defaultClient(cfg.HTTP, DefaultModelMaxBody)
 	}
 	return a
@@ -76,7 +81,7 @@ type searchRequest struct {
 // Resolve：只接受 {query, max_results}；query 非空；max_results 缺省补 5，取值 1..20。
 func (a *searchAdapter) Resolve(body []byte) ([]byte, map[string]any, error) {
 	switch a.cfg.Provider {
-	case SearchFake, SearchTavily, SearchDDGLite:
+	case SearchFake, SearchTavily, SearchDDGLite, SearchSerper:
 	default:
 		return nil, nil, fatalf(http.StatusBadRequest, CodeUnsupportedProvider, "搜索供应商 %q 未声明", a.cfg.Provider)
 	}
@@ -140,6 +145,8 @@ func (a *searchAdapter) Do(ctx context.Context, resolved []byte) (Response, *Err
 		results, reqID, resp, e = a.tavily(ctx, r)
 	case SearchDDGLite:
 		results, resp, e = a.ddgLite(ctx, r)
+	case SearchSerper:
+		results, resp, e = a.serper(ctx, r)
 	default:
 		e = fatalf(http.StatusBadRequest, CodeUnsupportedProvider, "搜索供应商 %q 未声明", a.cfg.Provider)
 	}
@@ -243,6 +250,47 @@ func (a *searchAdapter) tavily(ctx context.Context, r searchRequest) ([]SearchRe
 		id = reply.RequestID
 	}
 	return out, id, Response{}, nil
+}
+
+// serper：POST {BaseURL}/search {"q", "num"}，Key 走 X-API-KEY 头，不进请求体。取 organic[] 的
+// title / link / snippet（answerBox、knowledgeGraph 等忽略），跳过非 http(s) 链接。401/403 等 4xx 为
+// fatal upstream_rejected（与 tavily 一致），429/5xx/发送前失败可重试；2xx 但不是合法 JSON 为 fatal
+// upstream_bad_response（与 ddg_lite 解析失败一致：重试同一请求无助于得到可用结果）。
+func (a *searchAdapter) serper(ctx context.Context, r searchRequest) ([]SearchResult, Response, *Error) {
+	payload, _ := json.Marshal(map[string]any{"q": r.Query, "num": r.MaxResults})
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(a.cfg.BaseURL, "/")+"/search", bytes.NewReader(payload))
+	if err != nil {
+		return nil, Response{}, newErr(OutcomeFatal, http.StatusBadGateway, CodeInvalidURL, errors.New("搜索上游地址不合法"))
+	}
+	req.Header.Set("Content-Type", contentTypeJSON)
+	req.Header.Set("Accept", contentTypeJSON)
+	req.Header.Set("User-Agent", userAgent)
+	if a.cfg.APIKey != "" {
+		req.Header.Set("X-API-KEY", a.cfg.APIKey)
+	}
+	res, e := exchange(ctx, a.http, req, true)
+	if e != nil {
+		return nil, Response{RetryAfter: res.retryAfter}, e
+	}
+	var reply struct {
+		Organic []struct {
+			Title   string `json:"title"`
+			Link    string `json:"link"`
+			Snippet string `json:"snippet"`
+		} `json:"organic"`
+	}
+	if json.Unmarshal(res.body, &reply) != nil {
+		return nil, Response{}, newErr(OutcomeFatal, http.StatusBadGateway, CodeUpstreamBadResponse, errors.New("serper 响应不是合法 JSON"))
+	}
+	out := make([]SearchResult, 0, len(reply.Organic))
+	for _, x := range reply.Organic {
+		u, err := url.Parse(x.Link)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			continue
+		}
+		out = append(out, SearchResult{Title: x.Title, URL: x.Link, Snippet: x.Snippet})
+	}
+	return out, Response{}, nil
 }
 
 // ddgLite：GET {BaseURL}?q=...，解析结果链接与摘要。脆弱、仅演示；解析失败为 fatal。
