@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -94,6 +95,8 @@ func runServer(args []string, stderr io.Writer) int {
 	cacheMode := fs.String("cache", "on", "搜索与抓取的共享缓存：on | off（on 且配置了 --redis-addr 时生效；Redis 不可用时视为未命中）")
 	callDeadline := fs.Duration("call-deadline", call.DefaultCallDeadline, "搜索与抓取（/v1/search、/v1/fetch）的调用期限：自 Tx1 起计，含排队、退避与全部 try（须 > 0）")
 	modelCallDeadline := fs.Duration("model-call-deadline", call.DefaultModelCallDeadline, "模型调用（/v1/chat/completions）的调用期限：推理模型的长输出可能超过 120 s（须 > 0）")
+	userOrchestrator := fs.String("user-orchestrator-model", "kimi-k3", "用户研究的编排模型（spec.orchestrator_model；须为声明的模型）。配置了 --model-base-url 时启用用户账号")
+	userWorker := fs.String("user-worker-model", "kimi-k2.6", "用户研究的 worker 模型（spec.worker_model；须为声明的模型）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -123,6 +126,16 @@ func runServer(args []string, stderr io.Writer) int {
 	// 供应商 Key 只从宿主环境变量读取（不设标志，避免出现在进程参数与 shell 历史中），只交给 Gateway 的
 	// upstream adapter；不写日志、不进入 init 与沙箱环境（§9.9）。
 	model.APIKey = os.Getenv(modelKeyEnv)
+	// 配置了模型上游时启用用户账号：用户研究的两个模型须在声明的白名单中（在取得锁、连接数据库之前拒绝）。
+	accounts := model.BaseURL != ""
+	if accounts {
+		for _, m := range []struct{ flag, name string }{{"--user-orchestrator-model", *userOrchestrator}, {"--user-worker-model", *userWorker}} {
+			if m.name != model.Name && !slices.Contains(model.Models, m.name) {
+				fmt.Fprintf(stderr, "agentbox server: %s %q 不在声明的模型白名单中（--model-name / --models）\n", m.flag, m.name)
+				return 2
+			}
+		}
+	}
 	if w := plaintextListenWarning(*listen, *tlsCert != ""); w != "" {
 		fmt.Fprintln(stderr, w)
 	}
@@ -138,28 +151,31 @@ func runServer(args []string, stderr io.Writer) int {
 		return 1
 	}
 	cfg := app.Config{
-		Listen:               *listen,
-		Capacity:             admission.Capacity{RunSlots: *runSlots, MemoryBytes: *memory},
-		DefaultMemoryBytes:   *defaultMemory,
-		DefaultRunTime:       *defaultRunTime,
-		RunTimeCap:           *runTimeCap,
-		AllowedHosts:         splitList(*allowedHost),
-		AllowedOrigins:       splitList(*allowedOrigin),
-		WebDir:               *webDir,
-		TLSCertFile:          *tlsCert,
-		TLSKeyFile:           *tlsKey,
-		WorkerArgv:           splitList(*workerArgv),
-		WorkerEnv:            splitList(*workerEnv),
-		DefaultBudgetMicro:   *defaultBudget,
-		BudgetCapMicro:       *budgetCap,
-		Model:                model,
-		SearchProvider:       *searchProvider,
-		SearchBaseURL:        *searchBaseURL,
-		SearchAPIKey:         os.Getenv(searchKeyEnv),
-		UpstreamAllowPrivate: splitList(*allowPrivate),
-		RedisAddr:            strings.TrimSpace(*redisAddr),
-		CacheOff:             *cacheMode == "off",
-		Gateway:              gatewayLim,
+		Listen:                *listen,
+		Capacity:              admission.Capacity{RunSlots: *runSlots, MemoryBytes: *memory},
+		DefaultMemoryBytes:    *defaultMemory,
+		DefaultRunTime:        *defaultRunTime,
+		RunTimeCap:            *runTimeCap,
+		AllowedHosts:          splitList(*allowedHost),
+		AllowedOrigins:        splitList(*allowedOrigin),
+		WebDir:                *webDir,
+		TLSCertFile:           *tlsCert,
+		TLSKeyFile:            *tlsKey,
+		WorkerArgv:            splitList(*workerArgv),
+		WorkerEnv:             splitList(*workerEnv),
+		DefaultBudgetMicro:    *defaultBudget,
+		BudgetCapMicro:        *budgetCap,
+		Model:                 model,
+		SearchProvider:        *searchProvider,
+		SearchBaseURL:         *searchBaseURL,
+		SearchAPIKey:          os.Getenv(searchKeyEnv),
+		UpstreamAllowPrivate:  splitList(*allowPrivate),
+		RedisAddr:             strings.TrimSpace(*redisAddr),
+		CacheOff:              *cacheMode == "off",
+		Gateway:               gatewayLim,
+		Accounts:              accounts,
+		UserOrchestratorModel: *userOrchestrator,
+		UserWorkerModel:       *userWorker,
 	}
 	if _, err := os.Stat(filepath.Join(dir, api.TokenFile)); err == nil {
 		if cfg.APIToken, err = api.LoadToken(dir); err != nil {

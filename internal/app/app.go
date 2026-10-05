@@ -118,6 +118,12 @@ type Config struct {
 	RedisAddr string
 	// CacheOff 关闭共享缓存（--cache=off）。缓存默认开启，但只在配置了 RedisAddr 时生效。
 	CacheOff bool
+	// Accounts 启用用户账号（/auth/*、POST /research；server 在配置了 --model-base-url 时设置）。须配置模型上游，
+	// UserOrchestratorModel 与 UserWorkerModel 须为声明的模型。
+	Accounts bool
+	// UserOrchestratorModel 与 UserWorkerModel 是用户研究 spec 的 orchestrator_model 与 worker_model（用户不能
+	// 指定模型；server 默认 kimi-k3 与 kimi-k2.6）。
+	UserOrchestratorModel, UserWorkerModel string
 }
 
 // ModelConfig 是模型上游的配置。APIKey 只从宿主环境变量 AGENTBOX_MODEL_API_KEY 加载，只交给 chat adapter
@@ -255,6 +261,16 @@ func (c Config) validate() error {
 	case len(c.Model.Models) > 0 && !slices.Contains(c.Model.Models, c.Model.Name):
 		return fmt.Errorf("app: 模型白名单 %v 不含默认模型 %q", c.Model.Models, c.Model.Name)
 	}
+	if c.Accounts {
+		if c.Model.BaseURL == "" {
+			return errors.New("app: 启用账号需要模型上游（--model-base-url）")
+		}
+		for _, m := range []struct{ role, name string }{{"编排", c.UserOrchestratorModel}, {"worker", c.UserWorkerModel}} {
+			if !c.Model.declared(m.name) {
+				return fmt.Errorf("app: 用户研究的%s模型 %q 不在声明的模型白名单中", m.role, m.name)
+			}
+		}
+	}
 	for m, p := range c.Model.PricingByModel {
 		if !c.Model.declared(m) {
 			return fmt.Errorf("app: 模型 %q 有单价但未声明", m)
@@ -304,6 +320,7 @@ type Store interface {
 	resource.Store
 	runner.Store
 	api.Store
+	api.Accounts
 	call.Store
 	// Migrate 执行尚未应用的迁移（安装引导之后）。
 	Migrate(ctx context.Context) error
@@ -1020,12 +1037,18 @@ func (s *server) startAPI() error {
 	if err != nil {
 		return fmt.Errorf("app: API 监听 %s: %w", s.cfg.Listen, err)
 	}
+	store := notifyingStore{Store: s.store, s: s}
+	var accounts api.Accounts // 未启用时保持 nil 接口（api 以 nil 判定）
+	if s.cfg.Accounts {
+		accounts = notifyingAccounts{Accounts: s.store, n: store}
+	}
 	h, err := api.New(api.Config{
-		Store: notifyingStore{Store: s.store, s: s}, Blobs: s.blobs, Mode: s.currentMode, ListenAddr: ln.Addr().String(),
+		Store: store, Blobs: s.blobs, Mode: s.currentMode, ListenAddr: ln.Addr().String(),
 		Token: s.cfg.APIToken, AllowedHosts: s.cfg.AllowedHosts, AllowedOrigins: s.cfg.AllowedOrigins,
 		TLS: tlsCfg != nil, WebDir: s.cfg.WebDir,
 		Logger: s.log, ConfigVersion: s.cfg.ConfigVersion, MaxFaultRetries: s.cfg.MaxFaultRetries,
 		EffectiveLimits: s.cfg.effectiveLimits, CacheMetrics: s.cacheMetrics,
+		Accounts: accounts, ResearchSpec: s.cfg.researchSpec, SecureCookies: tlsCfg != nil,
 	})
 	if err != nil {
 		_ = ln.Close()
@@ -1159,6 +1182,20 @@ func (n notifyingStore) AcceptControl(ctx context.Context, req api.ControlReques
 	r, err := n.Store.AcceptControl(ctx, req)
 	if err == nil {
 		n.submit(r.TaskID)
+	}
+	return r, err
+}
+
+// notifyingAccounts 在用户研究任务提交后同样通知 Scheduler（提交结果未知时经 notifyingStore.GetRequest 核对）。
+type notifyingAccounts struct {
+	api.Accounts
+	n notifyingStore
+}
+
+func (a notifyingAccounts) CreateResearch(ctx context.Context, userID int64, req api.CreateTaskRequest) (api.CreateTaskResult, error) {
+	r, err := a.Accounts.CreateResearch(ctx, userID, req)
+	if err == nil {
+		a.n.submit(r.TaskID)
 	}
 	return r, err
 }

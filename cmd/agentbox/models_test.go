@@ -1,14 +1,26 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"flag"
 	"io"
+	"net/url"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/account"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence/postgres"
 )
 
 // 模型标志：--models 白名单须包含 --model-name；--model-price 可重复、逗号分隔，模型须已声明；
@@ -151,5 +163,194 @@ func TestCallDeadlineFlags(t *testing.T) {
 	if code := runServer([]string{"--data-dir", t.TempDir(), "--database-url", "postgres://x", "--model-call-deadline", "0s"}, &stderr); code != 2 ||
 		!strings.Contains(stderr.String(), "--model-call-deadline") {
 		t.Fatalf("--model-call-deadline 0s 时 runServer 退出码 %d（%s），期望 2 并拒绝启动", code, stderr.String())
+	}
+}
+
+// ---- 用户账号（Plan 11 Task 4） ----
+
+// 配置了 --model-base-url 即启用账号：--user-orchestrator-model（默认 kimi-k3）与 --user-worker-model（默认
+// kimi-k2.6）须为声明的模型，否则在取得锁与连接数据库之前以退出码 2 拒绝启动。
+func TestUserModelFlags(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("runServer 只在 Linux 上可用")
+	}
+	var stderr strings.Builder
+	if code := runServer([]string{"-help"}, &stderr); code != 2 ||
+		!strings.Contains(stderr.String(), "-user-orchestrator-model string") || !strings.Contains(stderr.String(), `(default "kimi-k3")`) ||
+		!strings.Contains(stderr.String(), "-user-worker-model string") || !strings.Contains(stderr.String(), `(default "kimi-k2.6")`) {
+		t.Fatalf("-help 退出码 %d：%s", code, stderr.String())
+	}
+	base := []string{"--data-dir", t.TempDir(), "--database-url", "postgres://x", "--model-base-url", "https://api.moonshot.cn/v1", "--model-name", "kimi-k2.6"}
+	for _, tc := range []struct {
+		extra []string
+		flag  string
+	}{
+		{nil, "--user-orchestrator-model"}, // 默认 kimi-k3 未声明
+		{[]string{"--models", "kimi-k2.6,kimi-k3", "--user-worker-model", "gpt-x"}, "--user-worker-model"},
+	} {
+		stderr.Reset()
+		if code := runServer(append(append([]string{}, base...), tc.extra...), &stderr); code != 2 || !strings.Contains(stderr.String(), tc.flag) {
+			t.Errorf("%v：退出码 %d（%s），期望 2 并指出 %s", tc.extra, code, stderr.String(), tc.flag)
+		}
+	}
+}
+
+// userTestDatabase 建立独立的已迁移测试库（读 AGENTBOX_TEST_DATABASE_URL；CI 中缺失即失败）。
+func userTestDatabase(t *testing.T) (string, *postgres.Store) {
+	t.Helper()
+	admin := os.Getenv("AGENTBOX_TEST_DATABASE_URL")
+	if admin == "" {
+		if os.Getenv("CI") == "true" {
+			t.Fatal("CI 中必须设置 AGENTBOX_TEST_DATABASE_URL")
+		}
+		t.Skip("未设置 AGENTBOX_TEST_DATABASE_URL，跳过")
+	}
+	ctx := context.Background()
+	b := make([]byte, 6)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatal(err)
+	}
+	name := "agentbox_cli_" + hex.EncodeToString(b)
+	conn, err := pgx.Connect(ctx, admin)
+	if err != nil {
+		t.Fatalf("连接测试数据库: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }() // 只用于建库，关闭错误无影响
+	if _, err := conn.Exec(ctx, "CREATE DATABASE "+name); err != nil {
+		t.Fatalf("创建测试数据库: %v", err)
+	}
+	t.Cleanup(func() {
+		c, err := pgx.Connect(context.Background(), admin)
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.Close(context.Background()) }() // 清理尽力而为
+		_, _ = c.Exec(context.Background(), "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
+	})
+	u, err := url.Parse(admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Path = "/" + name
+	s, err := postgres.Open(ctx, postgres.Options{DSN: u.String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	if err := s.InitializeInstallation(ctx, "install-cli", make([]byte, ownership.TokenSize)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteInstallation(ctx, "install-cli"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return u.String(), s
+}
+
+// agentbox user：list 输出 username role disabled created_at；disable 吊销该用户的全部会话（不影响他人），
+// enable 恢复登录（已吊销的会话不恢复）；未知用户退出码 1；连接串（取自环境变量时）不出现在任何输出中。
+func TestUserCommand(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("agentbox user 只在 Linux 上可用")
+	}
+	dsn, s := userTestDatabase(t)
+	ctx := context.Background()
+	sessions := map[string][]byte{}
+	for _, name := range []string{"Alice", "bob"} {
+		_, key, err := account.NormalizeUsername(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		u, err := s.CreateUser(ctx, name, key, "pbkdf2-sha256$600000$c2FsdA$aGFzaA")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, hash, err := account.NewSessionID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CreateSession(ctx, hash, u.ID, time.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		sessions[name] = hash
+	}
+	t.Setenv("AGENTBOX_DATABASE_URL", dsn)
+	run := func(args ...string) (int, string, string) {
+		t.Helper()
+		var out, errb strings.Builder
+		code := runUser(args, &out, &errb)
+		if all := out.String() + errb.String(); strings.Contains(all, dsn) || strings.Contains(all, "agentbox_cli_") {
+			t.Fatalf("输出中出现了连接串：%s", all)
+		}
+		return code, out.String(), errb.String()
+	}
+	listed := func() map[string][]string {
+		t.Helper()
+		code, out, errb := run("list")
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		if code != 0 || strings.Join(strings.Fields(lines[0]), " ") != "username role disabled created_at" {
+			t.Fatalf("user list = %d %q %q", code, out, errb)
+		}
+		rows := map[string][]string{}
+		for _, l := range lines[1:] {
+			f := strings.Fields(l)
+			if len(f) != 4 {
+				t.Fatalf("user list 行 %q", l)
+			}
+			if _, err := time.Parse(time.RFC3339, f[3]); err != nil {
+				t.Fatalf("created_at %q: %v", f[3], err)
+			}
+			rows[f[0]] = f[1:3]
+		}
+		return rows
+	}
+	if rows := listed(); len(rows) != 2 || strings.Join(rows["Alice"], " ") != "user false" || strings.Join(rows["bob"], " ") != "user false" {
+		t.Fatalf("user list = %v", rows)
+	}
+
+	if code, out, errb := run("disable", "alice"); code != 0 || !strings.Contains(out, "alice") {
+		t.Fatalf("user disable alice = %d %q %q", code, out, errb)
+	}
+	if _, err := s.SessionUser(ctx, sessions["Alice"]); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("停用后 Alice 的会话应失效，得到 %v", err)
+	}
+	if u, err := s.SessionUser(ctx, sessions["bob"]); err != nil || u.Username != "bob" {
+		t.Fatalf("bob 的会话不应受影响：%+v %v", u, err)
+	}
+	if rows := listed(); strings.Join(rows["Alice"], " ") != "user true" {
+		t.Fatalf("停用后 user list = %v", rows)
+	}
+	if u, _, err := s.UserForLogin(ctx, "alice"); err != nil || !u.Disabled {
+		t.Fatalf("停用后 UserForLogin = %+v %v", u, err)
+	}
+
+	// 标志可以写在用户名之后。
+	if code, out, errb := run("enable", "Alice", "--database-url", dsn); code != 0 || !strings.Contains(out, "Alice") {
+		t.Fatalf("user enable Alice = %d %q %q", code, out, errb)
+	}
+	if u, _, err := s.UserForLogin(ctx, "alice"); err != nil || u.Disabled {
+		t.Fatalf("启用后 UserForLogin = %+v %v", u, err)
+	}
+	if _, err := s.SessionUser(ctx, sessions["Alice"]); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("启用不恢复已吊销的会话，得到 %v", err)
+	}
+
+	for _, name := range []string{"carol", "x"} { // 不存在 / 不符合用户名规则
+		for _, op := range []string{"disable", "enable"} {
+			if code, _, errb := run(op, name); code != 1 || !strings.Contains(errb, "不存在") {
+				t.Errorf("user %s %s = %d %q，期望退出码 1", op, name, code, errb)
+			}
+		}
+	}
+	for _, args := range [][]string{{}, {"list", "extra"}, {"disable"}, {"remove", "bob"}, {"list", "--bogus"}} {
+		if code, _, _ := run(args...); code != 2 {
+			t.Errorf("user %v 退出码 %d，期望 2（用法错误）", args, code)
+		}
+	}
+	t.Setenv("AGENTBOX_DATABASE_URL", "")
+	if code, _, errb := run("list"); code != 2 || !strings.Contains(errb, "--database-url") {
+		t.Fatalf("没有连接串时 user list = %d %q", code, errb)
 	}
 }

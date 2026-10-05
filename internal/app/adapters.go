@@ -27,6 +27,17 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
 )
 
+// ---- 用户研究 ----
+
+// researchSpec 由主题生成用户研究的 spec：模型由 server 配置固定（用户不能指定），其余取 Worker 的默认值。
+func (c Config) researchSpec(topic string) (json.RawMessage, error) {
+	return json.Marshal(struct {
+		Topic             string `json:"topic"`
+		OrchestratorModel string `json:"orchestrator_model"`
+		WorkerModel       string `json:"worker_model"`
+	}{topic, c.UserOrchestratorModel, c.UserWorkerModel})
+}
+
 // ---- 任务 limits ----
 
 // taskLimits 是任务 limits_json 中装配代码识别的字段（规格未固定 limits 的结构；M1 取这些键，

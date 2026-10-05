@@ -1036,6 +1036,21 @@ func TestGatewayConfigValidation(t *testing.T) {
 		}, ""},
 		{"Redis 地址", func(c *Config) { c.RedisAddr = "127.0.0.1:6379" }, ""},
 		{"Redis 地址缺端口", func(c *Config) { c.RedisAddr = "127.0.0.1" }, "host:port"},
+		{"账号无模型上游", func(c *Config) {
+			c.Accounts, c.UserOrchestratorModel, c.UserWorkerModel = true, "a", "a"
+		}, "模型上游"},
+		{"账号的用户模型已声明", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Models: []string{"a", "b"}}
+			c.Accounts, c.UserOrchestratorModel, c.UserWorkerModel = true, "b", "a"
+		}, ""},
+		{"账号的编排模型未声明", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Models: []string{"a", "b"}}
+			c.Accounts, c.UserOrchestratorModel, c.UserWorkerModel = true, "kimi-k3", "a"
+		}, "编排模型"},
+		{"账号的 worker 模型未声明", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a"}
+			c.Accounts, c.UserOrchestratorModel, c.UserWorkerModel = true, "a", ""
+		}, "worker模型"},
 	}
 	for _, tc := range cases {
 		c := base
@@ -1441,4 +1456,94 @@ func TestCacheStartup(t *testing.T) {
 			t.Fatalf("Run 返回 %v", err)
 		}
 	})
+}
+
+// ---- 用户账号装配（Plan 11 Task 4） ----
+
+// TestAccountsWiring：启用账号时 /auth/register 可用（非 TLS 监听的会话 cookie 不带 Secure），POST /research
+// 生成的 spec 只含主题与配置的用户模型，任务归属该用户并经 Scheduler 运行到终态；运维 Bearer 能看到它。
+// 用户模型不在白名单中时 Run 在取得任何依赖之前返回错误。
+func TestAccountsWiring(t *testing.T) {
+	model := ModelConfig{BaseURL: "https://m.example/v1", Name: "kimi-k2.6", Models: []string{"kimi-k2.6", "kimi-k3"}}
+	bad := testConfig()
+	bad.Model, bad.Accounts, bad.UserOrchestratorModel, bad.UserWorkerModel = model, true, "gpt-x", "kimi-k2.6"
+	if err := Run(context.Background(), bad, Deps{}); err == nil || !strings.Contains(err.Error(), "gpt-x") {
+		t.Fatalf("用户模型未声明时 Run = %v，期望配置错误", err)
+	}
+
+	h := newHarness(t)
+	cfg := testConfig()
+	cfg.Model, cfg.Accounts, cfg.UserOrchestratorModel, cfg.UserWorkerModel = model, true, "kimi-k3", "kimi-k2.6"
+	cfg.APIToken = "operator-token-0123456789"
+	h.start(cfg, task.SystemClock())
+	base := h.waitAddr()
+	do := func(method, path, body string, hdr map[string]string) (*http.Response, []byte) {
+		t.Helper()
+		req, err := http.NewRequest(method, base+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp, b
+	}
+
+	resp, b := do("POST", "/auth/register", `{"username":"Alice","password":"correct horse"}`, nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /auth/register = %d %s", resp.StatusCode, b)
+	}
+	var session *http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == "agentbox_session" {
+			session = c
+		}
+	}
+	if session == nil || session.Value == "" || session.Secure || !session.HttpOnly {
+		t.Fatalf("会话 cookie = %+v（非 TLS 监听不应带 Secure）", session)
+	}
+	cookie := map[string]string{"Cookie": session.Name + "=" + session.Value}
+	resp, b = do("POST", "/research", `{"request_id":"res-1","topic":"  量子计算的现状  "}`, cookie)
+	var created struct {
+		TaskID string `json:"task_id"`
+	}
+	if resp.StatusCode != http.StatusAccepted || json.Unmarshal(b, &created) != nil || created.TaskID == "" {
+		t.Fatalf("POST /research = %d %s", resp.StatusCode, b)
+	}
+	var spec []byte
+	var owner *int64
+	h.queryRow("SELECT spec_json::text, owner_user_id FROM tasks WHERE task_id = $1", []any{created.TaskID}, &spec, &owner)
+	var got map[string]string
+	if err := json.Unmarshal(spec, &got); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"topic": "量子计算的现状", "orchestrator_model": "kimi-k3", "worker_model": "kimi-k2.6"}
+	if len(got) != len(want) || got["topic"] != want["topic"] || got["orchestrator_model"] != want["orchestrator_model"] ||
+		got["worker_model"] != want["worker_model"] {
+		t.Fatalf("研究 spec = %s，期望 %v", spec, want)
+	}
+	if owner == nil || *owner <= 0 {
+		t.Fatalf("研究任务应归属用户，owner_user_id = %v", owner)
+	}
+	eventually(t, "研究任务到达终态", nil, func() bool {
+		st, _ := h.taskStatus(created.TaskID)
+		return task.IsTerminal(st)
+	})
+	if resp, b := do("GET", "/tasks", "", map[string]string{"Authorization": "Bearer " + cfg.APIToken}); resp.StatusCode != http.StatusOK ||
+		!strings.Contains(string(b), created.TaskID) {
+		t.Fatalf("运维 GET /tasks = %d %s", resp.StatusCode, b)
+	}
+	h.cancel()
+	if err := h.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
 }
