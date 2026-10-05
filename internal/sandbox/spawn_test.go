@@ -3518,11 +3518,11 @@ func (c *checker) checkSecurebits() {
 // checkIDs：resuid/resgid 均为 1000，附加组为空。
 func (c *checker) checkIDs() {
 	var ru, eu, su, rg, eg, sg uint32
-	syscall.RawSyscall(syscall.SYS_GETRESUID, uintptr(unsafe.Pointer(&ru)), uintptr(unsafe.Pointer(&eu)), uintptr(unsafe.Pointer(&su)))
-	syscall.RawSyscall(syscall.SYS_GETRESGID, uintptr(unsafe.Pointer(&rg)), uintptr(unsafe.Pointer(&eg)), uintptr(unsafe.Pointer(&sg)))
+	_, _, eu0 := syscall.RawSyscall(syscall.SYS_GETRESUID, uintptr(unsafe.Pointer(&ru)), uintptr(unsafe.Pointer(&eu)), uintptr(unsafe.Pointer(&su)))
+	_, _, eg0 := syscall.RawSyscall(syscall.SYS_GETRESGID, uintptr(unsafe.Pointer(&rg)), uintptr(unsafe.Pointer(&eg)), uintptr(unsafe.Pointer(&sg)))
 	groups, gerr := syscall.Getgroups()
-	c.check("uid", ru == workloadID && eu == workloadID && su == workloadID, "resuid=%d,%d,%d", ru, eu, su)
-	c.check("gid", rg == workloadID && eg == workloadID && sg == workloadID, "resgid=%d,%d,%d", rg, eg, sg)
+	c.check("uid", eu0 == 0 && ru == workloadID && eu == workloadID && su == workloadID, "resuid=%d,%d,%d errno=%v", ru, eu, su, eu0)
+	c.check("gid", eg0 == 0 && rg == workloadID && eg == workloadID && sg == workloadID, "resgid=%d,%d,%d errno=%v", rg, eg, sg, eg0)
 	st := chkStatus("/proc/self/status")
 	c.check("groups_empty", gerr == nil && len(groups) == 0 && st["Groups"] == "", "getgroups=%v err=%v status.Groups=%q", groups, gerr, st["Groups"])
 }
