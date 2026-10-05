@@ -2,7 +2,7 @@
 
 单执行主机上的 Agent Runtime：Go 负责执行与权限边界，Python 负责研究编排。
 
-> **状态：开发中（v0.2 内部里程碑 M1）。** `agentbox server` 已能在单台 Linux 主机（含 WSL2）上以真实沙箱（命名空间、映射 UID、只读 rootfs 模板、seccomp、降权）运行 sim-worker 任务，见下文"快速开始"；Plan 2 已验收（真实沙箱：WSL2 6.6 x86_64 本地 + CI ubuntu-24.04 x86_64）；**M1 门槛已于 2026-10-05 判定通过**（判定依据与"仅验证可行性"的边界见[计划索引](docs/plans/2026-10-03-m1-index.md)）。下文"已实现"只列出已经通过验收的部分；"这是什么"描述的是设计目标，每项保证在对应验收通过前都不成立。
+> **状态：v0.2 内部里程碑 M1、M2、M3 已通过（2026-10-06），并增加了面向用户的账号体系。** `agentbox server` 已能在单台 Linux 主机（含 WSL2）上以真实沙箱（命名空间、映射 UID、只读 rootfs 模板、seccomp、降权）运行 sim-worker 任务，见下文"快速开始"；Plan 2 已验收（真实沙箱：WSL2 6.6 x86_64 本地 + CI ubuntu-24.04 x86_64）；**M1 门槛 2026-10-05、M2 与 M3 门槛 2026-10-06 判定通过**（判定依据与"仅验证可行性"的边界见 [M1](docs/plans/2026-10-03-m1-index.md)、[M2](docs/plans/2026-10-05-m2-index.md)、[M3](docs/plans/2026-10-05-m3-index.md) 计划索引）；M2/M3 的真实模型演示在腾讯云上海 CVM（原生 Linux）上执行。下文"已实现"只列出已经通过验收的部分；"这是什么"描述的是设计目标，每项保证在对应验收通过前都不成立。
 
 ---
 
@@ -19,9 +19,11 @@
 | 沙箱生产启动器、init 环境建立、stage-2 helper、启用 server（Plan 2 Task 9–13） | **已验收**（Plan 2 联合验收，2026-10-05） | `local.NewProcessStarter`；首个切片、E1–E5（E5 为物理回收部分）、E7、E8、E10 与累计运行时限跨重启，在真实沙箱中以 root 通过（`tests/e2e` 的 `TestReal*`） |
 | Gateway：每 attempt 的 Unix socket 入口、调用 journal 与 task 层预算、OpenAI 兼容 chat / 搜索 / 抓取 adapter、SSRF 验证 dialer、启动账本转换（M2 Plan 7） | **已验收**（2026-10-05） | `internal/gateway/{edge,call,upstream}`；E11b、E17–E20、E48、I3、I14（journal）；供应商 Key 只在宿主进程内，沙箱中不可见（G3，真实沙箱验证） |
 | Worker SDK Gateway 客户端与 DeepResearch 接入（M2 Plan 8 Task 1–5） | **已验收**（以 fake upstream 自动化验收） | `worker/agentbox_worker/gateway.py`、`worker/deepresearch`（零运行时依赖）；计划 → 检索 → 阅读 → 总结 → 报告，checkpoint 可恢复，引用对应已保存证据 blob |
-| 真实模型研究演示（M2 Plan 8 Task 6） | 演示脚本已就绪（演练通过）；真实模型运行待执行 | `scripts/demo-m2.sh`（见"真实研究演示"）；真实运行默认使用 Moonshot（编排 `kimi-k3`、worker `kimi-k2.6`），需要 `AGENTBOX_MODEL_API_KEY` |
-| Redis 共享缓存与调用合并（M3 Plan 9） | 实现中（待 M3 联合验收） | `internal/gateway/cache`；`--redis-addr`、`--cache` |
-| 下载端点与 Vue 工作台（M3 Plan 10） | 实现中（自动化测试通过；浏览器联调待在演示服务器上执行） | `GET /tasks/{id}/result`、产物下载；`web/`（Vite + Vue 3），由 `agentbox server --web-dir` 同源提供，见"工作台" |
+| 真实模型研究演示（M2 Plan 8 Task 6） | **已验收**（2026-10-06，[演示记录](docs/evidence/2026-10-06-m2-demo-run.md)） | `scripts/demo-m2.sh`（见"真实研究演示"）；真实运行默认使用 Moonshot（编排 `kimi-k3`、worker `kimi-k2.6`），需要 `AGENTBOX_MODEL_API_KEY` |
+| Redis 共享缓存与调用合并（M3 Plan 9） | **已验收**（2026-10-06） | `internal/gateway/cache`；`--redis-addr`、`--cache` |
+| 下载端点与 Vue 工作台（M3 Plan 10） | **已验收**（2026-10-06，[服务器验收](docs/evidence/2026-10-06-m3-server-acceptance.md)） | `GET /tasks/{id}/result`、产物下载；`web/`（Vite + Vue 3），由 `agentbox server --web-dir` 同源提供，见"工作台" |
+| 用户账号与 DeepResearch 助手（M3 Plan 11） | **已验收**（2026-10-06，[账号验收](docs/evidence/2026-10-06-m3-accounts.md)） | 开放注册、服务端会话、用户只见自己的研究、内部细节仅运维可见；`internal/account`、`/auth/*`、`POST /research`、`agentbox user` |
+| 搜索供应商 serper（Google 结果）与按端点的调用期限 | **已验收**（2026-10-06） | `--search-provider serper`；`--call-deadline`（120 s）、`--model-call-deadline`（300 s） |
 | 会话、exec 沙箱、sub-run | 未开始 | M4 |
 
 ## 现在可以运行的命令
@@ -154,7 +156,7 @@ npm run build          # vue-tsc 类型检查 + vite build → web/dist
 
 开发检查（与 CI 的 `web` 作业相同）：`npm run lint`、`npm run typecheck`、`npm test`（Vitest），以及 `npm run gen:api`——从 `api/openapi.yaml` 重新生成 `web/src/api/schema.d.ts`，CI 要求生成结果与提交的文件一致。
 
-**启动**（待在演示服务器上执行）：在快速开始第 4 步的 server 命令后加 `--web-dir <仓库>/web/dist`，然后在浏览器中打开 `http://127.0.0.1:8080/`。API 路径（`/status`、`/tasks/...`）仍由 API 处理；其余路径从该目录提供静态文件，无扩展名的未知路径回退到 `index.html`（工作台用 `#/tasks/...` 哈希路由）。演示脚本可设置 `AGENTBOX_DEMO_WEB_DIR=<仓库>/web/dist` 让演示期间的 server 同时提供工作台。
+**启动**（已在演示服务器上执行）：在快速开始第 4 步的 server 命令后加 `--web-dir <仓库>/web/dist`，然后在浏览器中打开 `http://127.0.0.1:8080/`。API 路径（`/status`、`/tasks/...`）仍由 API 处理；其余路径从该目录提供静态文件，无扩展名的未知路径回退到 `index.html`（工作台用 `#/tasks/...` 哈希路由）。演示脚本可设置 `AGENTBOX_DEMO_WEB_DIR=<仓库>/web/dist` 让演示期间的 server 同时提供工作台。
 
 ```bash
 sudo sh -c 'set -a; . deploy/agentbox.env.example; exec ./bin/agentbox server $AGENTBOX_SERVER_FLAGS --web-dir "$PWD/web/dist"'
@@ -162,7 +164,7 @@ sudo sh -c 'set -a; . deploy/agentbox.env.example; exec ./bin/agentbox server $A
 
 **token**：打开工作台后在入口页输入 API token（`<data>/api.token` 的内容）。token 默认只保存在页面内存中（刷新即需重新输入），可选择保存到本标签页的 `sessionStorage`；从不写入 `localStorage`、URL 或构建产物，只放在请求的 `Authorization: Bearer` 头中。server 未配置 `api.token` 时（只允许 loopback 监听）可选择"无 token 继续"。
 
-**远程访问**（待在演示服务器上执行）：server 保持监听 `127.0.0.1:8080`，从本机经 SSH 隧道访问，然后在本机浏览器打开 `http://127.0.0.1:8080/`：
+**远程访问**（已在演示服务器上执行）：server 保持监听 `127.0.0.1:8080`，从本机经 SSH 隧道访问，然后在本机浏览器打开 `http://127.0.0.1:8080/`：
 
 ```bash
 ssh -L 8080:127.0.0.1:8080 ubuntu@<server>
@@ -174,6 +176,26 @@ ssh -L 8080:127.0.0.1:8080 ubuntu@<server>
 - 所有响应带 `Content-Security-Policy`、`X-Content-Type-Options: nosniff` 与 `Referrer-Policy: no-referrer`；访问日志不记录请求头与查询串。
 - 报告 Markdown 经 `marked` 渲染后由 DOMPurify 清洗（去除脚本、事件属性、`javascript:` 链接、`iframe`/`object`/`style` 等）再插入页面；`text/html`、`image/svg+xml` 等主动内容只下载、不内联。
 - 优先用 SSH 隧道。若直接监听非 loopback 地址，须有 `<data>/api.token`（0600）与 `--allowed-host`，并经 TLS 访问（`--tls-cert`/`--tls-key` 或外部 TLS 终止）；未启用 TLS 时 server 在启动时警告 token 会以明文传输。
+
+### DeepResearch 助手（用户侧，M3 Plan 11）
+
+配置了模型上游（`--model-base-url`）时，server 启用用户账号，浏览器打开站点根路径即是面向用户的研究助手：
+
+1. **注册 / 登录**：用户名 3–32 位字母、数字、`_`、`.`、`-`；密码 8–128 个字符。会话保存在 `HttpOnly; Secure; SameSite=Strict` cookie 中，有效期 7 天。
+2. **新研究**：只需输入研究主题。模型、搜索与预算由 server 固定（编排 `--user-orchestrator-model`，默认 `kimi-k3`；worker `--user-worker-model`，默认 `kimi-k2.6`）。每个用户同一时间最多 1 个进行中的研究。
+3. **我的研究**：只列出自己的研究；进度按"计划 → 子任务 → 报告"显示；完成后在页面中阅读报告（安全渲染）并下载。
+
+用户看不到 API Key、token、预算、模型、费用或调用明细（事件流与任务视图在服务端按允许列表脱敏）；他人的研究一律返回"不存在"。注册与登录按 IP 限速，登录失败不区分"用户不存在"与"密码错误"；密码以 PBKDF2-SHA256（600,000 次迭代，标准库 `crypto/pbkdf2`）存储。
+
+**运维**：工作台移到 `#/admin`，仍使用 `<data>/api.token`（启用账号时运维调用必须带有效 Bearer token）。账号管理直接连数据库（已在演示服务器上执行）：
+
+```bash
+sudo AGENTBOX_DATABASE_URL=... agentbox user list
+sudo AGENTBOX_DATABASE_URL=... agentbox user disable <username>   # 同时吊销其全部会话
+sudo AGENTBOX_DATABASE_URL=... agentbox user enable <username>
+```
+
+演示服务器的常驻服务见 `deploy/systemd/agentbox-demo.service`（HTTPS 443、自签证书、serper、Redis、4C8G 资源与预算上限）。
 
 ## 文档
 
