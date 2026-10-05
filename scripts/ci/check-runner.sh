@@ -27,4 +27,30 @@ rm -rf "$tmp"
 
 unshare --mount --pid --uts --ipc --net --fork true || fail "无法创建 mount/pid/uts/ipc/net namespace"
 
+unshare --user true || fail "无法创建 user namespace"
+
+# 新挂载 API 与 close_range：用 python3 ctypes 直接发系统调用（号段 x86_64/aarch64 相同）。
+python3 - <<'PY' || fail "新挂载 API（open_tree/mount_setattr）或 close_range 不可用"
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+AT_FDCWD, OPEN_TREE_CLONE, OPEN_TREE_CLOEXEC, AT_EMPTY_PATH = -100, 1, 0x80000, 0x1000
+ENOSYS, EPERM = 38, 1
+
+fd = libc.syscall(428, AT_FDCWD, b"/", OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC)
+if fd < 0:
+    print("open_tree 失败: errno=%d" % ctypes.get_errno(), file=sys.stderr); sys.exit(1)
+os.close(fd)
+
+ctypes.set_errno(0)
+libc.syscall(442, -1, b"", AT_EMPTY_PATH, None, 0)  # 非法参数：只区分存在与否
+if ctypes.get_errno() in (ENOSYS, EPERM):
+    print("mount_setattr 不可用: errno=%d" % ctypes.get_errno(), file=sys.stderr); sys.exit(1)
+
+ctypes.set_errno(0)
+r = libc.syscall(436, 2, 1, 0)  # 空区间，不关闭任何 fd
+if r < 0 and ctypes.get_errno() in (ENOSYS, EPERM):
+    print("close_range 不可用: errno=%d" % ctypes.get_errno(), file=sys.stderr); sys.exit(1)
+PY
+
 echo "runner 条件满足"

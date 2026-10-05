@@ -30,6 +30,13 @@ func main() {
 
 	if len(os.Args) > 1 && os.Args[1] == "doctor" {
 		r := hostcheck.Check()
+		for _, it := range r.Items {
+			status := "通过"
+			if !it.OK {
+				status = "失败"
+			}
+			fmt.Printf("[%s] %s：%s\n", status, it.Name, it.Detail)
+		}
 		if err := r.Err(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)

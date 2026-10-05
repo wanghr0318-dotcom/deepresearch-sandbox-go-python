@@ -23,6 +23,25 @@ type Report struct {
 	CgroupV2   bool
 	CgroupRoot string
 	Problems   []string
+	// Items 是逐项检查结果（名称、是否通过、原因），供 agentbox doctor 逐项输出。
+	Items []Item
+}
+
+// Item 是一项宿主能力检查的结果。
+type Item struct {
+	Name   string
+	OK     bool
+	Detail string
+}
+
+// probes 是需要实际调用内核探测的能力检查；测试中可替换。
+var probes = []struct {
+	name string
+	run  func() (bool, string)
+}{
+	{"新挂载 API（open_tree/mount_setattr）", probeNewMountAPI},
+	{"close_range", probeCloseRange},
+	{"user namespace 可创建", probeUserNS},
 }
 
 // Check 对当前宿主机做一次自检。
@@ -48,8 +67,19 @@ func Check() Report {
 	var problems []string
 	r.CgroupV2, problems = checkCgroup(r.CgroupRoot, release, checkCgroupV2)
 	r.Problems = append(r.Problems, problems...)
+	cgDetail := "cgroup v2、cgroup.kill（内核 ≥ 5.14）与必需控制器可用；内核 " + release
+	if len(problems) > 0 {
+		cgDetail = strings.Join(problems, "；")
+	}
+	r.Items = append(r.Items, Item{"cgroup v2", r.CgroupV2 && len(problems) == 0, cgDetail})
 
-	// 挂载方式相关的前置条件（规格不再使用 overlayfs）待 Plan 1B 确定后补充。
+	for _, p := range probes {
+		ok, detail := p.run()
+		r.Items = append(r.Items, Item{p.name, ok, detail})
+		if !ok {
+			r.Problems = append(r.Problems, p.name+" 检查未通过："+detail)
+		}
+	}
 	return r
 }
 

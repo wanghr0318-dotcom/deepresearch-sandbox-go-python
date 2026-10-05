@@ -5,6 +5,7 @@ package hostcheck
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
@@ -77,5 +78,43 @@ func TestCheck_SuccessPath(t *testing.T) {
 	}
 	if !r.CgroupV2 {
 		t.Error("Report.CgroupV2 = false, want true")
+	}
+}
+
+// TestProbes_RootHost 在 root 下实际调用内核：三项能力都应可用（CI 与 WSL2 验收环境）。
+func TestProbes_RootHost(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+	for _, p := range probes {
+		ok, detail := p.run()
+		if !ok {
+			t.Errorf("%s 不可用：%s", p.name, detail)
+		}
+		if detail == "" {
+			t.Errorf("%s 的 detail 不应为空", p.name)
+		}
+	}
+}
+
+// TestCheck_FailedProbeBecomesProblem 失败的探测必须进入 Problems 与 Items，且带原因。
+func TestCheck_FailedProbeBecomesProblem(t *testing.T) {
+	saved := probes
+	defer func() { probes = saved }()
+	probes = []struct {
+		name string
+		run  func() (bool, string)
+	}{{"假能力", func() (bool, string) { return false, "ENOSYS" }}}
+
+	r := Check()
+	var found bool
+	for _, it := range r.Items {
+		if it.Name == "假能力" && !it.OK && it.Detail == "ENOSYS" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Items 中缺少失败的假能力：%+v", r.Items)
+	}
+	if err := r.Err(); err == nil || !strings.Contains(err.Error(), "假能力") || !strings.Contains(err.Error(), "ENOSYS") {
+		t.Fatalf("Err() 应包含能力名与原因，实际 %v", err)
 	}
 }

@@ -39,8 +39,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: build (linux)
-        run: go build ./...
+      - name: build (linux，生产二进制 CGO_ENABLED=0)
+        run: CGO_ENABLED=0 go build ./...
       - name: build (windows，开发机平台)
         run: GOOS=windows go build ./...
       - name: gofmt
@@ -98,14 +98,20 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: 验证 runner 能力（cgroup v2、挂载、namespace）
+      - name: 验证 runner 能力（cgroup v2、挂载、namespace、新挂载 API、close_range）
         run: sudo bash scripts/ci/check-runner.sh
+      # 生产二进制与 helper 固定 CGO_ENABLED=0（静态、无 libc 线程初始化）；doctor 逐项输出宿主能力。
+      # correctness 作业的 -race 需要 cgo，保持默认，不受此约束。
+      - name: 构建生产二进制（CGO_ENABLED=0）并运行 doctor
+        run: |
+          CGO_ENABLED=0 go build -o bin/agentbox ./cmd/agentbox
+          sudo ./bin/agentbox doctor
       # go test 的退出码是主判据；citestjson 只补充检查 skip、中断与执行数量，不能替代退出码。
       # 两者都先执行完（以便都留下诊断输出），最后一起判定。
       - name: root 测试与判定
         run: |
           set +e
-          sudo -E env "PATH=$PATH" go test -json -count=1 ./... > test.json
+          sudo -E env "PATH=$PATH" CGO_ENABLED=0 go test -json -count=1 ./... > test.json
           test_exit=$?
           go run ./tools/citestjson test.json scripts/ci/allowed-skips.txt
           judge_exit=$?
