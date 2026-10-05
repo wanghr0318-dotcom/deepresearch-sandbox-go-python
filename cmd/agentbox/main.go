@@ -59,6 +59,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "verify-invariants" {
 		os.Exit(runVerify(os.Args[2:], os.Stdout, os.Stderr))
 	}
-	fmt.Fprintln(os.Stderr, "用法: agentbox doctor | server ... | verify-invariants [--quiescent] ... | task ... | status")
+	if len(os.Args) > 1 && os.Args[1] == "cache" {
+		os.Exit(runCache(os.Args[2:], os.Stdout, os.Stderr))
+	}
+	fmt.Fprintln(os.Stderr, "用法: agentbox doctor | server ... | verify-invariants [--quiescent] ... | cache rotate-key --data-dir DIR | task ... | status")
 	os.Exit(2)
 }
