@@ -68,8 +68,8 @@ func rawForkExecveat(a *forkArgs, oldmask *uint64) (pid uintptr, errno syscall.E
 	}
 	r1, _, e := syscall.RawSyscall6(syscall.SYS_CLONE, uintptr(syscall.SIGCHLD), 0, 0, 0, 0, 0)
 	if e != 0 || r1 != 0 {
-		// 父进程（或 clone 失败）：恢复掩码。
-		syscall.RawSyscall6(syscall.SYS_RT_SIGPROCMASK, sigSetmask, uintptr(unsafe.Pointer(oldmask)), 0, 8, 0, 0)
+		// 父进程（或 clone 失败）：恢复掩码。参数在上面已验证可用，恢复失败无可补救，返回 clone 的结果。
+		_, _, _ = syscall.RawSyscall6(syscall.SYS_RT_SIGPROCMASK, sigSetmask, uintptr(unsafe.Pointer(oldmask)), 0, 8, 0, 0)
 		return r1, e
 	}
 
@@ -85,7 +85,8 @@ func rawForkExecveat(a *forkArgs, oldmask *uint64) (pid uintptr, errno syscall.E
 		step = childStepSetpgid
 		goto fail
 	}
-	syscall.RawSyscall6(syscall.SYS_RT_SIGPROCMASK, sigSetmask, uintptr(unsafe.Pointer(&a.empty)), 0, 8, 0, 0)
+	// 清空掩码：与上面相同的合法参数不会失败；子进程中无法再做任何处理，继续 execveat。
+	_, _, _ = syscall.RawSyscall6(syscall.SYS_RT_SIGPROCMASK, sigSetmask, uintptr(unsafe.Pointer(&a.empty)), 0, 8, 0, 0)
 	_, _, e = syscall.RawSyscall6(a.execveat, a.dirfd, uintptr(unsafe.Pointer(a.path)),
 		uintptr(unsafe.Pointer(a.argv)), uintptr(unsafe.Pointer(a.envv)), atEmptyPath, 0)
 	step = childStepExecveat
@@ -98,9 +99,10 @@ fail:
 		buf[3] = byte(e >> 8)
 		buf[4] = byte(e >> 16)
 		buf[5] = byte(e >> 24)
-		syscall.RawSyscall(syscall.SYS_WRITE, uintptr(a.fds[3]), uintptr(unsafe.Pointer(&buf[0])), childRecordLen)
+		// 尽力写出失败记录；写失败时父进程读到 EOF 无字节，由 reaper 的 wait 状态（exit 127）归为 died_before_exec。
+		_, _, _ = syscall.RawSyscall(syscall.SYS_WRITE, uintptr(a.fds[3]), uintptr(unsafe.Pointer(&buf[0])), childRecordLen)
 		for {
-			syscall.RawSyscall(syscall.SYS_EXIT_GROUP, 127, 0, 0)
+			_, _, _ = syscall.RawSyscall(syscall.SYS_EXIT_GROUP, 127, 0, 0) // 不返回
 		}
 	}
 }
