@@ -19,15 +19,159 @@ info:
     request body (sorted keys, no whitespace; control requests also include the task id and the
     action). The same `request_id` with the same content returns the first result; different content
     returns 409 `request_conflict`.
+
+    User accounts (M3): when the server enables accounts, `/auth/*` and `/research` are served and a
+    second credential is accepted, the `agentbox_session` cookie (`HttpOnly; SameSite=Strict; Path=/`,
+    plus `Secure` on a TLS listener; valid 7 days, not renewed). A request with an `Authorization`
+    header is judged by the Bearer token only (wrong token is 401, never a fallback to the cookie);
+    the Bearer caller is the operator and keeps full access. Otherwise the session cookie identifies a
+    user. Anonymous callers may use only `POST /auth/register`, `POST /auth/login`, `GET /status` and
+    static files; everything else is 401 `unauthorized`. A user may call `POST /research`, `GET /tasks`
+    (own tasks only), `GET /tasks/{id}`, `/events`, `/result`, `/artifacts/...` and
+    `POST /tasks/{id}/cancel`; another user's task, an unowned task and a missing task all answer the
+    same 404 `task_not_found`. Every other operation answers a user with 403 `forbidden`, and the
+    session-only operations (`/auth/logout`, `/auth/me`, `/research`) answer the operator with 403
+    `forbidden`. Register and login are rate limited per client IP (5 and 10 per minute; 429
+    `rate_limited`). Without accounts only the Bearer token applies, exactly as above.
 servers:
   - url: http://127.0.0.1:8080
 security:
   - bearerAuth: []
+  - cookieAuth: []
 paths:
+  /auth/register:
+    post:
+      operationId: register
+      summary: Create a user account and sign in (anonymous; rate limited per IP)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Credentials'}
+      responses:
+        '201':
+          description: Account created; the response sets the `agentbox_session` cookie
+          headers:
+            Set-Cookie:
+              description: '`agentbox_session=...; Path=/; Max-Age=604800; HttpOnly; SameSite=Strict` (plus `Secure` on TLS)'
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/User'}
+        '400':
+          description: '`invalid_request`, `invalid_username` (3–32 of `[A-Za-z0-9_.-]`) or `invalid_password` (8–128 characters)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409':
+          description: '`username_taken`: the username is taken (case-insensitive)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /auth/login:
+    post:
+      operationId: login
+      summary: Sign in (anonymous; rate limited per IP)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Credentials'}
+      responses:
+        '200':
+          description: Signed in; the response sets the `agentbox_session` cookie
+          headers:
+            Set-Cookie:
+              description: '`agentbox_session=...; Path=/; Max-Age=604800; HttpOnly; SameSite=Strict` (plus `Secure` on TLS)'
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/User'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401':
+          description: '`invalid_credentials`: the same body for an unknown user, a wrong password and a disabled account; or `unauthorized` (wrong Bearer token)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /auth/logout:
+    post:
+      operationId: logout
+      summary: Sign out (deletes the session; session only)
+      security:
+        - cookieAuth: []
+      responses:
+        '204':
+          description: Session deleted; the response clears the cookie (`Max-Age=0`)
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /auth/me:
+    get:
+      operationId: me
+      summary: The signed-in user (session only)
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: The user
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/User'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /research:
+    post:
+      operationId: createResearch
+      summary: Start a research task on a topic (session only; idempotent by request_id)
+      description: |
+        The server builds the task spec from the topic (fixed orchestrator and worker models and search
+        configuration) and applies the server's default limits; the user cannot choose models, budget or
+        limits. The task is owned by the user. A user may have at most one non-terminal task at a time.
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ResearchRequest'}
+      responses:
+        '202':
+          description: Research task created, or the first result of the same request replayed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CreateTaskResult'}
+        '400':
+          description: '`invalid_request`; or `invalid_topic`: the trimmed topic is empty or longer than 500 characters'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409':
+          description: '`user_task_running`: the user already has a non-terminal task; or `request_conflict`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
   /status:
     get:
       operationId: getStatus
-      summary: Health and service mode
+      summary: Health and service mode (anonymous when accounts are enabled)
       responses:
         '200':
           description: Current mode
@@ -275,7 +419,12 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: Required when the server binds a non-loopback address. Never put the token in a URL.
+      description: The operator credential. Required when the server binds a non-loopback address. Never put the token in a URL.
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: agentbox_session
+      description: A user session (accounts enabled), set by `/auth/register` and `/auth/login`. Ignored when an `Authorization` header is present.
   parameters:
     TaskID:
       name: id
@@ -336,17 +485,22 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
     Unauthorized:
-      description: '`unauthorized`: missing or wrong Bearer token'
+      description: '`unauthorized`: missing or wrong Bearer token, or (accounts enabled) no valid session'
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
     Forbidden:
-      description: '`forbidden_host` or `forbidden_origin`: Host or Origin is not in the allowlist'
+      description: '`forbidden_host` or `forbidden_origin`: Host or Origin is not in the allowlist; or `forbidden` (accounts enabled): the operation is not open to this kind of caller (operator-only for a user, session-only for the operator)'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    RateLimited:
+      description: '`rate_limited`: too many attempts from this client IP'
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
     NotFound:
-      description: '`task_not_found`'
+      description: '`task_not_found` (for a user also: another user''s task or an unowned task)'
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
@@ -400,6 +554,26 @@ components:
             error: {type: integer}
             breaker_open: {type: integer}
             integrity_failure: {type: integer}
+    Credentials:
+      type: object
+      additionalProperties: false
+      required: [username, password]
+      properties:
+        username: {type: string, minLength: 3, maxLength: 32, pattern: '^[A-Za-z0-9_.-]+$'}
+        password: {type: string, minLength: 8, maxLength: 128}
+    User:
+      type: object
+      required: [username, role]
+      properties:
+        username: {type: string}
+        role: {type: string, enum: [user, admin]}
+    ResearchRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id, topic]
+      properties:
+        request_id: {type: string, minLength: 1, maxLength: 128}
+        topic: {type: string, minLength: 1, maxLength: 500, description: Trimmed of surrounding whitespace before validation}
     CreateTaskRequest:
       type: object
       additionalProperties: false

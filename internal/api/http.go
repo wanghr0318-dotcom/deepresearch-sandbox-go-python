@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -23,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/account"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/jcs"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 )
@@ -91,21 +91,32 @@ type Config struct {
 	// CacheMetrics 可选：返回 Gateway 共享缓存的指标（规格 §11.5），由 GET /status 的 cache 字段给出；
 	// nil 或返回 nil（缓存关闭）时省略该字段。
 	CacheMetrics func() map[string]int64
+
+	Accounts Accounts // nil 时不提供 /auth/* 与 /research（只有运维 Bearer）
+	// ResearchSpec 由主题生成用户研究的 spec（server 固定模型与搜索配置）。
+	ResearchSpec  func(topic string) (json.RawMessage, error)
+	SecureCookies bool             // TLS 监听时为 true
+	Now           func() time.Time // 测试注入；nil 为 time.Now
 }
 
 // Handler 实现 api/openapi.yaml 描述的 REST 与 SSE 接口。
 type Handler struct {
-	cfg     Config
-	token   []byte
-	hosts   map[string]bool
-	origins map[string]bool
-	mux     *http.ServeMux
+	cfg           Config
+	token         []byte
+	hosts         map[string]bool
+	origins       map[string]bool
+	prefixes      map[string]bool // 保留给 API 的首段路径，见 isAPIPath
+	mux           *http.ServeMux
+	registerLimit *account.Limiter // 启用账号时每 IP 的注册限速
+	loginLimit    *account.Limiter // 启用账号时每 IP 的登录限速
 }
 
 // route 是一个已实现的操作。statuses 是该操作可能返回的状态码集合，须与 openapi.yaml 一致。
+// audience 只在启用账号时起作用。
 type route struct {
 	method, path string
 	access       access
+	audience     audience
 	statuses     []int
 	handle       func(h *Handler, w http.ResponseWriter, r *http.Request)
 }
@@ -128,18 +139,18 @@ var (
 
 // routes 是已实现操作的唯一列表；测试据此与 openapi.yaml 比对。
 var routes = []route{
-	{"GET", "/status", accessDiagnostic, []int{200, 401, 403}, (*Handler).getStatus},
-	{"GET", "/tasks", accessRead, []int{200, 400, 401, 403, 500, 503}, (*Handler).listTasks},
-	{"POST", "/tasks", accessWrite, []int{201, 400, 401, 403, 409, 500, 503}, (*Handler).createTask},
-	{"GET", "/tasks/{id}", accessRead, readStatuses, (*Handler).getTask},
-	{"POST", "/tasks/{id}/cancel", accessWrite, controlStatuses, control("cancel")},
-	{"POST", "/tasks/{id}/pause", accessWrite, controlStatuses, control("pause")},
-	{"POST", "/tasks/{id}/resume", accessWrite, controlStatuses, control("run")},
-	{"GET", "/tasks/{id}/events", accessRead, []int{200, 400, 401, 403, 404, 500, 503}, (*Handler).streamEvents},
-	{"GET", "/tasks/{id}/result", accessRead, resultStatuses, (*Handler).getResult},
-	{"GET", "/tasks/{id}/artifacts/{artifact_id}", accessRead, blobStatuses, (*Handler).getArtifact},
-	{"GET", "/tasks/{id}/artifacts/{artifact_id}/versions/{v}", accessRead, blobStatuses, (*Handler).getArtifact},
-	{"GET", "/tasks/{id}/inspect", accessDiagnostic, readStatuses, (*Handler).inspect},
+	{"GET", "/status", accessDiagnostic, audienceAnyone, []int{200, 401, 403}, (*Handler).getStatus},
+	{"GET", "/tasks", accessRead, audienceList, []int{200, 400, 401, 403, 500, 503}, (*Handler).listTasks},
+	{"POST", "/tasks", accessWrite, audienceAdmin, []int{201, 400, 401, 403, 409, 500, 503}, (*Handler).createTask},
+	{"GET", "/tasks/{id}", accessRead, audienceTask, readStatuses, (*Handler).getTask},
+	{"POST", "/tasks/{id}/cancel", accessWrite, audienceTask, controlStatuses, control("cancel")},
+	{"POST", "/tasks/{id}/pause", accessWrite, audienceAdmin, controlStatuses, control("pause")},
+	{"POST", "/tasks/{id}/resume", accessWrite, audienceAdmin, controlStatuses, control("run")},
+	{"GET", "/tasks/{id}/events", accessRead, audienceTask, []int{200, 400, 401, 403, 404, 500, 503}, (*Handler).streamEvents},
+	{"GET", "/tasks/{id}/result", accessRead, audienceTask, resultStatuses, (*Handler).getResult},
+	{"GET", "/tasks/{id}/artifacts/{artifact_id}", accessRead, audienceTask, blobStatuses, (*Handler).getArtifact},
+	{"GET", "/tasks/{id}/artifacts/{artifact_id}/versions/{v}", accessRead, audienceTask, blobStatuses, (*Handler).getArtifact},
+	{"GET", "/tasks/{id}/inspect", accessDiagnostic, audienceAdmin, readStatuses, (*Handler).inspect},
 }
 
 // New 校验访问配置并构造处理器。
@@ -211,10 +222,31 @@ func New(cfg Config) (*Handler, error) {
 	if h.cfg.NewTaskID == nil {
 		h.cfg.NewTaskID = randomTaskID
 	}
-	for _, rt := range routes {
+	active := routes
+	if cfg.Accounts != nil {
+		if cfg.ResearchSpec == nil {
+			return nil, errors.New("api: 启用账号（Accounts）需要 ResearchSpec")
+		}
+		active = allRoutes()
+		h.registerLimit = account.NewLimiter(registerPerMinute, h.now)
+		h.loginLimit = account.NewLimiter(loginPerMinute, h.now)
+	}
+	h.prefixes = map[string]bool{"events": true}
+	for _, rt := range active {
+		seg, _, _ := strings.Cut(strings.TrimPrefix(rt.path, "/"), "/")
+		h.prefixes[seg] = true
 		h.mux.HandleFunc(rt.method+" "+rt.path, func(w http.ResponseWriter, r *http.Request) {
+			if h.cfg.Accounts != nil {
+				var ok bool
+				if r, ok = h.authorize(w, r, rt.audience); !ok {
+					return
+				}
+			}
 			if code, msg, ok := h.modeAllows(rt.access); !ok {
 				writeError(w, http.StatusServiceUnavailable, code, msg)
+				return
+			}
+			if h.cfg.Accounts != nil && rt.audience == audienceTask && !h.ownsTask(w, r) {
 				return
 			}
 			rt.handle(h, w, r)
@@ -271,24 +303,15 @@ var securityHeaders = map[string]string{
 	"Referrer-Policy":        "no-referrer",
 }
 
-// apiPrefixes 是保留给 API 的首段路径（routes 的首段，加上为 SSE 保留的 events）：这些路径总由 API
+// isAPIPath 报告路径是否保留给 API：首段是已注册操作的首段，或为 SSE 保留的 events。这些路径总由 API
 // 处理（未知端点为 JSON 404），从不由静态文件或 SPA 回退应答。
-var apiPrefixes = func() map[string]bool {
-	m := map[string]bool{"events": true}
-	for _, rt := range routes {
-		seg, _, _ := strings.Cut(strings.TrimPrefix(rt.path, "/"), "/")
-		m[seg] = true
-	}
-	return m
-}()
-
-func isAPIPath(p string) bool {
+func (h *Handler) isAPIPath(p string) bool {
 	seg, _, _ := strings.Cut(strings.TrimPrefix(path.Clean("/"+p), "/"), "/")
-	return apiPrefixes[seg]
+	return h.prefixes[seg]
 }
 
 // ServeHTTP 依次校验 Host、Origin 与 token，再分派到操作。访问日志只记录方法、路径、状态与耗时：
-// 不记录任何请求头（包括 Authorization）与查询串。
+// 不记录任何请求头（包括 Authorization 与 Cookie）与查询串。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	sw := &statusWriter{ResponseWriter: w}
@@ -308,7 +331,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden_host", "Host 不在允许列表中")
 		return
 	}
-	if h.cfg.WebDir != "" && !isAPIPath(r.URL.Path) {
+	if h.cfg.WebDir != "" && !h.isAPIPath(r.URL.Path) {
 		h.serveStatic(w, r)
 		return
 	}
@@ -326,13 +349,17 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if h.token != nil {
-		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !ok || subtle.ConstantTimeCompare([]byte(got), h.token) != 1 {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="agentbox"`)
-			writeError(w, http.StatusUnauthorized, "unauthorized", "缺少或无效的 Bearer token")
+	if h.cfg.Accounts == nil {
+		if !h.checkBearer(w, r) { // 只有运维 token：每个请求都须携带
 			return
 		}
+	} else if _, present := r.Header["Authorization"]; present {
+		// 启用账号：有 Authorization 头时只按 Bearer 判定（无效即 401，不回退到 cookie）；其余由操作的
+		// audience 在 authorize 中判定（会话 cookie 或匿名）。
+		if !h.checkBearer(w, r) {
+			return
+		}
+		r = r.WithContext(withPrincipal(r.Context(), principal{admin: true}))
 	}
 	h.mux.ServeHTTP(w, r)
 }
@@ -497,18 +524,25 @@ func rejectedMessage(rej *persistence.RejectedError) string {
 
 // decodeBody 严格解码 JSON 请求体（拒绝未知字段与多余内容）。
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
+	msg, ok := readJSON(w, r, v)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_request", msg)
+	}
+	return ok
+}
+
+// readJSON 严格解码 JSON 请求体；失败时返回带解码细节的消息（不写响应）。
+func readJSON(w http.ResponseWriter, r *http.Request, v any) (string, bool) {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	dec.DisallowUnknownFields()
 	dec.UseNumber()
 	if err := dec.Decode(v); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "请求体不是合法的 JSON 对象: "+err.Error())
-		return false
+		return "请求体不是合法的 JSON 对象: " + err.Error(), false
 	}
 	if _, err := dec.Token(); err != io.EOF {
-		writeError(w, http.StatusBadRequest, "invalid_request", "请求体只能包含一个 JSON 对象")
-		return false
+		return "请求体只能包含一个 JSON 对象", false
 	}
-	return true
+	return "", true
 }
 
 func validRequestID(w http.ResponseWriter, id string) bool {
@@ -570,7 +604,14 @@ func (h *Handler) listTasks(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = n
 	}
-	views, next, err := h.cfg.Store.ListTasks(r.Context(), q.Get("after"), limit)
+	var views []TaskView
+	var next string
+	var err error
+	if p, ok := principalFrom(r.Context()); ok && !p.admin {
+		views, next, err = h.cfg.Accounts.ListTasksByOwner(r.Context(), p.user.ID, q.Get("after"), limit)
+	} else {
+		views, next, err = h.cfg.Store.ListTasks(r.Context(), q.Get("after"), limit)
+	}
 	if err != nil {
 		writeStoreError(w, err)
 		return

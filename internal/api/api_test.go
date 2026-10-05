@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/account"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 )
 
@@ -382,7 +383,7 @@ func (ts *testServer) do(method, path, body string, hdr map[string]string) (int,
 func (ts *testServer) checkDeclared(req *http.Request, status int) {
 	ts.t.Helper()
 	_, pattern := ts.h.mux.Handler(req)
-	for _, rt := range routes {
+	for _, rt := range allRoutes() {
 		if rt.method+" "+rt.path == pattern {
 			if !slices.Contains(rt.statuses, status) {
 				ts.t.Errorf("%s 返回了未在契约中声明的状态码 %d", pattern, status)
@@ -461,7 +462,7 @@ func openAPIOperations(t *testing.T) map[string][]int {
 func TestHandlersMatchOpenAPI(t *testing.T) {
 	spec := openAPIOperations(t)
 	impl := map[string][]int{}
-	for _, rt := range routes {
+	for _, rt := range allRoutes() {
 		impl[rt.method+" "+rt.path] = slices.Sorted(slices.Values(rt.statuses))
 	}
 	for k, v := range spec {
@@ -480,8 +481,8 @@ func TestHandlersMatchOpenAPI(t *testing.T) {
 			t.Errorf("处理器实现了 %s，openapi.yaml 未声明", k)
 		}
 	}
-	if len(spec) != 12 {
-		t.Errorf("openapi.yaml 解析出 %d 个操作，期望 12（M1 范围加产物最新版本下载）", len(spec))
+	if len(spec) != 17 {
+		t.Errorf("openapi.yaml 解析出 %d 个操作，期望 17（M1 范围加产物最新版本下载，加账号的 5 个操作）", len(spec))
 	}
 	for k := range spec {
 		if strings.Contains(k, "/sessions") {
@@ -1290,4 +1291,553 @@ func TestWebDirStaticAndSPAFallback(t *testing.T) {
 			t.Fatalf("访问日志中出现 %q: %s", secret, logs)
 		}
 	}
+}
+
+// ---- 用户账号（M3 Plan 11） ----
+
+// fakeAccounts 是内存中的 Accounts；任务本身仍存于 fakeStore，owner 记在 owners。
+type fakeAccounts struct {
+	mu       sync.Mutex
+	store    *fakeStore
+	nextID   int64
+	users    map[string]*fakeUser // key（小写用户名）→ 用户
+	sessions map[string]int64     // string(idHash) → user id
+	owners   map[string]int64     // task_id → owner
+	lastReq  CreateTaskRequest    // 最近一次 CreateResearch 的请求
+}
+
+type fakeUser struct {
+	u    User
+	hash string
+}
+
+func newFakeAccounts(s *fakeStore) *fakeAccounts {
+	return &fakeAccounts{store: s, users: map[string]*fakeUser{}, sessions: map[string]int64{}, owners: map[string]int64{}}
+}
+
+func (a *fakeAccounts) CreateUser(_ context.Context, display, key, hash string) (User, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, ok := a.users[key]; ok {
+		return User{}, fmt.Errorf("%w: username", persistence.ErrConflict)
+	}
+	a.nextID++
+	u := User{ID: a.nextID, Username: display, Role: "user", CreatedAt: time.Unix(1700000000, 0).UTC()}
+	a.users[key] = &fakeUser{u: u, hash: hash}
+	return u, nil
+}
+
+func (a *fakeAccounts) UserForLogin(_ context.Context, key string) (User, string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	fu, ok := a.users[key]
+	if !ok {
+		return User{}, "", persistence.ErrNotFound
+	}
+	return fu.u, fu.hash, nil
+}
+
+func (a *fakeAccounts) CreateSession(_ context.Context, idHash []byte, userID int64, _ time.Time) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sessions[string(idHash)] = userID
+	return nil
+}
+
+func (a *fakeAccounts) SessionUser(_ context.Context, idHash []byte) (User, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	id, ok := a.sessions[string(idHash)]
+	if !ok {
+		return User{}, persistence.ErrNotFound
+	}
+	for _, fu := range a.users {
+		if fu.u.ID == id && !fu.u.Disabled {
+			return fu.u, nil
+		}
+	}
+	return User{}, persistence.ErrNotFound
+}
+
+func (a *fakeAccounts) DeleteSession(_ context.Context, idHash []byte) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.sessions, string(idHash))
+	return nil
+}
+
+func (a *fakeAccounts) SetDisabled(_ context.Context, key string, disabled bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	fu, ok := a.users[key]
+	if !ok {
+		return persistence.ErrNotFound
+	}
+	fu.u.Disabled = disabled
+	if disabled {
+		for k, id := range a.sessions {
+			if id == fu.u.ID {
+				delete(a.sessions, k)
+			}
+		}
+	}
+	return nil
+}
+
+func (a *fakeAccounts) ListUsers(context.Context) ([]User, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []User
+	for _, fu := range a.users {
+		out = append(out, fu.u)
+	}
+	return out, nil
+}
+
+func (a *fakeAccounts) CreateResearch(ctx context.Context, userID int64, req CreateTaskRequest) (CreateTaskResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.store.mu.Lock()
+	_, replay := a.store.requests[req.RequestID]
+	running := false
+	for id, owner := range a.owners {
+		if t := a.store.tasks[id]; owner == userID && t != nil && !isTerminal(t.Status) {
+			running = true
+		}
+	}
+	a.store.mu.Unlock()
+	if !replay && running { // 与 postgres 实现相同：重放先于运行中检查，且错误带包装
+		return CreateTaskResult{}, fmt.Errorf("CreateResearch(%s): %w", req.RequestID, ErrUserTaskRunning)
+	}
+	res, err := a.store.CreateTask(ctx, req)
+	if err != nil {
+		return CreateTaskResult{}, err
+	}
+	if replay && a.owners[res.TaskID] != userID {
+		return CreateTaskResult{}, fmt.Errorf("%w: request_conflict", persistence.ErrConflict)
+	}
+	a.owners[res.TaskID] = userID
+	a.lastReq = req
+	return res, nil
+}
+
+func (a *fakeAccounts) TaskOwner(ctx context.Context, taskID string) (int64, error) {
+	if _, err := a.store.GetTask(ctx, taskID); err != nil {
+		return 0, err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.owners[taskID], nil
+}
+
+func (a *fakeAccounts) ListTasksByOwner(ctx context.Context, ownerID int64, _ string, limit int) ([]TaskView, string, error) {
+	all, _, err := a.store.ListTasks(ctx, "", 1000)
+	if err != nil {
+		return nil, "", err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []TaskView
+	for _, v := range all {
+		if a.owners[v.TaskID] == ownerID && len(out) < limit {
+			out = append(out, v)
+		}
+	}
+	return out, "", nil
+}
+
+// seedUser 直接建立用户与会话（不经 PBKDF2），返回会话 cookie 的明文值。
+func (a *fakeAccounts) seedUser(t *testing.T, name string) (User, string) {
+	t.Helper()
+	u, err := a.CreateUser(context.Background(), name, strings.ToLower(name), "unused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, idHash, err := account.NewSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.CreateSession(context.Background(), idHash, u.ID, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	return u, id
+}
+
+func (a *fakeAccounts) own(taskID string, userID int64) {
+	a.mu.Lock()
+	a.owners[taskID] = userID
+	a.mu.Unlock()
+}
+
+const adminToken = "admin-s3cret-token-0123456789"
+
+var adminAuth = map[string]string{"Authorization": "Bearer " + adminToken}
+
+func testResearchSpec(topic string) (json.RawMessage, error) {
+	return json.Marshal(map[string]string{"topic": topic, "orchestrator_model": "kimi-k3", "worker_model": "kimi-k2.6"})
+}
+
+// newAccountServer 启动启用账号的服务（同时配置运维 token）。
+func newAccountServer(t *testing.T, mutate func(*Config)) (*testServer, *fakeAccounts) {
+	t.Helper()
+	var acc *fakeAccounts
+	ts := newTestServer(t, func(c *Config) {
+		acc = newFakeAccounts(c.Store.(*fakeStore))
+		c.Accounts = acc
+		c.Token = adminToken
+		c.ResearchSpec = testResearchSpec
+		if mutate != nil {
+			mutate(c)
+		}
+	})
+	return ts, acc
+}
+
+func session(id string) map[string]string {
+	return map[string]string{"Cookie": SessionCookie + "=" + id}
+}
+
+// sessionCookie 返回响应中下发的会话 cookie 及其原始 Set-Cookie 行。
+func sessionCookie(t *testing.T, h http.Header) (*http.Cookie, string) {
+	t.Helper()
+	for _, c := range (&http.Response{Header: h}).Cookies() {
+		if c.Name == SessionCookie {
+			return c, h.Get("Set-Cookie")
+		}
+	}
+	t.Fatalf("响应没有下发 %s cookie: %v", SessionCookie, h)
+	return nil, ""
+}
+
+// TestAuthRegisterLoginLogout：注册即登录并下发 HttpOnly/SameSite=Strict cookie（TLS 时带 Secure）；重名 409、
+// 弱密码与非法用户名 400；登录失败（密码错、用户不存在、已停用）的响应正文逐字节相同；登出删除会话；
+// 访问日志与响应不含会话 ID 与密码。
+func TestAuthRegisterLoginLogout(t *testing.T) {
+	ts, acc := newAccountServer(t, nil)
+	const pw = "correct-horse-1"
+	st, b, h := ts.do("POST", "/auth/register", `{"username":"Alice","password":"`+pw+`"}`, nil)
+	expect(t, st, b, 201, "")
+	var me userJSON
+	if err := json.Unmarshal(b, &me); err != nil || me != (userJSON{Username: "Alice", Role: "user"}) {
+		t.Fatalf("注册响应 = %s (%v)", b, err)
+	}
+	c, raw := sessionCookie(t, h)
+	if !c.HttpOnly || c.SameSite != http.SameSiteStrictMode || c.Path != "/" || c.Secure || c.MaxAge != 7*24*3600 {
+		t.Fatalf("cookie 属性不符: %s", raw)
+	}
+	secrets := []string{c.Value, pw}
+	st, b, _ = ts.do("GET", "/auth/me", "", session(c.Value))
+	expect(t, st, b, 200, "")
+	if !bytes.Contains(b, []byte(`"username":"Alice"`)) {
+		t.Fatalf("/auth/me = %s", b)
+	}
+
+	st, b, _ = ts.do("POST", "/auth/register", `{"username":"alice","password":"another-pass"}`, nil)
+	expect(t, st, b, 409, "username_taken")
+	st, b, _ = ts.do("POST", "/auth/register", `{"username":"bob","password":"short"}`, nil)
+	expect(t, st, b, 400, "invalid_password")
+	st, b, _ = ts.do("POST", "/auth/register", `{"username":"b b","password":"long-enough"}`, nil)
+	expect(t, st, b, 400, "invalid_username")
+
+	// 登录失败：三种原因的正文逐字节相同。
+	var fails [][]byte
+	for _, body := range []string{
+		`{"username":"alice","password":"wrong-password"}`,
+		`{"username":"nobody","password":"wrong-password"}`,
+	} {
+		st, b, h = ts.do("POST", "/auth/login", body, nil)
+		expect(t, st, b, 401, "invalid_credentials")
+		if h.Get("Set-Cookie") != "" {
+			t.Fatalf("登录失败下发了 cookie: %s", h.Get("Set-Cookie"))
+		}
+		fails = append(fails, b)
+	}
+	st, b, h = ts.do("POST", "/auth/login", `{"username":"ALICE","password":"`+pw+`"}`, nil)
+	expect(t, st, b, 200, "")
+	c2, _ := sessionCookie(t, h)
+	secrets = append(secrets, c2.Value)
+	if err := acc.SetDisabled(context.Background(), "alice", true); err != nil {
+		t.Fatal(err)
+	}
+	st, b, _ = ts.do("POST", "/auth/login", `{"username":"alice","password":"`+pw+`"}`, nil)
+	expect(t, st, b, 401, "invalid_credentials")
+	fails = append(fails, b)
+	for _, f := range fails[1:] {
+		if !bytes.Equal(f, fails[0]) {
+			t.Fatalf("登录失败的正文不同：%s 与 %s", f, fails[0])
+		}
+	}
+	st, b, _ = ts.do("GET", "/auth/me", "", session(c2.Value))
+	expect(t, st, b, 401, "unauthorized") // 停用即吊销会话
+	st, b, _ = ts.do("GET", "/auth/me", "", session(c.Value))
+	expect(t, st, b, 401, "unauthorized")
+	if err := acc.SetDisabled(context.Background(), "alice", false); err != nil {
+		t.Fatal(err)
+	}
+	st, b, h = ts.do("POST", "/auth/login", `{"username":"alice","password":"`+pw+`"}`, nil)
+	expect(t, st, b, 200, "")
+	c, _ = sessionCookie(t, h)
+	secrets = append(secrets, c.Value)
+
+	// 登出：删除会话并下发 Max-Age=0；旧 cookie 失效。
+	st, b, h = ts.do("POST", "/auth/logout", "", session(c.Value))
+	expect(t, st, b, 204, "")
+	if _, raw := sessionCookie(t, h); !strings.Contains(raw, "Max-Age=0") || !strings.Contains(raw, "HttpOnly") {
+		t.Fatalf("登出的 Set-Cookie = %s", raw)
+	}
+	st, b, _ = ts.do("GET", "/auth/me", "", session(c.Value))
+	expect(t, st, b, 401, "unauthorized")
+	st, b, _ = ts.do("POST", "/auth/logout", "", session(c.Value))
+	expect(t, st, b, 401, "unauthorized")
+
+	ts.mu.Lock()
+	logs := ts.logs.String()
+	ts.mu.Unlock()
+	if !strings.Contains(logs, `"path":"/auth/me"`) {
+		t.Fatalf("访问日志未记录请求: %s", logs)
+	}
+	for _, s := range append(secrets, SessionCookie) {
+		if strings.Contains(logs, s) {
+			t.Fatalf("访问日志中出现会话 ID、cookie 或密码 %q: %s", s, logs)
+		}
+	}
+	for _, f := range fails {
+		for _, s := range secrets {
+			if bytes.Contains(f, []byte(s)) {
+				t.Fatalf("错误正文中出现秘密: %s", f)
+			}
+		}
+	}
+
+	// TLS 监听：cookie 带 Secure。
+	tls, _ := newAccountServer(t, func(c *Config) { c.SecureCookies = true })
+	st, b, h = tls.do("POST", "/auth/register", `{"username":"carol","password":"`+pw+`"}`, nil)
+	expect(t, st, b, 201, "")
+	if c, raw := sessionCookie(t, h); !c.Secure || !c.HttpOnly || c.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("SecureCookies 时 cookie 属性不符: %s", raw)
+	}
+}
+
+// TestAuthRateLimit：每 IP 注册 5 次/分钟、登录 10 次/分钟，超出 429 rate_limited（在解析请求体之前判定）；
+// 令牌随时间补充。
+func TestAuthRateLimit(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Unix(1700000000, 0)
+	ts, _ := newAccountServer(t, func(c *Config) {
+		c.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	})
+	for i := 0; i < 5; i++ {
+		st, b, _ := ts.do("POST", "/auth/register", `{"username":"u`+strconv.Itoa(i)+`x","password":"short"}`, nil)
+		expect(t, st, b, 400, "invalid_password")
+	}
+	st, b, _ := ts.do("POST", "/auth/register", `{"username":"u9x","password":"short"}`, nil)
+	expect(t, st, b, 429, "rate_limited")
+	for i := 0; i < 10; i++ {
+		st, b, _ := ts.do("POST", "/auth/login", `{`, nil)
+		expect(t, st, b, 400, "invalid_request")
+	}
+	st, b, _ = ts.do("POST", "/auth/login", `{`, nil)
+	expect(t, st, b, 429, "rate_limited")
+	// X-Forwarded-For 不改变客户端 IP。
+	st, b, _ = ts.do("POST", "/auth/login", `{`, map[string]string{"X-Forwarded-For": "203.0.113.9"})
+	expect(t, st, b, 429, "rate_limited")
+	mu.Lock()
+	now = now.Add(time.Minute)
+	mu.Unlock()
+	st, b, _ = ts.do("POST", "/auth/register", `{"username":"u9x","password":"short"}`, nil)
+	expect(t, st, b, 400, "invalid_password")
+}
+
+// TestAuthPrincipalResolution：匿名只能访问 register、login、status；Bearer 优先且无效即 401（不回退到
+// cookie）；运维权限不变；只限会话的操作对运维 403；外部 Origin 的登录 403；未启用账号时没有 /auth 与 /research。
+func TestAuthPrincipalResolution(t *testing.T) {
+	ts, acc := newAccountServer(t, func(c *Config) { c.AllowedOrigins = []string{"https://box.example"} })
+	ts.store.addTask("t1", "running", "run")
+	_, cookie := acc.seedUser(t, "dave")
+
+	for _, tc := range []struct{ method, path, body string }{
+		{"GET", "/tasks", ""}, {"GET", "/tasks/t1", ""}, {"GET", "/tasks/t1/inspect", ""},
+		{"POST", "/tasks", `{"request_id":"a","spec":{}}`}, {"GET", "/auth/me", ""}, {"POST", "/auth/logout", ""},
+		{"POST", "/research", `{"request_id":"a","topic":"x"}`},
+	} {
+		st, b, _ := ts.do(tc.method, tc.path, tc.body, nil)
+		expect(t, st, b, 401, "unauthorized")
+	}
+	st, b, _ := ts.do("GET", "/status", "", nil)
+	expect(t, st, b, 200, "")
+
+	// Bearer 无效时即便 cookie 有效也 401。
+	hdr := session(cookie)
+	hdr["Authorization"] = "Bearer wrong"
+	st, b, _ = ts.do("GET", "/tasks", "", hdr)
+	expect(t, st, b, 401, "unauthorized")
+	st, b, _ = ts.do("GET", "/auth/me", "", hdr)
+	expect(t, st, b, 401, "unauthorized")
+	st, b, _ = ts.do("GET", "/auth/me", "", session(cookie))
+	expect(t, st, b, 200, "")
+
+	// 运维 Bearer：全部端点照旧；只限会话的操作 403。
+	st, b, _ = ts.do("GET", "/tasks", "", adminAuth)
+	expect(t, st, b, 200, "")
+	if !bytes.Contains(b, []byte(`"t1"`)) {
+		t.Fatalf("运维列表应含无主任务: %s", b)
+	}
+	st, b, _ = ts.do("POST", "/tasks", `{"request_id":"adm","spec":{}}`, adminAuth)
+	expect(t, st, b, 201, "")
+	st, b, _ = ts.do("POST", "/tasks/t1/pause", `{"request_id":"p"}`, adminAuth)
+	expect(t, st, b, 200, "")
+	st, b, _ = ts.do("GET", "/tasks/t1/inspect", "", adminAuth)
+	expect(t, st, b, 404, "task_not_found") // fake 中没有诊断数据：到达了处理器
+	st, b, _ = ts.do("POST", "/research", `{"request_id":"r","topic":"x"}`, adminAuth)
+	expect(t, st, b, 403, "forbidden")
+	st, b, _ = ts.do("GET", "/auth/me", "", adminAuth)
+	expect(t, st, b, 403, "forbidden")
+
+	st, b, _ = ts.do("POST", "/auth/login", `{"username":"dave","password":"whatever-1"}`, map[string]string{"Origin": "https://evil.example"})
+	expect(t, st, b, 403, "forbidden_origin")
+	st, b, _ = ts.do("POST", "/auth/register", `{"username":"eve","password":"whatever-1"}`, map[string]string{"Origin": "https://evil.example"})
+	expect(t, st, b, 403, "forbidden_origin")
+
+	plain := newTestServer(t, nil)
+	for _, p := range []string{"/auth/login", "/auth/register", "/research"} {
+		st, b, _ = plain.do("POST", p, `{}`, nil)
+		expect(t, st, b, 404, "not_found")
+	}
+	if _, err := New(Config{Store: newFakeStore(), Blobs: &fakeBlobs{}, ListenAddr: "127.0.0.1:1", Accounts: acc}); err == nil {
+		t.Fatal("启用账号而没有 ResearchSpec 应拒绝")
+	}
+}
+
+// TestUserTaskIsolation：用户只看到自己的任务；他人与无主任务在列表、详情、事件、结果、产物、取消上一律
+// 与不存在相同的 404；inspect、pause、resume、POST /tasks 对用户 403。
+func TestUserTaskIsolation(t *testing.T) {
+	ts, acc := newAccountServer(t, nil)
+	a, ca := acc.seedUser(t, "anna")
+	b, cb := acc.seedUser(t, "ben")
+	for _, id := range []string{"ta", "tb", "t0"} {
+		ts.store.addTask(id, "succeeded", "run")
+		ts.store.appendEvent(id, EventTaskTerminal)
+		ts.store.results[id] = json.RawMessage(`{"summary":"s","outputs":[]}`)
+		ts.store.addArtifact(ts.blobs, id, "report.md", "text/markdown", []byte("# r"))
+	}
+	ts.store.addTask("ta2", "running", "run")
+	acc.own("ta", a.ID)
+	acc.own("ta2", a.ID)
+	acc.own("tb", b.ID)
+
+	st, body, _ := ts.do("GET", "/tasks", "", session(ca))
+	expect(t, st, body, 200, "")
+	var l taskListJSON
+	if err := json.Unmarshal(body, &l); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, x := range l.Tasks {
+		ids = append(ids, x.TaskID)
+	}
+	slices.Sort(ids)
+	if !slices.Equal(ids, []string{"ta", "ta2"}) {
+		t.Fatalf("用户 A 的列表 = %v", ids)
+	}
+
+	_, missing, _ := ts.do("GET", "/tasks/nope", "", session(ca))
+	for _, id := range []string{"tb", "t0", "nope"} {
+		for _, tc := range []struct{ method, path, body string }{
+			{"GET", "/tasks/" + id, ""},
+			{"GET", "/tasks/" + id + "/events", ""},
+			{"GET", "/tasks/" + id + "/result", ""},
+			{"GET", "/tasks/" + id + "/artifacts/report.md", ""},
+			{"GET", "/tasks/" + id + "/artifacts/report.md/versions/1", ""},
+			{"POST", "/tasks/" + id + "/cancel", `{"request_id":"c-` + id + `"}`},
+		} {
+			st, got, _ := ts.do(tc.method, tc.path, tc.body, session(ca))
+			expect(t, st, got, 404, "task_not_found")
+			if !bytes.Equal(got, missing) {
+				t.Fatalf("%s %s 的 404 正文与不存在的任务不同: %s / %s", tc.method, tc.path, got, missing)
+			}
+		}
+	}
+	for _, tc := range []struct{ method, path, body string }{
+		{"GET", "/tasks/ta", ""}, {"GET", "/tasks/ta/events", ""}, {"GET", "/tasks/ta/result", ""},
+		{"GET", "/tasks/ta/artifacts/report.md", ""}, {"GET", "/tasks/ta/artifacts/report.md/versions/1", ""},
+		{"POST", "/tasks/ta2/cancel", `{"request_id":"c-own"}`},
+	} {
+		st, got, _ := ts.do(tc.method, tc.path, tc.body, session(ca))
+		expect(t, st, got, 200, "")
+	}
+	for _, tc := range []struct{ method, path, body string }{
+		{"GET", "/tasks/ta/inspect", ""}, {"POST", "/tasks/ta2/pause", `{"request_id":"p"}`},
+		{"POST", "/tasks/ta2/resume", `{"request_id":"r"}`}, {"POST", "/tasks", `{"request_id":"n","spec":{}}`},
+	} {
+		st, got, _ := ts.do(tc.method, tc.path, tc.body, session(ca))
+		expect(t, st, got, 403, "forbidden")
+	}
+	// 用户 B 同样看不到 A 的任务。
+	st, body, _ = ts.do("GET", "/tasks/ta", "", session(cb))
+	expect(t, st, body, 404, "task_not_found")
+
+	ts.mu.Lock()
+	logs := ts.logs.String()
+	ts.mu.Unlock()
+	if strings.Contains(logs, ca) || strings.Contains(logs, cb) {
+		t.Fatalf("访问日志中出现会话 ID: %s", logs)
+	}
+}
+
+// TestResearch：主题去首尾空白后由 server 生成 spec 并以默认 limits 创建、归属用户；同 request_id 重放返回
+// 首次结果；已有非终态任务时 409 user_task_running；主题非法 400；他人重用 request_id 为 request_conflict。
+func TestResearch(t *testing.T) {
+	ts, acc := newAccountServer(t, func(c *Config) {
+		c.EffectiveLimits = func(l json.RawMessage) (json.RawMessage, error) {
+			if l != nil {
+				return nil, errors.New("研究不接受请求中的 limits")
+			}
+			return json.RawMessage(`{"max_run_time_ms":600000}`), nil
+		}
+	})
+	a, ca := acc.seedUser(t, "anna")
+	_, cb := acc.seedUser(t, "ben")
+
+	for _, topic := range []string{`""`, `"   "`, strconv.Quote(strings.Repeat("研", 501))} {
+		st, b, _ := ts.do("POST", "/research", `{"request_id":"bad","topic":`+topic+`}`, session(ca))
+		expect(t, st, b, 400, "invalid_topic")
+	}
+	st, b, _ := ts.do("POST", "/research", `{"request_id":"r1","topic":"x","spec":{"model":"gpt"}}`, session(ca))
+	expect(t, st, b, 400, "invalid_request") // 用户不能指定 spec
+
+	st, b, _ = ts.do("POST", "/research", `{"request_id":"r1","topic":"  量子计算  "}`, session(ca))
+	expect(t, st, b, 202, "")
+	var first CreateTaskResult
+	if err := json.Unmarshal(b, &first); err != nil || first.TaskID == "" {
+		t.Fatalf("研究响应 = %s", b)
+	}
+	acc.mu.Lock()
+	req, owner := acc.lastReq, acc.owners[first.TaskID]
+	acc.mu.Unlock()
+	if owner != a.ID {
+		t.Fatalf("任务 owner = %d，期望 %d", owner, a.ID)
+	}
+	if string(req.Spec) != `{"orchestrator_model":"kimi-k3","topic":"量子计算","worker_model":"kimi-k2.6"}` {
+		t.Fatalf("研究 spec = %s", req.Spec)
+	}
+	if string(req.Limits) != `{"max_run_time_ms":600000}` {
+		t.Fatalf("研究 limits = %s", req.Limits)
+	}
+	st, b, _ = ts.do("POST", "/research", `{"request_id":"r1","topic":"  量子计算  "}`, session(ca))
+	expect(t, st, b, 202, "")
+	if !bytes.Contains(b, []byte(first.TaskID)) {
+		t.Fatalf("重放应返回首次结果: %s", b)
+	}
+	st, b, _ = ts.do("POST", "/research", `{"request_id":"r2","topic":"另一个"}`, session(ca))
+	expect(t, st, b, 409, "user_task_running")
+	st, b, _ = ts.do("POST", "/research", `{"request_id":"r1","topic":"  量子计算  "}`, session(cb))
+	expect(t, st, b, 409, "request_conflict")
+
+	ts.store.mu.Lock()
+	ts.store.tasks[first.TaskID].Status = "succeeded"
+	ts.store.mu.Unlock()
+	st, b, _ = ts.do("POST", "/research", `{"request_id":"r2","topic":"另一个"}`, session(ca))
+	expect(t, st, b, 202, "")
+	st, b, _ = ts.do("POST", "/research", `{"request_id":"r3","topic":"并行"}`, session(cb))
+	expect(t, st, b, 202, "") // 每用户独立
 }
