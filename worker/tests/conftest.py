@@ -64,6 +64,9 @@ class FakeGateway:
         self.release = threading.Event()
         # 可选：按 (kind, 请求体) 生成计费调用的结果体；缺省时结果体回显请求
         self.responder: Callable[[str, Any], Any] | None = None
+        # 可选：按请求注入回复（如对某个 call id 返回错误）；返回 None 时按缺省逻辑处理。
+        # 注入的回复不记录调用结果，同一 call id 再次到达时重新经过拦截。
+        self.interceptor: Callable[[Recorded], Reply | None] | None = None
         self._lock = threading.Lock()
 
     def put_blob(self, data: bytes) -> str:
@@ -79,6 +82,8 @@ class FakeGateway:
             self.release.wait(self.delay)
         if queued is not None:
             return queued
+        if self.interceptor is not None and (injected := self.interceptor(req)) is not None:
+            return injected
         if req.method == "GET" and req.path == "/v1/budget":
             return Reply(200, self.budget)
         if req.method == "GET" and req.path.startswith("/blobs/"):

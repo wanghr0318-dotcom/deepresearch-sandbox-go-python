@@ -357,3 +357,436 @@ def test_deepresearch_imports_only_stdlib_and_sdk():
                     "agentbox_worker",
                     "deepresearch",
                 ), (path, name)
+
+
+# ---- 研究循环（app.run）：经 SDK 运行时 + fake Gateway ----
+
+import asyncio
+import itertools
+from collections.abc import Callable
+
+from conftest import Recorded, Reply, error_reply
+
+from agentbox_worker import MemoryTransport, TaskContext, Timing, run_worker
+from agentbox_worker.runtime import GATEWAY_SOCKET_ENV
+from deepresearch import app as dr_app
+
+LOOP_TIMING = Timing(ack_timeout=1.0, max_ack_attempts=2, retry_backoff=0.01, artifact_timeout=2)
+LOOP_INIT = {
+    "type": "init",
+    "bootstrap": 1,
+    "protocol_versions": [1],
+    "mode": "task",
+    "task_id": "t-1",
+    "attempt_id": "a-1",
+    "attempt_no": 1,
+}
+PLAN_TASKS = [
+    {"title": "材料", "intent": "电解质路线", "query": "固态电解质"},
+    {"title": "产业", "intent": "量产进度", "query": "固态电池 量产"},
+]
+EVIDENCE_LINE = re.compile(r"^- \[(\d+)\] .* — sha256:([0-9a-f]{64})$", re.MULTILINE)
+
+
+class LoopScript:
+    """2 个任务；每个查询 2 条搜索结果（max_fetch=1 时只抓取第 1 条）；chat 按阶段标记回复。"""
+
+    def __init__(self) -> None:
+        self.chat = {
+            prompts.STAGE_PLAN: json.dumps({"tasks": PLAN_TASKS}, ensure_ascii=False),
+            prompts.STAGE_SUMMARIZE: "## 任务总结\n- 关键发现 [1]",
+            prompts.STAGE_REPORT: "## 核心洞见\n本研究综述了固态电池 [1]，量产仍有挑战 [2]。",
+        }
+
+    def __call__(self, kind: str, body: dict) -> dict:
+        if kind == "chat":
+            system = body["messages"][0]["content"]
+            stage = next(s for s in self.chat if system.startswith(s))
+            return {"choices": [{"message": {"role": "assistant", "content": self.chat[stage]}}]}
+        if kind == "search":
+            query = body["query"]
+            slug = hashlib.sha256(query.encode()).hexdigest()[:8]
+            results = [
+                {
+                    "url": f"https://{slug}.example/{i}",
+                    "title": f"{query} {i}",
+                    "snippet": f"片段 {i}",
+                }
+                for i in (1, 2)
+            ]
+            return {"query": query, "results": results[: body["max_results"]]}
+        url = body["url"]
+        return {"url": url, "status": 200, "content_type": "text/plain", "text": f"{url} 的正文"}
+
+
+def ok_host(pause_at: str | None = None) -> Callable[[dict, MemoryTransport], None]:
+    """宿主：checkpoint 一律 committed，产物一律 saved；pause_at 的 checkpoint 之前先送 pause。"""
+
+    def respond(msg: dict, transport: MemoryTransport) -> None:
+        def send(m: dict) -> None:
+            transport.feed(json.dumps({"v": 1, **m}).encode())
+
+        if msg["type"] == "checkpoint":
+            if msg["step_id"] == pause_at:
+                send({"type": "pause", "attempt_id": "a-1", "reason": "user", "grace_ms": 0})
+            send(
+                {
+                    "type": "checkpoint_result",
+                    "checkpoint_id": msg["checkpoint_id"],
+                    "scope": "task",
+                    "status": "committed",
+                }
+            )
+        elif msg["type"] == "artifact":
+            send(
+                {
+                    "type": "artifact_result",
+                    "artifact_id": msg["artifact_id"],
+                    "status": "saved",
+                    "version": 1,
+                    "sha256": msg["declared_sha256"],
+                }
+            )
+
+    return respond
+
+
+class Killed(Exception):
+    pass
+
+
+def kill_after(step_id: str):
+    """在 step_id 的 checkpoint 提交之后抛出，模拟 Worker 在该边界被杀死。"""
+
+    async def app(ctx: TaskContext):
+        commit = ctx.checkpoint
+
+        async def checkpoint(step: str, **kwargs):
+            checkpoint_id = await commit(step, **kwargs)
+            if step == step_id:
+                raise Killed(step)
+            return checkpoint_id
+
+        ctx.checkpoint = checkpoint
+        return await dr_app.run(ctx)
+
+    return app
+
+
+def run_loop(tmp_path, *, app=dr_app.run, config=None, resume=None, pause_at=None):
+    config = {"topic": "固态电池", "max_fetch": 1, **(config or {})}
+
+    async def go():
+        transport = MemoryTransport()
+        init = {**LOOP_INIT, "out_dir": str(tmp_path), "config": config}
+        if resume is not None:
+            init = {**init, "attempt_no": 2, "resume": resume}
+        transport.feed(json.dumps(init).encode())
+        host = ok_host(pause_at)
+        transport.on_send = lambda line: host(json.loads(line), transport)
+        counter = itertools.count(1)
+        code = await asyncio.wait_for(
+            run_worker(
+                app,
+                transport,
+                name=dr_app.NAME,
+                version=dr_app.VERSION,
+                timing=LOOP_TIMING,
+                new_id=lambda: f"cp-{next(counter)}",
+            ),
+            timeout=20,
+        )
+        return code, [json.loads(line) for line in transport.sent]
+
+    return asyncio.run(go())
+
+
+@pytest.fixture
+def loop_gw(fake_gateway: FakeGateway, monkeypatch) -> FakeGateway:
+    monkeypatch.setenv(GATEWAY_SOCKET_ENV, fake_gateway.socket_path)
+    fake_gateway.responder = LoopScript()
+    return fake_gateway
+
+
+def checkpoints(events: list[dict]) -> dict[str, dict]:
+    return {e["step_id"]: e for e in events if e["type"] == "checkpoint"}
+
+
+def call_ids(gw: FakeGateway, start: int = 0) -> list[str]:
+    return [r.headers["x-agentbox-call-id"] for r in gw.requests[start:] if r.method == "POST"]
+
+
+def resume_from(cp: dict) -> dict:
+    return {
+        "checkpoint_id": cp["checkpoint_id"],
+        "step_id": cp["step_id"],
+        "state": cp["state"],
+        "refs": cp["refs"],
+    }
+
+
+def assert_refs_are_returned_blobs(gw: FakeGateway, events: list[dict]) -> None:
+    """§5.5 规则 2：每个 checkpoint 的 refs 都是本任务经 Gateway 调用得到的结果 blob。"""
+    returned = set(gw.calls.values())
+    for cp in checkpoints(events).values():
+        assert set(cp["refs"]) <= returned, cp["step_id"]
+        assert len(cp["refs"]) == len(set(cp["refs"]))
+
+
+def test_loop_full_run_produces_report_with_mapped_citations(loop_gw, tmp_path):
+    code, events = run_loop(tmp_path)
+    assert code == 0, events[-1]
+    assert [e["type"] for e in events] == [
+        "ready", "checkpoint", "checkpoint", "checkpoint", "artifact", "checkpoint", "result",
+    ]  # fmt: skip
+    result = events[-1]
+    assert result["outputs"] == ["report"]
+    assert result["summary"] == "本研究综述了固态电池 [1]，量产仍有挑战 [2]。"
+    assert call_ids(loop_gw) == [
+        "root/plan/chat/1",
+        "root/task-1/search/1", "root/task-1/fetch/1", "root/task-1/chat/1",
+        "root/task-2/search/1", "root/task-2/fetch/1", "root/task-2/chat/1",
+        "root/report/chat/1",
+    ]  # fmt: skip
+    cps = checkpoints(events)
+    assert list(cps) == ["plan", "task-1", "task-2", "report"]
+    blob = loop_gw.calls
+    assert cps["plan"]["refs"] == [blob["root/plan/chat/1"]]
+    assert cps["task-1"]["refs"] == [blob["root/task-1/fetch/1"], blob["root/task-1/chat/1"]]
+    assert cps["task-2"]["refs"] == [blob["root/task-2/fetch/1"], blob["root/task-2/chat/1"]]
+    assert cps["report"]["refs"] == [blob["root/report/chat/1"]]
+    assert_refs_are_returned_blobs(loop_gw, events)
+    # 状态内联，带 SDK 的 call id 计数器；证据只存 sha 引用
+    final = cps["report"]["state"]
+    assert final["_agentbox"]["call_ids"]["root/report/chat"] == 1
+    state = ResearchState.from_json(migrate({k: v for k, v in final.items() if k != "_agentbox"}))
+    assert [t.status for t in state.tasks] == ["done", "done"]
+    assert state.report_sha256 == blob["root/report/chat/1"]
+    assert list(state.evidence) == [blob["root/task-1/fetch/1"], blob["root/task-2/fetch/1"]]
+    # 报告：每个 [n] 都映射到 state.evidence 中的 sha
+    artifact = next(e for e in events if e["type"] == "artifact")
+    report = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert artifact["path"] == "report.md" and artifact["media_type"] == "text/markdown"
+    assert artifact["declared_sha256"] == hashlib.sha256(report.encode()).hexdigest()
+    listing = dict(EVIDENCE_LINE.findall(report))
+    body_part = report.split("\n## 证据\n", 1)[0]
+    cited = set(re.findall(r"\[(\d+)\]", body_part))
+    assert cited == {"1", "2"} and cited <= set(listing)
+    assert set(listing.values()) == set(state.evidence)
+
+
+def test_loop_resume_after_kill_skips_plan_and_done_tasks(loop_gw, tmp_path):
+    code, events = run_loop(tmp_path, app=kill_after("task-1"))
+    assert code == 1 and events[-1]["type"] == "error"  # 被"杀死"
+    cp1 = checkpoints(events)["task-1"]
+    assert cp1["state"]["_agentbox"]["call_ids"] == {
+        "root/plan/chat": 1, "root/task-1/search": 1, "root/task-1/fetch": 1,
+        "root/task-1/chat": 1,
+    }  # fmt: skip
+    before = len(loop_gw.requests)
+    code, events = run_loop(tmp_path, resume=resume_from(cp1))
+    assert code == 0 and events[-1]["type"] == "result"
+    # 不重新计划、任务 1 不重做；任务 2 与报告照常
+    assert call_ids(loop_gw, before) == [
+        "root/task-2/search/1", "root/task-2/fetch/1", "root/task-2/chat/1",
+        "root/report/chat/1",
+    ]  # fmt: skip
+    assert sum(1 for c in call_ids(loop_gw) if c.startswith("root/plan/")) == 1
+    assert sum(1 for c in call_ids(loop_gw) if c.startswith("root/task-1/")) == 3
+    cps = checkpoints(events)
+    assert list(cps) == ["task-2", "report"]
+    # 计数器从恢复的快照继续：已有的 plan/task-1 序号保留，新步骤从 1 起
+    assert cps["report"]["state"]["_agentbox"]["call_ids"] == {
+        **cp1["state"]["_agentbox"]["call_ids"],
+        "root/task-2/search": 1, "root/task-2/fetch": 1, "root/task-2/chat": 1,
+        "root/report/chat": 1,
+    }  # fmt: skip
+    assert_refs_are_returned_blobs(loop_gw, events)
+    state = cps["report"]["state"]
+    assert [t["status"] for t in state["tasks"]] == ["done", "done"]
+    assert len(state["evidence"]) == 2
+
+
+def test_loop_resume_retry_continues_call_ids(loop_gw, tmp_path):
+    """恢复后的任务失败重做时，新 ID 在计数器之上递增，不回退、不复用失败的 ID。"""
+    code, events = run_loop(tmp_path, app=kill_after("task-1"))
+    cp1 = checkpoints(events)["task-1"]
+    failed = set()
+
+    def flaky(req: Recorded) -> Reply | None:
+        call_id = req.headers.get("x-agentbox-call-id", "")
+        if call_id == "root/task-2/fetch/1" and call_id not in failed:
+            failed.add(call_id)
+            return error_reply(504, "call_deadline_exceeded")
+        return None
+
+    loop_gw.interceptor = flaky
+    before = len(loop_gw.requests)
+    code, events = run_loop(tmp_path, resume=resume_from(cp1))
+    assert code == 0
+    assert call_ids(loop_gw, before) == [
+        "root/task-2/search/1", "root/task-2/fetch/1",
+        "root/task-2/search/2", "root/task-2/fetch/2", "root/task-2/chat/1",
+        "root/report/chat/1",
+    ]  # fmt: skip
+
+
+def test_loop_resume_at_report_rebuilds_without_model_calls(loop_gw, tmp_path):
+    code, events = run_loop(tmp_path)
+    original = (tmp_path / "report.md").read_text(encoding="utf-8")
+    report_cp = checkpoints(events)["report"]
+    (tmp_path / "report.md").unlink()
+    before = len(loop_gw.requests)
+    code, events = run_loop(tmp_path, resume=resume_from(report_cp))
+    assert code == 0
+    assert [e["type"] for e in events] == ["ready", "artifact", "result"]
+    assert call_ids(loop_gw, before) == []  # 只读取了报告 blob
+    assert [r.path for r in loop_gw.requests[before:]] == [f"/blobs/{report_cp['refs'][0]}"]
+    assert (tmp_path / "report.md").read_text(encoding="utf-8") == original
+    assert events[-1]["outputs"] == ["report"]
+
+
+def test_loop_pauses_at_checkpoint_boundary(loop_gw, tmp_path):
+    code, events = run_loop(tmp_path, pause_at="plan")
+    assert code == 0
+    assert [e["type"] for e in events] == ["ready", "checkpoint", "paused"]
+    assert events[-1]["checkpoint_id"] == events[1]["checkpoint_id"]
+    assert call_ids(loop_gw) == ["root/plan/chat/1"]
+    # 从暂停点恢复，继续任务 1
+    code, events = run_loop(tmp_path, resume=resume_from(events[1]), pause_at="task-1")
+    assert [e["type"] for e in events] == ["ready", "checkpoint", "paused"]
+    assert events[1]["step_id"] == "task-1"
+    assert call_ids(loop_gw)[1:] == [
+        "root/task-1/search/1", "root/task-1/fetch/1", "root/task-1/chat/1",
+    ]  # fmt: skip
+
+
+def test_loop_divergence_supersedes_with_new_id(loop_gw, tmp_path):
+    def diverge(req: Recorded) -> Reply | None:
+        if req.headers.get("x-agentbox-call-id") == "root/task-1/search/1":
+            return error_reply(409, "fingerprint_mismatch")
+        return None
+
+    loop_gw.interceptor = diverge
+    code, events = run_loop(tmp_path)
+    assert code == 0 and events[-1]["type"] == "result"
+    assert call_ids(loop_gw)[1:5] == [
+        "root/task-1/search/1", "root/task-1/search/2", "root/task-1/fetch/1",
+        "root/task-1/chat/1",
+    ]  # fmt: skip
+    superseding = loop_gw.requests[2]
+    assert superseding.headers["x-agentbox-supersedes"] == "root/task-1/search/1"
+    assert superseding.headers["x-agentbox-supersede-reason"] == "divergence"
+    assert superseding.json() == loop_gw.requests[1].json()
+    state = checkpoints(events)["task-1"]["state"]
+    assert state["tasks"][0]["status"] == "done"
+    assert any("root/task-1/search/1" in f and "取代" in f for f in state["failures"])
+    assert_refs_are_returned_blobs(loop_gw, events)
+
+
+def test_loop_second_divergence_fails_only_that_task(loop_gw, tmp_path):
+    def diverge(req: Recorded) -> Reply | None:
+        if req.headers.get("x-agentbox-call-id", "").startswith("root/task-1/search/"):
+            return error_reply(409, "fingerprint_mismatch")
+        return None
+
+    loop_gw.interceptor = diverge
+    code, events = run_loop(tmp_path)
+    assert code == 0 and events[-1]["outputs"] == ["report"]
+    cps = checkpoints(events)
+    assert cps["task-1"]["refs"] == []
+    assert [t["status"] for t in cps["report"]["state"]["tasks"]] == ["failed", "done"]
+    assert [c for c in call_ids(loop_gw) if c.startswith("root/task-1/")] == [
+        "root/task-1/search/1",
+        "root/task-1/search/2",
+    ]
+
+
+def test_loop_budget_exhausted_writes_degraded_report(loop_gw, tmp_path):
+    def broke(req: Recorded) -> Reply | None:
+        if req.headers.get("x-agentbox-call-id", "").startswith("root/task-2/"):
+            return error_reply(402, "budget_exhausted")
+        return None
+
+    loop_gw.interceptor = broke
+    code, events = run_loop(tmp_path)
+    assert code == 0
+    result = events[-1]
+    assert result["type"] == "result" and result["outputs"] == ["report"]
+    assert result["summary"].startswith(dr_app.BUDGET_NOTE)
+    assert call_ids(loop_gw)[-1] == "root/task-2/search/1"  # 之后不再发起调用（没有报告调用）
+    cps = checkpoints(events)
+    assert list(cps) == ["plan", "task-1", "report"] and cps["report"]["refs"] == []
+    state = cps["report"]["state"]
+    assert [t["status"] for t in state["tasks"]] == ["done", "skipped"]
+    assert state["report_sha256"] is None
+    report = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert "关键发现 [1]" in report and "未完成（skipped）" in report
+    assert dict(EVIDENCE_LINE.findall(report)) == {"1": loop_gw.calls["root/task-1/fetch/1"]}
+
+
+def test_loop_budget_exhausted_before_any_task_fails(loop_gw, tmp_path):
+    def broke(req: Recorded) -> Reply | None:
+        return error_reply(402, "budget_exhausted") if req.method == "POST" else None
+
+    loop_gw.interceptor = broke
+    code, events = run_loop(tmp_path)
+    assert code == 1
+    error = events[-1]
+    assert error["type"] == "error" and error["code"] == "budget_exhausted"
+    assert error["retryable"] is False
+
+
+def test_loop_fetch_failure_retries_task_once(loop_gw, tmp_path):
+    failed = set()
+
+    def flaky(req: Recorded) -> Reply | None:
+        call_id = req.headers.get("x-agentbox-call-id", "")
+        if call_id == "root/task-1/fetch/1" and call_id not in failed:
+            failed.add(call_id)
+            return error_reply(502, "upstream_error")
+        return None
+
+    loop_gw.interceptor = flaky
+    code, events = run_loop(tmp_path)
+    assert code == 0 and events[-1]["type"] == "result"
+    assert call_ids(loop_gw)[1:6] == [
+        "root/task-1/search/1", "root/task-1/fetch/1",
+        "root/task-1/search/2", "root/task-1/fetch/2", "root/task-1/chat/1",
+    ]  # fmt: skip
+    cps = checkpoints(events)
+    assert cps["task-1"]["refs"][0] == loop_gw.calls["root/task-1/fetch/2"]
+    assert any("task-1" in f and "重做" in f for f in cps["task-1"]["state"]["failures"])
+
+
+def test_loop_fetch_failing_twice_fails_task_and_continues(loop_gw, tmp_path):
+    def timeout(req: Recorded) -> Reply | None:
+        if req.headers.get("x-agentbox-call-id", "").startswith("root/task-1/fetch/"):
+            return error_reply(504, "call_deadline_exceeded")
+        return None
+
+    loop_gw.interceptor = timeout
+    code, events = run_loop(tmp_path)
+    assert code == 0 and events[-1]["outputs"] == ["report"]
+    state = checkpoints(events)["report"]["state"]
+    assert [t["status"] for t in state["tasks"]] == ["failed", "done"]
+    assert [c for c in call_ids(loop_gw) if c.startswith("root/task-1/fetch/")] == [
+        "root/task-1/fetch/1",
+        "root/task-1/fetch/2",
+    ]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [{"topic": ""}, {"topic": "x", "max_tasks": 0}, {"topic": "x", "max_fetch": True}, "x"],
+)
+def test_parse_config_rejects_bad_values(config):
+    with pytest.raises(dr_app.WorkerFailure) as info:
+        dr_app.parse_config(config)
+    assert info.value.code == "invalid_config"
+    assert dr_app.parse_config({"topic": " t "}) == dr_app.Config(topic="t")
+
+
+def test_first_paragraph_skips_headings():
+    md = "# 主题\n\n## 核心洞见\n第一段 [1]\n续行\n\n第二段"
+    assert dr_app.first_paragraph(md) == "第一段 [1]\n续行"
