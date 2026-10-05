@@ -35,6 +35,7 @@ type fakeStore struct {
 	events   map[string][]Event
 	requests map[string]RequestRecord
 	inspect  map[string]Inspection
+	limits   map[string]string // request_id → 存储的 limits
 	// failWith 非空时，下一次 CreateTask/AcceptControl/GetTask/ListTasks 返回该错误；
 	// commitThenUnknown 为真时先提交再返回 ErrCommitUnknown。
 	failWith          error
@@ -43,7 +44,18 @@ type fakeStore struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{tasks: map[string]*TaskView{}, events: map[string][]Event{},
-		requests: map[string]RequestRecord{}, inspect: map[string]Inspection{}}
+		requests: map[string]RequestRecord{}, inspect: map[string]Inspection{}, limits: map[string]string{}}
+}
+
+func (f *fakeStore) limitsOf(t *testing.T, requestID string) string {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	l, ok := f.limits[requestID]
+	if !ok {
+		t.Fatalf("请求 %s 没有创建任务", requestID)
+	}
+	return l
 }
 
 func (f *fakeStore) takeFailure() error {
@@ -96,6 +108,7 @@ func (f *fakeStore) CreateTask(_ context.Context, req CreateTaskRequest) (Create
 		return CreateTaskResult{}, errors.New("fake: 缺少字段")
 	}
 	f.tasks[req.TaskID] = &TaskView{TaskID: req.TaskID, Status: "queued", Desired: "run", ControlVersion: 1}
+	f.limits[req.RequestID] = string(req.Limits)
 	f.order = append(f.order, req.TaskID)
 	f.events[req.TaskID] = []Event{{TaskSeq: 1, Source: "host", Type: "task_created"}}
 	res := CreateTaskResult{TaskID: req.TaskID}
@@ -442,20 +455,22 @@ func TestCreateTaskIdempotency(t *testing.T) {
 	}
 }
 
-// TestCreateTaskValidateLimits：装配提供的 ValidateLimits 拒绝的 limits → 400 invalid_limits，且不创建任务；
-// 省略 limits 时不调用校验。
-func TestCreateTaskValidateLimits(t *testing.T) {
+// TestCreateTaskEffectiveLimits：装配提供的 EffectiveLimits 拒绝 → 400 invalid_limits 且不创建任务；
+// 接受时存储的是它返回的有效 limits（省略 limits 时也调用，收到 nil）。
+func TestCreateTaskEffectiveLimits(t *testing.T) {
 	var seen []string
 	ts := newTestServer(t, func(c *Config) {
-		c.ValidateLimits = func(l json.RawMessage) error {
+		c.EffectiveLimits = func(l json.RawMessage) (json.RawMessage, error) {
 			seen = append(seen, string(l))
 			var v struct {
 				MemoryMax int64 `json:"memory_max"`
 			}
-			if err := json.Unmarshal(l, &v); err != nil || v.MemoryMax > 1024 {
-				return errors.New("memory_max 超过总内存")
+			if len(l) > 0 {
+				if err := json.Unmarshal(l, &v); err != nil || v.MemoryMax > 1024 {
+					return nil, errors.New("memory_max 超过总内存")
+				}
 			}
-			return nil
+			return json.RawMessage(fmt.Sprintf(`{"max_run_time_ms":3600000,"memory_max":%d}`, v.MemoryMax)), nil
 		}
 	})
 	st, b, _ := ts.do("POST", "/tasks", `{"request_id":"r1","spec":{},"limits":{"memory_max":4096}}`, nil)
@@ -467,8 +482,11 @@ func TestCreateTaskValidateLimits(t *testing.T) {
 	expect(t, st, b, 201, "")
 	st, b, _ = ts.do("POST", "/tasks", `{"request_id":"r3","spec":{}}`, nil)
 	expect(t, st, b, 201, "")
-	if want := []string{`{"memory_max":4096}`, `{"memory_max":512}`}; !slices.Equal(seen, want) {
-		t.Fatalf("ValidateLimits 收到 %q，期望 %q", seen, want)
+	if want := []string{`{"memory_max":4096}`, `{"memory_max":512}`, ``}; !slices.Equal(seen, want) {
+		t.Fatalf("EffectiveLimits 收到 %q，期望 %q", seen, want)
+	}
+	if got := ts.store.limitsOf(t, "r3"); got != `{"max_run_time_ms":3600000,"memory_max":0}` {
+		t.Fatalf("存储的 limits = %s，应为有效 limits", got)
 	}
 }
 

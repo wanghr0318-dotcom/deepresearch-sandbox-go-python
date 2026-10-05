@@ -50,7 +50,8 @@ func runServer(args []string, stderr io.Writer) int {
 	runSlots := fs.Int("run-slots", 4, "并发执行的任务数（run slots）")
 	memory := fs.Int64("memory-bytes", 8<<30, "全部任务环境的内存总量（字节）")
 	defaultMemory := fs.Int64("default-memory-bytes", 1<<30, "limits 未设置 memory_max 时每个任务的内存（字节）")
-	maxRunTime := fs.Duration("max-run-time", time.Hour, "累计运行时限的默认值（任务 limits.max_run_time_ms 优先）")
+	defaultRunTime := fs.Duration("default-run-time", time.Hour, "累计运行时限的默认值：创建时未指定 limits.max_run_time_ms 的任务以此存储")
+	runTimeCap := fs.Duration("run-time-cap", 24*time.Hour, "显式累计运行时限的服务端上限")
 	allowedHost := fs.String("allowed-host", "", "非 loopback 监听时 Host 头的允许值（逗号分隔）")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -74,7 +75,8 @@ func runServer(args []string, stderr io.Writer) int {
 		Listen:             *listen,
 		Capacity:           admission.Capacity{RunSlots: *runSlots, MemoryBytes: *memory},
 		DefaultMemoryBytes: *defaultMemory,
-		MaxRunTime:         *maxRunTime,
+		DefaultRunTime:     *defaultRunTime,
+		RunTimeCap:         *runTimeCap,
 		AllowedHosts:       splitList(*allowedHost),
 	}
 	if _, err := os.Stat(filepath.Join(dir, api.TokenFile)); err == nil {

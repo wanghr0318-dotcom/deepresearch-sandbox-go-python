@@ -607,7 +607,7 @@ func newHarness(t *testing.T) *harness {
 }
 
 func baseConfig() app.Config {
-	return app.Config{Listen: "127.0.0.1:0", ShutdownTimeout: 20 * time.Second, MaxRunTime: 1000 * time.Hour,
+	return app.Config{Listen: "127.0.0.1:0", ShutdownTimeout: 20 * time.Second, DefaultRunTime: 1000 * time.Hour, RunTimeCap: 1000 * time.Hour,
 		Capacity: admission.Capacity{RunSlots: 4, MemoryBytes: 8 << 30}}
 }
 

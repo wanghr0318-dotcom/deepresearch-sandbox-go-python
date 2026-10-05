@@ -71,10 +71,11 @@ type Config struct {
 	PollInterval time.Duration
 	// NewTaskID 生成任务 ID；nil 时使用 128 位随机数。
 	NewTaskID func() string
-	// ValidateLimits 可选：创建任务时校验请求中的 limits（省略 limits 时不调用）；返回错误时以
-	// 400 invalid_limits 拒绝。装配代码据此拒绝永远无法满足容量的限额（例如 memory_max 超过总内存），
-	// 使 actor 申请槽位时不会遇到 admission.ErrExceedsCapacity。
-	ValidateLimits func(limits json.RawMessage) error
+	// EffectiveLimits 可选：创建任务时由请求中的 limits（省略时为 nil）得出随任务持久化的有效 limits，
+	// 例如补入默认的累计运行时限（规格 §14.4：创建时确定并存储）；返回错误时以 400 invalid_limits 拒绝
+	// （例如显式时限不是正数、超过服务端上限，或 memory_max 永远无法被授予）。body_hash 仍按原始请求计算。
+	// nil 时按原样存储请求中的 limits。
+	EffectiveLimits func(limits json.RawMessage) (json.RawMessage, error)
 }
 
 // Handler 实现 api/openapi.yaml 描述的 REST 与 SSE 接口。
@@ -497,11 +498,18 @@ func (h *Handler) createTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "limits 须为 JSON 对象")
 		return
 	}
-	if len(body.Limits) > 0 && h.cfg.ValidateLimits != nil {
-		if err := h.cfg.ValidateLimits(body.Limits); err != nil {
+	stored := body.Limits
+	if h.cfg.EffectiveLimits != nil {
+		eff, err := h.cfg.EffectiveLimits(body.Limits)
+		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_limits", err.Error())
 			return
 		}
+		if len(eff) > 0 && !isJSONObject(eff) {
+			writeError(w, http.StatusInternalServerError, "internal", "内部错误")
+			return
+		}
+		stored = eff
 	}
 	canon, err := canonicalJSON(body)
 	if err != nil {
@@ -513,8 +521,8 @@ func (h *Handler) createTask(w http.ResponseWriter, r *http.Request) {
 		Spec: mustCanonical(body.Spec), ConfigVersion: h.cfg.ConfigVersion,
 		MaxFaultRetries: h.cfg.MaxFaultRetries,
 	}
-	if len(body.Limits) > 0 {
-		req.Limits = mustCanonical(body.Limits)
+	if len(stored) > 0 {
+		req.Limits = mustCanonical(stored)
 	}
 	res, err := h.cfg.Store.CreateTask(r.Context(), req)
 	if errors.Is(err, persistence.ErrCommitUnknown) {

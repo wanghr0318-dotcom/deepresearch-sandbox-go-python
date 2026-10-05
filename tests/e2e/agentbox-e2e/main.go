@@ -87,7 +87,8 @@ func runServer(args []string, stderr io.Writer) int {
 	cfg := app.Config{
 		Listen:          *listen,
 		Capacity:        admission.Capacity{RunSlots: *runSlots, MemoryBytes: 8 << 30},
-		MaxRunTime:      1000 * time.Hour,
+		DefaultRunTime:  1000 * time.Hour,
+		RunTimeCap:      1000 * time.Hour,
 		ShutdownTimeout: *shutdown,
 		RetryBackoff:    func(int) time.Duration { return backoff },
 	}

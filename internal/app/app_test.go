@@ -244,7 +244,7 @@ func (w lockedWriter) Write(b []byte) (int, error) {
 }
 
 func testConfig() Config {
-	return Config{Listen: "127.0.0.1:0", ShutdownTimeout: 10 * time.Second, MaxRunTime: 1000 * time.Hour,
+	return Config{Listen: "127.0.0.1:0", ShutdownTimeout: 10 * time.Second, DefaultRunTime: 1000 * time.Hour, RunTimeCap: 1000 * time.Hour,
 		Capacity: admission.Capacity{RunSlots: 4, MemoryBytes: 8 << 30}}
 }
 
@@ -581,7 +581,7 @@ func TestStartupStepOrder(t *testing.T) {
 }
 
 // TestEndToEndTaskThroughHTTP：app.Run（fake provider + 真实 PostgreSQL）经 HTTP API 提交任务，任务到达
-// 终态 succeeded，环境停止；永远无法满足容量的 limits 被拒绝（ValidateLimits）。
+// 终态 succeeded，环境停止；永远无法满足容量的 limits 被拒绝（EffectiveLimits）。
 func TestEndToEndTaskThroughHTTP(t *testing.T) {
 	h := newHarness(t)
 	h.start(testConfig(), task.SystemClock())
@@ -912,4 +912,47 @@ func countOf(xs []string, x string) int {
 		}
 	}
 	return n
+}
+
+// TestEffectiveLimits：累计运行时限在创建时确定（规格 §14.4）——省略时补入默认值；显式值须为正且不超过
+// 服务端上限；其余键原样保留；永远无法满足容量的 memory_max 被拒绝。
+func TestEffectiveLimits(t *testing.T) {
+	c := Config{DefaultRunTime: time.Hour, RunTimeCap: 24 * time.Hour, DefaultMemoryBytes: 1 << 30,
+		Capacity: admission.Capacity{RunSlots: 4, MemoryBytes: 8 << 30}}
+	cases := []struct {
+		in, want, err string
+	}{
+		{in: ``, want: `{"max_run_time_ms":3600000}`},
+		{in: `{}`, want: `{"max_run_time_ms":3600000}`},
+		{in: `{"memory_max":1024,"x":"keep"}`, want: `{"max_run_time_ms":3600000,"memory_max":1024,"x":"keep"}`},
+		{in: `{"max_run_time_ms":60000}`, want: `{"max_run_time_ms":60000}`},
+		{in: `{"max_run_time_ms":86400000}`, want: `{"max_run_time_ms":86400000}`},
+		{in: `{"max_run_time_ms":0}`, err: "max_run_time_ms"},
+		{in: `{"max_run_time_ms":-5}`, err: "负数"},
+		{in: `{"max_run_time_ms":86400001}`, err: "max_run_time_ms"},
+		{in: `{"max_run_time_ms":1.5}`, err: "不合法"},
+		{in: `{"memory_max":17179869184}`, err: "永远无法被授予"},
+	}
+	for _, tc := range cases {
+		got, err := c.effectiveLimits(json.RawMessage(tc.in))
+		switch {
+		case tc.err != "":
+			if err == nil || !strings.Contains(err.Error(), tc.err) {
+				t.Errorf("%s：应拒绝（含 %q），得到 %s, %v", tc.in, tc.err, got, err)
+			}
+		case err != nil || string(got) != tc.want:
+			t.Errorf("%s → %s, %v；期望 %s", tc.in, got, err, tc.want)
+		}
+	}
+	// 存储后的时限即任务的时限：之后修改默认值不影响它。
+	stored, _ := c.effectiveLimits(nil)
+	c.DefaultRunTime = 5 * time.Minute
+	if got := c.runTimeLimit(task.TaskState{Limits: stored}); got != time.Hour {
+		t.Fatalf("已存储的时限应为 1h，得到 %s", got)
+	}
+	bad := c
+	bad.DefaultRunTime, bad.RunTimeCap = 48*time.Hour, 24*time.Hour
+	if err := bad.validate(); err == nil || !strings.Contains(err.Error(), "运行时限") {
+		t.Fatal("默认时限超过上限的配置应被拒绝")
+	}
 }

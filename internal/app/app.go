@@ -53,9 +53,11 @@ type Config struct {
 	// DefaultLimits 是环境资源限制的默认值（limits 中设置的字段覆盖它；MemoryMax 总取 memory_max 或
 	// DefaultMemoryBytes）。M1 默认 pids 512、cpu.max 一个 CPU、nofile 1024、tmpfs 64 MiB。
 	DefaultLimits provider.Limits
-	// MaxRunTime 是累计运行时限的默认值（§14.4），任务 limits.max_run_time_ms 设置时取后者。
-	// M1 默认 1 h：规格 §14.4 只定义计量，未给出上限的来源与默认值（spec §14.4 leaves the source open）。
-	MaxRunTime time.Duration
+	// DefaultRunTime 是累计运行时限的默认值（规格 §14.4、§19：3600 s）：创建任务时未指定
+	// limits.max_run_time_ms 则以此补入并随任务存储；之后修改不影响已创建任务。
+	DefaultRunTime time.Duration
+	// RunTimeCap 是显式时限的服务端上限（§19：24 h）；超过时创建失败。DefaultRunTime 不得超过它。
+	RunTimeCap time.Duration
 	// ShutdownTimeout 是退出时有期限清理的上限：物理停止全部环境、等待 actor 退出、关闭 API。默认 30 s。
 	ShutdownTimeout time.Duration
 	// Template 是任务环境的只读 rootfs 模板标识。M1 默认 "default"。
@@ -106,8 +108,11 @@ func (c Config) withDefaults() Config {
 	if c.DefaultLimits.TmpBytes <= 0 {
 		c.DefaultLimits.TmpBytes = 64 << 20
 	}
-	if c.MaxRunTime <= 0 {
-		c.MaxRunTime = time.Hour
+	if c.DefaultRunTime <= 0 {
+		c.DefaultRunTime = time.Hour
+	}
+	if c.RunTimeCap <= 0 {
+		c.RunTimeCap = 24 * time.Hour
 	}
 	if c.ShutdownTimeout <= 0 {
 		c.ShutdownTimeout = 30 * time.Second
@@ -137,6 +142,8 @@ func (c Config) validate() error {
 	switch {
 	case c.Capacity.RunSlots < 1 || c.Capacity.MemoryBytes <= 0:
 		return fmt.Errorf("app: 容量须至少 1 个 run slot 且内存为正：%+v", c.Capacity)
+	case c.DefaultRunTime > c.RunTimeCap:
+		return fmt.Errorf("app: 默认运行时限 %s 超过服务端上限 %s", c.DefaultRunTime, c.RunTimeCap)
 	case c.DefaultMemoryBytes > c.Capacity.MemoryBytes:
 		return fmt.Errorf("app: 默认内存 %d 超过总容量 %d", c.DefaultMemoryBytes, c.Capacity.MemoryBytes)
 	}
@@ -774,7 +781,7 @@ func (s *server) startAPI() error {
 		Store: notifyingStore{Store: s.store, s: s}, Mode: s.currentMode, ListenAddr: ln.Addr().String(),
 		Token: s.cfg.APIToken, AllowedHosts: s.cfg.AllowedHosts, AllowedOrigins: s.cfg.AllowedOrigins,
 		Logger: s.log, ConfigVersion: s.cfg.ConfigVersion, MaxFaultRetries: s.cfg.MaxFaultRetries,
-		ValidateLimits: s.cfg.validateLimits,
+		EffectiveLimits: s.cfg.effectiveLimits,
 	})
 	if err != nil {
 		_ = ln.Close()

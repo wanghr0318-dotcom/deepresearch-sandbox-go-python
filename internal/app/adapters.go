@@ -66,27 +66,45 @@ func (c Config) memory(l taskLimits) int64 {
 	return c.DefaultMemoryBytes
 }
 
-// validateLimits 是 api.Config.ValidateLimits：拒绝格式错误与永远无法满足容量的 limits，使 actor 申请
-// 槽位时不会遇到 admission.ErrExceedsCapacity（该错误在 actor 中是致命的）。
-func (c Config) validateLimits(raw json.RawMessage) error {
+// effectiveLimits 是 api.Config.EffectiveLimits：由请求中的 limits 得出随任务存储的有效 limits（规格 §14.4）。
+//   - 拒绝格式错误与永远无法满足容量的 limits，使 actor 申请槽位时不会遇到 admission.ErrExceedsCapacity
+//     （该错误在 actor 中是致命的）；
+//   - max_run_time_ms：省略时补入 DefaultRunTime；显式值须为正整数且不超过 RunTimeCap（0 也是错误）。
+//
+// 其余键原样保留。
+func (c Config) effectiveLimits(raw json.RawMessage) (json.RawMessage, error) {
 	l, err := parseLimits(raw)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if m := c.memory(l); m > c.Capacity.MemoryBytes {
-		return fmt.Errorf("limits.memory_max = %d 超过服务的总内存容量 %d，永远无法被授予", m, c.Capacity.MemoryBytes)
+		return nil, fmt.Errorf("limits.memory_max = %d 超过服务的总内存容量 %d，永远无法被授予", m, c.Capacity.MemoryBytes)
 	}
-	return nil
+	fields := map[string]json.RawMessage{}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			return nil, fmt.Errorf("limits 须为 JSON 对象: %w", err)
+		}
+	}
+	capMs := c.RunTimeCap.Milliseconds()
+	if _, set := fields["max_run_time_ms"]; set {
+		if l.MaxRunTimeMs <= 0 || l.MaxRunTimeMs > capMs {
+			return nil, fmt.Errorf("limits.max_run_time_ms 须为 1..%d 之间的整数（服务端上限 %s）", capMs, c.RunTimeCap)
+		}
+	} else {
+		fields["max_run_time_ms"] = json.RawMessage(fmt.Sprint(c.DefaultRunTime.Milliseconds()))
+	}
+	return json.Marshal(fields)
 }
 
-// runTimeLimit 是 task.Deps.RunTimeLimit：limits.max_run_time_ms，未设置时取 Config.MaxRunTime。
-// limits 无法解析时（API 已校验，只可能来自外部改动）取默认值，不放开限额。
+// runTimeLimit 是 task.Deps.RunTimeLimit：创建时存储的 limits.max_run_time_ms。缺失或无法解析时
+// （只可能来自外部改动）取默认值，不放开限额。
 func (c Config) runTimeLimit(ts task.TaskState) time.Duration {
 	l, err := parseLimits(ts.Limits)
 	if err == nil && l.MaxRunTimeMs > 0 {
 		return time.Duration(l.MaxRunTimeMs) * time.Millisecond
 	}
-	return c.MaxRunTime
+	return c.DefaultRunTime
 }
 
 // envLimits 是环境的资源限制：limits 中设置的字段覆盖 Config.DefaultLimits。
