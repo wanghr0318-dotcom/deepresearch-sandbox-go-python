@@ -40,3 +40,7 @@ __pycache__/
 .pytest_cache/
 .pytest-tmp/
 .ruff_cache/
+
+# 前端（web/）
+web/node_modules/
+web/dist/
