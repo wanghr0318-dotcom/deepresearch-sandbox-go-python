@@ -338,7 +338,7 @@ func New(opt Options) (*Provider, error) // Starter 为 nil 时返回错误（�
 **执行中修订（Task 11，中心裁定）：**
 - **EOF 先于可 wait**：实测 helper 在 exec 前 SIGKILL 自身时，EOF 总先于 reaper 记录到达（内核 `do_exit` 顺序：PF_EXITING → 关 FD → 可 wait）。仅凭"记录不晚于 EOF"会把 case 2 误判为 `start_ack`。裁定：EOF 无字节时读一次 `/proc/<pid>/stat` 的状态与标志字段（解析跳过最后一个 `)`，不读进程名），Z/X 或 PF_EXITING → 等待 reaper 记录再分类；存活 → `start_ack`；ENOENT → 用记录。单次读取 + 条件变量等待，不是轮询，不涉及进程名；已回写规格 §4.6 门槛 2。附带非 root 单元测试覆盖含 `)`/空格的进程名。
 - rlimit（`Limits.NoFile`/`FSize`）尚未从 provider 传到 `InitSpec`（接口变更），归入 Task 13 中心变更；暂为 NOFILE 1024、CORE 0、exec 的 FSIZE = max(TmpBytes, OutBytes)。
-- case 6 实测 150/150 为 `start_ack`+信号 `exit`，0 次落入残余窗口；残余窗口仍按规格显式保留。case 7（控制通道断开）以 init 的 stderr 与"无后续消息"证明，host 侧 ErrControlLost 由 Task 13 e2e 覆盖。
+- case 6 实测：第一轮 150/150 为 `start_ack`+信号 `exit`；修复轮 300 次中 298 次 `start_ack`、**2 次（约 0.7%）落入残余窗口**被归为 `died_before_exec`——证实该窗口真实存在，两种结局均为规格接受的结果；验收记录须同时写明两轮数据，不得只报 150/150。case 7（控制通道断开）以 init 的 stderr 与"无后续消息"证明，host 侧 ErrControlLost 由 Task 13 e2e 覆盖。
 - `init.go` 需修改以接入生产启动路径（桩 Launcher 替换）；`exec-stage2` 分流在 `init_linux.go`/`init_other.go`。
 
 ### Task 12：宿主检查、构建约束与 §16.2 生产验收
