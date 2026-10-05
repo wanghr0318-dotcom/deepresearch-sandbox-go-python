@@ -350,13 +350,13 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if h.cfg.Accounts == nil {
-		if !h.checkBearer(w, r) { // 只有运维 token：每个请求都须携带
+		if !h.checkBearer(w, r, true) { // 只有运维 token：配置了 token 时每个请求都须携带
 			return
 		}
 	} else if _, present := r.Header["Authorization"]; present {
-		// 启用账号：有 Authorization 头时只按 Bearer 判定（无效即 401，不回退到 cookie）；其余由操作的
-		// audience 在 authorize 中判定（会话 cookie 或匿名）。
-		if !h.checkBearer(w, r) {
+		// 启用账号：有 Authorization 头时只按 Bearer 判定（无效或未配置 token 即 401，不回退到 cookie）；
+		// 其余由操作的 audience 在 authorize 中判定（会话 cookie 或匿名）。
+		if !h.checkBearer(w, r, false) {
 			return
 		}
 		r = r.WithContext(withPrincipal(r.Context(), principal{admin: true}))
@@ -618,7 +618,7 @@ func (h *Handler) listTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	out := taskListJSON{Tasks: make([]taskJSON, 0, len(views)), Next: next}
 	for _, v := range views {
-		out.Tasks = append(out.Tasks, toTaskJSON(v))
+		out.Tasks = append(out.Tasks, userTaskJSON(r.Context(), v))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -716,7 +716,7 @@ func (h *Handler) getTask(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, toTaskJSON(v))
+	writeJSON(w, http.StatusOK, userTaskJSON(r.Context(), v))
 }
 
 type controlBody struct {

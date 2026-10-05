@@ -72,6 +72,7 @@ func (h *Handler) streamEvents(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	user := isUserCaller(ctx)
 	heartbeat := time.NewTicker(h.cfg.Heartbeat)
 	defer heartbeat.Stop()
 	poll := time.NewTimer(0)
@@ -92,8 +93,14 @@ func (h *Handler) streamEvents(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			for _, ev := range evs {
-				if err := writeEvent(w, ev); err != nil {
-					return
+				out, keep := ev, true
+				if user {
+					out, keep = userEvent(ev) // 用户只看到允许列表中的事件与字段；被丢弃的事件游标照常前进
+				}
+				if keep {
+					if err := writeEvent(w, out); err != nil {
+						return
+					}
 				}
 				cursor = ev.TaskSeq
 				if ev.Type == EventTaskTerminal {

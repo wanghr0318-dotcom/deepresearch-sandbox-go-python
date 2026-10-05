@@ -32,7 +32,10 @@ info:
     same 404 `task_not_found`. Every other operation answers a user with 403 `forbidden`, and the
     session-only operations (`/auth/logout`, `/auth/me`, `/research`) answer the operator with 403
     `forbidden`. Register and login are rate limited per client IP (5 and 10 per minute; 429
-    `rate_limited`). Without accounts only the Bearer token applies, exactly as above.
+    `rate_limited`). With accounts enabled the operator always needs a valid Bearer token: if no token
+    is configured, any `Authorization` header is 401 and credential-less requests are anonymous. Users
+    get a redacted view of tasks and events (see `GET /tasks/{id}` and `GET /tasks/{id}/events`).
+    Without accounts only the Bearer token applies, exactly as above.
 servers:
   - url: http://127.0.0.1:8080
 security:
@@ -229,6 +232,7 @@ paths:
     get:
       operationId: getTask
       summary: Current view of a task
+      description: A user (session) gets the same view without `current_attempt_id`; `GET /tasks` lists use the same view. The operator view is unchanged.
       responses:
         '200':
           description: The task
@@ -299,6 +303,19 @@ paths:
         Resume with `Last-Event-ID`; all events are kept in v0.2, so cursors never expire. A heartbeat
         comment line (`: heartbeat`) is sent every 15 s and takes no sequence number. The server closes
         the stream after `task_terminal`; clients stop reconnecting once they receive it.
+
+        User view (session caller; the operator sees every event unchanged). Only these events are sent,
+        keyed `source/type`, and their `payload` keeps only the listed fields:
+        `host/task_created` (none), `host/attempt_created` (`attempt_no`),
+        `host/control_accepted` (`desired`, `control_version`), `host/control_applied` (`status`,
+        `control_version`), `host/checkpoint_committed` (`checkpoint_id`, `commit_seq`, `step_id`),
+        `host/artifact_saved` (`artifact_id`, `version`), `host/attempt_ended` and `host/task_terminal`
+        (`task_status`, `status_reason`), `worker/progress` (`step_id`, `kind`, `message`),
+        `worker/result` (`summary`, `outputs`). `worker_seq` is omitted. Every other event (for example
+        Gateway `replay_divergence`, worker `ready`, `checkpoint`, `checkpoint_query`, `artifact`,
+        `paused`, `error`) is not sent, and no cost, budget, model, call, try, usage, token or
+        environment field is ever sent. Dropped events keep their task_seq, so ids stay increasing with
+        gaps, and any existing task_seq (including a dropped one) is a valid `Last-Event-ID`.
       parameters:
         - name: Last-Event-ID
           in: header

@@ -84,13 +84,14 @@ func clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-// checkBearer 校验 Bearer token；未配置 token 时一律通过（与未启用账号时相同）。
-func (h *Handler) checkBearer(w http.ResponseWriter, r *http.Request) bool {
-	if h.token == nil {
+// checkBearer 校验 Bearer token。open 为真时未配置 token 即通过（未启用账号时的 loopback 行为）；
+// 启用账号时 open 为假：未配置 token 就没有任何 Bearer 能成为运维。
+func (h *Handler) checkBearer(w http.ResponseWriter, r *http.Request, open bool) bool {
+	if h.token == nil && open {
 		return true
 	}
 	got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if ok && subtle.ConstantTimeCompare([]byte(got), h.token) == 1 {
+	if ok && h.token != nil && subtle.ConstantTimeCompare([]byte(got), h.token) == 1 {
 		return true
 	}
 	w.Header().Set("WWW-Authenticate", `Bearer realm="agentbox"`)
@@ -99,8 +100,8 @@ func (h *Handler) checkBearer(w http.ResponseWriter, r *http.Request) bool {
 }
 
 // authorize 在启用账号时确定调用者并按操作的 audience 放行。已由 serve 认证的 Bearer 调用者为运维；
-// 否则读会话 cookie。未配置 token（只允许 loopback）时，没有有效会话的请求仍按运维处理（与未启用账号时
-// 相同），但只限用户会话的操作要求有效会话。返回附带调用者的请求；ok 为 false 时已写出响应。
+// 否则读会话 cookie；两者都没有即为匿名（即便未配置 token 也不按运维处理），只能访问匿名操作。
+// 返回附带调用者的请求；ok 为 false 时已写出响应。
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, aud audience) (*http.Request, bool) {
 	if aud == audienceAnyone {
 		return r, true
@@ -118,9 +119,6 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, aud audience
 				return r, false
 			}
 		}
-		if !ok && h.token == nil && aud != audienceUser {
-			p, ok = principal{admin: true}, true
-		}
 		if ok {
 			r = r.WithContext(withPrincipal(r.Context(), p))
 		}
@@ -137,6 +135,60 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, aud audience
 		return r, false
 	}
 	return r, true
+}
+
+// isUserCaller 报告调用者是否为用户会话（启用账号且不是运维）。
+func isUserCaller(ctx context.Context) bool {
+	p, ok := principalFrom(ctx)
+	return ok && !p.admin
+}
+
+// userTaskJSON 是用户看到的任务视图：去掉内部的 current_attempt_id（运维视图不变）。
+func userTaskJSON(ctx context.Context, v TaskView) taskJSON {
+	j := toTaskJSON(v)
+	if isUserCaller(ctx) {
+		j.CurrentAttemptID = ""
+	}
+	return j
+}
+
+// userEventFields 是用户可见事件的允许列表：键为 "<source>/<type>"，值为 payload 中保留的字段，其余字段
+// （费用、预算、模型、调用、try、用量、token、env、checkpoint 状态等）一律去掉。不在列表中的事件
+// （Gateway 的 replay_divergence、worker 的 ready、checkpoint、checkpoint_query、artifact、paused、error 等）
+// 对用户不出现；事件的 task_seq 不变，游标照常前进，Last-Event-ID 续传不受影响。
+var userEventFields = map[string][]string{
+	"host/task_created":         {},
+	"host/attempt_created":      {"attempt_no"},
+	"host/control_accepted":     {"desired", "control_version"},
+	"host/control_applied":      {"status", "control_version"},
+	"host/checkpoint_committed": {"checkpoint_id", "commit_seq", "step_id"},
+	"host/artifact_saved":       {"artifact_id", "version"},
+	"host/attempt_ended":        {"task_status", "status_reason"},
+	"host/" + EventTaskTerminal: {"task_status", "status_reason"},
+	"worker/progress":           {"step_id", "kind", "message"},
+	"worker/result":             {"summary", "outputs"},
+}
+
+// userEvent 返回事件的用户视图；不在允许列表中的事件返回 false。worker_seq 是内部序号，也去掉。
+func userEvent(ev Event) (Event, bool) {
+	fields, ok := userEventFields[ev.Source+"/"+ev.Type]
+	if !ok {
+		return Event{}, false
+	}
+	var in map[string]json.RawMessage
+	_ = json.Unmarshal(ev.Payload, &in) // payload 不是对象时按空对象处理：只保留允许的字段
+	out := make(map[string]json.RawMessage, len(fields))
+	for _, f := range fields {
+		if v, ok := in[f]; ok {
+			out[f] = v
+		}
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return Event{}, false
+	}
+	ev.Payload, ev.WorkerSeq = b, 0
+	return ev, true
 }
 
 // ownsTask 对用户调用者检查路径中的任务属于自己；他人、无主与不存在的任务回答相同的 404。

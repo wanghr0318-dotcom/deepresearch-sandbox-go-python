@@ -1841,3 +1841,140 @@ func TestResearch(t *testing.T) {
 	st, b, _ = ts.do("POST", "/research", `{"request_id":"r3","topic":"并行"}`, session(cb))
 	expect(t, st, b, 202, "") // 每用户独立
 }
+
+// TestAccountsWithoutTokenHaveNoAdmin：启用账号而未配置 token 时，没有凭据的请求是匿名（不按运维处理），
+// 任何 Authorization 头都是 401；用户会话照常。未启用账号时行为不变（loopback 无 token 全部开放）。
+func TestAccountsWithoutTokenHaveNoAdmin(t *testing.T) {
+	ts, acc := newAccountServer(t, func(c *Config) { c.Token = "" })
+	ts.store.addTask("t1", "running", "run")
+	_, cookie := acc.seedUser(t, "fay")
+	for _, tc := range []struct {
+		method, path, body string
+		hdr                map[string]string
+	}{
+		{"GET", "/tasks", "", nil},
+		{"GET", "/tasks/t1", "", nil},
+		{"POST", "/tasks", `{"request_id":"x","spec":{}}`, nil},
+		{"GET", "/tasks/t1/inspect", "", nil},
+		{"GET", "/tasks", "", map[string]string{"Authorization": "Bearer anything"}},
+		{"GET", "/status", "", map[string]string{"Authorization": "Bearer anything"}},
+	} {
+		st, b, _ := ts.do(tc.method, tc.path, tc.body, tc.hdr)
+		expect(t, st, b, 401, "unauthorized")
+	}
+	st, b, _ := ts.do("GET", "/status", "", nil)
+	expect(t, st, b, 200, "")
+	st, b, _ = ts.do("GET", "/tasks", "", session(cookie))
+	expect(t, st, b, 200, "")
+	st, b, _ = ts.do("GET", "/tasks/t1/inspect", "", session(cookie))
+	expect(t, st, b, 403, "forbidden")
+
+	plain := newTestServer(t, nil)
+	plain.store.addTask("t1", "running", "run")
+	st, b, _ = plain.do("GET", "/tasks/t1", "", nil)
+	expect(t, st, b, 200, "")
+}
+
+// readAllFrames 解析已结束的事件流，返回事件帧（不含心跳）。
+func readAllFrames(body []byte) []sseFrame {
+	r := bufio.NewReader(bytes.NewReader(body))
+	var out []sseFrame
+	for {
+		f, err := readFrame(r)
+		if err != nil {
+			return out
+		}
+		if !f.comment {
+			out = append(out, f)
+		}
+	}
+}
+
+// TestUserEventRedaction：用户的事件流只含允许列表中的事件类型，payload 只含允许的字段（无费用、模型、
+// 调用、用量等）；被丢弃事件的 task_seq 不出现但游标照常前进，Last-Event-ID 续传（含指向被丢弃事件的
+// ID）有效；用户的任务视图不含 current_attempt_id；运维看到的事件流与任务视图不变。
+func TestUserEventRedaction(t *testing.T) {
+	ts, acc := newAccountServer(t, nil)
+	a, ca := acc.seedUser(t, "gil")
+	ts.store.addTask("ta", "succeeded", "run")
+	ts.store.mu.Lock()
+	ts.store.tasks["ta"].CurrentAttemptID = "att_1"
+	ts.store.mu.Unlock()
+	acc.own("ta", a.ID)
+	raw := []struct{ source, typ, payload string }{
+		{"host", "task_created", `{}`},
+		{"host", "attempt_created", `{"attempt_no":1,"env_id":"env_secret"}`},
+		{"worker", "ready", `{"type":"ready","seq":1,"mode":"task"}`},
+		{"host", "replay_divergence", `{"call_id":"call_1","cost_micro":5}`},
+		{"worker", "checkpoint", `{"type":"checkpoint","seq":2,"state":{"model":"kimi-k3","budget":1}}`},
+		{"host", "checkpoint_committed", `{"checkpoint_id":"cp1","commit_seq":1,"step_id":"plan"}`},
+		{"worker", "progress", `{"type":"progress","seq":3,"step_id":"search","kind":"step","message":"searching","data":{"cost_micro":9,"model":"kimi-k2.6","call_id":"c"}}`},
+		{"host", "artifact_saved", `{"artifact_id":"report.md","version":1,"sha256":"ab"}`},
+		{"worker", "error", `{"type":"error","seq":4,"code":"budget_exhausted","message":"tokens"}`},
+		{"worker", "result", `{"type":"result","seq":5,"summary":"done","outputs":[],"usage":{"tokens":5}}`},
+		{"host", EventTaskTerminal, `{"attempt_id":"att_1","outcome_class":"ok","task_status":"succeeded","status_reason":"ok","platform_killed":false,"output_incomplete":false}`},
+	}
+	ts.store.mu.Lock()
+	ts.store.events["ta"] = nil
+	for i, e := range raw {
+		ts.store.events["ta"] = append(ts.store.events["ta"], Event{TaskSeq: int64(i + 1), AttemptID: "att_1", Source: e.source, Type: e.typ,
+			WorkerSeq: int64(i), Payload: json.RawMessage(e.payload), TS: time.Unix(1700000000, 0).UTC()})
+	}
+	ts.store.mu.Unlock()
+
+	ids := func(fs []sseFrame) []string {
+		var out []string
+		for _, f := range fs {
+			out = append(out, f.id)
+		}
+		return out
+	}
+	st, body, _ := ts.do("GET", "/tasks/ta/events", "", session(ca))
+	expect(t, st, body, 200, "")
+	frames := readAllFrames(body)
+	if got := ids(frames); !slices.Equal(got, []string{"1", "2", "6", "7", "8", "10", "11"}) {
+		t.Fatalf("用户事件流的 ID = %v", got)
+	}
+	for _, bad := range []string{"cost", "model", "call", "usage", "tokens", "budget", "env_", "outcome_class", "worker_seq", "sha256", "data", "replay_divergence"} {
+		for _, f := range frames {
+			if strings.Contains(f.data, bad) || strings.Contains(f.event, bad) {
+				t.Fatalf("用户事件含 %q: %+v", bad, f)
+			}
+		}
+	}
+	if !strings.Contains(frames[3].data, `"payload":{"kind":"step","message":"searching","step_id":"search"}`) {
+		t.Fatalf("progress 的用户视图 = %s", frames[3].data)
+	}
+	for lastID, want := range map[string][]string{"6": {"7", "8", "10", "11"}, "4": {"6", "7", "8", "10", "11"}} {
+		hdr := session(ca)
+		hdr["Last-Event-ID"] = lastID
+		st, body, _ = ts.do("GET", "/tasks/ta/events", "", hdr)
+		expect(t, st, body, 200, "")
+		if got := ids(readAllFrames(body)); !slices.Equal(got, want) {
+			t.Fatalf("Last-Event-ID %s 续传 = %v，期望 %v", lastID, got, want)
+		}
+	}
+	st, body, _ = ts.do("GET", "/tasks/ta", "", session(ca))
+	expect(t, st, body, 200, "")
+	if strings.Contains(string(body), "att_1") {
+		t.Fatalf("用户的任务视图含 current_attempt_id: %s", body)
+	}
+	st, body, _ = ts.do("GET", "/tasks", "", session(ca))
+	expect(t, st, body, 200, "")
+	if strings.Contains(string(body), "att_1") {
+		t.Fatalf("用户的任务列表含 current_attempt_id: %s", body)
+	}
+
+	// 运维：全部事件，payload 原样。
+	st, body, _ = ts.do("GET", "/tasks/ta/events", "", adminAuth)
+	expect(t, st, body, 200, "")
+	all := readAllFrames(body)
+	if len(all) != len(raw) || !strings.Contains(all[3].data, `"cost_micro":5`) || !strings.Contains(all[6].data, `"worker_seq":6`) {
+		t.Fatalf("运维事件流被改动: %+v", all)
+	}
+	st, body, _ = ts.do("GET", "/tasks/ta", "", adminAuth)
+	expect(t, st, body, 200, "")
+	if !strings.Contains(string(body), `"current_attempt_id":"att_1"`) {
+		t.Fatalf("运维的任务视图 = %s", body)
+	}
+}
