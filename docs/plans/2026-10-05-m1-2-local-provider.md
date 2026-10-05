@@ -376,3 +376,31 @@ func New(opt Options) (*Provider, error) // Starter 为 nil 时返回错误（�
 - **规格覆盖**：§4.2 → Task 4；§4.3 → Task 5、6；§4.4 → Task 6（terminate）、Task 8（Stop/Destroy）；§4.5 seccomp → Task 3，其余隔离项 → 1B 之后；§9.2 旧代码处理 → Task 2；§18 Task 7–11 的修订 → Task 5–8。
 - **未在本计划内验证**：真实隔离（namespace、降权、挂载）——等待 1B。
 - **占位符**：无；接口签名为本计划的契约，实现时如需偏离，先修订本计划。
+
+## 验收记录（2026-10-05）——状态：已验收（Draft PR #11，未合并）
+
+**集成分支** `m1-batch2` @ b696db3。验收范围：**WSL2 6.6.87.2 x86_64**（本地）与 **CI ubuntu-24.04 x86_64**（GitHub runner，root 作业）；不代表其他 Linux 环境或 aarch64（规格 §16.2）。
+
+### 1. 本地测试结果
+- 非 root：`go vet ./...`、`GOOS=windows go build ./...`、`CI=true go test ./...`（真实 PostgreSQL）全部通过；archtest 9/9（规则 1–4、provider/fake 不入生产、凭据系统调用只在 sandbox、faultinject.Enable 只在 tests/e2e）。
+- root（`CGO_ENABLED=0`）：`internal/sandbox`、`provider/local`、`hostcheck`、`cgroup`、`rootfs` 连续 3 次通过，无 skip；其中 §16.2 检查器（`TestIsolationAcceptance16_2`）逐项通过，`TestWorkloadLimitsApplied` 证明 `Limits.NoFile/FSize` 经真实 init + stage-2 helper 施加到 workload。
+- 联合验收第 1–3 项（本地全量、Windows 构建、范围与 archtest）成立。
+
+### 2. 真实沙箱结果（`tests/e2e` 的 `TestReal*`，provider/local + 生产启动器）
+- 本地 root：连续 3 次 `CI=true CGO_ENABLED=0 go test ./tests/e2e/...`（约 149 s/次），每次 25 PASS / 0 FAIL / 0 SKIP；集成分支上再跑 1 次同样通过。
+- 用例：首个切片（提交 → checkpoint → 杀死 Worker → 恢复 → result）、E1（第 2 个 checkpoint 后杀死）、E2（Worker 超出 memory.max → `worker_oom_likely`，OOM 重试）、E3（同环境另一进程 OOM → `oom_observed_in_attempt`）、E4（100 次取消/result 随机交错，seed 记录）、E7（丢弃首个 checkpoint_result）、E8（Store 阻塞，执行树在约 3 s 内停止）、E10（产物篡改）、累计运行时限跨重启。
+- CI：run 37268782847（commit 8a63b70）全绿；上述 10 个 `TestReal*` 在 ubuntu-24.04 root 作业中**实际运行并通过**（非 skip）。
+- 演示脚本 `scripts/demo-m1.sh`：18/18 步通过（全新数据目录与数据库），完整输出见 [docs/evidence/2026-10-05-m1-demo-run.md](../evidence/2026-10-05-m1-demo-run.md)。
+
+### 3. 重启恢复结果
+- `TestRealE5ServerKilledPhysicalRecovery`：server 在任务运行中被 SIGKILL → 重启 → 孤儿环境目录与 cgroup 被回收、无误隔离、任务以新 attempt 恢复并完成；`verify-invariants --quiescent` 通过。
+- `TestRealRunTimeLimitAcrossRestart`：累计运行时限跨 server 重启不重置，到期 `task_deadline_exceeded`。
+- 演示脚本第 12–15 步复现同一流程（attempt 1 `lost_on_restart`，attempt 2 从 checkpoint s1 恢复并 `succeeded`）。
+
+### 4. 剩余限制与环境假设
+- **残余 exec 边界竞争窗口**（规格 §4.6 门槛 2，原文）：helper 在写完最后一步与 `execve` 返回之间被 SIGKILL，与 workload 在 `execve` 返回后立即被 SIGKILL，在"EOF 无字节 + 信号终止"上不可区分；按提交点归为 `died_before_exec`。实测：Task 11 第一轮 150/150 ack，修复轮 300 次中 2 次（约 0.7%）落入该窗口；12b 的 50 次中 0 次。`start_ack` 只表示到达提交点，不表示 workload 首条指令已执行。
+- 宿主假设：Linux cgroup v2、内核 ≥ 5.14、新挂载 API 与 `close_range` 可用、可创建 user namespace（`agentbox doctor` 逐项检查）；默认 rootfs 模板要求宿主存在 `/opt/agentbox`（worker 包）并复用宿主 `/usr`、`/etc` 子集与 `/lib*`；沙箱内 `python3 ≥ 3.11` 来自宿主 `/usr`；生产二进制与 helper 须 `CGO_ENABLED=0`（cgo 构建的 helper 拒绝启动 workload）。
+- 保真度：E3 的 OOM 受害者是同一环境中的另一个 exec，不是 Worker 的子进程；E5 中 server 被杀会连带 init 与 PID 命名空间退出，恢复只遇到孤儿目录与 cgroup，不会遇到存活进程。
+- 功能限制：`agentbox task result` 返回 501（M1 未实现下载端点，产物以固定版本存于 BlobStore）；不提供 `/dev/shm`；每任务 2 GiB 产物上限未强制；artifact 暂时性失败回复 `save_timeout`。
+- 留待最终评审：环境清理完成后 `env_status` 仍为 `creating`；任务因时限结束时 `run_time_ms` 未再持久化；e2e 真实 harness 结束后留下空的安装级 cgroup（演示脚本只删除本安装的）；workspace 目录没有清理者。
+- 工具环境：Docker Desktop 未开启 WSL 集成时，演示脚本经 `docker.exe` interop 新建演示数据库；`*.sh` 以 `.gitattributes` 固定 LF（Windows 检出后在 WSL 运行曾因 CRLF 失败）。
