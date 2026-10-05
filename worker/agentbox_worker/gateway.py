@@ -117,6 +117,11 @@ class _Response:
     data: bytes
 
 
+def _cache_headers(no_cache: bool) -> dict[str, str]:
+    """缓存指令头（规格 §11.4）：no-cache 时为 X-Agentbox-Cache: no-cache，否则不发送。"""
+    return {"X-Agentbox-Cache": "no-cache"} if no_cache else {}
+
+
 def _error_from(status: int, data: bytes) -> GatewayError:
     code, message = f"http_{status}", ""
     try:
@@ -194,16 +199,30 @@ class GatewayClient:
             body["temperature"] = temperature
         return body
 
-    def search(self, step_id: str, query: str, *, max_results: int = 5) -> GatewayResult:
+    def search(
+        self, step_id: str, query: str, *, max_results: int = 5, no_cache: bool = False
+    ) -> GatewayResult:
+        """no_cache=True 发送 X-Agentbox-Cache: no-cache：不读共享缓存、不加入合并，结果仍写入缓存；
+        该指令计入调用指纹（规格 §11.4），恢复后重发同一调用须给出同一取值。"""
         body = {"query": query, "max_results": max_results}
-        return self._call("search", self.call_ids.next(step_id, "search"), body, {})
+        return self._call(
+            "search", self.call_ids.next(step_id, "search"), body, _cache_headers(no_cache)
+        )
 
-    def fetch(self, step_id: str, url: str) -> GatewayResult:
-        return self._call("fetch", self.call_ids.next(step_id, "fetch"), {"url": url}, {})
+    def fetch(self, step_id: str, url: str, *, no_cache: bool = False) -> GatewayResult:
+        """no_cache 的含义同 search。"""
+        return self._call(
+            "fetch", self.call_ids.next(step_id, "fetch"), {"url": url}, _cache_headers(no_cache)
+        )
 
-    def retry(self, step_id: str, kind: str, call_id: str, body: dict) -> GatewayResult:
-        """以同一 call id 重发一次已失败的调用（X-Agentbox-Retry: true，规格 §9.4 failed 行）。"""
-        return self._call(kind, call_id, body, {"X-Agentbox-Retry": "true"})
+    def retry(
+        self, step_id: str, kind: str, call_id: str, body: dict, *, no_cache: bool = False
+    ) -> GatewayResult:
+        """以同一 call id 重发一次已失败的调用（X-Agentbox-Retry: true，规格 §9.4 failed 行）。
+        no_cache 须与原调用一致（缓存指令计入指纹）。"""
+        return self._call(
+            kind, call_id, body, {"X-Agentbox-Retry": "true", **_cache_headers(no_cache)}
+        )
 
     def supersede(
         self, step_id: str, kind: str, old_call_id: str, reason: str, body: dict

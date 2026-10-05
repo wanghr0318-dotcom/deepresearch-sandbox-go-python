@@ -20,8 +20,9 @@ import (
 //     IntegrityFailure。
 //   - Store：准入（Admit）与新鲜度（抓取取 Lifetime，搜索取 adapter TTL）→ Seal → 异步、可丢弃的 SET。
 //   - Bypass：no-cache 请求跳过读取时计数。
+//   - CoalesceKey / Coalesced：给出 singleflight 合并键中的 cache_key；follower 加入时计数（§11.4）。
 //
-// 指标：Guarded 只记 Error 与 BreakerOpen；Hit、Miss、Bypass、IntegrityFailure 在这里记，每次查找恰得到
+// 指标：Guarded 只记 Error 与 BreakerOpen；Hit、Miss、Bypass、Coalesced、IntegrityFailure 在这里记，每次查找恰得到
 // 一个结局（Redis 出错或熔断打开的查找只计 Error / BreakerOpen，不再计 Miss）。Source 不记账、不授权：
 // 命中只给出 blob 引用，journal 提交（CompleteFromCache）由 gateway/call 完成。
 type Source struct {
@@ -121,16 +122,10 @@ func (p probeKV) Del(ctx context.Context, key string) error { return p.kv.Del(ct
 // rawURL 是抓取的目标 URL（搜索为空）：每次查找按当前准入规则复查（凭据类参数、userinfo），不合规的 URL
 // 即使存在旧条目也不读取（计 Bypass）。
 func (s *Source) Lookup(ctx context.Context, kind upstream.Kind, provider, ver string, params []byte, rawURL string) (string, int64, bool) {
-	key, err := Key(kind, provider, ver, params)
-	if err != nil {
+	key, ok := s.CoalesceKey(kind, provider, ver, params, rawURL)
+	if !ok {
 		s.m.Bypass.Add(1)
 		return "", 0, false
-	}
-	if kind == upstream.KindFetch {
-		if ok, _ := Admit(kind, rawURL, Response{Status: 200}); !ok {
-			s.m.Bypass.Add(1)
-			return "", 0, false
-		}
 	}
 	pr := &probe{}
 	// Guarded 从不返回错误：Redis 出错或熔断打开都表现为未命中，并已由 Guarded 计数。
@@ -177,6 +172,24 @@ func (s *Source) verifyBlob(v Value) error {
 
 // Bypass 记录一次 no-cache 请求跳过缓存读取（§11.4：不读旧缓存，结果仍写入）。
 func (s *Source) Bypass() { s.m.Bypass.Add(1) }
+
+// CoalesceKey 返回可缓存调用的 cache_key（§11.4 合并键的一段）；不可缓存（类别、键段非法，或抓取 URL 不符合
+// 当前准入规则）时 ok 为 false，这样的调用不参与合并。不访问 Redis，不计数。
+func (s *Source) CoalesceKey(kind upstream.Kind, provider, ver string, params []byte, rawURL string) (string, bool) {
+	key, err := Key(kind, provider, ver, params)
+	if err != nil {
+		return "", false
+	}
+	if kind == upstream.KindFetch {
+		if ok, _ := Admit(kind, rawURL, Response{Status: 200}); !ok {
+			return "", false
+		}
+	}
+	return key, true
+}
+
+// Coalesced 记录一次请求作为 follower 加入进行中的共享请求（§11.4、§11.5 指标 coalesced）。
+func (s *Source) Coalesced() { s.m.Coalesced.Add(1) }
 
 // Store 在结果已结算为 completed 之后提交一次缓存写入（异步、可丢弃）。resp 是上游响应的元数据，其 Size
 // 须为结果 blob 的大小（准入按它判定 ≤ 2 MiB，命中时按它校验）；blobSHA 是结果 blob。

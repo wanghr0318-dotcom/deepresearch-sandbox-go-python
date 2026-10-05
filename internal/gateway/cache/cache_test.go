@@ -1241,6 +1241,25 @@ func TestSourceFetchAdmission(t *testing.T) {
 	if f.kv.gets != gets || f.m.Bypass.Load() != 2 {
 		t.Fatalf("凭据 URL 应跳过 Redis 并计 bypass：gets %d→%d，指标 %s", gets, f.kv.gets, f.metrics())
 	}
+	// 合并键（§11.4）：可缓存的抓取给出与 Key 相同的 cache_key（规范化后相同的 URL 同键）；凭据 URL 与模型调用
+	// 不参与合并；CoalesceKey 不访问 Redis、不计数，Coalesced 每次计一。
+	want, err := Key(upstream.KindFetch, "http_get", "v/1", []byte(fetch("http://example.com/a")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k, ok := f.src.CoalesceKey(upstream.KindFetch, "http_get", "v/1", []byte(fetch("HTTP://Example.COM:80/a")), "HTTP://Example.COM:80/a"); !ok || k != want {
+		t.Fatalf("CoalesceKey = %q, %v，期望 %q", k, ok, want)
+	}
+	if _, ok := f.src.CoalesceKey(upstream.KindFetch, "http_get", "v/1", []byte(fetch("http://example.com/a?token=x")), "http://example.com/a?token=x"); ok {
+		t.Fatal("凭据 URL 不应参与合并")
+	}
+	if _, ok := f.src.CoalesceKey(upstream.KindChat, "p", "v/1", []byte(`{}`), ""); ok {
+		t.Fatal("模型调用不应参与合并")
+	}
+	f.src.Coalesced()
+	if f.kv.gets != gets || f.m.Bypass.Load() != 2 || f.src.Metrics()["coalesced"] != 1 {
+		t.Fatalf("CoalesceKey 不应访问 Redis 或计数：gets %d→%d，指标 %s", gets, f.kv.gets, f.metrics())
+	}
 }
 
 // Redis 不可达：查找全部未命中，只计 error（不再计 miss）；连续 5 次失败后熔断打开，之后计 breaker_open。

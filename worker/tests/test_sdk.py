@@ -912,6 +912,29 @@ def test_retry_replay_and_supersede_headers(fake_gateway):
     assert "x-agentbox-retry" not in headers
 
 
+def test_no_cache_sends_cache_directive_only_when_asked(fake_gateway):
+    gw = client(fake_gateway)
+    gw.search("s1", "q", no_cache=True)
+    gw.fetch("s1", "https://example.com/a", no_cache=True)
+    gw.search("s1", "q")
+    gw.fetch("s1", "https://example.com/a")
+    gw.retry("s1", "fetch", "root/s1/fetch/1", {"url": "https://example.com/a"}, no_cache=True)
+    got = [r.headers.get("x-agentbox-cache") for r in fake_gateway.requests]
+    assert got == ["no-cache", "no-cache", None, None, "no-cache"]
+    assert fake_gateway.requests[4].headers["x-agentbox-retry"] == "true"
+    # 指令不改变请求体与调用 ID 序列
+    assert [r.json() for r in fake_gateway.requests[:2]] == [
+        {"query": "q", "max_results": 5},
+        {"url": "https://example.com/a"},
+    ]
+    assert [r.headers["x-agentbox-call-id"] for r in fake_gateway.requests[:4]] == [
+        "root/s1/search/1",
+        "root/s1/fetch/1",
+        "root/s1/search/2",
+        "root/s1/fetch/2",
+    ]
+
+
 @pytest.mark.parametrize(
     ("reply", "exc_type", "code"),
     [

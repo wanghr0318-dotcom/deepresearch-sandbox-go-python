@@ -249,18 +249,25 @@ func (s *fakeStore) CompleteFromCache(_ context.Context, r CacheCompletion) (Cal
 	if code := admit(s.facts(r.TaskID, r.AttemptID)); code != "" {
 		return CallRecord{}, rejected(code)
 	}
+	src := r.Source
+	if src == "" {
+		src = SourceCache
+	}
+	if src != SourceCache && src != SourceCoalesced {
+		return CallRecord{}, persistence.ErrInvalid
+	}
 	rec := s.calls[callKey{r.TaskID, r.CallID}]
 	switch {
 	case rec == nil:
 		return CallRecord{}, persistence.ErrNotFound
-	case rec.State == StateCompleted && rec.Source == "cache" && rec.ResultRef == r.ResultSHA256:
+	case rec.State == StateCompleted && rec.Source == src && rec.ResultRef == r.ResultSHA256:
 		return *rec, nil
 	case rec.State != StateResolving || rec.ResolvingSince == nil || rec.TriesUsed != 0:
 		return CallRecord{}, persistence.ErrConflict
 	case !time.Now().Before(rec.DeadlineAt):
 		return CallRecord{}, rejected(persistence.CodeCallDeadlineExceeded)
 	}
-	rec.State, rec.Source, rec.ResultRef, rec.ResolvingSince = StateCompleted, "cache", r.ResultSHA256, nil
+	rec.State, rec.Source, rec.ResultRef, rec.ResolvingSince = StateCompleted, src, r.ResultSHA256, nil
 	return *rec, nil
 }
 
@@ -1137,7 +1144,9 @@ type fakeCache struct {
 	lookups  int
 	bypasses int
 	stores   []fakeStored
-	onLookup func() // 查找时（Tx1 之后、Tx2 之前）执行，用于制造竞争
+	onLookup func()        // 查找时（Tx1 之后、Tx2 之前）执行，用于制造竞争
+	joined   chan struct{} // 非 nil 时每个 follower 加入共享请求发送一次（测试据此同步，不用 sleep）
+	nJoined  int
 }
 
 func fakeCacheKey(kind upstream.Kind, provider, ver string, params []byte) string {
@@ -1166,6 +1175,26 @@ func (f *fakeCache) Bypass() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.bypasses++
+}
+
+func (f *fakeCache) CoalesceKey(kind upstream.Kind, provider, ver string, params []byte, _ string) (string, bool) {
+	return fakeCacheKey(kind, provider, ver, params), true
+}
+
+func (f *fakeCache) Coalesced() {
+	f.mu.Lock()
+	f.nJoined++
+	ch := f.joined
+	f.mu.Unlock()
+	if ch != nil {
+		ch <- struct{}{}
+	}
+}
+
+func (f *fakeCache) coalesced() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nJoined
 }
 
 func (f *fakeCache) counts() (lookups, bypasses, stores int) {
@@ -1452,4 +1481,305 @@ func TestCacheSourceEndToEnd(t *testing.T) {
 			t.Fatalf("指标 %v", m)
 		}
 	})
+}
+
+// ---- 请求合并（§11.4） ----
+
+const fetchBody = `{"url":"https://example.com/a"}`
+
+func fetchInv(callID string) Invoke {
+	in := inv(callID, fetchBody)
+	in.Kind = upstream.KindFetch
+	return in
+}
+
+// newCoalesceHarness 装配一个使用 fakeCache（记录 follower 加入）的 Coordinator；adapter 为 kind 类别。
+func newCoalesceHarness(t *testing.T, kind upstream.Kind, script ...step) (*harness, *fakeCache) {
+	t.Helper()
+	fc := &fakeCache{entries: map[string]fakeEntry{}, joined: make(chan struct{}, 64)}
+	ad := newAdapter("p", script...)
+	ad.kind = kind
+	h := &harness{store: newFakeStore(t), ad: ad, blobs: &fakeBlobs{m: map[string][]byte{}}, events: &fakeEvents{},
+		logs: &syncBuffer{}, cache: fc}
+	h.c = h.newCoordinator(t, testLimits())
+	return h, fc
+}
+
+type invokeOutcome struct {
+	r   Result
+	err error
+}
+
+// start 在后台发起一次 Invoke，结果从返回的通道取得。
+func (h *harness) start(ctx context.Context, in Invoke) <-chan invokeOutcome {
+	ch := make(chan invokeOutcome, 1)
+	go func() {
+		r, err := h.c.Invoke(ctx, in)
+		ch <- invokeOutcome{r, err}
+	}()
+	return ch
+}
+
+func await(t *testing.T, ch <-chan invokeOutcome) Result {
+	t.Helper()
+	select {
+	case o := <-ch:
+		if o.err != nil {
+			t.Fatalf("Invoke：%v", o.err)
+		}
+		return o.r
+	case <-time.After(5 * time.Second):
+		t.Fatal("Invoke 没有返回")
+	}
+	return Result{}
+}
+
+// waitJoined 等待 n 个 follower 加入共享请求。
+func waitJoined(t *testing.T, fc *fakeCache, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		select {
+		case <-fc.joined:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("只有 %d 个 follower 加入，期望 %d", i, n)
+		}
+	}
+}
+
+// 同一 attempt 的 10 个相同抓取：1 次上游 try（leader 付费），9 个 follower 各自 completed（source = coalesced，
+// 无 try、无费用），结果为同一 blob 且授权到任务 scope；coalesced 计 9 次。
+func TestCoalesceIdenticalFetches(t *testing.T) {
+	gate := make(chan struct{})
+	h, fc := newCoalesceHarness(t, upstream.KindFetch, step{gate: gate, body: `{"page":"a"}`})
+	ctx := context.Background()
+	outs := []<-chan invokeOutcome{h.start(ctx, fetchInv("c0"))}
+	waitEntered(t, h.ad) // c0 是 leader：它的 try 已发出并阻塞在 gate 上
+	for i := 1; i < 10; i++ {
+		outs = append(outs, h.start(ctx, fetchInv(fmt.Sprintf("c%d", i))))
+	}
+	waitJoined(t, fc, 9)
+	close(gate)
+	var sha string
+	for i, ch := range outs {
+		r := await(t, ch)
+		if r.Status != 200 || r.Replayed || string(r.Body) != `{"page":"a"}` || (sha != "" && r.BlobSHA256 != sha) {
+			t.Fatalf("c%d：%+v", i, r)
+		}
+		sha = r.BlobSHA256
+	}
+	if calls, _, _ := h.ad.stats(); calls != 1 {
+		t.Fatalf("上游调用 %d 次，期望 1", calls)
+	}
+	for i := 0; i < 10; i++ {
+		rec, tries := h.call(t, "t1", fmt.Sprintf("c%d", i))
+		wantSrc, wantTries := SourceCoalesced, 0
+		if i == 0 {
+			wantSrc, wantTries = "upstream", 1
+		}
+		if rec.State != StateCompleted || rec.Source != wantSrc || rec.ResultRef != sha || rec.TriesUsed != wantTries ||
+			len(tries) != wantTries {
+			t.Fatalf("c%d 记录 %+v，try %+v", i, rec, tries)
+		}
+	}
+	if b := h.budget(t, "t1"); b.SpentMicro != 100 || b.ReservedMicro != 0 || b.UnknownMicro != 0 || h.store.nRes != 1 {
+		t.Fatalf("只有 leader 付费：账本 %+v，预留 %d 次", b, h.store.nRes)
+	}
+	if n := fc.coalesced(); n != 9 {
+		t.Fatalf("coalesced = %d，期望 9", n)
+	}
+	if lookups, _, _ := fc.counts(); lookups != 1 {
+		t.Fatalf("follower 加入进行中的共享请求时不查缓存：lookups = %d", lookups)
+	}
+	if r := h.invoke(t, fetchInv("c5")); !r.Replayed || r.BlobSHA256 != sha {
+		t.Fatalf("follower 的调用应按 journal 重放：%+v", r)
+	}
+}
+
+// 合并键含 sub-run 与 attempt：不同 sub-run（X-Agentbox-Subrun）或不同 attempt 的同一抓取各自访问上游。
+// 每个 try 都阻塞在 gate 上，三个 try 都开始即说明没有任何一个加入别人的共享请求。
+func TestCoalesceNotAcrossSubrunOrAttempt(t *testing.T) {
+	gate := make(chan struct{})
+	h, fc := newCoalesceHarness(t, upstream.KindFetch,
+		step{gate: gate, body: `{"page":"1"}`}, step{gate: gate, body: `{"page":"2"}`}, step{gate: gate, body: `{"page":"3"}`})
+	ctx := context.Background()
+	sr1, sr2, other := fetchInv("sr1/s/fetch/1"), fetchInv("sr2/s/fetch/1"), fetchInv("root/s/fetch/1")
+	sr1.SubrunID, sr2.SubrunID, other.AttemptID = "sr1", "sr2", "a2"
+	outs := []<-chan invokeOutcome{h.start(ctx, sr1)}
+	waitEntered(t, h.ad)
+	outs = append(outs, h.start(ctx, sr2))
+	waitEntered(t, h.ad)
+	outs = append(outs, h.start(ctx, other))
+	waitEntered(t, h.ad)
+	close(gate)
+	for _, ch := range outs {
+		if r := await(t, ch); r.Status != 200 {
+			t.Fatalf("结果 %+v", r)
+		}
+	}
+	if calls, _, _ := h.ad.stats(); calls != 3 || fc.coalesced() != 0 {
+		t.Fatalf("上游调用 %d 次、coalesced %d，期望 3 与 0", calls, fc.coalesced())
+	}
+}
+
+// no-cache 不加入进行中的共享请求；模型调用从不合并。
+func TestCoalesceSkipsNoCacheAndChat(t *testing.T) {
+	t.Run("no-cache", func(t *testing.T) {
+		gate := make(chan struct{})
+		h, fc := newCoalesceHarness(t, upstream.KindSearch, step{gate: gate}, step{gate: gate})
+		ctx := context.Background()
+		first := h.start(ctx, searchInv("c1"))
+		waitEntered(t, h.ad)
+		in := searchInv("c2")
+		in.NoCache = true
+		second := h.start(ctx, in)
+		waitEntered(t, h.ad)
+		close(gate)
+		for _, ch := range []<-chan invokeOutcome{first, second} {
+			if r := await(t, ch); r.Status != 200 {
+				t.Fatalf("结果 %+v", r)
+			}
+		}
+		if rec, _ := h.call(t, "t1", "c2"); rec.Source != "upstream" || fc.coalesced() != 0 {
+			t.Fatalf("no-cache 记录 %+v，coalesced %d", rec, fc.coalesced())
+		}
+	})
+	t.Run("chat", func(t *testing.T) {
+		gate := make(chan struct{})
+		h, fc := newCoalesceHarness(t, upstream.KindChat, step{gate: gate}, step{gate: gate})
+		ctx := context.Background()
+		first := h.start(ctx, inv("c1", chatBody))
+		waitEntered(t, h.ad)
+		second := h.start(ctx, inv("c2", chatBody))
+		waitEntered(t, h.ad)
+		close(gate)
+		for _, ch := range []<-chan invokeOutcome{first, second} {
+			if r := await(t, ch); r.Status != 200 {
+				t.Fatalf("结果 %+v", r)
+			}
+		}
+		if lookups, _, _ := fc.counts(); lookups != 0 || fc.coalesced() != 0 {
+			t.Fatalf("chat 不应触及缓存或合并：lookups %d，coalesced %d", lookups, fc.coalesced())
+		}
+	})
+}
+
+// leader 的 Worker 断开：共享请求不被取消，继续完成并结算；follower 拿到结果；leader 的调用之后可重放。
+func TestCoalesceLeaderWorkerLeaves(t *testing.T) {
+	gate := make(chan struct{})
+	h, fc := newCoalesceHarness(t, upstream.KindFetch, step{gate: gate, body: `{"page":"late"}`})
+	lctx, leave := context.WithCancel(context.Background())
+	leader := h.start(lctx, fetchInv("c0"))
+	waitEntered(t, h.ad)
+	follower := h.start(context.Background(), fetchInv("c1"))
+	waitJoined(t, fc, 1)
+	leave()
+	if o := <-leader; !errors.Is(o.err, context.Canceled) {
+		t.Fatalf("leader 的 Invoke 应随 Worker 上下文返回：%+v", o)
+	}
+	close(gate)
+	r := await(t, follower)
+	if r.Status != 200 || string(r.Body) != `{"page":"late"}` {
+		t.Fatalf("follower 结果 %+v", r)
+	}
+	if _, _, errs := h.ad.stats(); len(errs) != 1 || errs[0] != nil {
+		t.Fatalf("共享请求的上下文被取消：%v", errs)
+	}
+	if rec, _ := h.call(t, "t1", "c0"); rec.State != StateCompleted || rec.Source != "upstream" || rec.ResultRef != r.BlobSHA256 {
+		t.Fatalf("leader 记录 %+v", rec)
+	}
+	if rec, _ := h.call(t, "t1", "c1"); rec.State != StateCompleted || rec.Source != SourceCoalesced {
+		t.Fatalf("follower 记录 %+v", rec)
+	}
+	again, err := h.newCoordinator(t, testLimits()).Invoke(context.Background(), fetchInv("c0"))
+	if err != nil || !again.Replayed || again.BlobSHA256 != r.BlobSHA256 {
+		t.Fatalf("leader 的调用应可重放：%+v / %v", again, err)
+	}
+}
+
+// 任务取消：共享请求被取消（已发出 → unknown 计费一次；未发出 → 释放），leader 与每个 follower 都结算为
+// cancel_requested；follower 没有 try、不计费。
+func TestCoalesceTaskCancel(t *testing.T) {
+	for _, sent := range []bool{true, false} {
+		t.Run(fmt.Sprintf("sent=%v", sent), func(t *testing.T) {
+			h, fc := newCoalesceHarness(t, upstream.KindFetch, step{hang: true, sent: sent})
+			ctx := context.Background()
+			outs := []<-chan invokeOutcome{h.start(ctx, fetchInv("c0"))}
+			waitEntered(t, h.ad)
+			outs = append(outs, h.start(ctx, fetchInv("c1")), h.start(ctx, fetchInv("c2")))
+			waitJoined(t, fc, 2)
+			h.store.mu.Lock()
+			h.store.desired["t1"] = "cancel"
+			h.store.mu.Unlock()
+			h.c.CancelAttempt("a1", ReasonCancel)
+			for i, ch := range outs {
+				if r := await(t, ch); r.Status != 409 || r.Code != persistence.CodeCancelRequested {
+					t.Fatalf("c%d：%+v", i, r)
+				}
+			}
+			for _, id := range []string{"c1", "c2"} {
+				if rec, tries := h.call(t, "t1", id); rec.State != StateFailed || rec.FailReason != persistence.CodeCancelRequested ||
+					len(tries) != 0 {
+					t.Fatalf("follower %s 记录 %+v，try %+v", id, rec, tries)
+				}
+			}
+			rec, _ := h.call(t, "t1", "c0")
+			b := h.budget(t, "t1")
+			if calls, _, _ := h.ad.stats(); calls != 1 || b.ReservedMicro != 0 || b.SpentMicro != 0 {
+				t.Fatalf("上游 %d 次，账本 %+v", calls, b)
+			}
+			if sent && (rec.State != StateUnknown || b.UnknownMicro != 100) {
+				t.Fatalf("已发出：leader %+v，账本 %+v", rec, b)
+			}
+			if !sent && (rec.State != StateFailed || rec.FailReason != persistence.CodeCancelRequested || b.UnknownMicro != 0) {
+				t.Fatalf("未发出：leader %+v，账本 %+v", rec, b)
+			}
+		})
+	}
+}
+
+// E19 共享请求变体：attempt 被替换（非取消原因）时共享请求继续至完成并写入 journal；新 attempt 以 leader 的
+// call ID 请求得到 call_in_progress，完成后重放；follower 在访问复查时被拒（access_revoked，可重试），新 attempt
+// 带 X-Agentbox-Retry 重发后正常完成。
+func TestCoalesceAttemptReplacedContinues(t *testing.T) {
+	gate := make(chan struct{})
+	h, fc := newCoalesceHarness(t, upstream.KindFetch, step{gate: gate, body: `{"page":"shared"}`})
+	ctx := context.Background()
+	leader := h.start(ctx, fetchInv("c0"))
+	waitEntered(t, h.ad)
+	follower := h.start(ctx, fetchInv("c1"))
+	waitJoined(t, fc, 1)
+	h.store.mu.Lock()
+	h.store.revoked["a1"] = true
+	h.store.mu.Unlock()
+	h.c.CancelAttempt("a1", "attempt_replaced")
+	next := fetchInv("c0")
+	next.AttemptID = "a2"
+	if r := h.invoke(t, next); r.Code != persistence.CodeCallInProgress {
+		t.Fatalf("新 attempt 在共享请求进行中应得到 call_in_progress：%+v", r)
+	}
+	close(gate)
+	if r := await(t, leader); r.Status != 200 || string(r.Body) != `{"page":"shared"}` {
+		t.Fatalf("leader 结果 %+v", r)
+	}
+	if r := await(t, follower); r.Status != 403 || r.Code != persistence.CodeAccessRevoked {
+		t.Fatalf("follower 结果 %+v", r)
+	}
+	if _, _, errs := h.ad.stats(); len(errs) != 1 || errs[0] != nil {
+		t.Fatalf("共享请求的上下文被取消：%v", errs)
+	}
+	if rec, _ := h.call(t, "t1", "c0"); rec.State != StateCompleted || rec.Source != "upstream" {
+		t.Fatalf("leader 记录 %+v", rec)
+	}
+	if rec, _ := h.call(t, "t1", "c1"); rec.State != StateFailed || rec.FailReason != persistence.CodeAccessRevoked {
+		t.Fatalf("follower 记录 %+v", rec)
+	}
+	c2 := h.newCoordinator(t, testLimits()) // 新进程视角：leader 的执行已结束
+	if r, err := c2.Invoke(ctx, next); err != nil || !r.Replayed || string(r.Body) != `{"page":"shared"}` {
+		t.Fatalf("新 attempt 应重放 leader 的结果：%+v / %v", r, err)
+	}
+	retry := fetchInv("c1")
+	retry.AttemptID, retry.Retry = "a2", true
+	if r, err := c2.Invoke(ctx, retry); err != nil || r.Status != 200 || r.Replayed {
+		t.Fatalf("follower 的调用带 Retry 重发：%+v / %v", r, err)
+	}
 }

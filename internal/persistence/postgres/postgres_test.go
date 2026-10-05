@@ -2712,6 +2712,36 @@ func TestCompleteFromCache(t *testing.T) {
 		t.Fatalf("冲突回滚后 c3 应仍为 resolving：%+v / %v", rec, err)
 	}
 
+	// singleflight follower（§11.4）：source = coalesced，同样无 reservation 与 try；重跑以同一来源幂等，
+	// 以其他来源重提为冲突；未知来源无效。
+	beginCall(t, s, "t1", "c5")
+	co := cc
+	co.CallID, co.Source = "c5", call.SourceCoalesced
+	if rec, err := s.CompleteFromCache(ctx, co); err != nil || rec.Source != call.SourceCoalesced || rec.State != call.StateCompleted ||
+		rec.ResultRef != sha || rec.TriesUsed != 0 || rec.CostCharged != 0 {
+		t.Fatalf("coalesced 提交 = %+v / %v", rec, err)
+	}
+	if again, err := s.CompleteFromCache(ctx, co); err != nil || again.Source != call.SourceCoalesced {
+		t.Fatalf("coalesced 重复提交应原样返回：%+v / %v", again, err)
+	}
+	asCache := co
+	asCache.Source = ""
+	if _, err := s.CompleteFromCache(ctx, asCache); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("已由 coalesced 完成的调用以 cache 重提应为冲突，得到 %v", err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM blob_provenance WHERE sha256 = $1 AND ref = 'c5#coalesced'", sha); n != 1 {
+		t.Fatalf("blob_provenance 应记录 c5#coalesced 一次，得到 %d", n)
+	}
+	bogus := co
+	bogus.CallID, bogus.Source = "c3", "upstream"
+	if _, err := s.CompleteFromCache(ctx, bogus); !errors.Is(err, persistence.ErrInvalid) {
+		t.Fatalf("source 不是 cache 或 coalesced 应为 ErrInvalid，得到 %v", err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM call_tries WHERE call_id = 'c5'"); n != 0 {
+		t.Fatalf("coalesced 不应建 try，得到 %d", n)
+	}
+	checkI3(t, s)
+
 	// E23：取消先提交 → 命中结果不被授权。
 	beginCall(t, s, "t1", "c4")
 	if _, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "cancel-1", BodyHash: []byte("h"), TaskID: "t1", Desired: "cancel"}); err != nil {

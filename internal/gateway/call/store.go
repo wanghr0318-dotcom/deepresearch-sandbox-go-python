@@ -40,7 +40,7 @@ const (
 type CallRecord struct {
 	TaskID, CallID, Fingerprint, Endpoint string
 	State                                 CallState
-	Source                                string // upstream | cache（缓存命中，无 try、无预留）
+	Source                                string // upstream | cache（缓存命中）| coalesced（合并的 follower）；后两者无 try、无预留
 	ResultRef                             string // 结果 blob 的 sha256（仅 completed）
 	TriesUsed                             int
 	CreatedAt, DeadlineAt                 time.Time
@@ -95,11 +95,19 @@ type Settlement struct {
 	Error             string
 }
 
-// CacheCompletion 是缓存命中的 Tx2 输入：结果 blob 已存在且已由 Gateway 校验内容哈希（§11.5）。
+// CacheCompletion 是不经上游 try 完成调用的 Tx2 输入：结果 blob 已存在且已由 Gateway 校验内容哈希（§11.5）。
+// Source 是 calls.source：SourceCache（缓存命中，空值同此）或 SourceCoalesced（singleflight follower，§11.4）。
 type CacheCompletion struct {
 	TaskID, CallID, AttemptID, ResultSHA256 string
 	ResultSize                              int64
+	Source                                  string
 }
+
+// calls.source 中不经上游 try 的来源。
+const (
+	SourceCache     = "cache"
+	SourceCoalesced = "coalesced"
+)
 
 // Store 是 call 对持久化层的窄接口。每个方法一个事务（规格 §7.1 锁顺序）。
 type Store interface {
@@ -120,7 +128,8 @@ type Store interface {
 	// CompleteFromCache 是缓存命中的 Tx2（§11.2）：复查访问（含 desired ≠ cancel；取消先提交则拒绝，命中结果
 	// 不被授权，E23）与期限 → 结果 blob 写入 scope_blobs(task) → calls.completed（source = cache、result_ref）。
 	// 无预留、无 try、不改动账本。调用须仍是本次解析中的 resolving 且没有 try，否则为 ErrConflict；
-	// 同一结果的重复提交（提交结果未知后的重跑）返回已有记录。
+	// 同一来源、同一结果的重复提交（提交结果未知后的重跑）返回已有记录。singleflight follower 以
+	// source = coalesced 经同一事务提交（§11.4：各自访问复查与 journal 提交，无上游费用）。
 	CompleteFromCache(ctx context.Context, r CacheCompletion) (CallRecord, error)
 	// FailCall 把没有 try 或已耗尽的调用置为 failed（含 call_deadline_exceeded）。
 	FailCall(ctx context.Context, taskID, callID, reason string) error
