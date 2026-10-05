@@ -1238,10 +1238,10 @@ func (w *workerRun) onWorker(ctx context.Context, line []byte) []byte {
 	w.rec.mu.Unlock()
 	if hd := w.d.Hold; hd != nil && hd.Type == m.Type && hd.Nth == w.typeCount[m.Type] {
 		w.rec.heldOnce.Do(func() { close(w.rec.held) })
-		select {
-		case <-w.rec.release:
-		case <-ctx.Done():
-		}
+		// 只等显式释放（或测试清理时的 releaseHold）。不再以 ctx.Done() 放行：拦截上下文在 Worker 进程退出
+		// （Wait）时取消，而 sim_worker 发出 result 后立即退出，会把"暂停 result"变成"暂停到进程退出"的竞争，
+		// 在慢机器上让 result 抢在取消请求之前到达 runner（CI 上 E4 屏障 1 曾因此得到 409 task_ended）。
+		<-w.rec.release
 	}
 	t := w.d.Tamper
 	if m.Type != protocol.TypeArtifact || t == nil || t.ArtifactID != m.ArtifactID {
