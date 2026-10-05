@@ -2283,6 +2283,21 @@ func TestReserveTryCommitLostE11b(t *testing.T) {
 		err = s.FailCall(ctx, "t1", "c1", "x")
 		expectRejected(t, err, persistence.CodeCallInProgress)
 		checkI3(t, s)
+		// 提交结果未知之后访问被撤销：以同一身份重试仍返回原 try，不复查访问，不产生新预留
+		if err := s.RevokeAttemptAccess(ctx, "att-t1", "stopping"); err != nil {
+			t.Fatal(err)
+		}
+		again, err := reserve(s, "t1", "c1", 300)
+		if err != nil || again != tr {
+			t.Fatalf("撤销后以同一身份重试应返回原 try：%+v / %v，原为 %+v", again, err, tr)
+		}
+		if n := count(t, s, "SELECT count(*) FROM reservations"); n != 1 {
+			t.Fatalf("不应产生第二笔预留，得到 %d", n)
+		}
+		checkI3(t, s)
+		_, err = reserve(s, "t1", "c1", 301) // 不是同一身份：作为新预留检查访问
+		expectRejected(t, err, persistence.CodeAccessRevoked)
+		checkI3(t, s)
 	})
 }
 
@@ -2359,34 +2374,97 @@ func TestBeginCallJournal(t *testing.T) {
 	checkI3(t, s)
 }
 
-// TestResetResolving：只复位没有 try 的 resolving；之后同一 call_id 可重新登记；有 try 的调用与账本不变。
+// TestResetResolving：只复位没有 try、仍在解析的 resolving，且不改变 created_at 与 deadline_at（重启不重置期限，
+// §9.7、E48）；复位后同指纹的 BeginCall 接管它，不同指纹不接管；复位后已过期的调用在 ReserveTry 被拒。
 func TestResetResolving(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t, Options{})
 	gwFixture(t, s, "t1", 1000)
-	beginCall(t, s, "t1", "c1")              // resolving，无 try
-	beginCall(t, s, "t1", "c2")              // in_flight，持有预留
-	tr := mustReserve(t, s, "t1", "c2", 100) //
-	beginCall(t, s, "t1", "c3")              // 有 try 的 resolving（人为构造，防御性检查）
-	tr3 := mustReserve(t, s, "t1", "c3", 50) //
+	begin := func(callID, fp string) call.BeginCallResult {
+		t.Helper()
+		res, err := s.BeginCall(ctx, call.BeginCallRequest{TaskID: "t1", CallID: callID, AttemptID: "att-t1", Fingerprint: fp,
+			Endpoint: "chat", Deadline: 120 * time.Second})
+		if err != nil {
+			t.Fatalf("BeginCall %s: %v", callID, err)
+		}
+		checkI3(t, s)
+		return res
+	}
+	orig := beginCall(t, s, "t1", "c1") // resolving，无 try，正在解析
+	if orig.ResolvingSince == nil {
+		t.Fatalf("新登记的 resolving 应有 resolving_since：%+v", orig)
+	}
+	if res := begin("c1", "fp-c1"); !res.Existing || res.Record.ResolvingSince == nil {
+		t.Fatalf("正在解析时重复请求应得到已有记录：%+v", res)
+	}
+	beginCall(t, s, "t1", "c2") // in_flight，持有预留
+	mustReserve(t, s, "t1", "c2", 100)
+	beginCall(t, s, "t1", "c3") // 有 try 的 resolving（人为构造，防御性检查）
+	tr3 := mustReserve(t, s, "t1", "c3", 50)
 	settle(t, s, call.Settlement{Try: tr3, Outcome: "retryable"})
-	if _, err := s.pool.Exec(ctx, "UPDATE calls SET state = 'resolving' WHERE call_id = 'c3'"); err != nil {
+	if _, err := s.pool.Exec(ctx, "UPDATE calls SET state = 'resolving', resolving_since = now() WHERE call_id = 'c3'"); err != nil {
 		t.Fatal(err)
 	}
+	beginCall(t, s, "t1", "c4") // 复位后过期
+
 	n, err := s.ResetResolving(ctx)
-	if err != nil || n != 1 {
-		t.Fatalf("应复位 1 个调用，得到 %d / %v", n, err)
+	if err != nil || n != 2 {
+		t.Fatalf("应复位 2 个调用，得到 %d / %v", n, err)
 	}
-	if got := count(t, s, "SELECT count(*) FROM calls WHERE call_id IN ('c2', 'c3')"); got != 2 {
-		t.Fatalf("有 try 的调用不应被复位，剩 %d", got)
+	if got := count(t, s, "SELECT count(*) FROM calls WHERE call_id IN ('c2', 'c3') AND (state = 'in_flight' OR resolving_since IS NOT NULL)"); got != 2 {
+		t.Fatalf("有 try 的调用不应被复位，得到 %d", got)
+	}
+	reset, _, err := s.LoadCall(ctx, "t1", "c1")
+	if err != nil || reset.State != call.StateResolving || reset.ResolvingSince != nil ||
+		!reset.CreatedAt.Equal(orig.CreatedAt) || !reset.DeadlineAt.Equal(orig.DeadlineAt) {
+		t.Fatalf("复位只应清空 resolving_since：%+v / %v，原为 %+v", reset, err, orig)
 	}
 	expectBudget(t, s, "t1", call.Budget{LimitMicro: 1000, ReservedMicro: 100})
 	checkI3(t, s)
-	rec := beginCall(t, s, "t1", "c1")
-	if rec.State != call.StateResolving {
-		t.Fatalf("复位后应可重新登记：%+v", rec)
+
+	if res := begin("c1", "other"); !res.Existing || res.Record.ResolvingSince != nil {
+		t.Fatalf("不同指纹不应接管：%+v", res)
 	}
-	_ = tr
+	taken := begin("c1", "fp-c1")
+	if taken.Existing || taken.Record.ResolvingSince == nil || !taken.Record.DeadlineAt.Equal(orig.DeadlineAt) ||
+		!taken.Record.CreatedAt.Equal(orig.CreatedAt) {
+		t.Fatalf("同指纹应接管且期限不变：%+v，原为 %+v", taken, orig)
+	}
+	if res := begin("c1", "fp-c1"); !res.Existing {
+		t.Fatalf("接管后再次请求应为进行中：%+v", res)
+	}
+	mustReserve(t, s, "t1", "c1", 10)
+	if r, _, _ := s.LoadCall(ctx, "t1", "c1"); r.State != call.StateInFlight || r.ResolvingSince != nil {
+		t.Fatalf("预留后应为 in_flight 且 resolving_since 为空：%+v", r)
+	}
+
+	if _, err := s.pool.Exec(ctx, "UPDATE calls SET created_at = now() - interval '10 minutes', deadline_at = now() - interval '1 second' WHERE call_id = 'c4'"); err != nil {
+		t.Fatal(err)
+	}
+	if res := begin("c4", "fp-c4"); res.Existing {
+		t.Fatalf("复位的调用应可接管：%+v", res)
+	}
+	_, err = reserve(s, "t1", "c4", 10)
+	expectRejected(t, err, persistence.CodeCallDeadlineExceeded)
+	checkI3(t, s)
+}
+
+// TestMigrationBackfillsBudgets：0003 之前创建的任务在迁移后得到零预算行（失败关闭），而不是找不到预算。
+func TestMigrationBackfillsBudgets(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	// 还原为只应用了 0001、0002 的旧库：任务 t1 没有预算行
+	if _, err := s.pool.Exec(ctx, `DROP TABLE call_tries, reservations, calls, budgets; DELETE FROM schema_migrations WHERE version >= 3`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	expectBudget(t, s, "t1", call.Budget{})
+	beginCall(t, s, "t1", "c1")
+	_, err := reserve(s, "t1", "c1", 1)
+	expectRejected(t, err, persistence.CodeBudgetExhausted)
 }
 
 // TestReserveTryAccessRejections：访问撤销、取消、非当前 attempt 分别被 ReserveTry 拒绝，且不留下预留；

@@ -49,6 +49,9 @@ type CallRecord struct {
 	SupersedesCallID, SupersedeReason     string
 	PossibleExternalDuplicate             bool
 	FailReason                            string // 置为 failed 的原因（FailCall 或 fatal 结算）
+	// ResolvingSince 只在 resolving 时可能非空：非空表示某次请求正在解析（重复请求得到 call_in_progress）；
+	// 为空表示已由 ResetResolving 复位，下一次 BeginCall 会接管它（Existing=false），期限不变。
+	ResolvingSince *time.Time
 }
 
 // BeginCallRequest 是 Tx1 的输入。
@@ -96,7 +99,8 @@ type Settlement struct {
 type Store interface {
 	// CheckAccess 在一致快照中读取 §9.2 的事实（attempt_access.state、tasks.current_attempt_id、task_control.desired）。
 	CheckAccess(ctx context.Context, taskID, attemptID string) (AccessFacts, error)
-	// BeginCall 是 Tx1：复查访问 → 无记录则登记 resolving（created_at、deadline_at = created_at + Deadline）；有记录则返回它（含指纹供比较）。
+	// BeginCall 是 Tx1：复查访问 → 无记录则登记 resolving（created_at、deadline_at = created_at + Deadline）；有记录则返回它（含指纹供比较）；
+	// 已复位的 resolving（ResolvingSince 为空）由本次请求接管并按新登记返回（Existing=false），created_at、deadline_at 不变。
 	BeginCall(ctx context.Context, r BeginCallRequest) (BeginCallResult, error)
 	// ReserveTry 是 Tx2：复查访问与期限（db now() < deadline_at）、累计 tries_used < MaxTries、预算可用 ≥ 估算；
 	// 分配 try_no、创建 reservation（held）、budgets.reserved += 估算、calls.state = in_flight、tries_used += 1。
@@ -109,7 +113,8 @@ type Store interface {
 	SettleTry(ctx context.Context, s Settlement) (CallRecord, error)
 	// FailCall 把没有 try 或已耗尽的调用置为 failed（含 call_deadline_exceeded）。
 	FailCall(ctx context.Context, taskID, callID, reason string) error
-	// ResetResolving 把遗留的 resolving（无 try）复位为可重新解析（启动时调用，§11.2）。
+	// ResetResolving 把遗留的 resolving（无 try）复位为可重新解析（启动时调用，§11.2）：清空 resolving_since，
+	// 状态仍为 resolving，created_at、deadline_at 不变（重启不重置期限，§9.7）；返回复位的数量。
 	ResetResolving(ctx context.Context) (int, error)
 	// LoadBudget / LoadCall / ListCalls 供 /v1/budget、重放与 inspect 使用。
 	LoadBudget(ctx context.Context, taskID string) (Budget, error)

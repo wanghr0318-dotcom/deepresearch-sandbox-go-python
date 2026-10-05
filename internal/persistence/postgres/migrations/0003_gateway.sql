@@ -1,6 +1,7 @@
 -- 0003：Gateway 的 task 层账本与调用 journal（规格 §6、§9.4–§9.7）。
 -- sub-run 层（subrun_budgets）与 exec 配额（exec_quotas）属 M4，此处不建表；subrun_id 列预留为 NULL。
--- 相对 §6 的补充列：calls.fail_reason（置为 failed 的原因）、call_tries.error（try 的错误摘要，审计元数据）。
+-- 相对 §6 的补充列：calls.fail_reason（置为 failed 的原因）、call_tries.error（try 的错误摘要，审计元数据）、
+-- calls.resolving_since（resolving 正在由某次请求解析的起点；NULL 表示已复位、可重新解析，§11.2）。
 
 CREATE TABLE budgets (
     task_id        text PRIMARY KEY REFERENCES tasks (task_id),
@@ -29,8 +30,10 @@ CREATE TABLE calls (
     supersede_reason            text,
     possible_external_duplicate boolean NOT NULL DEFAULT false,
     fail_reason                 text NOT NULL DEFAULT '',
+    resolving_since             timestamptz,
     PRIMARY KEY (task_id, call_id),
     CHECK ((state = 'completed') = (result_ref IS NOT NULL)),
+    CHECK (resolving_since IS NULL OR state = 'resolving'),
     CHECK (deadline_at > created_at),
     FOREIGN KEY (task_id, first_attempt_id) REFERENCES attempts (task_id, attempt_id)
 );
@@ -65,3 +68,8 @@ CREATE TABLE call_tries (
     FOREIGN KEY (task_id, call_id) REFERENCES calls (task_id, call_id),
     FOREIGN KEY (task_id, attempt_id) REFERENCES attempts (task_id, attempt_id)
 );
+
+-- 迁移前已存在的任务补一行零预算：付费调用以 budget_exhausted 失败关闭，而不是找不到预算行。
+INSERT INTO budgets (task_id, limit_micro, reserved_micro, spent_micro, unknown_micro)
+    SELECT task_id, 0, 0, 0, 0 FROM tasks
+    ON CONFLICT DO NOTHING;

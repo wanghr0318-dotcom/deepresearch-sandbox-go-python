@@ -25,14 +25,14 @@ var _ call.Store = (*Store)(nil)
 // callColumns 与 scanCall 一一对应。
 const callColumns = `task_id, call_id, fingerprint, endpoint, state, source, COALESCE(result_ref, ''), tries_used,
 	created_at, deadline_at, cost_charged, first_attempt_id, upstream_request_id, COALESCE(supersedes_call_id, ''),
-	COALESCE(supersede_reason, ''), possible_external_duplicate, fail_reason`
+	COALESCE(supersede_reason, ''), possible_external_duplicate, fail_reason, resolving_since`
 
 func scanCall(row pgx.Row) (call.CallRecord, error) {
 	var r call.CallRecord
 	var state string
 	err := row.Scan(&r.TaskID, &r.CallID, &r.Fingerprint, &r.Endpoint, &state, &r.Source, &r.ResultRef, &r.TriesUsed,
 		&r.CreatedAt, &r.DeadlineAt, &r.CostCharged, &r.FirstAttemptID, &r.UpstreamRequestID, &r.SupersedesCallID,
-		&r.SupersedeReason, &r.PossibleExternalDuplicate, &r.FailReason)
+		&r.SupersedeReason, &r.PossibleExternalDuplicate, &r.FailReason, &r.ResolvingSince)
 	r.State = call.CallState(state)
 	return r, err
 }
@@ -114,7 +114,9 @@ func (s *Store) CheckAccess(ctx context.Context, taskID, attemptID string) (call
 
 // BeginCall 是 Tx1（实现 call.Store）：复查访问；无记录则登记 resolving，deadline_at 按数据库时间
 // = now() + Deadline；有记录则原样返回（Existing），由调用方按 §9.4 比较指纹与状态。
-// 提交结果未知后的重跑：本次调用自己登记的行（同指纹、同首个 attempt、尚无 try）仍按新登记返回。
+// 已由 ResetResolving 复位的 resolving（resolving_since 为空）且指纹相同时由本次请求接管：置 resolving_since = now()，
+// 按新登记返回（Existing=false），created_at 与 deadline_at 不变（§9.7）。
+// 提交结果未知后的重跑：本次调用自己登记或接管的行（同指纹、仍在解析、尚无 try）仍按新登记返回。
 func (s *Store) BeginCall(ctx context.Context, r call.BeginCallRequest) (call.BeginCallResult, error) {
 	if r.TaskID == "" || r.CallID == "" || r.AttemptID == "" || r.Fingerprint == "" || r.Endpoint == "" || r.Deadline <= 0 {
 		return call.BeginCallResult{}, invalidf("BeginCall 缺少 task_id、call_id、attempt_id、指纹、端点，或期限不为正")
@@ -127,8 +129,8 @@ func (s *Store) BeginCall(ctx context.Context, r call.BeginCallRequest) (call.Be
 			return err
 		}
 		rec, err := scanCall(tx.QueryRow(ctx, `INSERT INTO calls (task_id, call_id, fingerprint, endpoint, state, source,
-				created_at, deadline_at, first_attempt_id, supersedes_call_id, supersede_reason)
-			VALUES ($1, $2, $3, $4, 'resolving', 'upstream', now(), now() + $5::bigint * interval '1 microsecond', $6, NULLIF($7, ''), NULLIF($8, ''))
+				created_at, deadline_at, first_attempt_id, supersedes_call_id, supersede_reason, resolving_since)
+			VALUES ($1, $2, $3, $4, 'resolving', 'upstream', now(), now() + $5::bigint * interval '1 microsecond', $6, NULLIF($7, ''), NULLIF($8, ''), now())
 			ON CONFLICT (task_id, call_id) DO NOTHING RETURNING `+callColumns,
 			r.TaskID, r.CallID, r.Fingerprint, r.Endpoint, r.Deadline.Microseconds(), r.AttemptID, r.SupersedesCallID, r.SupersedeReason))
 		if err == nil {
@@ -142,8 +144,15 @@ func (s *Store) BeginCall(ctx context.Context, r call.BeginCallRequest) (call.Be
 		if out.Record, err = selectCallForUpdate(ctx, tx, r.TaskID, r.CallID); err != nil {
 			return err
 		}
-		ours := inserted && out.Record.State == call.StateResolving && out.Record.TriesUsed == 0 &&
-			out.Record.Fingerprint == r.Fingerprint && out.Record.FirstAttemptID == r.AttemptID
+		rec = out.Record
+		if rec.State == call.StateResolving && rec.ResolvingSince == nil && rec.TriesUsed == 0 && rec.Fingerprint == r.Fingerprint {
+			out.Record, err = scanCall(tx.QueryRow(ctx, `UPDATE calls SET resolving_since = now() WHERE task_id = $1 AND call_id = $2
+				RETURNING `+callColumns, r.TaskID, r.CallID))
+			inserted = true
+			return err
+		}
+		ours := inserted && rec.State == call.StateResolving && rec.ResolvingSince != nil && rec.TriesUsed == 0 &&
+			rec.Fingerprint == r.Fingerprint
 		out.Existing = !ours
 		return nil
 	})
@@ -162,6 +171,7 @@ func newReservationID() (string, error) {
 // ReserveTry 是 Tx2（实现 call.Store）：复查访问、期限、累计次数与预算后分配 try_no、创建 held reservation、
 // 增加 reserved、置调用为 in_flight。最近一次 try 仍持有预留时：同一身份（本次生成的 reservation_id，或
 // 同 attempt、同环境、同估算的重试——提交结果未知后的再次调用，E11b）返回原 try，否则为 call_in_progress。
+// 已存在的 try 先于一切检查查找并原样返回，不复查访问、期限与预算：预留已经发生，复查只会让它悬空。
 func (s *Store) ReserveTry(ctx context.Context, r call.ReserveTryRequest) (call.Try, error) {
 	if r.TaskID == "" || r.CallID == "" || r.AttemptID == "" || r.EstimateMicro < 0 || r.MaxTries < 1 {
 		return call.Try{}, invalidf("ReserveTry 缺少 task_id、call_id、attempt_id，或估算为负、MaxTries < 1")
@@ -173,6 +183,10 @@ func (s *Store) ReserveTry(ctx context.Context, r call.ReserveTryRequest) (call.
 	var out call.Try
 	err = s.run(ctx, "ReserveTry", r.TaskID+"/"+r.CallID+"@"+rid, func(ctx context.Context, tx pgx.Tx) error {
 		out = call.Try{}
+		if prev, ok, err := heldTry(ctx, tx, r, rid); err != nil || ok {
+			out = prev
+			return err
+		}
 		if err := checkAccessTx(ctx, tx, r.TaskID, r.AttemptID); err != nil {
 			return err
 		}
@@ -234,7 +248,7 @@ func (s *Store) ReserveTry(ctx context.Context, r call.ReserveTryRequest) (call.
 		if _, err := tx.Exec(ctx, "UPDATE budgets SET reserved_micro = reserved_micro + $2 WHERE task_id = $1", r.TaskID, r.EstimateMicro); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, "UPDATE calls SET state = 'in_flight', tries_used = $3 WHERE task_id = $1 AND call_id = $2",
+		if _, err := tx.Exec(ctx, "UPDATE calls SET state = 'in_flight', tries_used = $3, resolving_since = NULL WHERE task_id = $1 AND call_id = $2",
 			r.TaskID, r.CallID, tryNo); err != nil {
 			return err
 		}
@@ -242,6 +256,29 @@ func (s *Store) ReserveTry(ctx context.Context, r call.ReserveTryRequest) (call.
 		return nil
 	})
 	return out, err
+}
+
+// heldTry 不加锁地查找本次请求已创建且仍持有预留的 try（ReserveTry 的幂等身份）：最近一次 try 的
+// reservation 为 held，且是本次生成的 reservation_id，或同 attempt、同环境、同估算。读到的是已提交的事实。
+func heldTry(ctx context.Context, tx pgx.Tx, r call.ReserveTryRequest, rid string) (call.Try, bool, error) {
+	prev := call.Try{TaskID: r.TaskID, CallID: r.CallID}
+	var env string
+	var amount int64
+	err := tx.QueryRow(ctx, `SELECT t.try_no, r.reservation_id, r.amount, t.attempt_id, COALESCE(t.env_id, '')
+		FROM calls c JOIN call_tries t ON t.task_id = c.task_id AND t.call_id = c.call_id AND t.try_no = c.tries_used
+		JOIN reservations r ON r.reservation_id = t.reservation_id
+		WHERE c.task_id = $1 AND c.call_id = $2 AND r.state = 'held'`, r.TaskID, r.CallID).
+		Scan(&prev.TryNo, &prev.ReservationID, &amount, &prev.AttemptID, &env)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return call.Try{}, false, nil
+	}
+	if err != nil {
+		return call.Try{}, false, err
+	}
+	if prev.ReservationID == rid || (prev.AttemptID == r.AttemptID && env == r.EnvID && amount == r.EstimateMicro) {
+		return prev, true, nil
+	}
+	return call.Try{}, false, nil
 }
 
 func isSHA256Hex(s string) bool {
@@ -401,17 +438,19 @@ func (s *Store) FailCall(ctx context.Context, taskID, callID, reason string) err
 		if held {
 			return rejectf(persistence.CodeCallInProgress, "调用 %s 仍有持有预留的 try", callID)
 		}
-		_, err = tx.Exec(ctx, "UPDATE calls SET state = 'failed', fail_reason = $3 WHERE task_id = $1 AND call_id = $2", taskID, callID, reason)
+		_, err = tx.Exec(ctx, "UPDATE calls SET state = 'failed', fail_reason = $3, resolving_since = NULL WHERE task_id = $1 AND call_id = $2", taskID, callID, reason)
 		return err
 	})
 }
 
-// ResetResolving 删除遗留的、没有任何 try 的 resolving 调用，使同一 call_id 可以重新解析（实现 call.Store；
-// 启动时调用，规格 §11.2、§14.1 第 4 步）。这类调用没有预留、没有费用，删除不影响账本；有 try 的调用不动。
+// ResetResolving 把遗留的、没有任何 try 的 resolving 调用复位为可重新解析（实现 call.Store；启动时调用，
+// 规格 §11.2、§14.1 第 4 步）：清空 resolving_since，状态、created_at 与 deadline_at 不变（重启不重置期限，§9.7）。
+// 下一次同指纹的 BeginCall 接管它。有 try 的调用不动。
 func (s *Store) ResetResolving(ctx context.Context) (int, error) {
 	var n int
 	err := s.run(ctx, "ResetResolving", "resolving", func(ctx context.Context, tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `DELETE FROM calls c WHERE c.state = 'resolving' AND c.tries_used = 0
+		tag, err := tx.Exec(ctx, `UPDATE calls c SET resolving_since = NULL
+			WHERE c.state = 'resolving' AND c.resolving_since IS NOT NULL AND c.tries_used = 0
 			AND NOT EXISTS (SELECT 1 FROM call_tries t WHERE t.task_id = c.task_id AND t.call_id = c.call_id)`)
 		if err != nil {
 			return err
@@ -461,7 +500,7 @@ func (s *Store) LoadCall(ctx context.Context, taskID, callID string) (call.CallR
 			var latency, cost *int64
 			if err := rows.Scan(&r.TaskID, &r.CallID, &r.Fingerprint, &r.Endpoint, &state, &r.Source, &r.ResultRef, &r.TriesUsed,
 				&r.CreatedAt, &r.DeadlineAt, &r.CostCharged, &r.FirstAttemptID, &r.UpstreamRequestID, &r.SupersedesCallID,
-				&r.SupersedeReason, &r.PossibleExternalDuplicate, &r.FailReason,
+				&r.SupersedeReason, &r.PossibleExternalDuplicate, &r.FailReason, &r.ResolvingSince,
 				&tryNo, &attempt, &env, &tstate, &outcome, &latency, &cost, &rid, &terr); err != nil {
 				return err
 			}
