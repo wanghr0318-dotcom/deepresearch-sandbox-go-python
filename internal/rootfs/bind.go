@@ -1,9 +1,10 @@
 //go:build linux
 
-// Package rootfs 负责沙箱根文件系统的准备：模板落盘与 bind 挂载原语。
+// Package rootfs 负责沙箱根文件系统的描述与校验：M1 模板（template.go 的 Template，宿主路径集合）
+// 与宿主侧的 bind/unmount 原语。
 //
-// 规格不再使用 overlayfs（代码组织 §9.2）；挂载方式的具体方案随 Plan 1B 确定，
-// 这里只保留与方案无关的 bind/unmount 原语。
+// 规格不再使用 overlayfs（代码组织 §9.2）。按 Plan 1B 的结论，模板的只读 bind 由 init 在沙箱自己的
+// mount namespace 中建立（internal/sandbox 的 mounts.go），不在宿主侧预挂载。
 package rootfs
 
 import (

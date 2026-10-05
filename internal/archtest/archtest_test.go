@@ -161,11 +161,14 @@ func TestFaultInjectEnabledOnlyByE2E(t *testing.T) {
 
 // TestCredentialSyscallsOnlyInLauncher：进程级凭据边界（规格 §4.6 实现门槛 1）——server 进程不调用改变
 // 自身凭据的系统调用（setgroups、set*uid/set*gid、capset，以及作用于全部线程的 AllThreadsSyscall）。
-// 以源码检查：这些调用只出现在 internal/sandbox 的专用启动进程（launch.go）与 stage-2 helper（helper.go）中，
-// 二者都运行在 re-exec 出的独立进程里。experiments/ 下的 spike 不进入任何二进制，不检查。
+// 以源码检查：这些调用只出现在 internal/sandbox 的专用启动进程（launch.go）、沙箱 init 的能力设置（caps.go）
+// 与 stage-2 helper（helper.go）中，三者都运行在 re-exec 出的独立进程里。experiments/ 下的 spike 不进入任何
+// 二进制，不检查。
 func TestCredentialSyscallsOnlyInLauncher(t *testing.T) {
 	root := filepath.Join("..", "..")
-	allowed := map[string]bool{"internal/sandbox/launch.go": true, "internal/sandbox/helper.go": true}
+	allowed := map[string]bool{
+		"internal/sandbox/launch.go": true, "internal/sandbox/caps.go": true, "internal/sandbox/helper.go": true,
+	}
 	// 模式本身的写法不匹配自身（名字被拆成 "Set" 与分组）。
 	cred := regexp.MustCompile(`\b(?:Set(?:groups|resuid|resgid|reuid|regid|uid|gid|fsuid|fsgid)|AllThreadsSyscall6?)\(` +
 		`|\bSYS_(?:SET(?:GROUPS|RESUID|RESGID|REUID|REGID|UID|GID|FSUID|FSGID)(?:32)?|CAPSET)\b`)

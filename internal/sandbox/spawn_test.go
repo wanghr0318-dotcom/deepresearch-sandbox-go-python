@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +23,9 @@ import (
 	"testing"
 	"time"
 	"unsafe"
+
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/rootfs"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
 )
 
 // TestMain 让这个测试二进制在被以 "init" 或 "sandbox-launch" re-exec 时，表现得
@@ -43,6 +48,9 @@ func TestMain(m *testing.M) {
 		os.Exit(runServeChild(name))
 	}
 	if len(os.Args) > 1 && os.Args[1] == InitArg {
+		// init 的测试钩子（只在测试构建中可设置）：经 LaunchSpec.Env 传入的环境变量。
+		initFailAt = os.Getenv(envTestInitFail)
+		forceClassicMounts = os.Getenv(envTestInitClassic) == "1"
 		if err := RunInit(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -142,9 +150,8 @@ func TestLaunchRejectsUnsafeSpec(t *testing.T) {
 // `agentbox init` 执行它，证明这条 argv 分流确实通到了
 // runSandboxInit() -> sandbox.RunInit()。
 //
-// 不需要 root：RunInit 只有在设置了 AGENTBOX_HOSTNAME 时才会调用
-// Sethostname（需要特权），这里不设置，所以能在普通用户下跑通到
-// “init 尚未实现完整”这一步。
+// 不需要 root：直接执行时没有继承的控制 socket（fd 3），RunInit 在第一步
+// （init/control_fd）就失败，不触及命名空间与挂载。
 func TestMainDispatchesInitToRunInit(t *testing.T) {
 	repoRoot := repoRootDir(t)
 
@@ -156,7 +163,6 @@ func TestMainDispatchesInitToRunInit(t *testing.T) {
 	}
 
 	cmd := exec.Command(binPath, InitArg)
-	cmd.Env = append(os.Environ(), envSandboxRoot+"="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 
 	var exitErr *exec.ExitError
@@ -166,8 +172,8 @@ func TestMainDispatchesInitToRunInit(t *testing.T) {
 	if exitErr.ExitCode() != 1 {
 		t.Fatalf("agentbox init 退出码 = %d, want 1\n输出:\n%s", exitErr.ExitCode(), out)
 	}
-	if !strings.Contains(string(out), "init 尚未实现完整") {
-		t.Fatalf("stderr 未包含预期的“init 尚未实现完整”，实际输出:\n%s", out)
+	if !strings.Contains(string(out), "init/"+stepControlFD+": ") {
+		t.Fatalf("输出未包含 init/%s 的失败原因，实际输出:\n%s", stepControlFD, out)
 	}
 
 	// sandbox-launch 分流：没有继承的 FD 时 RunLaunch 立即失败（不触及凭据与命名空间）。
@@ -1957,4 +1963,665 @@ func serveChildHostClose() error {
 		return err
 	}
 	return h.closeAndWait()
+}
+
+// ---------------------------------------------------------------------------
+// Task 10：init 环境建立（规格 §4.5、§4.6 init 段）。init 由真正的启动进程（RunLaunch）在 user namespace、
+// 测试专用 cgroup 中启动（本测试二进制即 /proc/self/exe）；检查全部从宿主经 /proc/<init pid> 进行
+// （mountinfo 与 /proc/<pid>/root 呈现的是 init 的 mount namespace 与根）。
+// ---------------------------------------------------------------------------
+
+// init 的测试钩子环境变量（TestMain 读取后设置 initFailAt、forceClassicMounts）。
+const (
+	envTestInitFail    = "AGENTBOX_TEST_INIT_FAIL"
+	envTestInitClassic = "AGENTBOX_TEST_INIT_CLASSIC"
+)
+
+// initTestIDBase 是测试环境的 UID/GID 范围基址（大小 4096，含 workload 的 1000）。
+const initTestIDBase = 400000
+
+// initInjectionPoints 是实验记录 §8 的 9 个 init 注入点。
+var initInjectionPoints = []string{
+	stepMountPrivate, stepMountRootfs, stepMountTmpfs, stepMountProc, stepMaskProc,
+	stepOpenSelf, stepPivotRoot, stepUmountOldroot, stepInitCaps,
+}
+
+// sandboxInit 是一个已启动的 init：ready 为 nil 即已就绪（否则为 init_err 的原因）。
+type sandboxInit struct {
+	pid, pidfd int
+	conn       *Conn
+	ready      error
+	stderr     *os.File
+}
+
+// output 返回启动进程与 init 的 stderr。
+func (s *sandboxInit) output() string {
+	b, _ := os.ReadFile(s.stderr.Name())
+	return string(b)
+}
+
+// waitPidfdExit 等待 pidfd 对应的进程退出（pidfd 可读），超时返回 false。init 不是本进程的子进程，不收割它。
+func waitPidfdExit(pidfd int, d time.Duration) bool {
+	type pollFd struct {
+		fd             int32
+		events, revent int16
+	}
+	deadline := time.Now().Add(d)
+	for {
+		left := time.Until(deadline)
+		if left <= 0 {
+			return false
+		}
+		fds := []pollFd{{fd: int32(pidfd), events: 0x1}} // POLLIN
+		ts := syscall.NsecToTimespec(left.Nanoseconds())
+		n, _, e := syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(&fds[0])), 1, uintptr(unsafe.Pointer(&ts)), 0, 0, 0)
+		if e == syscall.EINTR {
+			continue
+		}
+		return e == 0 && n == 1
+	}
+}
+
+// startSandboxInit 在新建的测试 cgroup 中经 RunLaunch 启动 init 并等待就绪结果。测试结束时关闭控制连接
+// （init 的 Serve 返回、init 退出），必要时以 SIGKILL 兜底，然后删除 cgroup。
+func startSandboxInit(t *testing.T, spec LaunchSpec) *sandboxInit {
+	t.Helper()
+	cg := filepath.Join("/sys/fs/cgroup", fmt.Sprintf("agentbox-t10-%d-%d", os.Getpid(), time.Now().UnixNano()))
+	if err := os.Mkdir(cg, 0o755); err != nil {
+		t.Fatalf("创建测试 cgroup: %v", err)
+	}
+	s := &sandboxInit{pidfd: -1}
+	t.Cleanup(func() {
+		if s.conn != nil {
+			s.conn.Close()
+		}
+		if s.pidfd >= 0 {
+			if !waitPidfdExit(s.pidfd, 10*time.Second) {
+				t.Errorf("init %d 在控制连接关闭后未退出，SIGKILL", s.pid)
+				_ = PidfdKill(s.pidfd)
+				waitPidfdExit(s.pidfd, 10*time.Second)
+			}
+			syscall.Close(s.pidfd)
+		}
+		var err error
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			if err = syscall.Rmdir(cg); err == nil || errors.Is(err, syscall.ENOENT) {
+				return
+			}
+		}
+		t.Errorf("删除测试 cgroup %s: %v", cg, err)
+	})
+
+	b, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctl, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, ctlChild := os.NewFile(uintptr(ctl[0]), "ctl-host"), os.NewFile(uintptr(ctl[1]), "ctl-child")
+	res, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(res[0])
+	resChild := os.NewFile(uintptr(res[1]), "res-child")
+	specR, specW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := specW.Write(b); err != nil {
+		t.Fatal(err)
+	}
+	specW.Close()
+	readyR, readyW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readyR.Close()
+	cgdir, err := os.OpenFile(cg, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// stderr 用普通文件：管道会让 cmd.Wait 等到 init 退出才返回。
+	s.stderr, err = os.CreateTemp("", "agentbox-t10-stderr-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.stderr.Close(); os.Remove(s.stderr.Name()) })
+	cmd := LaunchCommand(LaunchFiles{Control: ctlChild, Cgroup: cgdir, Spec: specR, Result: resChild, Ready: readyW})
+	cmd.Stdout, cmd.Stderr = s.stderr, s.stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []*os.File{ctlChild, cgdir, specR, resChild, readyW} {
+		f.Close()
+	}
+	s.conn = NewConn(host, 16)
+	pid, pidfd, rerr := RecvLaunchResult(res[0])
+	werr := cmd.Wait()
+	if rerr != nil {
+		t.Fatalf("启动进程失败: %v（退出 %v）\n%s", rerr, werr, s.output())
+	}
+	s.pid, s.pidfd = pid, pidfd
+
+	buf, _ := io.ReadAll(io.LimitReader(readyR, 4096))
+	switch {
+	case len(buf) == 1 && buf[0] == InitReadyByte:
+	case len(buf) == 0:
+		s.ready = errors.New("init 未通知就绪即退出")
+	default:
+		s.ready = errors.New(string(buf))
+	}
+	return s
+}
+
+// initTestDir 返回一个宿主临时目录：init 以未映射的宿主身份访问宿主路径（对宿主 root 拥有的目录没有
+// DAC 豁免），因此目录须对其他用户可进入。
+func initTestDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "agentbox-t10-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// hostTestTemplate 是由宿主系统目录组成的模板（同 rootfs.DefaultTemplate，但不含宿主上没有的 worker 目录）。
+func hostTestTemplate(t *testing.T) rootfs.Template {
+	t.Helper()
+	var tm rootfs.Template
+	for _, p := range rootfs.DefaultTemplate().Paths {
+		if p != rootfs.WorkerDir {
+			tm.Paths = append(tm.Paths, p)
+		}
+	}
+	if err := tm.Ensure(); err != nil {
+		t.Fatalf("宿主测试模板不可用: %v", err)
+	}
+	return tm
+}
+
+// initTestSpec 返回给定环境类型的启动规格：task 带 workspace（属主为映射 uid 1000，内有标记文件）与
+// Gateway socket（属主映射 uid 1000、0600）；exec 带 /in（内有标记文件）与 /out。
+func initTestSpec(t *testing.T, kind string, classic bool) LaunchSpec {
+	t.Helper()
+	dir := initTestDir(t)
+	is := InitSpec{Kind: kind, Template: hostTestTemplate(t), TmpBytes: 64 << 20}
+	hostWorkload := initTestIDBase + workloadID
+	switch kind {
+	case KindExec:
+		is.In = filepath.Join(dir, "in")
+		is.OutBytes = 1 << 20
+		if err := os.Mkdir(is.In, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(is.In, "marker"), []byte("in"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		is.Workspace = filepath.Join(dir, "ws")
+		if err := os.Mkdir(is.Workspace, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(is.Workspace, "marker"), []byte("ws"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(is.Workspace, hostWorkload, hostWorkload); err != nil {
+			t.Fatal(err)
+		}
+		is.GatewaySocket = gatewayTestSocket(t, dir, hostWorkload)
+	}
+	spec := LaunchSpec{
+		UIDBase: initTestIDBase, UIDSize: 4096, GIDBase: initTestIDBase, GIDSize: 4096,
+		Hostname: "agentbox", Init: is,
+	}
+	if classic {
+		spec.Env = append(spec.Env, envTestInitClassic+"=1")
+	}
+	return spec
+}
+
+// gatewayTestSocket 在 dir 下建一个监听中的 unix socket，属主设为 uid（宿主视角），权限 0600。
+func gatewayTestSocket(t *testing.T, dir string, uid int) string {
+	t.Helper()
+	path := filepath.Join(dir, "gw.sock")
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	if err := os.Chown(path, uid, uid); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// mountinfoEntry 是 /proc/<pid>/mountinfo 的一行。
+type mountinfoEntry struct {
+	point, fstype string
+	opts, super   []string
+	optional      []string
+}
+
+func readMountinfo(t *testing.T, pid int) []mountinfoEntry {
+	t.Helper()
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/mountinfo", pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []mountinfoEntry
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		f := strings.Fields(line)
+		sep := -1
+		for i := 6; i < len(f); i++ {
+			if f[i] == "-" {
+				sep = i
+				break
+			}
+		}
+		if len(f) < 10 || sep < 0 || sep+3 >= len(f) {
+			t.Fatalf("无法解析 mountinfo 行 %q", line)
+		}
+		out = append(out, mountinfoEntry{
+			point: unescapeMountinfo(f[4]), opts: strings.Split(f[5], ","), optional: f[6:sep],
+			fstype: f[sep+1], super: strings.Split(f[sep+3], ","),
+		})
+	}
+	return out
+}
+
+func hasAll(have []string, want ...string) bool {
+	for _, w := range want {
+		found := false
+		for _, h := range have {
+			found = found || h == w
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// under 报告 p 是否等于 base 或位于其下。
+func under(p, base string) bool { return p == base || strings.HasPrefix(p, base+"/") }
+
+// procStatusFields 解析一个 status 文件。
+func procStatusFields(t *testing.T, path string) map[string]string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := make(map[string]string)
+	for _, line := range strings.Split(string(b), "\n") {
+		if k, v, ok := strings.Cut(line, ":"); ok {
+			m[k] = strings.TrimSpace(v)
+		}
+	}
+	return m
+}
+
+// TestInitEnvironment：编排环境（task：workspace + Gateway socket）与 exec 环境（/in + /out，无 Gateway），
+// 各以新挂载 API 与 mount(2) 回退路径运行一次。init 就绪后检查：
+//   - mountinfo：全部私有传播；旧根已脱离（只有一个 / 且为只读 tmpfs，挂载点全部属于预期集合）；rootfs 模板各项
+//     （含子挂载）与 /in 为 ro,nosuid,nodev；/proc 只读路径为 ro；/sys 与 cgroupfs 未挂载；
+//   - /proc 掩蔽项生效（目录为只读空 tmpfs，文件为 /dev/null）；/dev 只有 null/zero/random/urandom，/dev/shm 不存在；
+//   - tmpfs 限额；task 的 Gateway socket（属主映射 uid 1000、0600）与 workspace（可写、nosuid、nodev）；exec 环境
+//     没有 /run（Gateway socket 不可见）也没有 /workspace，/out 的 nr_inodes=1024；
+//   - 每个线程的能力集合为 initCaps，inheritable 与 ambient 为空；
+//   - fd 3、4、5 已关闭，其余 fd（除 0–2）都带 close-on-exec，其中有高位的控制 socket 与指向本二进制的 helper fd；
+//   - init 已进入 Serve：start 得到 start_err（生产 Launcher 尚未实现），不运行 workload。
+func TestInitEnvironment(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+	for _, kind := range []string{KindTask, KindExec} {
+		for _, classic := range []bool{false, true} {
+			name := kind + "/new-mount-api"
+			if classic {
+				name = kind + "/mount2-fallback"
+			}
+			t.Run(name, func(t *testing.T) { checkInitEnvironment(t, kind, classic) })
+		}
+	}
+}
+
+func checkInitEnvironment(t *testing.T, kind string, classic bool) {
+	spec := initTestSpec(t, kind, classic)
+	s := startSandboxInit(t, spec)
+	if s.ready != nil {
+		t.Fatalf("init 未就绪: %v\n%s", s.ready, s.output())
+	}
+	if fell := strings.Contains(s.output(), "mount(2) 回退路径"); fell != classic {
+		t.Fatalf("回退路径使用 = %v，期望 %v；输出:\n%s", fell, classic, s.output())
+	}
+	is := spec.Init
+	rootDir := fmt.Sprintf("/proc/%d/root", s.pid)
+	mounts := readMountinfo(t, s.pid)
+
+	// 预期的挂载点集合。
+	allowed := []string{"/tmp", "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev", "/proc"}
+	if kind == KindExec {
+		allowed = append(allowed, "/out", "/in")
+	} else {
+		allowed = append(allowed, "/run", gatewaySocket, "/workspace")
+	}
+	allowed = append(allowed, is.Template.Paths...)
+	roots := 0
+	for _, m := range mounts {
+		if len(m.optional) != 0 {
+			t.Errorf("挂载 %s 的传播不是私有: %v", m.point, m.optional)
+		}
+		if under(m.point, "/sys") || m.fstype == "sysfs" || m.fstype == "cgroup" || m.fstype == "cgroup2" {
+			t.Errorf("沙箱内挂载了 %s（%s）", m.point, m.fstype)
+		}
+		if m.point == "/" {
+			roots++
+			if m.fstype != "tmpfs" || !hasAll(m.opts, "ro", "nosuid", "nodev") {
+				t.Errorf("根挂载 = %s %v，期望只读 tmpfs（ro,nosuid,nodev）", m.fstype, m.opts)
+			}
+			continue
+		}
+		ok := under(m.point, "/proc")
+		for _, a := range allowed {
+			ok = ok || under(m.point, a)
+		}
+		if !ok {
+			t.Errorf("意外的挂载点 %s（%s）：旧根未脱离或多余挂载", m.point, m.fstype)
+		}
+		ro := kind == KindExec && under(m.point, "/in")
+		for _, p := range is.Template.Paths {
+			ro = ro || under(m.point, p)
+		}
+		if ro && !hasAll(m.opts, "ro", "nosuid", "nodev") {
+			t.Errorf("模板/只读挂载 %s 的选项 %v，期望含 ro,nosuid,nodev", m.point, m.opts)
+		}
+	}
+	if roots != 1 {
+		t.Errorf("挂载点 / 有 %d 个，期望 1 个（旧根已脱离）", roots)
+	}
+	find := func(point string) *mountinfoEntry {
+		var last *mountinfoEntry
+		for i := range mounts {
+			if mounts[i].point == point {
+				last = &mounts[i]
+			}
+		}
+		return last
+	}
+	for _, p := range is.Template.Paths {
+		if fi, err := os.Lstat(p); err == nil && fi.Mode()&os.ModeSymlink == 0 && find(p) == nil {
+			t.Errorf("模板项 %s 没有挂载", p)
+		}
+	}
+
+	// /proc 只读路径与掩蔽清单（宿主上同一内核存在的项）。
+	for _, p := range procReadonlyPaths {
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		if m := find(p); m == nil || !hasAll(m.opts, "ro") {
+			t.Errorf("只读路径 %s 的挂载 = %+v，期望只读", p, m)
+		}
+	}
+	for _, p := range procMaskPaths {
+		hfi, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if hfi.IsDir() {
+			m := find(p)
+			ents, rerr := os.ReadDir(rootDir + p)
+			if m == nil || m.fstype != "tmpfs" || !hasAll(m.opts, "ro") || rerr != nil || len(ents) != 0 {
+				t.Errorf("目录掩蔽 %s：挂载 %+v，内容 %v（%v），期望只读空 tmpfs", p, m, ents, rerr)
+			}
+			continue
+		}
+		var st syscall.Stat_t
+		if err := syscall.Stat(rootDir+p, &st); err != nil || st.Mode&syscall.S_IFMT != syscall.S_IFCHR || st.Rdev != 1<<8|3 {
+			t.Errorf("文件掩蔽 %s：stat = %+v（%v），期望 /dev/null（字符设备 1:3）", p, st, err)
+		}
+	}
+
+	// /dev。
+	ents, err := os.ReadDir(rootDir + "/dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	if strings.Join(names, ",") != "null,random,urandom,zero" {
+		t.Errorf("/dev 内容 = %v，期望 null、random、urandom、zero", names)
+	}
+	if _, err := os.Lstat(rootDir + "/dev/shm"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("/dev/shm 存在（%v），规格 §4.5 不提供", err)
+	}
+	if m := find("/dev"); m == nil || !hasAll(m.opts, "ro", "nosuid", "noexec") {
+		t.Errorf("/dev 挂载 = %+v，期望只读 tmpfs", m)
+	}
+
+	// tmpfs 限额与环境类型相关的挂载。
+	tmpSize := fmt.Sprintf("size=%dk", is.TmpBytes>>10)
+	if m := find("/tmp"); m == nil || m.fstype != "tmpfs" || !hasAll(m.super, tmpSize) || !hasAll(m.opts, "rw", "nosuid", "nodev") {
+		t.Errorf("/tmp 挂载 = %+v，期望 tmpfs %s", m, tmpSize)
+	}
+	hostWorkload := uint32(initTestIDBase + workloadID)
+	if kind == KindExec {
+		if m := find("/out"); m == nil || m.fstype != "tmpfs" || !hasAll(m.super, fmt.Sprintf("size=%dk", is.OutBytes>>10), "nr_inodes=1024") {
+			t.Errorf("/out 挂载 = %+v，期望 tmpfs size=%dk,nr_inodes=1024", m, is.OutBytes>>10)
+		}
+		var st syscall.Stat_t
+		if err := syscall.Stat(rootDir+"/out", &st); err != nil || st.Uid != hostWorkload {
+			t.Errorf("/out 属主 = %d（%v），期望映射 uid 1000（宿主 %d）", st.Uid, err, hostWorkload)
+		}
+		if b, err := os.ReadFile(rootDir + "/in/marker"); err != nil || string(b) != "in" {
+			t.Errorf("/in/marker = %q, %v", b, err)
+		}
+		for _, p := range []string{"/run", "/workspace"} {
+			if _, err := os.Lstat(rootDir + p); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("exec 环境中 %s 存在（%v）：Gateway socket 与 workspace 不应可见", p, err)
+			}
+		}
+	} else {
+		if m := find("/run"); m == nil || m.fstype != "tmpfs" || !hasAll(m.super, tmpSize) {
+			t.Errorf("/run 挂载 = %+v，期望 tmpfs %s", m, tmpSize)
+		}
+		var st syscall.Stat_t
+		if err := syscall.Stat(rootDir+gatewaySocket, &st); err != nil || st.Mode&syscall.S_IFMT != syscall.S_IFSOCK ||
+			st.Mode&0o7777 != 0o600 || st.Uid != hostWorkload {
+			t.Errorf("Gateway socket stat = mode %#o uid %d（%v），期望属主映射 uid 1000 的 0600 socket", st.Mode, st.Uid, err)
+		}
+		if m := find(gatewaySocket); m == nil || !hasAll(m.opts, "nosuid", "nodev") {
+			t.Errorf("Gateway socket 挂载 = %+v", m)
+		}
+		if b, err := os.ReadFile(rootDir + "/workspace/marker"); err != nil || string(b) != "ws" {
+			t.Errorf("/workspace/marker = %q, %v", b, err)
+		}
+		if m := find("/workspace"); m == nil || !hasAll(m.opts, "rw", "nosuid", "nodev") {
+			t.Errorf("/workspace 挂载 = %+v，期望 rw,nosuid,nodev", m)
+		}
+	}
+
+	// 能力集合（逐线程）。
+	tasks, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", s.pid))
+	if err != nil || len(tasks) == 0 {
+		t.Fatalf("读取 init 的线程: %v", err)
+	}
+	want := map[string]string{
+		"CapBnd": fmt.Sprintf("%016x", initCaps.Bounding), "CapPrm": fmt.Sprintf("%016x", initCaps.Permitted),
+		"CapEff": fmt.Sprintf("%016x", initCaps.Effective), "CapInh": "0000000000000000", "CapAmb": "0000000000000000",
+	}
+	for _, task := range tasks {
+		st := procStatusFields(t, fmt.Sprintf("/proc/%d/task/%s/status", s.pid, task.Name()))
+		for k, v := range want {
+			if st[k] != v {
+				t.Errorf("线程 %s 的 %s = %s，期望 %s", task.Name(), k, st[k], v)
+			}
+		}
+	}
+
+	// FD：继承的 3、4、5 已关闭；其余（除 0–2）都带 close-on-exec；控制 socket 与 helper fd 在高位。
+	var self syscall.Stat_t
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Stat(exe, &self); err != nil {
+		t.Fatal(err)
+	}
+	fdDir := fmt.Sprintf("/proc/%d/fd", s.pid)
+	fds, err := os.ReadDir(fdDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var control, helper bool
+	for _, e := range fds {
+		n, _ := strconv.Atoi(e.Name())
+		if n <= 2 {
+			continue
+		}
+		if n <= InitSpecFD {
+			t.Errorf("继承的 fd %d 仍打开", n)
+		}
+		info, err := os.ReadFile(fmt.Sprintf("/proc/%d/fdinfo/%d", s.pid, n))
+		if err != nil {
+			continue // 读取期间关闭
+		}
+		var flags uint64
+		for _, line := range strings.Split(string(info), "\n") {
+			if v, ok := strings.CutPrefix(line, "flags:"); ok {
+				flags, _ = strconv.ParseUint(strings.TrimSpace(v), 8, 64)
+			}
+		}
+		if flags&syscall.O_CLOEXEC == 0 {
+			t.Errorf("init 的 fd %d 没有 close-on-exec（flags %o）", n, flags)
+		}
+		link, _ := os.Readlink(filepath.Join(fdDir, e.Name()))
+		if n >= controlFDMin && n < helperFDMin && strings.HasPrefix(link, "socket:") {
+			control = true
+		}
+		var st syscall.Stat_t
+		if n >= helperFDMin && syscall.Stat(filepath.Join(fdDir, e.Name()), &st) == nil && st.Dev == self.Dev && st.Ino == self.Ino {
+			helper = true
+		}
+	}
+	if !control || !helper {
+		t.Errorf("高位控制 socket 存在 = %v，helper fd 存在 = %v；期望都存在", control, helper)
+	}
+
+	// init 已进入 Serve：start 被拒绝（start_err），不运行 workload。
+	nullFDs, err := devNullFDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.conn.Send(Message{Type: MsgStart, ExecID: "e1", Spec: argvSpec("/bin/true")}, nullFDs[:]); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range nullFDs {
+		f.Close()
+	}
+	m, _, err := s.conn.Recv()
+	if err != nil || m.Type != MsgStartErr || m.ExecID != "e1" || !strings.Contains(m.Reason, "init/launcher") {
+		t.Fatalf("start 的回复 = %+v, %v；期望 start_err（init/launcher）", m, err)
+	}
+}
+
+// TestInitFailurePointsReportInitErr：实验记录 §8 的 9 个注入点各自让环境建立失败：就绪管道收到
+// init_err 的原因 `init/<步骤>: …`；init 退出，控制连接直接 EOF（没有任何消息，未进入 Serve，workload 未运行）。
+func TestInitFailurePointsReportInitErr(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+	for _, step := range initInjectionPoints {
+		t.Run(step, func(t *testing.T) {
+			spec := initTestSpec(t, KindTask, false)
+			spec.Env = append(spec.Env, envTestInitFail+"="+step)
+			s := startSandboxInit(t, spec)
+			if s.ready == nil || !strings.HasPrefix(s.ready.Error(), "init/"+step+": ") || !strings.Contains(s.ready.Error(), errInjected.Error()) {
+				t.Fatalf("就绪结果 = %v，期望 init/%s: %v\n%s", s.ready, step, errInjected, s.output())
+			}
+			assertInitGone(t, s)
+		})
+	}
+}
+
+// TestInitRealFailuresReportInitErr：不经注入的真实失败同样报告 init_err：规格不合法（tmp_bytes 为 0）、
+// 模板路径在宿主上不存在、Gateway socket 的属主不是映射 uid 1000。
+func TestInitRealFailuresReportInitErr(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+	cases := map[string]struct {
+		step   string
+		mutate func(t *testing.T, s *LaunchSpec)
+	}{
+		"tmp_bytes 为 0": {stepSpec, func(t *testing.T, s *LaunchSpec) { s.Init.TmpBytes = 0 }},
+		"模板路径不存在": {stepMountRootfs, func(t *testing.T, s *LaunchSpec) {
+			s.Init.Template.Paths = append(s.Init.Template.Paths, "/nonexistent-agentbox-t10")
+		}},
+		"Gateway socket 属主": {stepMountGateway, func(t *testing.T, s *LaunchSpec) { s.Init.GatewaySocket = gatewayTestSocket(t, initTestDir(t), 0) }},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			spec := initTestSpec(t, KindTask, false)
+			c.mutate(t, &spec)
+			s := startSandboxInit(t, spec)
+			if s.ready == nil || !strings.HasPrefix(s.ready.Error(), "init/"+c.step+": ") {
+				t.Fatalf("就绪结果 = %v，期望 init/%s 失败\n%s", s.ready, c.step, s.output())
+			}
+			assertInitGone(t, s)
+		})
+	}
+}
+
+// assertInitGone：init 已退出，控制连接读到 EOF 而没有任何消息。
+func assertInitGone(t *testing.T, s *sandboxInit) {
+	t.Helper()
+	if !waitPidfdExit(s.pidfd, 10*time.Second) {
+		t.Fatalf("init_err 之后 init %d 未退出", s.pid)
+	}
+	if m, _, err := s.conn.Recv(); !errors.Is(err, io.EOF) {
+		t.Fatalf("init_err 之后控制连接收到 %+v, %v；期望 EOF", m, err)
+	}
+}
+
+// TestInitSpecValidate：init 拒绝不合法的输入（按环境类型的挂载组合、限额、路径形式、模板），不需要 root。
+func TestInitSpecValidate(t *testing.T) {
+	base := func() InitSpec {
+		return InitSpec{Kind: KindTask, Template: rootfs.Template{Paths: []string{"/usr"}}, TmpBytes: 1 << 20,
+			Workspace: "/w", GatewaySocket: "/g.sock"}
+	}
+	execSpec := func() InitSpec {
+		return InitSpec{Kind: KindExec, Template: rootfs.Template{Paths: []string{"/usr"}}, TmpBytes: 1 << 20, In: "/i", OutBytes: 1 << 20}
+	}
+	for _, ok := range []InitSpec{base(), execSpec(), {Kind: KindSession, Template: rootfs.Template{Paths: []string{"/usr"}}, TmpBytes: 1}} {
+		if err := ok.validate(); err != nil {
+			t.Errorf("%+v: %v", ok, err)
+		}
+	}
+	bad := map[string]InitSpec{}
+	add := func(name string, s InitSpec, f func(*InitSpec)) { f(&s); bad[name] = s }
+	add("未知类型", base(), func(s *InitSpec) { s.Kind = "vm" })
+	add("tmp_bytes 为 0", base(), func(s *InitSpec) { s.TmpBytes = 0 })
+	add("模板为空", base(), func(s *InitSpec) { s.Template.Paths = nil })
+	add("模板与挂载点重叠", base(), func(s *InitSpec) { s.Template.Paths = []string{"/tmp/x"} })
+	add("编排环境带 /out", base(), func(s *InitSpec) { s.OutBytes = 1 })
+	add("编排环境带 /in", base(), func(s *InitSpec) { s.In = "/i" })
+	add("workspace 相对路径", base(), func(s *InitSpec) { s.Workspace = "w" })
+	add("exec 带 workspace", execSpec(), func(s *InitSpec) { s.Workspace = "/w" })
+	add("exec 带 Gateway", execSpec(), func(s *InitSpec) { s.GatewaySocket = "/g" })
+	add("exec 的 out_bytes 为 0", execSpec(), func(s *InitSpec) { s.OutBytes = 0 })
+	add("exec 的 in 不规范", execSpec(), func(s *InitSpec) { s.In = "/i/../j" })
+	for name, s := range bad {
+		if err := s.validate(); err == nil {
+			t.Errorf("%s: validate 通过，期望拒绝", name)
+		}
+	}
 }

@@ -25,7 +25,8 @@ import (
 //   - 任何一步失败：经结果 socket 报告原因文本，以非零码退出，不留进程（clone 之后的失败先以
 //     pidfd_send_signal 发 SIGKILL 并收割 init）。
 //
-// 改变凭据的系统调用（setgroups 等）只允许出现在本文件与 stage-2 helper 中（archtest 以源码检查固定）。
+// 改变凭据的系统调用（setgroups 等）只允许出现在本文件、init 的能力设置（caps.go）与 stage-2 helper 中
+// （archtest 以源码检查固定）；三者都运行在 re-exec 出的独立进程里。
 
 // InitArg 是 re-exec 沙箱 init 时传给自身的子命令名。
 const InitArg = "init"
@@ -33,19 +34,15 @@ const InitArg = "init"
 // LaunchArg 是 re-exec 专用启动进程时传给自身的子命令名。
 const LaunchArg = "sandbox-launch"
 
-// envSandboxRoot 把新根目录传给 init 侧（init 环境建立见 init.go）。
-const envSandboxRoot = "AGENTBOX_ROOT"
-
-// envSandboxHostname 把沙箱主机名传给 init 侧。
-const envSandboxHostname = "AGENTBOX_HOSTNAME"
-
-// init 继承的 FD：控制 socket 的沙箱端与就绪管道的写端。
+// init 继承的 FD：控制 socket 的沙箱端、就绪管道的写端，以及启动规格（LaunchSpec 的 JSON，读到 EOF；
+// init 的全部输入经它与继承的 FD 传入，不经环境变量）。
 //
 // 就绪约定：init 完成环境建立、可经控制连接接收 start 时，向 InitReadyFD 写入一个字节
 // InitReadyByte 后关闭它；未就绪即失败时写入原因文本（不以 InitReadyByte 开头）或直接退出（EOF）。
 const (
 	InitControlFD = 3
 	InitReadyFD   = 4
+	InitSpecFD    = 5
 	InitReadyByte = 0x01
 )
 
@@ -79,6 +76,8 @@ type LaunchSpec struct {
 	GIDBase  uint32 `json:"gid_base"`
 	GIDSize  uint32 `json:"gid_size"`
 	Hostname string `json:"hostname"`
+	// Init 是 init 环境建立的输入（挂载、模板等，见 init.go）；由 init 校验，启动进程原样转交。
+	Init InitSpec `json:"init"`
 	// Env 是附加给 init 的环境变量（测试钩子；生产为空）。init 不继承 server 的环境。
 	Env []string `json:"env,omitempty"`
 	// FailAt 在给定步骤注入失败（测试钩子；生产为空）。
@@ -231,16 +230,26 @@ func RunLaunch() error {
 		return fail("getgroups", fmt.Errorf("清空后附加组仍为 %v", gs))
 	}
 
-	env := make([]string, 0, 1+len(spec.Env))
-	env = append(env, envSandboxHostname+"="+spec.Hostname)
-	env = append(env, spec.Env...)
+	// 启动规格原样（重新编码）转交 init：经管道作为 InitSpecFD，clone 之后写入（init 首先读取它）。
+	initSpec, err := json.Marshal(spec)
+	if err != nil {
+		return fail("spec", err)
+	}
+	specR, specW, err := os.Pipe()
+	if err != nil {
+		return fail("spec", err)
+	}
+	defer specR.Close()
+	defer specW.Close()
+
 	pidfd := -1
 	cmd := exec.Command("/proc/self/exe", InitArg)
-	cmd.Env = env
+	cmd.Env = append([]string{}, spec.Env...)
 	cmd.Dir = "/"
 	cmd.ExtraFiles = []*os.File{
 		os.NewFile(launchControlFD, "control"), // → InitControlFD
 		os.NewFile(launchReadyFD, "ready"),     // → InitReadyFD
+		specR,                                  // → InitSpecFD
 	}
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -271,6 +280,12 @@ func RunLaunch() error {
 	if pidfd < 0 {
 		return abort("pidfd", errors.New("clone 没有返回 pidfd"))
 	}
+	// 关闭本进程的读端后写入：init 未读完即退出时写入以 EPIPE 失败，而不是阻塞。
+	specR.Close()
+	if _, err := specW.Write(initSpec); err != nil {
+		return abort("spec", err)
+	}
+	specW.Close()
 	if spec.FailAt == LaunchFailAfterClone {
 		return abort(LaunchFailAfterClone, errors.New("注入的失败"))
 	}

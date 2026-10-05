@@ -11,32 +11,246 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/rootfs"
 )
 
-// RunInit 是沙箱内 1 号进程的主函数。它永不正常返回。
-//
-// 调用时机：进程以 `/proc/self/exe init` 启动，且 main 在做任何
-// 其他初始化之前就分流到这里。
-func RunInit() error {
-	// root 目前只做判空校验；它的值本身留给 Task 6 去做 pivot_root
-	// （把这个目录切换成新的根文件系统），这里先不用，避免引入
-	// 一个只声明未使用、又要用 _ 掩盖的半成品变量。
-	root := os.Getenv(envSandboxRoot)
-	if root == "" {
-		return fmt.Errorf("缺少环境变量 %s", envSandboxRoot)
+// 环境类型（与 provider.EnvKind 的取值一致；sandbox 不依赖 provider 包）。
+const (
+	KindTask    = "task"
+	KindSession = "session"
+	KindExec    = "exec"
+)
+
+// InitSpec 是 init 建立环境所需的输入（规格 §4.5），随 LaunchSpec 经 InitSpecFD 传给 init。
+// 路径都是宿主路径；init 在挂载之前以 O_PATH 固定它们。
+type InitSpec struct {
+	Kind     string          `json:"kind"`
+	Template rootfs.Template `json:"template"`
+	// TmpBytes 是 /tmp（编排环境另有 /run）tmpfs 的限额，必须为正（tmpfs 的 size=0 表示不限）。
+	TmpBytes int64 `json:"tmp_bytes"`
+	// 编排环境（task、session）：workspace 目录挂到 /workspace（可写，nosuid、nodev）；
+	// Gateway socket 挂到 /run/agentbox/gateway.sock（须属主为映射 uid 1000、0600）。均可为空。
+	Workspace     string `json:"workspace,omitempty"`
+	GatewaySocket string `json:"gateway_socket,omitempty"`
+	// exec 环境：/in 只读输入目录（可为空）；/out tmpfs 的大小（必须为正，nr_inodes=1024）。
+	In       string `json:"in,omitempty"`
+	OutBytes int64  `json:"out_bytes,omitempty"`
+}
+
+func (s *InitSpec) validate() error {
+	if err := s.Template.Validate(); err != nil {
+		return fmt.Errorf("rootfs 模板: %w", err)
 	}
-	if h := os.Getenv(envSandboxHostname); h != "" {
-		if err := syscall.Sethostname([]byte(h)); err != nil {
-			return fmt.Errorf("设置沙箱 hostname: %w", err)
+	if s.TmpBytes <= 0 {
+		return fmt.Errorf("tmp_bytes 必须为正（实际 %d）", s.TmpBytes)
+	}
+	abs := func(what, p string) error {
+		if p != "" && (!filepath.IsAbs(p) || filepath.Clean(p) != p) {
+			return fmt.Errorf("%s %q 不是规范的绝对路径", what, p)
+		}
+		return nil
+	}
+	switch s.Kind {
+	case KindTask, KindSession:
+		if s.In != "" || s.OutBytes != 0 {
+			return fmt.Errorf("%s 环境不能有 /in 或 /out", s.Kind)
+		}
+		if err := abs("workspace", s.Workspace); err != nil {
+			return err
+		}
+		return abs("gateway_socket", s.GatewaySocket)
+	case KindExec:
+		if s.Workspace != "" || s.GatewaySocket != "" {
+			return errors.New("exec 环境不能有 workspace 或 Gateway socket")
+		}
+		if s.OutBytes <= 0 {
+			return fmt.Errorf("exec 环境的 out_bytes 必须为正（实际 %d）", s.OutBytes)
+		}
+		return abs("in", s.In)
+	default:
+		return fmt.Errorf("未知的环境类型 %q", s.Kind)
+	}
+}
+
+// init 环境建立的步骤名；失败原因为 `init/<步骤>: <原因>`（实验记录 §8）。
+const (
+	stepControlFD      = "control_fd"
+	stepSpec           = "spec"
+	stepHostname       = "sethostname"
+	stepMountPrivate   = "mount_private"
+	stepMountRootfs    = "mount_rootfs"
+	stepMountIn        = "mount_in"
+	stepMountTmpfs     = "mount_tmpfs"
+	stepMountDev       = "mount_dev"
+	stepMountGateway   = "mount_gateway"
+	stepMountWorkspace = "mount_workspace"
+	stepMountProc      = "mount_proc"
+	stepMaskProc       = "mask_proc"
+	stepOpenSelf       = "open_self"
+	stepPivotRoot      = "pivot_root"
+	stepUmountOldroot  = "umount_oldroot"
+	stepInitCaps       = "init_caps"
+)
+
+// 控制 socket 与 helper 二进制 fd 移到的最低编号：高于 workload 启动时 dup3 覆盖的 0..3，
+// 也高于继承的 3..5。
+const (
+	controlFDMin = 100
+	helperFDMin  = 200
+)
+
+// stepErr 给错误标上产生它的步骤。
+type stepErr struct {
+	step string
+	err  error
+}
+
+func (e *stepErr) Error() string { return e.step + ": " + e.err.Error() }
+func (e *stepErr) Unwrap() error { return e.err }
+
+// initFailAt 是测试钩子：在该步骤注入失败。只由测试设置（生产二进制中恒为空）。
+var initFailAt string
+
+var errInjected = errors.New("注入的失败")
+
+func checkFailpoint(step string) error {
+	if initFailAt != "" && initFailAt == step {
+		return &stepErr{step, errInjected}
+	}
+	return nil
+}
+
+// initEnv 是环境建立的结果：init 此后持有的两个 FD（均为 close-on-exec 且在高位）。
+type initEnv struct {
+	control  *os.File
+	helperFD int // stage-2 helper 二进制（/proc/self/exe）的 O_PATH fd，供生产 Launcher 使用（Task 11）
+}
+
+// RunInit 是沙箱内 1 号进程的主函数（规格 §4.6 init 段）。
+//
+// 调用时机：进程由专用启动进程（RunLaunch）以 `/proc/self/exe init` 启动，main 在做任何其他初始化
+// 之前就分流到这里。继承的 FD：InitControlFD（控制 socket）、InitReadyFD（就绪管道写端）、
+// InitSpecFD（LaunchSpec 的 JSON，读到 EOF）。
+//
+// 环境建立完成后向就绪管道写入 InitReadyByte 并关闭它，然后进入 Serve，直到宿主关闭控制连接；
+// 任一步失败则把 `init/<步骤>: <原因>` 写入就绪管道（init_err，不经控制 socket）并返回该错误，
+// 此时没有进入 Serve，不会运行任何 workload。
+func RunInit() error {
+	syscall.CloseOnExec(InitReadyFD)
+	env, err := establish()
+	if err != nil {
+		reason := "init/" + err.Error()
+		_, _ = syscall.Write(InitReadyFD, []byte(reason))
+		syscall.Close(InitReadyFD)
+		return errors.New(reason)
+	}
+	if _, err := syscall.Write(InitReadyFD, []byte{InitReadyByte}); err != nil {
+		return fmt.Errorf("init/ready: %w", err)
+	}
+	syscall.Close(InitReadyFD)
+	conn := NewConn(env.control, 64)
+	reg := NewRegistry(func(m Message) error { return conn.Send(m, nil) })
+	return Serve(context.Background(), conn, reg, unavailableLauncher{})
+}
+
+// establish 按规格 §4.6 的 init 段逐步建立环境。返回的错误都是 *stepErr。
+func establish() (initEnv, error) {
+	// 控制 socket 立即移到高位并带上 close-on-exec（ExtraFiles 继承时不带 FD_CLOEXEC）。
+	ctl, err := fcntl(InitControlFD, syscall.F_DUPFD_CLOEXEC, controlFDMin)
+	if err != nil {
+		return initEnv{}, &stepErr{stepControlFD, err}
+	}
+	syscall.Close(InitControlFD)
+	control := os.NewFile(uintptr(ctl), "control")
+	ok := false
+	defer func() {
+		if !ok {
+			control.Close()
+		}
+	}()
+
+	spec, err := readInitSpec()
+	if err != nil {
+		return initEnv{}, &stepErr{stepSpec, err}
+	}
+	if spec.Hostname != "" {
+		if err := syscall.Sethostname([]byte(spec.Hostname)); err != nil {
+			return initEnv{}, &stepErr{stepHostname, err}
 		}
 	}
-	// pivot_root 与伪文件系统挂载尚未补齐。
-	// 控制循环见 Serve；生产 Launcher（stage-2 helper，规格 §4.6）在 Plan 1B
-	// 之后实现，在此之前 init 没有可用的启动器，不进入 Serve。
-	return fmt.Errorf("init 尚未实现完整")
+	logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, "sandbox init: "+format+"\n", a...) }
+	if err := setupMounts(&spec.Init, checkFailpoint, logf); err != nil {
+		return initEnv{}, err
+	}
+
+	// helper 二进制：pivot_root 之前打开（之后旧根已脱离），移到高位，close-on-exec。
+	if err := checkFailpoint(stepOpenSelf); err != nil {
+		return initEnv{}, err
+	}
+	fd, err := syscall.Open("/proc/self/exe", oPath|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return initEnv{}, &stepErr{stepOpenSelf, err}
+	}
+	helper, err := fcntl(fd, syscall.F_DUPFD_CLOEXEC, helperFDMin)
+	syscall.Close(fd)
+	if err != nil {
+		return initEnv{}, &stepErr{stepOpenSelf, err}
+	}
+	defer func() {
+		if !ok {
+			syscall.Close(helper)
+		}
+	}()
+
+	if err := pivotRoot(checkFailpoint); err != nil {
+		return initEnv{}, err
+	}
+
+	if err := checkFailpoint(stepInitCaps); err != nil {
+		return initEnv{}, err
+	}
+	if err := applyCaps(initCaps); err != nil {
+		return initEnv{}, &stepErr{stepInitCaps, err}
+	}
+	ok = true
+	return initEnv{control: control, helperFD: helper}, nil
+}
+
+// readInitSpec 从 InitSpecFD 读取 LaunchSpec（读到 EOF 后关闭），校验其中的 InitSpec。
+func readInitSpec() (LaunchSpec, error) {
+	f := os.NewFile(InitSpecFD, "init-spec")
+	if f == nil {
+		return LaunchSpec{}, errors.New("缺少启动规格 fd")
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxLaunchMsg+1))
+	f.Close()
+	if err != nil {
+		return LaunchSpec{}, fmt.Errorf("读取启动规格: %w", err)
+	}
+	if len(b) > maxLaunchMsg {
+		return LaunchSpec{}, fmt.Errorf("启动规格超过 %d 字节", maxLaunchMsg)
+	}
+	var s LaunchSpec
+	if err := json.Unmarshal(b, &s); err != nil {
+		return LaunchSpec{}, fmt.Errorf("解码启动规格: %w", err)
+	}
+	if err := s.Init.validate(); err != nil {
+		return LaunchSpec{}, err
+	}
+	return s, nil
+}
+
+// unavailableLauncher 拒绝每个 start：生产 Launcher（stage-2 helper 降权，Plan 2 Task 11）实现之前，
+// init 不运行任何未降权的 workload（start_err）。
+type unavailableLauncher struct{}
+
+func (unavailableLauncher) Launch(json.RawMessage, *os.File, *os.File, *os.File) (int, error) {
+	return 0, errors.New("init/launcher: 生产 Launcher 尚未实现（Plan 2 Task 11）")
 }
 
 // ReasonDuplicateExecID 是 start 的 exec_id 已登记且尚未退出时 start_err 的 reason。
