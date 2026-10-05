@@ -2819,4 +2819,21 @@ func TestGatewayTaskFactsAndInspect(t *testing.T) {
 	if len(c.Tries) != 1 || c.Tries[0] != want {
 		t.Fatalf("try 视图 = %+v，期望 %+v", c.Tries, want)
 	}
+	if c.Model != "" {
+		t.Fatalf("未记录模型的调用 model 应为空：%q", c.Model)
+	}
+
+	// journal 记录解析后的模型：新建时写入，重放的 BeginCall 不改写；LoadCall 与 Inspect 都读到它。
+	for _, m := range []string{"kimi-k2.6", "other"} {
+		if _, err := s.BeginCall(ctx, call.BeginCallRequest{TaskID: "t1", CallID: "c2", AttemptID: "att-t1", Fingerprint: "fp-c2",
+			Endpoint: "chat", Deadline: time.Minute, Model: m}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rec, _, err := s.LoadCall(ctx, "t1", "c2"); err != nil || rec.Model != "kimi-k2.6" {
+		t.Fatalf("LoadCall model = %q, %v", rec.Model, err)
+	}
+	if in, err = s.Inspect(ctx, "t1"); err != nil || len(in.Calls) != 2 || in.Calls[1].Model != "kimi-k2.6" {
+		t.Fatalf("Inspect 的 model：%+v, %v", in.Calls, err)
+	}
 }

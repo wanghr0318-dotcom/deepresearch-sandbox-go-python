@@ -201,6 +201,13 @@ describe("watchTaskEvents", () => {
     expect(b.calls).toHaveLength(1);
   });
 
+  it("stops at once on 503 diagnostic_mode instead of reconnecting", async () => {
+    const { fn, calls } = scriptedFetch(() => jsonResponse(503, { code: "diagnostic_mode", message: "read-only" }));
+    const out = await watchTaskEvents({ taskId: "t1", fetch: fn, onEvent: () => {} }).done;
+    expect(out.kind === "error" && (out.error as ApiError).code).toBe("diagnostic_mode");
+    expect(calls).toHaveLength(1);
+  });
+
   it("never puts the token in the URL; sends it only as a Bearer header", async () => {
     const { fn, calls } = scriptedFetch((_c, n) =>
       n === 0 ? sseResponse([frame(1, "a")]) : sseResponse([frame(2, "task_terminal")]),

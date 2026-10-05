@@ -1,7 +1,7 @@
 // agentbox HTTP API 客户端（规格 §15.1、§15.4；契约 api/openapi.yaml）。
 // - 只用 fetch；token 只放在 Authorization 头，从不进入 URL。
 // - 非 2xx 的错误体映射为 ApiError（code/message）。
-// - 写请求带 request_id；可重试错误（网络错误、5xx 除 501）按退避重试，
+// - 写请求带 request_id；可重试错误（网络错误、5xx 除 501 与 503 服务模式错误）按有界退避重试，
 //   请求体在重试间保持不变，所以 request_id 被复用，服务端按幂等语义返回首次结果。
 
 import { authHeaders } from "./auth";
@@ -34,11 +34,19 @@ export class ApiError extends Error {
     this.code = code;
   }
 
-  /** 5xx（501 除外）与 429 可以用同一 request_id 重试。 */
+  /**
+   * 暂时性错误可以用同一 request_id 重试：5xx（501 除外）与 429。
+   * 服务模式错误（503 diagnostic_mode / ownership_lost）不是暂时性的——服务端在操作员处理前一直拒绝，
+   * 重试只会推迟提示，所以不重试，立即交给界面显示。
+   */
   get retryable(): boolean {
+    if (this.status === 503 && SERVICE_MODE_CODES.has(this.code)) return false;
     return (this.status >= 500 && this.status !== 501) || this.status === 429;
   }
 }
+
+/** 表示服务整体处于非正常模式的 503 错误码（契约 Status.mode）；不重试。 */
+const SERVICE_MODE_CODES: ReadonlySet<string> = new Set(["diagnostic_mode", "ownership_lost"]);
 
 /** 网络层失败（连接被拒、断开等），总是可重试。 */
 export class NetworkError extends Error {

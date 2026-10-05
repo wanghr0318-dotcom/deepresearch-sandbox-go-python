@@ -25,6 +25,9 @@ describe("parseApiError", () => {
     expect(new ApiError(500, "internal", "").retryable).toBe(true);
     expect(new ApiError(501, "not_implemented", "").retryable).toBe(false);
     expect(new ApiError(409, "request_conflict", "").retryable).toBe(false);
+    // 服务模式错误不是暂时性的：不重试。
+    expect(new ApiError(503, "diagnostic_mode", "").retryable).toBe(false);
+    expect(new ApiError(503, "ownership_lost", "").retryable).toBe(false);
   });
 });
 
@@ -70,6 +73,27 @@ describe("ApiClient", () => {
     expect(err).toBeInstanceOf(ApiError);
     expect((err as ApiError).code).toBe("task_ended");
     expect(calls).toHaveLength(1);
+  });
+
+  it.each(["diagnostic_mode", "ownership_lost"])("does not retry 503 %s and surfaces the message at once", async (code) => {
+    const { fn, calls } = scriptedFetch(() => jsonResponse(503, { code, message: `server is in ${code}` }));
+    // 退避很长：若误重试，用例会卡到超时，而不是立即得到错误。
+    const api = new ApiClient({ fetch: fn, backoffBaseMs: 60_000, maxAttempts: 4 });
+    for (const op of [() => api.listTasks(), () => api.createTask({ spec: { goal: "x" } }), () => api.cancelTask("t-1")]) {
+      const err = await op().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ApiError);
+      const e = err as ApiError;
+      expect([e.status, e.code, e.message]).toEqual([503, code, `server is in ${code}`]);
+    }
+    expect(calls).toHaveLength(3);
+  });
+
+  it("keeps bounded retries for other transient 5xx", async () => {
+    const { fn, calls } = scriptedFetch(() => jsonResponse(503, { code: "contention", message: "busy" }));
+    const err = await new ApiClient({ fetch: fn, backoffBaseMs: 0, maxAttempts: 4 }).getStatus().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe("contention");
+    expect(calls).toHaveLength(4);
   });
 
   it("gives up after maxAttempts with the last error", async () => {

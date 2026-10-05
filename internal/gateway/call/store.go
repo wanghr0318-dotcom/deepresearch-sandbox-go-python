@@ -52,13 +52,15 @@ type CallRecord struct {
 	// ResolvingSince 只在 resolving 时可能非空：非空表示某次请求正在解析（重复请求得到 call_in_progress）；
 	// 为空表示已由 ResetResolving 复位，下一次 BeginCall 会接管它（Existing=false），期限不变。
 	ResolvingSince *time.Time
+	Model          string // 解析后的模型（chat；搜索与抓取为空），只是审计元数据
 }
 
-// BeginCallRequest 是 Tx1 的输入。
+// BeginCallRequest 是 Tx1 的输入。Model 只在新建记录时写入；已有记录保持首次写入的值。
 type BeginCallRequest struct {
 	TaskID, CallID, AttemptID, Fingerprint, Endpoint string
 	Deadline                                         time.Duration
 	SupersedesCallID, SupersedeReason                string
+	Model                                            string
 }
 
 // BeginCallResult：Existing 表示已有同 ID 记录（调用方按 §9.4 表处理）。

@@ -680,6 +680,9 @@ func TestInspect(t *testing.T) {
 		Task:        TaskView{TaskID: "t1", Status: "failed"},
 		Attempts:    []AttemptView{{AttemptID: "a1", AttemptNo: 1, Status: "ended", OutcomeClass: "oom", ExitSignal: &code, OOMKillDelta: 1, EnvID: "e1", CleanupState: "done"}},
 		Checkpoints: []CheckpointView{{CheckpointID: "c1", StepID: "s1", AttemptID: "a1", CommitSeq: 4}},
+		// 调用表的 model 来自 journal：chat 调用给出解析后的模型，其他端点（空值）省略该字段。
+		Calls: []CallView{{CallID: "k1", Endpoint: "/v1/chat/completions", Model: "kimi-k2.6", State: "completed"},
+			{CallID: "k2", Endpoint: "/v1/search", State: "completed"}},
 	}
 	st, b, _ := ts.do("GET", "/tasks/t1/inspect", "", nil)
 	expect(t, st, b, 200, "")
@@ -703,6 +706,18 @@ func TestInspect(t *testing.T) {
 		in.Attempts[0].ExitSignal == nil || *in.Attempts[0].ExitSignal != 137 || in.Attempts[0].OOMKillDelta != 1 ||
 		len(in.Checkpoints) != 1 || in.Checkpoints[0].CommitSeq != 4 {
 		t.Fatalf("inspect = %s", b)
+	}
+	var raw struct {
+		Calls []map[string]any `json:"calls"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.Calls) != 2 || raw.Calls[0]["model"] != "kimi-k2.6" {
+		t.Fatalf("chat 调用应带 model：%s", b)
+	}
+	if _, has := raw.Calls[1]["model"]; has {
+		t.Fatalf("非 chat 调用不应有 model 字段：%s", b)
 	}
 	st, b, _ = ts.do("GET", "/tasks/nope/inspect", "", nil)
 	expect(t, st, b, 404, "task_not_found")

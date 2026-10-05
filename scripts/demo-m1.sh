@@ -12,7 +12,9 @@
 # 每次运行都使用全新的数据目录（默认 /var/lib/agentbox-demo，先清空）与全新的数据库（默认 agentbox_demo，经
 # docker compose 的 postgres 服务 DROP + CREATE），因此可重复执行、与 README 快速开始的 /var/lib/agentbox 互不影响。
 # 可选环境变量：AGENTBOX_DATABASE_URL（用于探测 PostgreSQL 可达性；默认 127.0.0.1:5432）、AGENTBOX_DEMO_DB、
-# AGENTBOX_DEMO_DATA_DIR、AGENTBOX_DEMO_DATABASE_URL（自备空库时设置，跳过新建）、AGENTBOX_DEMO_LISTEN（默认 127.0.0.1:8080）。
+# AGENTBOX_DEMO_DATA_DIR、AGENTBOX_DEMO_DATABASE_URL（自备空库时设置，跳过新建）、AGENTBOX_DEMO_LISTEN（默认 127.0.0.1:8080）、
+# AGENTBOX_DEMO_WEB_DIR（可选：工作台构建产物目录，例如 <仓库>/web/dist；设置后 server 以 --web-dir 同源提供工作台，
+# 演示期间可在浏览器中打开 http://$AGENTBOX_DEMO_LISTEN/ 观察任务；不设置时行为不变）。
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -24,6 +26,7 @@ PG_ADMIN_URL="${AGENTBOX_DATABASE_URL:-postgres://agentbox:agentbox@127.0.0.1:54
 DEMO_DB="${AGENTBOX_DEMO_DB:-agentbox_demo}"
 DATA="${AGENTBOX_DEMO_DATA_DIR:-/var/lib/agentbox-demo}"
 LISTEN="${AGENTBOX_DEMO_LISTEN:-127.0.0.1:8080}"
+WEB_DIR="${AGENTBOX_DEMO_WEB_DIR:-}"
 export AGENTBOX_ADDR="http://$LISTEN"
 WORKER_DIR=/opt/agentbox
 CGROOT=/sys/fs/cgroup
@@ -79,10 +82,13 @@ env_of() { inspect "$1" | json "[a for a in d['attempts'] if a['attempt_no'] == 
 server_ready() { curl -fsS "$AGENTBOX_ADDR/status" | grep -q '"normal"'; }
 start_server() {
   local log="$LOGDIR/server-$1.log"
-  "$BIN" server --data-dir "$DATA" --listen "$LISTEN" >"$log" 2>&1 &
+  local web=()
+  [ -z "$WEB_DIR" ] || web=(--web-dir "$WEB_DIR")
+  "$BIN" server --data-dir "$DATA" --listen "$LISTEN" "${web[@]}" >"$log" 2>&1 &
   SERVER_PID=$!
   wait_for "server 进入 normal 模式" 60 server_ready
   ok "server pid $SERVER_PID 已就绪（$AGENTBOX_ADDR，日志 $log）"
+  [ -z "$WEB_DIR" ] || info "工作台：浏览器打开 $AGENTBOX_ADDR/（静态文件 $WEB_DIR；远程主机经 ssh -L 8080:$LISTEN 隧道访问）"
 }
 
 # 环境全部停止并清理：所有 attempt 的 cleanup_state 为 done，数据目录中没有环境目录。

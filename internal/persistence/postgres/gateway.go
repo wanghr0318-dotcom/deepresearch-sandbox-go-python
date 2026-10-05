@@ -27,14 +27,14 @@ var _ call.Store = (*Store)(nil)
 // callColumns 与 scanCall 一一对应。
 const callColumns = `task_id, call_id, fingerprint, endpoint, state, source, COALESCE(result_ref, ''), tries_used,
 	created_at, deadline_at, cost_charged, first_attempt_id, upstream_request_id, COALESCE(supersedes_call_id, ''),
-	COALESCE(supersede_reason, ''), possible_external_duplicate, fail_reason, resolving_since`
+	COALESCE(supersede_reason, ''), possible_external_duplicate, fail_reason, resolving_since, model`
 
 func scanCall(row pgx.Row) (call.CallRecord, error) {
 	var r call.CallRecord
 	var state string
 	err := row.Scan(&r.TaskID, &r.CallID, &r.Fingerprint, &r.Endpoint, &state, &r.Source, &r.ResultRef, &r.TriesUsed,
 		&r.CreatedAt, &r.DeadlineAt, &r.CostCharged, &r.FirstAttemptID, &r.UpstreamRequestID, &r.SupersedesCallID,
-		&r.SupersedeReason, &r.PossibleExternalDuplicate, &r.FailReason, &r.ResolvingSince)
+		&r.SupersedeReason, &r.PossibleExternalDuplicate, &r.FailReason, &r.ResolvingSince, &r.Model)
 	r.State = call.CallState(state)
 	return r, err
 }
@@ -131,10 +131,11 @@ func (s *Store) BeginCall(ctx context.Context, r call.BeginCallRequest) (call.Be
 			return err
 		}
 		rec, err := scanCall(tx.QueryRow(ctx, `INSERT INTO calls (task_id, call_id, fingerprint, endpoint, state, source,
-				created_at, deadline_at, first_attempt_id, supersedes_call_id, supersede_reason, resolving_since)
-			VALUES ($1, $2, $3, $4, 'resolving', 'upstream', now(), now() + $5::bigint * interval '1 microsecond', $6, NULLIF($7, ''), NULLIF($8, ''), now())
+				created_at, deadline_at, first_attempt_id, supersedes_call_id, supersede_reason, resolving_since, model)
+			VALUES ($1, $2, $3, $4, 'resolving', 'upstream', now(), now() + $5::bigint * interval '1 microsecond', $6, NULLIF($7, ''), NULLIF($8, ''), now(), $9)
 			ON CONFLICT (task_id, call_id) DO NOTHING RETURNING `+callColumns,
-			r.TaskID, r.CallID, r.Fingerprint, r.Endpoint, r.Deadline.Microseconds(), r.AttemptID, r.SupersedesCallID, r.SupersedeReason))
+			r.TaskID, r.CallID, r.Fingerprint, r.Endpoint, r.Deadline.Microseconds(), r.AttemptID, r.SupersedesCallID, r.SupersedeReason,
+			r.Model))
 		if err == nil {
 			inserted = true
 			out.Record = rec
@@ -597,7 +598,7 @@ func (s *Store) LoadCall(ctx context.Context, taskID, callID string) (call.CallR
 			var latency, cost *int64
 			if err := rows.Scan(&r.TaskID, &r.CallID, &r.Fingerprint, &r.Endpoint, &state, &r.Source, &r.ResultRef, &r.TriesUsed,
 				&r.CreatedAt, &r.DeadlineAt, &r.CostCharged, &r.FirstAttemptID, &r.UpstreamRequestID, &r.SupersedesCallID,
-				&r.SupersedeReason, &r.PossibleExternalDuplicate, &r.FailReason, &r.ResolvingSince,
+				&r.SupersedeReason, &r.PossibleExternalDuplicate, &r.FailReason, &r.ResolvingSince, &r.Model,
 				&tryNo, &attempt, &env, &tstate, &outcome, &latency, &cost, &rid, &terr); err != nil {
 				return err
 			}

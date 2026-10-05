@@ -68,9 +68,10 @@ type Inspection struct {
 
 // CallView 是一个 Gateway 逻辑调用的审计视图（§9.9）：只有元数据——端点、状态、费用、上游请求 ID 与
 // 每次 try 的 attempt、结果、延迟、费用；不含请求或响应正文、提示词与凭据。ResultRef 是结果 blob 的
-// sha256（只在 completed 时非空）。
+// sha256（只在 completed 时非空）。Model 是 journal 记录的解析后模型（chat 调用；其他端点为空）。
 type CallView struct {
 	CallID, Endpoint, State, Source   string
+	Model                             string
 	FirstAttemptID, UpstreamRequestID string
 	ResultRef, FailReason             string
 	SupersedesCallID, SupersedeReason string

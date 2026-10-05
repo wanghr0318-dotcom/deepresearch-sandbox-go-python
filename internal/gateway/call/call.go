@@ -553,6 +553,7 @@ func (c *Coordinator) run(j *job) (Result, error) {
 	res, err := c.store.BeginCall(ctx, BeginCallRequest{
 		TaskID: in.TaskID, CallID: in.CallID, AttemptID: in.AttemptID, Fingerprint: j.fp, Endpoint: endpointOf(in.Kind),
 		Deadline: c.limits.CallDeadline, SupersedesCallID: in.Supersedes, SupersedeReason: in.SupersedeReason,
+		Model: j.model,
 	})
 	cancel()
 	if err != nil {

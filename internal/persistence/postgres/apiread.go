@@ -140,7 +140,7 @@ func (s *Store) PinnedArtifact(ctx context.Context, taskID, artifactID string, v
 func inspectCalls(ctx context.Context, q queryer, taskID string) ([]api.CallView, error) {
 	rows, err := q.Query(ctx, `SELECT call_id, endpoint, state, source, first_attempt_id, upstream_request_id,
 			COALESCE(result_ref, ''), fail_reason, COALESCE(supersedes_call_id, ''), COALESCE(supersede_reason, ''),
-			tries_used, cost_charged, possible_external_duplicate, created_at, deadline_at
+			tries_used, cost_charged, possible_external_duplicate, created_at, deadline_at, model
 		FROM calls WHERE task_id = $1 ORDER BY created_at, call_id`, taskID)
 	if err != nil {
 		return nil, err
@@ -149,7 +149,7 @@ func inspectCalls(ctx context.Context, q queryer, taskID string) ([]api.CallView
 		var v api.CallView
 		err := r.Scan(&v.CallID, &v.Endpoint, &v.State, &v.Source, &v.FirstAttemptID, &v.UpstreamRequestID,
 			&v.ResultRef, &v.FailReason, &v.SupersedesCallID, &v.SupersedeReason,
-			&v.TriesUsed, &v.CostChargedMicro, &v.PossibleExternalDuplicate, &v.CreatedAt, &v.DeadlineAt)
+			&v.TriesUsed, &v.CostChargedMicro, &v.PossibleExternalDuplicate, &v.CreatedAt, &v.DeadlineAt, &v.Model)
 		return v, err
 	})
 	if err != nil || len(calls) == 0 {

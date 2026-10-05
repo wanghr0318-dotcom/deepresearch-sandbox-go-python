@@ -125,7 +125,7 @@ func (s *fakeStore) BeginCall(_ context.Context, r BeginCallRequest) (BeginCallR
 		rec = &CallRecord{TaskID: r.TaskID, CallID: r.CallID, Fingerprint: r.Fingerprint, Endpoint: r.Endpoint,
 			State: StateResolving, Source: "upstream", CreatedAt: now, DeadlineAt: now.Add(r.Deadline),
 			FirstAttemptID: r.AttemptID, SupersedesCallID: r.SupersedesCallID, SupersedeReason: r.SupersedeReason,
-			ResolvingSince: &now}
+			ResolvingSince: &now, Model: r.Model}
 		s.calls[k] = rec
 		s.budget(r.TaskID)
 		select {
@@ -716,6 +716,12 @@ func TestCostUsesPerModelPricing(t *testing.T) {
 	// 默认模型 m1 无专属价格 → 类别价格表：10 × 1 + 20 × 2 = 50
 	if b := h.budget(t, "t1"); b.SpentMicro != 180 {
 		t.Fatalf("默认模型按类别价格结算：%+v", b)
+	}
+	// journal 记录解析后的模型（请求指定的，或 adapter 补的默认值），供 inspect 展示。
+	for callID, want := range map[string]string{"c1": "big", "c2": "m1"} {
+		if rec, _ := h.call(t, "t1", callID); rec.Model != want {
+			t.Fatalf("%s 的 journal 模型 = %q，期望 %q", callID, rec.Model, want)
+		}
 	}
 }
 

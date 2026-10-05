@@ -176,3 +176,32 @@ jobs:
         run: uv run pytest -q
       - name: 复杂度报告（只报告，不阻断）
         run: uv run ruff check --select C90 --exit-zero .
+
+  # Vue 工作台（规格 §15）：lint、类型检查、Vitest，并确认提交的生成类型与 api/openapi.yaml 一致。
+  web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: 安装依赖（锁文件必须最新）
+        run: npm ci
+      - name: eslint
+        run: npm run lint
+      - name: 类型检查（vue-tsc）
+        run: npm run typecheck
+      - name: Vitest（单元与组件测试）
+        run: npm test
+      - name: 生成类型与契约一致（npm run gen:api 后无差异）
+        run: |
+          npm run gen:api
+          git diff --exit-code src/api/schema.d.ts
+      - name: 生产构建（产物不提交）
+        run: npm run build

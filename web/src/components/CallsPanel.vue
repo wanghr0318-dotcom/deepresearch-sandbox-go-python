@@ -116,10 +116,9 @@ function latencyOf(c: Call): number {
   return (c.tries ?? []).reduce((s, t) => s + (t.latency_ms || 0), 0);
 }
 
-/** 契约中的 Call 不含模型字段；服务端若附带 model 则显示，否则为 "—"。 */
+/** 调用使用的模型（journal 记录的解析后模型）；非 chat 调用没有该字段，显示 "—"。 */
 function modelOf(c: Call): string {
-  const m = (c as unknown as Record<string, unknown>)["model"];
-  return typeof m === "string" && m ? m : "—";
+  return c.model || "—";
 }
 
 function stateClass(state: string): string {

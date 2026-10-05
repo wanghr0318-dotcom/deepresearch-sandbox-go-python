@@ -284,6 +284,7 @@ describe("CallsPanel", () => {
         {
           call_id: "c-1",
           endpoint: "chat",
+          model: "kimi-k2.6",
           state: "completed" as const,
           source: "worker",
           first_attempt_id: "a-1",
@@ -319,6 +320,10 @@ describe("CallsPanel", () => {
     expect(c1.text()).toContain("chat");
     expect(c1.text()).toContain("completed");
     expect(c1.text()).toContain("1.20 s");
+    // model 来自 inspect 的 Call.model；非 chat 调用没有模型，显示 "—"。
+    const modelCell = (id: string) => w.get(`tr[data-call="${id}"]`).findAll("td")[2]!.text();
+    expect(modelCell("c-1")).toBe("kimi-k2.6");
+    expect(modelCell("c-2")).toBe("—");
     expect(w.get('[data-testid="budget-failure"]').text()).toContain("budget_exhausted");
     await c1.get("button.expander").trigger("click");
     expect(w.text()).toContain("upstream 502");

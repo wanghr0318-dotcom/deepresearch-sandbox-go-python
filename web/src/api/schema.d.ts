@@ -240,6 +240,16 @@ export interface components {
         Status: {
             /** @enum {string} */
             mode: "normal" | "diagnostic" | "ownership_lost";
+            /** @description Gateway shared-cache counters since server start (spec §11.5); absent when the cache is off (no --redis-addr, or --cache=off). */
+            cache?: {
+                hit?: number;
+                miss?: number;
+                bypass?: number;
+                coalesced?: number;
+                error?: number;
+                breaker_open?: number;
+                integrity_failure?: number;
+            };
         };
         CreateTaskRequest: {
             request_id: string;
@@ -345,6 +355,8 @@ export interface components {
         Call: {
             call_id: string;
             endpoint: string;
+            /** @description The resolved model the call used (from the journal). Omitted for non-chat calls. */
+            model?: string;
             /** @enum {string} */
             state: "resolving" | "in_flight" | "completed" | "failed" | "unknown";
             source: string;

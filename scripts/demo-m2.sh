@@ -44,6 +44,8 @@
 #   AGENTBOX_DATABASE_URL、AGENTBOX_DEMO_DB、AGENTBOX_DEMO_DATA_DIR、AGENTBOX_DEMO_DATABASE_URL、
 #   AGENTBOX_DEMO_LISTEN                 与 scripts/demo-m1.sh 相同（默认库 agentbox_demo_m2、数据目录
 #                                        /var/lib/agentbox-demo-m2、监听 127.0.0.1:8080）
+#   AGENTBOX_DEMO_WEB_DIR                可选：工作台构建产物目录（例如 <仓库>/web/dist）；设置后 server 以
+#                                        --web-dir 同源提供工作台，可在浏览器中观察研究任务；不设置时行为不变
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -334,6 +336,7 @@ else
   [ -z "${AGENTBOX_DEMO_UPSTREAM_ALLOW_PRIVATE:-}" ] || FLAGS+=(--upstream-allow-private "$AGENTBOX_DEMO_UPSTREAM_ALLOW_PRIVATE")
 fi
 [ -z "$MODEL_PRICES" ] || FLAGS+=(--model-price "$MODEL_PRICES")
+[ -z "${AGENTBOX_DEMO_WEB_DIR:-}" ] || FLAGS+=(--web-dir "$AGENTBOX_DEMO_WEB_DIR")
 
 step "启动 agentbox server（生产启动器、Gateway、Worker = python3 -m deepresearch）"
 info "agentbox server ${FLAGS[*]}"
@@ -341,6 +344,7 @@ AGENTBOX_MODEL_API_KEY="$MODEL_KEY" AGENTBOX_SEARCH_API_KEY="$SEARCH_KEY" "$BIN"
 SERVER_PID=$!
 wait_for "server 进入 normal 模式" 60 server_ready
 ok "server pid $SERVER_PID 已就绪（$AGENTBOX_ADDR，日志 $SERVER_LOG）"
+[ -z "${AGENTBOX_DEMO_WEB_DIR:-}" ] || info "工作台：浏览器打开 $AGENTBOX_ADDR/（远程主机经 ssh -L 8080:$LISTEN 隧道访问）"
 
 step "提交研究任务"
 SPEC=$(python3 -c 'import json,sys; print(json.dumps({"topic": sys.argv[1], "orchestrator_model": sys.argv[2], "worker_model": sys.argv[3]}, ensure_ascii=False))' "$TOPIC" "$ORCH_MODEL" "$WORKER_MODEL")

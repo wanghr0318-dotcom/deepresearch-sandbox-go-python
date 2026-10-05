@@ -883,6 +883,7 @@ type tryJSON struct {
 type callJSON struct {
 	CallID                    string    `json:"call_id"`
 	Endpoint                  string    `json:"endpoint"`
+	Model                     string    `json:"model,omitempty"` // chat 调用解析后的模型；其他端点省略
 	State                     string    `json:"state"`
 	Source                    string    `json:"source"`
 	FirstAttemptID            string    `json:"first_attempt_id"`
@@ -925,7 +926,7 @@ func (h *Handler) inspect(w http.ResponseWriter, r *http.Request) {
 		out.Checkpoints = append(out.Checkpoints, checkpointJSON(c))
 	}
 	for _, c := range in.Calls {
-		cj := callJSON{CallID: c.CallID, Endpoint: c.Endpoint, State: c.State, Source: c.Source, FirstAttemptID: c.FirstAttemptID,
+		cj := callJSON{CallID: c.CallID, Endpoint: c.Endpoint, Model: c.Model, State: c.State, Source: c.Source, FirstAttemptID: c.FirstAttemptID,
 			TriesUsed: c.TriesUsed, CostChargedMicro: c.CostChargedMicro, UpstreamRequestID: c.UpstreamRequestID,
 			ResultRef: c.ResultRef, FailReason: c.FailReason, SupersedesCallID: c.SupersedesCallID, SupersedeReason: c.SupersedeReason,
 			PossibleExternalDuplicate: c.PossibleExternalDuplicate, CreatedAt: c.CreatedAt, DeadlineAt: c.DeadlineAt, Tries: []tryJSON{}}

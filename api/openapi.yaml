@@ -502,6 +502,7 @@ components:
       properties:
         call_id: {type: string}
         endpoint: {type: string}
+        model: {type: string, description: The resolved model the call used (from the journal). Omitted for non-chat calls.}
         state: {type: string, enum: [resolving, in_flight, completed, failed, unknown]}
         source: {type: string}
         first_attempt_id: {type: string}
