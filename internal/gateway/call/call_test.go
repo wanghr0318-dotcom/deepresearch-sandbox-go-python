@@ -38,12 +38,14 @@ type fakeStore struct {
 	calls      map[callKey]*CallRecord
 	tries      map[callKey][]*fakeTry
 	nRes       int
-	reserveErr error // 下一次 ReserveTry 返回的存储故障（一次性）
+	begun      chan string // 每次新登记调用时发送 call_id
+	settled    chan string // 每次 SettleTry 改变账本后发送 call_id
+	reserveErr error       // 下一次 ReserveTry 返回的存储故障（一次性）
 }
 
 func newFakeStore(t *testing.T) *fakeStore {
 	return &fakeStore{t: t, revoked: map[string]bool{}, desired: map[string]string{}, budgets: map[string]*Budget{},
-		calls: map[callKey]*CallRecord{}, tries: map[callKey][]*fakeTry{}}
+		calls: map[callKey]*CallRecord{}, tries: map[callKey][]*fakeTry{}, begun: make(chan string, 64), settled: make(chan string, 64)}
 }
 
 func (s *fakeStore) budget(taskID string) *Budget {
@@ -121,6 +123,10 @@ func (s *fakeStore) BeginCall(_ context.Context, r BeginCallRequest) (BeginCallR
 			ResolvingSince: &now}
 		s.calls[k] = rec
 		s.budget(r.TaskID)
+		select {
+		case s.begun <- r.CallID:
+		default:
+		}
 		return BeginCallResult{Record: *rec}, nil
 	}
 	if rec.State == StateResolving && rec.ResolvingSince == nil && rec.TriesUsed == 0 && rec.Fingerprint == r.Fingerprint {
@@ -223,6 +229,10 @@ func (s *fakeStore) SettleTry(_ context.Context, st Settlement) (CallRecord, err
 	}
 	if st.UpstreamRequestID != "" {
 		rec.UpstreamRequestID = st.UpstreamRequestID
+	}
+	select {
+	case s.settled <- t.CallID:
+	default:
 	}
 	return *rec, nil
 }
@@ -345,6 +355,7 @@ type step struct {
 	err        *upstream.Error
 	retryAfter time.Duration
 	gate       chan struct{} // 关闭前阻塞（ctx 结束则按 sent 归类）
+	hold       bool          // 与 gate 合用：忽略 ctx，只在 gate 关闭时返回
 	hang       bool          // 阻塞至 ctx 结束
 	sent       bool          // ctx 结束时请求是否已发出：是 → unknown，否 → retryable
 }
@@ -412,7 +423,9 @@ func (a *fakeAdapter) Do(ctx context.Context, _ []byte) (upstream.Response, *ups
 		a.ctxErrs = append(a.ctxErrs, ctx.Err())
 		a.mu.Unlock()
 	}()
-	if s.gate != nil {
+	if s.gate != nil && s.hold {
+		<-s.gate // 不理会 ctx：测试显式释放前一直占用槽位
+	} else if s.gate != nil {
 		select {
 		case <-s.gate:
 		case <-ctx.Done():
@@ -536,20 +549,19 @@ func waitEntered(t *testing.T, a *fakeAdapter) {
 	}
 }
 
-// waitIdle 等待后台执行结束（进程内不再持有该调用）。
-func waitIdle(t *testing.T, c *Coordinator, taskID, callID string) {
+// waitBegun 等待 Tx1 登记指定调用。
+func waitBegun(t *testing.T, s *fakeStore, callID string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		c.mu.Lock()
-		busy := c.busy[callKey{taskID, callID}]
-		c.mu.Unlock()
-		if !busy {
-			return
+	for {
+		select {
+		case id := <-s.begun:
+			if id == callID {
+				return
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("调用 %s 没有登记", callID)
 		}
-		time.Sleep(time.Millisecond)
 	}
-	t.Fatal("后台执行没有结束")
 }
 
 // ---- 指纹 ----
@@ -812,11 +824,18 @@ func TestWorkerCancelDoesNotCancelTry(t *testing.T) {
 	}
 	h.c.CancelAttempt("a1", "attempt_ended") // 非取消原因的撤销也不取消 try
 	close(gate)
-	waitIdle(t, h.c, "t1", "c1")
+	select { // 等待后台执行完成结算（结算发生在 try 返回之后）
+	case <-h.store.settled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("try 没有结算")
+	}
 	if _, _, errs := ad.stats(); len(errs) != 1 || errs[0] != nil {
 		t.Fatalf("try 的上下文被取消：%v", errs)
 	}
-	r := h.invoke(t, inv("c1", chatBody))
+	r, err := h.newCoordinator(t, testLimits()).Invoke(context.Background(), inv("c1", chatBody))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !r.Replayed || string(r.Body) != `{"answer":"late"}` {
 		t.Fatalf("重放 %+v", r)
 	}
@@ -842,8 +861,7 @@ func TestCancelAttemptCancelsTry(t *testing.T) {
 			if r.Status != 409 || r.Code != persistence.CodeCancelRequested {
 				t.Fatalf("得到 %+v", r)
 			}
-			waitIdle(t, h.c, "t1", "c1")
-			rec, tries := h.call(t, "t1", "c1")
+			rec, tries := h.call(t, "t1", "c1") // 结算先于结果返回，无需等待
 			b := h.budget(t, "t1")
 			if len(tries) != 1 || b.ReservedMicro != 0 {
 				t.Fatalf("try %d，账本 %+v", len(tries), b)
@@ -865,13 +883,15 @@ func TestPerTaskInflightBlocksUntilRelease(t *testing.T) {
 	lim := testLimits()
 	lim.PerTaskInflight = 1
 	gate := make(chan struct{})
-	ad := newAdapter("p", step{gate: gate})
+	ad := newAdapter("p", step{gate: gate, hold: true})
 	h := newHarness(t, lim, ad)
 	first := make(chan Result, 1)
 	go func() { r, _ := h.c.Invoke(context.Background(), inv("c1", chatBody)); first <- r }()
 	waitEntered(t, ad)
 	second := make(chan Result, 1)
 	go func() { r, _ := h.c.Invoke(context.Background(), inv("c2", chatBody)); second <- r }()
+	waitBegun(t, h.store, "c2")
+	// 第一个 try 在测试释放前一直占用唯一槽位，第二个调用不可能预留或进入上游（下面的窗口只是反向检查）。
 	select {
 	case <-ad.entered:
 		t.Fatal("第二个 try 没有等待槽位")
@@ -898,7 +918,8 @@ func TestPerProviderInflightWaitCountsTowardDeadline(t *testing.T) {
 	lim.PerProviderInflight = 1
 	lim.CallDeadline = 200 * time.Millisecond
 	gate := make(chan struct{})
-	ad := newAdapter("p", step{gate: gate})
+	// 占用 provider 槽位的 try 忽略自己的期限，只在第二个调用观察到期限、返回之后由测试释放。
+	ad := newAdapter("p", step{gate: gate, hold: true})
 	h := newHarness(t, lim, ad)
 	first := make(chan Result, 1)
 	go func() { r, _ := h.c.Invoke(context.Background(), inv("c1", chatBody)); first <- r }()
