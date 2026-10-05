@@ -4101,7 +4101,7 @@ func TestE17UpstreamFaults(t *testing.T) {
 	fu.Inject(fakeupstream.Chat, 3, fakeupstream.Action{Hang: true})
 	key := gwSecret()
 	const deadline = 8 * time.Second
-	h.start(gatewayCfg(fu, key, call.Limits{CallDeadline: deadline, BackoffBase: 50 * time.Millisecond}))
+	h.start(gatewayCfg(fu, key, call.Limits{ModelCallDeadline: deadline, BackoffBase: 50 * time.Millisecond}))
 	id := h.submit("e17", spec(nil, "e17", nil, chatStep("s1")))
 	v := h.waitTerminal(id)
 
@@ -4430,7 +4430,7 @@ func TestE48ServerKilledDuringCall(t *testing.T) {
 	t.Setenv(modelKeyEnv, key)
 	fu.Inject(fakeupstream.Chat, 1, fakeupstream.Action{Hang: true})
 	const deadline = 15 * time.Second
-	flags := []string{"--fake-upstream", fu.URL(), "--call-deadline", deadline.String(), "--gateway-per-task-inflight", "1"}
+	flags := []string{"--fake-upstream", fu.URL(), "--model-call-deadline", deadline.String(), "--gateway-per-task-inflight", "1"}
 	bDone := make(chan error, 1)
 	id, first := s.killAtCallInFlight(fu, flags, func(id string) {
 		// 调用 B：同一 attempt 的另一调用，等待 A 占用的每任务在途槽位，停在 resolving（Tx1 已提交、没有 try）。

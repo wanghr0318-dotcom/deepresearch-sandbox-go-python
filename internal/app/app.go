@@ -149,6 +149,9 @@ func configPricingVersion(p upstream.Pricing) string {
 var workerEnvAllowed = map[string]bool{
 	"PYTHONPATH": true, "PYTHONUNBUFFERED": true, "PYTHONDONTWRITEBYTECODE": true, "PYTHONHASHSEED": true,
 	"PYTHONIOENCODING": true, "LANG": true, "LC_ALL": true, "TZ": true,
+	// Worker 的 Gateway 客户端超时（秒；默认 330 s）。不是凭据：--model-call-deadline 或 --call-deadline 调到
+	// 330 s 及以上时须把它设为更长，让 Gateway 先给出 504，而不是客户端先放弃并以新调用 ID 重做。
+	"AGENTBOX_GATEWAY_TIMEOUT_S": true,
 }
 
 func (c Config) withDefaults() Config {

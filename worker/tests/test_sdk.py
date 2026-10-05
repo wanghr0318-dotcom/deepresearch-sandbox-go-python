@@ -996,9 +996,23 @@ def test_client_timeout_is_call_deadline_exceeded(fake_gateway):
     assert time.monotonic() - started < 2
 
 
-def test_default_timeout_exceeds_gateway_deadline():
-    # Gateway 期限 120 s（Plan 7 Task 3）；客户端 HTTP 超时须略大于它，由 Gateway 先给出 504
-    assert GatewayClient(call_ids=CallIds()).timeout_s == 130.0
+def test_default_timeout_exceeds_gateway_deadline(monkeypatch):
+    # Gateway 期限：模型调用默认 300 s，搜索与抓取 120 s；
+    # 客户端超时须长于最长者，由 Gateway 先给出 504
+    monkeypatch.delenv("AGENTBOX_GATEWAY_TIMEOUT_S", raising=False)
+    assert GatewayClient(call_ids=CallIds()).timeout_s == 330.0
+
+
+def test_timeout_override(monkeypatch):
+    # 宿主调高 --model-call-deadline 时经 --worker-env 设置 AGENTBOX_GATEWAY_TIMEOUT_S；
+    # 构造参数优先于它
+    monkeypatch.setenv("AGENTBOX_GATEWAY_TIMEOUT_S", "630")
+    assert GatewayClient(call_ids=CallIds()).timeout_s == 630.0
+    assert GatewayClient(call_ids=CallIds(), timeout_s=5).timeout_s == 5
+    for bad in ("0", "-1", "abc", "nan", "inf", "1e300"):
+        monkeypatch.setenv("AGENTBOX_GATEWAY_TIMEOUT_S", bad)
+        with pytest.raises(ValueError, match="AGENTBOX_GATEWAY_TIMEOUT_S"):
+            GatewayClient(call_ids=CallIds())
 
 
 def test_read_blob_and_budget(fake_gateway):

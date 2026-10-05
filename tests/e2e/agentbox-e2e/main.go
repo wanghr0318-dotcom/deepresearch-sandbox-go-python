@@ -13,7 +13,7 @@
 // Gateway（M2）：--fake-upstream URL 把模型上游指向 tests/e2e/fakeupstream（模型名 fakeupstream.Model，单价
 // 每 token 1 微美元），搜索供应商取 fake，并把该地址的 host:port 加入 upstream_allow_private（与 cmd/agentbox 的
 // --search-provider fake 校验相同）；模型 Key 与 cmd/agentbox 一样只读环境变量 AGENTBOX_MODEL_API_KEY。
-// --call-deadline、--gateway-backoff-base、--gateway-per-task-inflight 覆盖 §19 的调用限额（零值取默认）。
+// --call-deadline、--model-call-deadline、--gateway-backoff-base、--gateway-per-task-inflight 覆盖 §19 的调用限额（零值取默认）。
 // procprov 在宿主上运行 Worker（没有挂载），因此本 main 为每个执行设置 AGENTBOX_GATEWAY_SOCKET 为该 attempt
 // 的 socket 宿主路径（EnvSpec.Mounts.GatewaySocket）。
 package main
@@ -127,7 +127,8 @@ func runServer(args []string, stderr io.Writer) int {
 	retryBackoff := fs.Duration("retry-backoff", 200*time.Millisecond, "恢复、报警与 coordinator 持久化的重试退避（固定值）")
 	shutdown := fs.Duration("shutdown-timeout", 20*time.Second, "退出时有期限清理的上限")
 	fakeUpstream := fs.String("fake-upstream", "", "fake upstream 的根地址（http://127.0.0.1:<port>）：模型与 fake 搜索指向它")
-	callDeadline := fs.Duration("call-deadline", 0, "Gateway 调用期限（0 取默认 120 s）")
+	callDeadline := fs.Duration("call-deadline", 0, "Gateway 搜索与抓取的调用期限（0 取默认 120 s）")
+	modelCallDeadline := fs.Duration("model-call-deadline", 0, "Gateway 模型调用的调用期限（0 取默认 300 s）")
 	backoffBase := fs.Duration("gateway-backoff-base", 0, "Gateway 退避基数（0 取默认 2 s）")
 	perTask := fs.Int("gateway-per-task-inflight", 0, "每任务上游在途上限（0 取默认 4）")
 	if err := fs.Parse(args); err != nil {
@@ -162,7 +163,7 @@ func runServer(args []string, stderr io.Writer) int {
 	if *pythonPath != "" {
 		cfg.WorkerEnv = []string{"PYTHONPATH=" + *pythonPath}
 	}
-	if err := gatewayConfig(&cfg, *fakeUpstream, call.Limits{CallDeadline: *callDeadline, BackoffBase: *backoffBase,
+	if err := gatewayConfig(&cfg, *fakeUpstream, call.Limits{CallDeadline: *callDeadline, ModelCallDeadline: *modelCallDeadline, BackoffBase: *backoffBase,
 		PerTaskInflight: *perTask}); err != nil {
 		fmt.Fprintln(stderr, "agentbox-e2e server:", err)
 		return 2

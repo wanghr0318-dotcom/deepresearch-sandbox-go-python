@@ -1031,7 +1031,9 @@ func TestGatewayConfigValidation(t *testing.T) {
 				PricingByModel: map[string]upstream.Pricing{"b": {OutputMicroPerMTok: -1}}}
 		}, "不能为负数"},
 		{"Worker 环境变量含 Key", func(c *Config) { c.WorkerEnv = []string{"PYTHONPATH=/opt", "OPENAI_API_KEY=x"} }, "OPENAI_API_KEY"},
-		{"Worker 环境变量白名单", func(c *Config) { c.WorkerEnv = []string{"PYTHONPATH=/opt", "PYTHONUNBUFFERED=1"} }, ""},
+		{"Worker 环境变量白名单", func(c *Config) {
+			c.WorkerEnv = []string{"PYTHONPATH=/opt", "PYTHONUNBUFFERED=1", "AGENTBOX_GATEWAY_TIMEOUT_S=630"}
+		}, ""},
 		{"Redis 地址", func(c *Config) { c.RedisAddr = "127.0.0.1:6379" }, ""},
 		{"Redis 地址缺端口", func(c *Config) { c.RedisAddr = "127.0.0.1" }, "host:port"},
 	}

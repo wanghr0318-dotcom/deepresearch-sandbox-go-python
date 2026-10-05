@@ -21,6 +21,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/admission"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/app"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence/postgres"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
@@ -91,6 +92,8 @@ func runServer(args []string, stderr io.Writer) int {
 	allowPrivate := fs.String("upstream-allow-private", "", "显式放行的私有上游主机（逗号分隔的 host 或 host:port；例如本机模型服务或测试用 fake upstream）")
 	redisAddr := fs.String("redis-addr", "", "共享缓存的 Redis 地址 host:port（例如 deploy/docker-compose.yml 的 127.0.0.1:6379）；为空时缓存不启用")
 	cacheMode := fs.String("cache", "on", "搜索与抓取的共享缓存：on | off（on 且配置了 --redis-addr 时生效；Redis 不可用时视为未命中）")
+	callDeadline := fs.Duration("call-deadline", call.DefaultCallDeadline, "搜索与抓取（/v1/search、/v1/fetch）的调用期限：自 Tx1 起计，含排队、退避与全部 try（须 > 0）")
+	modelCallDeadline := fs.Duration("model-call-deadline", call.DefaultModelCallDeadline, "模型调用（/v1/chat/completions）的调用期限：推理模型的长输出可能超过 120 s（须 > 0）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -103,6 +106,11 @@ func runServer(args []string, stderr io.Writer) int {
 		return 2
 	}
 	if err := checkSearchProvider(*searchProvider, *allowPrivate, os.Getenv(searchKeyEnv) != ""); err != nil {
+		fmt.Fprintln(stderr, "agentbox server:", err)
+		return 2
+	}
+	gatewayLim, err := gatewayLimits(*callDeadline, *modelCallDeadline)
+	if err != nil {
 		fmt.Fprintln(stderr, "agentbox server:", err)
 		return 2
 	}
@@ -151,6 +159,7 @@ func runServer(args []string, stderr io.Writer) int {
 		UpstreamAllowPrivate: splitList(*allowPrivate),
 		RedisAddr:            strings.TrimSpace(*redisAddr),
 		CacheOff:             *cacheMode == "off",
+		Gateway:              gatewayLim,
 	}
 	if _, err := os.Stat(filepath.Join(dir, api.TokenFile)); err == nil {
 		if cfg.APIToken, err = api.LoadToken(dir); err != nil {

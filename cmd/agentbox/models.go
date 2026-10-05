@@ -1,7 +1,7 @@
 package main
 
 // 本文件解析 `agentbox server` 的模型标志：--model-name（默认模型）、--models（声明的白名单）、
-// --model-price model=IN:OUT（按模型的单价），并校验 --search-provider。与平台无关，便于在任何平台上测试。
+// --model-price model=IN:OUT（按模型的单价），校验 --search-provider 与调用期限标志。与平台无关，便于在任何平台上测试。
 
 import (
 	"errors"
@@ -10,8 +10,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/app"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
 )
 
@@ -142,4 +144,16 @@ func parseModelPrice(entry string) (string, upstream.Pricing, error) {
 		return "", upstream.Pricing{}, fmt.Errorf("--model-price %q：单价须为非负整数（每百万 token 的微美元）", entry)
 	}
 	return name, upstream.Pricing{InputMicroPerMTok: pi, OutputMicroPerMTok: po}, nil
+}
+
+// gatewayLimits 校验调用期限标志并构造 Gateway 限额：--call-deadline 用于搜索与抓取，--model-call-deadline
+// 用于 /v1/chat/completions（推理模型的长输出可以合法地超过 120 s）。两者都须 > 0。
+func gatewayLimits(callDeadline, modelCallDeadline time.Duration) (call.Limits, error) {
+	if callDeadline <= 0 {
+		return call.Limits{}, fmt.Errorf("--call-deadline 须大于 0，得到 %s", callDeadline)
+	}
+	if modelCallDeadline <= 0 {
+		return call.Limits{}, fmt.Errorf("--model-call-deadline 须大于 0，得到 %s", modelCallDeadline)
+	}
+	return call.Limits{CallDeadline: callDeadline, ModelCallDeadline: modelCallDeadline}, nil
 }

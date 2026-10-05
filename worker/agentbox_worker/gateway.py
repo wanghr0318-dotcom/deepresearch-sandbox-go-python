@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import os
 import re
 import socket
 import threading
@@ -30,6 +31,14 @@ from agentbox_worker.errors import (
 
 DEFAULT_SOCKET_PATH = "/run/agentbox/gateway.sock"
 MAX_CALL_ID_BYTES = 256
+
+# 客户端等待一次 Gateway 请求的默认上限（秒）：须长于服务端最长的调用期限
+# （模型调用默认 300 s，`--model-call-deadline`；搜索与抓取 120 s），让 Gateway 先给出
+# 504 call_deadline_exceeded，而不是客户端先放弃、应用以新调用 ID 重做一次可能已计费的调用。
+# 宿主调高期限时经 --worker-env 设置 GATEWAY_TIMEOUT_ENV。
+DEFAULT_TIMEOUT_S = 330.0
+GATEWAY_TIMEOUT_ENV = "AGENTBOX_GATEWAY_TIMEOUT_S"
+MAX_TIMEOUT_S = 86400.0  # 过大的值会使 socket 超时溢出
 
 # kind → 端点（M2 范围）
 ENDPOINTS: dict[str, str] = {
@@ -145,6 +154,26 @@ def _error_from(status: int, data: bytes) -> GatewayError:
     return GatewayError(status, code, message)
 
 
+def default_timeout_s() -> float:
+    """客户端超时的默认值：AGENTBOX_GATEWAY_TIMEOUT_S（正数秒）优先，否则 DEFAULT_TIMEOUT_S。
+
+    取值不合法（非数值、≤ 0、NaN 或超过 MAX_TIMEOUT_S）时抛出 ValueError：与收尾期限不同，这里不静默
+    退回默认值——宿主设置它正是因为期限长于默认值，退回会重新引入客户端先放弃、重做已计费调用的问题。
+    """
+    raw = os.environ.get(GATEWAY_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return DEFAULT_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if not 0 < value <= MAX_TIMEOUT_S:  # NaN 的比较为假
+        raise ValueError(
+            f"{GATEWAY_TIMEOUT_ENV} 须为 (0, {MAX_TIMEOUT_S:g}] 内的秒数，得到 {raw!r}"
+        )
+    return value
+
+
 class GatewayClient:
     """Gateway 的同步客户端。错误映射见 errors.py；call_in_progress 在客户端有界重试（同一 ID）。"""
 
@@ -158,11 +187,11 @@ class GatewayClient:
         socket_path: str = DEFAULT_SOCKET_PATH,
         *,
         call_ids: CallIds,
-        timeout_s: float = 130.0,
+        timeout_s: float | None = None,
     ) -> None:
         self.socket_path = socket_path
         self.call_ids = call_ids
-        self.timeout_s = timeout_s
+        self.timeout_s = default_timeout_s() if timeout_s is None else timeout_s
 
     # ---- 计费调用 ----
 

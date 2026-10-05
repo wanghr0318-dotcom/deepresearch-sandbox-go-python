@@ -64,9 +64,11 @@ var ErrClosed = errors.New("call: coordinator 已关闭")
 // errCancelRequested 是 CancelAttempt 取消在途 try 时的取消原因。
 var errCancelRequested = errors.New("call: 任务已请求取消")
 
-// Limits 是 Gateway 的调用限额（§19 默认值）。零值字段取默认值。
+// Limits 是 Gateway 的调用限额（§19 默认值）。零值字段取默认值。调用期限在 Tx1 按端点类别选定并写入
+// deadline_at，之后不再改变（deadlineFor）；模型调用单独设期限，因为推理模型的长输出可以合法地超过 120 s。
 type Limits struct {
-	CallDeadline        time.Duration // 调用期限，默认 120 s
+	CallDeadline        time.Duration // 搜索与抓取的调用期限，默认 120 s
+	ModelCallDeadline   time.Duration // 模型调用（/v1/chat/completions）的调用期限，默认 300 s
 	MaxTries            int           // 每逻辑调用累计 try，默认 3
 	PerTaskInflight     int           // 每任务上游在途，默认 4
 	PerProviderInflight int           // 每 provider 上游在途，默认 8
@@ -76,7 +78,10 @@ type Limits struct {
 
 func (l Limits) withDefaults() Limits {
 	if l.CallDeadline <= 0 {
-		l.CallDeadline = 120 * time.Second
+		l.CallDeadline = DefaultCallDeadline
+	}
+	if l.ModelCallDeadline <= 0 {
+		l.ModelCallDeadline = DefaultModelCallDeadline
 	}
 	if l.MaxTries <= 0 {
 		l.MaxTries = 3
@@ -94,6 +99,21 @@ func (l Limits) withDefaults() Limits {
 		l.BackoffMax = 60 * time.Second
 	}
 	return l
+}
+
+// 调用期限的默认值（§9、§19）：搜索与抓取 120 s；模型调用 300 s（推理模型的长输出）。
+const (
+	DefaultCallDeadline      = 120 * time.Second
+	DefaultModelCallDeadline = 300 * time.Second
+)
+
+// deadlineFor 返回端点类别的调用期限（Tx1 写入 deadline_at = created_at + 它）：模型调用用 ModelCallDeadline，
+// 其余用 CallDeadline。
+func (l Limits) deadlineFor(k upstream.Kind) time.Duration {
+	if k == upstream.KindChat {
+		return l.ModelCallDeadline
+	}
+	return l.CallDeadline
 }
 
 // BlobStore 是 Coordinator 使用的内容寻址存储子集（internal/blob.Store 满足它）。
@@ -552,7 +572,7 @@ func (c *Coordinator) run(j *job) (Result, error) {
 	ctx, cancel := c.opCtx()
 	res, err := c.store.BeginCall(ctx, BeginCallRequest{
 		TaskID: in.TaskID, CallID: in.CallID, AttemptID: in.AttemptID, Fingerprint: j.fp, Endpoint: endpointOf(in.Kind),
-		Deadline: c.limits.CallDeadline, SupersedesCallID: in.Supersedes, SupersedeReason: in.SupersedeReason,
+		Deadline: c.limits.deadlineFor(in.Kind), SupersedesCallID: in.Supersedes, SupersedeReason: in.SupersedeReason,
 		Model: j.model,
 	})
 	cancel()

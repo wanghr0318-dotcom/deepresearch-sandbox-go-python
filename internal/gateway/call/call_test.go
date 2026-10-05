@@ -545,7 +545,7 @@ func (s *syncBuffer) String() string {
 }
 
 func testLimits() Limits {
-	return Limits{CallDeadline: 5 * time.Second, BackoffBase: time.Millisecond, BackoffMax: 4 * time.Millisecond}
+	return Limits{CallDeadline: 5 * time.Second, ModelCallDeadline: 5 * time.Second, BackoffBase: time.Millisecond, BackoffMax: 4 * time.Millisecond}
 }
 
 func newHarness(t *testing.T, lim Limits, ad *fakeAdapter) *harness {
@@ -821,7 +821,7 @@ func TestUnknownChargedOnce(t *testing.T) {
 // 期限：剩余期限不足以完成退避（遵从 Retry-After）时不再新建 try，504 call_deadline_exceeded，调用 failed。
 func TestDeadlineStopsNewTries(t *testing.T) {
 	lim := testLimits()
-	lim.CallDeadline = 300 * time.Millisecond
+	lim.ModelCallDeadline = 300 * time.Millisecond
 	ad := newAdapter("p", step{err: rateLimited(), retryAfter: time.Second})
 	h := newHarness(t, lim, ad)
 	r := h.invoke(t, inv("c1", chatBody))
@@ -840,7 +840,7 @@ func TestDeadlineStopsNewTries(t *testing.T) {
 // 期限到达时在途 try 被中止：已发出的请求按 unknown 结算（possible_external_duplicate），不再新建 try。
 func TestDeadlineAbortsInFlightTry(t *testing.T) {
 	lim := testLimits()
-	lim.CallDeadline = 200 * time.Millisecond
+	lim.ModelCallDeadline = 200 * time.Millisecond
 	ad := newAdapter("p", step{hang: true, sent: true})
 	h := newHarness(t, lim, ad)
 	r := h.invoke(t, inv("c1", chatBody))
@@ -1011,7 +1011,7 @@ func TestPerTaskInflightBlocksUntilRelease(t *testing.T) {
 func TestPerProviderInflightWaitCountsTowardDeadline(t *testing.T) {
 	lim := testLimits()
 	lim.PerProviderInflight = 1
-	lim.CallDeadline = 200 * time.Millisecond
+	lim.ModelCallDeadline = 200 * time.Millisecond
 	gate := make(chan struct{})
 	// 占用 provider 槽位的 try 忽略自己的期限，只在第二个调用观察到期限、返回之后由测试释放。
 	ad := newAdapter("p", step{gate: gate, hold: true})
@@ -1787,5 +1787,48 @@ func TestCoalesceAttemptReplacedContinues(t *testing.T) {
 	retry.AttemptID, retry.Retry = "a2", true
 	if r, err := c2.Invoke(ctx, retry); err != nil || r.Status != 200 || r.Replayed {
 		t.Fatalf("follower 的调用带 Retry 重发：%+v / %v", r, err)
+	}
+}
+
+// ---- 按端点类别的调用期限 ----
+
+// 期限在 Tx1 按端点类别选定：模型调用 deadline_at = created_at + ModelCallDeadline，搜索与抓取用 CallDeadline。
+// 模型调用的上游耗时超过 CallDeadline（但在 ModelCallDeadline 之内）仍正常完成；同样挂起的搜索在 CallDeadline 到期。
+func TestDeadlinePerEndpointKind(t *testing.T) {
+	lim := testLimits()
+	lim.CallDeadline, lim.ModelCallDeadline = 150*time.Millisecond, 5*time.Second
+
+	gate := make(chan struct{})
+	chat := newHarness(t, lim, newAdapter("p", step{body: `{"answer":"slow"}`, gate: gate}))
+	done := chat.start(context.Background(), inv("c1", chatBody))
+	waitEntered(t, chat.ad)
+	time.Sleep(3 * lim.CallDeadline) // 超过搜索与抓取的期限
+	close(gate)
+	if r := await(t, done); r.Status != 200 || string(r.Body) != `{"answer":"slow"}` {
+		t.Fatalf("模型调用超过 CallDeadline 后应在 ModelCallDeadline 内完成：%+v", r)
+	}
+	if rec, _ := chat.call(t, "t1", "c1"); rec.State != StateCompleted || rec.DeadlineAt.Sub(rec.CreatedAt) != lim.ModelCallDeadline {
+		t.Fatalf("模型调用记录 %+v；期望 completed、deadline_at = created_at + %s", rec, lim.ModelCallDeadline)
+	}
+
+	for _, in := range []Invoke{searchInv("s1"), fetchInv("f1")} {
+		ad := newAdapter("p", step{hang: true, sent: true})
+		ad.kind = in.Kind
+		h := newHarness(t, lim, ad)
+		if r := h.invoke(t, in); r.Status != 504 || r.Code != persistence.CodeCallDeadlineExceeded {
+			t.Fatalf("%s：挂起的调用应在 CallDeadline 到期：%+v", endpointOf(in.Kind), r)
+		}
+		if rec, _ := h.call(t, "t1", in.CallID); rec.DeadlineAt.Sub(rec.CreatedAt) != lim.CallDeadline {
+			t.Fatalf("%s：deadline_at - created_at = %s；期望 %s", endpointOf(in.Kind), rec.DeadlineAt.Sub(rec.CreatedAt), lim.CallDeadline)
+		}
+	}
+}
+
+// 零值 Limits 取默认值：搜索与抓取 120 s，模型调用 300 s。
+func TestDeadlineDefaults(t *testing.T) {
+	l := Limits{}.withDefaults()
+	if l.deadlineFor(upstream.KindSearch) != 120*time.Second || l.deadlineFor(upstream.KindFetch) != 120*time.Second ||
+		l.deadlineFor(upstream.KindChat) != 300*time.Second {
+		t.Fatalf("默认期限 %+v", l)
 	}
 }

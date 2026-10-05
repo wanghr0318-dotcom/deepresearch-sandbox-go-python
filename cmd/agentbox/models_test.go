@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
 )
@@ -115,5 +116,40 @@ func TestPlaintextListenWarning(t *testing.T) {
 		if tc.warn && (!strings.HasPrefix(got, "warning: ") || !strings.Contains(got, tc.listen) || !strings.Contains(got, "without TLS")) {
 			t.Errorf("警告文本 %q 不含前缀、地址或 without TLS", got)
 		}
+	}
+}
+
+// TestCallDeadlineFlags：--call-deadline（搜索与抓取，默认 120 s）与 --model-call-deadline（模型调用，默认 300 s）
+// 须 > 0，否则拒绝启动（退出码 2，在取得锁与连接数据库之前）；合法值原样进入 Gateway 限额。
+func TestCallDeadlineFlags(t *testing.T) {
+	lim, err := gatewayLimits(90*time.Second, 10*time.Minute)
+	if err != nil || lim.CallDeadline != 90*time.Second || lim.ModelCallDeadline != 10*time.Minute {
+		t.Fatalf("gatewayLimits = %+v, %v", lim, err)
+	}
+	for _, tc := range []struct {
+		call, model time.Duration
+		flag        string
+	}{
+		{0, time.Minute, "--call-deadline"}, {-time.Second, time.Minute, "--call-deadline"},
+		{time.Minute, 0, "--model-call-deadline"}, {time.Minute, -time.Second, "--model-call-deadline"},
+	} {
+		if _, err := gatewayLimits(tc.call, tc.model); err == nil || !strings.Contains(err.Error(), tc.flag) {
+			t.Errorf("call=%s model=%s：%v，期望提到 %s", tc.call, tc.model, err, tc.flag)
+		}
+	}
+	if runtime.GOOS != "linux" {
+		return // 其他平台的 runServer 只报告不支持
+	}
+	// -help 列出两个标志及其默认值（120 s 与 300 s）。
+	var stderr strings.Builder
+	if code := runServer([]string{"-help"}, &stderr); code != 2 ||
+		!strings.Contains(stderr.String(), "-call-deadline duration") || !strings.Contains(stderr.String(), "(default 2m0s)") ||
+		!strings.Contains(stderr.String(), "-model-call-deadline duration") || !strings.Contains(stderr.String(), "(default 5m0s)") {
+		t.Fatalf("-help 退出码 %d：%s", code, stderr.String())
+	}
+	stderr.Reset()
+	if code := runServer([]string{"--data-dir", t.TempDir(), "--database-url", "postgres://x", "--model-call-deadline", "0s"}, &stderr); code != 2 ||
+		!strings.Contains(stderr.String(), "--model-call-deadline") {
+		t.Fatalf("--model-call-deadline 0s 时 runServer 退出码 %d（%s），期望 2 并拒绝启动", code, stderr.String())
 	}
 }
