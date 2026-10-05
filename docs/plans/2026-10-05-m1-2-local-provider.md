@@ -292,6 +292,11 @@ Task 11 第一步以测试验证这一点；验证不成立则停止并报告，
 
 **验证：** root：`go test -count=1 ./internal/sandbox/ ./internal/provider/local/`；非 root 全量；`GOOS=windows go build ./...`。
 
+**执行中修订（Task 9 之后，中心决定）：**
+- **就绪与失败通道**：启动进程给 init 传 fd 3 = 控制 socket、fd 4 = 就绪管道。init 环境建立完成后向管道写一字节 0x01 并关闭；建立失败时把 `init_err{init/<step>: 原因}` 的原因文本写入该管道（或直接退出，EOF 即失败）。**`init_err` 不经控制 socket**：控制 socket 的协议只承载 exec 生命周期（start/terminate/exit），环境建立失败发生在服务开始之前。
+- GID 范围与 UID 范围相同（`EnvSpec` 只有 UID 范围）；沙箱主机名为常量 `agentbox`；启动进程拒绝基址为 0 的范围（会把 ns root 映射到宿主 root）。
+- `sandbox-launch` 的分流放在 `cmd/agentbox/init_linux.go`/`init_other.go`（main.go 不能直接导入 Linux 专有包）；archtest 的凭据系统调用源码检查随 Task 9 加入。
+
 ### Task 10：init 环境建立
 
 **Files:** Create `internal/sandbox/mounts.go`、`internal/sandbox/caps.go`；Modify `internal/sandbox/init.go`（`RunInit` 按 §4.6 的 init 段执行，失败报告 `init_err{reason}`）、`internal/sandbox/spawn_test.go`、`internal/rootfs/*`（模板描述）。
