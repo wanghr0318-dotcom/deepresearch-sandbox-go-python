@@ -106,6 +106,14 @@ func TestDecisionCodeHasNoSideEffectDeps(t *testing.T) {
 	forbid(t, "internal/task", []string{"net/http", "os/exec", "github.com/jackc/pgx", "github.com/redis"})
 }
 
+// TestAccountIsPureLogic：account 是账号的纯逻辑（哈希、规则、会话 ID、限速），不导入 persistence、net/http 与 api
+// （Plan 11 Task 1）；存储与 HTTP 由调用方负责。
+func TestAccountIsPureLogic(t *testing.T) {
+	forbidDirect(t, "internal/account", []string{
+		module + "/internal/persistence", "net/http", module + "/internal/api",
+	})
+}
+
 // TestProtocolIsStdlibOnly：规则 3——protocol 只依赖标准库。
 func TestProtocolIsStdlibOnly(t *testing.T) {
 	for _, d := range deps(t, "internal/protocol") {
