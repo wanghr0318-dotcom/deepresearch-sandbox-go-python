@@ -254,8 +254,8 @@ func (a *searchAdapter) tavily(ctx context.Context, r searchRequest) ([]SearchRe
 
 // serper：POST {BaseURL}/search {"q", "num"}，Key 走 X-API-KEY 头，不进请求体。取 organic[] 的
 // title / link / snippet（answerBox、knowledgeGraph 等忽略），跳过非 http(s) 链接。401/403 等 4xx 为
-// fatal upstream_rejected（与 tavily 一致），429/5xx/发送前失败可重试；2xx 但不是合法 JSON 为 fatal
-// upstream_bad_response（与 ddg_lite 解析失败一致：重试同一请求无助于得到可用结果）。
+// fatal upstream_rejected（与 tavily 一致），429/5xx/发送前失败可重试；2xx 但不是合法 JSON 为 unknown
+// upstream_bad_response（与 tavily 一致：请求已发出、可能已计费，结果无法确认）。
 func (a *searchAdapter) serper(ctx context.Context, r searchRequest) ([]SearchResult, Response, *Error) {
 	payload, _ := json.Marshal(map[string]any{"q": r.Query, "num": r.MaxResults})
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(a.cfg.BaseURL, "/")+"/search", bytes.NewReader(payload))
@@ -280,7 +280,7 @@ func (a *searchAdapter) serper(ctx context.Context, r searchRequest) ([]SearchRe
 		} `json:"organic"`
 	}
 	if json.Unmarshal(res.body, &reply) != nil {
-		return nil, Response{}, newErr(OutcomeFatal, http.StatusBadGateway, CodeUpstreamBadResponse, errors.New("serper 响应不是合法 JSON"))
+		return nil, Response{}, newErr(OutcomeUnknown, http.StatusBadGateway, CodeUpstreamBadResponse, errors.New("serper 响应不是合法 JSON"))
 	}
 	out := make([]SearchResult, 0, len(reply.Organic))
 	for _, x := range reply.Organic {

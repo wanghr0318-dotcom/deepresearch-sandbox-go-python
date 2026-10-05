@@ -764,7 +764,7 @@ func TestSearchProviders(t *testing.T) {
 }
 
 // serper：请求形状（POST /search、X-API-KEY 头、JSON 体只有 q/num）、organic 映射（跳过非 http(s) 链接、
-// 截断到 max_results、忽略 answerBox）、401/403 fatal、429/503 可重试、非法 JSON fatal、错误文本不含 Key。
+// 截断到 max_results、忽略 answerBox）、401/403 fatal、429/503 可重试、非法 JSON unknown（已发出、可能已计费，与 tavily 一致）、错误文本不含 Key。
 func TestSearchSerper(t *testing.T) {
 	ctx := context.Background()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -841,7 +841,7 @@ func TestSearchSerper(t *testing.T) {
 		{"/403", OutcomeFatal, CodeUpstreamRejected},
 		{"/429", OutcomeRetryable, CodeUpstreamRateLimited},
 		{"/503", OutcomeRetryable, CodeUpstreamUnavailable},
-		{"/bad", OutcomeFatal, CodeUpstreamBadResponse},
+		{"/bad", OutcomeUnknown, CodeUpstreamBadResponse},
 	}
 	for _, c := range cases {
 		a := mk(c.path)
