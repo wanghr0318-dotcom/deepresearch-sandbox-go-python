@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/jcs"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 )
 
@@ -403,21 +404,6 @@ func validRequestID(w http.ResponseWriter, id string) bool {
 	return true
 }
 
-// canonicalJSON 返回 v 的规范化编码：对象键排序、无空白、数字保持原文。
-func canonicalJSON(v any) ([]byte, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	var x any
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.UseNumber()
-	if err := dec.Decode(&x); err != nil {
-		return nil, err
-	}
-	return json.Marshal(x) // map 按键排序编码
-}
-
 func bodyHash(canonical []byte) []byte {
 	sum := sha256.Sum256(canonical)
 	return sum[:]
@@ -511,7 +497,7 @@ func (h *Handler) createTask(w http.ResponseWriter, r *http.Request) {
 		}
 		stored = eff
 	}
-	canon, err := canonicalJSON(body)
+	canon, err := jcs.Canonical(body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", "请求体无法规范化")
 		return
@@ -546,7 +532,7 @@ func isJSONObject(b json.RawMessage) bool {
 }
 
 func mustCanonical(raw json.RawMessage) json.RawMessage {
-	b, err := canonicalJSON(raw)
+	b, err := jcs.Canonical(raw)
 	if err != nil {
 		return raw // 已由 decodeBody 解析过，不会发生
 	}
@@ -592,7 +578,7 @@ func control(desired string) func(h *Handler, w http.ResponseWriter, r *http.Req
 			return
 		}
 		taskID := r.PathValue("id")
-		canon, err := canonicalJSON(controlHashInput{controlBody: body, TaskID: taskID, Desired: desired})
+		canon, err := jcs.Canonical(controlHashInput{controlBody: body, TaskID: taskID, Desired: desired})
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request", "请求体无法规范化")
 			return
