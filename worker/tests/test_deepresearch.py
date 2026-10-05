@@ -214,6 +214,17 @@ def test_plan_falls_back_on_non_json(research):
     assert tasks[0].query == "固态电池 最新进展"
 
 
+def test_search_titles_collapse_whitespace(research):
+    fake, gw, script = research
+    script.search = [
+        {"url": "https://a.example/1", "title": "标准矩阵\n\t\t_\n\t\t省工信厅", "snippet": "s"}
+    ]
+    script.pages = {"https://a.example/1": {"content_type": "text/plain", "text": "正文"}}
+    task = ResearchTask(1, "标准", "行业标准", "固态电池 标准")
+    evidence = search_and_fetch(gw, task, max_results=5, max_fetch=1, step_id="task-1")
+    assert [e.title for e in evidence] == ["标准矩阵 _ 省工信厅"]
+
+
 def test_search_and_fetch_evidence_comes_from_fetch_blobs(research):
     fake, gw, script = research
     script.search = [

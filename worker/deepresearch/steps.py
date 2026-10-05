@@ -250,7 +250,9 @@ def _search_hits(body: dict) -> list[dict[str, str]]:
         snippet = next(
             (s for k in ("snippet", "content", "description") if (s := _text(item.get(k)))), ""
         )
-        hits.append({"url": url, "title": _text(item.get("title")) or url, "snippet": snippet})
+        # 网页 <title> 原文可能含制表符与换行：折叠为单个空格，证据列表才能一行一条。
+        title = " ".join(_text(item.get("title")).split())
+        hits.append({"url": url, "title": title or url, "snippet": snippet})
     return hits
 
 
