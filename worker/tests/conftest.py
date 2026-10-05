@@ -13,7 +13,7 @@ import shutil
 import socket
 import tempfile
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler
 from typing import Any
@@ -62,6 +62,8 @@ class FakeGateway:
         self.budget = {"budget_micro": 1_000_000, "remaining_micro": 750_000}
         self.delay = 0.0
         self.release = threading.Event()
+        # 可选：按 (kind, 请求体) 生成计费调用的结果体；缺省时结果体回显请求
+        self.responder: Callable[[str, Any], Any] | None = None
         self._lock = threading.Lock()
 
     def put_blob(self, data: bytes) -> str:
@@ -94,7 +96,10 @@ class FakeGateway:
             sha = self.calls.get(call_id)
             replayed = sha is not None
             if sha is None:
-                result = {"kind": kind, "call_id": call_id, "request": req.json()}
+                if self.responder is not None:
+                    result = self.responder(kind, req.json())
+                else:
+                    result = {"kind": kind, "call_id": call_id, "request": req.json()}
                 sha = self.put_blob(json.dumps(result, ensure_ascii=False).encode())
                 self.calls[call_id] = sha
         headers = {"X-Agentbox-Blob": sha}
