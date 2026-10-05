@@ -259,21 +259,15 @@ func New(opt Options) (*Provider, error) // Starter 为 nil 时返回错误（�
 不依赖名称的启动成功判据（R3）。"实验可行"与"生产启动路径通过验收"分开判定：Task 9–12 各自的测试通过不等于生产启动路径验收，
 后者是 Task 12 的 §16.2 生产验收加 Task 13 的真实端到端。
 
-**规格增量（随本节一并审阅）**：为实现 R3 的判据，init 的 permitted 集合由 `{KILL}` 改为 `{KILL, SETUID, SETGID, SETPCAP}`
-（effective 仍只有 `{KILL}`，inheritable 与 ambient 为空）。原因：判据依赖 ptrace 的 exec 事件，而被跟踪进程 execve 时内核把
-新的 permitted 限制在原 permitted 之内（tracer 无 `CAP_SYS_PTRACE` 时），init 若只保留 `{KILL}`，helper 将拿不到降权所需的能力。
-Task 11 第一步以测试验证这一点；验证不成立则停止并报告，不退回到基于名称或轮询的判据。
+**init 能力集不扩展**（2026-10-05 决定）：原先为 ptrace 判据考虑的 permitted 扩展已放弃；init 保持 permitted = effective = {KILL}（Task 10 的 `initCaps` 常量不改）。启动判据改为 exec-status 管道 + reaper wait 状态 + 显式提交点，见规格 §4.6 门槛 2 与[决策说明](../design/2026-10-05-startup-success-decision.md)。
 
-**用户审阅（2026-10-05）对上述增量与 Task 11 的约束（有界授权，先于实现）：**
-- permitted 集合扩展只为有界的 ptrace 实验**有条件授权**：先以测试验证，再采纳进生产；不得把 `effective = {KILL}` 描述为"阻止其余 permitted 能力被重新启用"（持有 permitted 的进程可以自行将其提升为 effective，真正的收缩发生在 helper 的降权序列中）。
-- 实现被跟踪的启动路径前先写明：等待 ptrace 事件**之前释放 `reg.mu`**；reaper 在持有登记表锁时的事件投递保持**非阻塞**；成功 detach 后保证 **`start_ack` 先于 `exit`** 投递；**detach 失败视为启动失败**，须终止并清理；**exec 成功与 Worker 就绪握手是两回事**，不得合并。
-- 实验失败或需要契约变更时，报告证据与所需决定；不退回基于名称或轮询的判定。
+**用户审阅（2026-10-05）对 Task 11 的约束：** 不扩展 init 能力集；不重试被拦截的 ptrace / seccomp-notif 实验；判据组合 = errno-on-failure 管道 + CLOEXEC EOF + reaper wait 状态 + `start_ack` 先于 `exit` 的显式顺序；判定时不持 `reg.mu`，reaper 持锁时投递非阻塞；exec 成功与 Worker 就绪握手是两回事；残余 exec 边界竞争在规格与验收记录中显式保留。
 
 | 任务 | 内容 | 依赖 |
 |---|---|---|
 | 9 | 专用启动进程与生产 `EnvStarter`（user namespace、ID 映射、`CLONE_INTO_CGROUP`、pidfd 交还、server 为 subreaper） | 8 |
 | 10 | init 环境建立：挂载（新挂载 API + 回退）、tmpfs、`/dev`、proc 与掩蔽、pivot_root、init 能力；`init_err` | 9 |
-| 11 | stage-2 helper 与 init 的生产 `Launcher`：降权序列、exec-status 管道、**R3 启动成功判据（ptrace exec 事件）**、reaper 集成 | 10 |
+| 11 | stage-2 helper 与 init 的生产 `Launcher`：降权序列、exec-status 管道、**exec 提交点判据（管道 + reaper wait）**、reaper 集成 | 10 |
 | 12 | `hostcheck` 补充、构建约束（`CGO_ENABLED=0`）、§16.2 生产验收（隔离检查器） | 11 |
 | 13 | 启用 `agentbox server`；真实隔离环境上的端到端与重启恢复验收（首个切片、E1–E10、E2/E3、E5 物理回收）；README 快速开始 | 12；Plan 5、6 |
 
@@ -292,6 +286,11 @@ Task 11 第一步以测试验证这一点；验证不成立则停止并报告，
 
 **验证：** root：`go test -count=1 ./internal/sandbox/ ./internal/provider/local/`；非 root 全量；`GOOS=windows go build ./...`。
 
+**执行中修订（Task 9 之后，中心决定）：**
+- **就绪与失败通道**：启动进程给 init 传 fd 3 = 控制 socket、fd 4 = 就绪管道。init 环境建立完成后向管道写一字节 0x01 并关闭；建立失败时把 `init_err{init/<step>: 原因}` 的原因文本写入该管道（或直接退出，EOF 即失败）。**`init_err` 不经控制 socket**：控制 socket 的协议只承载 exec 生命周期（start/terminate/exit），环境建立失败发生在服务开始之前。
+- GID 范围与 UID 范围相同（`EnvSpec` 只有 UID 范围）；沙箱主机名为常量 `agentbox`；启动进程拒绝基址为 0 的范围（会把 ns root 映射到宿主 root）。
+- `sandbox-launch` 的分流放在 `cmd/agentbox/init_linux.go`/`init_other.go`（main.go 不能直接导入 Linux 专有包）；archtest 的凭据系统调用源码检查随 Task 9 加入。
+
 ### Task 10：init 环境建立
 
 **Files:** Create `internal/sandbox/mounts.go`、`internal/sandbox/caps.go`；Modify `internal/sandbox/init.go`（`RunInit` 按 §4.6 的 init 段执行，失败报告 `init_err{reason}`）、`internal/sandbox/spawn_test.go`、`internal/rootfs/*`（模板描述）。
@@ -305,24 +304,34 @@ Task 11 第一步以测试验证这一点；验证不成立则停止并报告，
 
 **验证：** 同 Task 9。
 
+**执行中修订（Task 10 之后，中心决定）：**
+- **launcher→init 规格通道**：init 的输入经 `LaunchSpec.Init`（类型 `InitSpec`，含 hostname、模板、UID/GID 范围等），由启动进程写入 fd 5 的管道（`InitSpecFD = 5`）；`AGENTBOX_ROOT`/`AGENTBOX_HOSTNAME` 环境变量作废。测试 init 忽略 fd 5。
+- **模板**：`rootfs.Template`（`DefaultTemplate`/`ResolveTemplate`/`Validate`/`Ensure`）描述 M1 的宿主路径集合模板；旧的 `EnsureTemplate(dir)`（目录形态）保留但生产不再调用。生产装配需要宿主存在 `/opt/agentbox` 并在启动时 `Ensure()`——归入 Task 13 装配。
+- 规格留白的取值：`/run` 用 1777（§4.5 列为可写）；exec 环境无 `/run`；新根为暂存在 `/tmp` 的 tmpfs，所有源在挂载前 `O_PATH` 打开；模板路径不得与 init 自身挂载点重叠；init 自身校验 Gateway socket 属主为映射 uid 1000、0600。
+- **start 暂被拒**：Task 11 之前，init 就绪后以桩 Launcher 回 `start_err{init/launcher}`，不会运行未降权的 workload；Task 11 用 `initEnv.helperFD` 替换。
+
 ### Task 11：stage-2 helper、生产 `Launcher` 与启动成功判据
 
-**Files:** Create `internal/sandbox/helper.go`（`exec-stage2` 子命令）、`internal/sandbox/rawfork_linux.go`（raw clone + `execveat`，移植 spike 的 `rawfork.go`）、`internal/sandbox/launcher.go`（init 的生产 `Launcher`）；Modify `internal/sandbox/reaper.go`（ptrace 停止事件交给启动路径）、`internal/sandbox/spawn_test.go`、`cmd/agentbox/main.go`（分流 `exec-stage2`）。
+**Files:** Create `internal/sandbox/helper.go`（`exec-stage2` 子命令）、`internal/sandbox/rawfork_linux.go`（raw clone + `execveat`，移植 spike 的 `rawfork.go`）、`internal/sandbox/launcher.go`（init 的生产 `Launcher`）；Modify `internal/sandbox/reaper.go`（向启动路径非阻塞提供子进程 wait 状态）、`internal/sandbox/spawn_test.go`、`cmd/agentbox/main.go`（分流 `exec-stage2`）。
 
 **降权序列（规格 §4.6 helper 段，逐条）：** `PR_SET_NAME` → fd 3 设 `FD_CLOEXEC`、`close_range(4, ~0, CLOSE_RANGE_CLOEXEC)` → 清空 bounding → 设置并锁定 securebits 0x0f（在 `setresuid` 之前）→ `setresgid/setresuid(1000)` → 显式清空 eff/prm/inh 与 ambient → 显式设置 rlimit（`RLIMIT_NOFILE`、`RLIMIT_CORE=0`；exec 环境另 `RLIMIT_FSIZE`）→ `no_new_privs` → seccomp（Task 3 的过滤器，`SECCOMP_FILTER_FLAG_TSYNC`，`clone3 → ENOSYS`）→ `execve` workload。`LockOSThread`；身份与能力调用经 `syscall.AllThreadsSyscall`。任一步失败经 fd 3 写 `helper/<step>: <原因>` 后退出。
 
-**init 的启动路径（持 `reg.mu`）：** `recvmsg(MSG_CMSG_CLOEXEC)` 恰好 3 个 FD → `pipe2(O_CLOEXEC)` 作为 exec-status → 阻塞全部信号 → raw `clone(SIGCHLD)` → 子进程：`dup3` 到 0/1/2/3，`setpgid(0,0)`，`ptrace(PTRACE_TRACEME)`，清空信号掩码，`execveat(helper_fd, "", AT_EMPTY_PATH)`。
+**init 的启动路径：** 持 `reg.mu` 完成登记与 clone：`recvmsg(MSG_CMSG_CLOEXEC)` 恰好 3 个 FD → `pipe2(O_CLOEXEC)` 作为 exec-status → 阻塞全部信号 → raw `clone(SIGCHLD)` → 子进程：`dup3` 到 0/1/2/3，`setpgid(0,0)`，清空信号掩码，`execveat(helper_fd, "", AT_EMPTY_PATH)`；父进程把 pid 登记为"启动中"后**释放 `reg.mu`**，再等待判定。
 
-**R3 启动成功判据（ptrace exec 事件，不依赖名称或轮询）：**
-1. 子进程 `PTRACE_TRACEME` 后 `execveat` helper：成功时内核使其停在 exec 后的 `SIGTRAP`；init 收到该停止后 `PTRACE_SETOPTIONS(PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL)` 并 `PTRACE_CONT`。
-2. helper 执行降权序列后 `execve` workload：成功时内核产生 `PTRACE_EVENT_EXEC` 停止——这是"workload 已完成 execve、尚未执行任何指令"的内核事实。init 随即 `PTRACE_DETACH` 并回复 `start_ack`。
-3. 在 `PTRACE_EVENT_EXEC` 之前：exec-status 管道有数据 → `start_err{helper/<step>}`；进程退出或被信号终止 → `start_err{helper/died_before_exec: <状态>}`。两种情况 workload 都未运行。
-4. 因为事件发生在 workload 的第一条指令之前，workload 快速退出（如 `true`）总是报告为 `start_ack` 后的 `exit`；workload 与 helper 同名不影响判定。
-5. ptrace 请求必须由 clone 子进程的那个 OS 线程发出（tracer 是线程）：启动路径在一个锁定的 goroutine 中完成 clone、等待与 detach。reaper 仍是唯一的 `wait` 调用者：对处于"启动中"的 pid，reaper 把停止事件（`WIFSTOPPED`）经登记表交给该启动路径，不收割、不丢弃。
-6. ptrace 不可用（`ptrace_scope ≥ 2`、LSM 拒绝）→ `start_err{init/ptrace: …}`，不退回启发式判据；`hostcheck` 预先检查（Task 12）。
-7. 第一步验证：helper 在被跟踪的情况下 execve 后能否获得 `{SETUID, SETGID, SETPCAP}`（取决于 init 的 permitted，见本节开头的规格增量）。测试先行；不成立则停止报告。
+**exec 提交点判据（规格 §4.6 门槛 2，逐条实现）：**
+1. **提交点**：helper 的 `execve(workload)` 成功返回即"已启动"。`start_ack` 表示启动路径到达提交点，不表示 workload 首条指令已执行。
+2. **失败路径**：helper 任一降权步骤或 `execve` 失败 → 向 fd 3（exec-status，O_CLOEXEC）写 `helper/<step>: <errno 文本>` 后 `exit(126)`。init 读到字节 → `start_err{helper/<step>: …}`，workload 未运行。
+3. **成功路径**：`execve` 成功 → 内核关闭 exec-status 的写端 → init 读到 EOF 无字节。
+4. **reaper wait 状态消歧**：reaper 仍是唯一 `wait` 者。登记表为每个"启动中"pid 保存 reaper 观察到的终止状态（若有）。init 在 EOF 无字节后查询：
+   - 子进程存活，或已以**非 126 的退出码**正常退出 → `start_ack`；随后 reaper 投递该 pid 的 `exit`。
+   - 子进程**以信号终止**，且 reaper 的终止记录不晚于 EOF 观察 → `start_err{helper/died_before_exec: signal <sig>}`。
+   - 子进程以 126 退出但管道无字节（helper 写失败后退出）→ `start_err{helper/died_before_exec: exit 126}`。
+5. **顺序保证**：对同一 exec，`start_ack` 必须先于 `exit` 投递：reaper 对"启动中"pid 的终止**只记录不投递**，由启动路径在判定后按序投递（ack 后再 exit，或只投递 start_err）。reaper 持登记表锁时的记录操作非阻塞（不等待 channel）。
+6. **控制通道断开**：判定期间控制 socket 断开 → 终止该 pid 的进程组、清理登记，不投递任何消息（host 侧按 ErrControlLost 处理）。
+7. **残余竞争窗口显式**：helper 在最后一步与 `execve` 返回之间被 SIGKILL 与 workload 在 `execve` 后立即被 SIGKILL，在"EOF 无字节 + 信号终止"上不可区分，按提交点归为 `died_before_exec`；代码注释与验收记录写明。**不**用进程名、不轮询、不 ptrace。
+8. exec 成功与协议层 `ready` 握手分开：`start_ack` 不等 ready。
 
-**Tests（root）：** R3 矩阵——workload `true`（快速退出）→ `start_ack` + exit 0；helper 在每个降权步骤注入失败（12 个注入点）→ 对应 `start_err`、workload 未运行（以 workload 写入的标记文件不存在判定）；helper 在 exec 前被 SIGKILL（注入点处自杀）→ `start_err{helper/died_before_exec: signal killed}`；workload 二进制与 helper 同名（复制为同名文件、`PR_SET_NAME` 相同）→ 判定不受影响；workload 被 SIGKILL 立即终止 → `start_ack` + 信号退出；并发 32 次启动无错配。workload 内核验：uid/gid 1000、能力全 0（逐线程）、`NoNewPrivs: 1`、securebits 0x0f 锁定、除 0/1/2 外无 FD、`TracerPid: 0`（已 detach）。
+**Tests（root）：** 提交点矩阵——(1) helper 在每个降权步骤注入失败（12 个注入点）→ 对应 `start_err{helper/<step>}`、workload 未运行（workload 应写的标记文件不存在）；(2) helper 在 exec 前 SIGKILL 自身 → `start_err{helper/died_before_exec: signal killed}`、无 `start_ack`、无 `exit`；(3) workload `true`（快速退出）→ `start_ack` 然后 `exit 0`，顺序断言；(4) workload 立即 `exit 126` → `start_ack` + `exit 126`（126 只对无字节 EOF 前的信号/126 消歧生效，不误判已 exec 的 workload——以标记文件证明 workload 运行过）；(5) workload 二进制与 helper 同名（复制为同名、相同 `PR_SET_NAME`）→ 判定不受影响；(6) workload 启动后被 SIGKILL → `start_ack` + 信号 `exit`（若落入残余窗口则为 `died_before_exec`，测试接受两者之一并记录频次）；(7) 判定期间控制 socket 断开 → 进程组被终止、登记清理、无消息；(8) 边界分类：构造"reaper 先于 EOF 观察到信号终止"与"EOF 先于终止"两种时序（以测试钩子控制 reaper 投递时机）→ 分别 `died_before_exec` 与 `start_ack`；(9) 并发 32 次启动无 pid 错配、无 `reg.mu` 持有期间阻塞（以锁等待钩子断言）。workload 内核验：uid/gid 1000、能力全 0（逐线程）、`NoNewPrivs: 1`、securebits 0x0f 锁定、除 0/1/2 外无 FD。
 
 **验证：** 同 Task 9。
 
@@ -330,7 +339,7 @@ Task 11 第一步以测试验证这一点；验证不成立则停止并报告，
 
 **Files:** Modify `internal/hostcheck/*`、`internal/archtest/archtest_test.go`、`.github/workflows/ci.yml`、`scripts/ci/check-runner.sh`；Create `internal/sandbox/isolation_test.go`（或并入 `spawn_test.go`，以本包唯一测试文件规则为准）与检查器（移植 spike `check.go` 为测试辅助二进制）。
 
-**规则：** `hostcheck` 增加：新挂载 API（`open_tree`/`mount_setattr` 可用）、`close_range`、`kernel.yama.ptrace_scope ≤ 1`、user namespace 可用（含 AppArmor 的非特权 userns 限制不影响 root 创建）；`agentbox doctor` 输出每项结果。构建约束：helper 所在二进制以 `CGO_ENABLED=0` 构建——`internal/sandbox` 增加 `//go:build cgo` 的文件使 helper 在 cgo 构建下拒绝运行（`start_err{helper/cgo_enabled}`），CI 的构建步骤固定 `CGO_ENABLED=0`。
+**规则：** `hostcheck` 增加：新挂载 API（`open_tree`/`mount_setattr` 可用）、`close_range`、user namespace 可用（含 AppArmor 的非特权 userns 限制不影响 root 创建）；`agentbox doctor` 输出每项结果。构建约束：helper 所在二进制以 `CGO_ENABLED=0` 构建——`internal/sandbox` 增加 `//go:build cgo` 的文件使 helper 在 cgo 构建下拒绝运行（`start_err{helper/cgo_enabled}`），CI 的构建步骤固定 `CGO_ENABLED=0`。
 
 **§16.2 生产验收（检查器在生产启动路径启动的 workload 内运行）：** 规格 §16.2 全部条目，`Seccomp_filters ≥ 宿主基线 + 1`（基线在宿主上同法读取）；启动成功判据条目；server 凭据不变条目。CI 的 `linux-integration`（ubuntu-24.04，x86_64）实际运行且无 skip。验收范围按 §16.2 表述：WSL2 指定环境 + CI 的 GitHub runner；不代表其他 Linux 环境或 aarch64。
 
