@@ -85,11 +85,45 @@ func (h *hooks) dials() []string {
 
 func mustResolve(t *testing.T, a Adapter, body string) []byte {
 	t.Helper()
-	out, _, err := a.Resolve([]byte(body))
+	out, _, err := a.Resolve([]byte(body)) // applied_defaults 由专门的用例检查，此处无关
 	if err != nil {
 		t.Fatalf("Resolve(%s): %v", body, err)
 	}
 	return out
+}
+
+// write 在 httptest handler 中写响应正文；handler 不在测试 goroutine 中，失败只能 Errorf。
+func write(t *testing.T, w io.Writer, b []byte) {
+	t.Helper()
+	if _, err := w.Write(b); err != nil {
+		t.Errorf("写响应：%v", err)
+	}
+}
+
+func writeStr(t *testing.T, w io.Writer, s string) {
+	t.Helper()
+	write(t, w, []byte(s))
+}
+
+func unmarshal(t *testing.T, b []byte, v any) {
+	t.Helper()
+	if err := json.Unmarshal(b, v); err != nil {
+		t.Fatalf("解码 %q：%v", b, err)
+	}
+}
+
+// closedAddr 返回一个刚关闭的本地监听地址，用于构造"连接被拒"。
+func closedAddr(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return addr
 }
 
 func wantErr(t *testing.T, e *Error, o Outcome, code string) {
@@ -124,7 +158,10 @@ func TestDialerRejectsForbiddenAddresses(t *testing.T) {
 		if _, err := d.DialContext(context.Background(), "tcp", "evil.test:443"); !errors.Is(err, ErrBlocked) {
 			t.Errorf("evil.test → %s：期望 ErrBlocked，得到 %v", ip, err)
 		}
-		u, _ := url.Parse("http://" + net.JoinHostPort(ip, "80") + "/")
+		u, err := url.Parse("http://" + net.JoinHostPort(ip, "80") + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
 		if err := d.CheckURL(u); !errors.Is(err, ErrBlocked) {
 			t.Errorf("CheckURL %s：期望 ErrBlocked，得到 %v", u, err)
 		}
@@ -152,7 +189,7 @@ func TestDialerDNSRebindingConnectsCheckedIP(t *testing.T) {
 		if r.Host != "rebind.test" {
 			t.Errorf("Host 头应保留原始主机名，得到 %q", r.Host)
 		}
-		io.WriteString(w, "hello")
+		writeStr(t, w, "hello")
 	}))
 	defer srv.Close()
 	h := newHooks(srv.Listener.Addr().String(), nil)
@@ -163,7 +200,7 @@ func TestDialerDNSRebindingConnectsCheckedIP(t *testing.T) {
 		t.Fatalf("Do: %v", e)
 	}
 	var res FetchResult
-	json.Unmarshal(resp.Body, &res)
+	unmarshal(t, resp.Body, &res)
 	if res.Content != "hello" {
 		t.Fatalf("内容 %q", res.Content)
 	}
@@ -185,9 +222,11 @@ func TestFetchRedirects(t *testing.T) {
 			http.Redirect(w, r, "http://internal.test/secret", http.StatusFound)
 		case strings.HasPrefix(r.URL.Path, "/r/"):
 			var n int
-			fmt.Sscanf(r.URL.Path, "/r/%d", &n)
+			if _, err := fmt.Sscanf(r.URL.Path, "/r/%d", &n); err != nil {
+				t.Errorf("路径 %q：%v", r.URL.Path, err)
+			}
 			if n == 0 {
-				io.WriteString(w, "end")
+				writeStr(t, w, "end")
 				return
 			}
 			http.Redirect(w, r, fmt.Sprintf("http://pub.test/r/%d", n-1), http.StatusFound)
@@ -204,7 +243,7 @@ func TestFetchRedirects(t *testing.T) {
 		t.Fatalf("5 跳应通过：%v", e)
 	}
 	var res FetchResult
-	json.Unmarshal(resp.Body, &res)
+	unmarshal(t, resp.Body, &res)
 	if res.Content != "end" || res.FinalURL != "http://pub.test/r/0" {
 		t.Fatalf("5 跳结果 %+v", res)
 	}
@@ -232,12 +271,14 @@ func TestFetchTruncatesAfterDecompression(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/exact":
-			w.Write(bytes.Repeat([]byte("a"), limit))
+			write(t, w, bytes.Repeat([]byte("a"), limit))
 		case "/gz":
 			w.Header().Set("Content-Encoding", "gzip")
 			zw := gzip.NewWriter(w)
-			zw.Write(bytes.Repeat([]byte("a"), limit+1))
-			zw.Close()
+			write(t, zw, bytes.Repeat([]byte("a"), limit+1))
+			if err := zw.Close(); err != nil {
+				t.Errorf("gzip Close：%v", err)
+			}
 		}
 	}))
 	defer srv.Close()
@@ -252,7 +293,7 @@ func TestFetchTruncatesAfterDecompression(t *testing.T) {
 			t.Fatalf("%s: %v", c.path, e)
 		}
 		var res FetchResult
-		json.Unmarshal(resp.Body, &res)
+		unmarshal(t, resp.Body, &res)
 		if res.Truncated != c.truncated || len(res.Content) != limit || resp.Usage.ResponseBytes != limit {
 			t.Fatalf("%s：truncated=%v len=%d bytes=%d", c.path, res.Truncated, len(res.Content), resp.Usage.ResponseBytes)
 		}
@@ -268,7 +309,7 @@ func TestFetchTargetHTTPErrors(t *testing.T) {
 		case "/503":
 			w.Header().Set("Retry-After", "5")
 			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write(bytes.Repeat([]byte("x"), 10_000))
+			write(t, w, bytes.Repeat([]byte("x"), 10_000))
 		case "/private":
 			http.Redirect(w, r, "http://10.0.0.1/", http.StatusFound)
 		}
@@ -288,7 +329,7 @@ func TestFetchTargetHTTPErrors(t *testing.T) {
 			t.Fatalf("%s：应为 ok，得到 %v", c.path, e)
 		}
 		var res FetchResult
-		json.Unmarshal(resp.Body, &res)
+		unmarshal(t, resp.Body, &res)
 		if res.Status != c.status || res.Error != "http_status" || len(res.Content) != c.n || res.Truncated != c.truncated ||
 			resp.Usage != (Usage{Requests: 1, ResponseBytes: c.bytes}) {
 			t.Fatalf("%s：%+v usage %+v", c.path, res, resp.Usage)
@@ -297,9 +338,7 @@ func TestFetchTargetHTTPErrors(t *testing.T) {
 	_, e := f.Do(context.Background(), mustResolve(t, f, `{"url":"http://pub.test/private"}`))
 	wantErr(t, e, OutcomeFatal, CodeEgressBlocked)
 
-	l, _ := net.Listen("tcp", "127.0.0.1:0")
-	refused := newHooks(l.Addr().String(), map[string][]string{"pub.test": {"93.184.216.34"}})
-	l.Close()
+	refused := newHooks(closedAddr(t), map[string][]string{"pub.test": {"93.184.216.34"}})
 	g := NewFetch(FetchConfig{Dialer: refused.dialer()})
 	_, e = g.Do(context.Background(), mustResolve(t, g, `{"url":"http://pub.test/"}`))
 	wantErr(t, e, OutcomeRetryable, CodeUpstreamUnreachable)
@@ -337,7 +376,7 @@ func TestNoProxyFromEnvironment(t *testing.T) {
 		t.Setenv(k, "http://127.0.0.1:1")
 	}
 	t.Setenv("NO_PROXY", "")
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "direct") }))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { writeStr(t, w, "direct") }))
 	defer srv.Close()
 	h := newHooks(srv.Listener.Addr().String(), map[string][]string{"pub.test": {"93.184.216.34"}})
 	d := h.dialer()
@@ -349,8 +388,13 @@ func TestNoProxyFromEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("应直连：%v", err)
 	}
-	b, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if string(b) != "direct" || len(h.dials()) != 1 || h.dials()[0] != "93.184.216.34:80" {
 		t.Fatalf("body=%q dials=%v", b, h.dials())
 	}
@@ -374,7 +418,7 @@ func TestChatResolveAndEstimate(t *testing.T) {
 		t.Fatalf("applied_defaults %v", defaults)
 	}
 	var obj map[string]json.RawMessage
-	json.Unmarshal(out, &obj)
+	unmarshal(t, out, &obj)
 	if string(obj["max_tokens"]) != "256" || string(obj["model"]) != `"m-1"` || obj["stream"] != nil {
 		t.Fatalf("resolved %s", out)
 	}
@@ -385,18 +429,21 @@ func TestChatResolveAndEstimate(t *testing.T) {
 		t.Fatalf("Estimate = %d, %v；期望 %d", got, err, want)
 	}
 	// 显式 max_tokens 不进 applied_defaults。
-	_, defaults, _ = a.Resolve([]byte(`{"model":"m-1","max_tokens":10,"messages":` + msgs + `}`))
-	if len(defaults) != 0 {
-		t.Fatalf("显式值不应进入 applied_defaults：%v", defaults)
+	_, defaults, err = a.Resolve([]byte(`{"model":"m-1","max_tokens":10,"messages":` + msgs + `}`))
+	if err != nil || len(defaults) != 0 {
+		t.Fatalf("显式值不应进入 applied_defaults：%v %v", defaults, err)
 	}
 	// 超过上限（默认 4096）的 max_tokens 截断到上限、进入 applied_defaults，估算按截断后的值。
 	out, defaults, err = a.Resolve([]byte(`{"model":"m-1","max_tokens":100000,"messages":` + msgs + `}`))
-	json.Unmarshal(out, &obj)
-	if err != nil || string(obj["max_tokens"]) != "4096" || defaults["max_tokens"] != 4096 {
-		t.Fatalf("截断：resolved %s defaults %v err %v", out, defaults, err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got, _ := a.Estimate(out); got != in*3+4096*15 {
-		t.Fatalf("截断后估算 = %d，期望 %d", got, in*3+4096*15)
+	unmarshal(t, out, &obj)
+	if string(obj["max_tokens"]) != "4096" || defaults["max_tokens"] != 4096 {
+		t.Fatalf("截断：resolved %s defaults %v", out, defaults)
+	}
+	if got, err := a.Estimate(out); err != nil || got != in*3+4096*15 {
+		t.Fatalf("截断后估算 = %d, %v；期望 %d", got, err, in*3+4096*15)
 	}
 	for body, code := range map[string]string{
 		`{"messages":` + msgs + `,"stream":true}`:                               CodeUnsupportedField,
@@ -427,18 +474,21 @@ func TestChatOutcomesAndNoKeyLeak(t *testing.T) {
 		if r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer "+testKey {
 			t.Errorf("请求 %s auth=%v", r.URL.Path, r.Header.Get("Authorization") != "")
 		}
-		body, _ := io.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("读请求体：%v", err)
+		}
 		if bytes.Contains(body, []byte(testKey)) {
 			t.Error("请求体不应含 Key")
 		}
 		switch mode.Load().(string) {
 		case "ok":
 			w.Header().Set("X-Request-Id", "req-42")
-			io.WriteString(w, `{"id":"cmpl-1","choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":11,"completion_tokens":7}}`)
+			writeStr(t, w, `{"id":"cmpl-1","choices":[{"message":{"role":"assistant","content":"hi"}}],"usage":{"prompt_tokens":11,"completion_tokens":7}}`)
 		case "nousage":
-			io.WriteString(w, `{"id":"cmpl-2","choices":[]}`)
+			writeStr(t, w, `{"id":"cmpl-2","choices":[]}`)
 		case "badjson":
-			io.WriteString(w, `not json`)
+			writeStr(t, w, `not json`)
 		case "429":
 			w.Header().Set("Retry-After", "7")
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -447,12 +497,20 @@ func TestChatOutcomesAndNoKeyLeak(t *testing.T) {
 		case "401":
 			// 恶意或调试型上游回显请求头：错误文本不得带出响应体。
 			w.WriteHeader(http.StatusUnauthorized)
-			io.WriteString(w, `{"error":"bad key `+r.Header.Get("Authorization")+`"}`)
+			writeStr(t, w, `{"error":"bad key `+r.Header.Get("Authorization")+`"}`)
 		case "cut":
-			conn, buf, _ := w.(http.Hijacker).Hijack()
-			buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{\"id\":\"cmpl-")
-			buf.Flush()
-			conn.Close()
+			conn, buf, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("Hijack：%v", err)
+				return
+			}
+			writeStr(t, buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{\"id\":\"cmpl-")
+			if err := buf.Flush(); err != nil {
+				t.Errorf("Flush：%v", err)
+			}
+			if err := conn.Close(); err != nil { // 声明 1000 字节却只发几个字节后断开：模拟响应中途断开
+				t.Errorf("Close：%v", err)
+			}
 		}
 	}))
 	defer srv.Close()
@@ -474,7 +532,10 @@ func TestChatOutcomesAndNoKeyLeak(t *testing.T) {
 		t.Fatalf("ok：%+v %v", resp.Usage, e)
 	}
 	resp, e = run("nousage")
-	in, maxTok, _ := chatInputs(resolved)
+	in, maxTok, ie := chatInputs(resolved)
+	if ie != nil {
+		t.Fatal(ie)
+	}
 	if e != nil || resp.Usage.InputTokens != in || resp.Usage.OutputTokens != maxTok || resp.UpstreamRequestID != "cmpl-2" {
 		t.Fatalf("缺 usage 应按保守估算计量：%+v %v", resp.Usage, e)
 	}
@@ -493,10 +554,7 @@ func TestChatOutcomesAndNoKeyLeak(t *testing.T) {
 	wantErr(t, e, OutcomeUnknown, CodeUpstreamUnconfirmed)
 
 	// 发送前失败（连接被拒）→ retryable。
-	l, _ := net.Listen("tcp", "127.0.0.1:0")
-	closed := "http://" + l.Addr().String()
-	l.Close()
-	b := newChat(closed, Pricing{})
+	b := newChat("http://"+closedAddr(t), Pricing{})
 	_, e = b.Do(context.Background(), resolved)
 	wantErr(t, e, OutcomeRetryable, CodeUpstreamUnreachable)
 	errs = append(errs, e.Error())
@@ -549,8 +607,8 @@ func TestSearchProviders(t *testing.T) {
 	if err != nil || defaults["max_results"] != defaultSearchResults {
 		t.Fatalf("Resolve: %v %v", defaults, err)
 	}
-	if m, _ := fake.Estimate(resolved); m != 500 {
-		t.Fatalf("Estimate %d", m)
+	if m, err := fake.Estimate(resolved); err != nil || m != 500 {
+		t.Fatalf("Estimate %d, %v", m, err)
 	}
 	resp, e := fake.Do(ctx, mustResolve(t, fake, `{"query":"go","max_results":2}`))
 	if e != nil || len(decode(resp).Results) != 2 || decode(resp).Results[0].Title != "go" {
@@ -577,18 +635,20 @@ func TestSearchProviders(t *testing.T) {
 		switch r.URL.Path {
 		case "/search":
 			var in map[string]any
-			json.NewDecoder(r.Body).Decode(&in)
+			if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+				t.Errorf("tavily 请求体：%v", err)
+			}
 			if r.Header.Get("Authorization") != "Bearer "+testKey || in["query"] != "golang context" || in["api_key"] != nil {
 				t.Errorf("tavily 请求不合规：%v", in)
 			}
-			io.WriteString(w, `{"request_id":"tv-1","results":[{"title":"T","url":"https://t.example/","content":"C","score":0.9}]}`)
+			writeStr(t, w, `{"request_id":"tv-1","results":[{"title":"T","url":"https://t.example/","content":"C","score":0.9}]}`)
 		case "/lite/":
 			if r.URL.Query().Get("q") != "golang context" {
 				t.Errorf("ddg 查询参数 %q", r.URL.RawQuery)
 			}
-			w.Write(sample)
+			write(t, w, sample)
 		case "/broken/":
-			io.WriteString(w, "<html><body>captcha</body></html>")
+			writeStr(t, w, "<html><body>captcha</body></html>")
 		}
 	}))
 	defer srv.Close()
