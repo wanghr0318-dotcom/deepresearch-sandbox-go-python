@@ -320,3 +320,7 @@ type Scheduler struct{ /* 管理 actor 集合；ListActiveTasks 启动；新任�
 - 执行中发现并修复：UID 范围池耗尽此前使任务永久失败（`create_failed_env`），现为等待归还的暂时性情况，停止记录后立即唤醒清理。
 - 不在本次验收内：以生产启动器（真实隔离）运行上述用例、E2/E3——依赖 Plan 1B 与 Plan 2 生产启动器。
 - 留待最终评审的次要项见 `.superpowers/sdd/progress.md`（负载下取消偶发 `503 contention`、E7 受 SDK 固定 10 s 确认超时影响等）。
+
+### 执行中修订（用户审阅后，2026-10-05）
+
+- **累计运行时限按规格 §14.4（已回写）落实**：创建任务时确定有效时限并随任务存储在 `limits.max_run_time_ms`（`api.Config.EffectiveLimits` 取代 `ValidateLimits`）；省略时补入默认 3600 s，显式值须为正整数且不超过服务端上限（默认 24 h），否则 `400 invalid_limits`；actor 只读取存储值，修改服务配置不影响已创建任务。此前"运行时由配置推出"的做法作废。

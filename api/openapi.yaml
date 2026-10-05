@@ -263,7 +263,7 @@ components:
         application/octet-stream:
           schema: {type: string, format: binary}
     BadRequest:
-      description: '`invalid_request`: malformed body, missing request_id or invalid parameter; `invalid_limits` (POST /tasks): limits that can never fit the configured capacity'
+      description: '`invalid_request`: malformed body, missing request_id or invalid parameter; `invalid_limits` (POST /tasks): limits that can never fit the configured capacity, or max_run_time_ms not a positive integer within the server cap (omitted max_run_time_ms is filled with the default and stored with the task)'
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
