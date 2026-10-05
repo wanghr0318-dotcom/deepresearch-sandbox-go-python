@@ -37,6 +37,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/admission"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/datadir"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/cache"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
@@ -1029,6 +1030,8 @@ func TestGatewayConfigValidation(t *testing.T) {
 		}, "不能为负数"},
 		{"Worker 环境变量含 Key", func(c *Config) { c.WorkerEnv = []string{"PYTHONPATH=/opt", "OPENAI_API_KEY=x"} }, "OPENAI_API_KEY"},
 		{"Worker 环境变量白名单", func(c *Config) { c.WorkerEnv = []string{"PYTHONPATH=/opt", "PYTHONUNBUFFERED=1"} }, ""},
+		{"Redis 地址", func(c *Config) { c.RedisAddr = "127.0.0.1:6379" }, ""},
+		{"Redis 地址缺端口", func(c *Config) { c.RedisAddr = "127.0.0.1" }, "host:port"},
 	}
 	for _, tc := range cases {
 		c := base
@@ -1368,4 +1371,70 @@ func TestTLSListenerAndWebDir(t *testing.T) {
 	if err := h.wait(); err != nil {
 		t.Fatalf("Run 返回 %v", err)
 	}
+
+}
+
+// ---- 共享缓存装配（Plan 9 Task 3） ----
+
+// TestCacheStartup：启动时总会加载缓存签名密钥（不存在则生成 <data>/cache.key，0600），缓存关闭时也一样；
+// 没有 Redis 地址时缓存不启用，/status 不含 cache；配置了 Redis（AGENTBOX_TEST_REDIS_ADDR）时 /status 给出
+// §11.5 的指标。
+func TestCacheStartup(t *testing.T) {
+	status := func(t *testing.T, base string) map[string]json.RawMessage {
+		t.Helper()
+		st, b := httpDo(t, "GET", base+"/status", "")
+		var v map[string]json.RawMessage
+		if st != http.StatusOK || json.Unmarshal(b, &v) != nil {
+			t.Fatalf("GET /status = %d %s", st, b)
+		}
+		return v
+	}
+	checkKey := func(t *testing.T, dir string) {
+		t.Helper()
+		fi, err := os.Stat(filepath.Join(dir, cache.KeyFileName))
+		if err != nil || fi.Mode().Perm() != 0o600 {
+			t.Fatalf("应生成 0600 的 %s：%v / %v", cache.KeyFileName, fi, err)
+		}
+	}
+	t.Run("无 Redis 地址", func(t *testing.T) {
+		h := newHarness(t)
+		h.start(testConfig(), task.SystemClock())
+		base := h.waitAddr()
+		checkKey(t, h.dir)
+		if v := status(t, base); v["cache"] != nil {
+			t.Fatalf("缓存未启用时 /status 不应含 cache：%s", v["cache"])
+		}
+		h.cancel()
+		if err := h.wait(); err != nil {
+			t.Fatalf("Run 返回 %v", err)
+		}
+	})
+	t.Run("Redis", func(t *testing.T) {
+		addr := os.Getenv("AGENTBOX_TEST_REDIS_ADDR")
+		if addr == "" {
+			if os.Getenv("CI") == "true" {
+				t.Fatal("CI 中必须设置 AGENTBOX_TEST_REDIS_ADDR")
+			}
+			t.Skip("未设置 AGENTBOX_TEST_REDIS_ADDR，跳过")
+		}
+		h := newHarness(t)
+		cfg := testConfig()
+		cfg.RedisAddr = addr
+		h.start(cfg, task.SystemClock())
+		base := h.waitAddr()
+		checkKey(t, h.dir)
+		var m map[string]int64
+		if err := json.Unmarshal(status(t, base)["cache"], &m); err != nil {
+			t.Fatalf("/status 的 cache：%v", err)
+		}
+		for _, k := range []string{"hit", "miss", "bypass", "coalesced", "error", "breaker_open", "integrity_failure"} {
+			if _, ok := m[k]; !ok {
+				t.Fatalf("/status 的 cache 缺少 %s：%v", k, m)
+			}
+		}
+		h.cancel()
+		if err := h.wait(); err != nil {
+			t.Fatalf("Run 返回 %v", err)
+		}
+	})
 }

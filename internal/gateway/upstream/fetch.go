@@ -106,10 +106,13 @@ func (a *fetchAdapter) Do(ctx context.Context, resolved []byte) (Response, *Erro
 	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "*/*")
+	requestTime := time.Now()
 	r, e := roundTrip(ctx, a.http, req)
 	if e != nil {
 		return Response{}, e
 	}
+	meta := &HTTPMeta{Status: r.resp.StatusCode, Header: r.resp.Header.Clone(), RequestTime: requestTime,
+		ResponseTime: time.Now(), Truncated: r.truncated}
 	content, truncated := r.body, r.truncated
 	res := FetchResult{
 		URL:         in.URL,
@@ -130,5 +133,5 @@ func (a *fetchAdapter) Do(ctx context.Context, resolved []byte) (Response, *Erro
 		res.Encoding, res.Content = "base64", base64.StdEncoding.EncodeToString(content)
 	}
 	body, _ := json.Marshal(res)
-	return Response{Body: body, Usage: Usage{Requests: 1, ResponseBytes: int64(len(r.body))}}, nil
+	return Response{Body: body, Usage: Usage{Requests: 1, ResponseBytes: int64(len(r.body))}, HTTP: meta}, nil
 }

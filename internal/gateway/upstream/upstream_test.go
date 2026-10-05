@@ -269,6 +269,7 @@ func TestFetchTruncatesAfterDecompression(t *testing.T) {
 		if r.Method != http.MethodGet || r.ContentLength > 0 || r.Header.Get("Accept-Encoding") != "gzip" || r.Header.Get("Authorization") != "" {
 			t.Errorf("请求不合规：%s len=%d AE=%q", r.Method, r.ContentLength, r.Header.Get("Accept-Encoding"))
 		}
+		w.Header().Set("Cache-Control", "max-age=60")
 		switch r.URL.Path {
 		case "/exact":
 			write(t, w, bytes.Repeat([]byte("a"), limit))
@@ -296,6 +297,12 @@ func TestFetchTruncatesAfterDecompression(t *testing.T) {
 		unmarshal(t, resp.Body, &res)
 		if res.Truncated != c.truncated || len(res.Content) != limit || resp.Usage.ResponseBytes != limit {
 			t.Fatalf("%s：truncated=%v len=%d bytes=%d", c.path, res.Truncated, len(res.Content), resp.Usage.ResponseBytes)
+		}
+		// 缓存准入所需的 HTTP 元数据（§11.3）：状态、响应头、请求与响应时刻、截断标志。
+		m := resp.HTTP
+		if m == nil || m.Status != 200 || m.Truncated != c.truncated || m.Header.Get("Cache-Control") != "max-age=60" ||
+			m.RequestTime.IsZero() || m.ResponseTime.Before(m.RequestTime) {
+			t.Fatalf("%s：HTTP 元数据 %+v", c.path, m)
 		}
 	}
 }

@@ -88,6 +88,9 @@ type Config struct {
 	// （例如显式时限不是正数、超过服务端上限，或 memory_max 永远无法被授予）。body_hash 仍按原始请求计算。
 	// nil 时按原样存储请求中的 limits。
 	EffectiveLimits func(limits json.RawMessage) (json.RawMessage, error)
+	// CacheMetrics 可选：返回 Gateway 共享缓存的指标（规格 §11.5），由 GET /status 的 cache 字段给出；
+	// nil 或返回 nil（缓存关闭）时省略该字段。
+	CacheMetrics func() map[string]int64
 }
 
 // Handler 实现 api/openapi.yaml 描述的 REST 与 SSE 接口。
@@ -524,11 +527,16 @@ func bodyHash(canonical []byte) []byte {
 // ---- 操作 ----
 
 type statusResponse struct {
-	Mode Mode `json:"mode"`
+	Mode  Mode             `json:"mode"`
+	Cache map[string]int64 `json:"cache,omitempty"`
 }
 
 func (h *Handler) getStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, statusResponse{Mode: h.cfg.Mode()})
+	resp := statusResponse{Mode: h.cfg.Mode()}
+	if h.cfg.CacheMetrics != nil {
+		resp.Cache = h.cfg.CacheMetrics()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 type taskJSON struct {

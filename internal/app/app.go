@@ -30,6 +30,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/blob"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/datadir"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/cache"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/edge"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
@@ -113,6 +114,10 @@ type Config struct {
 	UpstreamAllowPrivate []string
 	// Gateway 是调用限额（零值取 §19 默认值）。
 	Gateway call.Limits
+	// RedisAddr 是共享缓存的 Redis 地址（§11；host:port）。为空时缓存关闭（等价于 CacheOff）。
+	RedisAddr string
+	// CacheOff 关闭共享缓存（--cache=off）。缓存默认开启，但只在配置了 RedisAddr 时生效。
+	CacheOff bool
 }
 
 // ModelConfig 是模型上游的配置。APIKey 只从宿主环境变量 AGENTBOX_MODEL_API_KEY 加载，只交给 chat adapter
@@ -221,6 +226,11 @@ func (c Config) withDefaults() Config {
 }
 
 func (c Config) validate() error {
+	if c.RedisAddr != "" {
+		if host, port, err := net.SplitHostPort(c.RedisAddr); err != nil || host == "" || port == "" {
+			return fmt.Errorf("app: Redis 地址 %q 须为 host:port", c.RedisAddr)
+		}
+	}
 	switch {
 	case (c.TLSCertFile == "") != (c.TLSKeyFile == ""):
 		return errors.New("app: TLS 证书与私钥须同时设置")
@@ -428,6 +438,9 @@ type server struct {
 	edge      *edge.Edge        // Gateway 的每 attempt 入口（task.Access）
 	blobs     blob.Store        // runner、Gateway 与 API 产物下载共用的 BlobStore
 
+	cache *cache.Source // Gateway 的共享缓存；nil 表示关闭
+	redis *cache.Redis
+
 	mode    atomic.Value // api.Mode
 	sched   atomic.Pointer[task.Scheduler]
 	fatalCh chan error
@@ -581,14 +594,56 @@ func (s *server) assembleGateway(blobs blob.Store) error {
 	}
 	dialer := upstream.NewDialer(upstream.DialerConfig{AllowPrivate: s.cfg.UpstreamAllowPrivate})
 	adapters, pricing, chatPricing := s.cfg.gatewayAdapters(dialer)
-	calls, err := call.New(call.Config{Store: s.store, Adapters: adapters, Pricing: pricing, ChatPricing: chatPricing,
-		Blobs: blobs, Events: hostEvents{s: s.store}, Limits: s.cfg.Gateway, Logger: s.log})
+	cfg := call.Config{Store: s.store, Adapters: adapters, Pricing: pricing, ChatPricing: chatPricing,
+		Blobs: blobs, Events: hostEvents{s: s.store}, Limits: s.cfg.Gateway, Logger: s.log}
+	if err := s.assembleCache(blobs); err != nil {
+		return err
+	}
+	if s.cache != nil {
+		cfg.Cache = s.cache
+	}
+	calls, err := call.New(cfg)
 	if err != nil {
 		return fmt.Errorf("app: Gateway 调用协调器: %w", err)
 	}
 	s.calls = calls
 	s.edge = edge.New(edge.Config{SocketDir: dir, Logger: s.log}, calls, attemptLookup{s: s.store})
 	return nil
+}
+
+// assembleCache 加载缓存签名密钥并按配置构造共享缓存（§11.5）。密钥 `<data>/cache.key` 总在启动时加载，
+// 不存在则生成（0600；即"安装时生成"，此后 `agentbox cache rotate-key` 可轮换，重启后生效），缓存关闭时也一样。
+// 缓存默认开启，但没有 RedisAddr 时等价于关闭；Redis 在启动时不可达不阻止启动（之后的查找视为未命中）。
+func (s *server) assembleCache(blobs blob.Store) error {
+	signer, err := cache.LoadKeys(s.d.DataDir)
+	if err != nil {
+		return fmt.Errorf("app: 缓存签名密钥: %w", err)
+	}
+	switch {
+	case s.cfg.CacheOff:
+		s.log.Info("Gateway 共享缓存已关闭（--cache=off）")
+		return nil
+	case s.cfg.RedisAddr == "":
+		s.log.Info("Gateway 共享缓存未启用：没有配置 Redis 地址（--redis-addr）")
+		return nil
+	}
+	r := cache.NewRedis(cache.RedisConfig{Addr: s.cfg.RedisAddr})
+	src, err := cache.NewSource(cache.SourceConfig{KV: r, Signer: signer, Blobs: blobs})
+	if err != nil {
+		_ = r.Close() // 尚未使用的客户端，关闭错误无关紧要
+		return fmt.Errorf("app: Gateway 共享缓存: %w", err)
+	}
+	s.redis, s.cache = r, src
+	s.log.Info("Gateway 共享缓存已启用", "redis_addr", s.cfg.RedisAddr)
+	return nil
+}
+
+// cacheMetrics 返回共享缓存的指标（/status）；缓存关闭时为 nil。
+func (s *server) cacheMetrics() map[string]int64 {
+	if s.cache == nil {
+		return nil
+	}
+	return s.cache.Metrics()
 }
 
 // recovered 是恢复 goroutine 的结果。
@@ -964,7 +1019,7 @@ func (s *server) startAPI() error {
 		Token: s.cfg.APIToken, AllowedHosts: s.cfg.AllowedHosts, AllowedOrigins: s.cfg.AllowedOrigins,
 		TLS: tlsCfg != nil, WebDir: s.cfg.WebDir,
 		Logger: s.log, ConfigVersion: s.cfg.ConfigVersion, MaxFaultRetries: s.cfg.MaxFaultRetries,
-		EffectiveLimits: s.cfg.effectiveLimits,
+		EffectiveLimits: s.cfg.effectiveLimits, CacheMetrics: s.cacheMetrics,
 	})
 	if err != nil {
 		_ = ln.Close()
@@ -1028,6 +1083,13 @@ func (s *server) shutdown(reason error) error {
 	}
 	if s.calls != nil {
 		waitOrTimeout(ctx, s.calls.Close, func() { s.log.Error("等待 Gateway 在途调用结算超时") })
+	}
+	// 共享缓存：在途调用结算之后不再有新的写入；等待已提交的异步写入（每个有上限）后关闭 Redis 连接。
+	if s.cache != nil {
+		waitOrTimeout(ctx, s.cache.Close, func() { s.log.Error("等待缓存异步写入超时") })
+		if err := s.redis.Close(); err != nil {
+			s.log.Error("关闭 Redis 连接失败", "error", err.Error())
+		}
 	}
 	return reason
 }

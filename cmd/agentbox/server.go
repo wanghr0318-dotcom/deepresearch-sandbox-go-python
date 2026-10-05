@@ -88,11 +88,17 @@ func runServer(args []string, stderr io.Writer) int {
 	searchBaseURL := fs.String("search-base-url", "", "搜索供应商地址覆盖（空时取供应商默认）；与 --search-provider fake 同用时 fake 搜索向 <地址>/search 发出请求（测试用 fake upstream，主机须在 --upstream-allow-private 中）")
 	searchProvider := fs.String("search-provider", upstream.SearchDDGLite, "搜索供应商：fake | tavily | ddg_lite（tavily 的 Key 只读环境变量 "+searchKeyEnv+"；fake 只用于测试，须同时设置 --upstream-allow-private）")
 	allowPrivate := fs.String("upstream-allow-private", "", "显式放行的私有上游主机（逗号分隔的 host 或 host:port；例如本机模型服务或测试用 fake upstream）")
+	redisAddr := fs.String("redis-addr", "", "共享缓存的 Redis 地址 host:port（例如 deploy/docker-compose.yml 的 127.0.0.1:6379）；为空时缓存不启用")
+	cacheMode := fs.String("cache", "on", "搜索与抓取的共享缓存：on | off（on 且配置了 --redis-addr 时生效；Redis 不可用时视为未命中）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *dataDir == "" || *dsn == "" {
 		fmt.Fprintln(stderr, "agentbox server: 需要 --data-dir 与 --database-url（或环境变量 "+databaseURLEnv+"）")
+		return 2
+	}
+	if *cacheMode != "on" && *cacheMode != "off" {
+		fmt.Fprintf(stderr, "agentbox server: --cache 须为 on 或 off，得到 %q\n", *cacheMode)
 		return 2
 	}
 	switch *searchProvider {
@@ -149,6 +155,8 @@ func runServer(args []string, stderr io.Writer) int {
 		SearchBaseURL:        *searchBaseURL,
 		SearchAPIKey:         os.Getenv(searchKeyEnv),
 		UpstreamAllowPrivate: splitList(*allowPrivate),
+		RedisAddr:            strings.TrimSpace(*redisAddr),
+		CacheOff:             *cacheMode == "off",
 	}
 	if _, err := os.Stat(filepath.Join(dir, api.TokenFile)); err == nil {
 		if cfg.APIToken, err = api.LoadToken(dir); err != nil {

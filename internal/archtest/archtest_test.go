@@ -34,7 +34,7 @@ func TestConsumersDoNotDependOnPostgres(t *testing.T) {
 	for _, pkg := range []string{
 		"internal/api", "internal/task", "internal/runner", "internal/resource",
 		"internal/ownership", "internal/persistence", "internal/datadir", "internal/blob",
-		"internal/gateway/call", "internal/gateway/edge", "internal/gateway/upstream",
+		"internal/gateway/call", "internal/gateway/edge", "internal/gateway/upstream", "internal/gateway/cache",
 	} {
 		forbid(t, pkg, forbidden)
 	}
@@ -46,7 +46,16 @@ func TestConsumersDoNotDependOnPostgres(t *testing.T) {
 //   - gateway/upstream 只做协议适配，不记账：不依赖 persistence，也不依赖 call 与 edge。
 //   - gateway/edge 不导入 persistence（只调用 call 与 task 定义的窄接口），传递上也不依赖 PostgreSQL 实现。
 //   - task 不依赖 gateway/*：task.Access 由 edge 实现，装配在 internal/app。
+//   - gateway/cache 是共享优化，不记账、不授权（Plan 9）：不导入 net/http（它经 upstream.Kind 间接依赖
+//     net/http，只能按直接导入检查）、persistence 与 gateway/call；传递上也不依赖 persistence 与 call
+//     （call 只经 CacheSource 窄接口使用 cache，不能反向）。
 func TestGatewayLayering(t *testing.T) {
+	forbidDirect(t, "internal/gateway/cache", []string{
+		"net/http", module + "/internal/persistence", module + "/internal/gateway/call",
+	})
+	forbid(t, "internal/gateway/cache", []string{
+		module + "/internal/persistence", module + "/internal/gateway/call", module + "/internal/gateway/edge",
+	})
 	forbidDirect(t, "internal/gateway/call", []string{"net/http"})
 	for _, d := range deps(t, "internal/gateway/call") {
 		if first, _, _ := strings.Cut(d, "/"); strings.Contains(first, ".") && !strings.HasPrefix(d, module+"/") {

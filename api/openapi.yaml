@@ -387,6 +387,19 @@ components:
       required: [mode]
       properties:
         mode: {type: string, enum: [normal, diagnostic, ownership_lost]}
+        cache:
+          type: object
+          description: >-
+            Gateway shared-cache counters since server start (spec §11.5); absent when the cache is
+            off (no --redis-addr, or --cache=off).
+          properties:
+            hit: {type: integer}
+            miss: {type: integer}
+            bypass: {type: integer}
+            coalesced: {type: integer}
+            error: {type: integer}
+            breaker_open: {type: integer}
+            integrity_failure: {type: integer}
     CreateTaskRequest:
       type: object
       additionalProperties: false

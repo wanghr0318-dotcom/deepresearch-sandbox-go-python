@@ -51,6 +51,18 @@ type Response struct {
 	Usage             Usage
 	UpstreamRequestID string
 	RetryAfter        time.Duration
+	// HTTP 是目标站点响应的 HTTP 元数据，只由抓取 adapter 在结果为 ok 时填写；Gateway 据此判定能否进入
+	// 共享缓存（§11.3 准入与新鲜度）。其余 adapter 为 nil。
+	HTTP *HTTPMeta
+}
+
+// HTTPMeta 是一次抓取的 HTTP 响应元数据。RequestTime 与 ResponseTime 是 Gateway 时钟上发出请求与读完
+// 响应的时刻（RFC 9111 §4.2.3 的 request_time、response_time）；Truncated 表示正文超过上限被截断。
+type HTTPMeta struct {
+	Status                    int
+	Header                    http.Header
+	RequestTime, ResponseTime time.Time
+	Truncated                 bool
 }
 
 // Outcome 是一次 try 的结果类别（§9.7）。

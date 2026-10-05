@@ -244,10 +244,17 @@ func TestBindingIsolatesAttempts(t *testing.T) {
 
 	r := do(t, p1, "POST", "/v1/search", strings.NewReader(`{"query":"q"}`), map[string]string{
 		HeaderCallID: "root/s1/search/1", HeaderRetry: "true",
-		HeaderSupersedes: "root/s0/search/1", HeaderSupersedeReason: "divergence",
+		HeaderSupersedes: "root/s0/search/1", HeaderSupersedeReason: "divergence", HeaderCache: " No-Cache ",
 	})
 	if r.status != 200 || r.header.Get(HeaderBlob) != testSHA || r.header.Get(HeaderReplayed) != "" {
 		t.Errorf("a1 search: %d %v %s", r.status, r.header, r.body)
+	}
+	// 缓存指令只接受 no-cache；其他取值在调用 call 之前以 400 拒绝。
+	r = do(t, p1, "POST", "/v1/search", strings.NewReader(`{"query":"q"}`), map[string]string{
+		HeaderCallID: "root/s1/search/2", HeaderCache: "only-if-cached",
+	})
+	if r.status != 400 || !strings.Contains(string(r.body), CodeInvalidRequest) {
+		t.Errorf("未知缓存指令：%d %s", r.status, r.body)
 	}
 	r = do(t, p2, "POST", "/v1/chat/completions", strings.NewReader(`{"messages":[]}`), callHdr("root/s1/chat/1"))
 	if r.status != 200 {
@@ -261,7 +268,7 @@ func TestBindingIsolatesAttempts(t *testing.T) {
 	invokes, checks, _, _ := calls.snapshot()
 	want := []call.Invoke{
 		{TaskID: "t1", AttemptID: "a1", EnvID: "e1", CallID: "root/s1/search/1", Kind: upstream.KindSearch,
-			Body: []byte(`{"query":"q"}`), Retry: true, Supersedes: "root/s0/search/1", SupersedeReason: "divergence"},
+			Body: []byte(`{"query":"q"}`), Retry: true, Supersedes: "root/s0/search/1", SupersedeReason: "divergence", NoCache: true},
 		{TaskID: "t2", AttemptID: "a2", EnvID: "e2", CallID: "root/s1/chat/1", Kind: upstream.KindChat,
 			Body: []byte(`{"messages":[]}`)},
 	}
@@ -272,7 +279,8 @@ func TestBindingIsolatesAttempts(t *testing.T) {
 		got := invokes[i]
 		if got.TaskID != want[i].TaskID || got.AttemptID != want[i].AttemptID || got.EnvID != want[i].EnvID ||
 			got.CallID != want[i].CallID || got.Kind != want[i].Kind || !bytes.Equal(got.Body, want[i].Body) ||
-			got.Retry != want[i].Retry || got.Supersedes != want[i].Supersedes || got.SupersedeReason != want[i].SupersedeReason {
+			got.Retry != want[i].Retry || got.Supersedes != want[i].Supersedes || got.SupersedeReason != want[i].SupersedeReason ||
+			got.NoCache != want[i].NoCache {
 			t.Errorf("invoke[%d] = %+v，期望 %+v", i, got, want[i])
 		}
 	}

@@ -85,6 +85,8 @@ const (
 	HeaderSubrun          = "X-Agentbox-Subrun"
 	HeaderBlob            = "X-Agentbox-Blob"
 	HeaderReplayed        = "X-Agentbox-Replayed"
+	// HeaderCache 是缓存指令（§11.4）：唯一接受的取值是 no-cache（不读缓存，结果仍写入；计入指纹）。
+	HeaderCache = "X-Agentbox-Cache"
 )
 
 // ErrClosed 表示 Edge 已关闭。
@@ -379,12 +381,22 @@ func (b *binding) invoke(w http.ResponseWriter, r *http.Request, kind upstream.K
 		b.writeError(w, http.StatusBadRequest, CodeInvalidRequest, "读取请求体失败")
 		return
 	}
+	noCache := false
+	switch v := strings.TrimSpace(r.Header.Get(HeaderCache)); {
+	case v == "":
+	case strings.EqualFold(v, call.CacheDirectiveNoCache):
+		noCache = true
+	default:
+		b.writeError(w, http.StatusBadRequest, CodeInvalidRequest, "X-Agentbox-Cache 只接受 no-cache")
+		return
+	}
 	in := call.Invoke{
 		TaskID: b.taskID, AttemptID: b.attemptID, EnvID: b.envID,
 		CallID: callID, Kind: kind, Body: body,
 		Retry:           strings.EqualFold(strings.TrimSpace(r.Header.Get(HeaderRetry)), "true"),
 		Supersedes:      r.Header.Get(HeaderSupersedes),
 		SupersedeReason: r.Header.Get(HeaderSupersedeReason),
+		NoCache:         noCache,
 	}
 	// Worker 在响应前断开（net/http 读到 EOF 后取消 r.Context()）：立即关闭服务端连接、释放连接名额，
 	// Invoke 不受影响，响应写入失败即丢弃。处理函数返回前 stop，正常结束不会触发。

@@ -3,6 +3,8 @@ package call
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,15 +17,21 @@ import (
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/blob"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/faultinject"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/cache"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/jcs"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 )
 
-// Coordinator 的流程（规格 §9.4、§9.5、§9.7、§11.2 无缓存分支）：
+// Coordinator 的流程（规格 §9.4、§9.5、§9.7、§11.2）：
 //
 //	解析（拒绝重复键）→ 指纹 → Tx1 BeginCall → 按已有记录分流（重放 / 进行中 / 指纹分歧 / unknown / failed）
-//	→ 循环：等待并发槽位 → Tx2 ReserveTry → 上游 try → 先保存结果 blob 再 SettleTry → 可重试时退避
+//	→ 新登记的搜索与抓取：查缓存（事务外）→ 命中：校验 blob → Tx2 CompleteFromCache（无预留）→ 返回
+//	→ 未命中：循环：等待并发槽位 → Tx2 ReserveTry → 上游 try → 先保存结果 blob 再 SettleTry → 可重试时退避
+//	→ ok 结算之后异步写入缓存（准入与新鲜度由 cache 判定）
+//
+// journal 优先：已有记录（含 completed 的重放）从不查缓存，缓存结果也不会覆盖已记录的结果。模型调用从不缓存。
+// Redis 的任何问题都只是未命中；PostgreSQL 或访问检查失败返回错误，不绕过（§11.2）。
 //
 // 一次逻辑调用的执行在 Coordinator 自有的后台 goroutine 中进行：Worker 的请求上下文取消或连接断开只让 Invoke
 // 提前返回，不取消 try（继续至期限并结算，供重放，§9.1）；只有 CancelAttempt(attemptID, ReasonCancel) 取消在途 try。
@@ -91,6 +99,18 @@ type HostEvents interface {
 	ReplayDivergence(ctx context.Context, taskID, attemptID, callID string, detail string) error
 }
 
+// CacheSource 是 call 对共享缓存的窄接口（§11.2；internal/gateway/cache.Source 实现）。它不记账、不授权，
+// 自身的任何故障都表现为未命中；journal 提交由 Coordinator 完成。只用于搜索与抓取。
+type CacheSource interface {
+	// Lookup 查找 (kind, provider, ver, params) 的缓存条目；命中时 blobSHA 与 size 已通过 HMAC、expires_at
+	// 与内容哈希校验。rawURL 是抓取的目标 URL（搜索为空），供按当前准入规则复查。
+	Lookup(ctx context.Context, kind upstream.Kind, provider, ver string, params []byte, rawURL string) (blobSHA string, size int64, hit bool)
+	// Store 在结果 completed 之后提交一次异步、可丢弃的写入；resp.Size 是结果 blob 的大小。
+	Store(kind upstream.Kind, provider, ver string, params []byte, rawURL string, resp cache.Response, blobSHA string)
+	// Bypass 记录一次 no-cache 请求跳过读取。
+	Bypass()
+}
+
 // Config 装配 Coordinator。
 type Config struct {
 	Store    Store
@@ -108,6 +128,8 @@ type Config struct {
 	Now         func() time.Time // nil 时为 time.Now
 	// StoreTimeout 是每个 Store 事务与 blob 写入的超时；≤ 0 时取 30 s。
 	StoreTimeout time.Duration
+	// Cache 是共享缓存（§11）；nil 表示关闭（全部走上游）。
+	Cache CacheSource
 }
 
 // Invoke 是一次 Worker 请求。
@@ -118,6 +140,7 @@ type Invoke struct {
 	Body                        []byte
 	Retry                       bool // X-Agentbox-Retry
 	Supersedes, SupersedeReason string
+	NoCache                     bool // X-Agentbox-Cache: no-cache（计入指纹；不读缓存，结果仍写入）
 }
 
 // Result 是返回给 edge 的结果。Status 是 HTTP 状态；Code 只在失败时非空（稳定错误码）。
@@ -142,6 +165,7 @@ type Coordinator struct {
 	log          *slog.Logger
 	now          func() time.Time
 	storeTimeout time.Duration
+	cache        CacheSource
 
 	root context.Context
 	stop context.CancelFunc
@@ -189,6 +213,7 @@ func New(cfg Config) (*Coordinator, error) {
 		log:          cfg.Logger,
 		now:          cfg.Now,
 		storeTimeout: cfg.StoreTimeout,
+		cache:        cfg.Cache,
 		busy:         map[callKey]bool{},
 		byAttempt:    map[string]map[*job]bool{},
 		taskSem:      map[string]*semaphore{},
@@ -382,7 +407,11 @@ func (c *Coordinator) Invoke(ctx context.Context, in Invoke) (Result, error) {
 		return reject(upstream.CodeInvalidRequest), nil
 	}
 	model := modelOf(resolved)
-	fp, err := Fingerprint(endpointOf(in.Kind), ad.Version(), ad.Provider(), model, defaults, in.Body)
+	directive := ""
+	if in.NoCache {
+		directive = CacheDirectiveNoCache
+	}
+	fp, err := Fingerprint(endpointOf(in.Kind), ad.Version(), ad.Provider(), model, defaults, directive, in.Body)
 	if err != nil {
 		return reject(upstream.CodeInvalidRequest), nil
 	}
@@ -525,8 +554,112 @@ func (c *Coordinator) run(j *job) (Result, error) {
 		default:
 			return Result{}, fmt.Errorf("call: 调用 %s/%s 的状态 %q 未知", rec.TaskID, rec.CallID, rec.State)
 		}
+	} else if c.cache != nil && cacheable(in.Kind) {
+		// 只有本次新登记（或接管复位）的 resolving 调用查缓存：已有记录一律按 journal 处理（journal 优先）。
+		if r, done, err := c.resolveFromCache(j); done {
+			return r, err
+		}
 	}
 	return c.execute(j, rec)
+}
+
+// cacheable 报告类别是否使用共享缓存（§11.1：公开搜索结果与抓取页面；不缓存模型调用）。
+func cacheable(k upstream.Kind) bool { return k == upstream.KindSearch || k == upstream.KindFetch }
+
+// fetchURL 取抓取请求（Resolve 之后）的目标 URL；其他类别为空。
+func fetchURL(k upstream.Kind, resolved []byte) string {
+	if k != upstream.KindFetch {
+		return ""
+	}
+	var v struct {
+		URL string `json:"url"`
+	}
+	if json.Unmarshal(resolved, &v) != nil {
+		return ""
+	}
+	return v.URL
+}
+
+// resolveFromCache 是缓存分支（§11.2）：查缓存（事务外）→ 命中则读取并复核结果 blob → Tx2 CompleteFromCache。
+// done 为 false 表示未命中（含 no-cache、Redis 故障与 blob 复核失败），调用方照常走上游。
+// Tx2 被拒（取消先提交、访问撤销、期限已过）或存储故障时与 ReserveTry 失败的处理相同：调用置为 failed
+// （存储故障为可重试的 store_unavailable），结果不被授权（E23）。
+func (c *Coordinator) resolveFromCache(j *job) (Result, bool, error) {
+	in := j.in
+	if in.NoCache {
+		c.cache.Bypass()
+		return Result{}, false, nil
+	}
+	sha, size, hit := c.cache.Lookup(j.ctx, in.Kind, j.ad.Provider(), j.ad.Version(), j.resolved, fetchURL(in.Kind, j.resolved))
+	if !hit {
+		return Result{}, false, nil
+	}
+	body, err := c.readResult(sha, size)
+	if err != nil {
+		c.log.Warn("gateway: 缓存命中的结果 blob 复核失败，按未命中处理", "task_id", in.TaskID, "call_id", in.CallID, "err", err)
+		return Result{}, false, nil
+	}
+	ctx, cancel := c.opCtx()
+	_, err = c.store.CompleteFromCache(ctx, CacheCompletion{TaskID: in.TaskID, CallID: in.CallID, AttemptID: in.AttemptID,
+		ResultSHA256: sha, ResultSize: size})
+	cancel()
+	if err != nil {
+		var rej *persistence.RejectedError
+		if errors.As(err, &rej) {
+			r, ferr := c.giveUp(j, StateResolving, rej.Code)
+			return r, true, ferr
+		}
+		if _, ferr := c.giveUp(j, StateResolving, CodeStoreUnavailable); ferr != nil {
+			c.log.Warn("gateway: 缓存命中提交失败后无法把调用置为 failed", "task_id", in.TaskID, "call_id", in.CallID, "err", ferr)
+		}
+		return Result{}, true, err
+	}
+	c.log.Info("gateway: cache hit", "task_id", in.TaskID, "attempt_id", in.AttemptID, "call_id", in.CallID,
+		"endpoint", endpointOf(in.Kind), "provider", j.ad.Provider(), "blob", sha)
+	return Result{Body: body, BlobSHA256: sha, Status: 200}, true, nil
+}
+
+// readResult 读取结果 blob，并确认其大小与 sha256 与期望一致（命中的内容在返回给 Worker 前再核对一次）。
+func (c *Coordinator) readResult(sha string, size int64) ([]byte, error) {
+	if size < 0 {
+		return nil, fmt.Errorf("call: blob %s 的大小 %d 无效", sha, size)
+	}
+	rc, err := c.blobs.Open(sha)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	body, err := io.ReadAll(io.LimitReader(rc, size+1))
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(body)
+	if int64(len(body)) != size || hex.EncodeToString(sum[:]) != sha {
+		return nil, fmt.Errorf("call: blob %s 的内容与缓存条目不一致", sha)
+	}
+	return body, nil
+}
+
+// offerCache 在 ok 结算使调用 completed 之后，把结果交给缓存（异步、可丢弃；准入与新鲜度由 cache 判定）。
+// 搜索按成功结果缓存（状态 200，寿命为 adapter TTL）；抓取需要目标站点的 HTTP 元数据，截断的正文不缓存。
+func (c *Coordinator) offerCache(j *job, resp upstream.Response, ref blob.Ref, latency time.Duration) {
+	if c.cache == nil || !cacheable(j.in.Kind) {
+		return
+	}
+	var r cache.Response
+	switch j.in.Kind {
+	case upstream.KindSearch:
+		end := c.now()
+		r = cache.Response{Status: 200, Size: ref.Size, RequestTime: end.Add(-latency), ResponseTime: end}
+	case upstream.KindFetch:
+		m := resp.HTTP
+		if m == nil || m.Truncated {
+			return
+		}
+		r = cache.Response{Status: m.Status, Header: map[string][]string(m.Header), Size: ref.Size,
+			RequestTime: m.RequestTime, ResponseTime: m.ResponseTime}
+	}
+	c.cache.Store(j.in.Kind, j.ad.Provider(), j.ad.Version(), j.resolved, fetchURL(j.in.Kind, j.resolved), r, ref.SHA256)
 }
 
 func persistedFailure(rec CallRecord) Result {
@@ -692,11 +825,16 @@ func (c *Coordinator) complete(j *job, try Try, resp upstream.Response, latency 
 		}
 		return Result{}, fmt.Errorf("call: 保存调用 %s 的结果 blob: %w", j.in.CallID, err)
 	}
-	if _, err := c.settle(Settlement{
+	rec, err := c.settle(Settlement{
 		Try: try, Outcome: "ok", ActualMicro: c.cost(j.in.Kind, j.model, resp.Usage, j.est), LatencyMs: latency.Milliseconds(),
 		UpstreamRequestID: resp.UpstreamRequestID, ResultSHA256: ref.SHA256, ResultSize: ref.Size,
-	}); err != nil {
+	})
+	if err != nil {
 		return Result{}, err
+	}
+	// 只有本次结算使调用 completed 时才写缓存（迟到的结算不改变 journal，也不产生缓存条目）。
+	if rec.State == StateCompleted && rec.ResultRef == ref.SHA256 {
+		c.offerCache(j, resp, ref, latency)
 	}
 	return Result{Body: resp.Body, BlobSHA256: ref.SHA256, Status: 200}, nil
 }

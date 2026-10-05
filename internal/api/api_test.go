@@ -852,6 +852,20 @@ func TestStatusAndModes(t *testing.T) {
 		if s.Mode != m {
 			t.Fatalf("status mode = %q，期望 %q", s.Mode, m)
 		}
+		if strings.Contains(string(b), `"cache"`) {
+			t.Fatalf("未配置缓存指标时不应有 cache 字段：%s", b)
+		}
+	}
+	// 缓存指标（§11.5）经 /status 暴露；诊断模式下同样可读。
+	cs := newTestServer(t, func(c *Config) {
+		c.CacheMetrics = func() map[string]int64 { return map[string]int64{"hit": 3, "miss": 1} }
+	})
+	cs.setMode(ModeDiagnostic)
+	cst, cb, _ := cs.do("GET", "/status", "", nil)
+	expect(t, cst, cb, 200, "")
+	var withCache statusResponse
+	if err := json.Unmarshal(cb, &withCache); err != nil || withCache.Cache["hit"] != 3 || withCache.Cache["miss"] != 1 {
+		t.Fatalf("status 的 cache 字段：%s / %v", cb, err)
 	}
 
 	ts.setMode(ModeDiagnostic)

@@ -2660,6 +2660,76 @@ func TestReserveTryAccessRejections(t *testing.T) {
 	}
 }
 
+// TestCompleteFromCache（Plan 9 Task 3；§11.2、E23）：缓存命中的 Tx2 不建 reservation 与 try、不改动账本，结果写入
+// scope_blobs(task) 并 completed（source = cache）；同一结果的重复提交原样返回；已有 try、已完成为其他结果或 blob
+// 大小不符为冲突；取消先提交时被拒（cancel_requested），结果不被授权，调用保持 resolving（由 Gateway 置为 failed）。
+func TestCompleteFromCache(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	gwFixture(t, s, "t1", 1000)
+	sha := strings.Repeat("ab", 32)
+	beginCall(t, s, "t1", "c1")
+	cc := call.CacheCompletion{TaskID: "t1", CallID: "c1", AttemptID: "att-t1", ResultSHA256: sha, ResultSize: 42}
+	rec, err := s.CompleteFromCache(ctx, cc)
+	if err != nil || rec.State != call.StateCompleted || rec.Source != "cache" || rec.ResultRef != sha || rec.TriesUsed != 0 ||
+		rec.ResolvingSince != nil || rec.CostCharged != 0 {
+		t.Fatalf("CompleteFromCache = %+v / %v", rec, err)
+	}
+	if again, err := s.CompleteFromCache(ctx, cc); err != nil || again.ResultRef != sha || again.Source != "cache" {
+		t.Fatalf("同一结果的重复提交应原样返回：%+v / %v", again, err)
+	}
+	if ok, err := s.BlobAuthorized(ctx, "t1", sha); err != nil || !ok {
+		t.Fatalf("命中结果应在 scope_blobs(task) 中：%v / %v", ok, err)
+	}
+	expectBudget(t, s, "t1", call.Budget{LimitMicro: 1000})
+	if n := count(t, s, "SELECT count(*) FROM reservations") + count(t, s, "SELECT count(*) FROM call_tries"); n != 0 {
+		t.Fatalf("命中不应建 reservation 或 try，得到 %d 行", n)
+	}
+	if n := count(t, s, "SELECT count(*) FROM blob_provenance WHERE sha256 = $1 AND ref = 'c1#cache'", sha); n != 1 {
+		t.Fatalf("blob_provenance 应记录 c1#cache 一次，得到 %d", n)
+	}
+	checkI3(t, s)
+
+	other := cc
+	other.ResultSHA256 = strings.Repeat("cd", 32)
+	if _, err := s.CompleteFromCache(ctx, other); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("已完成的调用以其他结果提交应为冲突，得到 %v", err)
+	}
+	beginCall(t, s, "t1", "c2")
+	mustReserve(t, s, "t1", "c2", 10)
+	withTry := cc
+	withTry.CallID = "c2"
+	if _, err := s.CompleteFromCache(ctx, withTry); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("已有 try 的调用不能由缓存完成，得到 %v", err)
+	}
+	beginCall(t, s, "t1", "c3")
+	badSize := cc
+	badSize.CallID, badSize.ResultSize = "c3", 43
+	if _, err := s.CompleteFromCache(ctx, badSize); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("blob 大小与登记不符应为冲突，得到 %v", err)
+	}
+	if rec, _, err := s.LoadCall(ctx, "t1", "c3"); err != nil || rec.State != call.StateResolving {
+		t.Fatalf("冲突回滚后 c3 应仍为 resolving：%+v / %v", rec, err)
+	}
+
+	// E23：取消先提交 → 命中结果不被授权。
+	beginCall(t, s, "t1", "c4")
+	if _, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "cancel-1", BodyHash: []byte("h"), TaskID: "t1", Desired: "cancel"}); err != nil {
+		t.Fatal(err)
+	}
+	late := cc
+	late.CallID, late.ResultSHA256 = "c4", strings.Repeat("ef", 32)
+	_, err = s.CompleteFromCache(ctx, late)
+	expectRejected(t, err, persistence.CodeCancelRequested)
+	if ok, err := s.BlobAuthorized(ctx, "t1", late.ResultSHA256); err != nil || ok {
+		t.Fatalf("取消先提交后命中结果不应被授权：%v / %v", ok, err)
+	}
+	if rec, _, err := s.LoadCall(ctx, "t1", "c4"); err != nil || rec.State != call.StateResolving || rec.ResultRef != "" {
+		t.Fatalf("被拒后 c4 应仍为 resolving 且无结果：%+v / %v", rec, err)
+	}
+	checkI3(t, s)
+}
+
 // TestGatewayTaskFactsAndInspect（Plan 7 Task 5）：LookupAttempt 给出 attempt 的任务与环境；AppendHostEvent 经
 // task_seq 追加 host 事件且以内容幂等；BlobAuthorized 按 scope_blobs(task) 授权；Inspect 汇总调用与每次 try
 // （G11：task_id → attempt_id → call_id → try_no）。

@@ -40,7 +40,7 @@ const (
 type CallRecord struct {
 	TaskID, CallID, Fingerprint, Endpoint string
 	State                                 CallState
-	Source                                string // upstream（M2 唯一来源）
+	Source                                string // upstream | cache（缓存命中，无 try、无预留）
 	ResultRef                             string // 结果 blob 的 sha256（仅 completed）
 	TriesUsed                             int
 	CreatedAt, DeadlineAt                 time.Time
@@ -95,6 +95,12 @@ type Settlement struct {
 	Error             string
 }
 
+// CacheCompletion 是缓存命中的 Tx2 输入：结果 blob 已存在且已由 Gateway 校验内容哈希（§11.5）。
+type CacheCompletion struct {
+	TaskID, CallID, AttemptID, ResultSHA256 string
+	ResultSize                              int64
+}
+
 // Store 是 call 对持久化层的窄接口。每个方法一个事务（规格 §7.1 锁顺序）。
 type Store interface {
 	// CheckAccess 在一致快照中读取 §9.2 的事实（attempt_access.state、tasks.current_attempt_id、task_control.desired）。
@@ -111,6 +117,11 @@ type Store interface {
 	// unknown → unknown += 估算（charged_unknown），calls.state = unknown（BeginCall 见到 unknown 可在上限内新建 try）。
 	// 每笔 reservation 只进入一个桶（互斥记账）；幂等：同 try 重复结算返回已有结果。
 	SettleTry(ctx context.Context, s Settlement) (CallRecord, error)
+	// CompleteFromCache 是缓存命中的 Tx2（§11.2）：复查访问（含 desired ≠ cancel；取消先提交则拒绝，命中结果
+	// 不被授权，E23）与期限 → 结果 blob 写入 scope_blobs(task) → calls.completed（source = cache、result_ref）。
+	// 无预留、无 try、不改动账本。调用须仍是本次解析中的 resolving 且没有 try，否则为 ErrConflict；
+	// 同一结果的重复提交（提交结果未知后的重跑）返回已有记录。
+	CompleteFromCache(ctx context.Context, r CacheCompletion) (CallRecord, error)
 	// FailCall 把没有 try 或已耗尽的调用置为 failed（含 call_deadline_exceeded）。
 	FailCall(ctx context.Context, taskID, callID, reason string) error
 	// ResetResolving 把遗留的 resolving（无 try）复位为可重新解析（启动时调用，§11.2）：清空 resolving_since，

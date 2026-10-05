@@ -322,24 +322,67 @@ func validateSettlement(st call.Settlement) error {
 }
 
 // recordResultBlob 登记调用结果 blob 并授权到任务 scope；同一 sha256 的大小不同为冲突（同 recordBlob）。
-func recordResultBlob(ctx context.Context, tx pgx.Tx, st call.Settlement) error {
-	if _, err := tx.Exec(ctx, "INSERT INTO blobs (sha256, size) VALUES ($1, $2) ON CONFLICT DO NOTHING", st.ResultSHA256, st.ResultSize); err != nil {
+// ref 是来源记录（上游结果为 <call_id>#<try_no>，缓存命中为 <call_id>#cache）。
+func recordResultBlob(ctx context.Context, tx pgx.Tx, taskID, sha string, wantSize int64, ref string) error {
+	if _, err := tx.Exec(ctx, "INSERT INTO blobs (sha256, size) VALUES ($1, $2) ON CONFLICT DO NOTHING", sha, wantSize); err != nil {
 		return err
 	}
 	var size int64
-	if err := tx.QueryRow(ctx, "SELECT size FROM blobs WHERE sha256 = $1", st.ResultSHA256).Scan(&size); err != nil {
+	if err := tx.QueryRow(ctx, "SELECT size FROM blobs WHERE sha256 = $1", sha).Scan(&size); err != nil {
 		return err
 	}
-	if size != st.ResultSize {
-		return conflictf("blob %s 已登记为 %d 字节，不是 %d", st.ResultSHA256, size, st.ResultSize)
+	if size != wantSize {
+		return conflictf("blob %s 已登记为 %d 字节，不是 %d", sha, size, wantSize)
 	}
 	if _, err := tx.Exec(ctx, "INSERT INTO scope_blobs (scope_kind, scope_id, sha256) VALUES ('task', $1, $2) ON CONFLICT DO NOTHING",
-		st.Try.TaskID, st.ResultSHA256); err != nil {
+		taskID, sha); err != nil {
 		return err
 	}
 	_, err := tx.Exec(ctx, "INSERT INTO blob_provenance (scope_kind, scope_id, sha256, source, ref) VALUES ('task', $1, $2, 'gateway', $3)",
-		st.Try.TaskID, st.ResultSHA256, fmt.Sprintf("%s#%d", st.Try.CallID, st.Try.TryNo))
+		taskID, sha, ref)
 	return err
+}
+
+// CompleteFromCache 是缓存命中的 Tx2（实现 call.Store；规格 §11.2）：按锁顺序复查访问（含 desired ≠ cancel）
+// → 锁住调用行 → 复查期限 → 结果 blob 写入 scope_blobs(task) → calls.completed（source = cache）。
+// 不建 reservation 与 try、不改动账本。取消先提交时本事务读到 desired = cancel 而拒绝，命中结果不被授权（E23）；
+// 本事务先提交时，随后的取消与之串行（task_control 上的共享锁）。调用须为仍在解析中的 resolving 且没有 try，
+// 否则为 ErrConflict；已以同一结果由缓存完成时原样返回（提交结果未知后的重跑）。
+func (s *Store) CompleteFromCache(ctx context.Context, r call.CacheCompletion) (call.CallRecord, error) {
+	if r.TaskID == "" || r.CallID == "" || r.AttemptID == "" || !isSHA256Hex(r.ResultSHA256) || r.ResultSize < 0 {
+		return call.CallRecord{}, invalidf("CompleteFromCache 缺少 task_id、call_id、attempt_id，或结果不是小写十六进制 sha256 与非负大小")
+	}
+	var out call.CallRecord
+	err := s.run(ctx, "CompleteFromCache", r.TaskID+"/"+r.CallID, func(ctx context.Context, tx pgx.Tx) error {
+		if err := checkAccessTx(ctx, tx, r.TaskID, r.AttemptID); err != nil {
+			return err
+		}
+		rec, err := selectCallForUpdate(ctx, tx, r.TaskID, r.CallID)
+		if err != nil {
+			return err
+		}
+		if rec.State == call.StateCompleted && rec.Source == "cache" && rec.ResultRef == r.ResultSHA256 {
+			out = rec
+			return nil
+		}
+		if rec.State != call.StateResolving || rec.ResolvingSince == nil || rec.TriesUsed != 0 {
+			return conflictf("调用 %s/%s 处于 %s（tries_used %d），不能由缓存完成", r.TaskID, r.CallID, rec.State, rec.TriesUsed)
+		}
+		var expired bool
+		if err := tx.QueryRow(ctx, "SELECT now() >= $1::timestamptz", rec.DeadlineAt).Scan(&expired); err != nil {
+			return err
+		}
+		if expired {
+			return rejectf(persistence.CodeCallDeadlineExceeded, "调用 %s 已超过 deadline_at", r.CallID)
+		}
+		if err := recordResultBlob(ctx, tx, r.TaskID, r.ResultSHA256, r.ResultSize, r.CallID+"#cache"); err != nil {
+			return err
+		}
+		out, err = scanCall(tx.QueryRow(ctx, `UPDATE calls SET state = 'completed', source = 'cache', result_ref = $3, resolving_since = NULL
+			WHERE task_id = $1 AND call_id = $2 RETURNING `+callColumns, r.TaskID, r.CallID, r.ResultSHA256))
+		return err
+	})
+	return out, err
 }
 
 // SettleTry 完成一次 try 的结算（实现 call.Store；规格 §9.5、§9.6）。幂等以 reservation 状态为条件：
@@ -379,7 +422,7 @@ func (s *Store) SettleTry(ctx context.Context, st call.Settlement) (call.CallRec
 		var spent, unknown, cost int64
 		switch st.Outcome {
 		case "ok":
-			if err := recordResultBlob(ctx, tx, st); err != nil {
+			if err := recordResultBlob(ctx, tx, t.TaskID, st.ResultSHA256, st.ResultSize, fmt.Sprintf("%s#%d", t.CallID, t.TryNo)); err != nil {
 				return err
 			}
 			newRes, callState, spent, cost = "settled", string(call.StateCompleted), st.ActualMicro, st.ActualMicro

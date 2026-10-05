@@ -10,12 +10,15 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/blob"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/cache"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/jcs"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
@@ -236,6 +239,28 @@ func (s *fakeStore) SettleTry(_ context.Context, st Settlement) (CallRecord, err
 	case s.settled <- t.CallID:
 	default:
 	}
+	return *rec, nil
+}
+
+func (s *fakeStore) CompleteFromCache(_ context.Context, r CacheCompletion) (CallRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	defer s.checkI3()
+	if code := admit(s.facts(r.TaskID, r.AttemptID)); code != "" {
+		return CallRecord{}, rejected(code)
+	}
+	rec := s.calls[callKey{r.TaskID, r.CallID}]
+	switch {
+	case rec == nil:
+		return CallRecord{}, persistence.ErrNotFound
+	case rec.State == StateCompleted && rec.Source == "cache" && rec.ResultRef == r.ResultSHA256:
+		return *rec, nil
+	case rec.State != StateResolving || rec.ResolvingSince == nil || rec.TriesUsed != 0:
+		return CallRecord{}, persistence.ErrConflict
+	case !time.Now().Before(rec.DeadlineAt):
+		return CallRecord{}, rejected(persistence.CodeCallDeadlineExceeded)
+	}
+	rec.State, rec.Source, rec.ResultRef, rec.ResolvingSince = StateCompleted, "cache", r.ResultSHA256, nil
 	return *rec, nil
 }
 
@@ -492,6 +517,7 @@ type harness struct {
 	events      *fakeEvents
 	logs        *syncBuffer
 	chatPricing map[string]upstream.Pricing
+	cache       CacheSource // 非 nil 时装配进 Coordinator（newCacheHarness）
 }
 
 type syncBuffer struct {
@@ -530,6 +556,7 @@ func (h *harness) newCoordinator(t *testing.T, lim Limits) *Coordinator {
 		Pricing:     map[upstream.Kind]upstream.Pricing{upstream.KindChat: {InputMicroPerMTok: 1_000_000, OutputMicroPerMTok: 2_000_000}},
 		ChatPricing: h.chatPricing,
 		Logger:      slog.New(slog.NewJSONHandler(h.logs, nil)),
+		Cache:       h.cache,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -598,7 +625,7 @@ func waitBegun(t *testing.T, s *fakeStore, callID string) {
 func TestFingerprint(t *testing.T) {
 	fp := func(defaults map[string]any, model, body string) string {
 		t.Helper()
-		s, err := Fingerprint("/v1/chat/completions", "fake/1", "p", model, defaults, []byte(body))
+		s, err := Fingerprint("/v1/chat/completions", "fake/1", "p", model, defaults, "", []byte(body))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -614,8 +641,13 @@ func TestFingerprint(t *testing.T) {
 	if b := fp(map[string]any{"max_tokens": 64}, "m2", `{"a":1,"b":[1,2]}`); a == b {
 		t.Fatal("模型不同但指纹相同")
 	}
-	if _, err := Fingerprint("/v1/chat/completions", "fake/1", "p", "m1", nil, []byte(`{"a":1,"a":2}`)); !errors.Is(err, jcs.ErrDuplicateKey) {
+	if _, err := Fingerprint("/v1/chat/completions", "fake/1", "p", "m1", nil, "", []byte(`{"a":1,"a":2}`)); !errors.Is(err, jcs.ErrDuplicateKey) {
 		t.Fatalf("重复属性名：%v", err)
+	}
+	// 缓存指令计入指纹（§11.4）：no-cache 与无指令不同。
+	nc, err := Fingerprint("/v1/chat/completions", "fake/1", "p", "m1", map[string]any{"max_tokens": 64}, CacheDirectiveNoCache, []byte(`{"a":1,"b":[1,2]}`))
+	if err != nil || nc == a {
+		t.Fatalf("no-cache 的指纹 %s / %v，不应等于无指令的 %s", nc, err, a)
 	}
 }
 
@@ -1082,4 +1114,342 @@ func TestBackoff(t *testing.T) {
 	if d := c.backoff(1, 30*time.Second); d != 30*time.Second {
 		t.Fatalf("Retry-After：%v", d)
 	}
+}
+
+// ---- 缓存分支（§11.2、§11.4、§11.5） ----
+
+type fakeEntry struct {
+	sha  string
+	size int64
+}
+
+type fakeStored struct {
+	kind upstream.Kind
+	url  string
+	resp cache.Response
+	sha  string
+}
+
+// fakeCache 是按 (kind, provider, ver, params) 精确匹配的内存缓存；记录查找、跳过与写入。
+type fakeCache struct {
+	mu       sync.Mutex
+	entries  map[string]fakeEntry
+	lookups  int
+	bypasses int
+	stores   []fakeStored
+	onLookup func() // 查找时（Tx1 之后、Tx2 之前）执行，用于制造竞争
+}
+
+func fakeCacheKey(kind upstream.Kind, provider, ver string, params []byte) string {
+	return string(kind) + "|" + provider + "|" + ver + "|" + string(params)
+}
+
+func (f *fakeCache) Lookup(_ context.Context, kind upstream.Kind, provider, ver string, params []byte, _ string) (string, int64, bool) {
+	f.mu.Lock()
+	f.lookups++
+	e, ok := f.entries[fakeCacheKey(kind, provider, ver, params)]
+	hook := f.onLookup
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return e.sha, e.size, ok
+}
+
+func (f *fakeCache) Store(kind upstream.Kind, _, _ string, _ []byte, rawURL string, resp cache.Response, sha string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stores = append(f.stores, fakeStored{kind: kind, url: rawURL, resp: resp, sha: sha})
+}
+
+func (f *fakeCache) Bypass() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bypasses++
+}
+
+func (f *fakeCache) counts() (lookups, bypasses, stores int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lookups, f.bypasses, len(f.stores)
+}
+
+const searchBody = `{"query":"go"}`
+
+func searchInv(callID string) Invoke {
+	in := inv(callID, searchBody)
+	in.Kind = upstream.KindSearch
+	return in
+}
+
+// newCacheHarness 装配一个使用 cs 的 Coordinator；adapter 为搜索类别。
+func newCacheHarness(t *testing.T, cs CacheSource, script ...step) *harness {
+	t.Helper()
+	ad := newAdapter("p", script...)
+	ad.kind = upstream.KindSearch
+	h := &harness{store: newFakeStore(t), ad: ad, blobs: &fakeBlobs{m: map[string][]byte{}}, events: &fakeEvents{},
+		logs: &syncBuffer{}, cache: cs}
+	h.c = h.newCoordinator(t, testLimits())
+	return h
+}
+
+// seed 把 body 存为 blob，并在 fc 中登记 searchBody 的条目指向它。
+func (h *harness) seed(t *testing.T, fc *fakeCache, body string) fakeEntry {
+	t.Helper()
+	ref, err := h.blobs.Put(context.Background(), strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, _, err := h.ad.Resolve([]byte(searchBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := fakeEntry{sha: ref.SHA256, size: ref.Size}
+	fc.mu.Lock()
+	fc.entries[fakeCacheKey(upstream.KindSearch, "p", "fake/1", resolved)] = e
+	fc.mu.Unlock()
+	return e
+}
+
+// 命中：不预留、不访问上游、不改动账本；journal completed（source = cache，无 try），结果授权到任务 scope；
+// 之后同 ID 的请求按 journal 重放，不再查缓存。
+func TestCacheHitNoReservation(t *testing.T) {
+	fc := &fakeCache{entries: map[string]fakeEntry{}}
+	h := newCacheHarness(t, fc)
+	e := h.seed(t, fc, `{"results":["cached"]}`)
+	r := h.invoke(t, searchInv("c1"))
+	if r.Status != 200 || r.Replayed || r.BlobSHA256 != e.sha || string(r.Body) != `{"results":["cached"]}` {
+		t.Fatalf("命中结果 %+v", r)
+	}
+	if calls, _, _ := h.ad.stats(); calls != 0 {
+		t.Fatalf("命中不应访问上游，得到 %d 次", calls)
+	}
+	rec, tries := h.call(t, "t1", "c1")
+	if rec.State != StateCompleted || rec.Source != "cache" || rec.ResultRef != e.sha || rec.TriesUsed != 0 || len(tries) != 0 {
+		t.Fatalf("调用记录 %+v，try %+v", rec, tries)
+	}
+	if b := h.budget(t, "t1"); b.ReservedMicro != 0 || b.SpentMicro != 0 || b.UnknownMicro != 0 || h.store.nRes != 0 {
+		t.Fatalf("命中不应预留或计费：%+v，预留 %d 次", b, h.store.nRes)
+	}
+	rc, err := h.c.OpenBlob(context.Background(), "t1", e.sha)
+	if err != nil {
+		t.Fatalf("命中结果应授权到任务 scope：%v", err)
+	}
+	_ = rc.Close() // 只读的内存 blob，关闭错误无关紧要
+	again := h.invoke(t, searchInv("c1"))
+	if !again.Replayed || again.BlobSHA256 != e.sha {
+		t.Fatalf("重放结果 %+v", again)
+	}
+	if lookups, _, stores := fc.counts(); lookups != 1 || stores != 0 {
+		t.Fatalf("重放不应查缓存、命中不应写缓存：lookups=%d stores=%d", lookups, stores)
+	}
+}
+
+// journal 优先：已完成的调用以 journal 结果重放，缓存里出现同参数的其他结果也不覆盖它；未命中走上游并在
+// 结算之后把结果（大小为结果 blob 的大小）交给缓存。
+func TestCacheJournalFirst(t *testing.T) {
+	fc := &fakeCache{entries: map[string]fakeEntry{}}
+	h := newCacheHarness(t, fc, step{body: `{"results":["upstream"]}`})
+	first := h.invoke(t, searchInv("c1"))
+	if first.Status != 200 || string(first.Body) != `{"results":["upstream"]}` {
+		t.Fatalf("未命中结果 %+v", first)
+	}
+	fc.mu.Lock()
+	stored := append([]fakeStored(nil), fc.stores...)
+	fc.mu.Unlock()
+	if len(stored) != 1 || stored[0].sha != first.BlobSHA256 || stored[0].kind != upstream.KindSearch ||
+		stored[0].resp.Status != 200 || stored[0].resp.Size != int64(len(first.Body)) || stored[0].resp.ResponseTime.IsZero() {
+		t.Fatalf("结算后的缓存写入 %+v", stored)
+	}
+	h.seed(t, fc, `{"results":["cached-later"]}`)
+	again := h.invoke(t, searchInv("c1"))
+	if !again.Replayed || again.BlobSHA256 != first.BlobSHA256 || string(again.Body) != `{"results":["upstream"]}` {
+		t.Fatalf("journal 应先于缓存：%+v", again)
+	}
+	if lookups, _, _ := fc.counts(); lookups != 1 {
+		t.Fatalf("重放不应查缓存，lookups=%d", lookups)
+	}
+	if rec, _ := h.call(t, "t1", "c1"); rec.Source != "upstream" || rec.ResultRef != first.BlobSHA256 {
+		t.Fatalf("已记录的结果被改变：%+v", rec)
+	}
+}
+
+// no-cache：不读缓存（计 bypass），走上游，结果仍写入缓存；指令计入指纹（同 ID 去掉指令为指纹分歧）。
+func TestNoCacheSkipsReadButWrites(t *testing.T) {
+	fc := &fakeCache{entries: map[string]fakeEntry{}}
+	h := newCacheHarness(t, fc, step{body: `{"results":["fresh"]}`})
+	h.seed(t, fc, `{"results":["stale"]}`)
+	in := searchInv("c1")
+	in.NoCache = true
+	r := h.invoke(t, in)
+	if r.Status != 200 || string(r.Body) != `{"results":["fresh"]}` {
+		t.Fatalf("no-cache 结果 %+v", r)
+	}
+	if lookups, bypasses, stores := fc.counts(); lookups != 0 || bypasses != 1 || stores != 1 {
+		t.Fatalf("no-cache：lookups=%d bypasses=%d stores=%d，期望 0/1/1", lookups, bypasses, stores)
+	}
+	if calls, _, _ := h.ad.stats(); calls != 1 {
+		t.Fatalf("上游调用 %d 次", calls)
+	}
+	if r := h.invoke(t, searchInv("c1")); r.Code != persistence.CodeFingerprintMismatch {
+		t.Fatalf("去掉 no-cache 的同 ID 请求应为指纹分歧，得到 %+v", r)
+	}
+}
+
+// 命中条目引用的 blob 缺失或内容不符 → 按未命中走上游，不提交缓存结果。
+func TestCacheHitBlobMismatchFallsBack(t *testing.T) {
+	fc := &fakeCache{entries: map[string]fakeEntry{}}
+	h := newCacheHarness(t, fc, step{body: `{"results":["upstream"]}`})
+	e := h.seed(t, fc, `{"results":["cached"]}`)
+	h.blobs.mu.Lock()
+	h.blobs.m[e.sha] = []byte(`{"results":["tampered"]}`)
+	h.blobs.mu.Unlock()
+	r := h.invoke(t, searchInv("c1"))
+	if r.Status != 200 || string(r.Body) != `{"results":["upstream"]}` {
+		t.Fatalf("复核失败应走上游，得到 %+v", r)
+	}
+	if rec, _ := h.call(t, "t1", "c1"); rec.Source != "upstream" || rec.State != StateCompleted {
+		t.Fatalf("调用记录 %+v", rec)
+	}
+}
+
+// E23：取消在命中之后、Tx2 之前提交 → CompleteFromCache 拒绝，结果不被授权，调用为 failed（cancel_requested）。
+func TestCacheHitAfterCancelNotAuthorized(t *testing.T) {
+	fc := &fakeCache{entries: map[string]fakeEntry{}}
+	h := newCacheHarness(t, fc)
+	e := h.seed(t, fc, `{"results":["cached"]}`)
+	fc.mu.Lock()
+	fc.onLookup = func() {
+		h.store.mu.Lock()
+		h.store.desired["t1"] = "cancel"
+		h.store.mu.Unlock()
+	}
+	fc.mu.Unlock()
+	r := h.invoke(t, searchInv("c1"))
+	if r.Status != 409 || r.Code != persistence.CodeCancelRequested || r.Body != nil {
+		t.Fatalf("取消先提交时得到 %+v", r)
+	}
+	if rec, _ := h.call(t, "t1", "c1"); rec.State != StateFailed || rec.FailReason != persistence.CodeCancelRequested || rec.ResultRef != "" {
+		t.Fatalf("调用记录 %+v", rec)
+	}
+	if ok, err := h.store.BlobAuthorized(context.Background(), "t1", e.sha); err != nil || ok {
+		t.Fatalf("命中结果不应被授权：%v / %v", ok, err)
+	}
+	if calls, _, _ := h.ad.stats(); calls != 0 {
+		t.Fatalf("上游调用 %d 次", calls)
+	}
+}
+
+// 模型调用从不查缓存、也不写缓存（§11.1）。
+func TestChatNeverCached(t *testing.T) {
+	fc := &fakeCache{entries: map[string]fakeEntry{}}
+	h := newHarness(t, testLimits(), newAdapter("p"))
+	h.cache = fc
+	h.c = h.newCoordinator(t, testLimits())
+	if r := h.invoke(t, inv("c1", chatBody)); r.Status != 200 {
+		t.Fatalf("chat 结果 %+v", r)
+	}
+	in := inv("c2", chatBody)
+	in.NoCache = true
+	if r := h.invoke(t, in); r.Status != 200 {
+		t.Fatalf("chat no-cache 结果 %+v", r)
+	}
+	if lookups, bypasses, stores := fc.counts(); lookups != 0 || bypasses != 0 || stores != 0 {
+		t.Fatalf("chat 不应触及缓存：lookups=%d bypasses=%d stores=%d", lookups, bypasses, stores)
+	}
+}
+
+// 真实的 cache.Source：Redis 不可达时全部未命中（计 error），任务结果正确；真实 Redis（AGENTBOX_TEST_REDIS_ADDR）
+// 上第二个同参数调用命中，不访问上游、不预留。
+func TestCacheSourceEndToEnd(t *testing.T) {
+	newSource := func(t *testing.T, h *harness, addr string) (*cache.Source, *cache.Redis) {
+		t.Helper()
+		signer, err := cache.LoadKeys(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := cache.NewRedis(cache.RedisConfig{Addr: addr})
+		src, err := cache.NewSource(cache.SourceConfig{KV: r, Signer: signer, Blobs: h.blobs})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			src.Close()
+			_ = r.Close() // 测试结束，关闭错误无关紧要
+		})
+		return src, r
+	}
+	t.Run("Redis 不可达", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		dead := ln.Addr().String()
+		if err := ln.Close(); err != nil {
+			t.Fatal(err)
+		}
+		h := newCacheHarness(t, nil)
+		src, _ := newSource(t, h, dead)
+		h.cache = src
+		h.c = h.newCoordinator(t, testLimits())
+		for _, id := range []string{"c1", "c2"} {
+			if r := h.invoke(t, searchInv(id)); r.Status != 200 || string(r.Body) != `{"answer":"ok"}` {
+				t.Fatalf("%s：%+v", id, r)
+			}
+		}
+		if calls, _, _ := h.ad.stats(); calls != 2 {
+			t.Fatalf("Redis 不可达时应全部走上游，上游调用 %d 次", calls)
+		}
+		m := src.Metrics()
+		if m["hit"] != 0 || m["error"] < 2 {
+			t.Fatalf("指标 %v", m)
+		}
+	})
+	t.Run("真实 Redis", func(t *testing.T) {
+		addr := os.Getenv("AGENTBOX_TEST_REDIS_ADDR")
+		if addr == "" {
+			if os.Getenv("CI") == "true" {
+				t.Fatal("CI 中必须设置 AGENTBOX_TEST_REDIS_ADDR")
+			}
+			t.Skip("未设置 AGENTBOX_TEST_REDIS_ADDR，跳过")
+		}
+		h := newCacheHarness(t, nil)
+		h.ad.provider = fmt.Sprintf("p%d", time.Now().UnixNano()) // 每次运行使用新键，不受旧条目影响
+		src, r := newSource(t, h, addr)
+		h.cache = src
+		h.c = h.newCoordinator(t, testLimits())
+		first := h.invoke(t, searchInv("c1"))
+		resolved, _, err := h.ad.Resolve([]byte(searchBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, err := cache.Key(upstream.KindSearch, h.ad.provider, "fake/1", resolved)
+		if err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			_, ok, err := r.Get(context.Background(), key)
+			if err == nil && ok {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("异步写入没有到达 Redis：%v", err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		second := h.invoke(t, searchInv("c2"))
+		if second.BlobSHA256 != first.BlobSHA256 || !bytes.Equal(second.Body, first.Body) || second.Replayed {
+			t.Fatalf("命中结果 %+v，首次 %+v", second, first)
+		}
+		if calls, _, _ := h.ad.stats(); calls != 1 {
+			t.Fatalf("命中不应访问上游，上游调用 %d 次", calls)
+		}
+		if rec, _ := h.call(t, "t1", "c2"); rec.Source != "cache" || rec.TriesUsed != 0 {
+			t.Fatalf("c2 记录 %+v", rec)
+		}
+		if m := src.Metrics(); m["hit"] != 1 || m["miss"] != 1 {
+			t.Fatalf("指标 %v", m)
+		}
+	})
 }
