@@ -18,6 +18,17 @@ type Store interface {
 	// AccountUnrecordedRunTime 把上次持久化之后到 until 的未记账区间按墙钟差全额计入（规格 §14.4）；
 	// 同一 until 重复调用不重复计入。只接受当前 attempt。
 	AccountUnrecordedRunTime(ctx context.Context, taskID, attemptID string, until time.Time) error
+	// ConvertLedger 是启动账本转换（规格 §14.1 第 4 步）：在单个事务中把全部 held 的 reservation 转为
+	// charged_unknown（reserved 减、unknown 加同额，I3 保持），其 try 按 unknown 结算，全部 in_flight 调用置为
+	// unknown（deadline_at 不变）。幂等：再次调用不转换任何记录。resolving 调用的复位不在此（ResetResolving）。
+	ConvertLedger(ctx context.Context) (LedgerConversion, error)
+}
+
+// LedgerConversion 是一次账本转换的结果。
+type LedgerConversion struct {
+	Reservations int   // held → charged_unknown 的 reservation 数（即按 unknown 结算的 try 数）
+	Calls        int   // in_flight → unknown 的调用数
+	UnknownMicro int64 // 转入 unknown 的金额合计（微美元）
 }
 
 // Facts 是恢复所需的数据库事实。

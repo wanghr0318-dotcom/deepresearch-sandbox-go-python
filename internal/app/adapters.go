@@ -434,7 +434,7 @@ func (c Config) gatewayAdapters(d *upstream.Dialer) ([]upstream.Adapter, map[ups
 		upstream.KindFetch:  {Version: "fetch/free"},
 	}
 	adapters := []upstream.Adapter{
-		upstream.NewSearch(upstream.SearchConfig{Provider: c.SearchProvider, APIKey: c.SearchAPIKey,
+		upstream.NewSearch(upstream.SearchConfig{Provider: c.SearchProvider, APIKey: c.SearchAPIKey, BaseURL: c.SearchBaseURL,
 			Pricing: pricing[upstream.KindSearch], HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0)}),
 		upstream.NewFetch(upstream.FetchConfig{Dialer: d, Pricing: pricing[upstream.KindFetch]}),
 	}

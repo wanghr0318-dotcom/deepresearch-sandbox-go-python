@@ -8,8 +8,9 @@
 //     SetStageReply 的脚本回复，否则回复确定性的占位文本；响应带 usage（prompt_tokens、completion_tokens）。
 //     模型 adapter 的 BaseURL 为 ModelBaseURL()（= URL()+"/v1"）。
 //   - POST /search：tavily 兼容（{query, max_results} → {request_id, results:[{title, url, content, snippet}]}）；
-//     结果 URL 指向本服务器的 /pages/...，可以继续抓取。Gateway 的 fake 搜索供应商是进程内的，不访问本端点；
-//     本端点供配置了 tavily 兼容地址的装配使用（Gateway 返回给 Worker 的形状是 results[]{title, url, snippet}）。
+//     结果 URL 指向本服务器的 /pages/...，可以继续抓取。Gateway 的 fake 搜索供应商配置了搜索上游地址
+//     （app.Config.SearchBaseURL / --search-base-url = URL()）时访问本端点；Gateway 返回给 Worker 的形状是
+//     results[]{title, url, snippet}。
 //   - GET 其他路径：抓取目标。SetPage 设置的页面按原样返回，否则返回确定性的 text/plain 正文（Gateway 的
 //     fetch adapter 把它包装为 {url, final_url, status, content_type, truncated, encoding, content}）。
 //

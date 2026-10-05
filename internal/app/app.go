@@ -16,6 +16,7 @@ import (
 	mrand "math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -96,6 +97,10 @@ type Config struct {
 	// SearchProvider 是搜索供应商：fake | tavily | ddg_lite（默认 ddg_lite）。fake 只用于测试，要求设置
 	// UpstreamAllowPrivate（指向本机 fake upstream）；tavily 要求 SearchAPIKey。
 	SearchProvider string
+	// SearchBaseURL 覆盖搜索供应商地址（http/https；空时取供应商默认）。供应商为 fake 时设置它，fake 搜索经
+	// 验证 dialer 向 <SearchBaseURL>/search 发出 HTTP 请求（测试用 fake upstream，主机须在 UpstreamAllowPrivate
+	// 中），否则 fake 是进程内的脚本化结果。
+	SearchBaseURL string
 	// SearchAPIKey 是搜索供应商的 Key（只从宿主环境变量 AGENTBOX_SEARCH_API_KEY 加载，§9.9）。
 	SearchAPIKey string
 	// UpstreamAllowPrivate 是显式放行的私有上游主机（§9.8 规则 2；"host" 或 "host:port"），所有 adapter 共用。
@@ -213,6 +218,11 @@ func (c Config) validate() error {
 	case upstream.SearchDDGLite:
 	default:
 		return fmt.Errorf("app: 搜索供应商须为 fake、tavily 或 ddg_lite，得到 %q", c.SearchProvider)
+	}
+	if c.SearchBaseURL != "" {
+		if u, err := url.Parse(c.SearchBaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("app: 搜索上游地址 %q 须为 http(s) 的绝对 URL", c.SearchBaseURL)
+		}
 	}
 	for _, kv := range c.WorkerEnv {
 		k, _, _ := strings.Cut(kv, "=")
@@ -631,7 +641,7 @@ func (s *server) recoverLoop(ctx context.Context) (recovery.Report, error) {
 }
 
 func (s *server) recoverOnce(ctx context.Context) (recovery.Report, error) {
-	// 第 3 步：单事务撤销全部 active 访问。第 4 步（账本转换）在 recovery.Execute 中，M1 为空操作。
+	// 第 3 步：单事务撤销全部 active 访问。第 4 步的账本转换在 recovery.Execute 中（见下）。
 	n, err := s.store.RevokeAllActive(ctx, "server_restart")
 	if err != nil {
 		return recovery.Report{}, fmt.Errorf("撤销 active 访问: %w", err)
@@ -668,6 +678,8 @@ func (s *server) recoverOnce(ctx context.Context) (recovery.Report, error) {
 	// 第 6–8 步：停止、提交 lost 与恢复安排、运行时限补记（由 recovery.Execute 完成，装配不重复）。
 	r, err := recovery.Execute(ctx, plan, recovery.Deps{Store: s.store, Tasks: s.store, Resources: s.store,
 		Coordinator: s.coord, Clock: s.d.Clock.Now, Options: recovery.Options{DefaultMemoryBytes: s.cfg.DefaultMemoryBytes}})
+	// 第 4 步（账本转换）在 Execute 的第一步完成：上一进程留下的 held 预留与 in_flight 调用转为 unknown。
+	s.log.Info("账本转换", "reservations", r.Ledger.Reservations, "calls", r.Ledger.Calls, "unknown_micro", r.Ledger.UnknownMicro)
 	if err != nil {
 		return r, err
 	}

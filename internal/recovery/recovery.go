@@ -92,6 +92,8 @@ type Report struct {
 	Excluded []string
 	Alerts   []Alert
 	Steps    []StepResult
+	// Ledger 是本次执行的账本转换结果（§14.1 第 4 步；重跑时已转换的记录不再计入）。
+	Ledger LedgerConversion
 }
 
 const (
@@ -138,9 +140,11 @@ func Execute(ctx context.Context, plan reconcile.RecoveryPlan, d Deps) (Report, 
 			x.envTask[s.EnvID] = s.TaskID
 		}
 	}
-	if err := convertLedger(ctx, d); err != nil {
+	ledger, err := convertLedger(ctx, d)
+	if err != nil {
 		return x.r, fmt.Errorf("recovery: 账本转换: %w", err)
 	}
+	x.r.Ledger = ledger
 	for _, s := range plan.Steps {
 		if err := ctx.Err(); err != nil {
 			return x.r, err
@@ -157,9 +161,12 @@ func Execute(ctx context.Context, plan reconcile.RecoveryPlan, d Deps) (Report, 
 	return x.r, nil
 }
 
-// convertLedger 是 §14.1 第 4 步（账本转换：held → charged_unknown、in_flight → unknown、resolving →
-// 可重新解析）的位置。账本属于 M2 的 Gateway journal；M1 没有 reservation 与 call 记录，本步为空操作。
-func convertLedger(context.Context, Deps) error { return nil }
+// convertLedger 是 §14.1 第 4 步（账本转换：held → charged_unknown、in_flight → unknown），在任何恢复步骤
+// 之前执行：上一进程的在途 try 不会再结算，其预留按无法确认的结果转入 unknown，调用之后可在累计上限与
+// deadline_at 内新建 try。resolving 调用的复位由装配在撤销访问之后完成（Store.ResetResolving）。幂等。
+func convertLedger(ctx context.Context, d Deps) (LedgerConversion, error) {
+	return d.Store.ConvertLedger(ctx)
+}
 
 type executor struct {
 	d        Deps

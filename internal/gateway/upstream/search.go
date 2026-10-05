@@ -31,10 +31,14 @@ type SearchResult struct {
 type SearchConfig struct {
 	Provider string // fake | tavily | ddg_lite
 	APIKey   string // tavily：来自宿主环境变量 AGENTBOX_SEARCH_API_KEY；只放在 Authorization 头
-	BaseURL  string // 覆盖供应商地址（测试或自托管）；空时 tavily 为 https://api.tavily.com，ddg_lite 为 https://lite.duckduckgo.com/lite/
-	Pricing  Pricing
-	HTTP     *http.Client // 须来自验证 Dialer.HTTPClient；nil 时用默认 Dialer（8 MiB）
-	// Fake 为 fake 供应商注入结果；nil 时按查询生成确定性的占位结果。返回 *Error 时原样作为结果类别。
+	// BaseURL 覆盖供应商地址（测试或自托管）；空时 tavily 为 https://api.tavily.com，ddg_lite 为
+	// https://lite.duckduckgo.com/lite/。fake 供应商设置了 BaseURL（且没有注入 Fake）时，向 <BaseURL>/search
+	// POST {query, max_results} 并取响应的 {"results":[{title, url, snippet}]}（测试用 fake upstream）。
+	BaseURL string
+	Pricing Pricing
+	HTTP    *http.Client // 须来自验证 Dialer.HTTPClient；nil 时用默认 Dialer（8 MiB）
+	// Fake 为 fake 供应商注入结果；nil 时按 BaseURL 访问 fake upstream，或按查询生成确定性的占位结果。
+	// 返回 *Error 时原样作为结果类别。
 	Fake func(ctx context.Context, query string, maxResults int) ([]SearchResult, error)
 }
 
@@ -54,7 +58,7 @@ func NewSearch(cfg SearchConfig) Adapter {
 		}
 	}
 	a := &searchAdapter{cfg: cfg}
-	if cfg.Provider == SearchTavily || cfg.Provider == SearchDDGLite {
+	if cfg.Provider == SearchTavily || cfg.Provider == SearchDDGLite || (cfg.Provider == SearchFake && cfg.BaseURL != "") {
 		a.http = defaultClient(cfg.HTTP, DefaultModelMaxBody)
 	}
 	return a
@@ -131,7 +135,7 @@ func (a *searchAdapter) Do(ctx context.Context, resolved []byte) (Response, *Err
 	)
 	switch a.cfg.Provider {
 	case SearchFake:
-		results, e = a.fake(ctx, r)
+		results, resp, e = a.fake(ctx, r)
 	case SearchTavily:
 		results, reqID, resp, e = a.tavily(ctx, r)
 	case SearchDDGLite:
@@ -152,17 +156,20 @@ func (a *searchAdapter) Do(ctx context.Context, resolved []byte) (Response, *Err
 	return Response{Body: body, Usage: Usage{Requests: 1, ResponseBytes: int64(len(body))}, UpstreamRequestID: reqID}, nil
 }
 
-func (a *searchAdapter) fake(ctx context.Context, r searchRequest) ([]SearchResult, *Error) {
+func (a *searchAdapter) fake(ctx context.Context, r searchRequest) ([]SearchResult, Response, *Error) {
 	if a.cfg.Fake != nil {
 		res, err := a.cfg.Fake(ctx, r.Query, r.MaxResults)
 		if err != nil {
 			var ue *Error
 			if errors.As(err, &ue) {
-				return nil, ue // 测试可直接注入某类结果
+				return nil, Response{}, ue // 测试可直接注入某类结果
 			}
-			return nil, newErr(OutcomeFatal, http.StatusBadGateway, CodeUpstreamRejected, err)
+			return nil, Response{}, newErr(OutcomeFatal, http.StatusBadGateway, CodeUpstreamRejected, err)
 		}
-		return res, nil
+		return res, Response{}, nil
+	}
+	if a.cfg.BaseURL != "" {
+		return a.fakeUpstream(ctx, r)
 	}
 	out := make([]SearchResult, 0, r.MaxResults)
 	for i := 1; i <= r.MaxResults; i++ {
@@ -172,7 +179,32 @@ func (a *searchAdapter) fake(ctx context.Context, r searchRequest) ([]SearchResu
 			Snippet: fmt.Sprintf("fake 供应商为查询 %q 生成的第 %d 条占位结果。", r.Query, i),
 		})
 	}
-	return out, nil
+	return out, Response{}, nil
+}
+
+// fakeUpstream：POST {BaseURL}/search {query, max_results}，经验证 dialer（主机须在 upstream_allow_private 中）；
+// 响应 {"results":[{title, url, snippet}]}。状态与传输失败按 exchange 归类（429/5xx 可重试并带 Retry-After）；
+// 2xx 但无法解析为 unknown（已发出、结果无法确认）。
+func (a *searchAdapter) fakeUpstream(ctx context.Context, r searchRequest) ([]SearchResult, Response, *Error) {
+	payload, _ := json.Marshal(map[string]any{"query": r.Query, "max_results": r.MaxResults})
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(a.cfg.BaseURL, "/")+"/search", bytes.NewReader(payload))
+	if err != nil {
+		return nil, Response{}, newErr(OutcomeFatal, http.StatusBadGateway, CodeInvalidURL, errors.New("搜索上游地址不合法"))
+	}
+	req.Header.Set("Content-Type", contentTypeJSON)
+	req.Header.Set("Accept", contentTypeJSON)
+	req.Header.Set("User-Agent", userAgent)
+	res, e := exchange(ctx, a.http, req, true)
+	if e != nil {
+		return nil, Response{RetryAfter: res.retryAfter}, e
+	}
+	var reply struct {
+		Results []SearchResult `json:"results"`
+	}
+	if json.Unmarshal(res.body, &reply) != nil {
+		return nil, Response{}, newErr(OutcomeUnknown, http.StatusBadGateway, CodeUpstreamBadResponse, errors.New("搜索响应不是合法 JSON"))
+	}
+	return reply.Results, Response{}, nil
 }
 
 // tavily：POST {BaseURL}/search，Key 走 Authorization: Bearer，不进请求体。

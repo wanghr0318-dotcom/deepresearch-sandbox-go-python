@@ -12,6 +12,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/faultinject"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/recovery"
 )
 
 var _ call.Store = (*Store)(nil)
@@ -466,6 +467,45 @@ func (s *Store) ResetResolving(ctx context.Context) (int, error) {
 		return nil
 	})
 	return n, err
+}
+
+// LedgerRestartError 是启动账本转换按 unknown 结算的 try 的 call_tries.error。
+const LedgerRestartError = "server_restart"
+
+// ConvertLedger 是启动账本转换（实现 recovery.Store；规格 §14.1 第 4 步），在单个事务中完成：
+//   - 全部 held 的 reservation → charged_unknown，所属任务账本 reserved -= amount、unknown += amount（I3 保持）；
+//   - 对应的 in_flight try → settled / unknown（error = server_restart）；
+//   - 全部 in_flight 调用 → unknown（deadline_at 不变）；持有预留的调用标记 possible_external_duplicate
+//     （上一进程的请求可能已经发出）。
+//
+// 重启前的进程已不存在，这些 try 不会再结算；转换后调用按 unknown 处理：期限内可在累计上限内新建 try，超期为
+// call_deadline_exceeded。幂等：没有 held 与 in_flight 时不改动任何行。锁顺序 budgets → calls → reservations。
+func (s *Store) ConvertLedger(ctx context.Context) (recovery.LedgerConversion, error) {
+	var out recovery.LedgerConversion
+	err := s.run(ctx, "ConvertLedger", "ledger", func(ctx context.Context, tx pgx.Tx) error {
+		out = recovery.LedgerConversion{}
+		if _, err := tx.Exec(ctx, `UPDATE budgets b SET reserved_micro = b.reserved_micro - h.total, unknown_micro = b.unknown_micro + h.total
+			FROM (SELECT task_id, sum(amount) AS total FROM reservations WHERE state = 'held' GROUP BY task_id) h
+			WHERE b.task_id = h.task_id`); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `UPDATE calls c SET state = 'unknown',
+				possible_external_duplicate = c.possible_external_duplicate OR EXISTS (SELECT 1 FROM reservations r
+					WHERE r.task_id = c.task_id AND r.call_id = c.call_id AND r.state = 'held')
+			WHERE c.state = 'in_flight'`)
+		if err != nil {
+			return err
+		}
+		out.Calls = int(tag.RowsAffected())
+		if _, err := tx.Exec(ctx, `UPDATE call_tries t SET state = 'settled', outcome = 'unknown', error = $1
+			FROM reservations r WHERE r.reservation_id = t.reservation_id AND r.state = 'held' AND t.state = 'in_flight'`,
+			LedgerRestartError); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `WITH x AS (UPDATE reservations SET state = 'charged_unknown' WHERE state = 'held' RETURNING amount)
+			SELECT count(*), COALESCE(sum(amount), 0)::bigint FROM x`).Scan(&out.Reservations, &out.UnknownMicro)
+	})
+	return out, err
 }
 
 // LoadBudget 读取任务的账本（实现 call.Store）。

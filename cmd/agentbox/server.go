@@ -78,6 +78,7 @@ func runServer(args []string, stderr io.Writer) int {
 	modelName := fs.String("model-name", "", "唯一声明的模型名（配置了 --model-base-url 时必填）")
 	priceIn := fs.Int64("model-price-in-micro-per-mtok", 3_000_000, "模型输入单价（每百万 token 的微美元），用于预留估算与结算")
 	priceOut := fs.Int64("model-price-out-micro-per-mtok", 15_000_000, "模型输出单价（每百万 token 的微美元），用于预留估算与结算")
+	searchBaseURL := fs.String("search-base-url", "", "搜索供应商地址覆盖（空时取供应商默认）；与 --search-provider fake 同用时 fake 搜索向 <地址>/search 发出请求（测试用 fake upstream，主机须在 --upstream-allow-private 中）")
 	searchProvider := fs.String("search-provider", upstream.SearchDDGLite, "搜索供应商：fake | tavily | ddg_lite（tavily 的 Key 只读环境变量 "+searchKeyEnv+"；fake 只用于测试，须同时设置 --upstream-allow-private）")
 	allowPrivate := fs.String("upstream-allow-private", "", "显式放行的私有上游主机（逗号分隔的 host 或 host:port；例如本机模型服务或测试用 fake upstream）")
 	if err := fs.Parse(args); err != nil {
@@ -125,6 +126,7 @@ func runServer(args []string, stderr io.Writer) int {
 		Model: app.ModelConfig{BaseURL: *modelBaseURL, Name: *modelName, APIKey: os.Getenv(modelKeyEnv),
 			Pricing: upstream.Pricing{InputMicroPerMTok: *priceIn, OutputMicroPerMTok: *priceOut}},
 		SearchProvider:       *searchProvider,
+		SearchBaseURL:        *searchBaseURL,
 		SearchAPIKey:         os.Getenv(searchKeyEnv),
 		UpstreamAllowPrivate: splitList(*allowPrivate),
 	}

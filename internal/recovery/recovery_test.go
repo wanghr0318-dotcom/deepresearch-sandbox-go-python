@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -31,6 +32,7 @@ type world struct {
 	reclaimed  map[string]bool
 	stopMode   map[string]string // "" 正常 | blocked | unrecorded
 	verdicts   map[string]task.Verdict
+	ledger     ledgerState
 
 	stopAt         time.Time
 	calls, failAt  int
@@ -66,7 +68,27 @@ func (w *world) call(apply func() error) error {
 	return apply()
 }
 
+// ledgerState 是账本转换（§14.1 第 4 步）关心的事实：held 的预留金额、in_flight 调用数、已转入 unknown 的合计。
+type ledgerState struct {
+	Held     []int64
+	InFlight int
+	Unknown  int64
+}
+
 // ---- recovery.Store ----
+
+func (w *world) ConvertLedger(context.Context) (LedgerConversion, error) {
+	var out LedgerConversion
+	err := w.call(func() error {
+		out = LedgerConversion{Reservations: len(w.ledger.Held), Calls: w.ledger.InFlight}
+		for _, a := range w.ledger.Held {
+			out.UnknownMicro += a
+		}
+		w.ledger = ledgerState{Unknown: w.ledger.Unknown + out.UnknownMicro}
+		return nil
+	})
+	return out, err
+}
 
 func (w *world) LoadRecoveryFacts(context.Context) (Facts, error) {
 	return Facts{}, errors.New("未使用")
@@ -305,12 +327,14 @@ type snapshot struct {
 	Accounted  map[string]time.Time
 	Reclaimed  map[string]bool
 	Verdicts   map[string]task.Verdict
+	Ledger     ledgerState
 }
 
 func (w *world) snapshot() snapshot {
 	s := snapshot{Tasks: map[string]task.TaskState{}, Attempts: map[string]task.Attempt{}, Envs: map[string]resource.Environment{},
 		Intents: map[string]resource.Intent{}, Ranges: map[string]resource.UIDRange{}, Quarantine: map[string]resource.Quarantine{},
-		Accounted: map[string]time.Time{}, Reclaimed: map[string]bool{}, Verdicts: map[string]task.Verdict{}}
+		Accounted: map[string]time.Time{}, Reclaimed: map[string]bool{}, Verdicts: map[string]task.Verdict{},
+		Ledger: ledgerState{Held: slices.Clone(w.ledger.Held), InFlight: w.ledger.InFlight, Unknown: w.ledger.Unknown}}
 	for k, v := range w.tasks {
 		s.Tasks[k] = *v
 	}
@@ -347,6 +371,7 @@ const lostMemory = 256 << 20
 func scenario(t *testing.T) (*world, reconcile.RecoveryPlan) {
 	t.Helper()
 	w := newWorld()
+	w.ledger = ledgerState{Held: []int64{300, 200}, InFlight: 2}
 	stopped := w.stopAt.Add(-time.Hour)
 	addTask := func(id, status, desired string, cv, applied int64, attemptID, attemptStatus, envID string) {
 		w.tasks[id] = &task.TaskState{TaskID: id, Status: status, Desired: desired, ControlVersion: cv,
@@ -425,6 +450,12 @@ func TestExecuteEachStepKind(t *testing.T) {
 		t.Fatalf("Execute = %+v, %v", r, err)
 	}
 	st := statuses(r)
+
+	// 账本转换（§14.1 第 4 步）先于全部步骤执行：held 预留全部转入 unknown，报告转换数量。
+	if want := (LedgerConversion{Reservations: 2, Calls: 2, UnknownMicro: 500}); r.Ledger != want ||
+		w.ledger.Unknown != 500 || len(w.ledger.Held) != 0 || w.ledger.InFlight != 0 {
+		t.Errorf("账本转换报告 %+v，状态 %+v；期望 %+v", r.Ledger, w.ledger, want)
+	}
 
 	// StopEnv：所有未停止的环境（含被隔离任务与终态 attempt 的环境）都已记录 stopped_at。
 	for _, id := range []string{"e1", "e2", "e6", "e-bad", "e3"} {
@@ -508,6 +539,9 @@ func TestExecuteEachStepKind(t *testing.T) {
 	r2, err := Execute(context.Background(), plan, w.deps())
 	if err != nil || !r2.Ready {
 		t.Fatalf("重跑 = %v", err)
+	}
+	if r2.Ledger != (LedgerConversion{}) {
+		t.Errorf("重跑再次转换了账本：%+v", r2.Ledger)
 	}
 	for _, s := range r2.Steps {
 		// ReclaimOrphan 的复核在 coordinator 内（逐层扫描，资源已不存在时为空操作），执行器无记录可读。

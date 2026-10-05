@@ -22,6 +22,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/recovery"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/resource"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
@@ -2447,6 +2448,64 @@ func TestResetResolving(t *testing.T) {
 	_, err = reserve(s, "t1", "c4", 10)
 	expectRejected(t, err, persistence.CodeCallDeadlineExceeded)
 	checkI3(t, s)
+}
+
+// TestConvertLedger：启动账本转换（§14.1 第 4 步）在一个事务中把全部 held 预留转为 charged_unknown（各任务
+// reserved 减、unknown 加同额）、其 try 按 unknown 结算、全部 in_flight 调用置为 unknown（deadline_at 不变；
+// 持有预留的调用标记 possible_external_duplicate）；resolving 不动；I3 保持；再次运行不转换任何记录；
+// 期限之内同指纹的请求在累计上限内新建 try。
+func TestConvertLedger(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	gwFixture(t, s, "t1", 1000)
+	gwFixture(t, s, "t2", 500)
+	c1 := beginCall(t, s, "t1", "c1") // in_flight，持有 300
+	mustReserve(t, s, "t1", "c1", 300)
+	beginCall(t, s, "t1", "c2") // in_flight，try 已按 retryable 结算（退避中），不持有预留
+	settle(t, s, call.Settlement{Try: mustReserve(t, s, "t1", "c2", 100), Outcome: "retryable"})
+	beginCall(t, s, "t1", "c3") // resolving：不属于账本转换
+	beginCall(t, s, "t2", "c1") // 另一任务，持有 200
+	mustReserve(t, s, "t2", "c1", 200)
+
+	got, err := s.ConvertLedger(ctx)
+	if want := (recovery.LedgerConversion{Reservations: 2, Calls: 3, UnknownMicro: 500}); err != nil || got != want {
+		t.Fatalf("ConvertLedger = %+v / %v，期望 %+v", got, err, want)
+	}
+	checkI3(t, s)
+	expectBudget(t, s, "t1", call.Budget{LimitMicro: 1000, UnknownMicro: 300})
+	expectBudget(t, s, "t2", call.Budget{LimitMicro: 500, UnknownMicro: 200})
+	rec, tries, err := s.LoadCall(ctx, "t1", "c1")
+	if err != nil || rec.State != call.StateUnknown || !rec.PossibleExternalDuplicate || !rec.DeadlineAt.Equal(c1.DeadlineAt) ||
+		len(tries) != 1 || tries[0].State != "settled" || tries[0].Outcome != "unknown" || tries[0].Error != LedgerRestartError {
+		t.Fatalf("t1/c1 = %+v，tries %+v / %v", rec, tries, err)
+	}
+	if rec, _, err := s.LoadCall(ctx, "t1", "c2"); err != nil || rec.State != call.StateUnknown || rec.PossibleExternalDuplicate {
+		t.Fatalf("无预留的 in_flight 调用应转为 unknown 且不标记重复：%+v / %v", rec, err)
+	}
+	if rec, _, err := s.LoadCall(ctx, "t1", "c3"); err != nil || rec.State != call.StateResolving || rec.ResolvingSince == nil {
+		t.Fatalf("resolving 调用不应被账本转换改动：%+v / %v", rec, err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM reservations WHERE state = 'charged_unknown'"); n != 2 {
+		t.Fatalf("charged_unknown 预留 %d 笔", n)
+	}
+
+	again, err := s.ConvertLedger(ctx)
+	if err != nil || again != (recovery.LedgerConversion{}) {
+		t.Fatalf("再次转换应为空操作：%+v / %v", again, err)
+	}
+	expectBudget(t, s, "t1", call.Budget{LimitMicro: 1000, UnknownMicro: 300})
+	checkI3(t, s)
+
+	// 期限之内：同指纹请求见到 unknown（可在上限内新建 try），新 try 正常预留。
+	res, err := s.BeginCall(ctx, call.BeginCallRequest{TaskID: "t1", CallID: "c1", AttemptID: "att-t1", Fingerprint: "fp-c1",
+		Endpoint: "chat", Deadline: 120 * time.Second})
+	if err != nil || !res.Existing || res.Record.State != call.StateUnknown {
+		t.Fatalf("转换后的 BeginCall = %+v / %v", res, err)
+	}
+	if tr := mustReserve(t, s, "t1", "c1", 300); tr.TryNo != 2 {
+		t.Fatalf("应新建 try 2，得到 %+v", tr)
+	}
+	expectBudget(t, s, "t1", call.Budget{LimitMicro: 1000, ReservedMicro: 300, UnknownMicro: 300})
 }
 
 // TestMigrationBackfillsBudgets：0003 之前创建的任务在迁移后得到零预算行（失败关闭），而不是找不到预算。

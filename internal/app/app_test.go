@@ -400,6 +400,11 @@ func (s recStore) RevokeAllActive(ctx context.Context, reason string) (int, erro
 	return s.Store.RevokeAllActive(ctx, reason)
 }
 
+func (s recStore) ConvertLedger(ctx context.Context) (recovery.LedgerConversion, error) {
+	s.h.record("store.ConvertLedger")
+	return s.Store.ConvertLedger(ctx)
+}
+
 func (s recStore) LoadRecoveryFacts(ctx context.Context) (recovery.Facts, error) {
 	s.h.record("store.LoadRecoveryFacts")
 	return s.Store.LoadRecoveryFacts(ctx)
@@ -570,7 +575,7 @@ func TestStartupStepOrder(t *testing.T) {
 		"step:data_dir", "step:flock", "acquire_ownership", "step:advisory_lock",
 		"store.InspectInstallation", "step:install_identity", "store.Migrate", "step:migrate",
 		"store.RevokeAllActive", "step:revoke_access", "provider.List", "provider.Scan", "step:scan",
-		"store.LoadRecoveryFacts", "step:recovery_plan", "step:recovery_execute", "step:admission_rebuild",
+		"store.LoadRecoveryFacts", "step:recovery_plan", "store.ConvertLedger", "step:recovery_execute", "step:admission_rebuild",
 		"step:cleanup_loop", "store.ListActiveTasks", "step:scheduler", "step:api",
 	}
 	if !slices.Equal(got, want) {
@@ -995,6 +1000,10 @@ func TestGatewayConfigValidation(t *testing.T) {
 		{"fake 有 allow-private", func(c *Config) { c.SearchProvider, c.UpstreamAllowPrivate = "fake", []string{"127.0.0.1"} }, ""},
 		{"tavily 无 Key", func(c *Config) { c.SearchProvider = "tavily" }, "AGENTBOX_SEARCH_API_KEY"},
 		{"tavily 有 Key", func(c *Config) { c.SearchProvider, c.SearchAPIKey = "tavily", "k" }, ""},
+		{"fake 搜索上游地址", func(c *Config) {
+			c.SearchProvider, c.UpstreamAllowPrivate, c.SearchBaseURL = "fake", []string{"127.0.0.1:9"}, "http://127.0.0.1:9"
+		}, ""},
+		{"搜索上游地址不是 URL", func(c *Config) { c.SearchBaseURL = "127.0.0.1:9/search" }, "绝对 URL"},
 		{"模型无名", func(c *Config) { c.Model.BaseURL = "https://m.example/v1" }, "模型名"},
 		{"Worker 环境变量含 Key", func(c *Config) { c.WorkerEnv = []string{"PYTHONPATH=/opt", "OPENAI_API_KEY=x"} }, "OPENAI_API_KEY"},
 		{"Worker 环境变量白名单", func(c *Config) { c.WorkerEnv = []string{"PYTHONPATH=/opt", "PYTHONUNBUFFERED=1"} }, ""},

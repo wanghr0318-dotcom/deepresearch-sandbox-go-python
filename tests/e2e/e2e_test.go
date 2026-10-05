@@ -3874,13 +3874,14 @@ func gwSecret() string {
 	return "sk-e2e-" + hex.EncodeToString(b)
 }
 
-// gatewayCfg 是进程内装置的 Gateway 配置：模型上游指向 fake upstream（单价每 token 1 微美元），搜索供应商 fake，
-// fake upstream 的 host:port 显式放行（与 cmd/agentbox 的 --search-provider fake 校验相同）。
+// gatewayCfg 是进程内装置的 Gateway 配置：模型上游指向 fake upstream（单价每 token 1 微美元），搜索供应商 fake
+// 且经 SearchBaseURL 访问 fake upstream 的 /search，fake upstream 的 host:port 显式放行（与 cmd/agentbox 的
+// --search-provider fake 校验相同）。
 func gatewayCfg(fu *fakeupstream.Server, key string, lim call.Limits) app.Config {
 	cfg := baseConfig()
 	cfg.Model = app.ModelConfig{BaseURL: fu.ModelBaseURL(), Name: fakeupstream.Model, APIKey: key,
 		Pricing: upstream.Pricing{InputMicroPerMTok: 1_000_000, OutputMicroPerMTok: 1_000_000}}
-	cfg.SearchProvider = upstream.SearchFake
+	cfg.SearchProvider, cfg.SearchBaseURL = upstream.SearchFake, fu.URL()
 	cfg.UpstreamAllowPrivate = []string{fu.HostPort()}
 	cfg.Gateway = lim
 	return cfg
@@ -4249,6 +4250,42 @@ func TestE20CancelDuringCall(t *testing.T) {
 	h.finish()
 }
 
+// TestSearchViaFakeUpstream：搜索供应商 fake 配置了 SearchBaseURL 时，Worker 的搜索经 Gateway（验证 dialer，主机
+// 显式放行）到达 fake upstream 的 /search：上游恰收到一次请求（不带 Key），Worker 得到上游给出的结果（URL 指向
+// fake upstream 的页面），调用以 ok 结算、结果授权到任务 scope。
+func TestSearchViaFakeUpstream(t *testing.T) {
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	h := newHarness(t)
+	h.start(gatewayCfg(fu, gwSecret(), call.Limits{}))
+	id := h.submit("search", spec(nil, "search", nil,
+		step{"op": "search", "step_id": "q1", "query": "固态电池", "max_results": 3}))
+	if v := h.waitTerminal(id); v.Status != "succeeded" {
+		t.Fatalf("任务 %+v", v)
+	}
+	const callID = "root/q1/search/1"
+	c := gwCallRow(t, h.dsn, id, callID)
+	tries := gwTries(t, h.dsn, id, callID)
+	reqs := fu.Requests(fakeupstream.Search)
+	if c.State != "completed" || len(tries) != 1 || tries[0].Outcome != "ok" || len(reqs) != 1 || reqs[0].Authorization != "" {
+		t.Fatalf("调用 %+v；tries %+v；上游搜索请求 %+v", c, tries, reqs)
+	}
+	var res struct {
+		Results []struct {
+			URL     string `json:"url"`
+			Snippet string `json:"snippet"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(h.readBlob(c.ResultRef), &res); err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Results) != 3 || !strings.HasPrefix(res.Results[0].URL, fu.URL()+"/pages/") || res.Results[0].Snippet == "" {
+		t.Fatalf("搜索结果 %+v，期望来自 fake upstream 的 3 条", res.Results)
+	}
+	t.Logf("搜索经 fake upstream：上游请求 %d 个；结果 %+v", fu.Count(fakeupstream.Search), res.Results)
+	h.finish()
+}
+
 // currentAttempt 返回任务的当前 attempt（没有时为空）。
 func (s *sysHarness) currentAttempt(taskID string) string {
 	s.t.Helper()
@@ -4258,22 +4295,6 @@ func (s *sysHarness) currentAttempt(taskID string) string {
 		return ""
 	}
 	return *a
-}
-
-// cancel 经 API 取消任务；503（争用、存储不可用、提交结果未知）按契约以同一 request_id 重试。
-func (s *sysHarness) cancel(taskID, requestID string) {
-	s.t.Helper()
-	deadline := time.Now().Add(waitLimit)
-	for {
-		st, b, err := httpDo("POST", s.srv.base+"/tasks/"+taskID+"/cancel", `{"request_id":"`+requestID+`","reason":"e2e"}`)
-		if err == nil && st == http.StatusOK {
-			return
-		}
-		if err != nil || st != http.StatusServiceUnavailable || time.Now().After(deadline) {
-			s.t.Fatalf("取消 %s = %d %s %v", taskID, st, b, err)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
 }
 
 // waitServerConnsGone 等待被杀死的 server 的数据库连接全部结束：它已发出的 COMMIT 仍可能完成，之后的事实才稳定。
@@ -4287,15 +4308,51 @@ func (s *sysHarness) waitServerConnsGone() {
 	})
 }
 
+// killAtCallInFlight 以 faultinject 点 call.in_flight 启动 server、提交一个 chat 任务，等待 server 在调用 A
+// （Worker 的 root/s1/chat/1）的上游 try 返回之后、结算之前被 SIGKILL，并等待其数据库连接全部结束。
+// before 非空时调用方须让 A 在上游挂起：本函数等 A 到达上游后执行 before，再放行 A；为空时 A 直接返回。
+func (s *sysHarness) killAtCallInFlight(fu *fakeupstream.Server, flags []string, before func(id string)) (string, *serverProc) {
+	s.t.Helper()
+	first := s.start(faultinject.CallInFlight+":1", flags...)
+	id := s.submit("e48", spec(nil, "e48", nil, chatStep("s1")))
+	if before != nil {
+		eventually(s.t, "调用 A 到达上游并挂起", func() bool { return fu.Hanging() == 1 })
+		before(id)
+		fu.Release() // A 的上游请求返回 → 结算之前到达 call.in_flight → SIGKILL
+	}
+	ps := s.waitExit(first)
+	if !killedBySIGKILL(ps) || !strings.Contains(first.logs.tail(1<<20), "faultinject: SIGKILL at "+faultinject.CallInFlight+":1") {
+		s.t.Fatalf("server 应在 %s 被 SIGKILL，退出状态 %v", faultinject.CallInFlight, ps)
+	}
+	s.waitServerConnsGone()
+	return id, first
+}
+
+// assertRestartConverted：重启后的账本转换把被杀死时在途的 try 按 unknown 结算（server_restart）、预留转入 unknown，
+// 调用 A 不再是 in_flight；deadline_at 与重启前相同。
+func assertRestartConverted(t *testing.T, s *sysHarness, id string, a0 gwCall) gwTry {
+	t.Helper()
+	tries := gwTries(t, s.dsn, id, e2eCallID)
+	if len(tries) == 0 || tries[0].Outcome != "unknown" || tries[0].Error != "server_restart" || tries[0].Reservation != "charged_unknown" {
+		t.Fatalf("重启后 try 1 应按 unknown（server_restart）结算：%+v", tries)
+	}
+	if a := gwCallRow(t, s.dsn, id, e2eCallID); a.State == "in_flight" || !a.PED || !a.Deadline.Equal(a0.Deadline) {
+		t.Fatalf("重启后调用 A %+v；期望不再 in_flight、possible_external_duplicate、deadline_at 不变（%s）", a, a0.Deadline)
+	}
+	if !strings.Contains(s.srv.logs.tail(1<<30), `"msg":"账本转换","reservations":1,"calls":1`) {
+		t.Fatal("重启后的 server 日志缺少账本转换的计数（1 笔预留、1 个调用）")
+	}
+	return tries[0]
+}
+
 // TestE48ServerKilledDuringCall：E48——调用进行中 SIGKILL server（faultinject 点 call.in_flight：Tx2 已提交、
-// 上游请求已发出并返回、尚未结算；fake upstream 确认收到请求）→ 重启后 deadline_at 不变（库中值相同）；
-// 遗留的 resolving 调用（同一任务的另一调用，因每任务在途上限 1 等待槽位）被复位为可重新解析；两者超期后
-// 同 ID 请求都得到 504 call_deadline_exceeded，且不再访问上游。
+// 上游请求已发出并返回、尚未结算；fake upstream 确认收到请求），等两个调用都超过 deadline_at 后重启：
+//   - 启动账本转换（§14.1 第 4 步）把在途调用 A 的 try 按 unknown 结算、held 预留转入 unknown；deadline_at 不变；
+//   - 遗留的 resolving 调用 B（同一 attempt 的另一调用，因每任务在途上限 1 等待槽位）被复位为可重新解析，期限不变；
+//   - 新 attempt 的 Worker 以同 ID 请求 A 得到 504 call_deadline_exceeded（不再访问上游），任务失败。
 //
-// 在途调用（in_flight，reservation held）的 504 依赖启动账本转换（§14.1 第 4 步：held → charged_unknown、
-// in_flight → unknown）。该转换尚未实现（internal/recovery.convertLedger 为空操作）：重启后该调用仍为 in_flight，
-// 同 ID 请求得到 409 call_in_progress。此时本用例完成其余全部断言与不变量检查后以 Skip 报告这一缺口；
-// 转换实现后同一断言自动生效。
+// 复位调用在期限之后被接管时得到 call_deadline_exceeded 由 TestResetResolving（存储层）覆盖：新 attempt 的 Worker
+// 收到 504 后立即失败，测试无法确定地在它结束之前另行连接该 attempt 的 socket。
 func TestE48ServerKilledDuringCall(t *testing.T) {
 	fu := fakeupstream.New()
 	t.Cleanup(fu.Close)
@@ -4305,29 +4362,21 @@ func TestE48ServerKilledDuringCall(t *testing.T) {
 	fu.Inject(fakeupstream.Chat, 1, fakeupstream.Action{Hang: true})
 	const deadline = 15 * time.Second
 	flags := []string{"--fake-upstream", fu.URL(), "--call-deadline", deadline.String(), "--gateway-per-task-inflight", "1"}
-	first := s.start(faultinject.CallInFlight+":1", flags...)
-	id := s.submit("e48", spec(nil, "e48", nil, chatStep("s1")))
-	eventually(t, "调用 A 到达上游并挂起", func() bool { return fu.Hanging() == 1 })
-	att1 := s.currentAttempt(id)
-
-	// 调用 B：同一 attempt 的另一调用，等待 A 占用的每任务在途槽位，停在 resolving（Tx1 已提交、没有 try）。
-	bBody := chatBody(probeMessages)
 	bDone := make(chan error, 1)
-	go func() {
-		_, err := gwDo(s.gwSocket(att1), http.MethodPost, "/v1/chat/completions", probeCallID, bBody)
-		bDone <- err
-	}()
-	eventually(t, "调用 B 登记为 resolving 并等待槽位", func() bool {
-		var n int
-		pgQueryRow(t, s.dsn, `SELECT count(*) FROM calls WHERE task_id = $1 AND call_id = $2 AND state = 'resolving'
-			AND resolving_since IS NOT NULL`, []any{id, probeCallID}, &n)
-		return n == 1
+	id, first := s.killAtCallInFlight(fu, flags, func(id string) {
+		// 调用 B：同一 attempt 的另一调用，等待 A 占用的每任务在途槽位，停在 resolving（Tx1 已提交、没有 try）。
+		sock := s.gwSocket(s.currentAttempt(id))
+		go func() {
+			_, err := gwDo(sock, http.MethodPost, "/v1/chat/completions", probeCallID, chatBody(probeMessages))
+			bDone <- err
+		}()
+		eventually(t, "调用 B 登记为 resolving 并等待槽位", func() bool {
+			var n int
+			pgQueryRow(t, s.dsn, `SELECT count(*) FROM calls WHERE task_id = $1 AND call_id = $2 AND state = 'resolving'
+				AND resolving_since IS NOT NULL`, []any{id, probeCallID}, &n)
+			return n == 1
+		})
 	})
-	fu.Release() // A 的上游请求返回 → 结算之前到达 call.in_flight → SIGKILL
-	ps := s.waitExit(first)
-	if !killedBySIGKILL(ps) || !strings.Contains(first.logs.tail(1<<20), "faultinject: SIGKILL at "+faultinject.CallInFlight+":1") {
-		t.Fatalf("server 应在 %s 被 SIGKILL，退出状态 %v", faultinject.CallInFlight, ps)
-	}
 	select {
 	case err := <-bDone:
 		if err == nil {
@@ -4336,7 +4385,6 @@ func TestE48ServerKilledDuringCall(t *testing.T) {
 	case <-time.After(waitLimit):
 		t.Fatal("server 被杀死后调用 B 的连接未结束")
 	}
-	s.waitServerConnsGone()
 	a0, b0 := gwCallRow(t, s.dsn, id, e2eCallID), gwCallRow(t, s.dsn, id, probeCallID)
 	tries0 := gwTries(t, s.dsn, id, e2eCallID)
 	reqs := fu.Requests(fakeupstream.Chat)
@@ -4354,57 +4402,67 @@ func TestE48ServerKilledDuringCall(t *testing.T) {
 		return n == 2
 	})
 	s.start("", flags...)
-	a1, b1 := gwCallRow(t, s.dsn, id, e2eCallID), gwCallRow(t, s.dsn, id, probeCallID)
-	if !a1.Deadline.Equal(a0.Deadline) || !b1.Deadline.Equal(b0.Deadline) {
-		t.Fatalf("重启后 deadline_at 改变：A %s → %s，B %s → %s", a0.Deadline, a1.Deadline, b0.Deadline, b1.Deadline)
-	}
-	if b1.State != "resolving" || b1.ResolvingSince != nil {
-		t.Fatalf("遗留的 resolving 调用应被复位（resolving_since 清空）：%+v", b1)
+	try1 := assertRestartConverted(t, s, id, a0)
+	if b1 := gwCallRow(t, s.dsn, id, probeCallID); b1.State != "resolving" || b1.ResolvingSince != nil || !b1.Deadline.Equal(b0.Deadline) {
+		t.Fatalf("遗留的 resolving 调用应被复位（resolving_since 清空、期限不变）：%+v，原为 %+v", b1, b0)
 	}
 
-	var att2 string
-	eventually(t, "attempt 2 的 Gateway socket 就绪", func() bool {
-		if att2 = s.currentAttempt(id); att2 == "" || att2 == att1 {
-			return false
-		}
-		_, err := os.Stat(s.gwSocket(att2))
-		return err == nil
-	})
-	gotB, err := gwDo(s.gwSocket(att2), http.MethodPost, "/v1/chat/completions", probeCallID, bBody)
-	b2 := gwCallRow(t, s.dsn, id, probeCallID)
-	if err != nil || gotB.Status != http.StatusGatewayTimeout || gotB.Code != "call_deadline_exceeded" ||
-		b2.State != "failed" || b2.FailReason != "call_deadline_exceeded" || !b2.Deadline.Equal(b0.Deadline) || b2.Tries != 0 {
-		t.Fatalf("超期后复位调用 B 的同 ID 请求得到 %+v %v，调用 %+v；期望 504 call_deadline_exceeded、failed、不新建 try", gotB, err, b2)
-	}
-	gotA, err := gwDo(s.gwSocket(att2), http.MethodPost, "/v1/chat/completions", e2eCallID, chatBody(gwMessages))
-	if err != nil {
-		t.Fatal(err)
-	}
-	blocked := false
-	switch {
-	case gotA.Status == http.StatusGatewayTimeout && gotA.Code == "call_deadline_exceeded":
-	case gotA.Status == http.StatusConflict && gotA.Code == "call_in_progress" && gwCallRow(t, s.dsn, id, e2eCallID).State == "in_flight":
-		blocked = true // 启动账本转换尚未实现（见用例说明）
-	default:
-		t.Fatalf("超期后在途调用 A 的同 ID 请求得到 %+v，期望 504 call_deadline_exceeded", gotA)
-	}
-	if n := fu.Count(fakeupstream.Chat); n != 1 {
-		t.Fatalf("超期后不应访问上游，上游收到 %d 个请求", n)
-	}
-	s.cancel(id, "e48-cancel")
 	v := s.waitTerminal(id)
-	reserved, spent, unknown := gwBudget(t, s.dsn, id)
-	logs := first.logs.tail(1<<30) + s.srv.logs.tail(1<<30)
-	assertKeyOnlyUpstream(t, key, logs, s.events(id), fu.Requests(fakeupstream.Chat))
-	t.Logf("E48：deadline_at A=%s B=%s（重启前后相同）；B 复位后超期请求 → %d %s；A → %d %s（state %s）；任务 %s；"+
-		"账本 reserved=%d spent=%d unknown=%d；上游请求 %d 个",
-		a0.Deadline.Format(time.RFC3339Nano), b0.Deadline.Format(time.RFC3339Nano), gotB.Status, gotB.Code, gotA.Status, gotA.Code,
-		gwCallRow(t, s.dsn, id, e2eCallID).State, v.Status, reserved, spent, unknown, fu.Count(fakeupstream.Chat))
-	s.finish()
-	if blocked {
-		t.Skip("E48 在途调用部分 BLOCKED：启动账本转换（§14.1 第 4 步，internal/recovery.convertLedger）未实现，" +
-			"重启后 in_flight 调用的同 ID 请求得到 409 call_in_progress 而不是 504 call_deadline_exceeded；其余断言均已通过")
+	in := s.inspect(id)
+	a2 := attemptByNo(in, 2)
+	var got504 bool
+	for _, e := range s.events(id) {
+		got504 = got504 || (e.AttemptID == a2.AttemptID && e.Source == "worker" && strings.Contains(string(e.Payload), "call_deadline_exceeded"))
 	}
+	a := gwCallRow(t, s.dsn, id, e2eCallID)
+	reserved, spent, unknown := gwBudget(t, s.dsn, id)
+	if v.Status != "failed" || !got504 || a.State != "unknown" || a.Tries != 1 || !a.Deadline.Equal(a0.Deadline) ||
+		reserved != 0 || spent != 0 || unknown != try1.Amount || fu.Count(fakeupstream.Chat) != 1 {
+		t.Fatalf("任务 %s（attempt 2 的 Worker 收到 504：%v）；调用 A %+v；账本 reserved=%d spent=%d unknown=%d；上游请求 %d 个",
+			v.Status, got504, a, reserved, spent, unknown, fu.Count(fakeupstream.Chat))
+	}
+	assertKeyOnlyUpstream(t, key, first.logs.tail(1<<30)+s.srv.logs.tail(1<<30), s.events(id), fu.Requests(fakeupstream.Chat))
+	t.Logf("E48（超期后重启）：deadline_at A=%s B=%s（重启前后相同）；try 1 %+v；新 attempt 的同 ID 请求 → 504；任务 %s/%s；"+
+		"账本 reserved=%d spent=%d unknown=%d；上游请求 %d 个",
+		a0.Deadline.Format(time.RFC3339Nano), b0.Deadline.Format(time.RFC3339Nano), try1, v.Status, v.StatusReason,
+		reserved, spent, unknown, fu.Count(fakeupstream.Chat))
+	s.finish()
+}
+
+// TestE48RestartBeforeDeadline：E48 的另一半——期限之内重启：账本转换把在途 try 按 unknown 结算后，新 attempt
+// 的同 ID 请求在累计上限内新建 try 2（上游第二次收到同一请求体），调用完成，任务成功；deadline_at 不变；
+// 账本 unknown = try 1 的估算、spent = try 2 的实际费用。
+func TestE48RestartBeforeDeadline(t *testing.T) {
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	s := newSys(t)
+	key := gwSecret()
+	t.Setenv(modelKeyEnv, key)
+	flags := []string{"--fake-upstream", fu.URL()}
+	id, first := s.killAtCallInFlight(fu, flags, nil)
+	a0 := gwCallRow(t, s.dsn, id, e2eCallID)
+	if a0.State != "in_flight" || fu.Count(fakeupstream.Chat) != 1 {
+		t.Fatalf("被杀死时调用 A %+v，上游请求 %d 个", a0, fu.Count(fakeupstream.Chat))
+	}
+	s.start("", flags...)
+	try1 := assertRestartConverted(t, s, id, a0)
+	v := s.waitTerminal(id)
+	in := s.inspect(id)
+	tries := gwTries(t, s.dsn, id, e2eCallID)
+	a := gwCallRow(t, s.dsn, id, e2eCallID)
+	reserved, spent, unknown := gwBudget(t, s.dsn, id)
+	if v.Status != "succeeded" || len(tries) != 2 || tries[1].Outcome != "ok" || tries[1].Reservation != "settled" ||
+		tries[0].AttemptID != attemptByNo(in, 1).AttemptID || tries[1].AttemptID != attemptByNo(in, 2).AttemptID ||
+		a.State != "completed" || a.Tries != 2 || !a.PED || !a.Deadline.Equal(a0.Deadline) ||
+		reserved != 0 || unknown != try1.Amount || spent != tries[1].Cost ||
+		fu.Count(fakeupstream.Chat) != 2 || fu.Distinct(fakeupstream.Chat) != 1 {
+		t.Fatalf("任务 %s；调用 %+v；tries %+v；账本 reserved=%d spent=%d unknown=%d；上游请求 %d 个（不同请求体 %d）",
+			v.Status, a, tries, reserved, spent, unknown, fu.Count(fakeupstream.Chat), fu.Distinct(fakeupstream.Chat))
+	}
+	assertKeyOnlyUpstream(t, key, first.logs.tail(1<<30)+s.srv.logs.tail(1<<30), s.events(id), fu.Requests(fakeupstream.Chat))
+	t.Logf("E48（期限内重启）：deadline_at %s 不变；tries %+v；账本 reserved=%d spent=%d unknown=%d；上游请求 %d 个",
+		a0.Deadline.Format(time.RFC3339Nano), tries, reserved, spent, unknown, fu.Count(fakeupstream.Chat))
+	s.finish()
 }
 
 // TestE11bReservationCommitLost：E11b——ReserveTry 的 COMMIT 已执行而回复丢失（faultinject 点 reservation.commit，

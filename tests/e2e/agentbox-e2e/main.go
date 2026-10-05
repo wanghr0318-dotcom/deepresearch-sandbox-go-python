@@ -93,7 +93,7 @@ func gatewayConfig(cfg *app.Config, fake string, lim call.Limits) error {
 	}
 	cfg.Model = app.ModelConfig{BaseURL: fake + "/v1", Name: fakeupstream.Model, APIKey: os.Getenv(modelKeyEnv),
 		Pricing: upstream.Pricing{InputMicroPerMTok: 1_000_000, OutputMicroPerMTok: 1_000_000}}
-	cfg.SearchProvider = upstream.SearchFake
+	cfg.SearchProvider, cfg.SearchBaseURL = upstream.SearchFake, fake
 	cfg.UpstreamAllowPrivate = []string{u.Host}
 	return nil
 }

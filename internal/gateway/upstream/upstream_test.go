@@ -649,6 +649,16 @@ func TestSearchProviders(t *testing.T) {
 			write(t, w, sample)
 		case "/broken/":
 			writeStr(t, w, "<html><body>captcha</body></html>")
+		case "/fu/search": // fake 供应商 + BaseURL：测试用 fake upstream
+			var in map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&in); err != nil || r.Method != http.MethodPost ||
+				in["query"] != "fu query" || in["max_results"] != float64(2) || r.Header.Get("Authorization") != "" {
+				t.Errorf("fake upstream 搜索请求不合规：%s %v %v", r.Method, in, err)
+			}
+			writeStr(t, w, `{"results":[{"title":"F","url":"https://f.example/1","snippet":"S"},{"title":"G"},{"title":"H"}]}`)
+		case "/fu429/search":
+			w.Header().Set("Retry-After", "2")
+			w.WriteHeader(http.StatusTooManyRequests)
 		}
 	}))
 	defer srv.Close()
@@ -658,6 +668,18 @@ func TestSearchProviders(t *testing.T) {
 	resp, e = tv.Do(ctx, mustResolve(t, tv, `{"query":"golang context"}`))
 	if e != nil || resp.UpstreamRequestID != "tv-1" || decode(resp).Results[0] != (SearchResult{Title: "T", URL: "https://t.example/", Snippet: "C"}) {
 		t.Fatalf("tavily：%s %v", resp.Body, e)
+	}
+
+	fu := NewSearch(SearchConfig{Provider: SearchFake, BaseURL: srv.URL + "/fu", HTTP: client})
+	resp, e = fu.Do(ctx, mustResolve(t, fu, `{"query":"fu query","max_results":2}`))
+	if e != nil || len(decode(resp).Results) != 2 || decode(resp).Results[0] != (SearchResult{Title: "F", URL: "https://f.example/1", Snippet: "S"}) {
+		t.Fatalf("fake + BaseURL：%s %v", resp.Body, e)
+	}
+	fu429 := NewSearch(SearchConfig{Provider: SearchFake, BaseURL: srv.URL + "/fu429", HTTP: client})
+	resp, e = fu429.Do(ctx, mustResolve(t, fu429, `{"query":"q"}`))
+	wantErr(t, e, OutcomeRetryable, CodeUpstreamRateLimited)
+	if resp.RetryAfter != 2*time.Second {
+		t.Fatalf("fake + BaseURL 的 Retry-After = %s", resp.RetryAfter)
 	}
 
 	ddg := NewSearch(SearchConfig{Provider: SearchDDGLite, BaseURL: srv.URL + "/lite/", HTTP: client})
