@@ -255,8 +255,11 @@ for cg in "$CGROOT"/agentbox-*; do
   fi
 done
 [ "$leaks" = 0 ] || fail "$leaks 个 agentbox cgroup 仍有进程或环境"
-if pgrep -f 'sim_worker' >/dev/null || pgrep -f '^/proc/self/exe (init|sandbox-launch)' >/dev/null; then
-  pgrep -af 'sim_worker|^/proc/self/exe (init|sandbox-launch)' | sed 's/^/         /'
+# 只匹配命令行以之开头的真实沙箱进程（Worker、init、启动进程、stage-2 helper），避免把包含这些字样的
+# 外层 shell（例如运行本脚本的包装命令）误判为残留。
+sandbox_procs() { pgrep -af '^python3 -m sim_worker|^/proc/self/exe (init|sandbox-launch)|^agentbox-helper( |$)' || true; }
+if [ -n "$(sandbox_procs)" ]; then
+  sandbox_procs | sed 's/^/         /'
   fail "仍有沙箱进程"
 fi
-ok "没有环境目录、没有带进程或环境的 agentbox cgroup（本安装的空 cgroup 已删除）、没有 sim_worker / init / sandbox-launch 进程"
+ok "没有环境目录、没有带进程或环境的 agentbox cgroup（本安装的空 cgroup 已删除）、没有 sim_worker / init / sandbox-launch / helper 进程"
