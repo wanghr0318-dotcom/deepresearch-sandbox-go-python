@@ -551,10 +551,18 @@ def test_loop_full_run_produces_report_with_mapped_citations(loop_gw, tmp_path):
     cps = checkpoints(events)
     assert list(cps) == ["plan", "task-1", "task-2", "report"]
     blob = loop_gw.calls
-    assert cps["plan"]["refs"] == [blob["root/plan/chat/1"]]
-    assert cps["task-1"]["refs"] == [blob["root/task-1/fetch/1"], blob["root/task-1/chat/1"]]
-    assert cps["task-2"]["refs"] == [blob["root/task-2/fetch/1"], blob["root/task-2/chat/1"]]
-    assert cps["report"]["refs"] == [blob["root/report/chat/1"]]
+    # refs 累积：计划 → 各任务证据与摘要 → 报告，首次出现顺序
+    plan_refs = [blob["root/plan/chat/1"]]
+    task1_refs = plan_refs + [blob["root/task-1/fetch/1"], blob["root/task-1/chat/1"]]
+    # 两个任务的摘要回复相同 → 摘要 blob 相同，按首次出现去重
+    task2_refs = list(
+        dict.fromkeys(task1_refs + [blob["root/task-2/fetch/1"], blob["root/task-2/chat/1"]])
+    )
+    assert len(task2_refs) == 4
+    assert cps["plan"]["refs"] == plan_refs
+    assert cps["task-1"]["refs"] == task1_refs
+    assert cps["task-2"]["refs"] == task2_refs
+    assert cps["report"]["refs"] == task2_refs + [blob["root/report/chat/1"]]
     assert_refs_are_returned_blobs(loop_gw, events)
     # 状态内联，带 SDK 的 call id 计数器；证据只存 sha 引用
     final = cps["report"]["state"]
@@ -641,7 +649,8 @@ def test_loop_resume_at_report_rebuilds_without_model_calls(loop_gw, tmp_path):
     assert code == 0
     assert [e["type"] for e in events] == ["ready", "artifact", "result"]
     assert call_ids(loop_gw, before) == []  # 只读取了报告 blob
-    assert [r.path for r in loop_gw.requests[before:]] == [f"/blobs/{report_cp['refs'][0]}"]
+    report_blob = report_cp["state"]["report_sha256"]
+    assert [r.path for r in loop_gw.requests[before:]] == [f"/blobs/{report_blob}"]
     assert (tmp_path / "report.md").read_text(encoding="utf-8") == original
     assert events[-1]["outputs"] == ["report"]
 
@@ -694,7 +703,7 @@ def test_loop_second_divergence_fails_only_that_task(loop_gw, tmp_path):
     code, events = run_loop(tmp_path)
     assert code == 0 and events[-1]["outputs"] == ["report"]
     cps = checkpoints(events)
-    assert cps["task-1"]["refs"] == []
+    assert cps["task-1"]["refs"] == cps["plan"]["refs"]  # 失败任务不增加 refs
     assert [t["status"] for t in cps["report"]["state"]["tasks"]] == ["failed", "done"]
     assert [c for c in call_ids(loop_gw) if c.startswith("root/task-1/")] == [
         "root/task-1/search/1",
@@ -716,7 +725,8 @@ def test_loop_budget_exhausted_writes_degraded_report(loop_gw, tmp_path):
     assert result["summary"].startswith(dr_app.BUDGET_NOTE)
     assert call_ids(loop_gw)[-1] == "root/task-2/search/1"  # 之后不再发起调用（没有报告调用）
     cps = checkpoints(events)
-    assert list(cps) == ["plan", "task-1", "report"] and cps["report"]["refs"] == []
+    assert list(cps) == ["plan", "task-1", "report"]
+    assert cps["report"]["refs"] == cps["task-1"]["refs"]  # 降级报告没有新 blob
     state = cps["report"]["state"]
     assert [t["status"] for t in state["tasks"]] == ["done", "skipped"]
     assert state["report_sha256"] is None
@@ -755,7 +765,7 @@ def test_loop_fetch_failure_retries_task_once(loop_gw, tmp_path):
         "root/task-1/search/2", "root/task-1/fetch/2", "root/task-1/chat/1",
     ]  # fmt: skip
     cps = checkpoints(events)
-    assert cps["task-1"]["refs"][0] == loop_gw.calls["root/task-1/fetch/2"]
+    assert cps["task-1"]["refs"][1] == loop_gw.calls["root/task-1/fetch/2"]
     assert any("task-1" in f and "重做" in f for f in cps["task-1"]["state"]["failures"])
 
 
@@ -790,3 +800,27 @@ def test_parse_config_rejects_bad_values(config):
 def test_first_paragraph_skips_headings():
     md = "# 主题\n\n## 核心洞见\n第一段 [1]\n续行\n\n第二段"
     assert dr_app.first_paragraph(md) == "第一段 [1]\n续行"
+
+
+def test_loop_refs_are_cumulative_and_reproduced_after_resume(loop_gw, tmp_path):
+    code, events = run_loop(tmp_path)
+    assert code == 0
+    full = checkpoints(events)
+    order = list(full)
+    for earlier, later in zip(order, order[1:], strict=False):  # 每步只增不减，前者是后者的前缀
+        assert full[later]["refs"][: len(full[earlier]["refs"])] == full[earlier]["refs"]
+    report_refs = set(full["report"]["refs"])
+    assert set(full["report"]["state"]["evidence"]) <= report_refs
+    assert full["report"]["state"]["report_sha256"] in report_refs
+    # 在 task-1 后杀死并恢复：下一个 checkpoint（task-2）得到与未中断运行相同的累积集合
+    code, events = run_loop(tmp_path, app=kill_after("task-1"))
+    cp1 = checkpoints(events)["task-1"]
+    assert cp1["refs"] == full["task-1"]["refs"]
+    code, events = run_loop(tmp_path, resume=resume_from(cp1))
+    assert code == 0
+    resumed = checkpoints(events)
+    assert resumed["task-2"]["refs"] == full["task-2"]["refs"]
+    assert resumed["report"]["refs"] == full["report"]["refs"]
+    # 即使 resume.refs 为空（如旧 checkpoint），状态中的证据 sha 仍进入累积 refs
+    code, events = run_loop(tmp_path, resume={**resume_from(cp1), "refs": []})
+    assert set(cp1["state"]["evidence"]) <= set(checkpoints(events)["task-2"]["refs"])

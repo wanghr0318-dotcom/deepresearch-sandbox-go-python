@@ -1,8 +1,11 @@
 """DeepResearch 的研究循环：计划 → 逐任务检索、抓取与总结 → 报告，每一步之后提交 checkpoint。
 
 状态即数据：每个 checkpoint 的 state 是 ResearchState.to_json()（内联 JSON 对象，SDK 在其中
-保存 call id 计数器），refs 只含本步骤经 Gateway 调用得到的结果 blob（规格 §5.5 规则 2）。
-恢复时从 resume.state 继续：已完成的计划与任务不重做，call id 随计数器续号。
+保存 call id 计数器）。refs 是累积的：本任务至今经 Gateway 调用得到的全部结果 blob（计划调用、
+各证据、各摘要调用、最后的报告调用），按首次出现顺序去重（规格 §5.5 规则 2）。
+恢复时从 resume.state 继续：已完成的计划与任务不重做，call id 随计数器续号；累积 refs 由
+resume.refs（上一 checkpoint 的累积集合）与状态中的证据 sha 重建，恢复后的下一个 checkpoint
+得到与未中断运行相同的集合。
 
 失败处理（Plan 8 Task 3 规则 4–6）：
 - CallDivergence：以新 ID + X-Agentbox-Supersedes 显式重发一次并记入 failures；再冲突则任务失败。
@@ -175,6 +178,7 @@ class _Loop:
         self.ctx = ctx
         self.cfg = cfg
         self.state = ResearchState(topic=cfg.topic)
+        self.refs: list[str] = []  # 累积 refs：本任务至今得到的全部结果 blob，首次出现顺序
         self._gw: _Superseding | None = None
 
     @property
@@ -183,10 +187,13 @@ class _Loop:
             self._gw = _Superseding(self.ctx.gateway, self.state.failures.append)
         return self._gw
 
-    async def checkpoint(self, step_id: str, refs: list[str]) -> Paused | None:
-        checkpoint_id = await self.ctx.checkpoint(
-            step_id, state=self.state.to_json(), refs=_dedupe(refs)
-        )
+    async def commit(self, step_id: str, new_refs: list[str]) -> str:
+        """提交 checkpoint：refs = 已累积的 blob + 本步骤新得到的 blob（去重，首次出现顺序）。"""
+        self.refs = _dedupe(self.refs + new_refs)
+        return await self.ctx.checkpoint(step_id, state=self.state.to_json(), refs=self.refs)
+
+    async def checkpoint(self, step_id: str, new_refs: list[str]) -> Paused | None:
+        checkpoint_id = await self.commit(step_id, new_refs)
         if self.ctx.cancel_reason is not None:
             raise WorkerFailure("cancelled", f"任务已取消：{self.ctx.cancel_reason}")
         return Paused(checkpoint_id) if self.ctx.should_pause() else None
@@ -195,6 +202,10 @@ class _Loop:
         resume = self.ctx.resume
         if resume is not None:
             self.state = _restore(resume.state)
+            restored = list(resume.refs) + list(self.state.evidence)
+            if self.state.report_sha256 is not None:
+                restored.append(self.state.report_sha256)
+            self.refs = _dedupe(restored)
             if resume.step_id == REPORT_STEP:
                 return await self.rebuild_report()
         else:
@@ -237,7 +248,7 @@ class _Loop:
         return await self.checkpoint(PLAN_STEP, _blobs(calls))
 
     async def research(self, task: ResearchTask) -> list[str]:
-        """检索、抓取并总结一个任务；返回该任务 checkpoint 的 refs。BudgetExhausted 上抛。"""
+        """检索、抓取并总结一个任务；返回新得到的 blob（证据 sha + 摘要调用）。预算耗尽上抛。"""
         step = task_step(task)
         for attempt in (1, 2):
             summary_calls: list[GatewayResult] = []
@@ -296,7 +307,7 @@ class _Loop:
         refs = _blobs(calls)
         self.state.report_sha256 = refs[-1] if refs else None
         await self.publish(text)
-        await self.ctx.checkpoint(REPORT_STEP, state=self.state.to_json(), refs=_dedupe(refs))
+        await self.commit(REPORT_STEP, refs)
         return Result(summary=first_paragraph(text), outputs=[self.cfg.report_artifact_id])
 
     async def degraded(self, failure: str, note: str) -> Result:
@@ -310,7 +321,7 @@ class _Loop:
         self.state.report_sha256 = None
         text = template_report(self.state, note)
         await self.publish(text)
-        await self.ctx.checkpoint(REPORT_STEP, state=self.state.to_json(), refs=[])
+        await self.commit(REPORT_STEP, [])
         return Result(
             summary=f"{note}：{first_paragraph(text)}", outputs=[self.cfg.report_artifact_id]
         )
