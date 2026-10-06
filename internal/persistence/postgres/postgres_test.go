@@ -256,7 +256,7 @@ func TestInstallationBootstrapE46(t *testing.T) {
 			t.Fatal(err)
 		}
 		// 还原为只应用了 0001 的旧库
-		if _, err := s.pool.Exec(ctx, undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions;
+		if _, err := s.pool.Exec(ctx, undo0008+undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions;
 			ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
 			ALTER TABLE installation DROP COLUMN bootstrap_token_hash; DELETE FROM schema_migrations WHERE version >= 2`); err != nil {
 			t.Fatal(err)
@@ -2071,7 +2071,7 @@ func gwFixture(t *testing.T, s *Store, taskID string, budget int64) {
 	}
 }
 
-// checkI3 断言账本不变量 I3：每个任务 reserved = Σ held，unknown = Σ charged_unknown，spent = Σ ok try 的实际费用；
+// checkI3 断言账本不变量 I3（money；cpu 见 DBViolations）：每个任务 reserved = Σ held，unknown = Σ charged_unknown，spent = Σ ok try 的实际费用；
 // 每笔 reservation 恰在一个桶中，且与其 try 的结算结果一致。
 func checkI3(t *testing.T, s *Store) {
 	t.Helper()
@@ -2080,16 +2080,16 @@ func checkI3(t *testing.T, s *Store) {
 		SELECT format('任务 %s：reserved %s / held %s，unknown %s / charged_unknown %s，spent %s / ok %s', b.task_id,
 				b.reserved_micro, h.held, b.unknown_micro, h.unk, b.spent_micro, h.ok) AS v
 			FROM budgets b, LATERAL (SELECT
-				COALESCE((SELECT sum(amount) FROM reservations r WHERE r.task_id = b.task_id AND r.state = 'held'), 0) AS held,
-				COALESCE((SELECT sum(amount) FROM reservations r WHERE r.task_id = b.task_id AND r.state = 'charged_unknown'), 0) AS unk,
+				COALESCE((SELECT sum(amount) FROM reservations r WHERE r.task_id = b.task_id AND r.kind = 'money' AND r.state = 'held'), 0) AS held,
+				COALESCE((SELECT sum(amount) FROM reservations r WHERE r.task_id = b.task_id AND r.kind = 'money' AND r.state = 'charged_unknown'), 0) AS unk,
 				COALESCE((SELECT sum(cost_micro) FROM call_tries c WHERE c.task_id = b.task_id AND c.outcome = 'ok'), 0) AS ok) h
 			WHERE b.reserved_micro <> h.held OR b.unknown_micro <> h.unk OR b.spent_micro <> h.ok
 		UNION ALL
 		SELECT format('reservation %s 处于 %s，try 结果 %L', r.reservation_id, r.state, c.outcome)
 			FROM reservations r LEFT JOIN call_tries c USING (reservation_id)
-			WHERE c.reservation_id IS NULL OR NOT (
+			WHERE r.kind = 'money' AND (c.reservation_id IS NULL OR NOT (
 				(r.state = 'held' AND c.outcome = '') OR (r.state = 'settled' AND c.outcome = 'ok') OR
-				(r.state = 'released' AND c.outcome IN ('retryable', 'fatal')) OR (r.state = 'charged_unknown' AND c.outcome = 'unknown'))
+				(r.state = 'released' AND c.outcome IN ('retryable', 'fatal')) OR (r.state = 'charged_unknown' AND c.outcome = 'unknown')))
 		) x`).Scan(&bad); err != nil {
 		t.Fatal(err)
 	}
@@ -2600,7 +2600,7 @@ func TestMigrationBackfillsBudgets(t *testing.T) {
 	s := newStore(t, Options{})
 	fixture(t, s, "t1")
 	// 还原为只应用了 0001、0002 的旧库：任务 t1 没有预算行
-	if _, err := s.pool.Exec(ctx, undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions; ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
+	if _, err := s.pool.Exec(ctx, undo0008+undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions; ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
 		DELETE FROM schema_migrations WHERE version >= 3`); err != nil {
 		t.Fatal(err)
 	}
@@ -3117,7 +3117,7 @@ func TestMigration0006(t *testing.T) {
 	t.Run("从 0005 升级", func(t *testing.T) {
 		s := newStore(t, Options{})
 		fixture(t, s, "old")
-		if _, err := s.pool.Exec(ctx, undo0007+undo0006); err != nil {
+		if _, err := s.pool.Exec(ctx, undo0008+undo0007+undo0006); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := s.pool.Exec(ctx, `INSERT INTO users (username, username_key, password_hash) VALUES ('carol', 'carol', 'h');
@@ -4123,12 +4123,12 @@ func retrySubrunTask(t *testing.T, s *Store, taskID string) {
 func TestMigration0007(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t, Options{})
-	if n := count(t, s, "SELECT max(version) FROM schema_migrations"); n != 7 {
+	if n := count(t, s, "SELECT count(*) FROM schema_migrations WHERE version <= 7"); n != 7 {
 		t.Fatalf("应迁移到 0007，得到 %d", n)
 	}
 	gwFixture(t, s, "t1", 1000)
 	beginCall(t, s, "t1", "c1")
-	if _, err := s.pool.Exec(ctx, undo0007); err != nil {
+	if _, err := s.pool.Exec(ctx, undo0008+undo0007); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Migrate(ctx); err != nil {
@@ -5685,3 +5685,669 @@ func TestFailQueuedTurn(t *testing.T) {
 }
 
 // ==== M4 Plan 12 Task 7 段结束 ====
+// ==== M4 Plan 15 Task 7：exec 配额与 exec try（migration 0008） ====
+
+// undo0008 把库还原为只应用了 0007 的形状；回滚到更早迁移的测试先执行它（再执行 undo0007）。
+const undo0008 = `DROP INDEX environments_exec_attempt;
+	ALTER TABLE call_tries DROP COLUMN cpu_usec, DROP COLUMN wall_ms, DROP COLUMN queue_ms, DROP COLUMN exec_started_at;
+	DROP TABLE exec_quotas;
+	ALTER TABLE reservations DROP CONSTRAINT reservations_kind_check;
+	ALTER TABLE reservations ADD CONSTRAINT reservations_kind_check CHECK (kind IN ('money'));
+	DELETE FROM schema_migrations WHERE version >= 8;
+`
+
+var execPolicy = call.ExecPolicy{CountLimit: 3, CPULimitUsec: 1000, WallLimitMs: 10_000}
+
+// execBegin 以 att-<taskID> 登记一个 /v1/exec 调用（Tx1）。
+func execBegin(t *testing.T, s *Store, taskID, callID string) {
+	t.Helper()
+	res, err := s.BeginCall(context.Background(), call.BeginCallRequest{TaskID: taskID, CallID: callID, AttemptID: "att-" + taskID,
+		Fingerprint: "fp-" + callID, Endpoint: call.ExecEndpoint, Deadline: 2 * time.Minute})
+	if err != nil || res.Existing {
+		t.Fatalf("BeginCall %s: %+v / %v", callID, res, err)
+	}
+}
+
+var execRIDs atomic.Int64
+
+// execReq 是 att-<taskID> 的一次预留请求（新的 reservation 身份；wall 1000 ms、排队 7 ms、上限 3 次 try）。
+func execReq(taskID, callID string, est int64, p call.ExecPolicy) call.ReserveExecRequest {
+	return call.ReserveExecRequest{TaskID: taskID, CallID: callID, AttemptID: "att-" + taskID,
+		ReservationID: fmt.Sprintf("rsv-exec-%d", execRIDs.Add(1)), CPUEstimateUsec: est, WallMs: 1000, QueueMs: 7, MaxTries: 3, Policy: p}
+}
+
+func mustReserveExec(t *testing.T, s *Store, r call.ReserveExecRequest) call.ExecTry {
+	t.Helper()
+	tr, err := s.ReserveExec(context.Background(), r)
+	if err != nil {
+		t.Fatalf("ReserveExec %s: %v", r.CallID, err)
+	}
+	expectNoDBViolations(t, s)
+	return tr
+}
+
+func mustMarkStarting(t *testing.T, s *Store, tr call.ExecTry) {
+	t.Helper()
+	if err := s.MarkExecStarting(context.Background(), tr); err != nil {
+		t.Fatalf("MarkExecStarting %s#%d: %v", tr.CallID, tr.TryNo, err)
+	}
+}
+
+func settleExec(t *testing.T, s *Store, st call.ExecSettlement) call.CallRecord {
+	t.Helper()
+	rec, err := s.SettleExec(context.Background(), st)
+	if err != nil {
+		t.Fatalf("SettleExec %+v: %v", st, err)
+	}
+	expectNoDBViolations(t, s)
+	return rec
+}
+
+func execQuota(t *testing.T, s *Store, taskID string) call.ExecQuota {
+	t.Helper()
+	q, err := s.LoadExecQuota(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("LoadExecQuota %s: %v", taskID, err)
+	}
+	return q
+}
+
+// execDone 是一次正常结束（completed、已启动、CPU 已知、wall 100 ms）的结算。
+func execDone(tr call.ExecTry, cpu int64) call.ExecSettlement {
+	return call.ExecSettlement{Try: tr, Outcome: call.ExecCompleted, Started: true, CPUUsec: cpu, CPUKnown: true, WallMs: 100, QueueMs: 7,
+		ResultSHA256: srSHA("exec/" + tr.CallID), ResultSize: 10}
+}
+
+func stopExecEnv(t *testing.T, s *Store, envID string) {
+	t.Helper()
+	if _, err := s.MarkStopped(context.Background(), envID, time.Now()); err != nil {
+		t.Fatalf("MarkStopped %s: %v", envID, err)
+	}
+}
+
+// TestMigration0008：全新库迁移到 0008，业务表清单（agentboxTables）与库中的表一致；0007 的库（含持有预留的
+// money 调用）升级到 0008 后原有预留保留；reservations.kind 只接受 money 与 cpu。
+func TestMigration0008(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	if n := count(t, s, "SELECT count(*) FROM schema_migrations WHERE version <= 8"); n != 8 {
+		t.Fatalf("应依次应用 0001–0008，得到 %d 个", n)
+	}
+	rows, err := s.pool.Query(ctx, `SELECT c.relname::text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p') AND c.relname <> 'schema_migrations' ORDER BY 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	known := map[string]bool{}
+	for _, n := range agentboxTables {
+		known[n] = true
+	}
+	for _, n := range tables {
+		if !known[n] {
+			t.Errorf("表 %s 不在 agentboxTables 中", n)
+		}
+	}
+	if len(tables) != len(agentboxTables) {
+		t.Errorf("库中有 %d 张业务表 %v，agentboxTables 列出 %d 张", len(tables), tables, len(agentboxTables))
+	}
+
+	gwFixture(t, s, "t1", 1000)
+	beginCall(t, s, "t1", "c1")
+	mustReserve(t, s, "t1", "c1", 10)
+	if _, err := s.pool.Exec(ctx, undo0008); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM reservations WHERE kind = 'money' AND state = 'held' AND amount = 10"); n != 1 {
+		t.Fatal("升级后原有 money 预留应保留")
+	}
+	if _, err := s.pool.Exec(ctx, "UPDATE reservations SET kind = 'gpu'"); sqlState(err) != "23514" {
+		t.Fatalf("未知 kind 应违反检查约束，得到 %v", err)
+	}
+	execBegin(t, s, "t1", "x1")
+	mustReserveExec(t, s, execReq("t1", "x1", 100, execPolicy))
+	checkI3(t, s)
+}
+
+// TestExecReserve：首次预留以 Policy 建立 exec_quotas 行并写入 environments（kind exec）、cpu reservation、
+// call_tries 与 calls（in_flight、source exec）；同一 ReservationID 重放（COMMIT 丢失）返回同一 try、不重复预留；
+// 持有预留时新身份为 call_in_progress；已有配额行不随 Policy 变化；非 exec 端点为冲突；sub-run 内的 exec 记入
+// calls.subrun_id，reservation 不带 sub-run（配额任务级）。
+func TestExecReserve(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	gwFixture(t, s, "t1", 1000)
+	if _, err := s.LoadExecQuota(ctx, "t1"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("首次 exec 之前不应有配额行：%v", err)
+	}
+	execBegin(t, s, "t1", "x1")
+	req := execReq("t1", "x1", 300, execPolicy)
+	tr := mustReserveExec(t, s, req)
+	env1 := call.ExecEnvID("t1", "x1", 1)
+	want := call.ExecTry{Try: call.Try{TaskID: "t1", CallID: "x1", TryNo: 1, ReservationID: req.ReservationID, AttemptID: "att-t1"}, EnvID: env1}
+	if tr != want {
+		t.Fatalf("ReserveExec = %+v，期望 %+v", tr, want)
+	}
+	if !strings.HasPrefix(env1, "exec-") || len(env1) != 29 || call.ExecEnvID("t1", "x1", 2) == env1 || call.ExecEnvID("t1", "x1", 1) != env1 {
+		t.Fatalf("ExecEnvID 应确定性派生且随 try 变化：%s", env1)
+	}
+	if q := execQuota(t, s, "t1"); q != (call.ExecQuota{CountLimit: 3, CPULimitUsec: 1000, CPUReservedUsec: 300, WallLimitMs: 10_000}) {
+		t.Fatalf("配额 = %+v", q)
+	}
+	row := func(callID string) string {
+		t.Helper()
+		var out string
+		if err := s.pool.QueryRow(ctx, `SELECT concat_ws('|', e.kind, e.attempt_id, e.status, e.stopped_at IS NULL,
+				r.kind, r.amount, r.state, r.subrun_id IS NULL, t.state, t.env_id, t.queue_ms, t.exec_started_at IS NULL,
+				c.state, c.source, c.tries_used, COALESCE(c.subrun_id, '-'))
+			FROM call_tries t JOIN reservations r USING (reservation_id) JOIN environments e ON e.env_id = t.env_id
+			JOIN calls c ON c.task_id = t.task_id AND c.call_id = t.call_id
+			WHERE t.task_id = 't1' AND t.call_id = $1 ORDER BY t.try_no DESC LIMIT 1`, callID).Scan(&out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	if got := row("x1"); got != "exec|att-t1|creating|t|cpu|300|held|t|in_flight|"+env1+"|7|t|in_flight|exec|1|-" {
+		t.Fatalf("预留写入的行 = %s", got)
+	}
+
+	// COMMIT 丢失后以同一身份重试：同一 try，不重复预留（Policy 变化也不影响）。
+	again := req
+	again.Policy = call.ExecPolicy{CountLimit: 99, CPULimitUsec: 99, WallLimitMs: 99}
+	if tr2, err := s.ReserveExec(ctx, again); err != nil || tr2 != want {
+		t.Fatalf("重放 = %+v / %v", tr2, err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM reservations WHERE kind = 'cpu'"); n != 1 {
+		t.Fatalf("重放不应重复预留：%d 笔", n)
+	}
+	_, err := s.ReserveExec(ctx, execReq("t1", "x1", 300, execPolicy))
+	expectRejected(t, err, persistence.CodeCallInProgress)
+
+	// 已有配额行不随 Policy 变化。
+	execBegin(t, s, "t1", "x2")
+	mustReserveExec(t, s, execReq("t1", "x2", 200, call.ExecPolicy{CountLimit: 9, CPULimitUsec: 9000, WallLimitMs: 9}))
+	if q := execQuota(t, s, "t1"); q.CountLimit != 3 || q.CPULimitUsec != 1000 || q.WallLimitMs != 10_000 || q.CPUReservedUsec != 500 {
+		t.Fatalf("已有配额行不应被 Policy 改写：%+v", q)
+	}
+
+	// 非 exec 端点、未知调用、参数不全。
+	beginCall(t, s, "t1", "c1")
+	if _, err := s.ReserveExec(ctx, execReq("t1", "c1", 1, execPolicy)); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("chat 调用不能预留 exec：%v", err)
+	}
+	if _, err := s.ReserveExec(ctx, execReq("t1", "nope", 1, execPolicy)); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("未知调用应为 ErrNotFound：%v", err)
+	}
+	bad := execReq("t1", "x1", 1, execPolicy)
+	bad.ReservationID = ""
+	if _, err := s.ReserveExec(ctx, bad); !errors.Is(err, persistence.ErrInvalid) {
+		t.Fatalf("缺少 ReservationID 应为 ErrInvalid：%v", err)
+	}
+
+	// sub-run 内的 exec：calls.subrun_id 记归属，reservation 不带 sub-run；换归属为 fingerprint_mismatch。
+	mustStartSubrun(t, s, "t1", "att-t1", "st1")
+	if res, err := s.BeginCall(ctx, call.BeginCallRequest{TaskID: "t1", CallID: "x3", AttemptID: "att-t1", Fingerprint: "fp-x3",
+		Endpoint: call.ExecEndpoint, Deadline: 2 * time.Minute, SubrunID: "st1"}); err != nil || res.Existing {
+		t.Fatalf("sub-run 的 BeginCall: %+v / %v", res, err)
+	}
+	_, err = s.ReserveExec(ctx, execReq("t1", "x3", 100, execPolicy))
+	expectRejected(t, err, persistence.CodeFingerprintMismatch)
+	sr := execReq("t1", "x3", 100, execPolicy)
+	sr.SubrunID = "st1"
+	tr3 := mustReserveExec(t, s, sr)
+	if got := row("x3"); got != "exec|att-t1|creating|t|cpu|100|held|t|in_flight|"+tr3.EnvID+"|7|t|in_flight|exec|1|st1" {
+		t.Fatalf("sub-run exec 的行 = %s", got)
+	}
+}
+
+// TestExecCountQuota：exec_count 只在 SettleExec(Started) 中扣除（MarkExecStarting 不计数、重复结算不计数、
+// start_failed 不计数）；count_used 加在途 exec 达到上限为 exec_quota_exhausted。MarkExecStarting 幂等。
+func TestExecCountQuota(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	gwFixture(t, s, "t1", 1000)
+	p := call.ExecPolicy{CountLimit: 2, CPULimitUsec: 10_000, WallLimitMs: 100_000}
+	execBegin(t, s, "t1", "x1")
+	tr1 := mustReserveExec(t, s, execReq("t1", "x1", 100, p))
+	mustMarkStarting(t, s, tr1)
+	startedAt := func() time.Time {
+		t.Helper()
+		var at time.Time
+		if err := s.pool.QueryRow(ctx, "SELECT exec_started_at FROM call_tries WHERE task_id = 't1' AND call_id = 'x1' AND try_no = 1").Scan(&at); err != nil {
+			t.Fatal(err)
+		}
+		return at
+	}
+	first := startedAt()
+	mustMarkStarting(t, s, tr1)
+	if !startedAt().Equal(first) {
+		t.Fatal("重复的 MarkExecStarting 不应改写 exec_started_at")
+	}
+	if q := execQuota(t, s, "t1"); q.CountUsed != 0 {
+		t.Fatalf("MarkExecStarting 不计数：%+v", q)
+	}
+	settleExec(t, s, execDone(tr1, 50))
+	settleExec(t, s, execDone(tr1, 50)) // 重复结算（重放）不计数
+	if q := execQuota(t, s, "t1"); q.CountUsed != 1 || q.CPUSpentUsec != 50 || q.CPUReservedUsec != 0 {
+		t.Fatalf("结算后配额 = %+v", q)
+	}
+	if err := s.MarkExecStarting(ctx, tr1); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("已结算的 try 不能再标记启动：%v", err)
+	}
+
+	execBegin(t, s, "t1", "x2")
+	tr2 := mustReserveExec(t, s, execReq("t1", "x2", 100, p))
+	execBegin(t, s, "t1", "x3")
+	_, err := s.ReserveExec(ctx, execReq("t1", "x3", 100, p))
+	expectRejected(t, err, call.CodeExecQuotaExhausted) // 已用 1 + 在途 1 = 上限 2
+	settleExec(t, s, call.ExecSettlement{Try: tr2, Outcome: call.ExecStartFailed, CPUKnown: true, Error: "helper/execve: ENOENT"})
+	tr3 := mustReserveExec(t, s, execReq("t1", "x3", 100, p))
+	settleExec(t, s, execDone(tr3, 10))
+	if q := execQuota(t, s, "t1"); q.CountUsed != 2 {
+		t.Fatalf("start_failed 不计数，之后的启动计数：%+v", q)
+	}
+	execBegin(t, s, "t1", "x4")
+	_, err = s.ReserveExec(ctx, execReq("t1", "x4", 100, p))
+	expectRejected(t, err, call.CodeExecQuotaExhausted)
+	if n := count(t, s, "SELECT count(*) FROM environments WHERE kind = 'exec'"); n != 3 {
+		t.Fatalf("被拒绝的预留不应建立环境：%d 个 exec 环境", n)
+	}
+}
+
+// TestExecCPUWallBlocked：CPU 可用不足为 exec_cpu_exhausted；wall_spent + WallMs 超过上限为 exec_wall_exhausted；
+// CPU 读取失败按全额预留计入 spent（cpu_usec 为 NULL）；spent 超过上限如实记账并置 blocked，此后为 exec_blocked。
+func TestExecCPUWallBlocked(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	gwFixture(t, s, "t1", 1000)
+	p := call.ExecPolicy{CountLimit: 10, CPULimitUsec: 1000, WallLimitMs: 2500}
+	with := func(callID string, est, wall int64) call.ReserveExecRequest {
+		r := execReq("t1", callID, est, p)
+		r.WallMs = wall
+		return r
+	}
+	execBegin(t, s, "t1", "x1")
+	tr1 := mustReserveExec(t, s, with("x1", 600, 1000))
+	execBegin(t, s, "t1", "x2")
+	_, err := s.ReserveExec(ctx, with("x2", 600, 1000))
+	expectRejected(t, err, call.CodeExecCPUExhausted)
+	_, err = s.ReserveExec(ctx, with("x2", 300, 3000))
+	expectRejected(t, err, call.CodeExecWallExhausted)
+
+	st := execDone(tr1, 0)
+	st.CPUKnown, st.WallMs = false, 2000
+	settleExec(t, s, st)
+	if q := execQuota(t, s, "t1"); q.CPUSpentUsec != 600 || q.WallSpentMs != 2000 || q.Blocked {
+		t.Fatalf("CPU 未知按全额计入：%+v", q)
+	}
+	_, err = s.ReserveExec(ctx, with("x2", 300, 1000))
+	expectRejected(t, err, call.CodeExecWallExhausted) // 2000 + 1000 > 2500
+	tr2 := mustReserveExec(t, s, with("x2", 300, 500)) // 2000 + 500 = 2500
+	st = execDone(tr2, 900)
+	st.WallMs = 500
+	settleExec(t, s, st)
+	q := execQuota(t, s, "t1")
+	if q.CPUSpentUsec != 1500 || !q.Blocked || q.CPUAvailable() != -500 {
+		t.Fatalf("超额应如实记账并 blocked：%+v", q)
+	}
+	execBegin(t, s, "t1", "x3")
+	_, err = s.ReserveExec(ctx, with("x3", 0, 0))
+	expectRejected(t, err, call.CodeExecBlocked)
+	if n := count(t, s, "SELECT count(*) FROM call_tries WHERE task_id = 't1' AND ((call_id = 'x1' AND cpu_usec IS NULL) OR (call_id = 'x2' AND cpu_usec = 900))"); n != 2 {
+		t.Fatal("cpu_usec 应记录实测值，读取失败为 NULL")
+	}
+}
+
+// TestExecAccessAndRerun：访问撤销与 desired = cancel 拒绝预留（不留下任何行）与启动标记（不写 exec_started_at）；
+// unknown 之后重跑须先确认此前 try 的环境已 stopped_at（否则 call_in_progress）；cancelled 可在累计上限内重跑；
+// 期限已过为 call_deadline_exceeded。
+func TestExecAccessAndRerun(t *testing.T) {
+	ctx := context.Background()
+	for _, c := range []struct {
+		name, code string
+		apply      func(t *testing.T, s *Store)
+	}{
+		{"撤销", persistence.CodeAccessRevoked, func(t *testing.T, s *Store) {
+			if err := s.RevokeAttemptAccess(ctx, "att-t1", "stopping"); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"取消", persistence.CodeCancelRequested, func(t *testing.T, s *Store) {
+			if _, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "c1", BodyHash: []byte("h"), TaskID: "t1", Desired: "cancel"}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := newStore(t, Options{})
+			gwFixture(t, s, "t1", 1000)
+			execBegin(t, s, "t1", "x1")
+			execBegin(t, s, "t1", "x2")
+			tr := mustReserveExec(t, s, execReq("t1", "x1", 100, execPolicy))
+			c.apply(t, s)
+			_, err := s.ReserveExec(ctx, execReq("t1", "x2", 100, execPolicy))
+			expectRejected(t, err, c.code)
+			expectRejected(t, s.MarkExecStarting(ctx, tr), c.code)
+			if n := count(t, s, `SELECT count(*) FROM call_tries WHERE exec_started_at IS NOT NULL`) +
+				count(t, s, `SELECT count(*) FROM reservations WHERE call_id = 'x2'`) +
+				count(t, s, `SELECT count(*) FROM environments WHERE kind = 'exec' AND env_id <> $1`, tr.EnvID); n != 0 {
+				t.Fatalf("被拒绝时不应写入：%d 行", n)
+			}
+		})
+	}
+
+	s := newStore(t, Options{})
+	gwFixture(t, s, "t1", 1000)
+	execBegin(t, s, "t1", "x1")
+	tr1 := mustReserveExec(t, s, execReq("t1", "x1", 300, execPolicy))
+	mustMarkStarting(t, s, tr1)
+	rec := settleExec(t, s, call.ExecSettlement{Try: tr1, Outcome: call.ExecUnknown, Started: true, Error: "stop blocked"})
+	if rec.State != call.StateUnknown || rec.PossibleExternalDuplicate {
+		t.Fatalf("unknown 结算后的调用 = %+v", rec)
+	}
+	if q := execQuota(t, s, "t1"); q.CPUUnknownUsec != 300 || q.CPUSpentUsec != 0 || q.CPUReservedUsec != 0 || q.CountUsed != 1 {
+		t.Fatalf("unknown 的 CPU 全额转 unknown：%+v", q)
+	}
+	_, err := s.ReserveExec(ctx, execReq("t1", "x1", 300, execPolicy))
+	expectRejected(t, err, persistence.CodeCallInProgress) // try 1 的环境未确认停止
+	stopExecEnv(t, s, tr1.EnvID)
+	tr2 := mustReserveExec(t, s, execReq("t1", "x1", 300, execPolicy))
+	if tr2.TryNo != 2 || tr2.EnvID != call.ExecEnvID("t1", "x1", 2) {
+		t.Fatalf("重跑应为 try 2：%+v", tr2)
+	}
+	rec = settleExec(t, s, call.ExecSettlement{Try: tr2, Outcome: call.ExecCancelled, Started: true, CPUUsec: 40, CPUKnown: true})
+	if rec.State != call.StateFailed || rec.FailReason != call.CodeExecCancelled {
+		t.Fatalf("cancelled → failed{exec_cancelled}：%+v", rec)
+	}
+	stopExecEnv(t, s, tr2.EnvID)
+	tr3 := mustReserveExec(t, s, execReq("t1", "x1", 300, execPolicy))
+	settleExec(t, s, call.ExecSettlement{Try: tr3, Outcome: call.ExecCancelled, Started: true, CPUKnown: true})
+	stopExecEnv(t, s, tr3.EnvID)
+	_, err = s.ReserveExec(ctx, execReq("t1", "x1", 300, execPolicy))
+	expectRejected(t, err, persistence.CodeTriesExhausted)
+
+	if res, err := s.BeginCall(ctx, call.BeginCallRequest{TaskID: "t1", CallID: "late", AttemptID: "att-t1", Fingerprint: "fp",
+		Endpoint: call.ExecEndpoint, Deadline: time.Millisecond}); err != nil || res.Existing {
+		t.Fatalf("BeginCall: %+v / %v", res, err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	_, err = s.ReserveExec(ctx, execReq("t1", "late", 1, execPolicy))
+	expectRejected(t, err, persistence.CodeCallDeadlineExceeded)
+}
+
+// TestExecSettleOutcomes：五种结局的账本、reservation 桶、try 结果与 calls 状态；completed/timed_out 的结果与全部
+// 输出进入 scope_blobs(task)；重复结算（任意结局）幂等；非法组合为 ErrInvalid；I3 的 cpu 组能发现植入的偏差，
+// 且 money 组不受 cpu 预留影响。
+func TestExecSettleOutcomes(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	gwFixture(t, s, "t1", 1000)
+	p := call.ExecPolicy{CountLimit: 50, CPULimitUsec: 100_000, WallLimitMs: 1_000_000}
+	outs := []call.ExecOutput{{SHA256: srSHA("out/a"), Size: 3}, {SHA256: srSHA("out/b"), Size: 0}}
+	cases := []struct {
+		st                          call.ExecSettlement
+		state, fail, res, tryResult string
+		dCount, dSpent, dUnknown    int64
+	}{
+		{call.ExecSettlement{Outcome: call.ExecCompleted, Started: true, CPUUsec: 80, CPUKnown: true, Outputs: outs},
+			"completed", "", "settled", "ok", 1, 80, 0},
+		{call.ExecSettlement{Outcome: call.ExecTimedOut, Started: true, CPUUsec: 190, CPUKnown: true},
+			"completed", "", "settled", "ok", 1, 190, 0},
+		{call.ExecSettlement{Outcome: call.ExecCancelled, Started: true, CPUUsec: 120, CPUKnown: true},
+			"failed", call.CodeExecCancelled, "settled", "retryable", 1, 120, 0},
+		{call.ExecSettlement{Outcome: call.ExecStartFailed, CPUKnown: true},
+			"failed", call.CodeExecStartFailed, "settled", "fatal", 0, 0, 0},
+		{call.ExecSettlement{Outcome: call.ExecUnknown},
+			"unknown", "", "charged_unknown", "unknown", 0, 0, 200},
+	}
+	for i, c := range cases {
+		id := fmt.Sprintf("x%d", i)
+		execBegin(t, s, "t1", id)
+		tr := mustReserveExec(t, s, execReq("t1", id, 200, p))
+		before := execQuota(t, s, "t1")
+		st := c.st
+		st.Try, st.WallMs, st.QueueMs = tr, 50, 7
+		if st.Outcome == call.ExecCompleted || st.Outcome == call.ExecTimedOut {
+			st.ResultSHA256, st.ResultSize = srSHA("exec/"+id), 10
+		}
+		rec := settleExec(t, s, st)
+		if string(rec.State) != c.state || rec.FailReason != c.fail || (c.state == "completed") != (rec.ResultRef != "" && rec.ResultRef == st.ResultSHA256) {
+			t.Fatalf("%s：调用 = %+v", c.st.Outcome, rec)
+		}
+		var rstate, outcome string
+		var wall, queue int64
+		if err := s.pool.QueryRow(ctx, `SELECT r.state, t.outcome, t.wall_ms, t.queue_ms FROM reservations r JOIN call_tries t USING (reservation_id)
+			WHERE r.reservation_id = $1`, tr.ReservationID).Scan(&rstate, &outcome, &wall, &queue); err != nil {
+			t.Fatal(err)
+		}
+		if rstate != c.res || outcome != c.tryResult || wall != 50 || queue != 7 {
+			t.Fatalf("%s：reservation %s、try %s、wall %d、queue %d", c.st.Outcome, rstate, outcome, wall, queue)
+		}
+		after := execQuota(t, s, "t1")
+		if after.CountUsed-before.CountUsed != c.dCount || after.CPUSpentUsec-before.CPUSpentUsec != c.dSpent ||
+			after.CPUUnknownUsec-before.CPUUnknownUsec != c.dUnknown || before.CPUReservedUsec-after.CPUReservedUsec != 200 ||
+			after.WallSpentMs-before.WallSpentMs != 50 {
+			t.Fatalf("%s：配额 %+v → %+v", c.st.Outcome, before, after)
+		}
+		// 重复结算（换一个结局也一样）：原样返回，账本不变。
+		dup := execDone(tr, 9999)
+		if again, err := s.SettleExec(ctx, dup); err != nil || again.State != rec.State || again.ResultRef != rec.ResultRef {
+			t.Fatalf("%s：重复结算 = %+v / %v", c.st.Outcome, again, err)
+		}
+		if q := execQuota(t, s, "t1"); q != after {
+			t.Fatalf("%s：重复结算改动了配额 %+v → %+v", c.st.Outcome, after, q)
+		}
+	}
+	for _, sha := range []string{srSHA("exec/x0"), outs[0].SHA256, outs[1].SHA256, srSHA("exec/x1")} {
+		if ok, err := s.BlobAuthorized(ctx, "t1", sha); err != nil || !ok {
+			t.Fatalf("结果与输出 %s 应授权到任务 scope：%v / %v", sha, ok, err)
+		}
+	}
+
+	execBegin(t, s, "t1", "bad")
+	tr := mustReserveExec(t, s, execReq("t1", "bad", 10, p))
+	for name, st := range map[string]call.ExecSettlement{
+		"start_failed 却已启动": {Try: tr, Outcome: call.ExecStartFailed, Started: true},
+		"completed 缺结果":     {Try: tr, Outcome: call.ExecCompleted, Started: true, CPUKnown: true},
+		"cancelled 带输出":     {Try: tr, Outcome: call.ExecCancelled, Started: true, Outputs: outs},
+		"负的 CPU":            {Try: tr, Outcome: call.ExecCancelled, Started: true, CPUUsec: -1, CPUKnown: true},
+		"未知结局":              {Try: tr, Outcome: "exploded"},
+		"输出 sha 不合法":        {Try: tr, Outcome: call.ExecCompleted, ResultSHA256: srSHA("r"), Outputs: []call.ExecOutput{{SHA256: "x"}}},
+	} {
+		if _, err := s.SettleExec(ctx, st); !errors.Is(err, persistence.ErrInvalid) {
+			t.Fatalf("%s 应为 ErrInvalid：%v", name, err)
+		}
+	}
+	wrong := tr
+	wrong.ReservationID = "rsv-other"
+	if _, err := s.SettleExec(ctx, call.ExecSettlement{Try: wrong, Outcome: call.ExecUnknown}); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("reservation 不符应为冲突：%v", err)
+	}
+
+	// I3 分 kind：money 组不受 cpu 预留影响（上面每步都已检查）；cpu 组发现植入的偏差，恰报告一次。
+	if _, err := s.pool.Exec(ctx, "UPDATE exec_quotas SET cpu_reserved_usec = cpu_reserved_usec + 1 WHERE task_id = 't1'"); err != nil {
+		t.Fatal(err)
+	}
+	vs, err := s.DBViolations(ctx)
+	if err != nil || len(vs) != 1 || vs[0].ID != "I3" || !strings.Contains(vs[0].Detail, "cpu_reserved") {
+		t.Fatalf("应恰报告一条 cpu 组的 I3：%+v / %v", vs, err)
+	}
+}
+
+// TestExecReserveConcurrent：两个 goroutine 并发为同一任务的不同调用预留（首次预留同时建立配额行），配额只够一次
+// （次数或 CPU）→ 恰一个成功，另一个得到对应拒绝码；配额与 I3 一致。
+func TestExecReserveConcurrent(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	for round := 0; round < 6; round++ {
+		taskID := fmt.Sprintf("t%d", round)
+		gwFixture(t, s, taskID, 1000)
+		p, code := call.ExecPolicy{CountLimit: 1, CPULimitUsec: 10_000, WallLimitMs: 100_000}, call.CodeExecQuotaExhausted
+		if round%2 == 1 {
+			p, code = call.ExecPolicy{CountLimit: 10, CPULimitUsec: 1000, WallLimitMs: 100_000}, call.CodeExecCPUExhausted
+		}
+		execBegin(t, s, taskID, "a")
+		execBegin(t, s, taskID, "b")
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		errs := make([]error, 2)
+		for i, id := range []string{"a", "b"} {
+			wg.Add(1)
+			go func(i int, id string) {
+				defer wg.Done()
+				<-start
+				_, errs[i] = s.ReserveExec(ctx, execReq(taskID, id, 600, p))
+			}(i, id)
+		}
+		close(start)
+		wg.Wait()
+		ok := 0
+		for _, err := range errs {
+			if err == nil {
+				ok++
+				continue
+			}
+			expectRejected(t, err, code)
+		}
+		if ok != 1 {
+			t.Fatalf("第 %d 轮应恰一个成功：%v", round, errs)
+		}
+		if q := execQuota(t, s, taskID); q.CPUReservedUsec != 600 {
+			t.Fatalf("第 %d 轮配额 = %+v", round, q)
+		}
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestExecLedgerConvert（D10）：启动账本转换按 kind 入账——money 的 held → budgets.unknown；cpu 的 held →
+// exec_quotas.cpu_unknown（cpu_reserved 扣回），已写 exec_started_at 的 try 保守计入 exec_count；budgets 不受 cpu
+// 影响；只有 money 调用标记 possible_external_duplicate；转换后两组 I3 均通过，再次转换为空操作；unknown 的 exec
+// 重跑仍须先确认旧环境停止。
+func TestExecLedgerConvert(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	gwFixture(t, s, "t1", 1000)
+	beginCall(t, s, "t1", "c1")
+	mustReserve(t, s, "t1", "c1", 300) // money，持有 300
+	execBegin(t, s, "t1", "x1")
+	tr1 := mustReserveExec(t, s, execReq("t1", "x1", 400, execPolicy)) // cpu，已标记启动
+	mustMarkStarting(t, s, tr1)
+	execBegin(t, s, "t1", "x2")
+	mustReserveExec(t, s, execReq("t1", "x2", 250, execPolicy)) // cpu，未启动
+	execBegin(t, s, "t1", "x3")
+	tr3 := mustReserveExec(t, s, execReq("t1", "x3", 100, execPolicy)) // 已结算，不属于转换
+	settleExec(t, s, execDone(tr3, 60))
+
+	got, err := s.ConvertLedger(ctx)
+	if want := (recovery.LedgerConversion{Reservations: 3, Calls: 3, UnknownMicro: 300}); err != nil || got != want {
+		t.Fatalf("ConvertLedger = %+v / %v，期望 %+v", got, err, want)
+	}
+	expectNoDBViolations(t, s)
+	checkI3(t, s)
+	expectBudget(t, s, "t1", call.Budget{LimitMicro: 1000, UnknownMicro: 300})
+	wantQ := call.ExecQuota{CountLimit: 3, CountUsed: 2, CPULimitUsec: 1000, CPUSpentUsec: 60, CPUUnknownUsec: 650, WallLimitMs: 10_000, WallSpentMs: 100}
+	if q := execQuota(t, s, "t1"); q != wantQ {
+		t.Fatalf("配额 = %+v，期望 %+v", q, wantQ)
+	}
+	if rec, _, err := s.LoadCall(ctx, "t1", "c1"); err != nil || rec.State != call.StateUnknown || !rec.PossibleExternalDuplicate {
+		t.Fatalf("money 调用 = %+v / %v", rec, err)
+	}
+	rec, tries, err := s.LoadCall(ctx, "t1", "x1")
+	if err != nil || rec.State != call.StateUnknown || rec.PossibleExternalDuplicate || len(tries) != 1 || tries[0].Outcome != "unknown" ||
+		tries[0].Error != LedgerRestartError {
+		t.Fatalf("exec 调用 = %+v，tries %+v / %v", rec, tries, err)
+	}
+
+	again, err := s.ConvertLedger(ctx)
+	if err != nil || again != (recovery.LedgerConversion{}) {
+		t.Fatalf("再次转换应为空操作：%+v / %v", again, err)
+	}
+	if q := execQuota(t, s, "t1"); q != wantQ {
+		t.Fatalf("再次转换改动了配额：%+v", q)
+	}
+	_, err = s.ReserveExec(ctx, execReq("t1", "x1", 100, execPolicy))
+	expectRejected(t, err, persistence.CodeCallInProgress)
+	stopExecEnv(t, s, tr1.EnvID)
+	if tr := mustReserveExec(t, s, execReq("t1", "x1", 100, execPolicy)); tr.TryNo != 2 {
+		t.Fatalf("确认停止后应新建 try 2：%+v", tr)
+	}
+}
+
+// TestInvariantI12：[A] exec_started_at 晚于所属 attempt 的 revoked_at 即违例（撤销前写入的不是）；[B] 已撤销
+// attempt 的 exec 环境超过停止期限仍无 stopped_at 且未记隔离即违例（期限内、已停止、已隔离的不是）。存活 attempt
+// 的任务环境与 exec 环境并存不违反 I2。
+func TestInvariantI12(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	i12 := func() []string {
+		t.Helper()
+		vs, err := s.DBViolations(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, v := range vs {
+			if v.ID != "I12" {
+				t.Fatalf("意外的违例：%+v", v)
+			}
+			out = append(out, v.Class+" "+v.Detail)
+		}
+		return out
+	}
+
+	gwFixture(t, s, "t1", 1000)
+	execBegin(t, s, "t1", "x1")
+	execBegin(t, s, "t1", "x2")
+	tr1 := mustReserveExec(t, s, execReq("t1", "x1", 10, execPolicy))
+	mustMarkStarting(t, s, tr1)
+	tr2 := mustReserveExec(t, s, execReq("t1", "x2", 10, execPolicy)) // 任务环境 + 两个 exec 环境并存：不违反 I2
+	if err := s.RevokeAttemptAccess(ctx, "att-t1", "stopping"); err != nil {
+		t.Fatal(err)
+	}
+	if vs := i12(); len(vs) != 0 {
+		t.Fatalf("撤销前标记的启动与期限内的环境不是违例：%v", vs)
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE call_tries SET exec_started_at = (SELECT revoked_at FROM attempt_access WHERE attempt_id = 'att-t1')
+		+ interval '1 second' WHERE task_id = 't1' AND call_id = 'x2'`); err != nil {
+		t.Fatal(err)
+	}
+	if vs := i12(); len(vs) != 1 || !strings.HasPrefix(vs[0], "A ") || !strings.Contains(vs[0], "x2") {
+		t.Fatalf("I12 [A] 应恰报告 x2：%v", vs)
+	}
+	stopExecEnv(t, s, tr1.EnvID)
+	stopExecEnv(t, s, tr2.EnvID)
+	if _, err := s.pool.Exec(ctx, "UPDATE call_tries SET exec_started_at = NULL WHERE task_id = 't1' AND call_id = 'x2'"); err != nil {
+		t.Fatal(err)
+	}
+
+	gwFixture(t, s, "t2", 1000)
+	var trs []call.ExecTry
+	for _, id := range []string{"y1", "y2", "y3"} {
+		execBegin(t, s, "t2", id)
+		trs = append(trs, mustReserveExec(t, s, execReq("t2", id, 10, execPolicy)))
+	}
+	if err := s.RevokeAttemptAccess(ctx, "att-t2", "stopping"); err != nil {
+		t.Fatal(err)
+	}
+	stopExecEnv(t, s, trs[0].EnvID)
+	if err := s.RecordQuarantine(ctx, resource.Quarantine{Layer: "cgroup", Path: "/sys/fs/cgroup/agentbox/" + trs[1].EnvID, Reason: "stop_blocked"}); err != nil {
+		t.Fatal(err)
+	}
+	if vs := i12(); len(vs) != 0 {
+		t.Fatalf("停止期限内不是违例：%v", vs)
+	}
+	if _, err := s.pool.Exec(ctx, "UPDATE attempt_access SET revoked_at = now() - interval '2 minutes' WHERE attempt_id = 'att-t2'"); err != nil {
+		t.Fatal(err)
+	}
+	if vs := i12(); len(vs) != 1 || !strings.HasPrefix(vs[0], "B ") || !strings.Contains(vs[0], trs[2].EnvID) {
+		t.Fatalf("I12 [B] 应恰报告 %s：%v", trs[2].EnvID, vs)
+	}
+}
+
+// ==== M4 Plan 15 Task 7 段结束 ====

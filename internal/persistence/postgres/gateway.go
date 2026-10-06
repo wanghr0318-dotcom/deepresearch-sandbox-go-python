@@ -639,33 +639,45 @@ func (s *Store) ResetResolving(ctx context.Context) (int, error) {
 const LedgerRestartError = "server_restart"
 
 // ConvertLedger 是启动账本转换（实现 recovery.Store；规格 §14.1 第 4 步），在单个事务中完成：
-//   - 全部 held 的 reservation → charged_unknown，所属任务账本 reserved -= amount、unknown += amount（I3 保持）；
-//     带 subrun_id 的另对 sub-run 层账本做同样调整（两层 I3）；
+//   - 全部 held 的 reservation → charged_unknown，按 kind 入账（D10）：money → 所属任务账本 reserved -= amount、
+//     unknown += amount（I3 money 组保持），带 subrun_id 的另对 sub-run 层账本做同样调整（两层 I3）；cpu →
+//     exec_quotas.cpu_reserved -= amount、cpu_unknown += amount（I3 cpu 组保持），该 try 已写 exec_started_at 时
+//     exec_count_used += 1（崩溃时处于"启动中"的 exec 保守计入）；
 //   - 对应的 in_flight try → settled / unknown（error = server_restart）；
-//   - 全部 in_flight 调用 → unknown（deadline_at 不变）；持有预留的调用标记 possible_external_duplicate
-//     （上一进程的请求可能已经发出）。
+//   - 全部 in_flight 调用 → unknown（deadline_at 不变）；持有 money 预留的调用标记 possible_external_duplicate
+//     （上一进程的上游请求可能已经发出；exec 没有外部副作用，其重跑由"旧环境已停止"把关）。
 //
 // 重启前的进程已不存在，这些 try 不会再结算；转换后调用按 unknown 处理：期限内可在累计上限内新建 try，超期为
-// call_deadline_exceeded。幂等：没有 held 与 in_flight 时不改动任何行。锁顺序 budgets → calls → reservations。
+// call_deadline_exceeded。幂等：没有 held 与 in_flight 时不改动任何行。锁顺序 budgets → subrun_budgets →
+// exec_quotas → calls → reservations。UnknownMicro 只计 money。
 func (s *Store) ConvertLedger(ctx context.Context) (recovery.LedgerConversion, error) {
 	var out recovery.LedgerConversion
 	err := s.run(ctx, "ConvertLedger", "ledger", func(ctx context.Context, tx pgx.Tx) error {
 		out = recovery.LedgerConversion{}
 		if _, err := tx.Exec(ctx, `UPDATE budgets b SET reserved_micro = b.reserved_micro - h.total, unknown_micro = b.unknown_micro + h.total
-			FROM (SELECT task_id, sum(amount) AS total FROM reservations WHERE state = 'held' GROUP BY task_id) h
+			FROM (SELECT task_id, sum(amount) AS total FROM reservations WHERE state = 'held' AND kind = 'money' GROUP BY task_id) h
 			WHERE b.task_id = h.task_id`); err != nil {
 			return err
 		}
 		// sub-run 层同步（§9.6）：按 reservation 的归属分组，与 task 层同一事务（锁顺序 budgets → subrun_budgets）。
 		if _, err := tx.Exec(ctx, `UPDATE subrun_budgets b SET reserved_micro = b.reserved_micro - h.total, unknown_micro = b.unknown_micro + h.total
-			FROM (SELECT task_id, subrun_id, sum(amount) AS total FROM reservations WHERE state = 'held' AND subrun_id IS NOT NULL
+			FROM (SELECT task_id, subrun_id, sum(amount) AS total FROM reservations WHERE state = 'held' AND kind = 'money' AND subrun_id IS NOT NULL
 				GROUP BY task_id, subrun_id) h
 			WHERE b.task_id = h.task_id AND b.subrun_id = h.subrun_id`); err != nil {
 			return err
 		}
+		// exec 配额（D10）：cpu 预留转 unknown；已标记启动的在途 exec 保守计入次数。
+		if _, err := tx.Exec(ctx, `UPDATE exec_quotas q SET cpu_reserved_usec = q.cpu_reserved_usec - h.total,
+				cpu_unknown_usec = q.cpu_unknown_usec + h.total, exec_count_used = q.exec_count_used + h.started
+			FROM (SELECT r.task_id, sum(r.amount) AS total, count(*) FILTER (WHERE t.exec_started_at IS NOT NULL) AS started
+				FROM reservations r JOIN call_tries t ON t.reservation_id = r.reservation_id
+				WHERE r.state = 'held' AND r.kind = 'cpu' GROUP BY r.task_id) h
+			WHERE q.task_id = h.task_id`); err != nil {
+			return err
+		}
 		tag, err := tx.Exec(ctx, `UPDATE calls c SET state = 'unknown',
 				possible_external_duplicate = c.possible_external_duplicate OR EXISTS (SELECT 1 FROM reservations r
-					WHERE r.task_id = c.task_id AND r.call_id = c.call_id AND r.state = 'held')
+					WHERE r.task_id = c.task_id AND r.call_id = c.call_id AND r.state = 'held' AND r.kind = 'money')
 			WHERE c.state = 'in_flight'`)
 		if err != nil {
 			return err
@@ -676,8 +688,8 @@ func (s *Store) ConvertLedger(ctx context.Context) (recovery.LedgerConversion, e
 			LedgerRestartError); err != nil {
 			return err
 		}
-		return tx.QueryRow(ctx, `WITH x AS (UPDATE reservations SET state = 'charged_unknown' WHERE state = 'held' RETURNING amount)
-			SELECT count(*), COALESCE(sum(amount), 0)::bigint FROM x`).Scan(&out.Reservations, &out.UnknownMicro)
+		return tx.QueryRow(ctx, `WITH x AS (UPDATE reservations SET state = 'charged_unknown' WHERE state = 'held' RETURNING kind, amount)
+			SELECT count(*), COALESCE(sum(amount) FILTER (WHERE kind = 'money'), 0)::bigint FROM x`).Scan(&out.Reservations, &out.UnknownMicro)
 	})
 	return out, err
 }
