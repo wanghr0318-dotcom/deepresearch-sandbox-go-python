@@ -25,6 +25,9 @@ from chatagent.config import TurnConfig
 from chatagent.events import Emitter
 from chatagent.model import ModelReply, assistant_message, call_model
 from chatagent.prompts import (
+    FINISH_SKIPPED,
+    NO_MATERIAL_REPLY,
+    answer_text,
     finish_instruction,
     history_messages,
     orchestrator_system,
@@ -38,10 +41,13 @@ from chatagent.report import (
     split_title,
 )
 from chatagent.state import SessionMemory, TurnState
+from chatagent.stop import can_finish, stop_card, stop_summary
 from chatagent.subtopic import RUN_SUBTOPIC, ResearchSubtopic, run_subtopic
 
 ORCH = "orch"
 ASK_STEP = "ask"
+STOP_STEP = "stop"
+PARTIAL_NOTE = "部分研究"
 MAX_REFS = 1024
 THINKING_MAX_CHARS = 600
 SKIPPED_FOR_QUESTION = "已跳过：等待用户回答"
@@ -131,8 +137,17 @@ class Agent:
 
     # ---- 入口 ----
 
-    async def run(self) -> LoopOutcome:
+    async def run(
+        self, *, finish: bool = False, answer: dict[str, Any] | None = None
+    ) -> LoopOutcome:
+        """finish：用户要求立即写报告（directive finish_now）；answer：directive answer。"""
         try:
+            if finish:
+                out = await self._apply_finish()
+                if out is not None:
+                    return out
+            if answer is not None:
+                await self._apply_answer(answer)
             return await self._run()
         except _Pause as p:
             return LoopOutcome("paused", checkpoint_id=p.paused.checkpoint_id)
@@ -143,10 +158,22 @@ class Agent:
         """压缩状态 → 写 checkpoint；之后宿主已请求暂停时返回 Paused。"""
         st = self.state
         st.compact()
-        cp = await self.ctx.checkpoint(step_id, state=st.to_json(), refs=st.refs[-MAX_REFS:])
+        await self.ctx.checkpoint(step_id, state=st.to_json(), refs=st.refs[-MAX_REFS:])
         if self.ctx.should_pause():
-            return Paused(cp)
+            return await self._stop()
         return None
+
+    async def _stop(self) -> Paused:
+        """宿主请求暂停：停止摘要（模型调用在 "stop" checkpoint 之前，call id 计数器随之保存）
+        → "stop" checkpoint → turn_stopped 停止卡。"""
+        st = self.state
+        st.stops += 1
+        findings = await stop_summary(self.ctx, self.gw, st, self.cfg)
+        st.stop_findings = findings
+        st.compact()
+        cp = await self.ctx.checkpoint(STOP_STEP, state=st.to_json(), refs=st.refs[-MAX_REFS:])
+        await self.emit.turn_stopped(stop_card(st), findings, can_finish(st))
+        return Paused(cp)
 
     async def checkpoint(self, step_id: str) -> None:
         paused = await self.commit(step_id)
@@ -177,6 +204,9 @@ class Agent:
                 if out is not None:
                     return out
                 continue
+            if st.restore_note:  # 恢复说明：在下一次编排模型调用之前追加到转录末尾
+                st.messages.append({"role": "user", "content": st.restore_note})
+                st.restore_note = None
             self._maybe_close()
             tools = None if st.closing else self.registry.schemas(self._available())
             reply = await asyncio.to_thread(
@@ -285,6 +315,71 @@ class Agent:
         )
         return LoopOutcome("awaiting", checkpoint_id=cp, question_id=pq["question_id"])
 
+    # ---- 停止之后的指令 ----
+
+    async def _apply_finish(self) -> LoopOutcome | None:
+        """立即写报告：未完成的计划项与子主题 → skipped，待执行的编排工具调用以"已跳过"作答，
+        标记部分研究；随后的编排调用带收尾指令且不带工具。没有任何材料时直接回复（不调用模型）。
+
+        幂等：崩溃后的新 attempt 再次带 finish_now 时不重复。"""
+        st = self.state
+        if not st.finish_requested:
+            st.finish_requested, st.partial = True, True
+            st.stop_findings = None
+            if PARTIAL_NOTE not in st.notes:
+                st.notes.append(PARTIAL_NOTE)
+            skipped = []
+            for item in st.todo:
+                if item.status != "done":
+                    item.status = "skipped"
+                sub = st.subtopics.get(item.id)
+                if sub is not None and sub.status in ("pending", "running"):
+                    sub.status = "skipped"
+                    skipped.append((sub, item.title))
+            st.phase, st.current_subtopic = "orchestrating", None
+            st.pending_question = None
+            for tc in pending_calls(st.messages):
+                event_id = f"{ORCH}:{_tool_count(st.messages) + 1}"
+                name, raw = tc["function"]["name"], tc["function"]["arguments"]
+                result = ToolResult(content=FINISH_SKIPPED, ok=False)
+                if name == "research_subtopic":  # 已完成的子主题仍把摘要交给编排模型
+                    tctx = self._tool_ctx(ORCH, st.messages, None)
+                    result = self.registry.dispatch(name, raw, tctx)
+                st.messages.append(_tool_message(tc["id"], name, result.content))
+                await self.emit.tool_result(ORCH, event_id, name, result, None, _args(raw))
+            if st.todo:
+                await self.emit.todo(ORCH, st.todo)
+            for sub, title in skipped:
+                await self.emit.subtopic(sub, title)
+        if self._has_material():
+            return None
+        st.phase = "done"
+        await self.emit.assistant_text(NO_MATERIAL_REPLY)
+        return LoopOutcome(
+            "reply", text=NO_MATERIAL_REPLY, reply=NO_MATERIAL_REPLY, memo=NO_MATERIAL_REPLY
+        )
+
+    async def _apply_answer(self, directive: dict[str, Any]) -> None:
+        """用户回答：作为提问调用的 tool 消息恢复同一位置；question_id 须与待答的提问一致。"""
+        st = self.state
+        qid = directive.get("question_id")
+        pq = st.pending_question
+        if pq is None and qid in st.answered:  # 崩溃后的新 attempt 再次带同一回答
+            return
+        if pq is None or pq.get("question_id") != qid:
+            want = pq.get("question_id") if pq is not None else None
+            raise WorkerFailure("invalid_directive", f"回答的提问 {qid!r} 不是待答的提问 {want!r}")
+        text = answer_text(pq.get("questions") or [], directive.get("answers") or [])
+        st.messages.append(_tool_message(pq["tool_call_id"], "ask_user", text))
+        index = str(qid).rsplit("-", 1)[-1]  # q-<step>-<call_index>：与 tool_call 事件同一 id
+        event_id = f"{ORCH}:{index}" if index.isdigit() else f"{ORCH}:{_tool_count(st.messages)}"
+        preview = {"kind": "text", "text": text[:THINKING_MAX_CHARS]}
+        await self.emit.tool_result(
+            ORCH, event_id, "ask_user", ToolResult(content=text, preview=preview), None
+        )
+        st.pending_question = None
+        st.answered.append(str(qid))
+
     # ---- 工具执行（编排与子主题共用） ----
 
     def _tool_ctx(
@@ -378,7 +473,8 @@ class Agent:
     def _has_material(self) -> bool:
         st = self.state
         done = any(s.status == "done" for s in st.subtopics.values())
-        return done or any(not s.origin for s in st.sources.all())
+        remembered = {s.origin for s in self.memory.sources}  # carryover 的来源也算材料
+        return done or any(not s.origin or s.origin not in remembered for s in st.sources.all())
 
     async def _final(self, content: str) -> LoopOutcome:
         st = self.state

@@ -112,6 +112,10 @@ class TurnState:
     notes: list[str] = field(default_factory=list)  # "已达工具额度（30/30）"、"部分研究"等
     refs: list[str] = field(default_factory=list)  # 累积的 Gateway 结果 blob，去重保序
     closing: str | None = None  # 已追加的收尾指令的原因（user_finish | budget | rounds）
+    task_id: str = ""  # 写出该状态的 turn（恢复种子来自另一个 task 时与本 task 不同）
+    stop_findings: str | None = None  # 停止时的"目前发现"（"stop" checkpoint）
+    restore_note: str | None = None  # 恢复说明：下一次编排模型调用之前追加到转录末尾
+    answered: list[str] = field(default_factory=list)  # 已回答的 question_id（answer 幂等）
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -133,6 +137,10 @@ class TurnState:
             "notes": list(self.notes),
             "refs": list(self.refs),
             "closing": self.closing,
+            "task_id": self.task_id,
+            "stop_findings": self.stop_findings,
+            "restore_note": self.restore_note,
+            "answered": list(self.answered),
         }
 
     @classmethod
@@ -165,6 +173,11 @@ class TurnState:
         _check(isinstance(notes, list) and all(isinstance(n, str) for n in notes), "notes")
         _check(isinstance(refs, list) and all(isinstance(r, str) for r in refs), "refs")
         _check(isinstance(todo, list), "todo")
+        task_id, answered = d.get("task_id", ""), d.get("answered", [])
+        _check(isinstance(task_id, str), "task_id")
+        _check(isinstance(answered, list) and all(isinstance(a, str) for a in answered), "answered")
+        for key in ("stop_findings", "restore_note"):
+            _check(d.get(key) is None or isinstance(d.get(key), str), key)
         return cls(
             phase=d["phase"],
             route=d.get("route"),
@@ -183,6 +196,10 @@ class TurnState:
             notes=list(notes),
             refs=list(refs),
             closing=d.get("closing"),
+            task_id=task_id,
+            stop_findings=d.get("stop_findings"),
+            restore_note=d.get("restore_note"),
+            answered=list(answered),
         )
 
     def add_refs(self, shas: Any) -> None:

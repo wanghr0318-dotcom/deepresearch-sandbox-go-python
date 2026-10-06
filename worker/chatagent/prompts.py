@@ -206,3 +206,53 @@ _DEFAULT_STRATEGY = """- 先宽后窄：先用概括性查询了解全貌，再�
 
 def tool_names(schemas: list[dict[str, Any]]) -> list[str]:
     return [s["function"]["name"] for s in schemas]
+
+
+# ---- 停止之后的控制（Task 5） ----
+
+FINISH_SKIPPED = "已跳过：用户要求立即写报告"
+UNANSWERED_ON_RESTORE = "用户未回答（研究已恢复）：按默认假设继续，并在报告“背景与范围”中写明。"
+NO_MATERIAL_REPLY = "尚无可用材料，未生成报告。"
+
+
+def restore_instruction(budget: int) -> str:
+    """恢复种子追加到编排转录末尾的说明（user 消息）。"""
+    return f"这是对之前被停止研究的恢复，获得新的 {budget} 次工具额度；不要重复已完成的子主题。"
+
+
+def answer_text(questions: list[dict[str, Any]], answers: list[Any]) -> str:
+    """用户对 ask_user 的回答 → 该提问调用的 tool 消息："用户的回答：\n1. 问题 → 选项"。
+
+    answers 按 openapi Answer：{question_id: 题号 "1"…, choice | other}；顺序按题号。"""
+    by_id: dict[str, Any] = {}
+    for a in answers:
+        if isinstance(a, dict) and isinstance(a.get("question_id"), str):
+            by_id.setdefault(a["question_id"], a)
+    lines = ["用户的回答："]
+    for i, q in enumerate(questions, 1):
+        a = by_id.get(str(i))
+        if a is None:
+            said = "（未回答）"
+        elif isinstance(a.get("other"), str) and a["other"].strip():
+            said = "其他：" + " ".join(a["other"].split())[:500]
+        else:
+            said = str(a.get("choice", "")).strip()[:200] or "（未回答）"
+        lines.append(f"{i}. {q.get('question', '')} → {said}")
+    return "\n".join(lines)
+
+
+def carryover_lines(state: TurnState) -> str:
+    """被取代 turn 的发现：已完成子主题的标题与摘要、来源列表（编号为该 turn 的编号，由调用方
+    在并入本轮来源表后改写）。没有任何发现时为空串。"""
+    lines: list[str] = []
+    for item in state.todo:
+        sub = state.subtopics.get(item.id)
+        if sub is not None and sub.status == "done" and sub.summary:
+            lines.append(f"### 子主题「{item.title}」\n{sub.summary.strip()}")
+    srcs = [s for s in state.sources.all() if not s.origin]
+    if srcs:
+        lines.append(
+            "来源（本轮可用 read_source(n) 重读，也可直接以 [n] 引用）：\n"
+            + "\n".join(f"- [{s.n}] {_clip(s.title or s.url, 80)}" for s in srcs)
+        )
+    return "\n\n".join(lines)

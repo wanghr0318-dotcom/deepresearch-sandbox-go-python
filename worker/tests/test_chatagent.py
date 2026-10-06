@@ -673,3 +673,451 @@ def test_event_tool_call_ids_are_unique_even_when_model_ids_repeat():
     assert call_ids == result_ids == ["orch:1", "orch:2"]
     tool_msgs = [m for m in model.bodies("orch")[-1]["messages"] if m["role"] == "tool"]
     assert [m["tool_call_id"] for m in tool_msgs] == ["web_fetch:0", "web_fetch:0"]
+
+
+# ---- 停止、继续、立即写报告、回答、恢复与会话状态（Task 5） ----
+
+from collections import Counter
+
+from chatagent.app import carryover_context, seed_restore
+from chatagent.state import MEMORY_LIMIT_BYTES
+from chatagent.stop import NO_FINDINGS
+
+STOP_FINDINGS = "目前发现：硫化物路线领先 [1]。量产时间尚待核实。"
+
+
+def pausing_host(step: str, nth: int, attempt: str = "a-1") -> SessionHost:
+    """在 attempt 的第 nth 个 step 的 checkpoint 之后送出 pause（checkpoint 结果之前到达）。"""
+    seen: Counter[str] = Counter()
+
+    def hook(event: dict[str, Any], host: SessionHost) -> None:
+        if event["type"] == "checkpoint" and event.get("attempt_id") == attempt:
+            seen[event["step_id"]] += 1
+            if event["step_id"] == step and seen[step] == nth:
+                host.send(
+                    {
+                        "type": "pause",
+                        "v": 1,
+                        "attempt_id": attempt,
+                        "reason": "user",
+                        "grace_ms": 0,
+                    }
+                )
+
+    return SessionHost(on_event=hook)
+
+
+def resume_from(cp: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "checkpoint_id": cp["checkpoint_id"],
+        "step_id": cp["step_id"],
+        "state": cp["state"],
+        "refs": cp["refs"],
+    }
+
+
+def continue_turn(
+    model: ScriptedModel,
+    cp: dict[str, Any],
+    gw: ScriptedGateway,
+    *,
+    task: str = "t-1",
+    attempt: str = "a-2",
+    config: dict[str, Any] | None = None,
+    host: SessionHost | None = None,
+    **fields: Any,
+) -> tuple[int, list[dict[str, Any]], ScriptedGateway]:
+    """以 checkpoint 为 resume 开始一个新 attempt（继续、指令、恢复种子）。"""
+    host = host or SessionHost()
+    attempt_no = fields.pop("attempt_no", 2)
+    start_task(
+        host,
+        task,
+        attempt,
+        config or RESEARCH_CONFIG,
+        attempt_no=attempt_no,
+        resume=resume_from(cp),
+        **fields,
+    )
+    return run_turn(model, gw=gw, host=host, start=False)
+
+
+def chat_steps(gw: ScriptedGateway) -> list[str]:
+    return [c.step_id for c in gw.calls if c.kind == "chat"]
+
+
+def counted_bodies(gw: ScriptedGateway, start: int = 0) -> list[dict[str, Any]]:
+    return [c.body for c in gw.calls[start:] if c.kind in ("search", "fetch")]
+
+
+def stoppable_model() -> ScriptedModel:
+    model = research_model()
+    model.scripts["stop-1"] = [reply(STOP_FINDINGS)]
+    return model
+
+
+def proposal(events: list[dict[str, Any]], typ: str) -> dict[str, Any]:
+    return next(e for e in events if e["type"] == typ)
+
+
+def test_stop_mid_research_emits_card_and_findings_then_continue_resumes_same_place():
+    model = stoppable_model()
+    code, events, gw = run_turn(model, config=RESEARCH_CONFIG, host=pausing_host("sub-1", 2))
+    assert code == 0
+    stopped = progress(events, "turn_stopped")[0]["data"]
+    card = stopped["card"]
+    assert {k: card[k] for k in card if k != "todo"} == {
+        "subtopics_done": 0,
+        "subtopics_total": 2,
+        "sources": 1,
+        "tool_calls_used": 2,
+        "tool_call_limit": 30,
+    }
+    assert [i["status"] for i in card["todo"]] == ["in_progress", "pending"]
+    assert stopped["can_finish"] is False
+    assert stopped["findings"] == STOP_FINDINGS  # 有来源 → kimi-k2.6 写摘要
+    assert chat_steps(gw)[-1] == "stop-1"
+    stop_body = model.bodies("stop-1")[0]
+    assert "tools" not in stop_body and stop_body["max_tokens"] == 4096
+    assert stop_body["model"] == "kimi-k2.6"
+    assert "a.example/1" in json.dumps(stop_body, ensure_ascii=False)
+    last = checkpoints(events)[-1]
+    assert last["step_id"] == "stop" and last["state"]["stop_findings"] == STOP_FINDINGS
+    assert last["state"]["stops"] == 1
+    assert "stop-1" in json.dumps(last["state"]["_agentbox"])  # 停止摘要的 call id 计数器已保存
+    paused = proposal(events, "paused")
+    assert paused["checkpoint_id"] == last["checkpoint_id"]
+    assert "session_state" not in paused
+    first_ids = {c.call_id for c in gw.calls}
+    before = len(gw.calls)
+    code2, events2, _ = continue_turn(model, last, gw)
+    assert code2 == 0
+    # 已完成的搜索与抓取不再发起；继续从 sub-1 的摘要调用开始
+    assert counted_bodies(gw, before) == [{"url": "https://b.example/1"}]
+    new = gw.calls[before:]
+    assert new[0].step_id == "sub-1" and new[0].kind == "chat"
+    assert not {c.call_id for c in new} & first_ids  # 没有重复的 call id
+    # 额度视图沿用：继续后的第一次计数调用是第 3 次
+    assert [e["data"] for e in progress(events2, "budget")] == [{"used": 3, "limit": 30}]
+    assert result(events2)["outputs"] == ["report"]
+    assert not progress(events2, "turn_stopped")
+
+
+def test_stop_during_planning_says_no_findings_without_model_call():
+    model = stoppable_model()
+    code, events, gw = run_turn(model, config=RESEARCH_CONFIG, host=pausing_host("orch", 1))
+    assert code == 0
+    stopped = progress(events, "turn_stopped")[0]["data"]
+    assert stopped["findings"] == NO_FINDINGS
+    assert stopped["can_finish"] is False
+    assert stopped["card"]["subtopics_total"] == 0 and stopped["card"]["sources"] == 0
+    assert not [s for s in chat_steps(gw) if s.startswith("stop-")]
+    assert proposal(events, "paused")["checkpoint_id"] == checkpoints(events)[-1]["checkpoint_id"]
+    # 无材料时"立即写报告"：不调用模型，以固定回复成功结束
+    n = len(model.requests)
+    code2, events2, _ = continue_turn(
+        model, checkpoints(events)[-1], gw, directive={"kind": "finish_now"}
+    )
+    assert code2 == 0 and len(model.requests) == n
+    assert result(events2)["summary"] == "尚无可用材料，未生成报告。"
+    assert result(events2)["outputs"] == []
+
+
+def test_stop_summary_failure_falls_back_to_fixed_sentence():
+    model = research_model()
+    model.scripts["stop-1"] = [
+        GatewayError(503, "upstream_error"),
+        GatewayError(503, "upstream_error"),
+    ]
+    code, events, gw = run_turn(model, config=RESEARCH_CONFIG, host=pausing_host("sub-1", 2))
+    assert code == 0
+    stopped = progress(events, "turn_stopped")[0]["data"]
+    assert stopped["findings"] == "已完成 0 个子主题、阅读 1 个来源。"
+    assert proposal(events, "paused")
+
+
+def finish_model() -> ScriptedModel:
+    return ScriptedModel(
+        orch=[
+            call("read_skill", name="deep-research"),
+            call("todo_write", items=[todo("1", "材料", 8), todo("2", "产业", 8)]),
+            call("research_subtopic", id="1"),
+            reply("# 固态电池\n\n## 摘要\n- 硫化物路线领先 [1]"),
+        ],
+        sub={
+            "1": [
+                call("web_search", query="固态电解质"),
+                call("web_fetch", url="https://a.example/1"),
+                reply("硫化物路线领先 [1]"),
+            ]
+        },
+        other={"stop-1": [reply(STOP_FINDINGS)]},
+    )
+
+
+def test_finish_now_skips_remaining_subtopics_and_marks_partial():
+    model = finish_model()
+    # 第 3 个 orch checkpoint：sub-1 刚完成（research_subtopic 的 tool 消息尚未写入）
+    code, events, gw = run_turn(model, config=RESEARCH_CONFIG, host=pausing_host("orch", 3))
+    assert code == 0
+    stopped = progress(events, "turn_stopped")[0]["data"]
+    assert stopped["can_finish"] is True and stopped["card"]["subtopics_done"] == 1
+    cp = checkpoints(events)[-1]
+    code2, events2, _ = continue_turn(model, cp, gw, directive={"kind": "finish_now"})
+    assert code2 == 0
+    todo_items = progress(events2, "todo_updated")[0]["data"]["items"]
+    assert [i["status"] for i in todo_items] == ["done", "skipped"]
+    last = model.bodies("orch")[-1]
+    assert "tools" not in last
+    assert "用户要求立即写报告" in last["messages"][-1]["content"]
+    rs = [m for m in last["messages"] if m.get("name") == "research_subtopic"]
+    assert rs[-1]["content"].startswith("子主题「材料」摘要：\n硫化物路线领先 [1]")
+    report = artifact_text(events2, "report")
+    assert "> 部分研究" in report and "[1]" in report
+    ready = progress(events2, "report_ready")[0]["data"]
+    assert ready["partial"] is True and ready["note"] == "部分研究"
+    assert result(events2)["outputs"] == ["report"]
+    assert "session_state" in result(events2)
+    assert not [c for c in gw.calls if c.step_id == "sub-2"]
+
+
+def ask_model() -> ScriptedModel:
+    return ScriptedModel(
+        orch=[
+            call("read_skill", name="deep-research"),
+            calls(("ask_user", {"questions": QUESTIONS}), ("web_search", {"query": "x"})),
+            reply("好的，按中国市场回答。"),
+        ]
+    )
+
+
+ANSWERS = [{"question_id": "1", "choice": "中国"}, {"question_id": "2", "other": "写论文"}]
+
+
+def test_answer_resumes_same_turn_at_same_position():
+    model = ask_model()
+    code, events, gw = run_turn(model, config={"text": "储能电池市场"})
+    awaiting = proposal(events, "awaiting_input")
+    assert "session_state" not in awaiting
+    cp = checkpoints(events)[-1]
+    ask_call = cp["state"]["pending_question"]["tool_call_id"]
+    # 不匹配的 question_id → invalid_directive
+    bad = {"kind": "answer", "question_id": "q-orch-9", "answers": ANSWERS}
+    _, events_bad, _ = continue_turn(model, cp, gw, directive=bad, config={"text": "储能"})
+    assert proposal(events_bad, "error")["code"] == "invalid_directive"
+    good = {"kind": "answer", "question_id": awaiting["question_id"], "answers": ANSWERS}
+    code2, events2, _ = continue_turn(
+        model, cp, gw, attempt="a-3", directive=good, config={"text": "储能电池市场"}
+    )
+    assert code2 == 0
+    msgs = model.bodies("orch")[-1]["messages"]
+    assert msgs[-1]["role"] == "tool" and msgs[-1]["tool_call_id"] == ask_call
+    assert msgs[-1]["content"].startswith("用户的回答：")
+    assert "1. 关注哪个地区？ → 中国" in msgs[-1]["content"]
+    assert "2. 研究用途？ → 其他：写论文" in msgs[-1]["content"]
+    answered = [e["data"] for e in progress(events2, "tool_result")]
+    assert answered[0]["tool"] == "ask_user" and answered[0]["tool_call_id"] == "orch:2"
+    assert result(events2)["summary"] == "好的，按中国市场回答。"
+    assert gw.counts().get("search", 0) == 0  # 回答不计额度，跳过的搜索不再执行
+
+
+def test_continue_while_awaiting_re_asks_same_question():
+    model = ask_model()
+    _, events, gw = run_turn(model, config={"text": "储能电池市场"})
+    cp = checkpoints(events)[-1]
+    n = len(model.requests)
+    code2, events2, _ = continue_turn(model, cp, gw, config={"text": "储能电池市场"})
+    assert code2 == 0 and len(model.requests) == n
+    again = proposal(events2, "awaiting_input")
+    assert again["question_id"] == proposal(events, "awaiting_input")["question_id"]
+    assert "session_state" not in again
+
+
+def test_restore_seeds_from_cancelled_checkpoint_with_fresh_budget():
+    _, events, _ = run_turn(research_model(), config=RESEARCH_CONFIG)
+    # sub-1 完成、research_subtopic 的 tool 消息已写入的 orch checkpoint
+    cp = [c for c in checkpoints(events) if c["step_id"] == "orch"][3]
+    assert cp["state"]["subtopics"]["1"]["status"] == "done"
+    seed = json.loads(json.dumps(cp))
+    seed["state"]["budget"]["used"] = 20
+    seed["state"]["notes"] = ["旧的说明"]
+    model2 = ScriptedModel(
+        orch=[call("research_subtopic", id="2"), reply("## 摘要\n- 路线 [1]，量产 [2]")],
+        sub={"2": [call("web_fetch", url="https://b.example/1"), reply("量产时间 [2]")]},
+    )
+    code, events2, _ = continue_turn(
+        model2,
+        seed,
+        make_gateway(model2),
+        task="t-2",
+        attempt="a-1",
+        attempt_no=1,
+        restored_from_task_id="t-1",
+    )
+    assert code == 0
+    first = model2.bodies("orch")[0]["messages"]
+    assert first[-1] == {
+        "role": "user",
+        "content": "这是对之前被停止研究的恢复，获得新的 30 次工具额度；不要重复已完成的子主题。",
+    }
+    fetch_msg = [m for m in model2.bodies("sub-2")[-1]["messages"] if m.get("name") == "web_fetch"]
+    assert "已用 1/30" in fetch_msg[0]["content"]
+    assert not [s for s, _ in model2.requests if s == "sub-1"]  # sub-1 不重做
+    assert result(events2)["outputs"] == ["report"]
+    assert "旧的说明" not in artifact_text(events2, "report")
+    assert all(c["state"]["task_id"] == "t-2" for c in checkpoints(events2))
+
+
+def test_seed_restore_scales_remaining_shares_and_answers_pending_question():
+    state = TurnState()
+    state.budget.shares = {"1": 20, "2": 20}
+    state.budget.spent = {"1": 4}
+    state.budget.used = 24
+    state.pending_question = {"question_id": "q-orch-2", "tool_call_id": "c1", "questions": []}
+    state.finish_requested, state.partial, state.notes, state.stops = True, True, ["部分研究"], 2
+    out = seed_restore(state, 30)
+    assert out.budget.used == 0 and out.budget.limit == 30
+    shares = out.budget.shares
+    assert sum(shares.values()) <= 26 and shares["1"] < shares["2"]
+    assert out.pending_question is None and out.messages[-1]["tool_call_id"] == "c1"
+    assert out.stops == 2 and not out.finish_requested and not out.partial and not out.notes
+
+
+def carry_state() -> dict[str, Any]:
+    _, events, _ = run_turn(research_model(), config=RESEARCH_CONFIG)
+    cp = [c for c in checkpoints(events) if c["step_id"] == "orch"][3]
+    return cp["state"]
+
+
+PRIOR_MEMORY = {
+    "schema_version": 1,
+    "turns": [
+        {
+            "task_id": "t-0",
+            "user": "之前的问题",
+            "reply": "之前的回答",
+            "route": "answer",
+            "report": None,
+        }
+    ],
+    "sources": [
+        {
+            "n": k,
+            "sha256": f"{k}" * 64,
+            "url": f"https://m.example/{k}",
+            "title": f"旧来源 {k}",
+            "excerpt": "",
+            "call_id": f"c{k}",
+            "origin": "t-0",
+        }
+        for k in (1, 2)
+    ],
+}
+
+
+def run_with_carry(
+    blob: bytes | None,
+) -> tuple[ScriptedModel, list[dict[str, Any]], ScriptedGateway]:
+    model = ScriptedModel(orch=[reply("# 报告\n\n## 摘要\n- 硫化物路线领先 [3]")])
+    gw = make_gateway(model)
+    ref = gw.put_blob(blob) if blob is not None else "f" * 64
+    host = SessionHost(session_resume={"checkpoint_id": "sc-1", "state": PRIOR_MEMORY})
+    start_task(
+        host,
+        "t-2",
+        "a-1",
+        {"text": "固态电池现状", "deep_research": True},
+        carryover={"task_id": "t-1", "checkpoint_ref": ref},
+    )
+    _, events, _ = run_turn(model, gw=gw, host=host, start=False)
+    return model, events, gw
+
+
+def test_carryover_sources_and_summaries_are_available_to_new_turn():
+    state = carry_state()
+    model, events, gw = run_with_carry(json.dumps(state, ensure_ascii=False).encode())
+    system = model.bodies("orch")[0]["messages"][0]["content"]
+    assert "上一轮被停止的研究的发现" in system
+    assert "硫化物路线领先 [3]" in system  # 原 [1] 并入后续编号为 [3]
+    assert "- [3] 页面 https://a.example/1" in system
+    report = artifact_text(events, "report")
+    assert re.findall(r"^- \[(\d+)\] .*a\.example/1", report, re.M) == ["3"]
+    memory = result(events)["session_state"]["state"]
+    assert "https://a.example/1" in {s["url"] for s in memory["sources"]}
+    # carryover 的来源在会话记忆中归入本轮
+    assert {s["origin"] for s in memory["sources"]} == {"t-0", "t-2"}
+
+
+@pytest.mark.parametrize("blob", [b"not json", json.dumps({"schema_version": 99}).encode(), None])
+def test_corrupt_or_missing_carryover_is_ignored(blob: bytes | None):
+    model, events, gw = run_with_carry(blob)
+    system = model.bodies("orch")[0]["messages"][0]["content"]
+    assert "上一轮被停止的研究" not in system
+    assert result(events)["summary"]  # 正常完成
+    assert carryover_context(None) == (None, [])
+
+
+def test_crash_after_tool_checkpoint_loses_at_most_the_in_flight_call():
+    model = research_model()
+    gw = make_gateway(model)
+    orig = gw._call
+    armed = {"on": False}
+    sent: list[tuple[str, str]] = []  # (call id, 发出时的请求体快照)
+
+    def recording(kind: str, step: str, body: dict[str, Any], run: Any) -> Any:
+        snapshot = json.dumps(body, ensure_ascii=False, sort_keys=True)
+        try:
+            return orig(kind, step, body, run)  # Gateway 已执行并记录
+        finally:
+            sent.append((gw.calls[-1].call_id, snapshot))
+            if armed["on"]:  # 结果送达之前 worker 崩溃
+                armed["on"] = False
+                raise GatewayError(0, "connection_lost", "worker 进程崩溃")
+
+    seen: Counter[str] = Counter()
+
+    def hook(event: dict[str, Any], host: SessionHost) -> None:
+        if event["type"] == "checkpoint":
+            seen[event["step_id"]] += 1
+            if event["step_id"] == "sub-1" and seen["sub-1"] == 2:
+                armed["on"] = True
+
+    gw._call = recording  # type: ignore[method-assign]
+    _, events, _ = run_turn(model, config=RESEARCH_CONFIG, gw=gw, host=SessionHost(on_event=hook))
+    assert proposal(events, "error")
+    in_flight = sent[-1]
+    assert gw.calls[-1].step_id == "sub-1" and gw.calls[-1].kind == "chat"
+    cp = [c for c in checkpoints(events) if c["step_id"] == "sub-1"][1]
+    recorded = {cid for cid, _ in sent[:-1]}
+    before, n_requests = len(sent), len(model.requests)
+    code2, events2, _ = continue_turn(model, cp, gw)
+    assert code2 == 0
+    assert sent[before] == in_flight  # 在途调用以同一 call id、同一请求体重发
+    assert gw.calls[before].call_id == in_flight[0]
+    assert not {cid for cid, _ in sent[before:]} & recorded  # 已记录的调用不再发起
+    assert {"url": "https://a.example/1"} not in counted_bodies(gw, before)
+    # 在途调用是重放，不再送达模型；之后的第一次新调用是编排
+    assert model.requests[n_requests][0] == "orch"
+    assert result(events2)["outputs"] == ["report"]
+
+
+def test_session_state_only_on_success():
+    _, paused_events, _ = run_turn(
+        stoppable_model(), config=RESEARCH_CONFIG, host=pausing_host("sub-1", 2)
+    )
+    _, ask_events, _ = run_turn(ask_model(), config={"text": "储能电池市场"})
+    _, fail_events, _ = run_turn(
+        ScriptedModel(orch=[GatewayError(503, "x"), GatewayError(503, "x")])
+    )
+    for evs, typ in (
+        (paused_events, "paused"),
+        (ask_events, "awaiting_input"),
+        (fail_events, "error"),
+    ):
+        assert "session_state" not in proposal(evs, typ)
+        assert "result" not in [e["type"] for e in evs]
+    _, ok_events, _ = run_turn(research_model(), config=RESEARCH_CONFIG)
+    ss = result(ok_events)["session_state"]
+    assert json_size(ss["state"]) <= MEMORY_LIMIT_BYTES
+    assert ss["state"]["turns"][-1]["task_id"] == "t-1"
+    assert {s["origin"] for s in ss["state"]["sources"]} == {"t-1"}

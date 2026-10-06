@@ -100,6 +100,9 @@ async def run_subtopic(agent: Agent, sub_id: str) -> ToolResult:
         item.status = "in_progress"
         await agent.emit.todo(step, st.todo)
         await agent.emit.subtopic(sub, item.title)
+    elif item.status != "in_progress":  # 恢复种子把进行中的项改回 pending：继续时重新标记
+        item.status = "in_progress"
+        await agent.emit.todo(step, st.todo)
     st.phase, st.current_subtopic = "subtopic", sub_id
     try:
         summary = await _loop(agent, sub, step)
