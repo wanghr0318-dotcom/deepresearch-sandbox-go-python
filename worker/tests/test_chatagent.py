@@ -1121,3 +1121,482 @@ def test_session_state_only_on_success():
     assert json_size(ss["state"]) <= MEMORY_LIMIT_BYTES
     assert ss["state"]["turns"][-1]["task_id"] == "t-1"
     assert {s["origin"] for s in ss["state"]["sources"]} == {"t-1"}
+
+
+# ---- 并行子主题：sub-run（Plan 14 Task 9） ----
+
+import itertools
+
+from agentbox_worker import BudgetExhausted
+from agentbox_worker.stream import SessionStreamChecker
+from chatagent.research import plan_caps
+
+PAR_TODO = [todo("1", "材料", 8), todo("2", "产业", 8), todo("3", "政策", 8)]
+PAR_REPORT = "# 固态电池\n\n## 摘要\n- 材料 [1][2]\n- 产业 [3]\n- 政策 [5][6] 与 [99]"
+
+
+def par_config(scheduling: str = "parallel", **research: Any) -> dict[str, Any]:
+    return {**RESEARCH_CONFIG, "research": {"scheduling": scheduling, **research}}
+
+
+def sub_steps(i: str, n_fetch: int = 2) -> list[Any]:
+    """子主题 i：一次搜索、一次并发抓取 n_fetch 页、摘要（本地编号 [1]…[n]）。"""
+    urls = [f"https://{i}.example/{k}" for k in range(1, n_fetch + 1)]
+    cites = "".join(f"[{k}]" for k in range(1, n_fetch + 1))
+    return [
+        call("web_search", query=f"主题{i}"),
+        calls(*[("web_fetch", {"url": u}) for u in urls]),
+        reply(f"子主题{i}结论 {cites}"),
+    ]
+
+
+def par_model(**extra_sub: list[Any]) -> ScriptedModel:
+    subs = {i: sub_steps(i) for i in ("1", "2", "3")}
+    subs.update(extra_sub)
+    return ScriptedModel(
+        orch=[
+            call("read_skill", name="deep-research"),
+            call("todo_write", items=PAR_TODO),
+            call("research_subtopic", id="1"),
+            reply(PAR_REPORT),
+        ],
+        sub=subs,
+    )
+
+
+def adaptive(i: str, summary: str, limit: int = 12) -> list[Any]:
+    """每次带工具的调用都再抓取一个新页面；不带工具（收尾）时写摘要。"""
+    counter = itertools.count(1)
+
+    def step(body: dict[str, Any]) -> dict[str, Any]:
+        if "tools" not in body:
+            return reply(summary)
+        return call("web_fetch", url=f"https://{i}.example/a{next(counter)}")
+
+    return [step] * limit
+
+
+def par_gateway(model: ScriptedModel, **kw: Any) -> ScriptedGateway:
+    kw.setdefault("search", default_search)
+    kw.setdefault("fetch", page)
+    return ScriptedGateway(chat=model, **kw)
+
+
+def subrun_host(gw: ScriptedGateway, *hooks: Any, **kw: Any) -> SessionHost:
+    """协商 sub-run 的宿主：subrun_start 的 budget_cap_micro 记入替身 Gateway 的两层账本。"""
+
+    def hook(event: dict[str, Any], host: SessionHost) -> None:
+        if event["type"] == "subrun_start":
+            gw.subrun_caps[event["subrun_id"]] = event.get("budget_cap_micro")
+        for h in hooks:
+            h(event, host)
+
+    return SessionHost(subruns=True, on_event=hook, **kw)
+
+
+def par_run(
+    model: ScriptedModel,
+    config: dict[str, Any] | None = None,
+    *,
+    gw: ScriptedGateway | None = None,
+    host: SessionHost | None = None,
+    start: bool = True,
+    **kw: Any,
+) -> tuple[int, list[dict[str, Any]], ScriptedGateway, SessionHost]:
+    gw = gw or par_gateway(model, **kw)
+    host = host or subrun_host(gw)
+    if start:
+        start_task(host, "t-1", "a-1", config or par_config())
+
+    def factory(ctx: Any) -> ScriptedGateway:
+        gw.call_ids = ctx.call_ids
+        ctx.subruns.gateway_factory = gw.view  # sub-run 的 Gateway 视图（替身）
+        return gw
+
+    code, events = host.run(make_app(gateway=factory, skills_root=SKILLS), timeout=30)
+    checker = SessionStreamChecker()  # Worker 事件按协商了 subruns 的 session 流规则回放
+    for side, msg in host.transcript:
+        if side == "host":
+            checker.host_sent(msg)
+        else:
+            checker.observe(msg)
+    return code, events, gw, host
+
+
+def of_type(events: list[dict[str, Any]], typ: str) -> list[dict[str, Any]]:
+    return [e for e in events if e["type"] == typ]
+
+
+def sub_result(events: list[dict[str, Any]]) -> dict[str, str]:
+    return {s["id"]: s["status"] for s in result(events).get("subruns", [])}
+
+
+def overlaps(spans: list[tuple[Any, ...]]) -> bool:
+    return any(
+        a[0] != b[0] and a[2] < b[3] and b[2] < a[3]
+        for i, a in enumerate(spans)
+        for b in spans[i + 1 :]
+        if a[0] and b[0]
+    )
+
+
+def evidence(report: str) -> dict[str, str]:
+    return dict(re.findall(r"^- \[(\d+)\] .* — sha256:([0-9a-f]{64})$", report, re.M))
+
+
+def resume_with_subruns(cp: dict[str, Any]) -> dict[str, Any]:
+    return {**resume_from(cp), "subruns": cp.get("subruns", [])}
+
+
+def test_parallel_subruns_interleave_and_serial_gives_same_split_prompts_ids_and_report():
+    runs = {}
+    for mode in ("parallel", "serial"):
+        model = par_model()
+        code, events, gw, _ = par_run(model, par_config(mode), latency=0.05)
+        assert code == 0, of_type(events, "error")
+        runs[mode] = (model, events, gw)
+    (pm, pev, pgw), (sm, sev, sgw) = runs["parallel"], runs["serial"]
+    assert overlaps(pgw.spans)  # 并行：不同 sub-run 的调用在时间上重叠
+    assert not overlaps(sgw.spans)  # 串行：逐个执行
+
+    def starts(evs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        keys = ("subrun_id", "parent_step_id", "deadline_ms", "budget_cap_micro")
+        return sorted(({k: e.get(k) for k in keys} for e in of_type(evs, "subrun_start")), key=str)
+
+    assert starts(pev) == starts(sev)
+    assert [s["subrun_id"] for s in starts(pev)] == ["st1", "st2", "st3"]
+    assert {s["parent_step_id"] for s in starts(pev)} == {"research"}
+    assert {s["deadline_ms"] for s in starts(pev)} == {600000}
+    for step in ("sub-1", "sub-2", "sub-3"):  # 子主题的提示词（系统 + 用户）相同
+        assert pm.bodies(step)[0]["messages"][:2] == sm.bodies(step)[0]["messages"][:2]
+        assert pm.bodies(step)[0]["model"] == "kimi-k2.6"
+    assert {c.call_id for c in pgw.calls} == {c.call_id for c in sgw.calls}
+    assert {c.call_id.split("/")[0] for c in pgw.calls if c.subrun} == {"st1", "st2", "st3"}
+    assert all(c.call_id.startswith(f"{c.subrun}/") for c in pgw.calls if c.subrun)
+    assert chat_models(pgw)["orch"] == "kimi-k3"
+    report = artifact_text(pev, "report")
+    assert report == artifact_text(sev, "report")
+    # 引用跨子主题全局编号（按计划顺序合并）且全部可定位到已保存的证据 blob
+    ev = evidence(report)
+    assert sorted(ev, key=int) == ["1", "2", "3", "4", "5", "6"]
+    assert all(sha in pgw.blobs for sha in ev.values())
+    assert "[99]" not in report and "[5][6]" in report
+    assert re.search(r"^- \[5\] .* — https://3\.example/1 — ", report, re.M)
+    assert sub_result(pev) == {"st1": "completed", "st2": "completed", "st3": "completed"}
+    # 结果产物 subruns/<id>.json（internal），其 sha 即 checkpoint 的 result_ref
+    arts = {e["artifact_id"]: e for e in of_type(pev, "artifact")}
+    assert arts["subrun-st1"]["visibility"] == "internal"
+    assert arts["subrun-st1"]["path"] == "subruns/st1.json"
+    body = json.loads(artifact_text(pev, "subrun-st1"))
+    assert body["partial"] is False and body["summary"] == "子主题1结论 [1][2]"
+    assert [s["url"] for s in body["sources"]] == ["https://1.example/1", "https://1.example/2"]
+    final = [c for c in checkpoints(pev) if len(c.get("subruns", [])) == 3][-1]
+    assert {s["status"] for s in final["subruns"]} == {"completed"}
+    refs = {s["subrun_id"]: s["result_ref"] for s in final["subruns"]}
+    assert refs["st1"] == arts["subrun-st1"]["declared_sha256"]
+    # 用户可见事件：sub-run 的 progress 带 subrun_id，工具步骤带 subtopic_id；可同时进行中
+    sub_calls = [e for e in progress(pev, "tool_call") if e.get("subrun_id")]
+    assert {(e["subrun_id"], e["data"]["subtopic_id"]) for e in sub_calls} == {
+        ("st1", "1"),
+        ("st2", "2"),
+        ("st3", "3"),
+    }
+    running = [
+        sum(i["status"] == "in_progress" for i in e["data"]["items"])
+        for e in progress(pev, "todo_updated")
+    ]
+    assert max(running) >= 2
+    # 编排模型一次收到全部子主题的摘要（全局编号）
+    rs = [m for m in pm.bodies("orch")[-1]["messages"] if m.get("name") == "research_subtopic"]
+    assert "子主题「材料」摘要" in rs[-1]["content"]
+    assert "子主题3结论 [5][6]" in rs[-1]["content"]
+
+
+def test_task_tool_budget_rejection_stops_all_subruns_and_report_says_so():
+    model = par_model(**{i: adaptive(i, f"结论{i} [1]") for i in ("1", "2", "3")})
+    code, events, gw, _ = par_run(model, tool_limit=7)
+    assert code == 0, of_type(events, "error")
+    assert "tool_budget_exhausted" in {r[1] for r in gw.rejections}
+    attempted = [c for c in gw.calls if c.kind in ("search", "fetch")]
+    assert len(attempted) - len(gw.rejections) == 7  # Gateway 只放行 7 次
+    assert len(gw.rejections) <= 3  # 被拒一次后各 sub-run 不再发起工具调用
+    assert sub_result(events) == {"st1": "completed", "st2": "completed", "st3": "completed"}
+    report = artifact_text(events, "report")
+    assert "已达工具额度" in report
+    assert progress(events, "report_ready")[0]["data"]["tool_budget_reached"] is True
+
+
+def test_deadline_cancel_marks_subtopic_timed_out_and_report_incomplete():
+    model = par_model(**{"2": adaptive("2", "不会写出", limit=40)})
+    sent = {"done": False}
+
+    def cancel_st2(event: dict[str, Any], host: SessionHost) -> None:
+        if event.get("subrun_id") == "st2" and event.get("kind") == "tool_call":
+            if not sent["done"]:
+                sent["done"] = True
+                host.send(
+                    {
+                        "type": "subrun_cancel_requested",
+                        "v": 1,
+                        "subrun_id": "st2",
+                        "reason": "deadline",
+                    }
+                )
+
+    gw = par_gateway(model, latency=0.03)
+    code, events, gw, _ = par_run(model, gw=gw, host=subrun_host(gw, cancel_st2))
+    assert code == 0, of_type(events, "error")
+    ends = {e["subrun_id"]: e["status"] for e in of_type(events, "subrun_end")}
+    assert ends == {"st1": "succeeded", "st2": "cancelled", "st3": "succeeded"}
+    assert sub_result(events) == {"st1": "completed", "st2": "timed_out", "st3": "completed"}
+    report = artifact_text(events, "report")
+    assert "子主题「产业」不完整" in report and "超时" in report
+    ready = progress(events, "report_ready")[0]["data"]
+    assert ready["partial"] is True
+    subs = {e["data"]["id"]: e["data"]["status"] for e in progress(events, "subtopic")}
+    assert subs["2"] == "failed"
+
+
+def test_subrun_budget_exhausted_completes_extractively_without_model_call():
+    def inject(c: Any) -> Exception | None:
+        if c.subrun == "st1" and c.kind == "chat" and c.call_id.endswith("/chat/3"):
+            return BudgetExhausted(402, "subrun_budget_exhausted")
+        return None
+
+    model = par_model()
+    code, events, gw, _ = par_run(model, inject=inject)
+    assert code == 0, of_type(events, "error")
+    assert len(model.bodies("sub-1")) == 2  # 第 3 次（摘要）被 402 拒绝，之后不再调用模型
+    body = json.loads(artifact_text(events, "subrun-st1"))
+    assert body["partial"] is True and "摘录" in body["summary"]
+    assert "[1]" in body["summary"] and "[2]" in body["summary"]
+    assert sub_result(events)["st1"] == "completed"
+    report = artifact_text(events, "report")
+    assert "子主题「材料」不完整" in report
+    assert progress(events, "report_ready")[0]["data"]["partial"] is True
+
+
+def test_report_reserve_keeps_main_agent_report_affordable_after_subrun_caps():
+    def cost(c: Any) -> int:
+        return 100 if c.kind == "chat" else 0
+
+    model = par_model(**{i: adaptive(i, f"结论{i} [1]") for i in ("1", "2", "3")})
+    config = par_config(report_reserve_micro=500, worker_output_micro_per_mtok=100_000)
+    config["subtopic_max_tokens"] = 1000
+    code, events, gw, _ = par_run(model, config, budget_limit_micro=2000, cost=cost)
+    assert code == 0, of_type(events, "error")
+    caps = {e["subrun_id"]: e["budget_cap_micro"] for e in of_type(events, "subrun_start")}
+    assert caps == {"st1": 400, "st2": 400, "st3": 400}  # (2000 - 3×100 - 500) / 3
+    codes = [r[1] for r in gw.rejections]
+    assert codes.count("subrun_budget_exhausted") == 3 and "budget_exhausted" not in codes
+    assert all(gw.subrun_spent[s] <= 400 for s in caps)
+    report = artifact_text(events, "report")
+    assert "材料 [1]" in report  # 主 Agent 的报告调用预留成功（不是无模型的兜底报告）
+    assert result(events)["outputs"] == ["report"]
+
+
+def pause_after_first_subrun_end(event: dict[str, Any], host: SessionHost) -> None:
+    if event["type"] == "subrun_end" and not getattr(host, "paused_once", False):
+        host.paused_once = True  # type: ignore[attr-defined]
+        host.send(
+            {
+                "type": "pause",
+                "v": 1,
+                "attempt_id": event["attempt_id"],
+                "reason": "user",
+                "grace_ms": 0,
+            }
+        )
+
+
+def fetch_counter() -> tuple[Counter[str], Any]:
+    seen: Counter[str] = Counter()
+
+    def fetch(url: str) -> dict[str, Any]:
+        seen[url] += 1
+        return page(url)
+
+    return seen, fetch
+
+
+def slow_steps(i: str, cite: str) -> list[Any]:
+    fetches = [call("web_fetch", url=f"https://{i}.example/{k}") for k in (1, 2, 3)]
+    return [call("web_search", query=f"主题{i}"), *fetches, reply(f"子主题{i}结论 {cite}")]
+
+
+def stopped_parallel_run() -> tuple[ScriptedModel, ScriptedGateway, list[dict[str, Any]], Any]:
+    model = par_model(**{"2": slow_steps("2", "[1][3]"), "3": slow_steps("3", "[2]")})
+    model.scripts["stop-1"] = [reply(STOP_FINDINGS)]
+    seen, fetch = fetch_counter()
+    gw = par_gateway(model, fetch=fetch, latency=0.02, tool_budget=lambda k: (k, 30))
+    code, events, gw, _ = par_run(model, gw=gw, host=subrun_host(gw, pause_after_first_subrun_end))
+    assert code == 0, of_type(events, "error")
+    return model, gw, events, seen
+
+
+def test_stop_during_parallel_run_card_counts_then_continue_runs_only_unfinished():
+    model, gw, events, seen = stopped_parallel_run()
+    stopped = progress(events, "turn_stopped")[0]["data"]
+    last = checkpoints(events)[-1]
+    assert last["step_id"] == "stop"
+    assert proposal(events, "paused")["checkpoint_id"] == last["checkpoint_id"]
+    state = TurnState.from_json(without_sdk_key(last["state"]))
+    done = [s for s in state.subtopics.values() if s.status == "done"]
+    found = {d["url"] for s in state.subtopics.values() for d in s.found}
+    card = stopped["card"]
+    assert card["subtopics_done"] == len(done) >= 1 and card["subtopics_total"] == 3
+    assert card["sources"] == len(found) + sum(1 for s in state.sources.all() if not s.origin)
+    assert card["tool_calls_used"] == state.budget.used
+    listed = {s["subrun_id"]: s["status"] for s in last["subruns"]}
+    assert set(listed) == {"st1", "st2", "st3"} and "completed" in listed.values()
+    assert set(listed.values()) <= {"completed", "started"}
+    completed = {sid for sid, st in listed.items() if st == "completed"}
+    before = len(gw.calls)
+    host = subrun_host(gw)
+    start_task(host, "t-1", "a-2", par_config(), attempt_no=2, resume=resume_with_subruns(last))
+    code2, events2, _, _ = par_run(model, gw=gw, host=host, start=False)
+    assert code2 == 0, of_type(events2, "error")
+    new = gw.calls[before:]
+    assert not [c for c in new if c.subrun in completed]  # 已完成的子主题不再发起任何调用
+    restarted = {e["subrun_id"] for e in of_type(events2, "subrun_start")}
+    assert restarted == {"st1", "st2", "st3"} - completed
+    assert all(n == 1 for n in seen.values())  # 每个页面只真正抓取一次
+    assert sub_result(events2) == {"st1": "completed", "st2": "completed", "st3": "completed"}
+    assert result(events2)["outputs"] == ["report"]
+
+
+def test_finish_now_after_parallel_stop_cancels_running_subruns():
+    model, gw, events, _ = stopped_parallel_run()
+    last = checkpoints(events)[-1]
+    listed = {s["subrun_id"]: s["status"] for s in last["subruns"]}
+    running = {sid for sid, st in listed.items() if st == "started"}
+    assert running
+    before = len(gw.calls)
+    host = subrun_host(gw)
+    start_task(
+        host,
+        "t-1",
+        "a-2",
+        par_config(),
+        attempt_no=2,
+        resume=resume_with_subruns(last),
+        directive={"kind": "finish_now"},
+    )
+    code2, events2, _, _ = par_run(model, gw=gw, host=host, start=False)
+    assert code2 == 0, of_type(events2, "error")
+    cancels = {e["subrun_id"]: e["reason"] for e in of_type(events2, "subrun_cancel")}
+    assert cancels == dict.fromkeys(running, "finish_now")
+    ends = {e["subrun_id"]: e["status"] for e in of_type(events2, "subrun_end")}
+    assert ends == dict.fromkeys(running, "cancelled")
+    assert not [c for c in gw.calls[before:] if c.subrun]  # 不再为子主题发起调用
+    statuses = sub_result(events2)
+    assert {statuses[s] for s in running} == {"cancelled"}
+    report = artifact_text(events2, "report")
+    assert "> 部分研究" in report
+    assert progress(events2, "report_ready")[0]["data"]["partial"] is True
+    assert "tools" not in model.bodies("orch")[-1]
+
+
+def test_crash_resume_of_parallel_run_is_deterministic():
+    model = par_model()
+    code, events, gw, _ = par_run(model, tool_budget=lambda k: (k, 30))
+    assert code == 0
+    first = {c.call_id: c.body for c in gw.calls}
+    report = artifact_text(events, "report")
+    n_requests = len(model.requests)
+    for k, cp in enumerate(checkpoints(events)):
+        before = len(gw.calls)
+        host = subrun_host(gw)
+        start_task(
+            host, "t-1", f"a-r{k}", par_config(), attempt_no=2, resume=resume_with_subruns(cp)
+        )
+        code2, events2, _, _ = par_run(model, gw=gw, host=host, start=False)
+        assert code2 == 0, (cp["step_id"], of_type(events2, "error"))
+        assert len(model.requests) == n_requests  # 全部是同一 call id 的重放
+        for c in gw.calls[before:]:
+            assert c.call_id in first and c.body == first[c.call_id], c.call_id
+        done = {s["subrun_id"] for s in cp.get("subruns", []) if s["status"] == "completed"}
+        assert not [c for c in gw.calls[before:] if c.subrun in done]
+        assert artifact_text(events2, "report") == report
+
+
+class RejectingHost(SessionHost):
+    """E41：st1 的 subrun_end{succeeded} 之后宿主取消它（deadline），并以 invalid_transition
+    拒绝之后仍列出 st1 completed 的 checkpoint。"""
+
+    def __init__(self, gw: ScriptedGateway) -> None:
+        super().__init__(subruns=True, on_event=self._hook)
+        self.gw = gw
+        self.cancelled = False
+        self.rejected = 0
+
+    def _hook(self, event: dict[str, Any], host: SessionHost) -> None:
+        if event["type"] == "subrun_start":
+            self.gw.subrun_caps[event["subrun_id"]] = event.get("budget_cap_micro")
+        if event["type"] == "subrun_end" and event["subrun_id"] == "st1" and not self.cancelled:
+            self.cancelled = True
+            self.send(
+                {
+                    "type": "subrun_cancel_requested",
+                    "v": 1,
+                    "subrun_id": "st1",
+                    "reason": "deadline",
+                }
+            )
+
+    def _checkpoint_result(self, event: dict[str, Any]) -> dict[str, Any]:
+        out = super()._checkpoint_result(event)
+        listed = {s["subrun_id"]: s["status"] for s in event.get("subruns", [])}
+        if self.cancelled and listed.get("st1") == "completed":
+            self.rejected += 1
+            out = {**out, "status": "rejected", "code": "invalid_transition"}
+        return out
+
+
+def test_checkpoint_rejected_after_cancel_race_is_rebuilt_without_completed():
+    model = par_model()
+    gw = par_gateway(model, latency=0.01)
+    host = RejectingHost(gw)
+    code, events, gw, _ = par_run(model, gw=gw, host=host)
+    assert code == 0, of_type(events, "error")
+    assert host.rejected >= 1  # E41 的拒绝确实发生过
+    st1_ends = [e["status"] for e in of_type(events, "subrun_end") if e["subrun_id"] == "st1"]
+    assert st1_ends == ["succeeded", "cancelled"]
+    assert sub_result(events)["st1"] == "timed_out"
+    last = checkpoints(events)[-1]
+    assert {s["subrun_id"]: s["status"] for s in last["subruns"]}["st1"] == "cancelled"
+    assert "子主题「材料」不完整" in artifact_text(events, "report")
+
+
+def test_plan_caps_reserves_report_and_reduces_parallelism():
+    cfg = parse_turn_config(
+        {
+            "text": "x",
+            "subtopic_max_tokens": 1000,
+            "report_max_tokens": 1000,
+            "research": {
+                "orchestrator_output_micro_per_mtok": 200_000,
+                "worker_output_micro_per_mtok": 100_000,
+            },
+        }
+    )
+    # 预留 = 1000 × 0.2 × 1.5 = 300；每次 sub-run 模型调用约 100
+    assert plan_caps(3, {"limit_micro": 1000, "available_micro": 700}, cfg) == (3, 133, None)
+    k, cap, note = plan_caps(3, {"limit_micro": 1000, "available_micro": 500}, cfg)
+    assert (k, cap) == (2, 100) and note and "合并" in note
+    assert plan_caps(3, {"limit_micro": 1000, "available_micro": 350}, cfg)[0] == 0
+    assert plan_caps(3, None, cfg) == (3, None, None)
+    assert plan_caps(3, {"limit_micro": 0, "available_micro": 0}, cfg) == (3, None, None)
+    for bad in ({"scheduling": "random"}, {"subrun_deadline_ms": 0}, {"fixed_plan": "x"}):
+        with pytest.raises(Exception) as exc:
+            parse_turn_config({"text": "x", "research": bad})
+        assert getattr(exc.value, "code", None) == "invalid_config"
+
+
+def test_fixed_plan_skips_planning_and_runs_given_subtopics():
+    model = ScriptedModel(orch=[reply(PAR_REPORT)], sub={i: sub_steps(i) for i in ("1", "2", "3")})
+    code, events, gw, _ = par_run(model, par_config("serial", fixed_plan=PAR_TODO))
+    assert code == 0, of_type(events, "error")
+    assert len(model.bodies("orch")) == 1  # 不经模型规划，直接执行固定的子主题
+    assert sub_result(events) == {"st1": "completed", "st2": "completed", "st3": "completed"}
+    assert "[5][6]" in artifact_text(events, "report")

@@ -39,9 +39,17 @@ class ResearchSubtopic:
         "additionalProperties": False,
     }
     counts_budget = False
+    PARALLEL_DESCRIPTION = (
+        "执行研究计划：运行时把计划中全部未完成的子主题同时交给各自独立的执行者（另一个模型，"
+        "按简报搜索、阅读并写摘要），全部结束后一次返回各子主题带 [n] 引用的摘要，失败、超时或"
+        "部分完成的子主题会标注“不完整”。须先 todo_write 写计划；id 填计划中任一子主题即可；"
+        "已完成的子主题不会重复执行。本身不消耗额度，子主题内部的搜索与阅读各自计数。"
+    )
 
-    def __init__(self, state: TurnState) -> None:
+    def __init__(self, state: TurnState, *, parallel: bool = False) -> None:
         self.state = state
+        if parallel:  # 协商了 sub-run 扩展：一次调用执行整个研究阶段（chatagent.research）
+            self.description = self.PARALLEL_DESCRIPTION
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         sid = args["id"]

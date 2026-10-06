@@ -16,7 +16,7 @@ from agentbox_worker.tools import TurnFlags
 from agentbox_worker.tools.budget import TurnBudget
 from agentbox_worker.tools.sources import Source, SourceStore
 from agentbox_worker.tools.sources import _source as source_from_json
-from agentbox_worker.tools.text import truncate_utf8
+from agentbox_worker.tools.text import renumber_citations, truncate_utf8
 from agentbox_worker.tools.todo import TodoItem
 
 SCHEMA_VERSION = 1
@@ -68,6 +68,21 @@ class SubtopicState:
     summary: str | None = None
     sources: list[int] = field(default_factory=list)
     closing: bool = False  # 已要求"现在写子主题摘要"（之后不再提供工具）
+    # ---- 作为 sub-run 执行时（Plan 14；未协商 sub-run 扩展时均为缺省值） ----
+    subrun_id: str | None = None  # st<id>
+    share: int = 0  # 本 sub-run 的工具份额（软上限；合并的子主题为份额之和）
+    spent: int = 0  # 本 sub-run 已用的工具次数（与 tool 消息一起写入，恢复后确定）
+    exhausted: bool = False  # 本 sub-run 的工具调用已遇到 task 级额度用尽
+    cap: int | None = None  # subrun_start.budget_cap_micro（定义的一部分，恢复时原样重发）
+    deadline_ms: int = 0
+    base: int = 0  # 启动时全局来源表的最大编号；本 sub-run 的新来源本地编号从 base + 1 起
+    found: list[dict[str, Any]] = field(default_factory=list)  # 本 sub-run 的新来源（本地编号）
+    merged: bool = False  # found 已并入全局来源表（summary 已改写为全局编号）
+    call_ids: dict[str, int] = field(default_factory=dict)  # 本 sub-run 的 call id 计数器
+    partial: bool = False  # 摘要为抽取式（费用上限已到）
+    incomplete: str | None = None  # 不完整的原因（报告中标注）
+    result_ref: str | None = None  # subruns/<id>.json 产物的 sha256
+    members: list[str] = field(default_factory=list)  # 费用不足时并入本 sub-run 的其他子主题
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -81,6 +96,14 @@ class SubtopicState:
         _check(summary is None or isinstance(summary, str), "子主题 summary")
         sources = d.get("sources", [])
         _check(isinstance(sources, list), "子主题 sources")
+        for key in ("subrun_id", "incomplete", "result_ref"):
+            _check(d.get(key) is None or isinstance(d.get(key), str), f"子主题 {key}")
+        cap = d.get("cap")
+        _check(cap is None or (isinstance(cap, int) and not isinstance(cap, bool)), "子主题 cap")
+        found, members, ids = d.get("found", []), d.get("members", []), d.get("call_ids", {})
+        _check(isinstance(found, list) and all(isinstance(s, dict) for s in found), "子主题 found")
+        _check(isinstance(members, list) and all(isinstance(m, str) for m in members), "members")
+        _check(isinstance(ids, dict), "子主题 call_ids")
         return cls(
             id=d["id"],
             status=d["status"],
@@ -89,7 +112,24 @@ class SubtopicState:
             summary=summary,
             sources=[_int(n, "子主题 sources[]") for n in sources],
             closing=bool(d.get("closing", False)),
+            subrun_id=d.get("subrun_id"),
+            share=_int(d.get("share", 0), "子主题 share"),
+            spent=_int(d.get("spent", 0), "子主题 spent"),
+            exhausted=bool(d.get("exhausted", False)),
+            cap=cap,
+            deadline_ms=_int(d.get("deadline_ms", 0), "子主题 deadline_ms"),
+            base=_int(d.get("base", 0), "子主题 base"),
+            found=[asdict(source_from_json(s)) for s in found],
+            merged=bool(d.get("merged", False)),
+            call_ids={str(k): _int(v, "子主题 call_ids[]") for k, v in ids.items()},
+            partial=bool(d.get("partial", False)),
+            incomplete=d.get("incomplete"),
+            result_ref=d.get("result_ref"),
+            members=list(members),
         )
+
+    def found_sources(self) -> list[Source]:
+        return [source_from_json(s) for s in self.found]
 
 
 @dataclass
@@ -116,6 +156,7 @@ class TurnState:
     stop_findings: str | None = None  # 停止时的"目前发现"（"stop" checkpoint）
     restore_note: str | None = None  # 恢复说明：下一次编排模型调用之前追加到转录末尾
     answered: list[str] = field(default_factory=list)  # 已回答的 question_id（answer 幂等）
+    phase_subs: list[str] | None = None  # 进行中的 sub-run 研究阶段：各组主子主题 id（计划顺序）
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -141,6 +182,7 @@ class TurnState:
             "stop_findings": self.stop_findings,
             "restore_note": self.restore_note,
             "answered": list(self.answered),
+            "phase_subs": list(self.phase_subs) if self.phase_subs is not None else None,
         }
 
     @classmethod
@@ -178,6 +220,12 @@ class TurnState:
         _check(isinstance(answered, list) and all(isinstance(a, str) for a in answered), "answered")
         for key in ("stop_findings", "restore_note"):
             _check(d.get(key) is None or isinstance(d.get(key), str), key)
+        phase_subs = d.get("phase_subs")
+        _check(
+            phase_subs is None
+            or (isinstance(phase_subs, list) and all(isinstance(s, str) for s in phase_subs)),
+            "phase_subs",
+        )
         return cls(
             phase=d["phase"],
             route=d.get("route"),
@@ -200,7 +248,38 @@ class TurnState:
             stop_findings=d.get("stop_findings"),
             restore_note=d.get("restore_note"),
             answered=list(answered),
+            phase_subs=list(phase_subs) if phase_subs is not None else None,
         )
+
+    def merge_found(self, sub: SubtopicState) -> None:
+        """把 sub-run 的新来源并入全局来源表（同 sha 或同 URL 只登记一次），摘要中的本地编号
+        改写为全局编号。各 sub-run 在阶段结束时按计划顺序合并，故编号与调度方式无关。"""
+        if sub.merged:
+            return
+        mapping = {s.n: s.n for s in self.sources.all() if s.n <= sub.base}
+        for src in sub.found_sources():
+            new, _ = self.sources.add(
+                sha256=src.sha256,
+                url=src.url,
+                title=src.title,
+                excerpt=src.excerpt,
+                call_id=src.call_id,
+            )
+            mapping[src.n] = new.n
+        if sub.summary:
+            sub.summary = renumber_citations(sub.summary, mapping)
+        sub.sources = sorted({mapping[s.n] for s in sub.found_sources()})
+        sub.found, sub.merged = [], True
+
+    def merged_copy(self) -> TurnState:
+        """副本：尚未合并的 sub-run 来源按计划顺序并入（停止卡、停止摘要与 carryover 使用）。"""
+        copy = TurnState.from_json(self.to_json())
+        order = [i.id for i in copy.todo] + [k for k in copy.subtopics if copy.todo_item(k) is None]
+        for sid in order:
+            sub = copy.subtopics.get(sid)
+            if sub is not None and (sub.found or sub.subrun_id) and not sub.merged:
+                copy.merge_found(sub)
+        return copy
 
     def add_refs(self, shas: Any) -> None:
         for sha in shas:

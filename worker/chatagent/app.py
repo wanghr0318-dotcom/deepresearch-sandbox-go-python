@@ -93,6 +93,9 @@ def seed_restore(state: TurnState, budget_limit: int) -> TurnState:
     if total > cap:
         left = {sid: v * cap // total for sid, v in left.items()}
     state.budget = TurnBudget(limit=budget_limit, shares=left)
+    for sid, sub in state.subtopics.items():  # sub-run 的份额同样缩放（新 task 的新额度）
+        if sub.subrun_id and sid in left:
+            sub.share, sub.exhausted = sub.spent + left[sid], False
     for item in state.todo:
         if item.id in left:
             item.budget = left[item.id]
@@ -133,7 +136,8 @@ def carryover_context(carry: dict[str, Any] | None) -> tuple[str | None, list[So
     if isinstance(raw, dict):
         raw = {k: v for k, v in raw.items() if k != RESERVED_STATE_KEY}
     try:
-        state = TurnState.from_json(raw)  # type: ignore[arg-type]
+        # 并行研究中被取代时，各 sub-run 的新来源尚未并入全局来源表：按计划顺序合并
+        state = TurnState.from_json(raw).merged_copy()  # type: ignore[arg-type]
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         _log(f"carryover 状态无法解析，本轮不带上一轮的发现：{exc}")
         return None, []

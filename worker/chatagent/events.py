@@ -73,12 +73,18 @@ def _fit(data: dict[str, Any]) -> dict[str, Any]:
 
 
 class Emitter:
-    def __init__(self, ctx: TaskContext) -> None:
+    def __init__(self, ctx: TaskContext, sink: Any = None) -> None:
         self.ctx = ctx
         self.message_id = f"{ctx.task_id}-reply"
+        # progress 的发送者：缺省为 TaskContext；sub-run 中为 SubrunHandle（事件带 subrun_id）
+        self._sink = sink if sink is not None else ctx
+
+    def for_subrun(self, handle: Any) -> Emitter:
+        """同一 turn 的发射器，事件经 handle.progress 发出（带 subrun_id）。"""
+        return Emitter(self.ctx, sink=handle)
 
     async def _send(self, kind: str, message: str, data: dict[str, Any], step: str | None) -> None:
-        await self.ctx.progress(kind, message, step_id=step, data=_fit(data))
+        await self._sink.progress(kind, message, step_id=step, data=_fit(data))
 
     async def route(self, route: str, forced: bool = False) -> None:
         label = "深度研究" if route == "research" else "直接回答"
@@ -186,9 +192,9 @@ class Emitter:
         data = {"used": b.used, "limit": b.limit}
         await self._send("budget", f"工具额度 {b.used}/{b.limit}", data, None)
 
-    async def subtopic(self, sub: SubtopicState, title: str) -> None:
+    async def subtopic(self, sub: SubtopicState, title: str, *, with_summary: bool = True) -> None:
         data: dict[str, Any] = {"id": sub.id, "title": title, "status": sub.status}
-        if sub.status == "done" and sub.summary:
+        if with_summary and sub.status == "done" and sub.summary:
             data["summary"] = sub.summary
         await self._send("subtopic", f"子主题 {sub.id}：{sub.status}", data, f"sub-{sub.id}")
 

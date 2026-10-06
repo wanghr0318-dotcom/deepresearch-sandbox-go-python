@@ -15,11 +15,14 @@ import asyncio
 import hashlib
 import itertools
 import json
+import threading
+import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from agentbox_worker.errors import BudgetExhausted, GatewayError, ToolBudgetExhausted
 from agentbox_worker.gateway import CallIds, GatewayClient, GatewayResult
 from agentbox_worker.runtime import Timing
 from agentbox_worker.session import run_session_worker
@@ -34,6 +37,7 @@ class GatewayCall:
     step_id: str
     call_id: str
     body: dict[str, Any]
+    subrun: str | None = None  # 经 sub-run 视图发起时为其 ID
 
 
 class ScriptedGateway:
@@ -45,6 +49,11 @@ class ScriptedGateway:
       含失败的调用）返回值的函数，或 None（模拟没有 X-Agentbox-Tool-Budget 头）。
     - calls 按发起顺序记录每次调用（含失败的）；blobs 为全部结果 blob；read_blob_error 不为 None 时
       read_blob 抛出它。
+    - sub-run（Plan 14）：view(id) 给出带 <id>/ call id 前缀的视图（自有 call_ids，可被替换）；
+      tool_limit 模拟 Gateway 的 task 级工具额度（超出 → 429 tool_budget_exhausted，不计数）；
+      budget_limit_micro + cost 模拟两层账本（subrun_caps 由测试按 subrun_start 填入；超出 →
+      402 subrun_budget_exhausted / budget_exhausted）；inject(call) 返回异常时抛出（不运行脚本）；
+      latency 秒的延迟，spans 记录 (subrun, kind, 开始, 结束)。线程安全。
     """
 
     def __init__(
@@ -55,18 +64,34 @@ class ScriptedGateway:
         fetch: Callable[[str], Any] | None = None,
         tool_budget: BudgetScript = None,
         call_ids: CallIds | None = None,
+        tool_limit: int | None = None,
+        latency: float = 0.0,
+        budget_limit_micro: int | None = None,
+        cost: Callable[[GatewayCall], int] | None = None,
+        inject: Callable[[GatewayCall], BaseException | None] | None = None,
     ) -> None:
         self.chat_script = chat
         self.search_script = search
         self.fetch_script = fetch
         self.tool_budget = tool_budget
         self.call_ids = call_ids if call_ids is not None else CallIds()
+        self.tool_limit = tool_limit
+        self.latency = latency
+        self.budget_limit_micro = budget_limit_micro
+        self.cost = cost
+        self.inject = inject
         self.calls: list[GatewayCall] = []
         self.blobs: dict[str, bytes] = {}
         self.blob_reads: list[str] = []
         self.read_blob_error: Exception | None = None
+        self.subrun_caps: dict[str, int | None] = {}
+        self.spent_micro = 0
+        self.subrun_spent: dict[str, int] = {}
+        self.spans: list[tuple[str | None, str, float, float]] = []
+        self.rejections: list[tuple[str | None, str]] = []  # (subrun, code)
         self._results: dict[str, GatewayResult] = {}
         self._counted = 0
+        self._lock = threading.Lock()
 
     # ---- GatewayLike ----
 
@@ -111,6 +136,24 @@ class ScriptedGateway:
             raise self.read_blob_error
         return self.blobs[sha256]
 
+    def budget(self) -> dict[str, int]:
+        """GET /v1/budget；未设 budget_limit_micro 时模拟没有该端点（404）。"""
+        if self.budget_limit_micro is None:
+            raise GatewayError(404, "not_found", "no budget")
+        with self._lock:
+            spent = self.spent_micro
+        limit = self.budget_limit_micro
+        return {
+            "limit_micro": limit,
+            "reserved_micro": 0,
+            "spent_micro": spent,
+            "unknown_micro": 0,
+            "available_micro": limit - spent,
+        }
+
+    def view(self, subrun_id: str) -> ScriptedSubrunView:
+        return ScriptedSubrunView(self, subrun_id)
+
     # ---- 测试辅助 ----
 
     def counts(self) -> dict[str, int]:
@@ -118,33 +161,75 @@ class ScriptedGateway:
 
     def put_blob(self, data: bytes) -> str:
         sha = hashlib.sha256(data).hexdigest()
-        self.blobs[sha] = data
+        with self._lock:
+            self.blobs[sha] = data
         return sha
 
     # ---- 内部 ----
 
     def _call(
-        self, kind: str, step_id: str, body: dict[str, Any], run: Callable[[], Any]
+        self,
+        kind: str,
+        step_id: str,
+        body: dict[str, Any],
+        run: Callable[[], Any],
+        view: ScriptedSubrunView | None = None,
     ) -> GatewayResult:
-        call_id = self.call_ids.next(step_id, kind)
-        self.calls.append(GatewayCall(kind, step_id, call_id, body))
-        old = self._results.get(call_id)
+        sub = view.subrun_id if view is not None else None
+        if view is not None and view.closed:
+            raise GatewayError(0, "subrun_closed", f"sub-run {sub} 已结束或被取消")
+        ids = view.call_ids if view is not None else self.call_ids
+        call_id = ids.next(step_id, kind, sub)
+        call = GatewayCall(kind, step_id, call_id, body, sub)
+        with self._lock:
+            self.calls.append(call)
+            old = self._results.get(call_id)
         if old is not None:  # 同一 call id 重发：重放已记录的结果（真实 Gateway 的重放也带额度头）
             return GatewayResult(
                 old.call_id, old.body, old.blob_sha256, True, old.status, old.tool_budget
             )
+        if self.inject is not None and (exc := self.inject(call)) is not None:
+            raise exc
         budget = None
-        if kind in ("search", "fetch"):
-            self._counted += 1
-            budget = self._budget(self._counted)
+        with self._lock:
+            self._charge(call)
+            if kind in ("search", "fetch"):
+                if self.tool_limit is not None and self._counted >= self.tool_limit:
+                    self.rejections.append((sub, "tool_budget_exhausted"))
+                    raise ToolBudgetExhausted(429, "tool_budget_exhausted")
+                self._counted += 1
+                budget = self._budget(self._counted)
+        start = time.monotonic()
+        if self.latency:
+            time.sleep(self.latency)
         out = run()
+        with self._lock:
+            self.spans.append((sub, kind, start, time.monotonic()))
         if isinstance(out, GatewayResult):
             res = out
         else:
             sha = self.put_blob(json.dumps(out, ensure_ascii=False, sort_keys=True).encode())
             res = GatewayResult(call_id, out, sha, False, 200, budget)
-        self._results[call_id] = res
+        with self._lock:
+            self._results[call_id] = res
         return res
+
+    def _charge(self, call: GatewayCall) -> None:
+        """两层账本（持锁调用）：sub-run 上限先于 task 预算检查。"""
+        if self.budget_limit_micro is None or self.cost is None:
+            return
+        price = self.cost(call)
+        sub = call.subrun
+        cap = self.subrun_caps.get(sub) if sub is not None else None
+        if cap is not None and self.subrun_spent.get(sub or "", 0) + price > cap:
+            self.rejections.append((sub, "subrun_budget_exhausted"))
+            raise BudgetExhausted(402, "subrun_budget_exhausted")
+        if self.spent_micro + price > self.budget_limit_micro:
+            self.rejections.append((sub, "budget_exhausted"))
+            raise BudgetExhausted(402, "budget_exhausted")
+        self.spent_micro += price
+        if sub is not None:
+            self.subrun_spent[sub] = self.subrun_spent.get(sub, 0) + price
 
     def _budget(self, k: int) -> tuple[int, int] | None:
         if callable(self.tool_budget):
@@ -156,6 +241,65 @@ def _need(script: Callable[..., Any] | None, kind: str) -> Callable[..., Any]:
     if script is None:
         raise AssertionError(f"ScriptedGateway 没有 {kind} 脚本")
     return script
+
+
+class ScriptedSubrunView:
+    """ScriptedGateway 的 sub-run 视图：call id 前缀 <subrun_id>/，自有 call_ids（编排层可替换），
+    close() 之后的请求以 GatewayError(0, "subrun_closed") 失败。"""
+
+    def __init__(self, parent: ScriptedGateway, subrun_id: str) -> None:
+        self.parent = parent
+        self.subrun_id = subrun_id
+        self.call_ids = CallIds()
+        self.closed = False
+
+    def chat(
+        self,
+        step_id: str,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
+    ) -> GatewayResult:
+        body = GatewayClient.chat_body(
+            messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        script = self.parent.chat_script
+        return self.parent._call(
+            "chat", step_id, body, lambda: _need(script, "chat")(step_id, body), self
+        )
+
+    def search(
+        self, step_id: str, query: str, *, max_results: int = 5, no_cache: bool = False
+    ) -> GatewayResult:
+        body = {"query": query, "max_results": max_results}
+        script = self.parent.search_script
+        return self.parent._call(
+            "search", step_id, body, lambda: _need(script, "search")(query, max_results), self
+        )
+
+    def fetch(self, step_id: str, url: str, *, no_cache: bool = False) -> GatewayResult:
+        script = self.parent.fetch_script
+        return self.parent._call(
+            "fetch", step_id, {"url": url}, lambda: _need(script, "fetch")(url), self
+        )
+
+    def read_blob(self, sha256: str) -> bytes:
+        return self.parent.read_blob(sha256)
+
+    def budget(self) -> dict[str, int]:
+        return self.parent.budget()
+
+    def close(self) -> None:
+        self.closed = True
 
 
 # ---- session 模式的脚本化宿主 ----
@@ -196,6 +340,8 @@ class SessionHost:
         checkpoint_status: str = "committed",
         on_event: EventHook | None = None,
         answer_outcome_queries: bool = True,
+        subruns: bool = False,
+        subrun_answer: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
     ) -> None:
         self.init: dict[str, Any] = {
             "type": "init",
@@ -207,6 +353,9 @@ class SessionHost:
         }
         if session_resume is not None:
             self.init["session_resume"] = session_resume
+        if subruns:  # 协商 sub-run 扩展；subrun_start 缺省答 started（subrun_answer 可改写或不答）
+            self.init["extensions"] = ["subruns"]
+        self.subrun_answer = subrun_answer
         self.verdicts = dict(verdicts or {})
         self.drop_first_outcome = drop_first_outcome
         self.checkpoint_status = checkpoint_status
@@ -312,6 +461,14 @@ class SessionHost:
             self.send(self._checkpoint_result(event))
         elif typ == "artifact":
             self.send(self._artifact_result(event))
+        elif typ == "subrun_start":
+            answer: dict[str, Any] | None = {"status": "started"}
+            if self.subrun_answer is not None:
+                answer = self.subrun_answer(event)
+            if answer is not None:
+                self.send(
+                    {"type": "subrun_started", "v": 1, "subrun_id": event["subrun_id"], **answer}
+                )
         elif typ in _PROPOSALS and event.get("attempt_id"):
             outcome = self.outcome_for(event)
             if self.drop_first_outcome and not self._dropped:
@@ -400,22 +557,25 @@ class ScriptedModel:
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self._used: Counter[str] = Counter()
         self._ids = itertools.count(1)
+        self._lock = threading.Lock()  # sub-run 并行时多个线程同时调用
 
     def __call__(self, step_id: str, body: dict[str, Any]) -> dict[str, Any]:
-        self.requests.append((step_id, json.loads(json.dumps(body))))
-        script = self.scripts.get(step_id)
-        k = self._used[step_id]
-        if script is None or k >= len(script):
-            raise AssertionError(f"ScriptedModel：{step_id} 第 {k + 1} 次调用没有脚本")
-        self._used[step_id] += 1
+        with self._lock:
+            self.requests.append((step_id, json.loads(json.dumps(body))))
+            script = self.scripts.get(step_id)
+            k = self._used[step_id]
+            if script is None or k >= len(script):
+                raise AssertionError(f"ScriptedModel：{step_id} 第 {k + 1} 次调用没有脚本")
+            self._used[step_id] += 1
         item = script[k]
         if isinstance(item, BaseException):
             raise item
         if callable(item):
             item = item(body)
         choice = json.loads(json.dumps(item))
-        for tc in choice["message"].get("tool_calls") or []:
-            tc.setdefault("id", f"call_{next(self._ids)}")
+        with self._lock:
+            for tc in choice["message"].get("tool_calls") or []:
+                tc.setdefault("id", f"call_{next(self._ids)}")
         return {"id": "resp", "choices": [{"index": 0, **choice}], "usage": {"total_tokens": 1}}
 
     def bodies(self, step_id: str) -> list[dict[str, Any]]:

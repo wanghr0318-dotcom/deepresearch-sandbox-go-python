@@ -36,8 +36,16 @@ def _fresh_sources(state: TurnState) -> int:
     return sum(1 for s in state.sources.all() if not s.origin)
 
 
+def _view(state: TurnState) -> TurnState:
+    """并行研究中途停止时，各 sub-run 的新来源尚未并入全局来源表：按计划顺序合并的副本。"""
+    if any(s.found and not s.merged for s in state.subtopics.values()):
+        return state.merged_copy()
+    return state
+
+
 def stop_card(state: TurnState) -> dict[str, Any]:
     """停止卡（契约 L：StopCard）：子主题完成数/总数、本轮来源数、工具额度，附计划清单。"""
+    state = _view(state)
     return {
         "subtopics_done": len(_done(state)),
         "subtopics_total": sum(1 for i in state.todo if i.budget > 0),
@@ -58,6 +66,7 @@ def can_finish(state: TurnState) -> bool:
 
 def findings_messages(state: TurnState, topic: str) -> list[dict[str, str]] | None:
     """无已完成子主题摘要且无本轮来源 → None（不调用模型）；否则为确定性的摘要请求。"""
+    state = _view(state)
     has_summary = any(s.status == "done" and s.summary for s in state.subtopics.values())
     if not has_summary and _fresh_sources(state) == 0:
         return None
@@ -65,6 +74,7 @@ def findings_messages(state: TurnState, topic: str) -> list[dict[str, str]] | No
 
 
 def fallback_findings(state: TurnState) -> str:
+    state = _view(state)
     return f"已完成 {len(_done(state))} 个子主题、阅读 {_fresh_sources(state)} 个来源。"
 
 

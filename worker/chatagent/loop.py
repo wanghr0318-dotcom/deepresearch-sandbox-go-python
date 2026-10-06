@@ -40,6 +40,7 @@ from chatagent.report import (
     report_summary,
     split_title,
 )
+from chatagent.research import ResearchPhase
 from chatagent.state import SessionMemory, TurnState
 from chatagent.stop import can_finish, stop_card, stop_summary
 from chatagent.subtopic import RUN_SUBTOPIC, ResearchSubtopic, run_subtopic
@@ -54,6 +55,8 @@ SKIPPED_FOR_QUESTION = "已跳过：等待用户回答"
 COST_BUDGET_NOTE = "预算耗尽，部分结果"
 REPORT_POINTER = "完整报告见右侧「报告」"
 FORCED_READ_ID = "forced-read-skill"
+FIXED_PLAN_ID = "fixed-plan"
+FIXED_RESEARCH_ID = "fixed-research"
 _BASE_TOOLS = ("read_skill", "web_search", "web_fetch", "read_source")
 
 
@@ -120,6 +123,9 @@ class Agent:
         self.skills = skills
         self.emit = emit
         self.carry = carry
+        # 宿主协商了 sub-run 扩展时，子主题作为 sub-run 并行执行（chatagent.research）；
+        # 否则按 Plan 13 在进程内逐个执行
+        self.subruns = ctx.subruns.negotiated
         # 工具实例每轮新建（无跨轮可变状态）
         self.registry = ToolRegistry(
             [
@@ -129,7 +135,7 @@ class Agent:
                 ReadSource(),
                 AskUser(),
                 TodoWrite(),
-                ResearchSubtopic(state),
+                ResearchSubtopic(state, parallel=self.subruns),
             ]
         )
         self.sub_registry = ToolRegistry([WebSearch(), WebFetch(), ReadSource()])
@@ -236,26 +242,50 @@ class Agent:
             {"role": "user", "content": cfg.text},
         ]
         st.phase = "orchestrating"
-        if not cfg.deep_research:
+        if not (cfg.deep_research or cfg.fixed_plan):
             return
         # 深度研究开关：由运行时直接读取 skill，不依赖模型遵守指令
         args = json.dumps({"name": RESEARCH_SKILL}, ensure_ascii=False)
-        call = {
-            "id": FORCED_READ_ID,
-            "type": "function",
-            "function": {"name": "read_skill", "arguments": args},
-        }
-        st.messages.append({"role": "assistant", "content": "", "tool_calls": [call]})
-        result = await asyncio.to_thread(
-            self.registry.dispatch, "read_skill", args, self._tool_ctx(ORCH, st.messages, None)
-        )
+        result = await self._synthetic_call(FORCED_READ_ID, "read_skill", args)
         if not result.ok:
             raise WorkerFailure(
                 "skills_unavailable", f"无法读取 {RESEARCH_SKILL}：{result.content}"
             )
-        st.messages.append(_tool_message(FORCED_READ_ID, "read_skill", result.content))
         await self._skill_events(ORCH, result)
+        if cfg.fixed_plan:
+            await self._fixed_plan(cfg.fixed_plan)
         await self.checkpoint(ORCH)
+
+    async def _synthetic_call(self, call_id: str, name: str, args: str) -> ToolResult:
+        """运行时代替模型发起的工具调用：assistant 调用消息 + 执行 + tool 结果消息（无事件）。"""
+        st = self.state
+        call = {"id": call_id, "type": "function", "function": {"name": name, "arguments": args}}
+        st.messages.append({"role": "assistant", "content": "", "tool_calls": [call]})
+        result = await asyncio.to_thread(
+            self.registry.dispatch, name, args, self._tool_ctx(ORCH, st.messages, None)
+        )
+        st.messages.append(_tool_message(call_id, name, result.content))
+        return result
+
+    async def _fixed_plan(self, items: tuple[dict[str, Any], ...]) -> None:
+        """research.fixed_plan（串并行对比的运维路径）：跳过规划，按给定清单写计划，并以合成的
+        research_subtopic 调用开始研究阶段（由编排循环执行）。"""
+        st = self.state
+        args = json.dumps({"items": list(items)}, ensure_ascii=False)
+        result = await self._synthetic_call(FIXED_PLAN_ID, "todo_write", args)
+        if not result.ok:
+            raise WorkerFailure("invalid_config", f"research.fixed_plan 不可用：{result.content}")
+        await self._after_tool(ORCH, "todo_write", result)
+        first = next(i.id for i in st.todo if i.budget > 0)
+        call = {
+            "id": FIXED_RESEARCH_ID,
+            "type": "function",
+            "function": {
+                "name": "research_subtopic",
+                "arguments": json.dumps({"id": first}, ensure_ascii=False),
+            },
+        }
+        st.messages.append({"role": "assistant", "content": "", "tool_calls": [call]})
 
     def _available(self) -> list[str]:
         names = list(_BASE_TOOLS)
@@ -324,6 +354,9 @@ class Agent:
         幂等：崩溃后的新 attempt 再次带 finish_now 时不重复。"""
         st = self.state
         if not st.finish_requested:
+            phase: ToolResult | None = None
+            if self.subruns and st.phase_subs is not None:
+                phase = await ResearchPhase(self).finish()  # 取消仍在运行的 sub-run
             st.finish_requested, st.partial = True, True
             st.stop_findings = None
             if PARTIAL_NOTE not in st.notes:
@@ -342,7 +375,9 @@ class Agent:
                 event_id = f"{ORCH}:{_tool_count(st.messages) + 1}"
                 name, raw = tc["function"]["name"], tc["function"]["arguments"]
                 result = ToolResult(content=FINISH_SKIPPED, ok=False)
-                if name == "research_subtopic":  # 已完成的子主题仍把摘要交给编排模型
+                if name == "research_subtopic" and phase is not None:
+                    result, phase = phase, None  # 研究阶段的结果（已完成与部分证据）
+                elif name == "research_subtopic":  # 已完成的子主题仍把摘要交给编排模型
                     tctx = self._tool_ctx(ORCH, st.messages, None)
                     result = self.registry.dispatch(name, raw, tctx)
                 st.messages.append(_tool_message(tc["id"], name, result.content))
@@ -418,7 +453,12 @@ class Agent:
         await self.emit.tool_call(step, event_id, name, args, subtopic_id)
         if name == "research_subtopic" and registry is self.registry:
             result = registry.dispatch(name, raw, tctx)
-            if result.control == RUN_SUBTOPIC:
+            if self.subruns and (result.control == RUN_SUBTOPIC or st.phase_subs is not None):
+                phase = await ResearchPhase(self).run()  # 全部子主题作为 sub-run 执行
+                if phase is None:  # 各 sub-run 已在工具边界返回：停止
+                    raise _Pause(await self._stop())
+                result = phase
+            elif result.control == RUN_SUBTOPIC:
                 result = await run_subtopic(self, (result.data or {})["id"])
         else:
             result = await asyncio.to_thread(registry.dispatch, name, raw, tctx)
