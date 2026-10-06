@@ -27,6 +27,7 @@
 | 会话后端：每会话一个长期 incarnation（冻结、驱逐、冷恢复、关闭）、turn 与工具额度（M4 Plan 12） | **已实现**（以脚本化会话 Worker 验收，待 Plan 13 联调） | `internal/session`、会话 API 与整会话 SSE、`--turn-tool-budget`、`--session-idle-freeze`、`--session-evict-after`、`--session-worker-argv`；E28–E33 在真实沙箱中以 root 运行，见"会话"；面向用户的会话 Agent 与聊天界面是 Plan 13 |
 | 独立 exec 沙箱与沙箱加固（M4 Plan 15） | **已实现**（WSL2 真实沙箱 root 验收；服务器验收与 CI 待协调者联合验收） | `POST /v1/exec`、`--exec-*` 标志、Worker 工具 `run_python`；E35–E38 在真实沙箱中以 root 通过，E39 由 provider 测试覆盖，见"代码执行沙箱"与[验收记录](docs/evidence/2026-10-06-m4-exec-hardening.md) |
 | 对话式研究助手：工具调用式 Agent `chatagent`、deep-research skill、停止/继续/立即写报告/恢复/提问、对话界面（M4 Plan 13） | **已实现**（2026-10-06 在演示服务器上以真实 Kimi + Serper 验收，[验收记录](docs/evidence/2026-10-06-m4-chat-acceptance.md)；待协调者联合验收与浏览器目视检查） | `worker/chatagent`、`worker/agentbox_worker/tools`、`worker/skills/deep-research`、`web/src/views/ChatView.vue`；`scripts/dev/install-worker.sh`；见"对话式助手" |
+| 受限多 Agent：同一 turn 内 2–4 个子主题以 sub-run 并行（两层账本、取消与恢复），以及串并行对比（M4 Plan 14） | **已实现**（2026-10-07 在演示服务器上验收与对比，[记录](docs/evidence/2026-10-06-m4-subrun-comparison.md)；"立即写报告时取消运行中的 sub-run"未在真实服务器上观察到，由自动化测试覆盖；待协调者联合验收） | `internal/subrun`、`worker/chatagent/research.py`、`--worker-subruns`、`--subrun-cancel-timeout`；E24、E40–E45、I13；见"并行研究（sub-run）" |
 
 ## 现在可以运行的命令
 
@@ -271,6 +272,17 @@ sudo -E ./bin/agentbox server --data-dir /var/lib/agentbox --web-dir web/dist \
 
 编排（路由、计划、报告）用 `--user-orchestrator-model`（默认 `kimi-k3`），子主题与停止摘要用 `--user-worker-model`（默认 `kimi-k2.6`）；两者是推理模型，`--model-max-tokens-cap`（默认 32768）不得低于 16384。用户点"停止"时宿主给 Worker 60 s 写停止卡，超时则终止 incarnation（会话被驱逐，turn 仍从最后 checkpoint 暂停，可继续）。独立 exec（`--exec-slots`，默认 4，演示服务器为 2）已启用，但对话 Agent 尚未提供 `run_python` 工具。
 
+### 并行研究（sub-run，M4 Plan 14）
+
+用户侧无需任何操作：深度研究的子主题（2–4 个）作为同一 turn 内的 sub-run 并行执行。主 Agent（kimi-k3）负责规划与写报告，每个 sub-run 内的搜索/阅读循环由 kimi-k2.6 驱动。右侧"进度"面板中多个子主题同时显示"进行中"。每轮 30 次工具额度由全部 sub-run 共享。停止、继续、立即写报告与恢复的用法不变；已完成的子主题在继续或恢复后不会重跑。
+
+运维侧：
+
+- **inspect。** `GET /tasks/{id}/inspect` 的 `subruns[]`，或工作台 `#/admin` 的任务详情，给出每个 sub-run 的状态、开始/结束时间、取消或失败原因，以及 sub-run 层的预留/已花/unknown 费用（task 层是两层之和的上层）。`calls[].subrun_id` 标出每个调用归属哪个 sub-run。
+- **`--worker-subruns`**（默认 true）：向 Worker 协商 `subruns` 扩展。设为 false 时，研究退回到进程内逐个执行子主题。
+- **`--subrun-cancel-timeout`**（默认 10s）：宿主取消一个 sub-run 后，等待 Worker 结束它的时限。超时则终止整个 attempt，从 checkpoint 恢复。
+- **串并行对比。** 运维可用 `POST /tasks {session_id, spec: {text, deep_research, research: {scheduling, fixed_plan}}}` 在指定会话中创建 turn。驱动脚本见 `experiments/subrun-compare/`，结果见[对比与验收记录](docs/evidence/2026-10-06-m4-subrun-comparison.md)。演示服务器上每组 N = 4（小样本）：墙钟时间 P50 串行 302 s、并行 184 s；费用中位数 0.48 / 0.50 USD；两组都无失败；引用可定位率都是 100%。
+
 ## 文档
 
 | 文档 | 内容 |
@@ -282,7 +294,7 @@ sudo -E ./bin/agentbox server --data-dir /var/lib/agentbox --web-dir web/dist \
 | [持久化设计](docs/design/2026-10-04-m1-4-persistence-design.md)、[安装身份修订](docs/design/2026-10-05-installation-identity-amendment.md) | Plan 4 的设计依据 |
 | [Provider 契约](docs/design/2026-10-05-provider-contract.md) | 环境生命周期的 Go 接口、错误、并发边界；会话环境的冻结、解冻、进程表与恢复暂存（第 10 节） |
 | [Plan 15 exec 与加固](docs/plans/2026-10-06-m4-15-exec-hardening.md)、[exec 加固验收记录](docs/evidence/2026-10-06-m4-exec-hardening.md) | 独立 exec 沙箱的决定 D1–D16、E34–E39 的证据与边界 |
-| [M4 计划索引](docs/plans/2026-10-06-m4-index.md)、[Plan 12 会话后端](docs/plans/2026-10-06-m4-12-sessions.md)、[会话后端验收记录](docs/evidence/2026-10-06-m4-sessions.md)、[Plan 13 Agent 与对话界面](docs/plans/2026-10-06-m4-13-agent-chat.md)、[对话式助手真实验收记录](docs/evidence/2026-10-06-m4-chat-acceptance.md) | M4 计划、Plan 12/13 共享契约与状态 |
+| [M4 计划索引](docs/plans/2026-10-06-m4-index.md)、[Plan 12 会话后端](docs/plans/2026-10-06-m4-12-sessions.md)、[会话后端验收记录](docs/evidence/2026-10-06-m4-sessions.md)、[Plan 13 Agent 与对话界面](docs/plans/2026-10-06-m4-13-agent-chat.md)、[对话式助手真实验收记录](docs/evidence/2026-10-06-m4-chat-acceptance.md)、[Plan 14 受限多 Agent](docs/plans/2026-10-06-m4-14-subruns.md)、[sub-run 串并行对比与验收记录](docs/evidence/2026-10-06-m4-subrun-comparison.md) | M4 计划、Plan 12/13 共享契约与状态 |
 | [Plan 2](docs/plans/2026-10-05-m1-2-local-provider.md)、[Plan 5](docs/plans/2026-10-05-m1-5-control-plane.md)、[Plan 6](docs/plans/2026-10-05-m1-6-recovery-entry.md) | M1 第 2 批计划、执行中修订与验收记录 |
 | [M2 计划索引](docs/plans/2026-10-05-m2-index.md)、[Plan 7 Gateway](docs/plans/2026-10-05-m2-7-gateway.md)、[Plan 8 DeepResearch](docs/plans/2026-10-05-m2-8-deepresearch.md) | M2 计划、执行中修订与验收记录 |
 | [M3 工作台验证记录](docs/evidence/2026-10-05-m3-workbench.md) | E26、E27 的自动化证据；浏览器联调待在演示服务器上补入 |

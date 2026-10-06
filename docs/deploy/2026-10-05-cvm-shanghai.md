@@ -64,3 +64,4 @@
 2. 迁移前备份（见上节），复制到本机 `backups/`；保留回滚副本 `/usr/local/bin/agentbox.m3-bak`、`/opt/agentbox.m3-bak`、`/opt/agentbox-web.m3-bak`、`/root/agentbox-demo.service.m3-bak`。
 3. `sudo bash scripts/dev/install-worker.sh /opt/agentbox`；web 在本机构建，`dist` 打包后装到 `/opt/agentbox-web`；停服务 → 换二进制与 unit（`deploy/systemd/agentbox-demo.service`）→ `daemon-reload` → 启动（新迁移在启动时应用；重启使全部会话转为驱逐，下一条消息冷恢复）。
 4. 回滚：停服务，换回 `.m3-bak` 副本；数据库已迁移时先按上节从迁移前的备份恢复。
+5. M4 Plan 14（2026-10-07，迁移 0009）：步骤同上。迁移前备份为 `agentbox-backup-20261006T160542Z`；回滚到 Plan 13 版本用 `*.m4p13-bak` 副本（`/usr/local/bin/agentbox.m4p13-bak`、`/opt/agentbox.m4p13-bak`、`/opt/agentbox-web.m4p13-bak`、`/root/agentbox-demo.service.m4p13-bak`）。见[记录](../evidence/2026-10-06-m4-subrun-comparison.md)。
