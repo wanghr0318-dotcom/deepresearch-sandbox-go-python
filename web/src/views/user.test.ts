@@ -3,8 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App.vue";
 import { ApiError, NetworkError } from "../api/client";
 import type { User } from "../api/client";
+import type { ChatApiLike } from "../api/chat";
 import type { SessionApiLike } from "../api/session";
-import { fakeChat, fakeSessionStream } from "../components/chat/chatkit";
+import { fakeChat, fakeSessionStream, session } from "../components/chat/chatkit";
+import type { Mocked as ChatMocked } from "../components/chat/chatkit";
 import { ev, fakeApi, fakeWatch, flushAll, task } from "../components/testkit";
 import type { FakeWatch } from "../components/testkit";
 import { servicesKey } from "../lib/services";
@@ -41,19 +43,21 @@ function fakeSessionApi(over: Partial<SessionApiLike> = {}): Mocked<SessionApiLi
 
 interface Kit {
   api: Mocked<SessionApiLike>;
+  chat: ChatMocked<ChatApiLike>;
   watch: FakeWatch;
   saveBlob: ReturnType<typeof vi.fn>;
   global: { provide: Record<symbol, unknown> };
 }
 
-function kit(over: Partial<SessionApiLike> = {}, admin?: Services): Kit {
+function kit(over: Partial<SessionApiLike> = {}, admin?: Services, chatOver: Partial<ChatApiLike> = {}): Kit {
   const api = fakeSessionApi(over);
+  const chat = fakeChat(chatOver);
   const watch = fakeWatch();
   const saveBlob = vi.fn();
-  const us: UserServices = { api, chat: fakeChat(), watch: watch.fn, watchSession: fakeSessionStream().fn, saveBlob };
+  const us: UserServices = { api, chat, watch: watch.fn, watchSession: fakeSessionStream().fn, saveBlob };
   const provide: Record<symbol, unknown> = { [userServicesKey as symbol]: us };
   if (admin) provide[servicesKey as symbol] = admin;
-  return { api, watch, saveBlob, global: { provide } };
+  return { api, chat, watch, saveBlob, global: { provide } };
 }
 
 async function fill(w: ReturnType<typeof mount>, values: Record<string, string>): Promise<void> {
@@ -139,36 +143,64 @@ describe("RegisterView", () => {
 });
 
 describe("App routing and session guard", () => {
-  it("redirects a signed-out visitor to #/login, then to the assistant after login", async () => {
+  it("redirects a signed-out visitor to #/login, then to the chat page after login", async () => {
     const me = vi.fn(async () => null);
-    const k = kit({ me, listTasks: vi.fn(async () => ({ tasks: [task({ task_id: "t-1", status: "succeeded", topic: "钠离子电池" })] })) });
+    const k = kit({ me }, undefined, { listSessions: vi.fn(async () => ({ sessions: [session({ session_id: "s1", title: "固态电池" })] })) });
     const w = mount(App, { global: k.global });
     await flushAll();
     expect(me).toHaveBeenCalledTimes(1);
     expect(window.location.hash).toBe("#/login");
-    expect(w.find(".assistant").exists()).toBe(false);
+    expect(w.find(".chat-view").exists()).toBe(false);
     expect(w.text()).toContain("欢迎回来");
 
     await fill(w, { username: "alice", password: "password123" });
     await w.get("form").trigger("submit");
     await flushAll();
     expect(window.location.hash).toBe("#/");
-    expect(w.find(".assistant").exists()).toBe(true);
+    expect(w.find(".chat-view").exists()).toBe(true);
+    expect(w.find(".assistant").exists()).toBe(false);
     expect(w.get('[data-testid="username"]').text()).toBe("alice");
+    expect(w.get("[data-session=s1]").text()).toContain("固态电池");
+    expect(w.get('[data-testid="nav-chat"]').classes()).toContain("on");
+    w.unmount();
+  });
+
+  it("opens a session at #/s/<id> and keeps the early research list at #/research", async () => {
+    window.location.hash = "#/s/s1";
+    const k = kit(
+      { listTasks: vi.fn(async () => ({ tasks: [task({ task_id: "t-1", status: "succeeded", topic: "钠离子电池" })] })) },
+      undefined,
+      { listTurns: vi.fn(async () => ({ turns: [] })) },
+    );
+    const w = mount(App, { global: k.global });
+    await flushAll();
+    expect(k.chat.listTurns).toHaveBeenCalledWith("s1");
+    expect(w.find(".chat-view").exists()).toBe(true);
+    expect(w.get('[data-testid="nav-legacy"]').attributes("href")).toBe("#/research");
+
+    window.location.hash = "#/research";
+    await flushAll();
+    expect(w.find(".chat-view").exists()).toBe(false);
+    expect(w.find(".assistant").exists()).toBe(true);
+    expect(w.get('[data-testid="nav-legacy"]').classes()).toContain("on");
     expect(w.get('li[data-task="t-1"]').text()).toContain("钠离子电池");
     expect(w.get('li[data-task="t-1"] .badge').text()).toBe("已完成");
     expect(w.get('li[data-task="t-1"] [data-testid="created"]').text()).toMatch(/^\d+月\d+日 \d\d:\d\d$/);
     w.unmount();
   });
 
-  it("also guards #/research/<id> and sends a signed-in user away from #/login", async () => {
-    window.location.hash = "#/research/t-1";
-    const k = kit({ me: vi.fn(async () => null) });
-    const w = mount(App, { global: k.global });
-    await flushAll();
-    expect(window.location.hash).toBe("#/login");
-    expect(k.watch.fn).not.toHaveBeenCalled();
-    w.unmount();
+  it("also guards #/research/<id>, #/research and #/s/<id>, and sends a signed-in user away from #/login", async () => {
+    for (const hash of ["#/research/t-1", "#/research", "#/s/x"]) {
+      window.location.hash = hash;
+      const k = kit({ me: vi.fn(async () => null) });
+      const w = mount(App, { global: k.global });
+      await flushAll();
+      expect(window.location.hash).toBe("#/login");
+      expect(k.watch.fn).not.toHaveBeenCalled();
+      expect(k.chat.listTurns).not.toHaveBeenCalled();
+      expect(k.api.listTasks).not.toHaveBeenCalled();
+      w.unmount();
+    }
 
     window.location.hash = "#/login";
     const k2 = kit();
@@ -189,12 +221,19 @@ describe("App routing and session guard", () => {
     w.unmount();
   });
 
-  it("returns to #/login when the session expires mid-use (401)", async () => {
-    const k = kit({ listTasks: vi.fn().mockRejectedValue(new ApiError(401, "unauthorized", "")) });
+  it("returns to #/login when the session expires mid-use (401) on the chat page and the early research page", async () => {
+    const k = kit({}, undefined, { listSessions: vi.fn().mockRejectedValue(new ApiError(401, "unauthorized", "")) });
     const w = mount(App, { global: k.global });
     await flushAll();
     expect(window.location.hash).toBe("#/login");
     w.unmount();
+
+    window.location.hash = "#/research";
+    const k2 = kit({ listTasks: vi.fn().mockRejectedValue(new ApiError(401, "unauthorized", "")) });
+    const w2 = mount(App, { global: k2.global });
+    await flushAll();
+    expect(window.location.hash).toBe("#/login");
+    w2.unmount();
   });
 
   it("keeps the operator workbench at #/admin behind the TokenGate, without touching the user session", async () => {
@@ -206,6 +245,8 @@ describe("App routing and session guard", () => {
     expect(w.text()).toContain("连接 agentbox");
     expect(w.find('input[aria-label="访问令牌"]').exists()).toBe(true);
     expect(w.find(".assistant").exists()).toBe(false);
+    expect(w.find(".chat-view").exists()).toBe(false);
+    expect(k.chat.listSessions).not.toHaveBeenCalled();
     expect(k.api.me).not.toHaveBeenCalled();
     expect(admin.listTasks).not.toHaveBeenCalled();
     expect(window.location.hash).toBe("#/admin");
@@ -373,6 +414,8 @@ describe("ResearchDetailView", () => {
     const w = mount(ResearchDetailView, { props: { id: "t-x" }, global: k.global });
     await flushAll();
     expect(w.text()).toContain("找不到这项研究");
+    // 返回早期研究列表（#/research），而不是对话页
+    for (const a of w.findAll("a")) expect(a.attributes("href")).toBe("#/research");
     expect(k.watch.closed()).toBe(true);
     w.unmount();
   });

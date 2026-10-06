@@ -1,11 +1,11 @@
 <template>
   <div class="research">
-    <a class="link back" :href="homeHref()">← 我的研究</a>
+    <a class="link back" :href="legacyHref()">← 我的研究</a>
 
     <div v-if="notFound" class="panel lost">
       <h1 class="r-title">找不到这项研究</h1>
       <p class="muted">它可能不存在，或者不属于当前账号。</p>
-      <a class="btn primary" :href="homeHref()">返回我的研究</a>
+      <a class="btn primary" :href="legacyHref()">返回我的研究</a>
     </div>
 
     <template v-else>
@@ -106,7 +106,7 @@ import {
   userErrorMessage,
 } from "../lib/research";
 import type { StageState } from "../lib/research";
-import { homeHref } from "../lib/router";
+import { legacyHref } from "../lib/router";
 import { mergeEvents } from "../lib/timeline";
 import { useUserServices } from "../lib/userServices";
 
