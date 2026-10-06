@@ -1,6 +1,6 @@
-// Package admission 是内存中的容量闸门：run slots 与环境内存按严格 FIFO 授予任务。
+// Package admission 是内存中的容量闸门：run slots 与环境内存按严格 FIFO 授予任务（Admission）；
+// exec slots 按全局上限与每任务上限授予（ExecGate，规格 §10.3）。
 // 未确认停止的环境保持占用：调用方在 stopped_at 持久化之后才归还（规格 §14.5）。
-// exec slots 属于 M4，本包不建模。
 package admission
 
 import (
