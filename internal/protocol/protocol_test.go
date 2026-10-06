@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -257,5 +258,265 @@ func TestScenarioFixtures(t *testing.T) {
 				t.Fatalf("未知的 expect.stream %q", sc.Expect.Stream)
 			}
 		})
+	}
+}
+
+// ---- session 扩展（M4 Plan 12）----
+
+// sameJSON 比较两段 JSON 的语义是否一致（键序与空白不计）。
+func sameJSON(t *testing.T, a, b []byte) bool {
+	t.Helper()
+	var x, y any
+	if err := json.Unmarshal(a, &x); err != nil {
+		t.Fatalf("解析 %s: %v", a, err)
+	}
+	if err := json.Unmarshal(b, &y); err != nil {
+		t.Fatalf("解析 %s: %v", b, err)
+	}
+	return reflect.DeepEqual(x, y)
+}
+
+func TestSessionMessageFixtures(t *testing.T) {
+	var f struct {
+		Valid   []messageCase `json:"valid"`
+		Invalid []messageCase `json:"invalid"`
+	}
+	loadJSON(t, filepath.Join(fixtureDir, "session_messages.json"), &f)
+	if len(f.Valid) == 0 || len(f.Invalid) == 0 {
+		t.Fatal("session 消息 fixtures 为空")
+	}
+	for _, c := range f.Valid {
+		t.Run("valid/"+c.Name, func(t *testing.T) {
+			dir := parseDirection(t, c.Direction)
+			m, err := DecodeSessionLine(dir, c.line())
+			if err != nil {
+				t.Fatalf("应当合法：%v", err)
+			}
+			b, err := EncodeSessionLine(dir, m)
+			if err != nil {
+				t.Fatalf("重新编码：%v", err)
+			}
+			if !sameJSON(t, b, c.line()) {
+				t.Fatalf("往返编码不一致：\n得到 %s\n期望 %s", b, c.line())
+			}
+		})
+	}
+	for _, c := range f.Invalid {
+		t.Run("invalid/"+c.Name, func(t *testing.T) {
+			_, err := DecodeSessionLine(parseDirection(t, c.Direction), c.line())
+			if got := CodeOf(err); got != c.Code {
+				t.Fatalf("错误码 = %q，期望 %q（err = %v）", got, c.Code, err)
+			}
+		})
+	}
+}
+
+// TestSessionCodecBoundaries 覆盖不适合放进跨语言 fixtures 的编解码边界：
+// task 模式不认识 session 专属类型；task_start 携带 resume.state，按 init 的 1 MiB 计。
+func TestSessionCodecBoundaries(t *testing.T) {
+	cases := []struct {
+		name   string
+		decode func(Direction, []byte) (Message, error)
+		dir    Direction
+		line   string
+		want   string
+	}{
+		{"task 模式不认识 task_accepted", DecodeLine, WorkerToHost, `{"type":"task_accepted","v":1,"seq":2,"attempt_id":"a-1"}`, CodeUnknownType},
+		{"task 模式不认识 task_start", DecodeLine, HostToWorker, `{"type":"task_start","v":1,"task_id":"t","attempt_id":"a","attempt_no":1,"out_dir":"/o"}`, CodeUnknownType},
+		{"task_start 上限是 1 MiB", DecodeSessionLine, HostToWorker, `{"type":"task_start","v":1,"task_id":"t","attempt_id":"a","attempt_no":1,"out_dir":"/o","config":"` + strings.Repeat("a", 100<<10) + `"}`, ""},
+		{"task_start 超过 1 MiB", DecodeSessionLine, HostToWorker, `{"type":"task_start","v":1,"task_id":"t","attempt_id":"a","attempt_no":1,"out_dir":"/o","config":"` + strings.Repeat("a", MaxInitBytes) + `"}`, CodeMessageTooLarge},
+		{"task_outcome 按 16 KiB 计", DecodeSessionLine, HostToWorker, `{"type":"task_outcome","v":1,"attempt_id":"a","verdict":"failed","pad":"` + strings.Repeat("a", MaxControlBytes) + `"}`, CodeMessageTooLarge},
+		{"session_resume 的键名区分大小写", DecodeSessionLine, HostToWorker, `{"type":"init","bootstrap":1,"protocol_versions":[1],"mode":"session","session_id":"s","incarnation_id":"i","session_resume":{"checkpoint_id":"sc","state":{},"Staged_State_Path":"x"}}`, CodeInvalidField},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := c.decode(c.dir, []byte(c.line)); CodeOf(err) != c.want {
+				t.Fatalf("错误码 = %q，期望 %q（err = %v）", CodeOf(err), c.want, err)
+			}
+		})
+	}
+
+	// session 模式的编码同样执行 session 规则：缺 attempt_id 的 checkpoint_result 不得发出。
+	cr := &CheckpointResult{HostHeader: HostHeader{Type: TypeCheckpointResult, V: Version}, CheckpointID: "cp-1", Scope: ScopeTask, Status: CheckpointCommitted}
+	if _, err := EncodeSessionLine(HostToWorker, cr); CodeOf(err) != CodeMissingField {
+		t.Fatalf("EncodeSessionLine 错误码 = %q，期望 %q", CodeOf(err), CodeMissingField)
+	}
+	if _, err := EncodeLine(HostToWorker, cr); err != nil {
+		t.Fatalf("task 模式下 attempt_id 可省略：%v", err)
+	}
+}
+
+type sessionScenario struct {
+	Name   string
+	Lines  []scenarioLine
+	Expect struct {
+		Stream    string `json:"stream"`
+		Phase     string `json:"phase"`
+		Violation string `json:"violation"`
+		At        int    `json:"at"`
+	}
+}
+
+// loadSessionScenarios 读取一个 session 场景文件（JSONL）：带 "scenario" 键的行开始一个新场景
+// （含 description 与 expect），其后带 "from" 的行是该场景按时间顺序的消息。
+func loadSessionScenarios(t *testing.T, path string) []sessionScenario {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取 %s: %v", path, err)
+	}
+	var out []sessionScenario
+	for i, raw := range strings.Split(string(b), "\n") {
+		raw = strings.TrimRight(raw, "\r")
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		var rec struct {
+			Scenario string          `json:"scenario"`
+			Expect   json.RawMessage `json:"expect"`
+			scenarioLine
+		}
+		if err := json.Unmarshal([]byte(raw), &rec); err != nil {
+			t.Fatalf("%s 第 %d 行: %v", path, i+1, err)
+		}
+		if rec.Scenario != "" {
+			sc := sessionScenario{Name: rec.Scenario}
+			if err := json.Unmarshal(rec.Expect, &sc.Expect); err != nil {
+				t.Fatalf("%s 第 %d 行 expect: %v", path, i+1, err)
+			}
+			out = append(out, sc)
+			continue
+		}
+		if len(out) == 0 || rec.From == "" {
+			t.Fatalf("%s 第 %d 行既不是场景头也不属于任何场景", path, i+1)
+		}
+		out[len(out)-1].Lines = append(out[len(out)-1].Lines, rec.scenarioLine)
+	}
+	return out
+}
+
+// replaySession 依次解码每一行：宿主消息送入 HostSent，Worker 事件送入 Accept；
+// 返回首个违规所在行号与错误码（无违规时为 -1, ""）以及最终阶段。
+func replaySession(t *testing.T, sc sessionScenario) (int, string, *SessionStream) {
+	t.Helper()
+	s := NewSessionStream()
+	for i, l := range sc.Lines {
+		dir := parseDirection(t, l.From)
+		line := []byte(l.Message)
+		if l.Raw != "" {
+			line = []byte(l.Raw)
+		}
+		m, err := DecodeSessionLine(dir, line)
+		if err == nil {
+			if dir == HostToWorker {
+				err = s.HostSent(m)
+			} else {
+				err = s.Accept(m)
+			}
+		}
+		if err != nil {
+			if code := CodeOf(err); code != "" {
+				return i, code, s
+			}
+			t.Fatalf("第 %d 行返回了非协议错误：%v", i, err)
+		}
+	}
+	return -1, "", s
+}
+
+func TestSessionScenarioFixtures(t *testing.T) {
+	files, err := filepath.Glob(filepath.Join(fixtureDir, "scenarios", "session_*.jsonl"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("没有 session 场景 fixtures（err=%v）", err)
+	}
+	// 计划要求覆盖的场景：名称 → 期望（"ok" 或违规码）。
+	required := map[string]string{
+		"happy_path":                  "ok",
+		"task_outcome_lost":           "ok",
+		"base_mismatch":               "ok",
+		"awaiting_input":              "ok",
+		"quiesce":                     "ok",
+		"progress_after_awaiting":     CodeAfterTerminal,
+		"checkpoint_wrong_attempt":    CodeWrongAttempt,
+		"task_released_after_quiesce": CodeWrongAttempt,
+		"ready_without_session_ext":   CodeSessionExtMissing,
+	}
+	seen := map[string]bool{}
+	for _, path := range files {
+		for _, sc := range loadSessionScenarios(t, path) {
+			if seen[sc.Name] {
+				t.Fatalf("场景名 %q 重复", sc.Name)
+			}
+			seen[sc.Name] = true
+			t.Run(sc.Name, func(t *testing.T) {
+				at, code, s := replaySession(t, sc)
+				switch sc.Expect.Stream {
+				case "ok":
+					if code != "" {
+						t.Fatalf("第 %d 行违规 %s，期望无违规", at, code)
+					}
+					if s.Phase() != sc.Expect.Phase {
+						t.Fatalf("最终阶段 %q，期望 %q", s.Phase(), sc.Expect.Phase)
+					}
+				case "violation":
+					if at != sc.Expect.At || code != sc.Expect.Violation {
+						t.Fatalf("得到 (%d, %q)，期望 (%d, %q)", at, code, sc.Expect.At, sc.Expect.Violation)
+					}
+				default:
+					t.Fatalf("未知的 expect.stream %q", sc.Expect.Stream)
+				}
+				if want, ok := required[sc.Name]; ok {
+					got := sc.Expect.Stream
+					if got == "violation" {
+						got = sc.Expect.Violation
+					}
+					if got != want {
+						t.Fatalf("场景 %q 的期望是 %q，计划要求 %q", sc.Name, got, want)
+					}
+				}
+			})
+		}
+	}
+	for name := range required {
+		if !seen[name] {
+			t.Errorf("缺少场景 %q", name)
+		}
+	}
+}
+
+// TestSessionStreamCurrent 检查 Current 随 task_start、task_released 变化（宿主据此路由事件）。
+func TestSessionStreamCurrent(t *testing.T) {
+	s := NewSessionStream()
+	steps := []struct {
+		host  bool
+		line  string
+		phase string
+		cur   string
+	}{
+		{true, `{"type":"init","bootstrap":1,"protocol_versions":[1],"mode":"session","session_id":"s-1","incarnation_id":"i-1"}`, PhaseReady, ""},
+		{false, `{"type":"ready","v":1,"seq":1,"protocol_version":1,"mode":"session","session_ext":1,"worker":{"name":"w"},"capabilities":[]}`, PhaseIdle, ""},
+		{true, `{"type":"task_start","v":1,"task_id":"t-1","attempt_id":"a-1","attempt_no":1,"out_dir":"/o"}`, PhaseStarting, "a-1"},
+		{false, `{"type":"task_accepted","v":1,"seq":2,"attempt_id":"a-1"}`, PhaseActive, "a-1"},
+		{true, `{"type":"cancel","v":1,"attempt_id":"a-1","reason":"user","grace_ms":0}`, PhaseActive, "a-1"},
+		{true, `{"type":"task_outcome","v":1,"attempt_id":"a-1","verdict":"cancelled"}`, PhaseProposed, "a-1"},
+		{false, `{"type":"task_released","v":1,"seq":3,"attempt_id":"a-1"}`, PhaseIdle, ""},
+		{true, `{"type":"session_close","v":1,"grace_ms":0}`, PhaseClosing, ""},
+		{false, `{"type":"closed","v":1,"seq":4}`, PhaseClosed, ""},
+	}
+	for i, st := range steps {
+		dir, apply := WorkerToHost, s.Accept
+		if st.host {
+			dir, apply = HostToWorker, s.HostSent
+		}
+		m, err := DecodeSessionLine(dir, []byte(st.line))
+		if err == nil {
+			err = apply(m)
+		}
+		if err != nil {
+			t.Fatalf("第 %d 步：%v", i, err)
+		}
+		if s.Phase() != st.phase || s.Current() != st.cur {
+			t.Fatalf("第 %d 步后 (%q, %q)，期望 (%q, %q)", i, s.Phase(), s.Current(), st.phase, st.cur)
+		}
 	}
 }

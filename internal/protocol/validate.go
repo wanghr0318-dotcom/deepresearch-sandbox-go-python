@@ -16,8 +16,8 @@ func (m *Init) validate() error {
 	if err := oneOf("mode", m.Mode, ModeTask, ModeSession); err != nil {
 		return err
 	}
-	if m.Mode != ModeTask {
-		return nil // session 扩展的字段由后续里程碑校验
+	if m.Mode == ModeSession {
+		return m.validateSessionInit()
 	}
 	if err := firstErr(required("task_id", m.TaskID), required("attempt_id", m.AttemptID), required("out_dir", m.OutDir)); err != nil {
 		return err
@@ -187,6 +187,11 @@ func checkState(state json.RawMessage, stateRef string) error {
 		}
 		return nil
 	}
+	return checkInlineState(state)
+}
+
+// checkInlineState 按紧凑 JSON 计算 inline state 的大小。
+func checkInlineState(state json.RawMessage) error {
 	var compact bytes.Buffer
 	if err := json.Compact(&compact, state); err != nil {
 		return newError(CodeMalformedJSON, "state: %v", err)

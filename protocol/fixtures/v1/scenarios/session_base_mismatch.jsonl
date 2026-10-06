@@ -1,0 +1,21 @@
+{"scenario": "base_mismatch", "description": "冷恢复的新 incarnation 中续跑 task；宿主裁决时发现 base_session_checkpoint_id 与会话指针不一致（宿主侧检查，规格 §12.3），裁决 failed、指针不变；Worker 丢弃工作副本回到已提交状态并释放，之后的 task 以原 base 开始", "expect": {"stream": "ok", "phase": "idle"}}
+{"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "session", "session_id": "s-1", "incarnation_id": "inc-2", "session_resume": {"checkpoint_id": "sc-1", "staged_state_path": "/run/agentbox/restore/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}
+{"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "session", "session_ext": 1, "worker": {"name": "chatagent", "version": "0.1.0"}, "capabilities": []}}
+{"from": "host", "message": {"type": "task_start", "v": 1, "task_id": "t-2", "attempt_id": "a-2", "attempt_no": 2, "out_dir": "/workspace/out/a-2", "base_session_checkpoint_id": "sc-0", "resume": {"checkpoint_id": "cp-1", "step_id": "s1", "state_ref": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}
+{"from": "worker", "message": {"type": "task_accepted", "v": 1, "seq": 2, "attempt_id": "a-2"}}
+{"from": "worker", "message": {"type": "result", "v": 1, "seq": 3, "attempt_id": "a-2", "summary": "完成", "outputs": [], "session_state": {"checkpoint_id": "sc-9", "state_ref": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}}
+{"from": "host", "message": {"type": "task_outcome", "v": 1, "attempt_id": "a-2", "verdict": "failed", "committed_session_checkpoint_id": "sc-1"}}
+{"from": "worker", "message": {"type": "task_released", "v": 1, "seq": 4, "attempt_id": "a-2"}}
+{"from": "host", "message": {"type": "task_start", "v": 1, "task_id": "t-3", "attempt_id": "a-3", "attempt_no": 1, "out_dir": "/workspace/out/a-3", "base_session_checkpoint_id": "sc-1"}}
+{"from": "worker", "message": {"type": "task_accepted", "v": 1, "seq": 5, "attempt_id": "a-3"}}
+{"from": "worker", "message": {"type": "error", "v": 1, "seq": 6, "attempt_id": "a-3", "code": "internal_error", "message": "boom", "retryable": true}}
+{"from": "host", "message": {"type": "task_outcome", "v": 1, "attempt_id": "a-3", "verdict": "failed", "committed_session_checkpoint_id": "sc-1"}}
+{"from": "worker", "message": {"type": "task_released", "v": 1, "seq": 7, "attempt_id": "a-3"}}
+{"scenario": "error_without_attempt_after_ready", "description": "ready 之后的 error 必须属于某个 attempt", "expect": {"stream": "violation", "violation": "missing_field", "at": 2}}
+{"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "session", "session_id": "s-1", "incarnation_id": "inc-1"}}
+{"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "session", "session_ext": 1, "worker": {"name": "chatagent", "version": "0.1.0"}, "capabilities": []}}
+{"from": "worker", "message": {"type": "error", "v": 1, "seq": 2, "code": "internal_error", "message": "boom", "retryable": true}}
+{"scenario": "startup_error_before_ready", "description": "ready 之前的 error 是启动失败，结束 incarnation；之后的事件违规", "expect": {"stream": "violation", "violation": "after_terminal", "at": 2}}
+{"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "session", "session_id": "s-1", "incarnation_id": "inc-1"}}
+{"from": "worker", "message": {"type": "error", "v": 1, "seq": 1, "code": "unsupported_mode", "message": "不支持 session 模式", "retryable": false}}
+{"from": "worker", "message": {"type": "ready", "v": 1, "seq": 2, "protocol_version": 1, "mode": "session", "session_ext": 1, "worker": {"name": "chatagent", "version": "0.1.0"}, "capabilities": []}}

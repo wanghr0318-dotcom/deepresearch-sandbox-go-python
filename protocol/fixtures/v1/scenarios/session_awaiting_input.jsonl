@@ -1,0 +1,33 @@
+{"scenario": "awaiting_input", "description": "提问：checkpoint 提交后以 awaiting_input 提议（引用最新已提交 checkpoint），裁决 paused 并释放；回答经新 attempt 的 directive=answer 送回，从同一 checkpoint 续跑至成功", "expect": {"stream": "ok", "phase": "idle"}}
+{"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "session", "session_id": "s-1", "incarnation_id": "inc-1"}}
+{"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "session", "session_ext": 1, "worker": {"name": "chatagent", "version": "0.1.0"}, "capabilities": []}}
+{"from": "host", "message": {"type": "task_start", "v": 1, "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "config": {"text": "研究 X", "deep_research": true}, "out_dir": "/workspace/out/a-1"}}
+{"from": "worker", "message": {"type": "task_accepted", "v": 1, "seq": 2, "attempt_id": "a-1"}}
+{"from": "worker", "message": {"type": "checkpoint", "v": 1, "seq": 3, "attempt_id": "a-1", "checkpoint_id": "cp-1", "scope": "task", "step_id": "ask-1", "state": {"pending_question": {"question_id": "q-1"}}}}
+{"from": "host", "message": {"type": "checkpoint_result", "v": 1, "attempt_id": "a-1", "checkpoint_id": "cp-1", "scope": "task", "status": "committed"}}
+{"from": "worker", "message": {"type": "awaiting_input", "v": 1, "seq": 4, "attempt_id": "a-1", "checkpoint_id": "cp-1", "question_id": "q-1"}}
+{"from": "worker", "message": {"type": "checkpoint_query", "v": 1, "seq": 5, "attempt_id": "a-1", "checkpoint_id": "cp-1", "scope": "task"}}
+{"from": "host", "message": {"type": "checkpoint_result", "v": 1, "attempt_id": "a-1", "checkpoint_id": "cp-1", "scope": "task", "status": "committed"}}
+{"from": "host", "message": {"type": "task_outcome", "v": 1, "attempt_id": "a-1", "verdict": "paused"}}
+{"from": "worker", "message": {"type": "task_released", "v": 1, "seq": 6, "attempt_id": "a-1"}}
+{"from": "host", "message": {"type": "task_start", "v": 1, "task_id": "t-1", "attempt_id": "a-2", "attempt_no": 2, "config": {"text": "研究 X", "deep_research": true}, "out_dir": "/workspace/out/a-2", "resume": {"checkpoint_id": "cp-1", "step_id": "ask-1", "state": {"pending_question": {"question_id": "q-1"}}}, "directive": {"kind": "answer", "question_id": "q-1", "answers": [{"index": 0, "choice": "近五年", "other": null}]}}}
+{"from": "worker", "message": {"type": "task_accepted", "v": 1, "seq": 7, "attempt_id": "a-2"}}
+{"from": "worker", "message": {"type": "result", "v": 1, "seq": 8, "attempt_id": "a-2", "summary": "完成", "outputs": [], "session_state": {"checkpoint_id": "sc-1", "state": {"turns": 1}}}}
+{"from": "host", "message": {"type": "task_outcome", "v": 1, "attempt_id": "a-2", "verdict": "succeeded", "committed_session_checkpoint_id": "sc-1"}}
+{"from": "worker", "message": {"type": "task_released", "v": 1, "seq": 9, "attempt_id": "a-2"}}
+{"scenario": "progress_after_awaiting", "description": "awaiting_input 是终态提议，其后的业务事件违规", "expect": {"stream": "violation", "violation": "after_terminal", "at": 7}}
+{"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "session", "session_id": "s-1", "incarnation_id": "inc-1"}}
+{"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "session", "session_ext": 1, "worker": {"name": "chatagent", "version": "0.1.0"}, "capabilities": []}}
+{"from": "host", "message": {"type": "task_start", "v": 1, "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}}
+{"from": "worker", "message": {"type": "task_accepted", "v": 1, "seq": 2, "attempt_id": "a-1"}}
+{"from": "worker", "message": {"type": "checkpoint", "v": 1, "seq": 3, "attempt_id": "a-1", "checkpoint_id": "cp-1", "scope": "task", "step_id": "ask-1", "state": {}}}
+{"from": "host", "message": {"type": "checkpoint_result", "v": 1, "attempt_id": "a-1", "checkpoint_id": "cp-1", "scope": "task", "status": "committed"}}
+{"from": "worker", "message": {"type": "awaiting_input", "v": 1, "seq": 4, "attempt_id": "a-1", "checkpoint_id": "cp-1", "question_id": "q-1"}}
+{"from": "worker", "message": {"type": "progress", "v": 1, "seq": 5, "attempt_id": "a-1", "kind": "thinking", "message": "…"}}
+{"scenario": "second_proposal_after_awaiting", "description": "awaiting_input 之后再发 result：每 attempt 至多一个终态提议", "expect": {"stream": "violation", "violation": "after_terminal", "at": 5}}
+{"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "session", "session_id": "s-1", "incarnation_id": "inc-1"}}
+{"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "session", "session_ext": 1, "worker": {"name": "chatagent", "version": "0.1.0"}, "capabilities": []}}
+{"from": "host", "message": {"type": "task_start", "v": 1, "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}}
+{"from": "worker", "message": {"type": "task_accepted", "v": 1, "seq": 2, "attempt_id": "a-1"}}
+{"from": "worker", "message": {"type": "awaiting_input", "v": 1, "seq": 3, "attempt_id": "a-1", "checkpoint_id": "cp-1", "question_id": "q-1"}}
+{"from": "worker", "message": {"type": "result", "v": 1, "seq": 4, "attempt_id": "a-1", "summary": "完成", "outputs": []}}

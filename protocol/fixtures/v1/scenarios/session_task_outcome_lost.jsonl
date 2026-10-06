@@ -1,0 +1,26 @@
+{"scenario": "task_outcome_lost", "description": "第一条 task_outcome 未送达；Worker 以 task_outcome_query 查询，宿主重发同一裁决后释放（规格 §12.3、E29）", "expect": {"stream": "ok", "phase": "idle"}}
+{"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "session", "session_id": "s-1", "incarnation_id": "inc-1"}}
+{"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "session", "session_ext": 1, "worker": {"name": "chatagent", "version": "0.1.0"}, "capabilities": []}}
+{"from": "host", "message": {"type": "task_start", "v": 1, "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}}
+{"from": "worker", "message": {"type": "task_accepted", "v": 1, "seq": 2, "attempt_id": "a-1"}}
+{"from": "worker", "message": {"type": "result", "v": 1, "seq": 3, "attempt_id": "a-1", "summary": "完成", "outputs": [], "session_state": {"checkpoint_id": "sc-1", "state": {"turns": 1}}}}
+{"from": "host", "message": {"type": "task_outcome", "v": 1, "attempt_id": "a-1", "verdict": "succeeded", "committed_session_checkpoint_id": "sc-1"}}
+{"from": "worker", "message": {"type": "task_outcome_query", "v": 1, "seq": 4, "attempt_id": "a-1"}}
+{"from": "worker", "message": {"type": "task_outcome_query", "v": 1, "seq": 5, "attempt_id": "a-1"}}
+{"from": "host", "message": {"type": "task_outcome", "v": 1, "attempt_id": "a-1", "verdict": "succeeded", "committed_session_checkpoint_id": "sc-1"}}
+{"from": "worker", "message": {"type": "task_released", "v": 1, "seq": 6, "attempt_id": "a-1"}}
+{"scenario": "outcome_query_for_other_attempt", "description": "task_outcome_query 指向的不是当前 attempt", "expect": {"stream": "violation", "violation": "wrong_attempt", "at": 5}}
+{"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "session", "session_id": "s-1", "incarnation_id": "inc-1"}}
+{"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "session", "session_ext": 1, "worker": {"name": "chatagent", "version": "0.1.0"}, "capabilities": []}}
+{"from": "host", "message": {"type": "task_start", "v": 1, "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}}
+{"from": "worker", "message": {"type": "task_accepted", "v": 1, "seq": 2, "attempt_id": "a-1"}}
+{"from": "worker", "message": {"type": "result", "v": 1, "seq": 3, "attempt_id": "a-1", "summary": "完成", "outputs": []}}
+{"from": "worker", "message": {"type": "task_outcome_query", "v": 1, "seq": 4, "attempt_id": "a-9"}}
+{"scenario": "business_event_after_outcome", "description": "宿主已发送裁决（取消）后，Worker 仍发业务事件", "expect": {"stream": "violation", "violation": "after_terminal", "at": 6}}
+{"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "session", "session_id": "s-1", "incarnation_id": "inc-1"}}
+{"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "session", "session_ext": 1, "worker": {"name": "chatagent", "version": "0.1.0"}, "capabilities": []}}
+{"from": "host", "message": {"type": "task_start", "v": 1, "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}}
+{"from": "worker", "message": {"type": "task_accepted", "v": 1, "seq": 2, "attempt_id": "a-1"}}
+{"from": "host", "message": {"type": "cancel", "v": 1, "attempt_id": "a-1", "reason": "superseded", "grace_ms": 0}}
+{"from": "host", "message": {"type": "task_outcome", "v": 1, "attempt_id": "a-1", "verdict": "cancelled"}}
+{"from": "worker", "message": {"type": "progress", "v": 1, "seq": 3, "attempt_id": "a-1", "kind": "tool_call", "message": "web_fetch"}}

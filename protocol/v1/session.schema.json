@@ -1,0 +1,346 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wanghr0318-dotcom/go-agentbox/protocol/v1/session.schema.json",
+  "title": "session 模式消息（宿主 → Worker 与 Worker → 宿主）",
+  "description": "宿主消息按 #/$defs/host 校验，Worker 事件按 #/$defs/worker 校验；顶层接受二者之一。与 internal/protocol（DecodeSessionLine）的规则逐条一致；顺序规则见 protocol/README.md。",
+  "oneOf": [
+    {"$ref": "#/$defs/host"},
+    {"$ref": "#/$defs/worker"}
+  ],
+  "$defs": {
+    "host": {
+      "oneOf": [
+        {"$ref": "#/$defs/init"},
+        {"$ref": "#/$defs/task_start"},
+        {"$ref": "#/$defs/task_outcome"},
+        {"$ref": "#/$defs/quiesce"},
+        {"$ref": "#/$defs/session_close"},
+        {"$ref": "#/$defs/checkpoint_result"},
+        {"$ref": "#/$defs/artifact_result"},
+        {"$ref": "#/$defs/cancel"},
+        {"$ref": "#/$defs/pause"}
+      ]
+    },
+    "worker": {
+      "oneOf": [
+        {"$ref": "#/$defs/ready"},
+        {"$ref": "#/$defs/task_accepted"},
+        {"$ref": "#/$defs/task_outcome_query"},
+        {"$ref": "#/$defs/task_released"},
+        {"$ref": "#/$defs/quiesced"},
+        {"$ref": "#/$defs/closed"},
+        {"$ref": "#/$defs/awaiting_input"},
+        {"$ref": "#/$defs/progress"},
+        {"$ref": "#/$defs/artifact"},
+        {"$ref": "#/$defs/checkpoint"},
+        {"$ref": "#/$defs/checkpoint_query"},
+        {"$ref": "#/$defs/paused"},
+        {"$ref": "#/$defs/result"},
+        {"$ref": "#/$defs/error"},
+        {"$ref": "#/$defs/handshake_error"}
+      ]
+    },
+
+    "nonEmpty": {"type": "string", "minLength": 1},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "int64": {"type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807},
+    "graceMs": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+    "refs": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/sha256"}},
+    "artifactPath": {
+      "type": "string",
+      "pattern": "^(?!/)(?![\\s\\S]*(?:^|/)\\.\\.?(?:/|$))(?![\\s\\S]*//)(?![\\s\\S]*/$)[^\\u0000]+$"
+    },
+    "stateXorRef": {
+      "oneOf": [
+        {"required": ["state"], "not": {"required": ["state_ref"]}},
+        {"required": ["state_ref"], "not": {"required": ["state"]}}
+      ]
+    },
+    "control": {
+      "type": "object",
+      "required": ["type", "v"],
+      "properties": {"v": {"const": 1}}
+    },
+
+    "init": {
+      "type": "object",
+      "required": ["type", "bootstrap", "protocol_versions", "mode", "session_id", "incarnation_id"],
+      "properties": {
+        "type": {"const": "init"},
+        "bootstrap": {"const": 1},
+        "protocol_versions": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/int64"}},
+        "mode": {"const": "session"},
+        "session_id": {"$ref": "#/$defs/nonEmpty"},
+        "incarnation_id": {"$ref": "#/$defs/nonEmpty"},
+        "session_resume": {"$ref": "#/$defs/session_resume"}
+      }
+    },
+    "session_resume": {
+      "type": "object",
+      "required": ["checkpoint_id"],
+      "properties": {
+        "checkpoint_id": {"$ref": "#/$defs/nonEmpty"},
+        "staged_state_path": {"type": "string", "pattern": "^/run/agentbox/restore/[0-9a-f]{64}$"},
+        "refs": {"$ref": "#/$defs/refs"}
+      },
+      "not": {"required": ["state_ref"]},
+      "oneOf": [
+        {"required": ["state"], "not": {"required": ["staged_state_path"]}},
+        {"required": ["staged_state_path"], "not": {"required": ["state"]}}
+      ]
+    },
+    "resume": {
+      "type": "object",
+      "required": ["checkpoint_id", "step_id"],
+      "properties": {
+        "checkpoint_id": {"$ref": "#/$defs/nonEmpty"},
+        "step_id": {"$ref": "#/$defs/nonEmpty"},
+        "state_ref": {"$ref": "#/$defs/sha256"},
+        "refs": {"$ref": "#/$defs/refs"}
+      },
+      "allOf": [{"$ref": "#/$defs/stateXorRef"}]
+    },
+    "directive": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {"enum": ["finish_now", "answer"]},
+        "question_id": {"type": "string"},
+        "answers": {"type": "array"}
+      },
+      "if": {"properties": {"kind": {"const": "answer"}}},
+      "then": {
+        "required": ["question_id", "answers"],
+        "properties": {"question_id": {"minLength": 1}, "answers": {"minItems": 1}}
+      }
+    },
+    "carryover": {
+      "type": "object",
+      "required": ["task_id", "checkpoint_ref"],
+      "properties": {
+        "task_id": {"$ref": "#/$defs/nonEmpty"},
+        "checkpoint_ref": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "task_start": {
+      "allOf": [{"$ref": "#/$defs/control"}],
+      "required": ["task_id", "attempt_id", "attempt_no", "out_dir"],
+      "properties": {
+        "type": {"const": "task_start"},
+        "task_id": {"$ref": "#/$defs/nonEmpty"},
+        "attempt_id": {"$ref": "#/$defs/nonEmpty"},
+        "attempt_no": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
+        "traceparent": {"type": "string"},
+        "config_version": {"type": "string"},
+        "input_refs": {"type": "array", "items": {"$ref": "#/$defs/sha256"}},
+        "out_dir": {"$ref": "#/$defs/nonEmpty"},
+        "base_session_checkpoint_id": {"type": "string"},
+        "resume": {"$ref": "#/$defs/resume"},
+        "directive": {"$ref": "#/$defs/directive"},
+        "restored_from_task_id": {"type": "string"},
+        "carryover": {"$ref": "#/$defs/carryover"}
+      }
+    },
+    "task_outcome": {
+      "allOf": [{"$ref": "#/$defs/control"}],
+      "required": ["attempt_id", "verdict"],
+      "properties": {
+        "type": {"const": "task_outcome"},
+        "attempt_id": {"$ref": "#/$defs/nonEmpty"},
+        "verdict": {"enum": ["succeeded", "failed", "cancelled", "paused"]},
+        "committed_session_checkpoint_id": {"type": "string"}
+      }
+    },
+    "quiesce": {
+      "allOf": [{"$ref": "#/$defs/control"}],
+      "properties": {"type": {"const": "quiesce"}, "grace_ms": {"$ref": "#/$defs/graceMs"}}
+    },
+    "session_close": {
+      "allOf": [{"$ref": "#/$defs/control"}],
+      "properties": {"type": {"const": "session_close"}, "grace_ms": {"$ref": "#/$defs/graceMs"}}
+    },
+    "checkpoint_result": {
+      "allOf": [{"$ref": "#/$defs/control"}],
+      "required": ["attempt_id", "checkpoint_id", "scope", "status"],
+      "properties": {
+        "type": {"const": "checkpoint_result"},
+        "attempt_id": {"$ref": "#/$defs/nonEmpty"},
+        "checkpoint_id": {"$ref": "#/$defs/nonEmpty"},
+        "scope": {"enum": ["task", "session"]},
+        "status": {"enum": ["committed", "conflict", "rejected", "retryable_error", "not_found"]},
+        "code": {"type": "string"}
+      }
+    },
+    "artifact_result": {
+      "allOf": [
+        {"$ref": "#/$defs/control"},
+        {
+          "if": {"properties": {"status": {"const": "saved"}}},
+          "then": {"required": ["version", "sha256"], "properties": {"version": {"minimum": 1}, "sha256": {"$ref": "#/$defs/sha256"}}}
+        },
+        {
+          "if": {"properties": {"status": {"const": "rejected"}}},
+          "then": {"required": ["code"], "properties": {"code": {"minLength": 1}}}
+        }
+      ],
+      "required": ["attempt_id", "artifact_id", "status"],
+      "properties": {
+        "type": {"const": "artifact_result"},
+        "attempt_id": {"$ref": "#/$defs/nonEmpty"},
+        "artifact_id": {"$ref": "#/$defs/nonEmpty"},
+        "status": {"enum": ["saved", "rejected"]},
+        "version": {"$ref": "#/$defs/int64"},
+        "sha256": {"type": "string"},
+        "code": {"type": "string"}
+      }
+    },
+    "stop": {
+      "allOf": [{"$ref": "#/$defs/control"}],
+      "required": ["attempt_id"],
+      "properties": {
+        "attempt_id": {"$ref": "#/$defs/nonEmpty"},
+        "reason": {"type": "string"},
+        "grace_ms": {"$ref": "#/$defs/graceMs"}
+      }
+    },
+    "cancel": {"allOf": [{"$ref": "#/$defs/stop"}, {"properties": {"type": {"const": "cancel"}}}]},
+    "pause": {"allOf": [{"$ref": "#/$defs/stop"}, {"properties": {"type": {"const": "pause"}}}]},
+
+    "event": {
+      "type": "object",
+      "required": ["type", "v", "seq"],
+      "properties": {
+        "v": {"const": 1},
+        "seq": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
+        "ts": {"type": "string"},
+        "attempt_id": {"type": "string"}
+      }
+    },
+    "attemptEvent": {
+      "allOf": [{"$ref": "#/$defs/event"}],
+      "required": ["attempt_id"],
+      "properties": {"attempt_id": {"minLength": 1}}
+    },
+    "ready": {
+      "allOf": [{"$ref": "#/$defs/event"}],
+      "required": ["protocol_version", "mode", "worker", "session_ext"],
+      "properties": {
+        "type": {"const": "ready"},
+        "protocol_version": {"const": 1},
+        "mode": {"const": "session"},
+        "session_ext": {"const": 1},
+        "worker": {
+          "type": "object",
+          "required": ["name"],
+          "properties": {"name": {"$ref": "#/$defs/nonEmpty"}, "version": {"type": "string"}}
+        },
+        "capabilities": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "task_accepted": {"allOf": [{"$ref": "#/$defs/attemptEvent"}], "properties": {"type": {"const": "task_accepted"}}},
+    "task_outcome_query": {"allOf": [{"$ref": "#/$defs/attemptEvent"}], "properties": {"type": {"const": "task_outcome_query"}}},
+    "task_released": {"allOf": [{"$ref": "#/$defs/attemptEvent"}], "properties": {"type": {"const": "task_released"}}},
+    "quiesced": {
+      "allOf": [{"$ref": "#/$defs/event"}],
+      "required": ["session_checkpoint_id"],
+      "properties": {"type": {"const": "quiesced"}, "session_checkpoint_id": {"type": "string"}}
+    },
+    "closed": {"allOf": [{"$ref": "#/$defs/event"}], "properties": {"type": {"const": "closed"}}},
+    "awaiting_input": {
+      "allOf": [{"$ref": "#/$defs/attemptEvent"}],
+      "required": ["checkpoint_id", "question_id"],
+      "properties": {
+        "type": {"const": "awaiting_input"},
+        "checkpoint_id": {"$ref": "#/$defs/nonEmpty"},
+        "question_id": {"$ref": "#/$defs/nonEmpty"}
+      }
+    },
+    "progress": {
+      "allOf": [{"$ref": "#/$defs/attemptEvent"}],
+      "required": ["kind"],
+      "properties": {
+        "type": {"const": "progress"},
+        "step_id": {"type": "string"},
+        "kind": {"$ref": "#/$defs/nonEmpty"},
+        "message": {"type": "string"}
+      }
+    },
+    "artifact": {
+      "allOf": [{"$ref": "#/$defs/attemptEvent"}],
+      "required": ["artifact_id", "path", "declared_sha256", "media_type", "visibility"],
+      "properties": {
+        "type": {"const": "artifact"},
+        "artifact_id": {"$ref": "#/$defs/nonEmpty"},
+        "path": {"$ref": "#/$defs/artifactPath"},
+        "declared_sha256": {"$ref": "#/$defs/sha256"},
+        "declared_size": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+        "media_type": {"$ref": "#/$defs/nonEmpty"},
+        "visibility": {"enum": ["output", "internal"]}
+      }
+    },
+    "checkpoint": {
+      "allOf": [{"$ref": "#/$defs/attemptEvent"}, {"$ref": "#/$defs/stateXorRef"}],
+      "required": ["checkpoint_id", "scope", "step_id"],
+      "properties": {
+        "type": {"const": "checkpoint"},
+        "checkpoint_id": {"$ref": "#/$defs/nonEmpty"},
+        "scope": {"const": "task"},
+        "step_id": {"$ref": "#/$defs/nonEmpty"},
+        "state_ref": {"$ref": "#/$defs/sha256"},
+        "refs": {"$ref": "#/$defs/refs"}
+      }
+    },
+    "checkpoint_query": {
+      "allOf": [{"$ref": "#/$defs/attemptEvent"}],
+      "required": ["checkpoint_id", "scope"],
+      "properties": {
+        "type": {"const": "checkpoint_query"},
+        "checkpoint_id": {"$ref": "#/$defs/nonEmpty"},
+        "scope": {"enum": ["task", "session"]}
+      }
+    },
+    "paused": {
+      "allOf": [{"$ref": "#/$defs/attemptEvent"}],
+      "required": ["checkpoint_id"],
+      "properties": {"type": {"const": "paused"}, "checkpoint_id": {"$ref": "#/$defs/nonEmpty"}}
+    },
+    "session_state": {
+      "type": "object",
+      "allOf": [{"$ref": "#/$defs/stateXorRef"}],
+      "required": ["checkpoint_id"],
+      "properties": {
+        "checkpoint_id": {"$ref": "#/$defs/nonEmpty"},
+        "state_ref": {"$ref": "#/$defs/sha256"},
+        "refs": {"$ref": "#/$defs/refs"}
+      }
+    },
+    "result": {
+      "allOf": [{"$ref": "#/$defs/attemptEvent"}],
+      "properties": {
+        "type": {"const": "result"},
+        "summary": {"type": "string"},
+        "outputs": {"type": "array", "items": {"$ref": "#/$defs/nonEmpty"}},
+        "session_state": {"$ref": "#/$defs/session_state"}
+      }
+    },
+    "error": {
+      "allOf": [{"$ref": "#/$defs/event"}],
+      "required": ["code"],
+      "properties": {
+        "type": {"const": "error"},
+        "code": {"$ref": "#/$defs/nonEmpty"},
+        "message": {"type": "string"},
+        "retryable": {"type": "boolean"}
+      }
+    },
+    "handshake_error": {
+      "type": "object",
+      "required": ["type", "bootstrap", "code"],
+      "properties": {
+        "type": {"const": "handshake_error"},
+        "bootstrap": {"const": 1},
+        "code": {"$ref": "#/$defs/nonEmpty"}
+      }
+    }
+  }
+}

@@ -8,6 +8,12 @@ const (
 	CodeAfterTerminal       = "after_terminal"
 	CodeHandshakeMisplaced  = "handshake_error_misplaced"
 	CodeAfterHandshakeError = "after_handshake_error"
+
+	// session 扩展（SessionStream，见 session.go）。
+	CodeWrongAttempt      = "wrong_attempt"       // 消息的 attempt_id 不是当前 attempt
+	CodeNotIdle           = "not_idle"            // quiesced 不在 quiesce 之后；或宿主在非空闲时发 task_start / quiesce
+	CodeSessionExtMissing = "session_ext_missing" // session 模式的 ready 未确认 session_ext: 1
+	CodeUnexpectedEvent   = "unexpected_event"    // 消息类型在当前阶段不允许，且不属于上述任何一种
 )
 
 type streamPhase int
