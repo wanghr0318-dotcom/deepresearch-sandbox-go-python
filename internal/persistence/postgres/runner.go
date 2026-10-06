@@ -41,6 +41,65 @@ func (s *Store) AppendWorkerEvents(ctx context.Context, attemptID string, events
 	return out, err
 }
 
+// AppendSessionWorkerEvents 原子追加一批 session 模式的 Worker 事件（实现 runner.Store）：worker_seq 是 incarnation
+// 序号，批内与同一 attempt 内严格递增、不要求连续。已存在的序号逐条校验内容；新序号须大于该 attempt 已提交的最大
+// 序号（不回填空隙）。
+func (s *Store) AppendSessionWorkerEvents(ctx context.Context, attemptID string, events []runner.WorkerEvent) (runner.Watermark, error) {
+	if len(events) == 0 {
+		return runner.Watermark{}, invalidf("Worker 事件批次为空")
+	}
+	for i, e := range events {
+		if e.Seq < 1 || (i > 0 && e.Seq <= events[i-1].Seq) {
+			return runner.Watermark{}, invalidf("session Worker 事件序号必须为正且严格递增，第 %d 条为 %d", i, e.Seq)
+		}
+		if e.Type == "" || len(e.Payload) == 0 {
+			return runner.Watermark{}, invalidf("Worker 事件 %d 缺少类型或载荷", e.Seq)
+		}
+	}
+	out := runner.Watermark{AttemptID: attemptID}
+	identity := fmt.Sprintf("%s:%d-%d", attemptID, events[0].Seq, events[len(events)-1].Seq)
+	err := s.run(ctx, "AppendSessionWorkerEvents", identity, func(ctx context.Context, tx pgx.Tx) error {
+		var taskID string
+		err := tx.QueryRow(ctx, "SELECT task_id FROM attempts WHERE attempt_id = $1", attemptID).Scan(&taskID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("attempt %s", attemptID)
+		}
+		if err != nil {
+			return err
+		}
+		if err := lockEventSeq(ctx, tx, taskID); err != nil {
+			return err
+		}
+		var watermark int64
+		if err := tx.QueryRow(ctx, "SELECT COALESCE(max(worker_seq), 0) FROM events WHERE attempt_id = $1 AND worker_seq IS NOT NULL",
+			attemptID).Scan(&watermark); err != nil {
+			return err
+		}
+		existing, err := existingWorkerHashes(ctx, tx, attemptID, events[0].Seq, min(events[len(events)-1].Seq, watermark))
+		if err != nil {
+			return err
+		}
+		for _, e := range events {
+			if e.Seq > watermark {
+				if err := insertWorkerEvent(ctx, tx, taskID, attemptID, e); err != nil {
+					return err
+				}
+				continue
+			}
+			h, ok := existing[e.Seq]
+			if !ok {
+				return conflictf("attempt %s 的 Worker 事件 %d 不大于已提交的 %d 且不存在", attemptID, e.Seq, watermark)
+			}
+			if !bytes.Equal(h, workerEventHash(e)) {
+				return conflictf("attempt %s 的 Worker 事件 %d 已存在且内容不同", attemptID, e.Seq)
+			}
+		}
+		out.WorkerSeq = max(watermark, events[len(events)-1].Seq)
+		return nil
+	})
+	return out, err
+}
+
 // WorkerEventWatermark 返回已提交的最大 worker_seq（实现 runner.Store）。
 func (s *Store) WorkerEventWatermark(ctx context.Context, attemptID string) (runner.Watermark, error) {
 	out := runner.Watermark{AttemptID: attemptID}
@@ -143,7 +202,8 @@ func fenceAttempt(ctx context.Context, tx pgx.Tx, taskID, attemptID string) erro
 }
 
 // authorizeRefs 要求 checkpoint 引用的每个 sha256 都已保存并授权到当前 scope（规格 §5.5 第 2 条）：
-// scope 由宿主按 attempt → task 推导（session 在 M4 加入），不接受其他任务的 blob。
+// scope 由宿主按 attempt → task → session 推导（会话 turn 另接受其会话 scope，例如 D5 carryover 与恢复种子的引用），
+// 不接受其他任务或会话的 blob。
 func authorizeRefs(ctx context.Context, tx pgx.Tx, c runner.Checkpoint) error {
 	refs := append([]string(nil), c.Refs...)
 	if c.StateRef != "" {
@@ -154,7 +214,8 @@ func authorizeRefs(ctx context.Context, tx pgx.Tx, c runner.Checkpoint) error {
 	}
 	rows, err := tx.Query(ctx, `SELECT r FROM unnest($1::text[]) AS r WHERE NOT EXISTS (
 		SELECT 1 FROM scope_blobs sb WHERE sb.sha256 = r AND
-			((sb.scope_kind = 'attempt' AND sb.scope_id = $2) OR (sb.scope_kind = 'task' AND sb.scope_id = $3)))`,
+			((sb.scope_kind = 'attempt' AND sb.scope_id = $2) OR (sb.scope_kind = 'task' AND sb.scope_id = $3)
+				OR (sb.scope_kind = 'session' AND sb.scope_id = (SELECT session_id FROM tasks WHERE task_id = $3))))`,
 		refs, c.AttemptID, c.Scope.ID)
 	if err != nil {
 		return err
@@ -247,7 +308,7 @@ func (s *Store) RegisterArtifact(ctx context.Context, a runner.Artifact) (runner
 	return out, err
 }
 
-// recordBlob 登记 blob 与其授权关联；同一 sha256 的大小不同为冲突。
+// recordBlob 登记 blob 与其授权关联（task 及其会话，规格 §5.6）；同一 sha256 的大小不同为冲突。
 func recordBlob(ctx context.Context, tx pgx.Tx, a runner.Artifact) error {
 	if _, err := tx.Exec(ctx, "INSERT INTO blobs (sha256, size) VALUES ($1, $2) ON CONFLICT DO NOTHING", a.SHA256, a.Size); err != nil {
 		return err
@@ -259,8 +320,16 @@ func recordBlob(ctx context.Context, tx pgx.Tx, a runner.Artifact) error {
 	if size != a.Size {
 		return conflictf("blob %s 已登记为 %d 字节，不是 %d", a.SHA256, size, a.Size)
 	}
-	_, err := tx.Exec(ctx, "INSERT INTO scope_blobs (scope_kind, scope_id, sha256) VALUES ('task', $1, $2) ON CONFLICT DO NOTHING",
-		a.TaskID, a.SHA256)
+	return authorizeTaskBlob(ctx, tx, a.TaskID, a.SHA256)
+}
+
+// authorizeTaskBlob 把 blob 授权到任务 scope，任务属于会话时同事务另授权到会话 scope（§5.5 第 2 条：attempt → task
+// → session 推导；会话 scope 使后续 turn 的 carryover、恢复与会话 checkpoint 可以引用它）。
+func authorizeTaskBlob(ctx context.Context, tx pgx.Tx, taskID, sha string) error {
+	_, err := tx.Exec(ctx, `INSERT INTO scope_blobs (scope_kind, scope_id, sha256)
+		SELECT 'task', $1::text, $2::text
+		UNION ALL SELECT 'session', session_id, $2::text FROM tasks WHERE task_id = $1::text AND session_id IS NOT NULL
+		ON CONFLICT DO NOTHING`, taskID, sha)
 	return err
 }
 
@@ -300,9 +369,9 @@ func proposalHash(p runner.TerminalProposal) []byte {
 // 不以 WHERE … IS NULL 静默忽略（设计 §2.4）。只写 attempts 的 terminal_proposal* 列。
 func (s *Store) RecordTerminalProposal(ctx context.Context, p runner.TerminalProposal) (runner.TerminalProposal, error) {
 	switch p.Kind {
-	case "result", "error", "paused":
+	case "result", "error", "paused", "awaiting_input":
 	default:
-		return runner.TerminalProposal{}, invalidf("终态提议必须是 result、error 或 paused，得到 %q", p.Kind)
+		return runner.TerminalProposal{}, invalidf("终态提议必须是 result、error、paused 或 awaiting_input，得到 %q", p.Kind)
 	}
 	hash := proposalHash(p)
 	var out runner.TerminalProposal

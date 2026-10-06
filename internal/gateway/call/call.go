@@ -185,6 +185,8 @@ type Result struct {
 	BlobSHA256 string
 	Status     int
 	Code       string
+	// ToolBudget 是搜索与抓取在任务有上限时的工具调用额度（X-Agentbox-Tool-Budget），含 429 与重放；其余为 nil。
+	ToolBudget *ToolBudget
 }
 
 // Coordinator 是 Gateway 唯一的记账与 journal 所有者。
@@ -326,7 +328,7 @@ func statusFor(code string) int {
 		return 409
 	case persistence.CodeBudgetExhausted, persistence.CodeBudgetInsufficient:
 		return 402
-	case persistence.CodeTriesExhausted:
+	case persistence.CodeTriesExhausted, persistence.CodeToolBudgetExhausted:
 		return 429
 	case persistence.CodeCallDeadlineExceeded:
 		return 504
@@ -543,7 +545,15 @@ func (c *Coordinator) unregister(j *job) {
 }
 
 // contended 处理进程内已有执行者的同 ID 请求：仍按 §9.2 检查访问；指纹不同报告分歧，否则 call_in_progress。
-func (c *Coordinator) contended(ctx context.Context, in Invoke, fp string) (Result, error) {
+// 搜索与抓取的响应带当前工具调用额度（读取失败时省略）。
+func (c *Coordinator) contended(ctx context.Context, in Invoke, fp string) (res Result, err error) {
+	if cacheable(in.Kind) {
+		defer func() {
+			if b, berr := c.store.LoadBudget(ctx, in.TaskID); berr == nil {
+				res.ToolBudget = b.ToolBudget()
+			}
+		}()
+	}
 	if r, err := c.CheckAccess(ctx, in.TaskID, in.AttemptID); err != nil || r.Code != "" {
 		return r, err
 	}
@@ -566,8 +576,9 @@ func (c *Coordinator) diverge(in Invoke, stored, got string) Result {
 	return reject(persistence.CodeFingerprintMismatch)
 }
 
-// run 是一次逻辑调用的后台执行：Tx1 与按已有记录分流，然后进入 try 循环。
-func (c *Coordinator) run(j *job) (Result, error) {
+// run 是一次逻辑调用的后台执行：Tx1 与按已有记录分流，然后进入 try 循环。Tx1 给出的工具调用额度随每个结果返回
+// （含 tool_budget_exhausted 的 429 与重放）。
+func (c *Coordinator) run(j *job) (out Result, outErr error) {
 	in := j.in
 	ctx, cancel := c.opCtx()
 	res, err := c.store.BeginCall(ctx, BeginCallRequest{
@@ -576,6 +587,9 @@ func (c *Coordinator) run(j *job) (Result, error) {
 		Model: j.model,
 	})
 	cancel()
+	if tb := res.ToolBudget; tb != nil {
+		defer func() { out.ToolBudget = tb }()
+	}
 	if err != nil {
 		if r, ok := rejection(err); ok {
 			return r, nil

@@ -3192,22 +3192,41 @@ func setSession(t *testing.T, s *Store, sessionID, status string) {
 	}
 }
 
-// authorize 登记 blob 并授权到 (kind, id) scope。
-func authorize(t *testing.T, s *Store, sha, kind, id string) {
-	t.Helper()
-	if _, err := s.pool.Exec(context.Background(), `INSERT INTO blobs (sha256, size) VALUES ($1, 1) ON CONFLICT DO NOTHING;`, sha); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.pool.Exec(context.Background(), "INSERT INTO scope_blobs (scope_kind, scope_id, sha256) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-		kind, id, sha); err != nil {
-		t.Fatal(err)
-	}
-}
-
+// mustAttempt 创建 att-<taskID>。会话 turn 经会话授予（Task 4）：会话没有存活 incarnation 时建立 inc-<sid>（环境
+// senv-<sid>），并以直接写入模拟 session actor 的就绪与释放（incarnation idle、会话 idle 且不被占用），不追加会话事件。
 func mustAttempt(t *testing.T, s *Store, taskID string) {
 	t.Helper()
-	if _, err := s.CreateAttempt(context.Background(), task.NewAttempt{TaskID: taskID, AttemptID: "att-" + taskID, AttemptNo: 1,
-		EnvID: "env-" + taskID}); err != nil {
+	ctx := context.Background()
+	a := task.NewAttempt{TaskID: taskID, AttemptID: "att-" + taskID, AttemptNo: 1, EnvID: "env-" + taskID}
+	var sid *string
+	if err := s.pool.QueryRow(ctx, "SELECT session_id FROM tasks WHERE task_id = $1", taskID).Scan(&sid); err != nil {
+		t.Fatal(err)
+	}
+	if sid != nil {
+		var inc, env string
+		err := s.pool.QueryRow(ctx, "SELECT incarnation_id, env_id FROM incarnations WHERE session_id = $1 AND status <> 'ended'", *sid).
+			Scan(&inc, &env)
+		if errors.Is(err, pgx.ErrNoRows) {
+			var rv int64
+			if err := s.pool.QueryRow(ctx, "SELECT row_version FROM sessions WHERE session_id = $1", *sid).Scan(&rv); err != nil {
+				t.Fatal(err)
+			}
+			inc, env = "inc-"+*sid, "senv-"+*sid
+			_, err = s.CreateIncarnation(ctx, session.NewIncarnation{IncarnationID: inc, SessionID: *sid, EnvID: env, FromRowVersion: rv})
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.pool.Exec(ctx, `UPDATE incarnations SET status = 'idle' WHERE incarnation_id = $1;`, inc); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.pool.Exec(ctx, `UPDATE sessions SET status = CASE WHEN status IN ('creating', 'running') THEN 'idle' ELSE status END,
+			current_task_id = NULL, blocked_by_task_id = NULL WHERE session_id = $1`, *sid); err != nil {
+			t.Fatal(err)
+		}
+		a.SessionID, a.IncarnationID, a.EnvID = *sid, inc, env
+	}
+	if _, err := s.CreateAttempt(ctx, a); err != nil {
 		t.Fatalf("CreateAttempt(%s): %v", taskID, err)
 	}
 }
@@ -3258,12 +3277,12 @@ func TestSessionEventSeq(t *testing.T) {
 	fixture(t, s, "solo") // 独立任务
 
 	mustTurn(t, s, turnReq("s1", "ta", alice))
-	mustAttempt(t, s, "ta")
-	workerEvents(t, s, "att-ta", 1, 2, `{"kind":"thinking","data":{"text":"x"}}`)
 	if _, err := s.Transition(ctx, session.Transition{SessionID: "s1", FromRowVersion: 0, From: []string{session.StatusCreating},
 		To: session.StatusIdle, Event: json.RawMessage(`{"state":"idle"}`)}); err != nil {
 		t.Fatal(err)
 	}
+	mustAttempt(t, s, "ta") // 会话 turn 的 attempt 经会话授予（Task 4），会话须先就绪
+	workerEvents(t, s, "att-ta", 1, 2, `{"kind":"thinking","data":{"text":"x"}}`)
 	setTask(t, s, "ta", "paused", "")
 	mustTurn(t, s, turnReq("s1", "tb", alice)) // ta 的 control_accepted，tb 的 task_created
 	mustAttempt(t, s, "tb")
@@ -3272,8 +3291,8 @@ func TestSessionEventSeq(t *testing.T) {
 	if err := s.AppendHostEvent(ctx, "ta", "", "probe", json.RawMessage(`{"n":1}`)); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"ta/host/task_created", "ta/host/attempt_created", "ta/worker/progress", "ta/worker/progress",
-		"/session/session_state", "ta/host/control_accepted", "tb/host/task_created", "tb/host/attempt_created",
+	want := []string{"ta/host/task_created", "/session/session_state", "ta/host/attempt_created", "ta/worker/progress", "ta/worker/progress",
+		"ta/host/control_accepted", "tb/host/task_created", "tb/host/attempt_created",
 		"tb/worker/progress", "ta/worker/progress", "ta/host/probe"}
 	recs, err := a.ListSessionEvents(ctx, "s1", 0, 100)
 	if err != nil || len(recs) != len(want) {
@@ -3284,8 +3303,8 @@ func TestSessionEventSeq(t *testing.T) {
 			t.Fatalf("第 %d 条：seq %d %s，期望 seq %d %s", i, r.SessionSeq, got, i+1, want[i])
 		}
 	}
-	if recs[4].TaskSeq != 0 || string(recs[4].Payload) != `{"state": "idle"}` || recs[2].AttemptID != "att-ta" || recs[2].TaskSeq != 3 {
-		t.Fatalf("记录字段：%+v / %+v", recs[4], recs[2])
+	if recs[1].TaskSeq != 0 || string(recs[1].Payload) != `{"state": "idle"}` || recs[3].AttemptID != "att-ta" || recs[3].TaskSeq != 3 {
+		t.Fatalf("记录字段：%+v / %+v", recs[1], recs[3])
 	}
 	page, err := a.ListSessionEvents(ctx, "s1", 5, 3)
 	if err != nil || len(page) != 3 || page[0].SessionSeq != 6 || page[2].SessionSeq != 8 {
@@ -4551,3 +4570,519 @@ func TestSubrunCallLockAndBudget(t *testing.T) {
 		t.Fatalf("LoadSubrunBudget 未知 = %v", err)
 	}
 }
+
+// authorize 登记 blob 并授权到 (kind, id) scope。
+func authorize(t *testing.T, s *Store, sha, kind, id string) {
+	t.Helper()
+	if _, err := s.pool.Exec(context.Background(), `INSERT INTO blobs (sha256, size) VALUES ($1, 1) ON CONFLICT DO NOTHING;`, sha); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(context.Background(), "INSERT INTO scope_blobs (scope_kind, scope_id, sha256) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+		kind, id, sha); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ==== M4 Plan 12 Task 4：会话 turn 的 attempt 与裁决、session scope、工具额度（本段到此结束前不含其他任务的用例） ====
+
+// liveSession 建立会话 sid（所有者 owner）及其空闲的 incarnation inc-<sid>（环境 senv-<sid>），会话为 idle。
+func liveSession(t *testing.T, s *Store, sid string, owner int64) {
+	t.Helper()
+	ctx := context.Background()
+	newSession(t, s, sid, owner)
+	if _, err := s.CreateIncarnation(ctx, session.NewIncarnation{IncarnationID: "inc-" + sid, SessionID: sid, EnvID: "senv-" + sid}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetIncarnationStatus(ctx, "inc-"+sid, []string{session.IncStarting}, session.IncIdle); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Transition(ctx, session.Transition{SessionID: sid, FromRowVersion: 0, From: []string{session.StatusCreating},
+		To: session.StatusIdle}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// turnAttempt 是会话 turn 的第 no 个 attempt（att<no>-<taskID>）在会话 sid 的当前 incarnation 中创建的请求。
+func turnAttempt(sid, taskID string, no int64) task.NewAttempt {
+	return task.NewAttempt{TaskID: taskID, AttemptID: fmt.Sprintf("att%d-%s", no, taskID), AttemptNo: no, EnvID: "senv-" + sid,
+		SessionID: sid, IncarnationID: "inc-" + sid}
+}
+
+// turnVerdictFor 是 turnAttempt 的 attempt 在 control_version cv 下的裁决。
+func turnVerdictFor(a task.NewAttempt, cv int64, status, reason string) task.Verdict {
+	return task.Verdict{AttemptID: a.AttemptID, TaskID: a.TaskID, ControlVersion: cv, FromStatus: "starting", AttemptStatus: "ended",
+		OutcomeClass: status, TaskStatus: status, TaskStatusReason: reason, EventType: "attempt_ended",
+		EventPayload: json.RawMessage(`{"status":"` + status + `"}`)}
+}
+
+// releaseIncarnation 模拟 session actor 的释放：incarnation releasing → idle、会话 running → idle。
+func releaseIncarnation(t *testing.T, s *Store, sid string) {
+	t.Helper()
+	if _, err := s.SetIncarnationStatus(context.Background(), "inc-"+sid, []string{session.IncReleasing}, session.IncIdle); err != nil {
+		t.Fatal(err)
+	}
+	setSession(t, s, sid, session.StatusIdle)
+}
+
+// sessionRow 返回会话的 status|current_task_id|blocked_by_task_id|latest_checkpoint_id|latest_commit_seq|incarnation 状态。
+func sessionRow(t *testing.T, s *Store, sid string) string {
+	t.Helper()
+	var out string
+	if err := s.pool.QueryRow(context.Background(), `SELECT concat_ws('|', s.status, COALESCE(s.current_task_id, '-'),
+			COALESCE(s.blocked_by_task_id, '-'), COALESCE(p.latest_checkpoint_id, '-'), p.latest_commit_seq,
+			(SELECT i.status FROM incarnations i WHERE i.incarnation_id = s.current_incarnation_id))
+		FROM sessions s JOIN session_progress p USING (session_id) WHERE s.session_id = $1`, sid).Scan(&out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestSessionTurnAttemptAndVerdict 覆盖会话 turn 的 attempt 创建与裁决（§8.1、§12.3；E47 存储侧、I10）：incarnation
+// 非 idle 与被其他 turn 阻塞时拒绝；阻塞者本人创建时清除阻塞并接管会话；成功裁决提交 session checkpoint 并推进指针；
+// base 不一致为 session_base_mismatch；失败与 awaiting_input 不推进指针；awaiting_input 在 desired = run 时被接受并
+// 阻塞会话；paused → cancelled 的 ApplyControl 清除阻塞。
+func TestSessionTurnAttemptAndVerdict(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	alice := mustUser(t, s, "alice")
+	liveSession(t, s, "s1", alice)
+	mustTurn(t, s, turnReq("s1", "ta", alice))
+	sha := strings.Repeat("5a", 32)
+	authorize(t, s, sha, "task", "ta")
+
+	// 准入：incarnation 非 idle、会话被其他 turn 阻塞时拒绝，且不留下任何改变。
+	a1 := turnAttempt("s1", "ta", 1)
+	before := snapshot(t, s, "ta")
+	if _, err := s.pool.Exec(ctx, "UPDATE incarnations SET status = 'releasing' WHERE incarnation_id = 'inc-s1'"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.CreateAttempt(ctx, a1)
+	expectRejected(t, err, persistence.CodeIncarnationNotIdle)
+	if _, err := s.pool.Exec(ctx, `UPDATE incarnations SET status = 'idle' WHERE incarnation_id = 'inc-s1';
+		UPDATE sessions SET blocked_by_task_id = 'other' WHERE session_id = 's1'`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.CreateAttempt(ctx, a1)
+	expectRejected(t, err, persistence.CodeSessionBlocked)
+	if after := snapshot(t, s, "ta"); after != before {
+		t.Fatalf("被拒绝后任务不应改变：%s → %s", before, after)
+	}
+	if _, err := s.CreateAttempt(ctx, task.NewAttempt{TaskID: "ta", AttemptID: "x", AttemptNo: 1, EnvID: "senv-s1"}); !errors.Is(err, persistence.ErrInvalid) {
+		t.Fatalf("会话 turn 不带会话授予应为 ErrInvalid，得到 %v", err)
+	}
+	wrongEnv := a1
+	wrongEnv.EnvID = "elsewhere"
+	if _, err := s.CreateAttempt(ctx, wrongEnv); !errors.Is(err, persistence.ErrInvalid) {
+		t.Fatalf("不在 incarnation 环境中的 attempt 应为 ErrInvalid，得到 %v", err)
+	}
+
+	// 阻塞者本人：清除阻塞、接管会话（idle → running）、incarnation busy、不另建任务环境。
+	if _, err := s.pool.Exec(ctx, "UPDATE sessions SET blocked_by_task_id = 'ta' WHERE session_id = 's1'"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.CreateAttempt(ctx, a1)
+	if err != nil || first.EnvID != "senv-s1" {
+		t.Fatalf("阻塞者本人应能创建 attempt：%+v, %v", first, err)
+	}
+	if again, err := s.CreateAttempt(ctx, a1); err != nil || fmt.Sprintf("%+v", again) != fmt.Sprintf("%+v", first) {
+		t.Fatalf("重复请求应返回原结果：%+v, %v", again, err)
+	}
+	if got := sessionRow(t, s, "s1"); got != "running|ta|-|-|0|busy" {
+		t.Fatalf("会话 = %s", got)
+	}
+	if n := count(t, s, "SELECT count(*) FROM environments WHERE attempt_id = 'att1-ta'"); n != 0 {
+		t.Fatal("会话 turn 不应另建任务环境")
+	}
+	if n := count(t, s, "SELECT count(*) FROM sessions WHERE session_id = 's1' AND row_version = 2"); n != 1 {
+		t.Fatal("idle → running 应递增会话的 row_version")
+	}
+
+	// 成功裁决：提交 session checkpoint、推进指针、补授权会话 scope、清 current_task_id、incarnation releasing。
+	if _, err := s.FinalizeAttempt(ctx, turnVerdictFor(a1, 1, "succeeded", "")); !errors.Is(err, persistence.ErrInvalid) {
+		t.Fatalf("会话 turn 的成功裁决缺 session_state 应为 ErrInvalid，得到 %v", err)
+	}
+	v1 := turnVerdictFor(a1, 1, "succeeded", "")
+	v1.SessionState = &task.SessionState{CheckpointID: "scp1", State: json.RawMessage(`{"memory":1}`), Refs: []string{sha}}
+	for i := 0; i < 2; i++ {
+		got, err := s.FinalizeAttempt(ctx, v1)
+		if err != nil || got.CommittedSessionCheckpointID != "scp1" {
+			t.Fatalf("第 %d 次成功裁决 = %+v, %v", i+1, got, err)
+		}
+	}
+	if got := sessionRow(t, s, "s1"); got != "running|-|-|scp1|1|releasing" {
+		t.Fatalf("成功裁决后会话 = %s", got)
+	}
+	if n := count(t, s, `SELECT count(*) FROM checkpoints WHERE scope_kind = 'session' AND scope_id = 's1' AND checkpoint_id = 'scp1'
+		AND commit_seq = 1 AND attempt_id = 'att1-ta' AND state_inline = '{"memory":1}'`); n != 1 {
+		t.Fatal("应插入 session checkpoint")
+	}
+	if n := count(t, s, "SELECT count(*) FROM scope_blobs WHERE scope_kind = 'session' AND scope_id = 's1' AND sha256 = $1", sha); n != 1 {
+		t.Fatal("session_state 的引用应补授权到会话 scope")
+	}
+
+	// 第二个 turn：base = scp1；指针被移动时成功裁决为 session_base_mismatch；失败裁决不推进指针。
+	releaseIncarnation(t, s, "s1")
+	mustTurn(t, s, turnReq("s1", "tb", alice))
+	b1 := turnAttempt("s1", "tb", 1)
+	if _, err := s.CreateAttempt(ctx, b1); err != nil {
+		t.Fatal(err)
+	}
+	st, err := s.LoadTask(ctx, "tb")
+	if err != nil || st.SessionID != "s1" || st.BaseSessionCheckpointID != "scp1" || st.TurnIndex != 1 || st.SessionLatest == nil ||
+		st.SessionLatest.CheckpointID != "scp1" || string(st.SessionLatest.State) != `{"memory": 1}` || len(st.SessionLatest.Refs) != 1 {
+		t.Fatalf("LoadTask 的会话字段 = %+v / %+v, %v", st, st.SessionLatest, err)
+	}
+	if _, err := s.pool.Exec(ctx, "UPDATE session_progress SET latest_checkpoint_id = 'moved' WHERE session_id = 's1'"); err != nil {
+		t.Fatal(err)
+	}
+	vb := turnVerdictFor(b1, 1, "succeeded", "")
+	vb.SessionState = &task.SessionState{CheckpointID: "scp2", State: json.RawMessage(`{"memory":2}`)}
+	_, err = s.FinalizeAttempt(ctx, vb)
+	expectRejected(t, err, persistence.CodeSessionBaseMismatch)
+	if _, err := s.pool.Exec(ctx, "UPDATE session_progress SET latest_checkpoint_id = 'scp1' WHERE session_id = 's1'"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.FinalizeAttempt(ctx, turnVerdictFor(b1, 1, "failed", "worker_error")); err != nil || got.CommittedSessionCheckpointID != "scp1" {
+		t.Fatalf("失败裁决 = %+v, %v（指针应保持 base）", got, err)
+	}
+	if got := sessionRow(t, s, "s1"); got != "running|-|-|scp1|1|releasing" {
+		t.Fatalf("失败裁决后会话 = %s", got)
+	}
+
+	// 第三个 turn：awaiting_input（desired = run）被接受、阻塞会话、清空续跑指令；不推进指针。
+	releaseIncarnation(t, s, "s1")
+	mustTurn(t, s, turnReq("s1", "tc", alice))
+	c1 := turnAttempt("s1", "tc", 1)
+	if _, err := s.CreateAttempt(ctx, c1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE tasks SET resume_directive = '{"kind":"finish_now"}' WHERE task_id = 'tc'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.FinalizeAttempt(ctx, turnVerdictFor(c1, 1, "paused", "")); !errors.Is(err, persistence.ErrInvalid) {
+		t.Fatalf("desired = run 时只有 awaiting_input 的暂停被接受，得到 %v", err)
+	}
+	if got, err := s.FinalizeAttempt(ctx, turnVerdictFor(c1, 1, "paused", task.ReasonAwaitingInput)); err != nil ||
+		got.CommittedSessionCheckpointID != "scp1" {
+		t.Fatalf("awaiting_input 裁决 = %+v, %v", got, err)
+	}
+	if got := sessionRow(t, s, "s1"); got != "running|-|tc|scp1|1|releasing" {
+		t.Fatalf("awaiting_input 后会话 = %s", got)
+	}
+	if n := count(t, s, `SELECT count(*) FROM tasks WHERE task_id = 'tc' AND status = 'paused' AND status_reason = 'awaiting_input'
+		AND resume_directive IS NULL`); n != 1 {
+		t.Fatal("awaiting_input 应为 paused/awaiting_input 并清空续跑指令")
+	}
+
+	// 新消息取代（D5）：cancel 控制，ApplyControl paused → cancelled 清除阻塞。
+	releaseIncarnation(t, s, "s1")
+	if r := mustTurn(t, s, turnReq("s1", "td", alice)); r.SupersededTurnID != "tc" {
+		t.Fatalf("新消息应取代 tc：%+v", r)
+	}
+	cs, err := s.GetControlState(ctx, "tc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ApplyControl(ctx, task.ApplyControl{TaskID: "tc", ControlVersion: cs.ControlVersion, Status: "cancelled",
+		StatusReason: "superseded"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := sessionRow(t, s, "s1"); got != "idle|-|-|scp1|1|idle" {
+		t.Fatalf("取代后会话 = %s", got)
+	}
+	if _, err := s.CreateAttempt(ctx, turnAttempt("s1", "td", 1)); err != nil {
+		t.Fatalf("阻塞清除后新 turn 应能运行：%v", err)
+	}
+	expectNoDBViolations(t, s)
+	expectSessionSeqContiguous(t, s, "s1")
+}
+
+// TestSessionTurnFaultRetryAndPause：故障重试的 turn 保持占用会话（current_task_id），在新 incarnation 中以 RetryFault
+// 创建 attempt 时要求旧会话环境已停止；queued 的 turn 被暂停时阻塞会话。
+func TestSessionTurnFaultRetryAndPause(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	alice, bob := mustUser(t, s, "alice"), mustUser(t, s, "bob")
+	liveSession(t, s, "s1", alice)
+	mustTurn(t, s, turnReq("s1", "ta", alice))
+	a1 := turnAttempt("s1", "ta", 1)
+	if _, err := s.CreateAttempt(ctx, a1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.FinalizeAttempt(ctx, turnVerdictFor(a1, 1, "queued", "worker_crashed")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevokeAttemptAccess(ctx, a1.AttemptID, "attempt_ended"); err != nil {
+		t.Fatal(err)
+	}
+	if got := sessionRow(t, s, "s1"); got != "running|ta|-|-|0|releasing" {
+		t.Fatalf("故障重试的 turn 应保持占用会话：%s", got)
+	}
+	// 旧 incarnation 销毁，新 incarnation inc2 在 senv2 中。
+	if _, err := s.EndIncarnation(ctx, "inc-s1", "worker_crashed"); err != nil {
+		t.Fatal(err)
+	}
+	st, err := s.LoadSession(ctx, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateIncarnation(ctx, session.NewIncarnation{IncarnationID: "inc2", SessionID: "s1", EnvID: "senv2",
+		FromRowVersion: st.RowVersion}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetIncarnationStatus(ctx, "inc2", []string{session.IncStarting}, session.IncIdle); err != nil {
+		t.Fatal(err)
+	}
+	a2 := task.NewAttempt{TaskID: "ta", AttemptID: "att2-ta", AttemptNo: 2, EnvID: "senv2", Retry: task.RetryFault,
+		SessionID: "s1", IncarnationID: "inc2"}
+	_, err = s.CreateAttempt(ctx, a2)
+	expectRejected(t, err, persistence.CodePreviousNotStopped)
+	stopEnv(t, s, "senv-s1")
+	if _, err := s.CreateAttempt(ctx, a2); err != nil {
+		t.Fatalf("旧会话环境停止后应能在新 incarnation 中重试：%v", err)
+	}
+	if got := sessionRow(t, s, "s1"); got != "running|ta|-|-|0|busy" {
+		t.Fatalf("重试后会话 = %s", got)
+	}
+
+	// queued 的 turn 被暂停：阻塞会话、清除占用。
+	liveSession(t, s, "s2", bob)
+	mustTurn(t, s, turnReq("s2", "tq", bob))
+	if _, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "p-tq", BodyHash: []byte("h"), TaskID: "tq", Desired: "pause"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ApplyControl(ctx, task.ApplyControl{TaskID: "tq", ControlVersion: 2, Status: "paused"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := sessionRow(t, s, "s2"); got != "idle|-|tq|-|0|idle" {
+		t.Fatalf("暂停 queued turn 后会话 = %s", got)
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestSessionScopeAndWorkerEvents：session 模式 Worker 事件序号不要求连续、同序号不同内容为冲突；产物与 Gateway 结果
+// blob 同时授权到会话 scope，同一会话后续 turn 的 checkpoint 与 blob 读取可以引用它，其他会话不可以；终态提议接受
+// awaiting_input。
+func TestSessionScopeAndWorkerEvents(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	alice, bob := mustUser(t, s, "alice"), mustUser(t, s, "bob")
+	liveSession(t, s, "s1", alice)
+	liveSession(t, s, "s2", bob)
+	mustTurn(t, s, turnReq("s1", "ta", alice))
+	a1 := turnAttempt("s1", "ta", 1)
+	if _, err := s.CreateAttempt(ctx, a1); err != nil {
+		t.Fatal(err)
+	}
+
+	ev := func(seq int64, payload string) runner.WorkerEvent {
+		return runner.WorkerEvent{Seq: seq, Type: "progress", Payload: json.RawMessage(payload)}
+	}
+	if wm, err := s.AppendSessionWorkerEvents(ctx, a1.AttemptID, []runner.WorkerEvent{ev(3, `{"n":3}`), ev(7, `{"n":7}`), ev(8, `{"n":8}`)}); err != nil ||
+		wm.WorkerSeq != 8 {
+		t.Fatalf("seq 3、7、8 = %+v, %v", wm, err)
+	}
+	if wm, err := s.AppendSessionWorkerEvents(ctx, a1.AttemptID, []runner.WorkerEvent{ev(7, `{"n":7}`), ev(8, `{"n":8}`), ev(10, `{"n":10}`)}); err != nil ||
+		wm.WorkerSeq != 10 {
+		t.Fatalf("重叠的批次应只追加新后缀：%+v, %v", wm, err)
+	}
+	expectConflicts(t, map[string]func() error{
+		"同序号不同内容": func() error {
+			_, err := s.AppendSessionWorkerEvents(ctx, a1.AttemptID, []runner.WorkerEvent{ev(7, `{"n":"x"}`)})
+			return err
+		},
+		"回填空隙": func() error {
+			_, err := s.AppendSessionWorkerEvents(ctx, a1.AttemptID, []runner.WorkerEvent{ev(5, `{"n":5}`)})
+			return err
+		},
+	})
+	if _, err := s.AppendSessionWorkerEvents(ctx, a1.AttemptID, []runner.WorkerEvent{ev(12, `{}`), ev(11, `{}`)}); !errors.Is(err, persistence.ErrInvalid) {
+		t.Fatalf("批内不递增应为 ErrInvalid，得到 %v", err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM events WHERE attempt_id = $1 AND worker_seq IS NOT NULL AND session_seq IS NOT NULL", a1.AttemptID); n != 4 {
+		t.Fatalf("应有 4 条带会话序号的 Worker 事件，得到 %d", n)
+	}
+
+	art := strings.Repeat("a1", 32)
+	if _, err := s.RegisterArtifact(ctx, runner.Artifact{TaskID: "ta", AttemptID: a1.AttemptID, ArtifactID: "report", SHA256: art, Size: 3,
+		MediaType: "text/markdown", Visibility: "output"}); err != nil {
+		t.Fatal(err)
+	}
+	res := strings.Repeat("b2", 32)
+	if _, err := s.BeginCall(ctx, call.BeginCallRequest{TaskID: "ta", CallID: "c1", AttemptID: a1.AttemptID, Fingerprint: "fp",
+		Endpoint: "/v1/fetch", Deadline: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CompleteFromCache(ctx, call.CacheCompletion{TaskID: "ta", CallID: "c1", AttemptID: a1.AttemptID, ResultSHA256: res,
+		ResultSize: 9}); err != nil {
+		t.Fatal(err)
+	}
+	for _, sha := range []string{art, res} {
+		if n := count(t, s, `SELECT count(*) FROM scope_blobs WHERE sha256 = $1 AND
+			((scope_kind = 'task' AND scope_id = 'ta') OR (scope_kind = 'session' AND scope_id = 's1'))`, sha); n != 2 {
+			t.Fatalf("blob %s 应同时授权到 task 与会话 scope，得到 %d", sha, n)
+		}
+	}
+	if _, err := s.RecordTerminalProposal(ctx, runner.TerminalProposal{AttemptID: a1.AttemptID, Kind: "awaiting_input", Ref: "q1"}); err != nil {
+		t.Fatalf("awaiting_input 提议应被记录：%v", err)
+	}
+	if _, err := s.FinalizeAttempt(ctx, turnVerdictFor(a1, 1, "failed", "worker_error")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 同一会话的下一个 turn：只授权到会话 scope 的 blob 可被 checkpoint 引用与读取；另一个会话的 turn 不可以。
+	releaseIncarnation(t, s, "s1")
+	mustTurn(t, s, turnReq("s1", "tb", alice))
+	b1 := turnAttempt("s1", "tb", 1)
+	if _, err := s.CreateAttempt(ctx, b1); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.BlobAuthorized(ctx, "tb", res); err != nil || !ok {
+		t.Fatalf("同会话后续 turn 应可读取会话 scope 的 blob：%v, %v", ok, err)
+	}
+	if _, err := s.CommitCheckpoint(ctx, runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "tb"}, CheckpointID: "cb1",
+		AttemptID: b1.AttemptID, StepID: "s", State: json.RawMessage(`{}`), Refs: []string{art}}); err != nil {
+		t.Fatalf("会话 scope 的引用应被 checkpoint 接受：%v", err)
+	}
+	mustTurn(t, s, turnReq("s2", "tx", bob))
+	x1 := turnAttempt("s2", "tx", 1)
+	if _, err := s.CreateAttempt(ctx, x1); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.BlobAuthorized(ctx, "tx", res); err != nil || ok {
+		t.Fatalf("其他会话的 turn 不应读到该 blob：%v, %v", ok, err)
+	}
+	_, err := s.CommitCheckpoint(ctx, runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "tx"}, CheckpointID: "cx1",
+		AttemptID: x1.AttemptID, StepID: "s", State: json.RawMessage(`{}`), Refs: []string{art}})
+	expectRejected(t, err, persistence.CodeRefNotAuthorized)
+	expectNoDBViolations(t, s)
+	expectSessionSeqContiguous(t, s, "s1")
+}
+
+// toolTask 建立一个预算充足、工具额度为 limit（nil 为不限）的独立任务及其 attempt。
+func toolTask(t *testing.T, s *Store, taskID string, limit *int64) {
+	t.Helper()
+	limits := `{"budget_micro":1000000}`
+	if limit != nil {
+		limits = fmt.Sprintf(`{"budget_micro":1000000,"max_tool_calls":%d}`, *limit)
+	}
+	if _, err := s.CreateTask(context.Background(), api.CreateTaskRequest{RequestID: "req-" + taskID, BodyHash: []byte("h"), TaskID: taskID,
+		Spec: json.RawMessage(`{"worker":"sim"}`), Limits: json.RawMessage(limits), MaxFaultRetries: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateAttempt(context.Background(), task.NewAttempt{TaskID: taskID, AttemptID: "att-" + taskID, AttemptNo: 1,
+		EnvID: "env-" + taskID}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func toolCall(s *Store, taskID, callID, endpoint string) (call.BeginCallResult, error) {
+	return s.BeginCall(context.Background(), call.BeginCallRequest{TaskID: taskID, CallID: callID, AttemptID: "att-" + taskID,
+		Fingerprint: "fp-" + callID, Endpoint: endpoint, Deadline: time.Minute})
+}
+
+// TestToolBudget 覆盖每 turn 的工具调用额度（契约 E，设计 D3）：只在 Tx1 新插入 calls 行时计数，并发下精确；拒绝不登记
+// 调用；同 call_id 重放与复位后接管不计数；模型调用不计数；缓存命中在 Tx1 已计数；重启后计数保持；不限的任务不受限。
+func TestToolBudget(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	limit := int64(30)
+	toolTask(t, s, "t1", &limit)
+
+	var wg sync.WaitGroup
+	var ok, exhausted atomic.Int32
+	errs := make(chan error, 40)
+	for i := 0; i < 40; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			res, err := toolCall(s, "t1", fmt.Sprintf("c%02d", i), "/v1/search")
+			var rej *persistence.RejectedError
+			switch {
+			case err == nil && res.ToolBudget != nil && res.ToolBudget.Limit == 30 && res.ToolBudget.Used >= 1 && res.ToolBudget.Used <= 30:
+				ok.Add(1)
+			case errors.As(err, &rej) && rej.Code == persistence.CodeToolBudgetExhausted && res.ToolBudget != nil &&
+				*res.ToolBudget == (call.ToolBudget{Used: 30, Limit: 30}):
+				exhausted.Add(1)
+			default:
+				errs <- fmt.Errorf("调用 %d：%+v, %v", i, res.ToolBudget, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if ok.Load() != 30 || exhausted.Load() != 10 {
+		t.Fatalf("应恰 30 个成功、10 个 tool_budget_exhausted，得到 %d / %d", ok.Load(), exhausted.Load())
+	}
+	b, err := s.LoadBudget(ctx, "t1")
+	if err != nil || b.ToolCallsUsed != 30 || b.ToolCallLimit == nil || *b.ToolCallLimit != 30 {
+		t.Fatalf("LoadBudget = %+v, %v", b, err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM calls WHERE task_id = 't1'"); n != 30 {
+		t.Fatalf("被拒绝的调用不应登记，calls 有 %d 行", n)
+	}
+
+	// 已登记调用的重放不计数，带当前计数。
+	var replay string
+	if err := s.pool.QueryRow(ctx, "SELECT call_id FROM calls WHERE task_id = 't1' LIMIT 1").Scan(&replay); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := toolCall(s, "t1", replay, "/v1/search"); err != nil || !res.Existing || res.ToolBudget == nil || res.ToolBudget.Used != 30 {
+		t.Fatalf("重放 = %+v, %v", res, err)
+	}
+	// 模型调用不计数、不受额度限制，也不带额度。
+	if res, err := toolCall(s, "t1", "chat-1", "/v1/chat/completions"); err != nil || res.ToolBudget != nil {
+		t.Fatalf("模型调用 = %+v, %v", res, err)
+	}
+	// 新开 Store（模拟重启）：计数保持，第 31 次仍拒绝。
+	s2, err := Open(ctx, Options{DSN: s.opt.DSN})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	_, err = toolCall(s2, "t1", "c-after-restart", "/v1/fetch")
+	expectRejected(t, err, persistence.CodeToolBudgetExhausted)
+	if n := count(t, s, "SELECT count(*) FROM budgets WHERE task_id = 't1' AND tool_calls_used = 30"); n != 1 {
+		t.Fatal("重启后计数应保持 30")
+	}
+
+	// 复位后接管不计数；缓存命中（CompleteFromCache）的调用已在 Tx1 计数。
+	two := int64(2)
+	toolTask(t, s, "t2", &two)
+	if res, err := toolCall(s, "t2", "r1", "/v1/search"); err != nil || res.ToolBudget == nil || res.ToolBudget.Used != 1 {
+		t.Fatalf("t2 第 1 次 = %+v, %v", res, err)
+	}
+	if _, err := s.ResetResolving(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := toolCall(s, "t2", "r1", "/v1/search"); err != nil || res.Existing || res.ToolBudget == nil || res.ToolBudget.Used != 1 {
+		t.Fatalf("复位后接管应按新登记返回且不计数：%+v, %v", res, err)
+	}
+	if res, err := toolCall(s, "t2", "r2", "/v1/fetch"); err != nil || res.ToolBudget.Used != 2 {
+		t.Fatalf("t2 第 2 次 = %+v, %v", res, err)
+	}
+	if _, err := s.CompleteFromCache(ctx, call.CacheCompletion{TaskID: "t2", CallID: "r2", AttemptID: "att-t2",
+		ResultSHA256: strings.Repeat("c3", 32), ResultSize: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := s.LoadBudget(ctx, "t2"); err != nil || b.ToolCallsUsed != 2 {
+		t.Fatalf("缓存命中不应再计数：%+v, %v", b, err)
+	}
+	_, err = toolCall(s, "t2", "r3", "/v1/search")
+	expectRejected(t, err, persistence.CodeToolBudgetExhausted)
+
+	// tool_call_limit 为 NULL 的独立任务不受限。
+	toolTask(t, s, "t3", nil)
+	for i := 0; i < 35; i++ {
+		if res, err := toolCall(s, "t3", fmt.Sprintf("u%d", i), "/v1/search"); err != nil || res.ToolBudget != nil {
+			t.Fatalf("不限的任务第 %d 次 = %+v, %v", i+1, res, err)
+		}
+	}
+	checkI3(t, s)
+	expectNoDBViolations(t, s)
+}
+
+// ==== M4 Plan 12 Task 4 段结束 ====

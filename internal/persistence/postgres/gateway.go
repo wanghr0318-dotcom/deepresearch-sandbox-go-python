@@ -119,16 +119,45 @@ func (s *Store) CheckAccess(ctx context.Context, taskID, attemptID string) (call
 // 已由 ResetResolving 复位的 resolving（resolving_since 为空）且指纹相同时由本次请求接管：置 resolving_since = now()，
 // 按新登记返回（Existing=false），created_at 与 deadline_at 不变（§9.7）。
 // 提交结果未知后的重跑：本次调用自己登记或接管的行（同指纹、仍在解析、尚无 try）仍按新登记返回。
+//
+// 工具额度（/v1/search、/v1/fetch）：在同一 Tx1 中先锁 budgets（锁顺序 budgets → calls）；需要新插入 calls 行时，
+// tool_call_limit 非空且 tool_calls_used ≥ tool_call_limit 为 ErrRejected(tool_budget_exhausted)（不插入调用），否则
+// tool_calls_used + 1。同 call_id 的重放与复位后接管不计数；缓存命中与合并在其后的 Tx2 完成，此处已计数。
+// 有上限时结果（含拒绝）带 ToolBudget：新登记后的计数，或已有记录时的当前值。
 func (s *Store) BeginCall(ctx context.Context, r call.BeginCallRequest) (call.BeginCallResult, error) {
 	if r.TaskID == "" || r.CallID == "" || r.AttemptID == "" || r.Fingerprint == "" || r.Endpoint == "" || r.Deadline <= 0 {
 		return call.BeginCallResult{}, invalidf("BeginCall 缺少 task_id、call_id、attempt_id、指纹、端点，或期限不为正")
 	}
+	tool := isToolEndpoint(r.Endpoint)
 	var out call.BeginCallResult
 	inserted := false // 跨重跑保留：之前的某次尝试已插入（可能已提交）
 	err := s.run(ctx, "BeginCall", r.TaskID+"/"+r.CallID, func(ctx context.Context, tx pgx.Tx) error {
 		out = call.BeginCallResult{}
 		if err := checkAccessTx(ctx, tx, r.TaskID, r.AttemptID); err != nil {
 			return err
+		}
+		var limit *int64
+		var used int64
+		if tool {
+			err := tx.QueryRow(ctx, "SELECT tool_call_limit, tool_calls_used FROM budgets WHERE task_id = $1 FOR UPDATE", r.TaskID).
+				Scan(&limit, &used)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return notFoundf("任务 %s 的预算", r.TaskID)
+			}
+			if err != nil {
+				return err
+			}
+			if limit != nil {
+				defer func() { out.ToolBudget = &call.ToolBudget{Used: used, Limit: *limit} }()
+				var exists bool
+				if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM calls WHERE task_id = $1 AND call_id = $2)",
+					r.TaskID, r.CallID).Scan(&exists); err != nil {
+					return err
+				}
+				if !exists && used >= *limit {
+					return rejectf(persistence.CodeToolBudgetExhausted, "任务 %s 的工具调用额度已用完（%d/%d）", r.TaskID, used, *limit)
+				}
+			}
 		}
 		rec, err := scanCall(tx.QueryRow(ctx, `INSERT INTO calls (task_id, call_id, fingerprint, endpoint, state, source,
 				created_at, deadline_at, first_attempt_id, supersedes_call_id, supersede_reason, resolving_since, model)
@@ -137,6 +166,12 @@ func (s *Store) BeginCall(ctx context.Context, r call.BeginCallRequest) (call.Be
 			r.TaskID, r.CallID, r.Fingerprint, r.Endpoint, r.Deadline.Microseconds(), r.AttemptID, r.SupersedesCallID, r.SupersedeReason,
 			r.Model))
 		if err == nil {
+			if tool {
+				if err := tx.QueryRow(ctx, "UPDATE budgets SET tool_calls_used = tool_calls_used + 1 WHERE task_id = $1 RETURNING tool_calls_used",
+					r.TaskID).Scan(&used); err != nil {
+					return err
+				}
+			}
 			inserted = true
 			out.Record = rec
 			return nil
@@ -161,6 +196,9 @@ func (s *Store) BeginCall(ctx context.Context, r call.BeginCallRequest) (call.Be
 	})
 	return out, err
 }
+
+// isToolEndpoint 报告端点是否计入每 turn 的工具调用额度（搜索与抓取；模型调用不计）。
+func isToolEndpoint(endpoint string) bool { return endpoint == "/v1/search" || endpoint == "/v1/fetch" }
 
 // newReservationID 在事务前生成 reservation 身份（规格 §7.3）。
 func newReservationID() (string, error) {
@@ -335,8 +373,7 @@ func recordResultBlob(ctx context.Context, tx pgx.Tx, taskID, sha string, wantSi
 	if size != wantSize {
 		return conflictf("blob %s 已登记为 %d 字节，不是 %d", sha, size, wantSize)
 	}
-	if _, err := tx.Exec(ctx, "INSERT INTO scope_blobs (scope_kind, scope_id, sha256) VALUES ('task', $1, $2) ON CONFLICT DO NOTHING",
-		taskID, sha); err != nil {
+	if err := authorizeTaskBlob(ctx, tx, taskID, sha); err != nil { // 任务属于会话时同时授权到会话 scope
 		return err
 	}
 	_, err := tx.Exec(ctx, "INSERT INTO blob_provenance (scope_kind, scope_id, sha256, source, ref) VALUES ('task', $1, $2, 'gateway', $3)",
@@ -563,8 +600,9 @@ func (s *Store) ConvertLedger(ctx context.Context) (recovery.LedgerConversion, e
 func (s *Store) LoadBudget(ctx context.Context, taskID string) (call.Budget, error) {
 	var b call.Budget
 	err := s.read(ctx, "LoadBudget", func(ctx context.Context, q queryer) error {
-		err := q.QueryRow(ctx, "SELECT limit_micro, reserved_micro, spent_micro, unknown_micro FROM budgets WHERE task_id = $1", taskID).
-			Scan(&b.LimitMicro, &b.ReservedMicro, &b.SpentMicro, &b.UnknownMicro)
+		err := q.QueryRow(ctx, `SELECT limit_micro, reserved_micro, spent_micro, unknown_micro, tool_call_limit, tool_calls_used
+			FROM budgets WHERE task_id = $1`, taskID).
+			Scan(&b.LimitMicro, &b.ReservedMicro, &b.SpentMicro, &b.UnknownMicro, &b.ToolCallLimit, &b.ToolCallsUsed)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return notFoundf("任务 %s 的预算", taskID)
 		}
@@ -636,11 +674,14 @@ func (s *Store) ListCalls(ctx context.Context, taskID string) ([]call.CallRecord
 	return out, err
 }
 
-// BlobAuthorized 报告 sha 是否在任务 scope 内（实现 call.Store；scope_blobs(task)，§9.3"按 scope 授权"）。
+// BlobAuthorized 报告 sha 是否在任务 scope 内（实现 call.Store；scope_blobs(task)，§9.3"按 scope 授权"）；会话 turn
+// 另接受其会话 scope（§5.5 第 2 条 attempt → task → session 推导，例如 D5 carryover 的 checkpoint blob）。
 func (s *Store) BlobAuthorized(ctx context.Context, taskID, sha string) (bool, error) {
 	var ok bool
 	err := s.read(ctx, "BlobAuthorized", func(ctx context.Context, q queryer) error {
-		return q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM scope_blobs WHERE scope_kind = 'task' AND scope_id = $1 AND sha256 = $2)`,
+		return q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM scope_blobs WHERE sha256 = $2 AND
+			((scope_kind = 'task' AND scope_id = $1)
+				OR (scope_kind = 'session' AND scope_id = (SELECT session_id FROM tasks WHERE task_id = $1))))`,
 			taskID, sha).Scan(&ok)
 	})
 	return ok, err

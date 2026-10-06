@@ -17,8 +17,23 @@ type AccessFacts struct {
 	Desired           string // task_control.desired
 }
 
-// Budget 是 task 层账本（微美元）。
-type Budget struct{ LimitMicro, ReservedMicro, SpentMicro, UnknownMicro int64 }
+// Budget 是 task 层账本（微美元）与每 turn 的工具调用额度。
+type Budget struct {
+	LimitMicro, ReservedMicro, SpentMicro, UnknownMicro int64
+	ToolCallLimit                                       *int64 // nil = 不限（独立任务）
+	ToolCallsUsed                                       int64
+}
+
+// ToolBudget 是搜索与抓取的工具调用额度（X-Agentbox-Tool-Budget: <Used>/<Limit>）；只在任务有上限时出现。
+type ToolBudget struct{ Used, Limit int64 }
+
+// ToolBudget 返回有上限时的工具调用额度，不限时为 nil。
+func (b Budget) ToolBudget() *ToolBudget {
+	if b.ToolCallLimit == nil {
+		return nil
+	}
+	return &ToolBudget{Used: b.ToolCallsUsed, Limit: *b.ToolCallLimit}
+}
 
 // Available 返回可用额度：limit − spent − reserved − unknown（规格 §9.6；可为负，即赤字）。
 func (b Budget) Available() int64 {
@@ -63,10 +78,12 @@ type BeginCallRequest struct {
 	Model                                            string
 }
 
-// BeginCallResult：Existing 表示已有同 ID 记录（调用方按 §9.4 表处理）。
+// BeginCallResult：Existing 表示已有同 ID 记录（调用方按 §9.4 表处理）。ToolBudget 只在搜索与抓取且任务有上限时
+// 返回：新登记后的计数，或已有记录（重放）时的当前值；拒绝为 tool_budget_exhausted 时与错误一同返回当前值。
 type BeginCallResult struct {
-	Record   CallRecord
-	Existing bool
+	Record     CallRecord
+	Existing   bool
+	ToolBudget *ToolBudget
 }
 
 // ReserveTryRequest 是 Tx2 的输入。
@@ -116,6 +133,7 @@ type Store interface {
 	// CheckAccess 在一致快照中读取 §9.2 的事实（attempt_access.state、tasks.current_attempt_id、task_control.desired）。
 	CheckAccess(ctx context.Context, taskID, attemptID string) (AccessFacts, error)
 	// BeginCall 是 Tx1：复查访问 → 无记录则登记 resolving（created_at、deadline_at = created_at + Deadline）；有记录则返回它（含指纹供比较）；
+	// 搜索与抓取新登记时在同一事务计入工具调用额度（已用完为 ErrRejected(tool_budget_exhausted)，不登记）；
 	// 已复位的 resolving（ResolvingSince 为空）由本次请求接管并按新登记返回（Existing=false），created_at、deadline_at 不变。
 	BeginCall(ctx context.Context, r BeginCallRequest) (BeginCallResult, error)
 	// ReserveTry 是 Tx2：复查访问与期限（db now() < deadline_at）、累计 tries_used < MaxTries、预算可用 ≥ 估算；
@@ -143,7 +161,7 @@ type Store interface {
 	LoadCall(ctx context.Context, taskID, callID string) (CallRecord, []TryRecord, error)
 	ListCalls(ctx context.Context, taskID string) ([]CallRecord, error)
 	// BlobAuthorized 报告 sha 是否在任务 scope 内（scope_blobs(task)：已完成调用的结果、产物与 checkpoint
-	// 引用等），供 GET /blobs/{sha} 授权（§9.3"按 scope 授权"）。
+	// 引用等；会话 turn 另含其会话 scope），供 GET /blobs/{sha} 授权（§9.3"按 scope 授权"）。
 	BlobAuthorized(ctx context.Context, taskID, sha string) (bool, error)
 }
 

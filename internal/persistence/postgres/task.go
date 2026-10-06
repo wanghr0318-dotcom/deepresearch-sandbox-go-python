@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
 )
 
@@ -28,15 +29,30 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 	default:
 		return task.Attempt{}, invalidf("CreateAttempt 的重试类别 %q 未定义", a.Retry)
 	}
+	if (a.SessionID == "") != (a.IncarnationID == "") {
+		return task.Attempt{}, invalidf("CreateAttempt 的 session_id 与 incarnation_id 须同时提供")
+	}
 	var out task.Attempt
 	err := s.run(ctx, "CreateAttempt", a.AttemptID, func(ctx context.Context, tx pgx.Tx) error {
+		var turn *sessionTurn
+		if a.SessionID != "" { // 会话 turn：锁顺序从 sessions 开始（§8.1）
+			t, err := lockSessionTurn(ctx, tx, a.SessionID, a.IncarnationID)
+			if err != nil {
+				return err
+			}
+			turn = &t
+		}
 		var status, desired string
-		err := tx.QueryRow(ctx, "SELECT status FROM tasks WHERE task_id = $1 FOR UPDATE", a.TaskID).Scan(&status)
+		var taskSession *string
+		err := tx.QueryRow(ctx, "SELECT status, session_id FROM tasks WHERE task_id = $1 FOR UPDATE", a.TaskID).Scan(&status, &taskSession)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return notFoundf("任务 %s", a.TaskID)
 		}
 		if err != nil {
 			return err
+		}
+		if (taskSession == nil && a.SessionID != "") || (taskSession != nil && *taskSession != a.SessionID) {
+			return invalidf("任务 %s 的会话与请求的会话 %q 不符", a.TaskID, a.SessionID)
 		}
 		if err := tx.QueryRow(ctx, "SELECT desired FROM task_control WHERE task_id = $1 FOR SHARE", a.TaskID).Scan(&desired); err != nil {
 			return err
@@ -63,15 +79,28 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
-		var envTaken bool // 否则 INSERT 的 23505 会被当作可重试错误一直重试到期限
-		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM environments WHERE env_id = $1)", a.EnvID).Scan(&envTaken); err != nil {
+		sessionEnv := ""
+		if turn != nil {
+			if a.EnvID != turn.incEnvID {
+				return invalidf("会话 turn 的 attempt 须在 incarnation %s 的环境 %s 中运行，得到 %s", a.IncarnationID, turn.incEnvID, a.EnvID)
+			}
+			sessionEnv = turn.incEnvID
+		} else {
+			var envTaken bool // 否则 INSERT 的 23505 会被当作可重试错误一直重试到期限
+			if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM environments WHERE env_id = $1)", a.EnvID).Scan(&envTaken); err != nil {
+				return err
+			}
+			if envTaken {
+				return conflictf("环境 %s 已存在", a.EnvID)
+			}
+		}
+		if err := admitAttempt(ctx, tx, a.TaskID, status, desired, sessionEnv); err != nil {
 			return err
 		}
-		if envTaken {
-			return conflictf("环境 %s 已存在", a.EnvID)
-		}
-		if err := admitAttempt(ctx, tx, a.TaskID, status, desired); err != nil {
-			return err
+		if turn != nil {
+			if err := turn.admit(a.TaskID, a.IncarnationID); err != nil {
+				return err
+			}
 		}
 		if _, err := tx.Exec(ctx, "INSERT INTO attempts (attempt_id, task_id, attempt_no, env_id, status) VALUES ($1, $2, $3, $4, 'starting')",
 			a.AttemptID, a.TaskID, a.AttemptNo, a.EnvID); err != nil {
@@ -80,9 +109,11 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 		if _, err := tx.Exec(ctx, "INSERT INTO attempt_access (attempt_id, task_id, state) VALUES ($1, $2, 'active')", a.AttemptID, a.TaskID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, "INSERT INTO environments (env_id, kind, attempt_id, status) VALUES ($1, 'task', $2, 'creating')",
-			a.EnvID, a.AttemptID); err != nil {
-			return err
+		if turn == nil { // 会话 turn 在 incarnation 的会话环境中运行，不另建任务环境
+			if _, err := tx.Exec(ctx, "INSERT INTO environments (env_id, kind, attempt_id, status) VALUES ($1, 'task', $2, 'creating')",
+				a.EnvID, a.AttemptID); err != nil {
+				return err
+			}
 		}
 		// 重试计数只在新建 attempt 的同一事务中递增；重放走上面的身份分支，不重复递增（规格 §14.2）。
 		tag, err := tx.Exec(ctx, `UPDATE tasks SET current_attempt_id = $2, attempts_total = attempts_total + 1, status = 'running',
@@ -94,6 +125,11 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 		}
 		if tag.RowsAffected() != 1 { // 持有任务行锁时不会发生；保留 CAS 作为最后一道检查
 			return rejectf(persistence.CodeNotRunnable, "任务 %s 已不在 queued", a.TaskID)
+		}
+		if turn != nil {
+			if err := turn.start(ctx, tx, a.TaskID, a.IncarnationID); err != nil {
+				return err
+			}
 		}
 		payload, _ := json.Marshal(map[string]any{"attempt_no": a.AttemptNo, "env_id": a.EnvID})
 		if _, err := appendHostEvent(ctx, tx, hostEvent{taskID: a.TaskID, key: "attempt_created:" + a.AttemptID,
@@ -107,14 +143,17 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 }
 
 // admitAttempt 检查创建 attempt 的准入前置条件（规格 §8.1）。旧环境的 stopped_at 只会从空变为
-// 非空，因此不加锁读取至多得到偏保守的"未停止"。
-func admitAttempt(ctx context.Context, tx pgx.Tx, taskID, status, desired string) error {
+// 非空，因此不加锁读取至多得到偏保守的"未停止"。会话 turn 的旧 attempt 在会话环境中运行（无任务环境记录）：
+// 在 sessionEnv（授予的 incarnation 的环境）中的旧 attempt 是正常切换（上一 attempt 已释放，复用同一 incarnation），
+// 在其他会话环境中的旧 attempt 要求该环境已停止（故障恢复或替换，§8.1 (b)）。
+func admitAttempt(ctx context.Context, tx pgx.Tx, taskID, status, desired, sessionEnv string) error {
 	if status != "queued" || desired != "run" {
 		return rejectf(persistence.CodeNotRunnable, "任务 %s 处于 %s、desired = %s", taskID, status, desired)
 	}
 	var running int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM attempts a JOIN environments e ON e.attempt_id = a.attempt_id
-		WHERE a.task_id = $1 AND e.stopped_at IS NULL`, taskID).Scan(&running); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM attempts a JOIN environments e
+			ON e.attempt_id = a.attempt_id OR (e.kind = 'session' AND e.env_id = a.env_id)
+		WHERE a.task_id = $1 AND e.stopped_at IS NULL AND e.env_id <> $2`, taskID, sessionEnv).Scan(&running); err != nil {
 		return err
 	}
 	if running > 0 {
@@ -158,6 +197,15 @@ func (s *Store) ApplyControl(ctx context.Context, c task.ApplyControl) (task.Con
 	}
 	var out task.ControlState
 	err := s.run(ctx, "ApplyControl", fmt.Sprintf("%s@%d", c.TaskID, c.ControlVersion), func(ctx context.Context, tx pgx.Tx) error {
+		sessionID, err := taskSessionID(ctx, tx, c.TaskID) // 会话 turn：从 sessions FOR UPDATE 开始（锁顺序）
+		if err != nil {
+			return err
+		}
+		if sessionID != "" {
+			if _, _, err := lockSession(ctx, tx, sessionID); err != nil {
+				return err
+			}
+		}
 		st, err := selectControlState(ctx, tx, c.TaskID, true)
 		if err != nil {
 			return err
@@ -177,12 +225,19 @@ func (s *Store) ApplyControl(ctx context.Context, c task.ApplyControl) (task.Con
 			return invalidf("任务 %s 处于 %s、desired = %s 时不能转换为 %s", c.TaskID, st.Status, st.Desired, c.Status)
 		}
 		tag, err := tx.Exec(ctx, `UPDATE tasks SET applied_control_version = $2, status = $3, status_reason = $4,
-			row_version = row_version + 1 WHERE task_id = $1 AND status = $5`, c.TaskID, c.ControlVersion, c.Status, c.StatusReason, st.Status)
+			row_version = row_version + 1, resume_directive = CASE WHEN $3 IN ('paused', 'cancelled') THEN NULL ELSE resume_directive END
+			WHERE task_id = $1 AND status = $5`, c.TaskID, c.ControlVersion, c.Status, c.StatusReason, st.Status)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() != 1 { // 持有任务行锁时不会发生；保留 CAS 作为最后一道检查
 			return conflictf("任务 %s 已不在 %s", c.TaskID, st.Status)
+		}
+		if sessionID != "" {
+			// 不经 attempt 的暂停（queued → paused）阻塞会话队列；取消（含 D5 取代、关闭）清除本 turn 的阻塞与占用（§12.3）。
+			if err := releaseSessionTurn(ctx, tx, sessionID, c.TaskID, c.Status); err != nil {
+				return err
+			}
 		}
 		if err := lockEventSeq(ctx, tx, c.TaskID); err != nil {
 			return err
@@ -255,20 +310,52 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 	if v.NotBefore != nil && v.TaskStatus != "queued" {
 		return task.Attempt{}, invalidf("not_before 只用于回到 queued 的故障重试，任务状态为 %s", v.TaskStatus)
 	}
+	if ss := v.SessionState; ss != nil {
+		if v.TaskStatus != "succeeded" || ss.CheckpointID == "" || (len(ss.State) == 0) == (ss.StateRef == "") {
+			return task.Attempt{}, invalidf("session_state 只用于成功裁决，且须有 checkpoint_id 与恰好一个 state 或 state_ref")
+		}
+	}
 	hash, err := verdictHash(v)
 	if err != nil {
 		return task.Attempt{}, err
 	}
 	var out task.Attempt
 	err = s.run(ctx, "FinalizeAttempt", v.AttemptID, func(ctx context.Context, tx pgx.Tx) error {
-		var current *string
+		sessionID, err := taskSessionID(ctx, tx, v.TaskID) // session_id 不变：先取会话再按锁顺序加锁
+		if err != nil {
+			return err
+		}
+		var turn *turnVerdict
+		if sessionID != "" {
+			tv, err := lockTurnVerdict(ctx, tx, sessionID, v.AttemptID)
+			if err != nil {
+				return err
+			}
+			turn = &tv
+		}
+		switch {
+		case turn == nil && v.SessionState != nil:
+			return invalidf("任务 %s 不属于会话，不能提交 session_state", v.TaskID)
+		case turn != nil && v.TaskStatus == "succeeded" && v.SessionState == nil:
+			return invalidf("会话 turn %s 的成功裁决须提交 session_state", v.TaskID)
+		}
+		var current, base *string
 		var status string
-		err := tx.QueryRow(ctx, "SELECT current_attempt_id, status FROM tasks WHERE task_id = $1 FOR UPDATE", v.TaskID).Scan(&current, &status)
+		err = tx.QueryRow(ctx, "SELECT current_attempt_id, status, base_session_checkpoint_id FROM tasks WHERE task_id = $1 FOR UPDATE",
+			v.TaskID).Scan(&current, &status, &base)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return notFoundf("任务 %s", v.TaskID)
 		}
 		if err != nil {
 			return err
+		}
+		committed := ""
+		switch {
+		case turn == nil:
+		case v.SessionState != nil:
+			committed = v.SessionState.CheckpointID
+		case base != nil:
+			committed = *base
 		}
 		var desired string
 		var controlVersion int64
@@ -290,6 +377,7 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 		case a.TaskID != v.TaskID:
 			return conflictf("attempt %s 不属于任务 %s", v.AttemptID, v.TaskID)
 		case a.VerdictHash != nil && bytes.Equal(a.VerdictHash, hash):
+			a.CommittedSessionCheckpointID = committed
 			out = a
 			return nil
 		case a.VerdictHash != nil:
@@ -301,10 +389,15 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 		case controlVersion != v.ControlVersion:
 			return rejectf(persistence.CodeControlChanged, "判决依据控制版本 %d，当前为 %d（desired = %s）",
 				v.ControlVersion, controlVersion, desired)
-		case !task.VerdictAllowed(desired, v.TaskStatus):
-			return invalidf("desired = %s 时任务不能裁决为 %s", desired, v.TaskStatus)
+		case !task.VerdictAllowedReason(desired, v.TaskStatus, v.TaskStatusReason):
+			return invalidf("desired = %s 时任务不能裁决为 %s（%s）", desired, v.TaskStatus, v.TaskStatusReason)
 		case a.Status != v.FromStatus:
 			return conflictf("attempt %s 处于 %s，不是 %s", v.AttemptID, a.Status, v.FromStatus)
+		}
+		if turn != nil {
+			if err := turn.apply(ctx, tx, v, base); err != nil {
+				return err
+			}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE attempts SET status = $2, outcome_class = $3, exit_code = $4, exit_signal = $5,
 			oom_kill_delta = $6, platform_killed = $7, verdict_hash = $8 WHERE attempt_id = $1`,
@@ -312,8 +405,10 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 			return err
 		}
 		// 判决已按 controlVersion 裁决，一并推进 applied_control_version，actor 不再对已裁决的任务应用控制。
+		// 终态与暂停裁决清空续跑指令（tasks.resume_directive 只用于下一次 attempt 的 task_start）。
 		if _, err := tx.Exec(ctx, `UPDATE tasks SET status = $2, status_reason = $3, result_json = $4,
-			applied_control_version = GREATEST(applied_control_version, $5), not_before = $6, row_version = row_version + 1
+			applied_control_version = GREATEST(applied_control_version, $5), not_before = $6, row_version = row_version + 1,
+			resume_directive = CASE WHEN $2 = 'queued' THEN resume_directive END
 			WHERE task_id = $1`, v.TaskID, v.TaskStatus, v.TaskStatusReason, nullJSON(v.Result), controlVersion, v.NotBefore); err != nil {
 			return err
 		}
@@ -322,8 +417,212 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 			return err
 		}
 		a.Status, a.OutcomeClass, a.VerdictHash = v.AttemptStatus, v.OutcomeClass, hash
+		a.CommittedSessionCheckpointID = committed
 		out = a
 		return nil
 	})
 	return out, err
+}
+
+// ---- 会话 turn（规格 §8.1、§12.3；M4 Plan 12 Task 4） ----
+
+// sessionTurn 是会话 turn 创建 attempt 时在 sessions FOR UPDATE 下读取的会话与 incarnation 事实。
+type sessionTurn struct {
+	sessionID, status, currentInc, currentTask, blockedBy string
+	latest                                                *string // session_progress.latest_checkpoint_id
+	incSession, incStatus, incEnvID                       string
+}
+
+// lockSessionTurn 按锁顺序 sessions → session_progress → incarnations 锁住会话 turn 准入需要的行。
+func lockSessionTurn(ctx context.Context, tx pgx.Tx, sessionID, incarnationID string) (sessionTurn, error) {
+	t := sessionTurn{sessionID: sessionID}
+	err := tx.QueryRow(ctx, `SELECT status, COALESCE(current_incarnation_id, ''), COALESCE(current_task_id, ''),
+			COALESCE(blocked_by_task_id, '') FROM sessions WHERE session_id = $1 FOR UPDATE`, sessionID).
+		Scan(&t.status, &t.currentInc, &t.currentTask, &t.blockedBy)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return t, notFoundf("会话 %s", sessionID)
+	}
+	if err != nil {
+		return t, err
+	}
+	if err := tx.QueryRow(ctx, "SELECT latest_checkpoint_id FROM session_progress WHERE session_id = $1 FOR UPDATE",
+		sessionID).Scan(&t.latest); err != nil {
+		return t, err
+	}
+	inc, err := selectIncarnation(ctx, tx, incarnationID, true)
+	if err != nil {
+		return t, err
+	}
+	t.incSession, t.incStatus, t.incEnvID = inc.SessionID, inc.Status, inc.EnvID
+	return t, nil
+}
+
+// admit 是会话 turn 的 attempt 准入（§8.1）：会话不被其他 turn 阻塞或占用、处于 idle（或 running 且未被占用），
+// 授予的 incarnation 是会话的当前 incarnation 且为 idle（上一 turn 已释放）。
+func (t sessionTurn) admit(taskID, incarnationID string) error {
+	switch {
+	case t.blockedBy != "" && t.blockedBy != taskID:
+		return rejectf(persistence.CodeSessionBlocked, "会话 %s 被 turn %s 阻塞", t.sessionID, t.blockedBy)
+	case t.currentTask != "" && t.currentTask != taskID:
+		return rejectf(persistence.CodeSessionBlocked, "会话 %s 正在运行 turn %s", t.sessionID, t.currentTask)
+	case t.status != "idle" && t.status != "running":
+		return rejectf(persistence.CodeSessionBlocked, "会话 %s 处于 %s", t.sessionID, t.status)
+	case t.incSession != t.sessionID || t.currentInc != incarnationID || t.incStatus != "idle":
+		return rejectf(persistence.CodeIncarnationNotIdle, "incarnation %s（会话 %s，%s）不是会话 %s 的空闲当前 incarnation（当前 %q）",
+			incarnationID, t.incSession, t.incStatus, t.sessionID, t.currentInc)
+	}
+	return nil
+}
+
+// start 是会话 turn 的交接写入（§8.1）：清除本 turn 的阻塞、current_task_id = 本 turn、会话 idle → running
+// （row_version + 1，使 session actor 之后的 CAS 读到新事实）、incarnation idle → busy、
+// tasks.base_session_checkpoint_id = 当前会话指针。会话生命周期事件（session_events）只由 session actor 的 Transition
+// 追加；turn 的运行由 attempt_created 等 turn 事件反映。
+func (t sessionTurn) start(ctx context.Context, tx pgx.Tx, taskID, incarnationID string) error {
+	if _, err := tx.Exec(ctx, "UPDATE incarnations SET status = 'busy' WHERE incarnation_id = $1", incarnationID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE sessions SET current_task_id = $2, blocked_by_task_id = NULL, status = 'running',
+			idle_since = NULL, frozen_since = NULL, last_active_at = now(),
+			row_version = row_version + CASE WHEN status = 'idle' THEN 1 ELSE 0 END
+		WHERE session_id = $1`, t.sessionID, taskID); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, "UPDATE tasks SET base_session_checkpoint_id = $2 WHERE task_id = $1", taskID, t.latest)
+	return err
+}
+
+// turnVerdict 是会话 turn 裁决时在 sessions FOR UPDATE 下读取的事实。
+type turnVerdict struct {
+	sessionID        string
+	latestID         *string // session_progress.latest_checkpoint_id
+	latestSeq        int64
+	incID, incStatus string // 运行该 attempt 的 incarnation（按环境；没有则为空）
+}
+
+// lockTurnVerdict 按锁顺序 sessions → session_progress → incarnations 锁住会话 turn 裁决需要的行。attempt 的 env_id
+// 不变，按它找到运行该 attempt 的 incarnation。
+func lockTurnVerdict(ctx context.Context, tx pgx.Tx, sessionID, attemptID string) (turnVerdict, error) {
+	tv := turnVerdict{sessionID: sessionID}
+	if _, _, err := lockSession(ctx, tx, sessionID); err != nil {
+		return tv, err
+	}
+	if err := tx.QueryRow(ctx, "SELECT latest_checkpoint_id, latest_commit_seq FROM session_progress WHERE session_id = $1 FOR UPDATE",
+		sessionID).Scan(&tv.latestID, &tv.latestSeq); err != nil {
+		return tv, err
+	}
+	err := tx.QueryRow(ctx, `SELECT i.incarnation_id, i.status FROM incarnations i
+		WHERE i.session_id = $1 AND i.env_id = (SELECT env_id FROM attempts WHERE attempt_id = $2) FOR UPDATE`, sessionID, attemptID).
+		Scan(&tv.incID, &tv.incStatus)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return tv, err
+	}
+	return tv, nil
+}
+
+// apply 写入会话 turn 裁决的会话侧效果（§8.1、§12.3）：
+//   - succeeded：base 须等于当前指针（否则 session_base_mismatch）；session_state 的引用须已授权到 attempt、task 或
+//     会话 scope（否则 ref_not_authorized），同事务补授权到会话 scope；插入 checkpoints(scope = session) 并推进
+//     session_progress（I10）；
+//   - paused（含 awaiting_input）：blocked_by_task_id = 本 turn；
+//   - failed、cancelled：清除等于本 turn 的 blocked_by_task_id；
+//   - 除 queued（故障重试，turn 仍占用会话）外清除等于本 turn 的 current_task_id；
+//   - 运行该 attempt 的 incarnation busy → releasing（释放后由 session actor 置回 idle）。
+func (tv turnVerdict) apply(ctx context.Context, tx pgx.Tx, v task.Verdict, base *string) error {
+	if ss := v.SessionState; ss != nil {
+		if (base == nil) != (tv.latestID == nil) || (base != nil && *base != *tv.latestID) {
+			return rejectf(persistence.CodeSessionBaseMismatch, "turn %s 的 base 为 %s，会话 %s 的当前指针为 %s",
+				v.TaskID, strOr(base, "∅"), tv.sessionID, strOr(tv.latestID, "∅"))
+		}
+		if err := tv.commitSessionState(ctx, tx, v); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE sessions SET
+			current_task_id = CASE WHEN $3 <> 'queued' AND current_task_id = $2 THEN NULL ELSE current_task_id END,
+			blocked_by_task_id = CASE WHEN $3 = 'paused' THEN $2
+				WHEN $3 <> 'queued' AND blocked_by_task_id = $2 THEN NULL ELSE blocked_by_task_id END
+		WHERE session_id = $1`, tv.sessionID, v.TaskID, v.TaskStatus); err != nil {
+		return err
+	}
+	if tv.incStatus == "busy" {
+		if _, err := tx.Exec(ctx, "UPDATE incarnations SET status = 'releasing' WHERE incarnation_id = $1", tv.incID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// commitSessionState 插入成功裁决提议的 session checkpoint 并推进 session_progress（I10：只由成功裁决推进）。
+func (tv turnVerdict) commitSessionState(ctx context.Context, tx pgx.Tx, v task.Verdict) error {
+	ss := v.SessionState
+	refs := append([]string(nil), ss.Refs...)
+	if ss.StateRef != "" {
+		refs = append(refs, ss.StateRef)
+	}
+	if len(refs) > 0 {
+		rows, err := tx.Query(ctx, `SELECT r FROM unnest($1::text[]) AS r WHERE NOT EXISTS (
+			SELECT 1 FROM scope_blobs sb WHERE sb.sha256 = r AND ((sb.scope_kind = 'attempt' AND sb.scope_id = $2)
+				OR (sb.scope_kind = 'task' AND sb.scope_id = $3) OR (sb.scope_kind = 'session' AND sb.scope_id = $4)))`,
+			refs, v.AttemptID, v.TaskID, tv.sessionID)
+		if err != nil {
+			return err
+		}
+		missing, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return err
+		}
+		if len(missing) > 0 {
+			return rejectf(persistence.CodeRefNotAuthorized, "session_state 引用 %v 不存在或未授权到 turn %s 或会话 %s", missing, v.TaskID, tv.sessionID)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO scope_blobs (scope_kind, scope_id, sha256) SELECT 'session', $1, r FROM unnest($2::text[]) AS r
+			ON CONFLICT DO NOTHING`, tv.sessionID, refs); err != nil {
+			return err
+		}
+	}
+	var taken bool // 否则主键冲突的 23505 会被当作可重试错误
+	if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM checkpoints WHERE scope_kind = 'session' AND scope_id = $1 AND checkpoint_id = $2)",
+		tv.sessionID, ss.CheckpointID).Scan(&taken); err != nil {
+		return err
+	}
+	if taken {
+		return conflictf("会话 %s 已有 checkpoint %s", tv.sessionID, ss.CheckpointID)
+	}
+	cp := runner.Checkpoint{Scope: runner.Scope{Kind: "session", ID: tv.sessionID}, CheckpointID: ss.CheckpointID, AttemptID: v.AttemptID,
+		StepID: sessionStateStep, State: ss.State, StateRef: ss.StateRef, Refs: ss.Refs}
+	b, _ := json.Marshal(nonNil(ss.Refs))
+	seq := tv.latestSeq + 1
+	if _, err := tx.Exec(ctx, `INSERT INTO checkpoints (scope_kind, scope_id, checkpoint_id, commit_seq, attempt_id, step_id,
+			content_hash, state_inline, state_ref, refs_json)
+		VALUES ('session', $1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), $9)`,
+		tv.sessionID, ss.CheckpointID, seq, v.AttemptID, sessionStateStep, checkpointHash(cp), nullJSON(ss.State), ss.StateRef, b); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, "UPDATE session_progress SET latest_checkpoint_id = $2, latest_commit_seq = $3 WHERE session_id = $1",
+		tv.sessionID, ss.CheckpointID, seq)
+	return err
+}
+
+// sessionStateStep 是由 result.session_state 提交的 session checkpoint 的 step_id。
+const sessionStateStep = "session_state"
+
+func strOr(s *string, def string) string {
+	if s == nil {
+		return def
+	}
+	return *s
+}
+
+// releaseSessionTurn 是 ApplyControl 对会话 turn 的会话侧效果：不经 attempt 的暂停（queued → paused）阻塞会话
+// 队列；取消（含 paused → cancelled 的 D5 取代与关闭）清除等于本 turn 的 blocked_by_task_id。两者都清除等于本
+// turn 的 current_task_id。其余转换不改变会话。调用方已持有 sessions 行锁。
+func releaseSessionTurn(ctx context.Context, tx pgx.Tx, sessionID, taskID, status string) error {
+	if status != "paused" && status != "cancelled" {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `UPDATE sessions SET
+			current_task_id = CASE WHEN current_task_id = $2 THEN NULL ELSE current_task_id END,
+			blocked_by_task_id = CASE WHEN $3 = 'paused' THEN $2 WHEN blocked_by_task_id = $2 THEN NULL ELSE blocked_by_task_id END
+		WHERE session_id = $1`, sessionID, taskID, status)
+	return err
 }

@@ -14,38 +14,65 @@ import (
 )
 
 // LoadTask 一次读取 Decide 需要的任务事实（实现 task.Store）：单个查询，含最新已提交 checkpoint 的完整内容。
+// 会话 turn 另读取会话字段、resume_directive 与会话 base checkpoint 的完整内容：base 为 tasks.base_session_checkpoint_id，
+// 尚未创建 attempt（base 为空）时取会话当前指针。
 func (s *Store) LoadTask(ctx context.Context, taskID string) (task.TaskState, error) {
 	st := task.TaskState{TaskID: taskID}
 	err := s.read(ctx, "LoadTask", func(ctx context.Context, q queryer) error {
-		var cpID, stepID, stateRef *string
-		var state, refs []byte
+		var cp, scp checkpointCols
+		var sessionID, base, restored *string
+		var turnIndex *int64
 		err := q.QueryRow(ctx, `SELECT t.status, t.status_reason, COALESCE(t.current_attempt_id, ''), t.spec_json, t.limits_json,
 				t.config_version, c.desired, c.control_version, t.applied_control_version, t.attempts_total,
 				t.fault_retries_used, t.max_fault_retries, t.oom_retries_used, t.run_time_ms, t.not_before,
-				cp.checkpoint_id, cp.step_id, cp.state_inline, cp.state_ref, cp.refs_json
+				cp.checkpoint_id, cp.step_id, cp.state_inline, cp.state_ref, cp.refs_json,
+				t.session_id, t.base_session_checkpoint_id, t.restored_from_task_id, t.turn_index, t.resume_directive,
+				scp.checkpoint_id, scp.step_id, scp.state_inline, scp.state_ref, scp.refs_json
 			FROM tasks t JOIN task_control c USING (task_id) JOIN task_progress p USING (task_id)
 			LEFT JOIN checkpoints cp ON cp.scope_kind = 'task' AND cp.scope_id = t.task_id AND cp.checkpoint_id = p.latest_checkpoint_id
+			LEFT JOIN session_progress sp ON sp.session_id = t.session_id
+			LEFT JOIN checkpoints scp ON scp.scope_kind = 'session' AND scp.scope_id = t.session_id
+				AND scp.checkpoint_id = COALESCE(t.base_session_checkpoint_id, sp.latest_checkpoint_id)
 			WHERE t.task_id = $1`, taskID).Scan(&st.Status, &st.StatusReason, &st.CurrentAttemptID, &st.Spec, &st.Limits,
 			&st.ConfigVersion, &st.Desired, &st.ControlVersion, &st.AppliedControlVersion, &st.AttemptsTotal,
 			&st.FaultRetriesUsed, &st.MaxFaultRetries, &st.OOMRetriesUsed, &st.RunTimeMs, &st.NotBefore,
-			&cpID, &stepID, &state, &stateRef, &refs)
+			&cp.id, &cp.step, &cp.state, &cp.stateRef, &cp.refs,
+			&sessionID, &base, &restored, &turnIndex, &st.Directive,
+			&scp.id, &scp.step, &scp.state, &scp.stateRef, &scp.refs)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return notFoundf("任务 %s", taskID)
 		}
-		if err != nil || cpID == nil {
+		if err != nil {
 			return err
 		}
-		latest := &task.LatestCheckpoint{CheckpointID: *cpID, StepID: *stepID, State: state}
-		if stateRef != nil {
-			latest.StateRef = *stateRef
+		st.SessionID, st.BaseSessionCheckpointID, st.RestoredFromTaskID = strOr(sessionID, ""), strOr(base, ""), strOr(restored, "")
+		if turnIndex != nil {
+			st.TurnIndex = *turnIndex
 		}
-		if err := json.Unmarshal(refs, &latest.Refs); err != nil {
+		if st.Latest, err = cp.latest(); err != nil {
 			return err
 		}
-		st.Latest = latest
-		return nil
+		st.SessionLatest, err = scp.latest()
+		return err
 	})
 	return st, err
+}
+
+// checkpointCols 是 LEFT JOIN 读出的一行 checkpoint（不存在时 id 为 nil）。
+type checkpointCols struct {
+	id, step, stateRef *string
+	state, refs        []byte
+}
+
+func (c checkpointCols) latest() (*task.LatestCheckpoint, error) {
+	if c.id == nil {
+		return nil, nil
+	}
+	l := &task.LatestCheckpoint{CheckpointID: *c.id, StepID: *c.step, State: c.state, StateRef: strOr(c.stateRef, "")}
+	if err := json.Unmarshal(c.refs, &l.Refs); err != nil {
+		return nil, err
+	}
+	return l, nil
 }
 
 // ListActiveTasks 返回非终态任务的 ID，按创建时间排序（实现 task.Store）。

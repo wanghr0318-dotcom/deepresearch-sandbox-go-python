@@ -42,11 +42,15 @@ var invariantQueries = []struct {
 			OR (r.state = 'charged_unknown' AND t.outcome = 'unknown'))`},
 	{"I4", "A", `SELECT task_id, format('事件 %s 条，task_seq 范围 %s..%s', count(*), min(task_seq), max(task_seq))
 		FROM events GROUP BY task_id HAVING count(*) <> max(task_seq) OR min(task_seq) <> 1`},
+	// I6：checkpoint 的引用授权到其 scope（session checkpoint 到会话 scope）、提交它的 attempt，或（task checkpoint）
+	// 任务所属会话的 scope（§5.5 第 2 条 attempt → task → session 推导）。
 	{"I6", "A", `SELECT c.scope_id, format('checkpoint %s 引用的 %s 未授权到当前 scope', c.checkpoint_id, refs.r)
 		FROM checkpoints c,
 			LATERAL (SELECT jsonb_array_elements_text(c.refs_json) AS r UNION ALL SELECT c.state_ref WHERE c.state_ref IS NOT NULL) refs
 		WHERE NOT EXISTS (SELECT 1 FROM scope_blobs sb WHERE sb.sha256 = refs.r AND
-			((sb.scope_kind = 'task' AND sb.scope_id = c.scope_id) OR (sb.scope_kind = 'attempt' AND sb.scope_id = c.attempt_id)))`},
+			((sb.scope_kind = c.scope_kind AND sb.scope_id = c.scope_id) OR (sb.scope_kind = 'attempt' AND sb.scope_id = c.attempt_id)
+				OR (c.scope_kind = 'task' AND sb.scope_kind = 'session'
+					AND sb.scope_id = (SELECT t.session_id FROM tasks t WHERE t.task_id = c.scope_id))))`},
 	{"I6", "A", `SELECT p.task_id, format('指针为 %s@%s，最新已提交为 commit_seq %s', COALESCE(p.latest_checkpoint_id, '∅'), p.latest_commit_seq, COALESCE(m.max_seq, 0))
 		FROM task_progress p
 		LEFT JOIN (SELECT scope_id, max(commit_seq) AS max_seq FROM checkpoints WHERE scope_kind = 'task' GROUP BY scope_id) m

@@ -855,3 +855,42 @@ func TestSearchSerper(t *testing.T) {
 		}
 	}
 }
+
+// 契约 H（推理模型的多轮工具调用）：assistant 消息可带 reasoning_content 与 tool_calls，content 可为空串，只发起工具
+// 调用时 content 可缺省或为 null；reasoning_content 只用于 assistant 且须为字符串；assistant 的 tool_calls 须为数组。
+func TestChatAcceptsReasoningAssistantMessages(t *testing.T) {
+	a := newChat("http://127.0.0.1:1", Pricing{Version: "p1", InputMicroPerMTok: 1, OutputMicroPerMTok: 1})
+	call := `[{"id":"orch:1","type":"function","function":{"name":"web_search","arguments":"{\"query\":\"go\"}"}}]`
+	user := `{"role":"user","content":"q"}`
+	tool := `{"role":"tool","tool_call_id":"orch:1","content":"结果"}`
+	for _, assistant := range []string{
+		`{"role":"assistant","content":"","reasoning_content":"先搜索","tool_calls":` + call + `}`,
+		`{"role":"assistant","content":null,"tool_calls":` + call + `}`,
+		`{"role":"assistant","reasoning_content":"想一想","tool_calls":` + call + `}`,
+	} {
+		body := `{"messages":[` + user + `,` + assistant + `,` + tool + `]}`
+		out, _, err := a.Resolve([]byte(body))
+		if err != nil {
+			t.Errorf("%s：应接受，得到 %v", assistant, err)
+			continue
+		}
+		var obj map[string]json.RawMessage
+		unmarshal(t, out, &obj)
+		if !strings.Contains(string(obj["messages"]), `"tool_calls"`) {
+			t.Errorf("规范化后应保留 tool_calls：%s", out)
+		}
+	}
+	for body, code := range map[string]string{
+		`{"messages":[{"role":"user","content":"q","reasoning_content":"x"}]}`:                 CodeUnsupportedField,
+		`{"messages":[` + user + `,{"role":"assistant","content":"a","reasoning_content":1}]}`: CodeInvalidRequest,
+		`{"messages":[` + user + `,{"role":"assistant","content":"a","tool_calls":{}}]}`:       CodeInvalidRequest,
+		`{"messages":[` + user + `,{"role":"assistant","content":null}]}`:                      CodeUnsupportedField,
+		`{"messages":[` + user + `,{"role":"assistant","tool_calls":[]}]}`:                     CodeUnsupportedField,
+	} {
+		_, _, err := a.Resolve([]byte(body))
+		e := asErr(t, err)
+		if e.Status != http.StatusBadRequest || e.Code != code {
+			t.Errorf("%s：期望 400/%s，得到 %d/%s", body, code, e.Status, e.Code)
+		}
+	}
+}

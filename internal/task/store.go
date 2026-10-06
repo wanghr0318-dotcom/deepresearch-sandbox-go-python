@@ -54,7 +54,18 @@ type NewAttempt struct {
 	AttemptNo int64
 	EnvID     string
 	Retry     RetryKind
+	// SessionID 非空：会话 turn。事务从 sessions FOR UPDATE 开始（§8.1），EnvID 须为该 incarnation 的环境
+	// （不另建任务环境记录）。
+	SessionID string
+	// IncarnationID 是会话授予的 incarnation；须为 sessions.current_incarnation_id 且 incarnation.status = idle。
+	IncarnationID string
 }
+
+// 会话 turn 的 CreateAttempt 额外检查并同事务写入（§8.1）：blocked_by_task_id 为空或等于本 task（等于时清除），
+// 会话处于 idle（或 running 且 current_task_id 为空或本 task），否则为 ErrRejected(code session_blocked)；
+// incarnation 不是当前或不是 idle 为 ErrRejected(code incarnation_not_idle)；incarnation idle → busy；
+// sessions.status idle → running、current_task_id = 本 task；tasks.base_session_checkpoint_id =
+// session_progress.latest_checkpoint_id。
 
 // Attempt 是 attempts 中的一行。
 type Attempt struct {
@@ -65,6 +76,17 @@ type Attempt struct {
 	Status       string
 	OutcomeClass string
 	VerdictHash  []byte
+	// CommittedSessionCheckpointID 只由会话 turn 的 FinalizeAttempt 返回：裁决后的会话指针（成功时为新提交的
+	// session checkpoint，未推进时为 base；会话还没有 checkpoint 时为空）。
+	CommittedSessionCheckpointID string
+}
+
+// SessionState 是成功裁决提交的新 session checkpoint（来自 result.session_state）；State 与 StateRef 恰有一个。
+type SessionState struct {
+	CheckpointID string
+	State        json.RawMessage
+	StateRef     string
+	Refs         []string
 }
 
 // ApplyControl 把任务的 applied_control_version 推进到 ControlVersion，并写入新的任务状态。
@@ -103,6 +125,9 @@ type Verdict struct {
 	EventType        string
 	EventPayload     json.RawMessage
 	NotBefore        *time.Time // 仅 TaskStatus = queued（故障重试）时可设置：下一次 attempt 的最早时间
+	// SessionState 只用于会话 turn 且 TaskStatus = succeeded（必填）：同事务提交新的 session checkpoint 并推进
+	// session_progress（§12.3）。
+	SessionState *SessionState
 }
 
 // TaskState 是 LoadTask 读取的任务事实。
@@ -116,6 +141,12 @@ type TaskState struct {
 	MaxFaultRetries, OOMRetriesUsed, RunTimeMs     int64
 	NotBefore                                      *time.Time
 	Latest                                         *LatestCheckpoint // 最新已提交 checkpoint；无则 nil
+
+	// 会话 turn 的事实（独立任务为零值）。
+	SessionID, BaseSessionCheckpointID, RestoredFromTaskID string
+	TurnIndex                                              int64
+	Directive                                              json.RawMessage   // tasks.resume_directive；无则 nil
+	SessionLatest                                          *LatestCheckpoint // 会话 base checkpoint 的完整内容；无则 nil
 }
 
 // LatestCheckpoint 是最新已提交 checkpoint 的完整内容（init.resume 所需）。

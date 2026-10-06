@@ -121,24 +121,44 @@ func (s *fakeStore) BeginCall(_ context.Context, r BeginCallRequest) (BeginCallR
 	k := callKey{r.TaskID, r.CallID}
 	rec := s.calls[k]
 	now := time.Now()
+	b := s.budget(r.TaskID)
+	tool := r.Endpoint == "/v1/search" || r.Endpoint == "/v1/fetch"
+	tb := func() *ToolBudget { // 与 postgres 相同：搜索与抓取在有上限时带额度，新登记时计数
+		if !tool {
+			return nil
+		}
+		return b.ToolBudget()
+	}
 	if rec == nil {
+		if tool && b.ToolCallLimit != nil && b.ToolCallsUsed >= *b.ToolCallLimit {
+			return BeginCallResult{ToolBudget: tb()}, rejected(persistence.CodeToolBudgetExhausted)
+		}
+		if tool {
+			b.ToolCallsUsed++
+		}
 		rec = &CallRecord{TaskID: r.TaskID, CallID: r.CallID, Fingerprint: r.Fingerprint, Endpoint: r.Endpoint,
 			State: StateResolving, Source: "upstream", CreatedAt: now, DeadlineAt: now.Add(r.Deadline),
 			FirstAttemptID: r.AttemptID, SupersedesCallID: r.SupersedesCallID, SupersedeReason: r.SupersedeReason,
 			ResolvingSince: &now, Model: r.Model}
 		s.calls[k] = rec
-		s.budget(r.TaskID)
 		select {
 		case s.begun <- r.CallID:
 		default:
 		}
-		return BeginCallResult{Record: *rec}, nil
+		return BeginCallResult{Record: *rec, ToolBudget: tb()}, nil
 	}
 	if rec.State == StateResolving && rec.ResolvingSince == nil && rec.TriesUsed == 0 && rec.Fingerprint == r.Fingerprint {
 		rec.ResolvingSince = &now
-		return BeginCallResult{Record: *rec}, nil
+		return BeginCallResult{Record: *rec, ToolBudget: tb()}, nil
 	}
-	return BeginCallResult{Record: *rec, Existing: true}, nil
+	return BeginCallResult{Record: *rec, Existing: true, ToolBudget: tb()}, nil
+}
+
+// setToolLimit 设置任务的工具调用上限（budgets.tool_call_limit）。
+func (s *fakeStore) setToolLimit(taskID string, limit int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.budget(taskID).ToolCallLimit = &limit
 }
 
 func (s *fakeStore) ReserveTry(_ context.Context, r ReserveTryRequest) (Try, error) {
@@ -1830,5 +1850,45 @@ func TestDeadlineDefaults(t *testing.T) {
 	if l.deadlineFor(upstream.KindSearch) != 120*time.Second || l.deadlineFor(upstream.KindFetch) != 120*time.Second ||
 		l.deadlineFor(upstream.KindChat) != 300*time.Second {
 		t.Fatalf("默认期限 %+v", l)
+	}
+}
+
+// ---- 每 turn 的工具调用额度（M4 Plan 12 Task 4；契约 E） ----
+
+// TestToolBudgetExhaustedIs429：Tx1 的 tool_budget_exhausted 映射为 429 且不可重试；Tx1 给出的额度随成功、重放与 429
+// 透传到 Result.ToolBudget；不限的任务不带额度。
+func TestToolBudgetExhaustedIs429(t *testing.T) {
+	ad := newAdapter("p", step{body: `{"results":[]}`}, step{body: `{"results":[]}`})
+	ad.kind = upstream.KindSearch
+	h := newHarness(t, testLimits(), ad)
+	h.store.setToolLimit("t1", 1)
+
+	first := h.invoke(t, searchInv("s1"))
+	if first.Status != 200 || first.ToolBudget == nil || *first.ToolBudget != (ToolBudget{Used: 1, Limit: 1}) {
+		t.Fatalf("首次搜索 %+v", first)
+	}
+	over := h.invoke(t, searchInv("s2"))
+	if over.Status != 429 || over.Code != persistence.CodeToolBudgetExhausted || over.ToolBudget == nil ||
+		*over.ToolBudget != (ToolBudget{Used: 1, Limit: 1}) {
+		t.Fatalf("超出额度 %+v", over)
+	}
+	if retryableReason(persistence.CodeToolBudgetExhausted) {
+		t.Fatal("tool_budget_exhausted 不可重试")
+	}
+	if calls, _, _ := ad.stats(); calls != 1 {
+		t.Fatalf("被拒绝的调用不应到达上游，上游被调用 %d 次", calls)
+	}
+	again := h.invoke(t, searchInv("s1"))
+	if !again.Replayed || again.ToolBudget == nil || again.ToolBudget.Used != 1 {
+		t.Fatalf("重放 %+v", again)
+	}
+	if b := h.budget(t, "t1"); b.ToolCallsUsed != 1 {
+		t.Fatalf("重放与拒绝不计数：%+v", b)
+	}
+
+	unlimited := h.invoke(t, Invoke{TaskID: "t2", AttemptID: "a2", EnvID: "e2", CallID: "u1", Kind: upstream.KindSearch,
+		Body: []byte(searchBody)})
+	if unlimited.Status != 200 || unlimited.ToolBudget != nil {
+		t.Fatalf("不限的任务不带额度：%+v", unlimited)
 	}
 }

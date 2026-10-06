@@ -64,7 +64,7 @@ var (
 		"model", "messages", "max_tokens", "temperature", "top_p", "stop", "stream",
 		"tools", "tool_choice", "response_format", "seed", "presence_penalty", "frequency_penalty",
 	}
-	chatMessageFields = []string{"role", "content", "name", "tool_call_id", "tool_calls"}
+	chatMessageFields = []string{"role", "content", "name", "tool_call_id", "tool_calls", "reasoning_content"}
 )
 
 // Resolve：stream 只能缺省或 false（删去）；messages 非空且每条 content 为字符串；model 缺省补默认模型、
@@ -140,14 +140,51 @@ func checkMessages(raw json.RawMessage) *Error {
 		if json.Unmarshal(m["role"], &role) != nil || role == "" {
 			return fatalf(http.StatusBadRequest, CodeInvalidRequest, "messages[%d].role 须为字符串", i)
 		}
-		var content string
+		if e := checkAssistantFields(i, role, m); e != nil {
+			return e
+		}
 		c, ok := m["content"]
-		if !ok || !bytes.HasPrefix(bytes.TrimSpace(c), []byte(`"`)) || json.Unmarshal(c, &content) != nil {
+		if role == "assistant" && (!ok || isJSONNull(c)) && hasToolCalls(m) {
+			continue // 只发起工具调用的 assistant 消息：content 可缺省或为 null
+		}
+		if !ok || !isJSONString(c) {
 			return fatalf(http.StatusBadRequest, CodeUnsupportedField, "messages[%d].content 须为字符串（仅支持纯文本消息）", i)
 		}
 	}
 	return nil
 }
+
+// checkAssistantFields 是推理模型的多轮工具调用（契约 H）：reasoning_content 只出现在 assistant 消息中且为字符串；
+// assistant 的 tool_calls 须为数组。content 可为空串（由调用方的字符串检查接受）。
+func checkAssistantFields(i int, role string, m map[string]json.RawMessage) *Error {
+	if rc, ok := m["reasoning_content"]; ok {
+		if role != "assistant" {
+			return fatalf(http.StatusBadRequest, CodeUnsupportedField, "messages[%d].reasoning_content 只用于 assistant 消息", i)
+		}
+		if !isJSONString(rc) && !isJSONNull(rc) {
+			return fatalf(http.StatusBadRequest, CodeInvalidRequest, "messages[%d].reasoning_content 须为字符串", i)
+		}
+	}
+	if tc, ok := m["tool_calls"]; ok && role == "assistant" {
+		var calls []json.RawMessage
+		if !isJSONNull(tc) && json.Unmarshal(tc, &calls) != nil {
+			return fatalf(http.StatusBadRequest, CodeInvalidRequest, "messages[%d].tool_calls 须为数组", i)
+		}
+	}
+	return nil
+}
+
+func hasToolCalls(m map[string]json.RawMessage) bool {
+	var calls []json.RawMessage
+	return json.Unmarshal(m["tool_calls"], &calls) == nil && len(calls) > 0
+}
+
+func isJSONString(raw json.RawMessage) bool {
+	var s string
+	return bytes.HasPrefix(bytes.TrimSpace(raw), []byte(`"`)) && json.Unmarshal(raw, &s) == nil
+}
+
+func isJSONNull(raw json.RawMessage) bool { return string(bytes.TrimSpace(raw)) == "null" }
 
 // chatInputs 从规范化请求中取出 input_estimate、max_tokens 与（解析后的）model。
 // input_estimate = ceil((bytes(messages) + bytes(tools)) / 4)：按每 4 字节一个 token 保守估计，含工具定义（§9.6）。

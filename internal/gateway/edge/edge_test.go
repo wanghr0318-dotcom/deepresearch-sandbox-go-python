@@ -751,3 +751,63 @@ func TestBudget(t *testing.T) {
 		t.Errorf("budget = %d %+v", r.status, got)
 	}
 }
+
+// 工具调用额度（M4 Plan 12 Task 4；契约 E）：搜索与抓取的响应（含 429 与重放）带 X-Agentbox-Tool-Budget；不限时不写；
+// /v1/budget 带 tool_calls_used 与 tool_call_limit（不限为 null）。
+func TestToolBudgetHeaderAndBudgetFields(t *testing.T) {
+	var mu sync.Mutex
+	var next call.Result
+	limit := int64(30)
+	calls := &fakeCalls{budget: call.Budget{LimitMicro: 1000, ToolCallLimit: &limit, ToolCallsUsed: 3},
+		invoke: func(context.Context, call.Invoke) (call.Result, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			return next, nil
+		}}
+	e := newEdge(t, Config{}, calls)
+	p := bind(t, e, "a1", "e1")
+	set := func(r call.Result) {
+		mu.Lock()
+		next = r
+		mu.Unlock()
+	}
+
+	set(call.Result{Body: []byte(`{"results":[]}`), BlobSHA256: testSHA, Status: 200, ToolBudget: &call.ToolBudget{Used: 3, Limit: 30}})
+	if r := do(t, p, "POST", "/v1/search", strings.NewReader(`{}`), callHdr("c1")); r.status != 200 || r.header.Get(HeaderToolBudget) != "3/30" {
+		t.Errorf("搜索: %d %v", r.status, r.header)
+	}
+	set(call.Result{Status: 429, Code: "tool_budget_exhausted", ToolBudget: &call.ToolBudget{Used: 30, Limit: 30}})
+	if r := do(t, p, "POST", "/v1/fetch", strings.NewReader(`{}`), callHdr("c2")); r.status != 429 ||
+		errCode(t, r) != "tool_budget_exhausted" || r.header.Get(HeaderToolBudget) != "30/30" {
+		t.Errorf("429: %d %v %s", r.status, r.header, r.body)
+	}
+	set(call.Result{Body: []byte(`{}`), Replayed: true, BlobSHA256: testSHA, Status: 200, ToolBudget: &call.ToolBudget{Used: 30, Limit: 30}})
+	if r := do(t, p, "POST", "/v1/search", strings.NewReader(`{}`), callHdr("c1")); r.header.Get(HeaderToolBudget) != "30/30" ||
+		r.header.Get(HeaderReplayed) != "true" {
+		t.Errorf("重放: %d %v", r.status, r.header)
+	}
+	set(call.Result{Body: []byte(`{}`), BlobSHA256: testSHA, Status: 200})
+	if r := do(t, p, "POST", "/v1/search", strings.NewReader(`{}`), callHdr("c3")); r.header.Values(HeaderToolBudget) != nil {
+		t.Errorf("不限时不应写额度头: %v", r.header)
+	}
+
+	r := do(t, p, "GET", "/v1/budget", nil, nil)
+	var got map[string]any
+	if err := json.Unmarshal(r.body, &got); err != nil {
+		t.Fatalf("%d %s: %v", r.status, r.body, err)
+	}
+	if got["tool_calls_used"] != float64(3) || got["tool_call_limit"] != float64(30) {
+		t.Errorf("/v1/budget = %s", r.body)
+	}
+	calls.mu.Lock()
+	calls.budget = call.Budget{LimitMicro: 1000}
+	calls.mu.Unlock()
+	r = do(t, p, "GET", "/v1/budget", nil, nil)
+	got = nil
+	if err := json.Unmarshal(r.body, &got); err != nil {
+		t.Fatalf("%d %s: %v", r.status, r.body, err)
+	}
+	if v, ok := got["tool_call_limit"]; !ok || v != nil || got["tool_calls_used"] != float64(0) {
+		t.Errorf("不限时 tool_call_limit 应为 null：%s", r.body)
+	}
+}

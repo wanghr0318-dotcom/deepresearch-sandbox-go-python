@@ -87,6 +87,8 @@ const (
 	HeaderReplayed        = "X-Agentbox-Replayed"
 	// HeaderCache 是缓存指令（§11.4）：唯一接受的取值是 no-cache（不读缓存，结果仍写入；计入指纹）。
 	HeaderCache = "X-Agentbox-Cache"
+	// HeaderToolBudget 是搜索与抓取响应（含 429 与重放）的工具调用额度 "<used>/<limit>"；任务不限时不写（契约 E）。
+	HeaderToolBudget = "X-Agentbox-Tool-Budget"
 )
 
 // ErrClosed 表示 Edge 已关闭。
@@ -412,6 +414,9 @@ func (b *binding) invoke(w http.ResponseWriter, r *http.Request, kind upstream.K
 		b.internalError(w, "invoke", err, "call_id", callID)
 		return
 	}
+	if tb := res.ToolBudget; tb != nil {
+		w.Header().Set(HeaderToolBudget, fmt.Sprintf("%d/%d", tb.Used, tb.Limit))
+	}
 	if res.Status != 0 && res.Code != "" {
 		b.writeError(w, res.Status, res.Code, http.StatusText(res.Status))
 		return
@@ -455,6 +460,9 @@ type budgetBody struct {
 	SpentMicro     int64 `json:"spent_micro"`
 	UnknownMicro   int64 `json:"unknown_micro"`
 	AvailableMicro int64 `json:"available_micro"`
+	ToolCallsUsed  int64 `json:"tool_calls_used"`
+	// ToolCallLimit 是每 turn 的工具调用上限；不限时为 null。
+	ToolCallLimit *int64 `json:"tool_call_limit"`
 }
 
 func (b *binding) budget(w http.ResponseWriter, r *http.Request) {
@@ -469,6 +477,7 @@ func (b *binding) budget(w http.ResponseWriter, r *http.Request) {
 	b.writeJSON(w, http.StatusOK, budgetBody{
 		LimitMicro: bg.LimitMicro, ReservedMicro: bg.ReservedMicro, SpentMicro: bg.SpentMicro,
 		UnknownMicro: bg.UnknownMicro, AvailableMicro: bg.Available(),
+		ToolCallsUsed: bg.ToolCallsUsed, ToolCallLimit: bg.ToolCallLimit,
 	})
 }
 
