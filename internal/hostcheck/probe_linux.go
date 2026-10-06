@@ -5,7 +5,9 @@ package hostcheck
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -15,6 +17,10 @@ const (
 	sysOpenTree     = 428
 	sysCloseRange   = 436
 	sysMountSetattr = 442
+
+	// pidfd 系统调用号在所有架构上统一（4xx 号段）。
+	sysPidfdSendSignal = 424
+	sysPidfdOpen       = 434
 
 	openTreeClone   = 1       // OPEN_TREE_CLONE
 	openTreeCloexec = 0x80000 // OPEN_TREE_CLOEXEC（= O_CLOEXEC）
@@ -81,4 +87,53 @@ func probeUserNS() (bool, string) {
 		return false, fmt.Sprintf("无法创建 user namespace：%v", err)
 	}
 	return true, "可创建 user namespace"
+}
+
+// readProc 读取一个 /proc 文件；失败时返回带路径的原因。
+func readProc(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("无法读取 %s：%w", path, err)
+	}
+	return string(b), nil
+}
+
+// probeUserNSMax 检查 /proc/sys/user/max_user_namespaces > 0。
+func probeUserNSMax() (bool, string) {
+	s, err := readProc("/proc/sys/user/max_user_namespaces")
+	if err != nil {
+		return false, err.Error()
+	}
+	return checkUserNS(s)
+}
+
+// probeSeccompActions 检查内核提供 seccomp 配置所需的动作。
+func probeSeccompActions() (bool, string) {
+	s, err := readProc("/proc/sys/kernel/seccomp/actions_avail")
+	if err != nil {
+		return false, err.Error()
+	}
+	return checkSeccompActions(s)
+}
+
+// probeCloneIntoCgroup 按内核版本判断 CLONE_INTO_CGROUP（≥ 5.7）。
+func probeCloneIntoCgroup() (bool, string) {
+	s, err := readProc("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return false, err.Error()
+	}
+	return checkCloneIntoCgroup(strings.TrimSpace(s))
+}
+
+// probePidfd 以非法参数调用 pidfd_open（pid 0 → EINVAL）与 pidfd_send_signal
+// （fd -1 → EBADF），不打开、不发信号给任何进程；ENOSYS（或被 seccomp 拒绝的 EPERM）即不可用。
+func probePidfd() (bool, string) {
+	if _, _, errno := syscall.Syscall(sysPidfdOpen, 0, 0, 0); unavailable(errno) {
+		return false, fmt.Sprintf("pidfd_open 不可用：%v", errno)
+	}
+	badFd := -1
+	if _, _, errno := syscall.Syscall6(sysPidfdSendSignal, uintptr(badFd), 0, 0, 0, 0, 0); unavailable(errno) {
+		return false, fmt.Sprintf("pidfd_send_signal 不可用：%v", errno)
+	}
+	return true, "pidfd_open 与 pidfd_send_signal 可用"
 }

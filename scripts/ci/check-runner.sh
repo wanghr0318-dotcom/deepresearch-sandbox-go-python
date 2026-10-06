@@ -29,8 +29,32 @@ unshare --mount --pid --uts --ipc --net --fork true || fail "无法创建 mount/
 
 unshare --user true || fail "无法创建 user namespace"
 
+max_userns=$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo 0)
+[ "${max_userns:-0}" -gt 0 ] 2>/dev/null || fail "user namespace 被禁用（max_user_namespaces=${max_userns}）"
+
+actions=$(cat /proc/sys/kernel/seccomp/actions_avail 2>/dev/null || true)
+for a in kill_process errno allow; do
+  case " $actions " in
+    *" $a "*) ;;
+    *) fail "seccomp 缺少动作 $a（actions_avail: ${actions:-不可读}）" ;;
+  esac
+done
+
+# CLONE_INTO_CGROUP 需要内核 ≥ 5.7。
+IFS=. read -r kmajor kminor _ < /proc/sys/kernel/osrelease
+kminor=${kminor%%[!0-9]*}
+if [ "$kmajor" -lt 5 ] || { [ "$kmajor" -eq 5 ] && [ "$kminor" -lt 7 ]; }; then
+  fail "内核 $(uname -r) 不支持 CLONE_INTO_CGROUP（需要 ≥ 5.7）"
+fi
+
+case "$(uname -m)" in
+  x86_64) ;;
+  aarch64) echo "警告: aarch64 未经单独验证，不构成支持主张（规格 §16.2）" >&2 ;;
+  *) fail "架构 $(uname -m) 不受支持" ;;
+esac
+
 # 新挂载 API 与 close_range：用 python3 ctypes 直接发系统调用（号段 x86_64/aarch64 相同）。
-python3 - <<'PY' || fail "新挂载 API（open_tree/mount_setattr）或 close_range 不可用"
+python3 - <<'PY' || fail "新挂载 API（open_tree/mount_setattr）、close_range 或 pidfd 不可用"
 import ctypes, os, sys
 libc = ctypes.CDLL(None, use_errno=True)
 libc.syscall.restype = ctypes.c_long
@@ -51,6 +75,13 @@ ctypes.set_errno(0)
 r = libc.syscall(436, 2, 1, 0)  # 空区间，不关闭任何 fd
 if r < 0 and ctypes.get_errno() in (ENOSYS, EPERM):
     print("close_range 不可用: errno=%d" % ctypes.get_errno(), file=sys.stderr); sys.exit(1)
+
+# pidfd：非法参数调用，不打开也不向任何进程发信号；ENOSYS/EPERM 即不可用（号段在所有架构统一）。
+for name, args in (("pidfd_open", (434, 0, 0)), ("pidfd_send_signal", (424, -1, 0, None, 0))):
+    ctypes.set_errno(0)
+    r = libc.syscall(*args)
+    if r < 0 and ctypes.get_errno() in (ENOSYS, EPERM):
+        print("%s 不可用: errno=%d" % (name, ctypes.get_errno()), file=sys.stderr); sys.exit(1)
 PY
 
 echo "runner 条件满足"

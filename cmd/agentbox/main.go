@@ -43,6 +43,9 @@ func main() {
 			}
 			fmt.Printf("[%s] %s：%s\n", status, it.Name, it.Detail)
 		}
+		for _, w := range r.Warnings { // 警告不阻止启动（例如 aarch64 未经验证）
+			fmt.Printf("[警告] %s\n", w)
+		}
 		if err := r.Err(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
