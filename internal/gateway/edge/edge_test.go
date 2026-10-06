@@ -97,7 +97,7 @@ func (f fakeAttempts) Lookup(_ context.Context, attemptID string) (string, strin
 	return v[0], v[1], nil
 }
 
-var defaultAttempts = fakeAttempts{"a1": {"t1", "e1"}, "a2": {"t2", "e2"}}
+var defaultAttempts = fakeAttempts{"a1": {"t1", "e1"}, "a2": {"t2", "e2"}, "a3": {"t3", "e1"}}
 
 func newEdge(t *testing.T, cfg Config, calls *fakeCalls) *Edge {
 	t.Helper()
@@ -809,5 +809,262 @@ func TestToolBudgetHeaderAndBudgetFields(t *testing.T) {
 	}
 	if v, ok := got["tool_call_limit"]; !ok || v != nil || got["tool_calls_used"] != float64(0) {
 		t.Errorf("不限时 tool_call_limit 应为 null：%s", r.body)
+	}
+}
+
+// ==== M4 Plan 12 Task 5：session incarnation 入口（§9.1）====
+
+// expectRefused 断言新连接被接受后立即关闭（得不到任何 HTTP 响应）。
+func expectRefused(t *testing.T, path, why string) {
+	t.Helper()
+	c, err := net.Dial("unix", path)
+	if err != nil {
+		t.Errorf("%s：dial %v（期望可连接、随即被关闭）", why, err)
+		return
+	}
+	defer c.Close()
+	if err := c.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// 写入可能因对端已关闭而失败，以读取结果为准。
+	_, _ = io.WriteString(c, "GET /v1/budget HTTP/1.1\r\nHost: gw\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	var ne net.Error
+	switch {
+	case err == nil:
+		resp.Body.Close()
+		t.Errorf("%s：连接未被拒绝，得到 %d", why, resp.StatusCode)
+	case errors.As(err, &ne) && ne.Timeout():
+		t.Errorf("%s：连接未被关闭（读超时）", why)
+	}
+}
+
+// incarnation 入口：未 Attach 时拒绝连接；Attach(A) 后连接与请求归 A；Detach(A, cancel) 关闭 A 的连接、结束其
+// 在途请求后转交 CancelAttempt(A, cancel)，之后拒绝新连接；Attach(B) 后请求归 B（E30：无 T1 调用计到 T2）；
+// RevokeIncarnation 删除 socket（幂等）。
+func TestIncarnationListener(t *testing.T) {
+	entered := make(chan string, 4)
+	var mu sync.Mutex
+	var events []string // Invoke 返回与 CancelAttempt 的顺序
+	calls := &fakeCalls{invoke: func(ctx context.Context, in call.Invoke) (call.Result, error) {
+		if in.CallID != "block" {
+			return call.Result{Body: []byte(`{}`), Status: 200}, nil
+		}
+		entered <- in.AttemptID
+		<-ctx.Done()
+		mu.Lock()
+		events = append(events, "invoke_returned:"+in.AttemptID)
+		mu.Unlock()
+		return call.Result{}, ctx.Err()
+	}}
+	e := newEdge(t, Config{}, calls)
+	ctx := context.Background()
+
+	p, err := e.BindIncarnation(ctx, "i1", "e1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p != filepath.Join(e.cfg.SocketDir, "inc-i1.sock") {
+		t.Fatalf("socket 路径 = %s", p)
+	}
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode()&os.ModeSocket == 0 || st.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v，期望 0600 socket", st.Mode())
+	}
+	if _, err := e.BindIncarnation(ctx, "i1", "e1"); !errors.Is(err, ErrAlreadyBound) {
+		t.Errorf("重复 BindIncarnation = %v，期望 ErrAlreadyBound", err)
+	}
+	if _, err := e.BindIncarnation(ctx, "../x", "e1"); err == nil {
+		t.Error("非法 incarnation_id 应被拒绝")
+	}
+
+	// 空闲（未 Attach）：拒绝连接。
+	expectRefused(t, p, "未 Attach")
+	if err := e.Attach(ctx, "nope", "a1"); err == nil {
+		t.Error("未绑定的 incarnation 上 Attach 应失败")
+	}
+	if err := e.Attach(ctx, "i1", "a2"); err == nil || errors.Is(err, ErrAlreadyBound) {
+		t.Errorf("环境不符的 Attach = %v，期望环境不符错误", err)
+	}
+	if err := e.Attach(ctx, "i1", "a1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Attach(ctx, "i1", "a3"); !errors.Is(err, ErrAlreadyBound) {
+		t.Errorf("已有 Attach 时 Attach = %v，期望 ErrAlreadyBound", err)
+	}
+
+	// A 的空闲 keep-alive 连接与一个在途请求。
+	idle, err := net.Dial("unix", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	if err := rawBudget(idle, bufio.NewReader(idle)); err != nil {
+		t.Fatal(err)
+	}
+	if r := do(t, p, "POST", "/v1/search", strings.NewReader(`{}`), callHdr("s1")); r.status != 200 {
+		t.Errorf("A search: %d %s", r.status, r.body)
+	}
+	busy, err := net.Dial("unix", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	if _, err := io.WriteString(busy, "POST /v1/search HTTP/1.1\r\nHost: gw\r\nX-Agentbox-Call-Id: block\r\nContent-Length: 2\r\n\r\n{}"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case id := <-entered:
+		if id != "a1" {
+			t.Fatalf("在途请求归 %s", id)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("请求未进入 Invoke")
+	}
+
+	if err := e.Detach(ctx, "i1", "a1", call.ReasonCancel); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	_, _, _, cancels := calls.snapshot()
+	events = append(events, fmt.Sprint(cancels))
+	got := fmt.Sprint(events)
+	mu.Unlock()
+	if got != "[invoke_returned:a1 [[a1 cancel]]]" {
+		t.Errorf("Detach 返回时：%s（期望在途请求先结束，再转交 CancelAttempt）", got)
+	}
+	for name, c := range map[string]net.Conn{"空闲连接": idle, "处理中连接": busy} {
+		if err := c.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		n, err := c.Read(make([]byte, 1))
+		var ne net.Error
+		if err == nil || (errors.As(err, &ne) && ne.Timeout()) {
+			t.Errorf("Detach 后%s未被关闭：n=%d err=%v", name, n, err)
+		}
+	}
+	expectRefused(t, p, "Detach 之后")
+	// 幂等：重复 Detach 不报错（原因仍转交）。
+	if err := e.Detach(ctx, "i1", "a1", call.ReasonCancel); err != nil {
+		t.Errorf("重复 Detach: %v", err)
+	}
+
+	// Attach(B)：之后的请求只归 B。
+	if err := e.Attach(ctx, "i1", "a3"); err != nil {
+		t.Fatal(err)
+	}
+	if r := do(t, p, "POST", "/v1/fetch", strings.NewReader(`{}`), callHdr("f1")); r.status != 200 {
+		t.Errorf("B fetch: %d %s", r.status, r.body)
+	}
+	if r := do(t, p, "GET", "/v1/budget", nil, nil); r.status != 200 {
+		t.Errorf("B budget: %d %s", r.status, r.body)
+	}
+	// 迟到的、针对旧 attempt 的 Detach 不影响 B。
+	if err := e.Detach(ctx, "i1", "a1", "attempt_ended"); err != nil {
+		t.Fatal(err)
+	}
+	if r := do(t, p, "GET", "/v1/budget", nil, nil); r.status != 200 {
+		t.Errorf("旧 attempt 的 Detach 影响了 B：%d %s", r.status, r.body)
+	}
+	invokes, checks, _, _ := calls.snapshot()
+	var seen []string
+	for _, in := range invokes {
+		seen = append(seen, in.CallID+"="+in.TaskID+"/"+in.AttemptID+"/"+in.EnvID)
+	}
+	if fmt.Sprint(seen) != "[s1=t1/a1/e1 block=t1/a1/e1 f1=t3/a3/e1]" {
+		t.Errorf("Invoke 归属 = %v", seen)
+	}
+	if fmt.Sprint(checks) != "[[t1 a1] [t3 a3] [t3 a3]]" {
+		t.Errorf("CheckAccess = %v", checks)
+	}
+
+	// RevokeIncarnation：关闭 B 的连接与 listener、删除 socket；幂等；之后 Attach 失败。
+	bconn, err := net.Dial("unix", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bconn.Close()
+	if err := rawBudget(bconn, bufio.NewReader(bconn)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RevokeIncarnation(ctx, "i1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bconn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bconn.Read(make([]byte, 1)); err == nil {
+		t.Error("RevokeIncarnation 后连接未关闭")
+	}
+	if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("RevokeIncarnation 后 socket 仍存在：%v", err)
+	}
+	if c, err := net.Dial("unix", p); err == nil {
+		_ = c.Close() // 不应到达此处
+		t.Error("RevokeIncarnation 后仍能连接")
+	}
+	if err := e.RevokeIncarnation(ctx, "i1"); err != nil {
+		t.Errorf("重复 RevokeIncarnation: %v", err)
+	}
+	if err := e.Attach(ctx, "i1", "a3"); err == nil {
+		t.Error("撤销后 Attach 应失败")
+	}
+}
+
+// Detach 等待在途请求以 ctx 为期限：超时返回 ctx 错误，但 CancelAttempt 仍转交、新连接仍被拒绝；
+// Close 删除 incarnation socket，之后 BindIncarnation 为 ErrClosed。
+func TestIncarnationDetachDeadline(t *testing.T) {
+	entered, release := make(chan struct{}, 1), make(chan struct{})
+	calls := &fakeCalls{invoke: func(context.Context, call.Invoke) (call.Result, error) {
+		entered <- struct{}{}
+		<-release // 不理会 ctx 的 Invoke
+		return call.Result{Body: []byte(`{}`), Status: 200}, nil
+	}}
+	if runtime.GOOS == "windows" {
+		t.Skip("edge 测试需要 Unix 平台的 AF_UNIX")
+	}
+	e := New(Config{SocketDir: filepath.Join(t.TempDir(), "gateway")}, calls, defaultAttempts)
+	ctx := context.Background()
+	p, err := e.BindIncarnation(ctx, "i1", "e1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Attach(ctx, "i1", "a1"); err != nil {
+		t.Fatal(err)
+	}
+	c, err := net.Dial("unix", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := io.WriteString(c, "POST /v1/chat/completions HTTP/1.1\r\nHost: gw\r\nX-Agentbox-Call-Id: c/1\r\nContent-Length: 2\r\n\r\n{}"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("请求未进入 Invoke")
+	}
+	dctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	if err := e.Detach(dctx, "i1", "a1", "attempt_ended"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Detach = %v，期望 DeadlineExceeded", err)
+	}
+	if _, _, _, cancels := calls.snapshot(); fmt.Sprint(cancels) != "[[a1 attempt_ended]]" {
+		t.Errorf("CancelAttempt = %v", cancels)
+	}
+	expectRefused(t, p, "Detach 超时之后")
+	close(release)
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Close 后 socket 仍存在：%v", err)
+	}
+	if _, err := e.BindIncarnation(ctx, "i2", "e1"); !errors.Is(err, ErrClosed) {
+		t.Errorf("Close 后 BindIncarnation = %v，期望 ErrClosed", err)
 	}
 }
