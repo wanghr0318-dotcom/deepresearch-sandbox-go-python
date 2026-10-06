@@ -528,6 +528,33 @@ func TestActiveControlUsesGrace(t *testing.T) {
 	}
 }
 
+// 会话 turn 的停止（pause）给 Worker 更长的 grace 写停止卡（真实 Kimi 验收中 10 s 不够）；cancel 与显式 grace 不变。
+func TestSessionTurnPauseUsesLongerGrace(t *testing.T) {
+	sendControl := func(d Decision) SendControl {
+		t.Helper()
+		for _, e := range d.Effects {
+			if sc, ok := e.(SendControl); ok {
+				return sc
+			}
+		}
+		t.Fatalf("没有 SendControl: %s", kinds(d.Effects))
+		return SendControl{}
+	}
+	s := base()
+	s.SessionID = "s1"
+	s.TaskStatus, s.Attempt, s.SlotHeld = "running", att("a1", "active"), true
+	if sc := sendControl(mustDecide(t, s, ControlChanged{Desired: "pause", ControlVersion: 2})); sc.Kind != "pause" || sc.GraceMs != DefaultSessionPauseGraceMs {
+		t.Fatalf("会话 pause: %+v", sc)
+	}
+	if sc := sendControl(mustDecide(t, s, ControlChanged{Desired: "cancel", ControlVersion: 2})); sc.Kind != "cancel" || sc.GraceMs != DefaultControlGraceMs {
+		t.Fatalf("会话 cancel: %+v", sc)
+	}
+	s.ControlGraceMs = 2500
+	if sc := sendControl(mustDecide(t, s, ControlChanged{Desired: "pause", ControlVersion: 2})); sc.GraceMs != 2500 {
+		t.Fatalf("显式 grace 被覆盖: %+v", sc)
+	}
+}
+
 // revokes 返回副作用中的撤销（now 为立即撤销 Gateway 入口的 RevokeGateway，stop 为停止时的 RevokeAccess）及其原因。
 func revokes(effects []Effect) []string {
 	var out []string

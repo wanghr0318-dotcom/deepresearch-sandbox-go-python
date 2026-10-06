@@ -20,6 +20,10 @@ const (
 	// DefaultControlGraceMs 是 State.ControlGraceMs 为 0 时 cancel/pause 的 grace_ms。规格未单列该值，
 	// 取与 exit_grace 相同的 10 s。
 	DefaultControlGraceMs = 10_000
+	// DefaultSessionPauseGraceMs 是会话 turn 的 pause（用户"停止"）在 ControlGraceMs 为 0 时的 grace_ms。停止时
+	// Worker 先等各子主题到达下一个工具边界（进行中的模型调用须返回），再用模型写 2–3 句"目前发现"并发出停止卡
+	// （设计 D2）；真实 Kimi 的这两段合计常超过 10 s，超时则宿主终止 incarnation（会话被驱逐、停止卡丢失）。
+	DefaultSessionPauseGraceMs = 60_000
 )
 
 // Decide 读取的 outcome_class（分类本身只由 runner.Classify 给出；Decide 只按类别裁决）。
@@ -658,6 +662,9 @@ func (d *decider) interrupt() {
 			grace := d.s.ControlGraceMs
 			if grace == 0 {
 				grace = DefaultControlGraceMs
+				if d.s.SessionID != "" && d.s.Desired == "pause" {
+					grace = DefaultSessionPauseGraceMs
+				}
 			}
 			// 取消生效时立即撤销 Gateway 入口（§9.1；attempt_access 留到停止时，见 RevokeGateway）；暂停不撤销。
 			if d.s.Desired == "cancel" {
