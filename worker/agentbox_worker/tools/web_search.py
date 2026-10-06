@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Iterable
 from typing import Any
 
 from agentbox_worker.tools.base import (
@@ -15,6 +17,8 @@ from agentbox_worker.tools.text import search_hits, site_of
 
 DEFAULT_MAX_RESULTS = 5
 PREVIEW_SNIPPET_MAX_CHARS = 300
+# 结果文本的一条："k. 标题 — 站点⏎摘要（可为空、可多行）⏎URL"（见 WebSearch.run）
+_ENTRY = re.compile(r"^\d+\. (.*)\n((?:.*\n)*?)(https?://\S+)$", re.MULTILINE)
 
 
 class WebSearch:
@@ -74,3 +78,20 @@ class WebSearch:
             raw={"call_id": out.call_id},
             blobs=(out.blob_sha256,) if out.blob_sha256 else (),
         )
+
+
+def search_snippets(messages: Iterable[dict[str, Any]]) -> dict[str, tuple[str, str]]:
+    """转录中 web_search 工具结果的 URL → (标题, 摘要)；同一 URL 取最早的一条。
+
+    从转录（checkpoint 状态的一部分）推出，恢复后与原执行相同。"""
+    out: dict[str, tuple[str, str]] = {}
+    for m in messages:
+        if m.get("role") != "tool" or m.get("name") != WebSearch.name:
+            continue
+        content = m.get("content")
+        if not isinstance(content, str):
+            continue
+        for e in _ENTRY.finditer(content):
+            title = e.group(1).rpartition(" — ")[0] or e.group(1)
+            out.setdefault(e.group(3), (title.strip(), " ".join(e.group(2).split())))
+    return out

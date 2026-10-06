@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 
 from agentbox_worker.runtime import ArtifactRef, TaskContext
-from agentbox_worker.tools.sources import SourceStore
+from agentbox_worker.tools.sources import Source, SourceStore
 from agentbox_worker.tools.text import renumber_citations, strip_thinking
 
 REPORT_ARTIFACT = "report"
@@ -44,12 +44,19 @@ def _drop_evidence_sections(text: str) -> str:
     return "\n".join(out)
 
 
+def citable(src: Source) -> bool:
+    """可作为证据引用的来源：有摘录（正文或搜索摘要）。本轮摘录为空的来源（旧版本登记的 PDF 等
+    无正文抓取）不可引用；沿用来源（之前轮次）的摘录可能被状态压缩清空，仍可引用。"""
+    return bool(src.excerpt) or bool(src.origin)
+
+
 def citation_pass(text: str, sources: SourceStore) -> tuple[str, list[int]]:
-    """去掉思考段；删除模型自写的"证据/参考来源"节；不在 sources 中的 [n] 删除。
+    """去掉思考段；删除模型自写的"证据/参考来源"节；不在 sources 中或不可引用（citable）的
+    [n] 删除。
 
     返回正文与按首次出现排序的已引用编号。"""
     body = _drop_evidence_sections(strip_thinking(text))
-    known = {s.n: s.n for s in sources.all()}
+    known = {s.n: s.n for s in sources.all() if citable(s)}
     body = renumber_citations(body, known)
     cited: list[int] = []
     for m in _CITE.finditer(body):
@@ -82,7 +89,7 @@ def render_report(
         parts.append("\n".join(f"> {n}" for n in notes))
     parts.append(body.strip())
     listed = [s for n in cited if (s := sources.get(n)) is not None]
-    listed += [s for s in sources.all() if not s.origin and s.n not in cited]
+    listed += [s for s in sources.all() if not s.origin and s.n not in cited and citable(s)]
     if listed:
         lines = [
             f"- [{s.n}] {_one_line(s.title) or s.url} — {s.url} — sha256:{s.sha256}" for s in listed

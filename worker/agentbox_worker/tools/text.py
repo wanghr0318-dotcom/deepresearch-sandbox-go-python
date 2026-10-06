@@ -7,8 +7,9 @@
 from __future__ import annotations
 
 import re
-from html.parser import HTMLParser
 from typing import Any
+
+from agentbox_worker.tools.html_text import html_to_text
 
 _HTML_PARSE_MAX_CHARS = 512 * 1024
 _THINK = re.compile(r"<think>.*?</think>|【思考】.*?【/思考】", re.DOTALL | re.IGNORECASE)
@@ -53,39 +54,16 @@ def search_hits(body: dict) -> list[dict[str, str]]:
 
 
 def page_text(body: dict) -> str:
-    """抓取响应中的正文（text|content|body），HTML 转为纯文本并压缩空白。"""
+    """抓取响应中的正文（text|content|body），HTML 取主要内容（去掉导航等站点外壳，见 html_text）
+    并压缩空白。"""
     raw = next((v for k in ("text", "content", "body") if isinstance(v := body.get(k), str)), "")
     content_type = body.get("content_type")
     is_html = (isinstance(content_type, str) and "html" in content_type.lower()) or raw.lstrip()[
         :1
     ] == "<"
     if is_html:
-        parser = _TextExtractor()
-        parser.feed(raw[:_HTML_PARSE_MAX_CHARS])
-        parser.close()
-        raw = " ".join(parser.chunks)
+        raw = html_to_text(raw[:_HTML_PARSE_MAX_CHARS])
     return " ".join(raw.split())
-
-
-class _TextExtractor(HTMLParser):
-    _SKIP = frozenset({"script", "style", "noscript", "template", "svg", "head"})
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.chunks: list[str] = []
-        self._skip_depth = 0
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in self._SKIP:
-            self._skip_depth += 1
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in self._SKIP and self._skip_depth:
-            self._skip_depth -= 1
-
-    def handle_data(self, data: str) -> None:
-        if not self._skip_depth and data.strip():
-            self.chunks.append(data)
 
 
 def renumber_citations(text: str, mapping: dict[int, int]) -> str:

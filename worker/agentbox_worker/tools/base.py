@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
 from agentbox_worker.errors import (
@@ -76,6 +76,8 @@ class ToolContext:
     subtopic_id: str | None = None
     skills: SkillCatalog | None = None
     call_index: int = 0  # 本步骤内第几次工具调用（由 Agent 循环给出；ask_user 的 question_id 用它）
+    # 本步骤转录中搜索结果的 URL → (标题, 摘要)（web_search.search_snippets）；抓取不到正文时退用
+    snippets: dict[str, tuple[str, str]] = field(default_factory=dict)
 
 
 class Tool(Protocol):
@@ -119,10 +121,42 @@ def counted_call(
         if is_fatal(exc):
             raise
         ctx.budget.record_failure(ctx.subtopic_id, exc.tool_budget)
-        reason = f"{exc.code}（{exc.message}）" if exc.message else exc.code
-        return failed(ctx, f"{action}失败：{reason}")
+        return failed(ctx, f"{action}失败：{user_error(exc.code, action)}")
     ctx.budget.record(res.tool_budget, ctx.subtopic_id)
     return res
+
+
+# Gateway 错误码 → 面向用户的说明。错误体的 message 是 HTTP 状态文字（如 tries_exhausted 的
+# "Too Many Requests"），并不说明原因，故不显示。"{target}" 为"网页"或"搜索服务"。
+_UNREACHABLE = "{target}无法访问或超时"
+USER_ERRORS: dict[str, str] = {
+    "tries_exhausted": _UNREACHABLE,  # 上游失败（多为超时、连不上）且重试次数用完
+    "upstream_unreachable": _UNREACHABLE,
+    "upstream_unconfirmed": _UNREACHABLE,
+    "call_deadline_exceeded": _UNREACHABLE,
+    "client_timeout": _UNREACHABLE,
+    "upstream_rate_limited": "请求过多，请稍后再试",
+    "upstream_unavailable": "网站暂时不可用",
+    "upstream_rejected": "网站拒绝了请求",
+    "upstream_bad_response": "网站返回了无法识别的响应",
+    "response_too_large": "内容过大，无法读取",
+    "too_many_redirects": "重定向次数过多",
+    "egress_blocked": "不允许访问该网址（安全限制）",
+    "invalid_url": "网址无效",
+    "invalid_request": "请求无效",
+    "tool_budget_exhausted": "已达工具额度",
+    "budget_exhausted": "已达费用额度",
+    "budget_insufficient_for_request": "已达费用额度",
+    "subrun_budget_exhausted": "已达费用额度",
+    "call_in_progress": "同一请求仍在进行中",
+}
+
+
+def user_error(code: str, action: str = "") -> str:
+    """Gateway 错误码的中文说明；未知错误码 → "暂时无法完成（<code>）"。"""
+    target = "搜索服务" if action == "搜索" else "网页"
+    known = USER_ERRORS.get(code)
+    return known.format(target=target) if known else f"暂时无法完成（{code}）"
 
 
 def with_budget_line(ctx: ToolContext, text: str) -> str:

@@ -606,3 +606,186 @@ def test_run_python_fatal_gateway_errors_propagate(exc):
         ToolRegistry([RunPython()]).dispatch(
             "run_python", '{"code": "x"}', tool_ctx(ExecGateway(exc))
         )
+
+
+# ---- 抓取质量与错误文案（M4 验收修复） ----
+
+NAV_PAGE = """<html><head><title>储能新闻</title><style>.x{}</style></head><body>
+<header><a href="/">首页</a><a href="/news">新闻中心</a></header>
+<nav class="top"><ul><li><a href="/a">产品</a></li><li><a href="/b">关于我们</a></li></ul></nav>
+<div class="breadcrumb"><a href="/">首页</a> &gt; <a href="/n">新闻</a></div>
+<div id="cookie-banner">本站使用 Cookie，继续浏览即表示同意。</div>
+<div role="navigation"><a href="/x">快速链接</a></div>
+<article>
+<h1>储能电池装机量创新高</h1>
+<p>今年上半年，国内新型储能新增装机规模达到新的高点，其中锂离子电池仍占主导地位，占比超过九成。</p>
+<p>业内人士认为，随着电芯价格下降与电力市场化改革推进，独立储能电站的收益模式正逐步清晰。</p>
+<form><input name="q"><button>搜索</button></form>
+</article>
+<aside class="related"><a href="/r1">相关阅读一</a><a href="/r2">相关阅读二</a></aside>
+<div class="ad-slot">广告：限时优惠</div>
+<footer>版权所有 © 某网站 京ICP备</footer>
+<script>var nav = "菜单";</script>
+</body></html>"""
+
+
+def html_body(html: str) -> dict[str, Any]:
+    return {"status": 200, "content_type": "text/html; charset=utf-8", "content": html}
+
+
+def test_page_text_drops_site_chrome_and_prefers_article():
+    out = text.page_text(html_body(NAV_PAGE))
+    assert out.startswith("储能电池装机量创新高 今年上半年")
+    assert "电力市场化改革" in out
+    for chrome in (
+        "首页",
+        "产品",
+        "Cookie",
+        "快速链接",
+        "相关阅读",
+        "广告",
+        "版权所有",
+        "菜单",
+        "搜索",
+    ):
+        assert chrome not in out, chrome
+    assert text.page_text(html_body(NAV_PAGE)) == out  # 确定性
+
+
+def test_page_text_main_and_role_main_win_over_surroundings():
+    html = (
+        "<body><div class='menu'><a href='/1'>栏目一</a></div>"
+        "<main><p>正文第一段，讲的是钠离子电池的成本结构与量产进度。</p></main>"
+        "<div id='sidebar'><p>热门文章列表</p></div></body>"
+    )
+    assert text.page_text(html_body(html)) == "正文第一段，讲的是钠离子电池的成本结构与量产进度。"
+    html2 = (
+        "<body><div><a href='/1'>栏目一</a> <a href='/2'>栏目二</a> <a href='/3'>栏目三</a></div>"
+        "<div role='main'><p>主体内容：液流电池适合长时储能。</p></div></body>"
+    )
+    assert text.page_text(html_body(html2)) == "主体内容：液流电池适合长时储能。"
+
+
+def test_page_text_without_landmarks_takes_densest_text_block():
+    para = "固态电池的电解质分为氧化物、硫化物与聚合物三条路线，各有优劣。" * 3
+    html = (
+        "<body><div class='wrap'>"
+        "<div><a href='/1'>新闻</a> <a href='/2'>产品</a> "
+        "<a href='/3'>联系我们</a> <a href='/4'>招聘</a></div>"
+        f"<div class='c'><h2>路线对比</h2><p>{para}</p><p>{para}</p></div>"
+        "<div><p>相关推荐：点此查看</p></div>"
+        "</div></body>"
+    )
+    out = text.page_text(html_body(html))
+    assert out.startswith("路线对比 固态电池")
+    assert "联系我们" not in out and "相关推荐" not in out
+
+
+def test_page_text_short_or_plain_pages_unchanged():
+    assert text.page_text({"content": "<p>a<script>x</script> b</p>"}) == "a b"
+    assert text.page_text({"content": "纯文本  正文\n第二行"}) == "纯文本 正文 第二行"
+    # 整页只有被当作导航的结构时，退回全页文本而不是空串
+    only_nav = "<body><div class='sidebar-layout'><p>唯一的一段正文。</p></div></body>"
+    assert text.page_text(html_body(only_nav)) == "唯一的一段正文。"
+    # 大量未闭合的标签：深度有界，不触发递归上限
+    assert text.page_text(html_body("<div>" * 5000 + "深处的文字")) == "深处的文字"
+    assert text.page_text(html_body("<p>行内<b>加粗</b>不切开</p>")) == "行内加粗不切开"
+
+
+PDF_BODY = {
+    "status": 200,
+    "content_type": "application/pdf",
+    "encoding": "base64",
+    "content": "JVBERi0xLjcKJcfsj6IK",
+}
+SEARCH_CONTENT = (
+    "1. 2025 年储能产业报告 — nea.gov.cn\n全国新型储能装机规模达 7376 万千瓦。\n"
+    "https://www.nea.gov.cn/r.pdf\n\n"
+    "2. 无摘要 — b.example\n\nhttps://b.example/x.pdf\n"
+    "工具额度：已用 1/30，剩余 29"
+)
+
+
+def test_search_snippets_parse_from_web_search_tool_messages():
+    from agentbox_worker.tools.web_search import search_snippets
+
+    msgs = [
+        {"role": "user", "content": "1. 假的 — x\n摘要\nhttps://x.example/"},
+        {"role": "tool", "tool_call_id": "c1", "name": "web_search", "content": SEARCH_CONTENT},
+    ]
+    assert search_snippets(msgs) == {
+        "https://www.nea.gov.cn/r.pdf": (
+            "2025 年储能产业报告",
+            "全国新型储能装机规模达 7376 万千瓦。",
+        ),
+        "https://b.example/x.pdf": ("无摘要", ""),
+    }
+
+
+def test_fetched_pdf_without_snippet_is_not_registered_as_source():
+    gw = ScriptedGateway(fetch=lambda url: PDF_BODY)
+    ctx = tool_ctx(gw)
+    r = ToolRegistry([WebFetch()]).dispatch("web_fetch", '{"url":"https://b.example/x.pdf"}', ctx)
+    assert r.ok and ctx.sources.all() == []
+    assert "PDF（未提取正文）" in r.content and "来源 [" not in r.content
+    assert r.preview is not None and "n" not in r.preview
+    assert r.preview["excerpt"] == "PDF（未提取正文）" and r.blobs  # 结果 blob 仍进入 refs
+    assert ctx.budget.used == 1
+
+
+def test_fetched_pdf_with_search_snippet_uses_snippet_as_excerpt():
+    gw = ScriptedGateway(fetch=lambda url: PDF_BODY)
+    url = "https://www.nea.gov.cn/r.pdf"
+    ctx = tool_ctx(
+        gw, snippets={url: ("2025 年储能产业报告", "全国新型储能装机规模达 7376 万千瓦。")}
+    )
+    r = ToolRegistry([WebFetch()]).dispatch("web_fetch", json.dumps({"url": url}), ctx)
+    src = ctx.sources.get(1)
+    assert r.ok and src is not None
+    assert src.title == "2025 年储能产业报告 · PDF（未提取正文）"
+    assert src.excerpt == "全国新型储能装机规模达 7376 万千瓦。"
+    assert "仅有搜索摘要" in r.content and r.preview is not None and r.preview["n"] == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "message", "phrase"),
+    [
+        (429, "tries_exhausted", "Too Many Requests", "网页无法访问或超时"),
+        (502, "upstream_unreachable", "Bad Gateway", "网页无法访问或超时"),
+        (502, "upstream_unconfirmed", "Bad Gateway", "网页无法访问或超时"),
+        (504, "call_deadline_exceeded", "Gateway Timeout", "网页无法访问或超时"),
+        (0, "client_timeout", "", "网页无法访问或超时"),
+        (429, "upstream_rate_limited", "Too Many Requests", "请求过多"),
+        (503, "upstream_unavailable", "Service Unavailable", "网站暂时不可用"),
+        (403, "egress_blocked", "Forbidden", "不允许访问该网址"),
+        (400, "invalid_url", "Bad Request", "网址无效"),
+        (502, "too_many_redirects", "Bad Gateway", "重定向次数过多"),
+        (502, "response_too_large", "Bad Gateway", "内容过大"),
+        (402, "subrun_budget_exhausted", "Payment Required", "已达费用额度"),
+        (418, "something_new", "I'm a teapot", "暂时无法完成（something_new）"),
+    ],
+)
+def test_fetch_errors_map_to_chinese_user_messages(status, code, message, phrase):
+    from agentbox_worker.errors import CallDeadlineExceeded as Deadline
+
+    cls = Deadline if code in ("call_deadline_exceeded", "client_timeout") else GatewayError
+
+    def fail(url: str) -> Any:
+        raise cls(status, code, message)
+
+    ctx = tool_ctx(ScriptedGateway(fetch=fail))
+    r = ToolRegistry([WebFetch()]).dispatch("web_fetch", '{"url":"https://a.example/x"}', ctx)
+    assert not r.ok and r.preview is not None
+    shown = r.preview["text"]
+    assert shown.startswith(f"抓取失败：{phrase}")
+    assert not message or message not in r.content  # HTTP 状态文字不说明原因，不显示
+    assert code == "something_new" or code not in shown
+
+
+def test_search_timeout_message_names_the_search_service():
+    def fail(query: str, n: int) -> Any:
+        raise GatewayError(429, "tries_exhausted", "Too Many Requests")
+
+    ctx = tool_ctx(ScriptedGateway(search=fail))
+    r = ToolRegistry([WebSearch()]).dispatch("web_search", '{"query":"储能"}', ctx)
+    assert not r.ok and r.preview == {"kind": "text", "text": "搜索失败：搜索服务无法访问或超时"}

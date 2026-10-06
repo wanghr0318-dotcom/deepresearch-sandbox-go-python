@@ -21,7 +21,7 @@ from agentbox_worker.tools.skills import RESEARCH_SKILL, ReadSkill, SkillCatalog
 from agentbox_worker.tools.sources import ReadSource
 from agentbox_worker.tools.todo import TodoItem, TodoWrite
 from agentbox_worker.tools.web_fetch import WebFetch
-from agentbox_worker.tools.web_search import WebSearch
+from agentbox_worker.tools.web_search import WebSearch, search_snippets
 from chatagent.config import TurnConfig
 from chatagent.events import Emitter
 from chatagent.model import ModelReply, assistant_message, call_model
@@ -433,6 +433,7 @@ class Agent:
             subtopic_id=subtopic_id,
             skills=self.skills,
             call_index=_tool_count(transcript) + 1,  # 确定性：转录中已有的工具结果数 + 1
+            snippets=search_snippets(transcript),  # 转录在状态中：恢复后相同
         )
 
     async def execute(

@@ -397,6 +397,44 @@ def test_unreachable_page_is_recorded_and_research_continues():
     assert result(events)["outputs"] == ["report"]
 
 
+def test_fetched_pdf_falls_back_to_search_snippet_and_is_otherwise_not_cited():
+    # 真实验收：PDF 摘录为空却被登记并引用。搜索摘要可用时以摘要为摘录；否则不登记为来源。
+    pdf = {"status": 200, "content_type": "application/pdf", "encoding": "base64", "content": ""}
+    hit = "https://s.example/固态电解质/1"
+
+    def fetch(url: str) -> dict[str, Any]:
+        return pdf if url.endswith((".pdf", "/1")) else page(url)
+
+    model = ScriptedModel(
+        orch=[
+            call("read_skill", name="deep-research"),
+            call("todo_write", items=[todo("1", "材料", 8), todo("2", "产业", 8)]),
+            call("research_subtopic", id="1"),
+            reply("## 摘要\n- 摘要所述 [1]，网页 [2]，无此来源 [3]"),
+        ],
+        sub={
+            "1": [
+                call("web_search", query="固态电解质"),
+                call("web_fetch", url=hit),
+                call("web_fetch", url="https://other.example/x.pdf"),
+                call("web_fetch", url="https://c.example/page"),
+                reply("结论 [1][2]"),
+            ]
+        },
+    )
+    code, events, _ = run_turn(model, fetch=fetch)
+    assert code == 0
+    fetched = [
+        e["data"] for e in progress(events, "tool_result") if e["data"]["tool"] == "web_fetch"
+    ]
+    assert fetched[0]["preview"]["n"] == 1 and "PDF（未提取正文）" in fetched[0]["preview"]["title"]
+    assert fetched[0]["preview"]["excerpt"] == "摘要"
+    assert "n" not in fetched[1]["preview"] and fetched[1]["ok"] is True
+    assert fetched[2]["preview"]["n"] == 2  # 无正文的 PDF 不占编号
+    report = artifact_text(events, "report")
+    assert "PDF（未提取正文）" in report and "other.example" not in report
+
+
 def test_assistant_messages_are_gateway_compatible():
     model = research_model()
     run_turn(model, config=RESEARCH_CONFIG)
@@ -601,8 +639,8 @@ def test_citation_pass_removes_unknown_numbers_and_model_reference_sections():
     from agentbox_worker.tools.sources import SourceStore
 
     store = SourceStore()
-    store.add(sha256="a" * 64, url="https://a/1", title="A", excerpt="", call_id="c1")
-    store.add(sha256="b" * 64, url="https://b/1", title="B", excerpt="", call_id="c2")
+    store.add(sha256="a" * 64, url="https://a/1", title="A", excerpt="甲", call_id="c1")
+    store.add(sha256="b" * 64, url="https://b/1", title="B", excerpt="乙", call_id="c2")
     text = (
         "<think>草稿</think>结论 [2][7]，另见 [1, 5]。\n\n## 参考来源\n- [1] A\n\n## 局限\n少 [3]"
     )
@@ -614,6 +652,21 @@ def test_citation_pass_removes_unknown_numbers_and_model_reference_sections():
     assert md.startswith("# 标题\n\n> 部分研究\n\n")
     assert re.findall(r"^- \[(\d+)\]", md, re.M) == ["2", "1"]
     assert report_summary("# T\n\n> 注\n\n首段文字。\n\n## 细节") == "首段文字。"
+
+
+def test_citation_pass_does_not_cite_sources_without_excerpt():
+    # 真实验收：PDF 抓取摘录为空却被登记并引用。本轮摘录为空的来源不可引用、不进证据列表；
+    # 沿用来源（之前轮次）的摘录可能被状态压缩清空，仍可引用。
+    from agentbox_worker.tools.sources import Source, SourceStore
+
+    store = SourceStore()
+    store.adopt([Source(1, "a" * 64, "https://old/1", "旧", "", "c0", "t-0")])
+    store.add(sha256="b" * 64, url="https://b/x.pdf", title="PDF", excerpt="", call_id="c1")
+    store.add(sha256="c" * 64, url="https://c/1", title="C", excerpt="丙", call_id="c2")
+    body, cited = citation_pass("甲 [2]，乙 [3]，丙 [1]。", store)
+    assert cited == [3, 1] and "[2]" not in body
+    md = render_report(body, "标题", store, cited, [])
+    assert re.findall(r"^- \[(\d+)\]", md, re.M) == ["3", "1"]
 
 
 # ---- 依赖约束 ----

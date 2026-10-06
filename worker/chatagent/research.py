@@ -47,6 +47,7 @@ from agentbox_worker.tools.sources import EXCERPT_MAX_BYTES, Source, SourceStore
 from agentbox_worker.tools.sources import _source as source_from_json
 from agentbox_worker.tools.text import truncate_utf8
 from agentbox_worker.tools.todo import BRIEF_MAX_CHARS, TITLE_MAX_CHARS, TodoItem
+from agentbox_worker.tools.web_search import search_snippets
 from chatagent.config import TurnConfig
 from chatagent.events import Emitter
 from chatagent.model import ModelReply, ModelUnavailable, assistant_message, call_model
@@ -599,6 +600,7 @@ class ResearchPhase:
             subtopic_id=g.id,
             skills=self.agent.skills,
             call_index=index,
+            snippets=search_snippets(g.messages),
         )
         try:
             result = await asyncio.to_thread(self.agent.sub_registry.dispatch, name, raw, tctx)

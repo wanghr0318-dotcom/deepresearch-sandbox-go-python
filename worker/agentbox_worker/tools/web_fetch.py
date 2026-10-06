@@ -20,6 +20,8 @@ from agentbox_worker.tools.text import page_text, site_of, truncate_utf8
 MODEL_TEXT_MAX_BYTES = 6 * 1024
 URL_MAX_CHARS = 2048
 _TITLE_SCAN_MAX_CHARS = 64 * 1024
+PDF_NOTE = "PDF（未提取正文）"
+NO_TEXT_NOTE = "页面没有可读的文本"
 _HTTP_URL = re.compile(r"https?://\S+", re.IGNORECASE)
 
 
@@ -59,16 +61,25 @@ class WebFetch:
         if out.blob_sha256 is None:
             return failed(ctx, "抓取失败：Gateway 未返回结果 blob", raw)
         text = page_text(body) if body.get("encoding", "utf-8") == "utf-8" else ""
+        title = _title(body)
+        note = ""
+        if not text:  # PDF 等二进制内容或没有可读文字的页面：只有搜索摘要时才作为来源
+            hit_title, snippet = ctx.snippets.get(url, ("", ""))
+            kind = PDF_NOTE if _is_pdf(body, url) else NO_TEXT_NOTE
+            if not snippet:
+                return _not_a_source(ctx, url, kind, raw, out.blob_sha256)
+            text, title = snippet, f"{title or hit_title or url} · {kind}"
+            note = "（未能读取正文，仅有搜索摘要）\n"
         src, _ = ctx.sources.add(
             sha256=out.blob_sha256,
             url=url,
-            title=_title(body) or url,
+            title=title or url,
             excerpt=truncate_utf8(text, EXCERPT_MAX_BYTES),
             call_id=out.call_id,
         )
-        shown = truncate_utf8(text, MODEL_TEXT_MAX_BYTES) if text else "（页面没有可读的文本）"
+        shown = truncate_utf8(text, MODEL_TEXT_MAX_BYTES)
         return ToolResult(
-            content=with_budget_line(ctx, f"来源 [{src.n}]：{src.title}\n{src.url}\n{shown}"),
+            content=with_budget_line(ctx, f"来源 [{src.n}]：{src.title}\n{src.url}\n{note}{shown}"),
             preview={
                 "kind": "fetch",
                 "n": src.n,
@@ -80,6 +91,29 @@ class WebFetch:
             raw=raw,
             blobs=(out.blob_sha256,),
         )
+
+
+def _not_a_source(
+    ctx: ToolContext, url: str, kind: str, raw: dict[str, Any], blob: str
+) -> ToolResult:
+    """抓到了内容但没有可用的文字：不登记为来源（报告不能引用它），结果 blob 仍进入 refs。"""
+    message = f"{kind}：{url}\n没有可用的正文，也没有搜索摘要，未登记为来源；请换一个网页。"
+    return ToolResult(
+        content=with_budget_line(ctx, message),
+        preview={"kind": "fetch", "url": url, "site": site_of(url), "excerpt": kind},
+        raw=raw,
+        blobs=(blob,),
+    )
+
+
+def _is_pdf(body: dict[str, Any], url: str) -> bool:
+    ctype = body.get("content_type")
+    content = body.get("content")
+    return (
+        (isinstance(ctype, str) and "pdf" in ctype.lower())
+        or url.lower().split("?", 1)[0].endswith(".pdf")
+        or (isinstance(content, str) and content.startswith(("%PDF", "JVBER")))
+    )
 
 
 def _title(body: dict[str, Any]) -> str:
