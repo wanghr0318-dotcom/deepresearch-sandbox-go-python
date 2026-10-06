@@ -353,6 +353,14 @@ describe("TurnView", () => {
     expect(w.get("[role=alert]").text()).toContain("模型服务暂时不可用，请重试");
   });
 
+  it("labels a restored turn that has no route event (older worker) as a restored research", () => {
+    const w = mount(TurnView, { props: { turn: blankTurn({ restoredFrom: "u0", status: "running" }), busy: false } });
+    expect(w.get("[data-testid=route]").text()).toBe("已恢复的研究");
+    expect(w.find("[data-action=view-progress]").exists()).toBe(true);
+    const plain = mount(TurnView, { props: { turn: blankTurn({ status: "running" }), busy: false } });
+    expect(plain.find("[data-testid=route]").exists()).toBe(false);
+  });
+
   it("running rows start expanded, others collapsed; clicking toggles; subtopic headings group rows", async () => {
     const steps: StepRowData[] = [
       { id: "a", kind: "skill", title: "读取 skill：deep-research", status: "done", text: "说明" },

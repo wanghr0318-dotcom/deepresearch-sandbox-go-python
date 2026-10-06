@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { sev, turn } from "../components/chat/chatkit";
 import { ApiError } from "../api/client";
-import { USER_ERRORS, activeResearchTurn, applyEvent, chatErrorMessage, emptyChat, recordAnswers, seedTurns, siteOf } from "./chat";
+import { USER_ERRORS, activeResearchTurn, applyEvent, chatErrorMessage, emptyChat, recordAnswers, routeLabel, seedTurns, siteOf } from "./chat";
 import type { ChatState } from "./chat";
 import type { SessionEvent } from "../api/chat";
 
@@ -290,6 +290,40 @@ describe("applyEvent", () => {
     expect(t.reply).toBe("等于 2。\n\n还有问题吗？");
     expect(t.status).toBe("succeeded");
     expect(activeResearchTurn(s)).toBeUndefined();
+  });
+
+  it("shows Chinese reasons for tool failures recorded with raw Gateway codes (older events)", () => {
+    const cases: [string, string, string][] = [
+      ["web_fetch", "抓取失败：tries_exhausted（Too Many Requests）", "抓取失败：网页无法访问或超时"],
+      ["web_fetch", "抓取失败：upstream_unreachable（Bad Gateway）", "抓取失败：网页无法访问或超时"],
+      ["web_fetch", "抓取失败：call_deadline_exceeded", "抓取失败：网页无法访问或超时"],
+      ["web_search", "搜索失败：tries_exhausted（Too Many Requests）", "搜索失败：搜索服务无法访问或超时"],
+      ["web_fetch", "抓取失败：upstream_rate_limited（Too Many Requests）", "抓取失败：请求过多，请稍后再试"],
+      ["web_fetch", "抓取失败：egress_blocked（Forbidden）", "抓取失败：不允许访问该网址（安全限制）"],
+      ["web_fetch", "抓取失败：tool_budget_exhausted", "抓取失败：已达工具额度"],
+      ["web_fetch", "抓取失败：weird_code（I'm a teapot）", "抓取失败：暂时无法完成（weird_code）"],
+      ["web_fetch", "抓取失败：网页无法访问或超时", "抓取失败：网页无法访问或超时"], // 新版 Worker：原样
+      ["web_fetch", "抓取失败：站点返回 HTTP 404", "抓取失败：站点返回 HTTP 404"],
+    ];
+    for (const [tool, error, shown] of cases) {
+      const s = run(started(), [
+        sev(1, "tool_call", { step_id: "orch", tool_call_id: "c1", tool, input: tool === "web_fetch" ? { url: "https://a.example/x" } : { query: "q" } }, "u1"),
+        sev(2, "tool_result", { step_id: "orch", tool_call_id: "c1", tool, ok: false, preview: { kind: "text", text: error }, error }, "u1"),
+      ]);
+      expect(s.turns[0]!.steps[0]!.text, error).toBe(shown);
+    }
+  });
+
+  it("gives a restored turn without a route event a research label and panel", () => {
+    const s = run(started("u1"), [
+      sev(1, "turn_created", { turn_index: 2, text: "固态电池", deep_research: false, restored_from_turn_id: "u1" }, "u2"),
+    ]);
+    const t = s.turns[1]!;
+    expect(t.route).toBeUndefined();
+    expect(routeLabel(t)).toBe("已恢复的研究");
+    expect(routeLabel({ ...t, route: "research" })).toBe("深度研究");
+    expect(routeLabel({ ...t, restoredFrom: undefined })).toBeUndefined();
+    expect(activeResearchTurn(s)?.turnId).toBe("u2");
   });
 
   it("falls back to turn_result.summary when no delta was seen (resumed late)", () => {

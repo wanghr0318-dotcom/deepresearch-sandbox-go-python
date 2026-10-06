@@ -1,10 +1,10 @@
 <template>
   <div class="turn" :data-status="turn.status">
     <div class="t-head">
-      <span v-if="turn.route" class="route" :class="turn.route" data-testid="route">{{ turn.route === "research" ? "深度研究" : "直接回答" }}</span>
+      <span v-if="label" class="route" :class="turn.route ?? 'research'" data-testid="route">{{ label }}</span>
       <span v-if="statusText" class="t-status">{{ statusText }}</span>
       <span class="spacer"></span>
-      <button v-if="turn.route === 'research'" class="link-btn" type="button" data-action="view-progress" @click="emit('panel', 'progress')">
+      <button v-if="isResearch" class="link-btn" type="button" data-action="view-progress" @click="emit('panel', 'progress')">
         查看进度
       </button>
       <button
@@ -74,6 +74,7 @@
 // 进行中的步骤默认展开、其余折叠；用户点击后以用户的选择为准。
 import { computed, ref } from "vue";
 import type { Answer, TurnAction } from "../../api/chat";
+import { routeLabel } from "../../lib/chat";
 import type { RawRef, StepRow as StepRowData, TurnView } from "../../lib/chat";
 import QuestionCard from "./QuestionCard.vue";
 import RawDialog from "./RawDialog.vue";
@@ -137,6 +138,10 @@ const blocks = computed<Block[]>(() => {
   }
   return out;
 });
+
+const label = computed(() => routeLabel(props.turn));
+// 恢复出的轮次（没有 route 事件时）也是研究：可查看进度
+const isResearch = computed(() => props.turn.route === "research" || (!props.turn.route && !!props.turn.restoredFrom));
 
 const statusText = computed(() => {
   const t = props.turn;

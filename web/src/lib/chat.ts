@@ -355,6 +355,42 @@ function firstCodeLine(code: unknown): string | undefined {
   return line.length > CODE_LINE_MAX ? `${line.slice(0, CODE_LINE_MAX - 1)}…` : line;
 }
 
+// 搜索/抓取失败的说明。旧版 Worker 写的是"抓取失败：<Gateway 错误码>（<HTTP 状态文字>）"，例如超时后重试用完的
+// "tries_exhausted（Too Many Requests）"——状态文字并不说明原因，会误导用户；这里按错误码改写为中文说明
+// （与 Worker 的 agentbox_worker.tools.base.USER_ERRORS 一致）。新版 Worker 已直接写中文，原样显示。
+const UNREACHABLE = "{target}无法访问或超时";
+const TOOL_ERRORS: Record<string, string> = {
+  tries_exhausted: UNREACHABLE,
+  upstream_unreachable: UNREACHABLE,
+  upstream_unconfirmed: UNREACHABLE,
+  call_deadline_exceeded: UNREACHABLE,
+  client_timeout: UNREACHABLE,
+  upstream_rate_limited: "请求过多，请稍后再试",
+  upstream_unavailable: "网站暂时不可用",
+  upstream_rejected: "网站拒绝了请求",
+  upstream_bad_response: "网站返回了无法识别的响应",
+  response_too_large: "内容过大，无法读取",
+  too_many_redirects: "重定向次数过多",
+  egress_blocked: "不允许访问该网址（安全限制）",
+  invalid_url: "网址无效",
+  invalid_request: "请求无效",
+  tool_budget_exhausted: "已达工具额度",
+  budget_exhausted: "已达费用额度",
+  budget_insufficient_for_request: "已达费用额度",
+  subrun_budget_exhausted: "已达费用额度",
+  call_in_progress: "同一请求仍在进行中",
+};
+const RAW_TOOL_ERROR = /^(搜索|抓取)失败：([a-z][a-z0-9_]*)(?:（[^）]*）)?$/;
+
+function toolErrorText(text: string): string {
+  const m = RAW_TOOL_ERROR.exec(text.trim());
+  if (!m) return text;
+  const [, action, code] = m as unknown as [string, string, string];
+  const known = TOOL_ERRORS[code];
+  const reason = known ? known.replace("{target}", action === "搜索" ? "搜索服务" : "网页") : `暂时无法完成（${code}）`;
+  return `${action}失败：${reason}`;
+}
+
 function previewText(p: Data): string | undefined {
   return optStr(p.text) ?? optStr(p.excerpt);
 }
@@ -450,7 +486,7 @@ function applyToolResult(t: TurnView, d: Data, seq: number): TurnView {
   }
   // run_python 失败（非零退出等）时预览含退出码与 stderr 末尾，比 error 的首段更完整
   const codeText = kind === "code" ? previewText(p) : undefined;
-  if (!ok) row.text = codeText ?? optStr(d.error) ?? row.text ?? "调用失败";
+  if (!ok) row.text = toolErrorText(codeText ?? optStr(d.error) ?? row.text ?? "调用失败");
   const raw = toRaw(d.raw);
   if (raw) row.raw = raw;
   if (i >= 0) steps[i] = row;
@@ -666,7 +702,17 @@ export function recordAnswers(state: ChatState, turnId: string, answers: string[
 export function activeResearchTurn(state: ChatState): TurnView | undefined {
   for (let i = state.turns.length - 1; i >= 0; i--) {
     const t = state.turns[i]!;
-    if (t.route === "research" || (t.route === undefined && t.deepResearch)) return t;
+    if (t.route === "research" || (t.route === undefined && (t.deepResearch || t.restoredFrom))) return t;
   }
   return undefined;
+}
+
+/**
+ * 轮次的路径标签。恢复出的轮次由旧版 Worker 运行时没有 route 事件（源轮次的 route 属于源轮次）：
+ * 可恢复的是被停止或被取代的研究，标为"已恢复的研究"。
+ */
+export function routeLabel(t: TurnView): string | undefined {
+  if (t.route === "research") return "深度研究";
+  if (t.route === "answer") return "直接回答";
+  return t.restoredFrom ? "已恢复的研究" : undefined;
 }
