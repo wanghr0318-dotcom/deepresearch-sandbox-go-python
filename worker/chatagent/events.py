@@ -89,8 +89,11 @@ class Emitter:
     async def _send(self, kind: str, message: str, data: dict[str, Any], step: str | None) -> None:
         await self._sink.progress(kind, message, step_id=step, data=_fit(data))
 
-    async def route(self, route: str, forced: bool = False) -> None:
+    async def route(self, route: str, forced: bool = False, *, restored: bool = False) -> None:
+        """restored：恢复出的 turn 补发源 turn 的路线（消息注明"恢复"）。"""
         label = "深度研究" if route == "research" else "直接回答"
+        if restored:
+            label += "（恢复）"
         await self._send("route", f"路线：{label}", {"route": route, "forced": forced}, None)
 
     async def skill_read(self, step_id: str, name: str, description: str, file: str | None) -> None:

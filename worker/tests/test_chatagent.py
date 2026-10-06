@@ -1009,6 +1009,11 @@ def test_restore_seeds_from_cancelled_checkpoint_with_fresh_budget():
         restored_from_task_id="t-1",
     )
     assert code == 0
+    # 真实验收：恢复出的 turn 没有 route 事件，界面不显示路径标签。恢复时补发（非强制）。
+    routes = progress(events2, "route")
+    assert [r["data"] for r in routes] == [{"route": "research", "forced": False}]
+    assert routes[0]["message"] == "路线：深度研究（恢复）"
+    assert kinds(events2)[0] == "route"
     first = model2.bodies("orch")[0]["messages"]
     assert first[-1] == {
         "role": "user",

@@ -245,6 +245,7 @@ def make_app(
         gw = gateway(ctx) if gateway is not None else ctx.gateway
         try:
             state, carry = await _state(ctx, mode, cfg.tool_budget, memory, gw)
+            emit = Emitter(ctx)
             agent = Agent(
                 ctx,
                 cfg,
@@ -252,9 +253,12 @@ def make_app(
                 memory,
                 gateway=gw,
                 skills=_skills(skills_root),
-                emit=Emitter(ctx),
+                emit=emit,
                 carry=carry,
             )
+            if mode == "restore" and state.route is not None:
+                # 源 turn 的 route 事件属于源 turn：恢复出的 turn 补发一次，界面据此显示路径标签
+                await emit.route(state.route, forced=False, restored=True)
             answer = ctx.directive if mode == "answer" else None
             out = await agent.run(finish=mode == "finish", answer=answer)
         except WorkerFailure:
