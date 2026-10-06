@@ -12,8 +12,11 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -22,6 +25,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/jcs"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
 )
 
 // ---- 内存 Store：语义对齐 internal/persistence/postgres 的 Gateway 事务用例，每次变更后断言 I3 ----
@@ -2168,5 +2172,1208 @@ func TestSubrunCodesAndAccess(t *testing.T) {
 	}
 	if Limits.withDefaults(Limits{}).PerSubrunInflight != 2 {
 		t.Fatal("PerSubrunInflight 默认应为 2")
+	}
+}
+
+// ==== M4 Plan 15 Task 8：exec 调度（§10；D6、D7、D8、D12、D16） ====
+
+// opLog 记录 exec 流程中各 fake 的操作序列（slot、ExecStore、ExecEnvs），用于断言顺序。
+type opLog struct {
+	mu  sync.Mutex
+	ops []string
+}
+
+func (l *opLog) add(op string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.ops = append(l.ops, op)
+}
+
+func (l *opLog) list() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.ops...)
+}
+
+func (l *opLog) count(op string) int {
+	n := 0
+	for _, o := range l.list() {
+		if o == op {
+			n++
+		}
+	}
+	return n
+}
+
+// ---- 内存 ExecStore：语义同 Task 7 的 postgres 契约（共用 fakeStore 的调用记录与锁） ----
+
+type fakeExecTry struct {
+	try     ExecTry
+	amount  int64
+	rstate  string // held | settled | charged_unknown
+	started bool
+	settled ExecSettlement
+}
+
+type fakeExecStore struct {
+	*fakeStore
+	log      *opLog
+	quotas   map[string]*ExecQuota
+	etries   map[callKey][]*fakeExecTry
+	byRes    map[string]*fakeExecTry
+	stopped  map[string]bool // env_id → stopped_at 已记录
+	reserves []ReserveExecRequest
+}
+
+func newFakeExecStore(s *fakeStore, log *opLog) *fakeExecStore {
+	return &fakeExecStore{fakeStore: s, log: log, quotas: map[string]*ExecQuota{}, etries: map[callKey][]*fakeExecTry{},
+		byRes: map[string]*fakeExecTry{}, stopped: map[string]bool{}}
+}
+
+func (s *fakeExecStore) markStopped(envID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stopped[envID] = true
+}
+
+func (s *fakeExecStore) ReserveExec(_ context.Context, r ReserveExecRequest) (ExecTry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.log.add("reserve")
+	if ft := s.byRes[r.ReservationID]; ft != nil {
+		return ft.try, nil
+	}
+	if code := admit(s.facts(r.TaskID, r.AttemptID, r.SubrunID)); code != "" {
+		return ExecTry{}, rejected(code)
+	}
+	q := s.quotas[r.TaskID]
+	if q == nil {
+		q = &ExecQuota{CountLimit: r.Policy.CountLimit, CPULimitUsec: r.Policy.CPULimitUsec, WallLimitMs: r.Policy.WallLimitMs}
+		s.quotas[r.TaskID] = q
+	}
+	k := callKey{r.TaskID, r.CallID}
+	rec := s.calls[k]
+	switch {
+	case rec == nil:
+		return ExecTry{}, persistence.ErrNotFound
+	case rec.Endpoint != ExecEndpoint:
+		return ExecTry{}, persistence.ErrConflict
+	case rec.SubrunID != r.SubrunID:
+		return ExecTry{}, rejected(persistence.CodeFingerprintMismatch)
+	}
+	for _, ft := range s.etries[k] {
+		if ft.rstate == "held" || !s.stopped[ft.try.EnvID] {
+			return ExecTry{}, rejected(persistence.CodeCallInProgress)
+		}
+	}
+	switch {
+	case rec.State == StateCompleted:
+		return ExecTry{}, persistence.ErrConflict
+	case !time.Now().Before(rec.DeadlineAt):
+		return ExecTry{}, rejected(persistence.CodeCallDeadlineExceeded)
+	case rec.TriesUsed >= r.MaxTries:
+		return ExecTry{}, rejected(persistence.CodeTriesExhausted)
+	}
+	var inflight int64
+	for ck, ts := range s.etries {
+		for _, ft := range ts {
+			if ck.taskID == r.TaskID && ft.rstate == "held" {
+				inflight++
+			}
+		}
+	}
+	switch {
+	case q.Blocked:
+		return ExecTry{}, rejected(CodeExecBlocked)
+	case q.CountUsed+inflight >= q.CountLimit:
+		return ExecTry{}, rejected(CodeExecQuotaExhausted)
+	case q.CPUAvailable() < r.CPUEstimateUsec:
+		return ExecTry{}, rejected(CodeExecCPUExhausted)
+	case q.WallSpentMs+r.WallMs > q.WallLimitMs:
+		return ExecTry{}, rejected(CodeExecWallExhausted)
+	}
+	tryNo := rec.TriesUsed + 1
+	ft := &fakeExecTry{try: ExecTry{Try: Try{TaskID: r.TaskID, CallID: r.CallID, TryNo: tryNo, ReservationID: r.ReservationID,
+		AttemptID: r.AttemptID}, EnvID: ExecEnvID(r.TaskID, r.CallID, tryNo)}, amount: r.CPUEstimateUsec, rstate: "held"}
+	s.etries[k] = append(s.etries[k], ft)
+	s.byRes[r.ReservationID] = ft
+	s.reserves = append(s.reserves, r)
+	q.CPUReservedUsec += r.CPUEstimateUsec
+	rec.State, rec.TriesUsed, rec.ResolvingSince = StateInFlight, tryNo, nil
+	return ft.try, nil
+}
+
+func (s *fakeExecStore) MarkExecStarting(_ context.Context, t ExecTry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.log.add("mark")
+	ft := s.byRes[t.ReservationID]
+	if ft == nil {
+		return persistence.ErrNotFound
+	}
+	rec := s.calls[callKey{t.TaskID, t.CallID}]
+	if code := admit(s.facts(t.TaskID, t.AttemptID, rec.SubrunID)); code != "" {
+		return rejected(code)
+	}
+	if ft.rstate != "held" {
+		return persistence.ErrConflict
+	}
+	ft.started = true
+	return nil
+}
+
+func (s *fakeExecStore) SettleExec(_ context.Context, st ExecSettlement) (CallRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.log.add("settle")
+	ft := s.byRes[st.Try.ReservationID]
+	if ft == nil {
+		return CallRecord{}, persistence.ErrNotFound
+	}
+	rec := s.calls[callKey{st.Try.TaskID, st.Try.CallID}]
+	switch st.Outcome {
+	case ExecCompleted, ExecTimedOut:
+		if len(st.ResultSHA256) != 64 {
+			return CallRecord{}, persistence.ErrInvalid
+		}
+	case ExecCancelled, ExecStartFailed, ExecUnknown:
+		if st.ResultSHA256 != "" || len(st.Outputs) != 0 || (st.Outcome == ExecStartFailed && st.Started) {
+			return CallRecord{}, persistence.ErrInvalid
+		}
+	default:
+		return CallRecord{}, persistence.ErrInvalid
+	}
+	if ft.rstate != "held" {
+		return *rec, nil
+	}
+	q := s.quotas[st.Try.TaskID]
+	q.CPUReservedUsec -= ft.amount
+	switch {
+	case st.Outcome == ExecUnknown:
+		q.CPUUnknownUsec += ft.amount
+		ft.rstate = "charged_unknown"
+	case st.CPUKnown:
+		q.CPUSpentUsec += st.CPUUsec
+		ft.rstate = "settled"
+	default:
+		q.CPUSpentUsec += ft.amount
+		ft.rstate = "settled"
+	}
+	if st.Started {
+		q.CountUsed++
+	}
+	q.WallSpentMs += st.WallMs
+	q.Blocked = q.Blocked || q.CPUSpentUsec > q.CPULimitUsec
+	ft.settled = st
+	switch st.Outcome {
+	case ExecCompleted, ExecTimedOut:
+		rec.State, rec.ResultRef = StateCompleted, st.ResultSHA256
+		for _, o := range st.Outputs {
+			s.scoped[callKey{st.Try.TaskID, o.SHA256}] = true
+		}
+	case ExecCancelled:
+		rec.State, rec.FailReason = StateFailed, CodeExecCancelled
+	case ExecStartFailed:
+		rec.State, rec.FailReason = StateFailed, CodeExecStartFailed
+	case ExecUnknown:
+		rec.State = StateUnknown
+	}
+	return *rec, nil
+}
+
+func (s *fakeExecStore) LoadExecQuota(_ context.Context, taskID string) (ExecQuota, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q := s.quotas[taskID]
+	if q == nil {
+		return ExecQuota{}, persistence.ErrNotFound
+	}
+	return *q, nil
+}
+
+// tries 返回调用的 exec try（按 try_no）。
+func (s *fakeExecStore) tries(taskID, callID string) []fakeExecTry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []fakeExecTry
+	for _, ft := range s.etries[callKey{taskID, callID}] {
+		out = append(out, *ft)
+	}
+	return out
+}
+
+func (s *fakeExecStore) nReserves() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.reserves)
+}
+
+// ---- 可脚本化的 exec 环境 ----
+
+// execScript 描述一个 exec 环境（按 Create 的先后取用）中 workload 的行为。
+type execScript struct {
+	exitCode       int
+	stdout, stderr string
+	bigOut         int64         // stdout 与 stderr 各交替写入这么多字节（无缓冲管道：只顺序读一个会挂起）
+	hang           bool          // 写完输出后挂起，直至环境被 Stop
+	startErr       error         // Start 的返回
+	waitErr        error         // Wait 的返回
+	stopBlocked    bool          // Stop 期限内未确认停止
+	createErr      error         // Create 的返回
+	createGate     chan struct{} // 非 nil：Create 阻塞至关闭
+	outputs        map[string]string
+	skipped        []provider.SkippedOutput
+}
+
+type fakeExecHandle struct {
+	log            *opLog
+	stdout, stderr *io.PipeReader
+	done           chan struct{}
+	status         provider.ExitStatus
+	waitErr        error
+}
+
+func (h *fakeExecHandle) Stdin() io.WriteCloser { return fakeStdin{h.log} }
+func (h *fakeExecHandle) Stdout() io.ReadCloser { return h.stdout }
+func (h *fakeExecHandle) Stderr() io.ReadCloser { return h.stderr }
+func (h *fakeExecHandle) Wait() (provider.ExitStatus, error) {
+	<-h.done
+	return h.status, h.waitErr
+}
+func (h *fakeExecHandle) Terminate(time.Duration) error { return nil }
+
+type fakeStdin struct{ log *opLog }
+
+func (fakeStdin) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+func (s fakeStdin) Close() error {
+	s.log.add("stdin_closed")
+	return nil
+}
+
+type fakeExecEnv struct {
+	id, inDir string
+	sc        execScript
+	killed    chan struct{}
+	killOnce  sync.Once
+	h         *fakeExecHandle
+	staged    map[string]string      // Start 时 /in 的内容（相对路径 → 内容）
+	modes     map[string]os.FileMode // Start 时 /in 中文件与目录的权限
+}
+
+func (e *fakeExecEnv) kill() { e.killOnce.Do(func() { close(e.killed) }) }
+
+type fakeEnvs struct {
+	t       *testing.T
+	log     *opLog
+	store   *fakeExecStore
+	mu      sync.Mutex
+	scripts []execScript
+	n       int
+	envs    map[string]*fakeExecEnv
+	reqs    []ExecEnvRequest
+	specs   []provider.ExecSpec
+	files   []*os.File
+	created chan string // 每次 Create 开始时发送 env_id
+	started chan string // 每次 Start 成功时发送 env_id
+}
+
+func (f *fakeEnvs) env(id string) *fakeExecEnv {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.envs[id]
+}
+
+func (f *fakeEnvs) Create(_ context.Context, r ExecEnvRequest) (string, error) {
+	f.log.add("create")
+	f.mu.Lock()
+	sc := execScript{stdout: "ok\n"}
+	if f.n < len(f.scripts) {
+		sc = f.scripts[f.n]
+	}
+	f.n++
+	f.reqs = append(f.reqs, r)
+	f.mu.Unlock()
+	f.created <- r.EnvID
+	if sc.createGate != nil {
+		<-sc.createGate
+	}
+	if sc.createErr != nil {
+		return "", sc.createErr
+	}
+	in := filepath.Join(f.t.TempDir(), "in")
+	if err := os.Mkdir(in, 0o755); err != nil {
+		return "", err
+	}
+	f.mu.Lock()
+	f.envs[r.EnvID] = &fakeExecEnv{id: r.EnvID, inDir: in, sc: sc, killed: make(chan struct{})}
+	f.mu.Unlock()
+	return in, nil
+}
+
+func (f *fakeEnvs) Start(_ context.Context, envID string, spec provider.ExecSpec) (provider.ExecHandle, error) {
+	f.log.add("start")
+	e := f.env(envID)
+	staged, modes := map[string]string{}, map[string]os.FileMode{}
+	err := filepath.WalkDir(e.inDir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(e.inDir, p)
+		if err != nil || rel == "." {
+			return err
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		modes[filepath.ToSlash(rel)] = fi.Mode().Perm()
+		if !d.IsDir() {
+			b, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			staged[filepath.ToSlash(rel)] = string(b)
+		}
+		return nil
+	})
+	if err != nil {
+		f.t.Errorf("读取 /in 暂存：%v", err)
+	}
+	f.mu.Lock()
+	f.specs = append(f.specs, spec)
+	e.staged, e.modes = staged, modes
+	f.mu.Unlock()
+	if e.sc.startErr != nil {
+		return nil, e.sc.startErr
+	}
+	or, ow := io.Pipe()
+	er, ew := io.Pipe()
+	h := &fakeExecHandle{log: f.log, stdout: or, stderr: er, done: make(chan struct{}), waitErr: e.sc.waitErr}
+	e.h = h
+	sc := e.sc
+	go func() {
+		defer close(h.done)
+		write := func(w *io.PipeWriter, s string) {
+			if s != "" {
+				if _, err := w.Write([]byte(s)); err != nil {
+					return // 读取端已关闭：与真实管道相同，丢弃
+				}
+			}
+		}
+		write(ow, sc.stdout)
+		write(ew, sc.stderr)
+		if sc.bigOut > 0 {
+			chunk := bytes.Repeat([]byte("x"), 64<<10)
+			for n := int64(0); n < sc.bigOut; n += int64(len(chunk)) {
+				if _, err := ow.Write(chunk); err != nil {
+					break
+				}
+				if _, err := ew.Write(chunk); err != nil {
+					break
+				}
+			}
+		}
+		if sc.hang {
+			<-e.killed
+			h.status = provider.ExitStatus{Signal: syscall.Signal(9)}
+		} else {
+			h.status = provider.ExitStatus{Code: sc.exitCode}
+		}
+		if err := ow.Close(); err != nil {
+			f.t.Errorf("关闭 stdout：%v", err)
+		}
+		if err := ew.Close(); err != nil {
+			f.t.Errorf("关闭 stderr：%v", err)
+		}
+	}()
+	f.started <- envID
+	return h, nil
+}
+
+func (f *fakeEnvs) Stop(_ context.Context, envID string) (ExecStop, error) {
+	f.log.add("stop")
+	e := f.env(envID)
+	if e == nil { // Create 失败：没有残留
+		f.store.markStopped(envID)
+		return ExecStop{Stopped: true, Recorded: true}, nil
+	}
+	if e.sc.stopBlocked {
+		return ExecStop{Blocked: true}, nil
+	}
+	e.kill()
+	if e.h != nil {
+		<-e.h.done
+	}
+	f.store.markStopped(envID)
+	return ExecStop{Stopped: true, Recorded: true}, nil
+}
+
+func (f *fakeEnvs) Diag(context.Context, string) (provider.ResourceDiag, error) {
+	f.log.add("diag")
+	return provider.ResourceDiag{CPUUsageUsec: 81234}, nil
+}
+
+func (f *fakeEnvs) OpenOutputs(_ context.Context, envID string, max int) ([]provider.OutputFile, []provider.SkippedOutput, error) {
+	f.log.add("outputs")
+	if max != provider.MaxOutputFiles {
+		f.t.Errorf("OpenOutputs max = %d，期望 %d", max, provider.MaxOutputFiles)
+	}
+	e := f.env(envID)
+	var paths []string
+	for p := range e.sc.outputs {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	dir := f.t.TempDir()
+	var out []provider.OutputFile
+	for i, p := range paths {
+		name := filepath.Join(dir, fmt.Sprint(i))
+		if err := os.WriteFile(name, []byte(e.sc.outputs[p]), 0o600); err != nil {
+			return nil, nil, err
+		}
+		fh, err := os.Open(name)
+		if err != nil {
+			return nil, nil, err
+		}
+		f.mu.Lock()
+		f.files = append(f.files, fh)
+		f.mu.Unlock()
+		out = append(out, provider.OutputFile{Path: p, Size: int64(len(e.sc.outputs[p])), File: fh})
+	}
+	return out, e.sc.skipped, nil
+}
+
+// Cleanup 与 provider 的 Destroy 相同：仍有打开的输出文件时 EBUSY（记为测试失败）。
+func (f *fakeEnvs) Cleanup(_ context.Context, envID string) error {
+	f.log.add("cleanup")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, fh := range f.files {
+		if _, err := fh.Stat(); err == nil {
+			f.t.Errorf("Cleanup(%s) 时输出文件 %s 仍未关闭（Destroy 会 EBUSY）", envID, fh.Name())
+			return syscall.EBUSY
+		}
+	}
+	return nil
+}
+
+// killAll 让挂起的 workload 结束（测试清理；Stop Blocked 的环境不会被 Coordinator 停止）。
+func (f *fakeEnvs) killAll() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, e := range f.envs {
+		e.kill()
+	}
+}
+
+func (f *fakeEnvs) lastSpec(t *testing.T) provider.ExecSpec {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.specs) == 0 {
+		t.Fatal("Start 没有被调用")
+	}
+	return f.specs[len(f.specs)-1]
+}
+
+// fakeSlots 是每任务 per 个的 exec slot（admission.ExecGate 的简化）。
+type fakeSlots struct {
+	log  *opLog
+	per  int
+	mu   sync.Mutex
+	sems map[string]chan struct{}
+}
+
+func (s *fakeSlots) Acquire(ctx context.Context, taskID string) (func(), error) {
+	s.mu.Lock()
+	ch := s.sems[taskID]
+	if ch == nil {
+		ch = make(chan struct{}, s.per)
+		s.sems[taskID] = ch
+	}
+	s.mu.Unlock()
+	select {
+	case ch <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	s.log.add("acquire")
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			<-ch
+			s.log.add("release")
+		})
+	}, nil
+}
+
+// ---- 装配 ----
+
+type execHarness struct {
+	*harness
+	es    *fakeExecStore
+	envs  *fakeEnvs
+	slots *fakeSlots
+	ops   *opLog
+	cfg   ExecConfig
+}
+
+func newExecHarness(t *testing.T, mod func(*ExecConfig), scripts ...execScript) *execHarness {
+	t.Helper()
+	ops := &opLog{}
+	base := &harness{store: newFakeStore(t), ad: newAdapter("p1"), blobs: &fakeBlobs{m: map[string][]byte{}}, events: &fakeEvents{},
+		logs: &syncBuffer{}}
+	es := newFakeExecStore(base.store, ops)
+	envs := &fakeEnvs{t: t, log: ops, store: es, scripts: scripts, envs: map[string]*fakeExecEnv{},
+		created: make(chan string, 64), started: make(chan string, 64)}
+	slots := &fakeSlots{log: ops, per: 2, sems: map[string]chan struct{}{}}
+	cfg := ExecConfig{Store: es, Envs: envs, Slots: slots, Policy: ExecPolicy{CountLimit: 50, CPULimitUsec: 600_000_000, WallLimitMs: 1_800_000},
+		Default: ExecLimits{WallMs: 60_000, MemoryBytes: 512 << 20}, Max: ExecLimits{WallMs: 300_000, MemoryBytes: 1 << 30},
+		QueueTimeout: 2 * time.Second, ImageDigest: "img-1", StopTimeout: 2 * time.Second}
+	if mod != nil {
+		mod(&cfg)
+	}
+	h := &execHarness{harness: base, es: es, envs: envs, slots: slots, ops: ops, cfg: cfg}
+	h.c = h.execCoordinator(t, cfg)
+	return h
+}
+
+func (h *execHarness) execCoordinator(t *testing.T, cfg ExecConfig) *Coordinator {
+	t.Helper()
+	c, err := New(Config{Store: h.store, Adapters: []upstream.Adapter{h.ad}, Blobs: h.blobs, Events: h.events, Limits: testLimits(),
+		Logger: slog.New(slog.NewJSONHandler(h.logs, nil)), Exec: &cfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Close)
+	t.Cleanup(h.envs.killAll) // 先于 Close 运行（LIFO）
+	return c
+}
+
+// execBody 构造 exec 请求体：code 按 JSON 编码，extra 是附加的成员（以逗号开头）。
+func execBody(code, extra string) string {
+	b, err := json.Marshal(code)
+	if err != nil {
+		panic(err)
+	}
+	return `{"language":"python3","code":` + string(b) + extra + `}`
+}
+
+func xinv(callID, body string) ExecInvoke {
+	return ExecInvoke{TaskID: "t1", AttemptID: "a1", CallID: callID, Body: []byte(body)}
+}
+
+func (h *execHarness) exec(t *testing.T, in ExecInvoke) Result {
+	t.Helper()
+	r, err := h.c.Exec(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Exec(%s)：%v", in.CallID, err)
+	}
+	return r
+}
+
+func (h *execHarness) startExec(in ExecInvoke) <-chan invokeOutcome {
+	ch := make(chan invokeOutcome, 1)
+	go func() {
+		r, err := h.c.Exec(context.Background(), in)
+		ch <- invokeOutcome{r, err}
+	}()
+	return ch
+}
+
+func waitChan(t *testing.T, ch <-chan string, what string) string {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(5 * time.Second):
+		t.Fatalf("等待 %s 超时", what)
+	}
+	return ""
+}
+
+// seedInput 保存一个输入 blob 并授权到任务 t1 的 scope。
+func (h *execHarness) seedInput(t *testing.T, content string) string {
+	t.Helper()
+	ref, err := h.blobs.Put(context.Background(), strings.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.store.scope("t1", ref.SHA256)
+	return ref.SHA256
+}
+
+type execResultView struct {
+	Status string `json:"status"`
+	Exit   *struct {
+		Code   int `json:"code"`
+		Signal int `json:"signal"`
+	} `json:"exit"`
+	Diag *struct {
+		OOMKillDelta uint64 `json:"oom_kill_delta"`
+		OOMObserved  bool   `json:"oom_observed"`
+		CPUUsageUsec uint64 `json:"cpu_usage_usec"`
+	} `json:"diag"`
+	Stdout            string `json:"stdout"`
+	StdoutTruncated   bool   `json:"stdout_truncated"`
+	StdoutInvalidUTF8 bool   `json:"stdout_invalid_utf8"`
+	Stderr            string `json:"stderr"`
+	StderrTruncated   bool   `json:"stderr_truncated"`
+	StderrInvalidUTF8 bool   `json:"stderr_invalid_utf8"`
+	Outputs           []struct {
+		Path   string `json:"path"`
+		SHA256 string `json:"sha256"`
+		Size   int64  `json:"size"`
+	} `json:"outputs"`
+	SkippedOutputs []struct {
+		Path   string `json:"path"`
+		Reason string `json:"reason"`
+	} `json:"skipped_outputs"`
+	QueueMs int64 `json:"queue_ms"`
+	WallMs  int64 `json:"wall_ms"`
+	Limits  struct {
+		WallMs      int64 `json:"wall_ms"`
+		MemoryBytes int64 `json:"memory_bytes"`
+	} `json:"limits"`
+	ImageDigest string `json:"image_digest"`
+}
+
+func parseExecResult(t *testing.T, r Result) execResultView {
+	t.Helper()
+	if r.Status != 200 {
+		t.Fatalf("exec 结果 %d %s，期望 200", r.Status, r.Code)
+	}
+	var v execResultView
+	if err := json.Unmarshal(r.Body, &v); err != nil {
+		t.Fatalf("结果不是 JSON：%v\n%s", err, r.Body)
+	}
+	return v
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ---- 1. 请求校验与 limits 截断 ----
+
+func TestExecRequestValidation(t *testing.T) {
+	h := newExecHarness(t, nil)
+	sha := strings.Repeat("a", 64)
+	in := func(path string) string { return `{"sha256":"` + sha + `","path":"` + path + `"}` }
+	cases := map[string]struct{ body, code string }{
+		"language":     {`{"language":"bash","code":"echo 1"}`, upstream.CodeInvalidRequest},
+		"缺少 code":      {`{"language":"python3"}`, upstream.CodeInvalidRequest},
+		"code 超长":      {execBody(strings.Repeat("x", 256<<10+1), ""), upstream.CodeInvalidRequest},
+		"..":           {execBody("x", `,"inputs":[`+in("../x")+`]`), upstream.CodeInvalidRequest},
+		"绝对路径":         {execBody("x", `,"inputs":[`+in("/abs")+`]`), upstream.CodeInvalidRequest},
+		"不规范":          {execBody("x", `,"inputs":[`+in("a//b")+`]`), upstream.CodeInvalidRequest},
+		"重复路径":         {execBody("x", `,"inputs":[`+in("a")+`,`+in("a")+`]`), upstream.CodeInvalidRequest},
+		"文件与目录冲突":      {execBody("x", `,"inputs":[`+in("a")+`,`+in("a/b")+`]`), upstream.CodeInvalidRequest},
+		".agentbox":    {execBody("x", `,"inputs":[`+in(".agentbox/x")+`]`), upstream.CodeInvalidRequest},
+		"sha 非法":       {execBody("x", `,"inputs":[{"sha256":"AB","path":"a"}]`), upstream.CodeInvalidRequest},
+		"未知字段":         {execBody("x", `,"argv":["sh"]`), upstream.CodeUnsupportedField},
+		"inputs 内未知字段": {execBody("x", `,"inputs":[{"sha256":"`+sha+`","path":"a","mode":1}]`), upstream.CodeUnsupportedField},
+		"limits 内未知字段": {execBody("x", `,"limits":{"cpu":2}`), upstream.CodeUnsupportedField},
+		"wall_ms 非正":   {execBody("x", `,"limits":{"wall_ms":0}`), upstream.CodeInvalidRequest},
+		"重复属性名":        {`{"language":"python3","code":"x","code":"y"}`, CodeDuplicateJSONKey},
+		"非对象":          {`[1]`, upstream.CodeInvalidRequest},
+	}
+	for name, tc := range cases {
+		r := h.exec(t, xinv("c-"+name, tc.body))
+		if r.Code != tc.code || r.Status != 400 {
+			t.Errorf("%s：得到 %d %s，期望 400 %s", name, r.Status, r.Code, tc.code)
+		}
+	}
+	if n := len(h.store.calls); n != 0 {
+		t.Fatalf("被拒绝的请求不应登记调用，得到 %d 个", n)
+	}
+	if ops := h.ops.list(); len(ops) != 0 {
+		t.Fatalf("被拒绝的请求不应有任何 exec 操作：%v", ops)
+	}
+
+	// 截断：超过上限的 limits 按上限生效，截断值进入指纹与响应（截断前后的两个请求指纹相同）。
+	r := h.exec(t, xinv("trunc", execBody("print(1)", `,"limits":{"wall_ms":999999,"memory_bytes":4294967296}`)))
+	v := parseExecResult(t, r)
+	if v.Limits.WallMs != 300_000 || v.Limits.MemoryBytes != 1<<30 {
+		t.Fatalf("limits = %+v，期望按上限截断", v.Limits)
+	}
+	if got := h.envs.reqs[0].MemoryBytes; got != 1<<30 {
+		t.Fatalf("ExecEnvRequest.MemoryBytes = %d，期望生效值 1 GiB", got)
+	}
+	r2 := h.exec(t, xinv("trunc", execBody("print(1)", `,"limits":{"wall_ms":300000,"memory_bytes":1073741824}`)))
+	if !r2.Replayed || r2.BlobSHA256 != r.BlobSHA256 {
+		t.Fatalf("截断后相同的请求应重放：%+v", r2)
+	}
+	// 默认值。
+	v3 := parseExecResult(t, h.exec(t, xinv("dflt", execBody("print(1)", ""))))
+	if v3.Limits.WallMs != 60_000 || v3.Limits.MemoryBytes != 512<<20 || v3.ImageDigest != "img-1" {
+		t.Fatalf("默认 limits / image_digest：%+v %s", v3.Limits, v3.ImageDigest)
+	}
+}
+
+// ---- 2. 指纹：输入顺序无关；image_digest 变化 → 409 fingerprint_mismatch ----
+
+func TestExecFingerprint(t *testing.T) {
+	h := newExecHarness(t, nil)
+	a, b := h.seedInput(t, "A"), h.seedInput(t, "B")
+	ab := execBody("x", `,"inputs":[{"sha256":"`+a+`","path":"a"},{"sha256":"`+b+`","path":"b"}]`)
+	ba := execBody("x", `,"inputs":[{"path":"b","sha256":"`+b+`"},{"sha256":"`+a+`","path":"a"}]`)
+	r1 := h.exec(t, xinv("c1", ab))
+	parseExecResult(t, r1)
+	r2 := h.exec(t, xinv("c1", ba))
+	if !r2.Replayed || r2.BlobSHA256 != r1.BlobSHA256 {
+		t.Fatalf("输入顺序不同应得到相同指纹（重放）：%+v", r2)
+	}
+	cfg := h.cfg
+	cfg.ImageDigest = "img-2"
+	c2 := h.execCoordinator(t, cfg)
+	r3, err := c2.Exec(context.Background(), xinv("c1", ab))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r3.Status != 409 || r3.Code != persistence.CodeFingerprintMismatch {
+		t.Fatalf("image_digest 变化：%d %s，期望 409 fingerprint_mismatch", r3.Status, r3.Code)
+	}
+	if ev := h.events.list(); len(ev) != 1 || !strings.Contains(ev[0], "endpoint=/v1/exec") {
+		t.Fatalf("replay_divergence 事件：%v", ev)
+	}
+}
+
+// ---- 3. 正常路径：操作顺序、argv/Dir/Env、/in 暂存、结果 JSON、结算与授权 ----
+
+func TestExecHappyPath(t *testing.T) {
+	h := newExecHarness(t, nil, execScript{stdout: "hi\n", stderr: "bad\xff!", exitCode: 3,
+		outputs: map[string]string{"r/a.txt": "hello world!", "z": ""},
+		skipped: []provider.SkippedOutput{{Path: "l", Reason: provider.SkipSymlink}}})
+	in := h.seedInput(t, "x,y\n1,2\n")
+	code := "print('hi')\n"
+	r := h.exec(t, xinv("c1", execBody(code, `,"inputs":[{"sha256":"`+in+`","path":"data/x.csv"}]`)))
+	v := parseExecResult(t, r)
+
+	want := []string{"acquire", "reserve", "create", "mark", "start", "stdin_closed", "stop", "diag", "outputs", "cleanup", "settle", "release"}
+	if got := h.ops.list(); !equalStrings(got, want) {
+		t.Fatalf("操作序列\n得到 %v\n期望 %v", got, want)
+	}
+	spec := h.envs.lastSpec(t)
+	if !equalStrings(spec.Argv, []string{"python3", "-I", "-B", "/in/.agentbox/main.py"}) || spec.Dir != "/out" ||
+		!equalStrings(spec.Env, []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/tmp", "LANG=C.UTF-8",
+			"PYTHONDONTWRITEBYTECODE=1", "PYTHONUNBUFFERED=1"}) {
+		t.Fatalf("ExecSpec = %+v", spec)
+	}
+	env := h.envs.env(h.envs.reqs[0].EnvID)
+	if env.staged[".agentbox/main.py"] != code || env.staged["data/x.csv"] != "x,y\n1,2\n" || len(env.staged) != 2 {
+		t.Fatalf("/in 暂存内容：%v", env.staged)
+	}
+	for p, m := range env.modes {
+		wantMode := os.FileMode(0o444)
+		if p == ".agentbox" || p == "data" {
+			wantMode = 0o755
+		}
+		if m != wantMode {
+			t.Errorf("/in/%s 的权限 %v，期望 %v", p, m, wantMode)
+		}
+	}
+	req := h.envs.reqs[0]
+	if req.AttemptID != "a1" || req.EnvID != ExecEnvID("t1", "c1", 1) || req.MemoryBytes != 512<<20 {
+		t.Fatalf("ExecEnvRequest = %+v", req)
+	}
+
+	if v.Status != "completed" || v.Exit == nil || v.Exit.Code != 3 || v.Exit.Signal != 0 {
+		t.Fatalf("status/exit：%+v %+v", v.Status, v.Exit)
+	}
+	if v.Diag == nil || v.Diag.CPUUsageUsec != 81234 || v.Stdout != "hi\n" || v.StdoutTruncated || v.StdoutInvalidUTF8 {
+		t.Fatalf("diag/stdout：%+v %q", v.Diag, v.Stdout)
+	}
+	if v.Stderr != "bad�!" || !v.StderrInvalidUTF8 || v.StderrTruncated {
+		t.Fatalf("stderr 非法 UTF-8 应替换为 U+FFFD 并置标志：%q %v", v.Stderr, v.StderrInvalidUTF8)
+	}
+	sum := sha256.Sum256([]byte("hello world!"))
+	if len(v.Outputs) != 2 || v.Outputs[0].Path != "r/a.txt" || v.Outputs[0].SHA256 != hex.EncodeToString(sum[:]) ||
+		v.Outputs[0].Size != 12 || v.Outputs[1].Path != "z" || v.Outputs[1].Size != 0 {
+		t.Fatalf("outputs = %+v", v.Outputs)
+	}
+	if len(v.SkippedOutputs) != 1 || v.SkippedOutputs[0].Path != "l" || v.SkippedOutputs[0].Reason != "symlink" {
+		t.Fatalf("skipped_outputs = %+v", v.SkippedOutputs)
+	}
+	if v.QueueMs < 0 || v.WallMs < 0 || v.ImageDigest != "img-1" {
+		t.Fatalf("queue/wall/image：%+v", v)
+	}
+	// 输出 blob 内容。
+	rc, err := h.blobs.Open(v.Outputs[0].SHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := io.ReadAll(rc); string(b) != "hello world!" {
+		t.Fatalf("输出 blob 内容 %q", b)
+	}
+
+	tries := h.es.tries("t1", "c1")
+	if len(tries) != 1 {
+		t.Fatalf("try 数 %d", len(tries))
+	}
+	st := tries[0].settled
+	if st.Outcome != ExecCompleted || !st.Started || !st.CPUKnown || st.CPUUsec != 81234 || st.ResultSHA256 != r.BlobSHA256 ||
+		st.ResultSize != int64(len(r.Body)) || len(st.Outputs) != 2 || st.Outputs[0].Size != 12 {
+		t.Fatalf("结算 %+v", st)
+	}
+	// CPU 预留 = 1 核 × 60 s × 1.1（usec）。
+	if res := h.es.reserves[0]; res.CPUEstimateUsec != 66_000_000 || res.WallMs != 60_000 || res.MaxTries != 3 || res.Policy.CountLimit != 50 {
+		t.Fatalf("ReserveExec = %+v", res)
+	}
+	rec, _ := h.call(t, "t1", "c1")
+	if rec.State != StateCompleted || rec.Endpoint != ExecEndpoint || rec.ResultRef != r.BlobSHA256 {
+		t.Fatalf("journal %+v", rec)
+	}
+	if !rec.DeadlineAt.After(rec.CreatedAt.Add(2*time.Second+60*time.Second+29*time.Second)) ||
+		rec.DeadlineAt.After(rec.CreatedAt.Add(2*time.Second+60*time.Second+31*time.Second)) {
+		t.Fatalf("调用期限应为排队上限 + wall + 30 s：%v", rec.DeadlineAt.Sub(rec.CreatedAt))
+	}
+	for _, sha := range []string{r.BlobSHA256, v.Outputs[0].SHA256} {
+		if ok, _ := h.store.BlobAuthorized(context.Background(), "t1", sha); !ok {
+			t.Fatalf("blob %s 未授权到任务 scope", sha)
+		}
+	}
+
+	// 4. 重放：fake 环境无任何操作，exec_count 不变。
+	before := len(h.ops.list())
+	r2 := h.exec(t, xinv("c1", execBody(code, `,"inputs":[{"sha256":"`+in+`","path":"data/x.csv"}]`)))
+	if !r2.Replayed || !bytes.Equal(r2.Body, r.Body) || r2.BlobSHA256 != r.BlobSHA256 {
+		t.Fatalf("重放：%+v", r2)
+	}
+	if after := len(h.ops.list()); after != before {
+		t.Fatalf("重放不应有 exec 操作：%v", h.ops.list()[before:])
+	}
+	if q, _ := h.es.LoadExecQuota(context.Background(), "t1"); q.CountUsed != 1 || q.CPUSpentUsec != 81234 || q.CPUReservedUsec != 0 {
+		t.Fatalf("配额 %+v", q)
+	}
+}
+
+// ---- 5. 超时：wall 到期 → Stop → timed_out，journal completed ----
+
+func TestExecWallTimeout(t *testing.T) {
+	h := newExecHarness(t, nil, execScript{stdout: "partial", hang: true})
+	r := h.exec(t, xinv("c1", execBody("while True: pass", `,"limits":{"wall_ms":50}`)))
+	v := parseExecResult(t, r)
+	if v.Status != "timed_out" || v.Stdout != "partial" || v.WallMs < 50 || v.Exit == nil || v.Exit.Signal != 9 {
+		t.Fatalf("超时结果 %+v exit %+v", v, v.Exit)
+	}
+	rec, _ := h.call(t, "t1", "c1")
+	if rec.State != StateCompleted {
+		t.Fatalf("timed_out 的 journal 应为 completed：%+v", rec)
+	}
+	if st := h.es.tries("t1", "c1")[0].settled; st.Outcome != ExecTimedOut || !st.Started || st.WallMs < 50 {
+		t.Fatalf("结算 %+v", st)
+	}
+	if h.ops.count("release") != 1 {
+		t.Fatalf("slot 未归还：%v", h.ops.list())
+	}
+}
+
+// ---- 6. E36（单元）：stdout/stderr 各 100 MB → 不挂起，各保留恰 1 MiB 并置截断 ----
+
+func TestExecOutputCapE36(t *testing.T) {
+	h := newExecHarness(t, nil, execScript{bigOut: 100 << 20})
+	done := make(chan Result, 1)
+	go func() {
+		r, err := h.c.Exec(context.Background(), xinv("c1", execBody("x", "")))
+		if err != nil {
+			t.Error(err)
+		}
+		done <- r
+	}()
+	var r Result
+	select {
+	case r = <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("大量输出时 exec 挂起（stdout 与 stderr 未被并发读取）")
+	}
+	v := parseExecResult(t, r)
+	if len(v.Stdout) != 1<<20 || !v.StdoutTruncated || len(v.Stderr) != 1<<20 || !v.StderrTruncated || v.Status != "completed" {
+		t.Fatalf("stdout %d %v / stderr %d %v / %s", len(v.Stdout), v.StdoutTruncated, len(v.Stderr), v.StderrTruncated, v.Status)
+	}
+}
+
+// ---- 7. 取消：任何原因（D7）→ Stop → failed{exec_cancelled}；新 attempt 带 Retry 重跑；I12 [A] ----
+
+func TestExecCancelAnyReason(t *testing.T) {
+	for _, reason := range []string{"replaced", ReasonCancel} {
+		t.Run(reason, func(t *testing.T) {
+			h := newExecHarness(t, nil, execScript{hang: true}, execScript{stdout: "again"})
+			body := execBody("x", "")
+			ch := h.startExec(xinv("c1", body))
+			waitChan(t, h.envs.started, "exec 启动")
+			h.c.CancelAttempt("a1", reason)
+			r := await(t, ch)
+			if r.Status != 409 || r.Code != CodeExecCancelled {
+				t.Fatalf("取消：%d %s", r.Status, r.Code)
+			}
+			rec, _ := h.call(t, "t1", "c1")
+			if rec.State != StateFailed || rec.FailReason != CodeExecCancelled {
+				t.Fatalf("journal %+v", rec)
+			}
+			st := h.es.tries("t1", "c1")[0].settled
+			if st.Outcome != ExecCancelled || !st.Started || !st.CPUKnown || st.CPUUsec != 81234 {
+				t.Fatalf("结算 %+v", st)
+			}
+			want := []string{"acquire", "reserve", "create", "mark", "start", "stdin_closed", "stop", "diag", "cleanup", "settle", "release"}
+			if got := h.ops.list(); !equalStrings(got, want) {
+				t.Fatalf("操作序列 %v", got)
+			}
+			// 不带 Retry：返回持久化失败；新 attempt 带 Retry：新 try 运行完成。
+			if r := h.exec(t, ExecInvoke{TaskID: "t1", AttemptID: "a2", CallID: "c1", Body: []byte(body)}); r.Code != CodeExecCancelled {
+				t.Fatalf("不带 Retry 应返回持久化失败：%+v", r)
+			}
+			r2 := h.exec(t, ExecInvoke{TaskID: "t1", AttemptID: "a2", CallID: "c1", Body: []byte(body), Retry: true})
+			if v := parseExecResult(t, r2); v.Stdout != "again" {
+				t.Fatalf("重跑结果 %+v", v)
+			}
+			tries := h.es.tries("t1", "c1")
+			if len(tries) != 2 || tries[1].try.AttemptID != "a2" || tries[1].try.EnvID == tries[0].try.EnvID {
+				t.Fatalf("重跑 try：%+v", tries)
+			}
+		})
+	}
+}
+
+func TestExecCancelBeforeStartI12(t *testing.T) {
+	gate := make(chan struct{})
+	h := newExecHarness(t, nil, execScript{createGate: gate})
+	ch := h.startExec(xinv("c1", execBody("x", "")))
+	waitChan(t, h.envs.created, "Create")
+	h.c.CancelAttempt("a1", "replaced")
+	close(gate)
+	r := await(t, ch)
+	if r.Code != CodeExecCancelled {
+		t.Fatalf("取消：%+v", r)
+	}
+	want := []string{"acquire", "reserve", "create", "stop", "diag", "cleanup", "settle", "release"}
+	if got := h.ops.list(); !equalStrings(got, want) {
+		t.Fatalf("MarkExecStarting 之前取消不应启动：%v", got)
+	}
+	tr := h.es.tries("t1", "c1")[0]
+	if tr.started || tr.settled.Started || tr.settled.Outcome != ExecCancelled {
+		t.Fatalf("try %+v", tr)
+	}
+	if q, _ := h.es.LoadExecQuota(context.Background(), "t1"); q.CountUsed != 0 {
+		t.Fatalf("未启动的 exec 不计数：%+v", q)
+	}
+}
+
+// 访问在 MarkExecStarting 时已失效（撤销先提交）→ 不启动，按 cancelled 结算。
+func TestExecMarkStartingRejected(t *testing.T) {
+	gate := make(chan struct{})
+	h := newExecHarness(t, nil, execScript{createGate: gate})
+	ch := h.startExec(xinv("c1", execBody("x", "")))
+	waitChan(t, h.envs.created, "Create")
+	h.store.mu.Lock()
+	h.store.revoked["a1"] = true
+	h.store.mu.Unlock()
+	close(gate)
+	if r := await(t, ch); r.Code != CodeExecCancelled {
+		t.Fatalf("结果 %+v", r)
+	}
+	if h.ops.count("start") != 0 || h.ops.count("mark") != 1 || h.ops.count("release") != 1 {
+		t.Fatalf("操作序列 %v", h.ops.list())
+	}
+}
+
+// D16：sub-run 内的 exec 记入 calls.subrun_id，CancelSubrun 终止它。
+func TestExecCancelSubrun(t *testing.T) {
+	h := newExecHarness(t, nil, execScript{hang: true})
+	in := xinv("st1/s1/exec/1", execBody("x", ""))
+	in.SubrunID = "st1"
+	ch := h.startExec(in)
+	waitChan(t, h.envs.started, "exec 启动")
+	h.c.CancelSubrun("t1", "a1", "st2") // 其他 sub-run：无影响
+	h.c.CancelSubrun("t1", "a1", "st1")
+	if r := await(t, ch); r.Code != CodeExecCancelled {
+		t.Fatalf("结果 %+v", r)
+	}
+	rec, _ := h.call(t, "t1", "st1/s1/exec/1")
+	if rec.SubrunID != "st1" || h.es.reserves[0].SubrunID != "st1" {
+		t.Fatalf("sub-run 归属：%+v %+v", rec, h.es.reserves[0])
+	}
+}
+
+// ---- 8. Stop Blocked → unknown，slot 不归还；重发 → call_in_progress ----
+
+func TestExecStopBlocked(t *testing.T) {
+	h := newExecHarness(t, nil, execScript{hang: true, stopBlocked: true})
+	body := execBody("x", `,"limits":{"wall_ms":30}`)
+	r := h.exec(t, xinv("c1", body))
+	if r.Status != 502 || r.Code != CodeExecUnknown {
+		t.Fatalf("Stop Blocked：%d %s", r.Status, r.Code)
+	}
+	want := []string{"acquire", "reserve", "create", "mark", "start", "stdin_closed", "stop", "settle"}
+	if got := h.ops.list(); !equalStrings(got, want) {
+		t.Fatalf("Stop Blocked 不收集、不清理、不归还 slot：%v", got)
+	}
+	st := h.es.tries("t1", "c1")[0].settled
+	if st.Outcome != ExecUnknown || !st.Started {
+		t.Fatalf("结算 %+v", st)
+	}
+	rec, _ := h.call(t, "t1", "c1")
+	if rec.State != StateUnknown {
+		t.Fatalf("journal %+v", rec)
+	}
+	r2 := h.exec(t, xinv("c1", body))
+	if r2.Status != 409 || r2.Code != persistence.CodeCallInProgress {
+		t.Fatalf("前一 try 环境未停止时重发：%d %s", r2.Status, r2.Code)
+	}
+	if n := len(h.es.tries("t1", "c1")); n != 1 {
+		t.Fatalf("不应新建 try：%d", n)
+	}
+}
+
+// ---- 9. start_err → start_failed（不计数）；ErrControlLost → Stop 确认后 unknown ----
+
+func TestExecStartErrors(t *testing.T) {
+	h := newExecHarness(t, nil, execScript{startErr: &provider.StartError{Reason: "exec_failed"}},
+		execScript{startErr: fmt.Errorf("start: %w", provider.ErrControlLost)})
+	r := h.exec(t, xinv("c1", execBody("x", "")))
+	if r.Status != 502 || r.Code != CodeExecStartFailed {
+		t.Fatalf("start_err：%d %s", r.Status, r.Code)
+	}
+	st := h.es.tries("t1", "c1")[0].settled
+	if st.Outcome != ExecStartFailed || st.Started {
+		t.Fatalf("结算 %+v", st)
+	}
+	want := []string{"acquire", "reserve", "create", "mark", "start", "stop", "diag", "cleanup", "settle", "release"}
+	if got := h.ops.list(); !equalStrings(got, want) {
+		t.Fatalf("操作序列 %v", got)
+	}
+	if q, _ := h.es.LoadExecQuota(context.Background(), "t1"); q.CountUsed != 0 {
+		t.Fatalf("start_failed 不计 exec_count：%+v", q)
+	}
+
+	r2 := h.exec(t, xinv("c2", execBody("y", "")))
+	if r2.Status != 502 || r2.Code != CodeExecUnknown {
+		t.Fatalf("ErrControlLost：%d %s", r2.Status, r2.Code)
+	}
+	st2 := h.es.tries("t1", "c2")[0].settled
+	if st2.Outcome != ExecUnknown || !st2.Started {
+		t.Fatalf("结算 %+v", st2)
+	}
+	ops := h.ops.list()[len(want):]
+	want2 := []string{"acquire", "reserve", "create", "mark", "start", "stop", "diag", "cleanup", "settle", "release"}
+	if !equalStrings(ops, want2) {
+		t.Fatalf("ErrControlLost 应先确认停止再按 unknown 结算：%v", ops)
+	}
+}
+
+// Create 失败：Stop 确认无残留后按 start_failed 结算，Worker 得到可重试的 503 exec_env_unavailable；带 Retry 重发可新建 try。
+func TestExecCreateFailure(t *testing.T) {
+	h := newExecHarness(t, nil, execScript{createErr: errors.New("uid 范围耗尽")})
+	body := execBody("x", "")
+	r := h.exec(t, xinv("c1", body))
+	if r.Status != 503 || r.Code != CodeExecEnvUnavailable {
+		t.Fatalf("Create 失败：%d %s", r.Status, r.Code)
+	}
+	want := []string{"acquire", "reserve", "create", "stop", "cleanup", "settle", "release"}
+	if got := h.ops.list(); !equalStrings(got, want) {
+		t.Fatalf("操作序列 %v", got)
+	}
+	st := h.es.tries("t1", "c1")[0].settled
+	if st.Outcome != ExecStartFailed || st.Started || !st.CPUKnown || st.CPUUsec != 0 || !strings.Contains(st.Error, CodeExecEnvUnavailable) {
+		t.Fatalf("结算 %+v", st)
+	}
+	if q, _ := h.es.LoadExecQuota(context.Background(), "t1"); q.CPUSpentUsec != 0 {
+		t.Fatalf("未运行的 exec 不应计 CPU：%+v", q)
+	}
+	r2 := h.exec(t, ExecInvoke{TaskID: "t1", AttemptID: "a1", CallID: "c1", Body: []byte(body), Retry: true})
+	parseExecResult(t, r2)
+}
+
+// 输入累计超过上限（256 MiB；测试把上限调小）→ 中止，按 start_failed 结算，400 inputs_too_large（不启动）。
+func TestExecInputsTooLarge(t *testing.T) {
+	h := newExecHarness(t, nil)
+	if h.c.execInputMax != 256<<20 {
+		t.Fatalf("输入上限 %d，期望 256 MiB", h.c.execInputMax)
+	}
+	h.c.execInputMax = 10
+	a := h.seedInput(t, "123456")
+	b := h.seedInput(t, "7890ab")
+	r := h.exec(t, xinv("c1", execBody("x", `,"inputs":[{"sha256":"`+a+`","path":"a"},{"sha256":"`+b+`","path":"b"}]`)))
+	if r.Status != 400 || r.Code != CodeInputsTooLarge {
+		t.Fatalf("输入超限：%d %s", r.Status, r.Code)
+	}
+	if h.ops.count("start") != 0 || h.ops.count("release") != 1 {
+		t.Fatalf("操作序列 %v", h.ops.list())
+	}
+	if st := h.es.tries("t1", "c1")[0].settled; st.Outcome != ExecStartFailed || st.Started {
+		t.Fatalf("结算 %+v", st)
+	}
+}
+
+// ---- 10. 输入未授权 → 403，无预留、无环境 ----
+
+func TestExecInputNotAuthorized(t *testing.T) {
+	h := newExecHarness(t, nil)
+	ref, err := h.blobs.Put(context.Background(), strings.NewReader("secret of t2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := h.exec(t, xinv("c1", execBody("x", `,"inputs":[{"sha256":"`+ref.SHA256+`","path":"a"}]`)))
+	if r.Status != 403 || r.Code != CodeInputNotAuthorized {
+		t.Fatalf("未授权输入：%d %s", r.Status, r.Code)
+	}
+	if ops := h.ops.list(); len(ops) != 0 {
+		t.Fatalf("不应排队、预留或建环境：%v", ops)
+	}
+	rec, _ := h.call(t, "t1", "c1")
+	if rec.State != StateFailed || rec.FailReason != CodeInputNotAuthorized {
+		t.Fatalf("journal %+v", rec)
+	}
+}
+
+// ---- 11. 每任务第 3 个并发 exec 排队；排队超时 → 504 exec_queue_timeout，无预留 ----
+
+func TestExecQueueTimeout(t *testing.T) {
+	h := newExecHarness(t, func(c *ExecConfig) { c.QueueTimeout = 100 * time.Millisecond },
+		execScript{hang: true}, execScript{hang: true})
+	ch1 := h.startExec(xinv("c1", execBody("1", "")))
+	ch2 := h.startExec(xinv("c2", execBody("2", "")))
+	waitChan(t, h.envs.started, "exec 1 启动")
+	waitChan(t, h.envs.started, "exec 2 启动")
+	start := time.Now()
+	r := h.exec(t, xinv("c3", execBody("3", "")))
+	if r.Status != 504 || r.Code != CodeExecQueueTimeout {
+		t.Fatalf("第 3 个 exec：%d %s", r.Status, r.Code)
+	}
+	if el := time.Since(start); el < 100*time.Millisecond {
+		t.Fatalf("排队超时过早：%v", el)
+	}
+	if n := h.es.nReserves(); n != 2 {
+		t.Fatalf("排队超时的 exec 不应预留：%d 次 ReserveExec", n)
+	}
+	rec, _ := h.call(t, "t1", "c3")
+	if rec.State != StateFailed || rec.FailReason != CodeExecQueueTimeout {
+		t.Fatalf("journal %+v", rec)
+	}
+	h.c.CancelAttempt("a1", "replaced")
+	for _, ch := range []<-chan invokeOutcome{ch1, ch2} {
+		if r := await(t, ch); r.Code != CodeExecCancelled {
+			t.Fatalf("结果 %+v", r)
+		}
+	}
+	if h.ops.count("acquire") != 2 || h.ops.count("release") != 2 {
+		t.Fatalf("slot：%v", h.ops.list())
+	}
+}
+
+// 未配置 exec → 404 endpoint_not_configured。
+func TestExecNotConfigured(t *testing.T) {
+	h := newHarness(t, testLimits(), newAdapter("p1"))
+	r, err := h.c.Exec(context.Background(), xinv("c1", execBody("x", "")))
+	if err != nil || r.Status != 404 || r.Code != CodeEndpointNotConfigured {
+		t.Fatalf("%+v %v", r, err)
 	}
 }

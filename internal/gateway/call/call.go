@@ -171,6 +171,8 @@ type Config struct {
 	StoreTimeout time.Duration
 	// Cache 是共享缓存（§11）；nil 表示关闭（全部走上游）。
 	Cache CacheSource
+	// Exec 装配 POST /v1/exec（§10，exec.go）；nil 表示关闭（404 endpoint_not_configured）。
+	Exec *ExecConfig
 }
 
 // Invoke 是一次 Worker 请求。
@@ -212,6 +214,8 @@ type Coordinator struct {
 	now          func() time.Time
 	storeTimeout time.Duration
 	cache        CacheSource
+	exec         *ExecConfig // 已取默认值；nil 表示未配置 exec
+	execInputMax int64       // exec 输入累计上限（MaxExecInputBytes；测试可调小）
 
 	root context.Context
 	stop context.CancelFunc
@@ -225,6 +229,9 @@ type Coordinator struct {
 	taskSem   map[string]*semaphore
 	provSem   map[string]*semaphore
 	flights   map[flightKey]*flight
+	// exec 的进程内执行（任何撤销原因都终止它们，D7）。
+	execByAttempt map[string]map[*execJob]bool
+	execBySubrun  map[subrunKey]map[*execJob]bool
 }
 
 type callKey struct{ taskID, callID string }
@@ -268,24 +275,34 @@ func New(cfg Config) (*Coordinator, error) {
 		return nil, errors.New("call: Store、Blobs、Events 必填")
 	}
 	c := &Coordinator{
-		store:        cfg.Store,
-		adapters:     map[upstream.Kind]upstream.Adapter{},
-		pricing:      cfg.Pricing,
-		chatPricing:  cfg.ChatPricing,
-		blobs:        cfg.Blobs,
-		events:       cfg.Events,
-		limits:       cfg.Limits.withDefaults(),
-		log:          cfg.Logger,
-		now:          cfg.Now,
-		storeTimeout: cfg.StoreTimeout,
-		cache:        cfg.Cache,
-		busy:         map[callKey]bool{},
-		byAttempt:    map[string]map[*job]bool{},
-		bySubrun:     map[subrunKey]map[*job]bool{},
-		subSem:       map[string]*semaphore{},
-		taskSem:      map[string]*semaphore{},
-		provSem:      map[string]*semaphore{},
-		flights:      map[flightKey]*flight{},
+		store:         cfg.Store,
+		adapters:      map[upstream.Kind]upstream.Adapter{},
+		pricing:       cfg.Pricing,
+		chatPricing:   cfg.ChatPricing,
+		blobs:         cfg.Blobs,
+		events:        cfg.Events,
+		limits:        cfg.Limits.withDefaults(),
+		log:           cfg.Logger,
+		now:           cfg.Now,
+		storeTimeout:  cfg.StoreTimeout,
+		cache:         cfg.Cache,
+		busy:          map[callKey]bool{},
+		byAttempt:     map[string]map[*job]bool{},
+		bySubrun:      map[subrunKey]map[*job]bool{},
+		subSem:        map[string]*semaphore{},
+		taskSem:       map[string]*semaphore{},
+		provSem:       map[string]*semaphore{},
+		flights:       map[flightKey]*flight{},
+		execInputMax:  MaxExecInputBytes,
+		execByAttempt: map[string]map[*execJob]bool{},
+		execBySubrun:  map[subrunKey]map[*execJob]bool{},
+	}
+	if cfg.Exec != nil {
+		x, err := cfg.Exec.withDefaults()
+		if err != nil {
+			return nil, err
+		}
+		c.exec = &x
 	}
 	for _, a := range cfg.Adapters {
 		if _, dup := c.adapters[a.Kind()]; dup {
@@ -341,37 +358,43 @@ func reject(code string) Result { return Result{Status: statusFor(code), Code: c
 // statusFor 把错误码映射为 HTTP 状态（用于 Gateway 自身的拒绝与持久化失败的重放）。
 func statusFor(code string) int {
 	switch code {
-	case persistence.CodeAccessRevoked, upstream.CodeEgressBlocked:
+	case persistence.CodeAccessRevoked, upstream.CodeEgressBlocked, CodeInputNotAuthorized:
 		return 403
 	case persistence.CodeNotCurrentAttempt, persistence.CodeCancelRequested,
-		persistence.CodeFingerprintMismatch, persistence.CodeCallInProgress, persistence.CodeSubrunClosed:
+		persistence.CodeFingerprintMismatch, persistence.CodeCallInProgress, persistence.CodeSubrunClosed, CodeExecCancelled:
 		return 409
-	case persistence.CodeBudgetExhausted, persistence.CodeBudgetInsufficient, persistence.CodeSubrunBudgetExhausted:
+	case persistence.CodeBudgetExhausted, persistence.CodeBudgetInsufficient, persistence.CodeSubrunBudgetExhausted,
+		CodeExecQuotaExhausted, CodeExecCPUExhausted, CodeExecWallExhausted, CodeExecBlocked:
 		return 402
 	case persistence.CodeTriesExhausted, persistence.CodeToolBudgetExhausted:
 		return 429
-	case persistence.CodeCallDeadlineExceeded:
+	case persistence.CodeCallDeadlineExceeded, CodeExecQueueTimeout:
 		return 504
 	case CodeDuplicateJSONKey, upstream.CodeInvalidRequest, upstream.CodeUnsupportedField,
-		upstream.CodeUnsupportedModel, upstream.CodeUnsupportedProvider, upstream.CodeInvalidURL:
+		upstream.CodeUnsupportedModel, upstream.CodeUnsupportedProvider, upstream.CodeInvalidURL, CodeInputsTooLarge:
 		return 400
 	case CodeEndpointNotConfigured:
 		return 404
-	case CodeStoreUnavailable, CodeGatewayShutdown:
+	case CodeStoreUnavailable, CodeGatewayShutdown, CodeExecEnvUnavailable:
 		return 503
 	}
-	return 502
+	return 502 // 含 exec_start_failed、exec_unknown
 }
 
 // retryableReason 报告 failed 调用的原因是否属于可重试类别（§9.4：带 X-Agentbox-Retry 时可在上限内新建 try）：
 // 上游的暂时失败、预算或访问在 Tx2 被拒、存储故障与关闭中止。期限与次数耗尽、上游明确拒绝不可重试；
 // subrun_closed 不可重试（sub-run 不会重新打开），sub-run 层预算耗尽与 task 层相同可重试（并发预留释放后可能恢复）。
+// exec（§10.4、D6）：exec_cancelled 可重试（新 attempt 带 Retry 重跑）；排队超时、环境不可用与启动失败可重试
+// （环境创建失败也按 start_failed 结算；启动失败不计 exec_count，重跑受累计 try 上限约束）；次数与 CPU 配额
+// 可能在在途 exec 结算后恢复，与预算同样可重试；wall 配额与 blocked 不会恢复，不可重试。
 func retryableReason(reason string) bool {
 	switch reason {
 	case upstream.CodeUpstreamRateLimited, upstream.CodeUpstreamUnavailable, upstream.CodeUpstreamUnreachable,
 		persistence.CodeBudgetExhausted, persistence.CodeBudgetInsufficient, persistence.CodeSubrunBudgetExhausted,
 		persistence.CodeAccessRevoked, persistence.CodeNotCurrentAttempt, persistence.CodeCancelRequested,
-		CodeStoreUnavailable, CodeGatewayShutdown:
+		CodeStoreUnavailable, CodeGatewayShutdown,
+		CodeExecCancelled, CodeExecQueueTimeout, CodeExecEnvUnavailable, CodeExecStartFailed,
+		CodeExecQuotaExhausted, CodeExecCPUExhausted:
 		return true
 	}
 	return false
@@ -446,12 +469,16 @@ func (c *Coordinator) OpenBlob(ctx context.Context, taskID, sha string) (io.Read
 
 // CancelAttempt 由 edge 在撤销 attempt 时调用。只有 reason == ReasonCancel 取消该 attempt 的在途 try
 // （按"未发出释放 / 有 usage 按实际 / 无法确认转 unknown"结算）；其他离开原因的 try 继续至期限并结算（§9.1）。
+// exec 不看原因（§10.4、D7）：任何原因都终止该 attempt 的全部 exec（停止执行树 → cancelled；尚未启动的不再启动）。
 func (c *Coordinator) CancelAttempt(attemptID, reason string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for j := range c.execByAttempt[attemptID] {
+		j.cancel(errExecCancelled)
+	}
 	if reason != ReasonCancel {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	for j := range c.byAttempt[attemptID] {
 		j.cancel(errCancelRequested)
 	}
@@ -464,14 +491,21 @@ func (c *Coordinator) CancelAttempt(attemptID, reason string) {
 //
 // 调用方（宿主取消 sub-run 的路径，以及 Plan 15 的 exec 协调）须先在同一事务中把 sub-run 置为 cancel_requested：
 // 之后到达的请求由 Store 的访问复查以 subrun_closed 拒绝，本方法只负责已在进程内执行的调用。
+//
+// 该 sub-run 的 exec（D16）同样被终止：停止执行树后按 cancelled 结算（journal failed{exec_cancelled}，Worker 得到
+// 409 exec_cancelled），尚未启动的不再启动。
 func (c *Coordinator) CancelSubrun(taskID, attemptID, subrunID string) {
 	if subrunID == "" {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for j := range c.bySubrun[subrunKey{taskID, attemptID, subrunID}] {
+	k := subrunKey{taskID, attemptID, subrunID}
+	for j := range c.bySubrun[k] {
 		j.cancel(errSubrunCancelRequested)
+	}
+	for j := range c.execBySubrun[k] {
+		j.cancel(errExecCancelled)
 	}
 }
 
@@ -625,19 +659,19 @@ func (c *Coordinator) contended(ctx context.Context, in Invoke, fp string) (res 
 	}
 	rec, _, err := c.store.LoadCall(ctx, in.TaskID, in.CallID)
 	if err == nil && rec.Fingerprint != fp {
-		return c.diverge(in, rec.Fingerprint, fp), nil
+		return c.diverge(in.TaskID, in.AttemptID, in.CallID, endpointOf(in.Kind), rec.Fingerprint, fp), nil
 	}
 	return reject(persistence.CodeCallInProgress), nil
 }
 
 // diverge 写入 host 事件 replay_divergence 并返回 409 fingerprint_mismatch。
-func (c *Coordinator) diverge(in Invoke, stored, got string) Result {
+func (c *Coordinator) diverge(taskID, attemptID, callID, endpoint, stored, got string) Result {
 	ctx, cancel := c.opCtx()
 	defer cancel()
-	detail := fmt.Sprintf("endpoint=%s stored_fingerprint=%s request_fingerprint=%s", endpointOf(in.Kind), stored, got)
-	if err := c.events.ReplayDivergence(ctx, in.TaskID, in.AttemptID, in.CallID, detail); err != nil {
-		c.log.Warn("gateway: 写入 replay_divergence 失败", "task_id", in.TaskID, "attempt_id", in.AttemptID,
-			"call_id", in.CallID, "err", err)
+	detail := fmt.Sprintf("endpoint=%s stored_fingerprint=%s request_fingerprint=%s", endpoint, stored, got)
+	if err := c.events.ReplayDivergence(ctx, taskID, attemptID, callID, detail); err != nil {
+		c.log.Warn("gateway: 写入 replay_divergence 失败", "task_id", taskID, "attempt_id", attemptID,
+			"call_id", callID, "err", err)
 	}
 	return reject(persistence.CodeFingerprintMismatch)
 }
@@ -665,7 +699,7 @@ func (c *Coordinator) run(j *job) (out Result, outErr error) {
 	rec := res.Record
 	if res.Existing {
 		if rec.Fingerprint != j.fp {
-			return c.diverge(in, rec.Fingerprint, j.fp), nil
+			return c.diverge(in.TaskID, in.AttemptID, in.CallID, endpointOf(in.Kind), rec.Fingerprint, j.fp), nil
 		}
 		switch rec.State {
 		case StateCompleted:

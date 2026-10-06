@@ -49,6 +49,8 @@ func TestConsumersDoNotDependOnPostgres(t *testing.T) {
 //   - gateway/cache 是共享优化，不记账、不授权（Plan 9）：不导入 net/http（它经 upstream.Kind 间接依赖
 //     net/http，只能按直接导入检查）、persistence 与 gateway/call；传递上也不依赖 persistence 与 call
 //     （call 只经 CacheSource 窄接口使用 cache，不能反向）。
+//   - exec 调度（Plan 15）：gateway/call 只导入 internal/provider 的纯类型，环境、slot 与 exec 事务经窄接口
+//     ExecEnvs、ExecSlots、ExecStore 使用，不直接导入 provider/local、resource、admission、persistence/postgres。
 func TestGatewayLayering(t *testing.T) {
 	forbidDirect(t, "internal/gateway/cache", []string{
 		"net/http", module + "/internal/persistence", module + "/internal/gateway/call",
@@ -56,7 +58,8 @@ func TestGatewayLayering(t *testing.T) {
 	forbid(t, "internal/gateway/cache", []string{
 		module + "/internal/persistence", module + "/internal/gateway/call", module + "/internal/gateway/edge",
 	})
-	forbidDirect(t, "internal/gateway/call", []string{"net/http"})
+	forbidDirect(t, "internal/gateway/call", []string{"net/http", module + "/internal/provider/local", module + "/internal/resource",
+		module + "/internal/admission", module + "/internal/persistence/postgres"})
 	for _, d := range deps(t, "internal/gateway/call") {
 		if first, _, _ := strings.Cut(d, "/"); strings.Contains(first, ".") && !strings.HasPrefix(d, module+"/") {
 			t.Errorf("internal/gateway/call 依赖了标准库与本模块之外的包 %s", d)
