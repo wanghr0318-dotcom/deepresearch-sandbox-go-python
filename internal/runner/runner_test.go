@@ -587,6 +587,10 @@ func TestScenarioFixtures(t *testing.T) {
 	}
 	ran := 0
 	for _, ent := range entries {
+		// task 模式的场景是单个 .json；session 模式的 .jsonl 场景由会话驱动的测试回放（M4 Plan 12）。
+		if filepath.Ext(ent.Name()) != ".json" {
+			continue
+		}
 		raw, err := os.ReadFile(filepath.Join(dir, ent.Name()))
 		if err != nil {
 			t.Fatal(err)
@@ -594,6 +598,10 @@ func TestScenarioFixtures(t *testing.T) {
 		var sc scenario
 		if err := json.Unmarshal(raw, &sc); err != nil {
 			t.Fatalf("%s: %v", ent.Name(), err)
+		}
+		// sub-run 场景需要 runner 的 sub-run 支持（M4 Plan 14 Task 6 加入；届时删除这一行排除）。
+		if strings.HasPrefix(ent.Name(), "subrun_") {
+			continue
 		}
 		ran++
 		t.Run(sc.Name, func(t *testing.T) { replay(t, e, sc) })
