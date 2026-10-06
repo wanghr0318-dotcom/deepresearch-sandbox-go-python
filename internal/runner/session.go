@@ -223,19 +223,38 @@ func (r *Runner) StartIncarnation(ctx context.Context, s IncarnationSpec) (*Inca
 		}
 		// 未送达：Worker 等不到 init，由 T_ready 终止
 	}
-	readyT := time.NewTimer(r.opt.ReadyTimeout)
-	defer readyT.Stop()
-	select {
-	case <-inc.readyCh:
-	case f := <-inc.startFail:
+	startFailed := func(f startFailure) (*Incarnation, error) {
 		if f.violation != "" {
 			return fail(ClassifyInput{Violation: f.violation}, f.violation, fmt.Errorf("runner: 启动阶段协议违规 %s", f.violation))
 		}
 		// ready 之前的 error：Worker 报告启动失败（retryable 只是建议）
 		in := ClassifyInput{Proposal: &TerminalProposal{Kind: protocol.TypeError}, Payload: f.payload}
 		return fail(in, "", fmt.Errorf("runner: Worker 启动失败: %s", f.payload))
+	}
+	readyT := time.NewTimer(r.opt.ReadyTimeout)
+	defer readyT.Stop()
+	select {
+	case <-inc.readyCh:
+	case f := <-inc.startFail:
+		return startFailed(f)
 	case <-inc.exited:
-		return fail(ClassifyInput{}, "", errors.New("runner: Worker 在 ready 之前退出"))
+		// 退出可能晚于（甚至由）处理器记录的启动违规 / ready 之前的 error / ready：处理器先发出通知再终止进程，
+		// 但 select 在多路同时就绪时随机选择，Worker 也可能写完最后一行即退出而该行尚未处理。与 finishRun
+		// 一样先等处理器处理完已接收的行（屏障 A 的期限内必然结束），再按处理器的结论判断，退出只作兜底。
+		select {
+		case <-inc.procDone:
+		case <-ctx.Done():
+			return fail(ClassifyInput{PlatformKill: ctxKillReason(ctx)}, "", ctx.Err())
+		}
+		select {
+		case f := <-inc.startFail:
+			return startFailed(f)
+		default:
+		}
+		if !isClosed(inc.readyCh) {
+			return fail(ClassifyInput{}, "", errors.New("runner: Worker 在 ready 之前退出"))
+		}
+		// 合法的 ready 已处理（之后才退出）：启动本身成功，进程退出由之后的 RunTask/Release 报告
 	case <-readyT.C:
 		return fail(ClassifyInput{PlatformKill: KillReadyTimeout}, "", errors.New("runner: T_ready 内没有 ready"))
 	case <-ctx.Done():

@@ -285,6 +285,7 @@ type fakeProc struct {
 	killOnce           sync.Once
 	done               chan struct{}
 	stdinDone          chan struct{} // stdin 读到 EOF（runner 关闭 stdin）后关闭
+	inited             chan struct{} // 读到 init 后关闭：与真实 Worker 一样，脚本在收到 init 之后才写出
 	status             provider.ExitStatus
 
 	mu        sync.Mutex
@@ -321,6 +322,7 @@ func (p *fakeProc) readStdin() {
 			if first {
 				p.init, first = m, false
 				p.mu.Unlock()
+				close(p.inited)
 				continue
 			}
 			p.all = append(p.all, m)
@@ -337,6 +339,13 @@ func (p *fakeProc) readStdin() {
 
 func (p *fakeProc) run() {
 	_, _ = io.WriteString(p.errW, "fake worker stderr\n")
+	// 先读到 init（或已被终止 / stdin 已关闭）再执行脚本：否则脚本的首行可能在宿主写出 init 之前
+	// 就被处理，会话事件流按 init 之前的事件报告 before_ready（真实 Worker 不会先于 init 写出）
+	select {
+	case <-p.inited:
+	case <-p.kill:
+	case <-p.stdinDone:
+	}
 	var err error
 	for _, s := range p.script {
 		if err = s(p); err != nil {
@@ -372,6 +381,7 @@ func (s *fakeStarter) StartExec(context.Context, string, provider.ExecSpec) (pro
 	p.kill = make(chan struct{})
 	p.done = make(chan struct{})
 	p.stdinDone = make(chan struct{})
+	p.inited = make(chan struct{})
 	go p.readStdin()
 	go p.run()
 	return p, nil
@@ -1924,6 +1934,20 @@ func TestSessionIncarnation(t *testing.T) {
 		}
 		if s.inc != nil || !s.killed() {
 			t.Fatal("启动失败的 Worker 应被终止")
+		}
+	})
+
+	// 回归：Worker 写出违规的 ready 后自行退出时，进程退出与处理器记录的违规几乎同时就绪；StartIncarnation
+	// 不能因 select 选中"退出"而丢掉违规码（曾返回空违规码、按 crashed 分类）。重复多次以覆盖两种先后顺序。
+	t.Run("startup_violation_then_exit", func(t *testing.T) {
+		for i := 0; i < 50; i++ {
+			r := ready(1)
+			r["mode"] = "session"
+			_, err := startSess(t, opt, nil, nil, w(r), exitWith(1))
+			var se *runner.StartError
+			if !errors.As(err, &se) || se.Class != runner.ClassProtocolMismatch || se.Violation != protocol.CodeSessionExtMissing {
+				t.Fatalf("第 %d 次 StartIncarnation 错误 %v", i, err)
+			}
 		}
 	})
 
