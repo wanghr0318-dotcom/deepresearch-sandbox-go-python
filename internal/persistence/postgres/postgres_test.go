@@ -258,7 +258,7 @@ func TestInstallationBootstrapE46(t *testing.T) {
 			t.Fatal(err)
 		}
 		// 还原为只应用了 0001 的旧库
-		if _, err := s.pool.Exec(ctx, undo0008+undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions;
+		if _, err := s.pool.Exec(ctx, undo0009+undo0008+undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions;
 			ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
 			ALTER TABLE installation DROP COLUMN bootstrap_token_hash; DELETE FROM schema_migrations WHERE version >= 2`); err != nil {
 			t.Fatal(err)
@@ -2602,7 +2602,7 @@ func TestMigrationBackfillsBudgets(t *testing.T) {
 	s := newStore(t, Options{})
 	fixture(t, s, "t1")
 	// 还原为只应用了 0001、0002 的旧库：任务 t1 没有预算行
-	if _, err := s.pool.Exec(ctx, undo0008+undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions; ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
+	if _, err := s.pool.Exec(ctx, undo0009+undo0008+undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions; ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
 		DELETE FROM schema_migrations WHERE version >= 3`); err != nil {
 		t.Fatal(err)
 	}
@@ -3119,7 +3119,7 @@ func TestMigration0006(t *testing.T) {
 	t.Run("从 0005 升级", func(t *testing.T) {
 		s := newStore(t, Options{})
 		fixture(t, s, "old")
-		if _, err := s.pool.Exec(ctx, undo0008+undo0007+undo0006); err != nil {
+		if _, err := s.pool.Exec(ctx, undo0009+undo0008+undo0007+undo0006); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := s.pool.Exec(ctx, `INSERT INTO users (username, username_key, password_hash) VALUES ('carol', 'carol', 'h');
@@ -4130,7 +4130,7 @@ func TestMigration0007(t *testing.T) {
 	}
 	gwFixture(t, s, "t1", 1000)
 	beginCall(t, s, "t1", "c1")
-	if _, err := s.pool.Exec(ctx, undo0008+undo0007); err != nil {
+	if _, err := s.pool.Exec(ctx, undo0009+undo0008+undo0007); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Migrate(ctx); err != nil {
@@ -5034,12 +5034,15 @@ func TestToolBudget(t *testing.T) {
 		t.Fatalf("被拒绝的调用不应登记，calls 有 %d 行", n)
 	}
 
-	// 已登记调用的重放不计数，带当前计数。
+	// 并发登记的 30 个调用各自记录不同的计数 1..30；已登记调用的重放不计数，带该调用首次登记时的计数（0009）。
+	if n := count(t, s, "SELECT count(DISTINCT tool_budget_used) FROM calls WHERE task_id = 't1' AND tool_budget_used BETWEEN 1 AND 30"); n != 30 {
+		t.Fatalf("各调用的首次计数应为 1..30 且互不相同，得到 %d 个不同值", n)
+	}
 	var replay string
-	if err := s.pool.QueryRow(ctx, "SELECT call_id FROM calls WHERE task_id = 't1' LIMIT 1").Scan(&replay); err != nil {
+	if err := s.pool.QueryRow(ctx, "SELECT call_id FROM calls WHERE task_id = 't1' AND tool_budget_used = 7").Scan(&replay); err != nil {
 		t.Fatal(err)
 	}
-	if res, err := toolCall(s, "t1", replay, "/v1/search"); err != nil || !res.Existing || res.ToolBudget == nil || res.ToolBudget.Used != 30 {
+	if res, err := toolCall(s, "t1", replay, "/v1/search"); err != nil || !res.Existing || res.ToolBudget == nil || res.ToolBudget.Used != 7 {
 		t.Fatalf("重放 = %+v, %v", res, err)
 	}
 	// 模型调用不计数、不受额度限制，也不带额度。
@@ -5791,7 +5794,7 @@ func TestMigration0008(t *testing.T) {
 	gwFixture(t, s, "t1", 1000)
 	beginCall(t, s, "t1", "c1")
 	mustReserve(t, s, "t1", "c1", 10)
-	if _, err := s.pool.Exec(ctx, undo0008); err != nil {
+	if _, err := s.pool.Exec(ctx, undo0009+undo0008); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Migrate(ctx); err != nil {
@@ -6905,3 +6908,189 @@ func TestInvariantI13(t *testing.T) {
 }
 
 // ==== M4 Plan 14 Task 11 段结束 ====
+
+// ==== M4 真实验收修复（fix-go）：工具额度重放确定、被取代的暂停 turn 收尾 sub-run、migration 0009 ====
+
+// undo0009 把库还原为只应用了 0008 的形状；回滚到更早迁移的测试先执行它。
+const undo0009 = `ALTER TABLE calls DROP COLUMN tool_budget_used;
+	DELETE FROM schema_migrations WHERE version >= 9;
+`
+
+// TestToolBudgetReplayKeepsFirstCount：同 call_id 的重放（completed 后再次请求、复位后接管、重启后）返回该调用首次
+// 登记时的工具调用计数，与之后登记了多少调用、额度是否已用尽无关——Worker 把 X-Agentbox-Tool-Budget 写进提示，
+// 崩溃恢复时重放出的请求体必须与首次相同。0009 之前登记的调用（无记录值）按当前计数返回。
+func TestToolBudgetReplayKeepsFirstCount(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	limit := int64(3)
+	toolTask(t, s, "t1", &limit)
+	for i, id := range []string{"a", "b", "c"} {
+		res, err := toolCall(s, "t1", id, "/v1/search")
+		if err != nil || res.Existing || res.ToolBudget == nil || *res.ToolBudget != (call.ToolBudget{Used: int64(i + 1), Limit: 3}) {
+			t.Fatalf("登记 %s = %+v, %v", id, res, err)
+		}
+	}
+	if _, err := s.CompleteFromCache(ctx, call.CacheCompletion{TaskID: "t1", CallID: "a", AttemptID: "att-t1",
+		ResultSHA256: strings.Repeat("a1", 32), ResultSize: 1}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := toolCall(s, "t1", "d", "/v1/fetch")
+	expectRejected(t, err, persistence.CodeToolBudgetExhausted)
+	if res, err := toolCall(s, "t1", "a", "/v1/search"); err != nil || !res.Existing || res.ToolBudget == nil ||
+		*res.ToolBudget != (call.ToolBudget{Used: 1, Limit: 3}) {
+		t.Fatalf("completed 后重放 a 应带首次的 1/3：%+v, %v", res, err)
+	}
+	if _, err := s.ResetResolving(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := toolCall(s, "t1", "b", "/v1/search"); err != nil || res.Existing || res.ToolBudget == nil ||
+		*res.ToolBudget != (call.ToolBudget{Used: 2, Limit: 3}) {
+		t.Fatalf("复位后接管 b 应带首次的 2/3：%+v, %v", res, err)
+	}
+	s2, err := Open(ctx, Options{DSN: s.opt.DSN})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if res, err := toolCall(s2, "t1", "a", "/v1/search"); err != nil || res.ToolBudget == nil || res.ToolBudget.Used != 1 {
+		t.Fatalf("重启后重放 a = %+v, %v", res, err)
+	}
+	if _, err := s.pool.Exec(ctx, "UPDATE calls SET tool_budget_used = NULL WHERE task_id = 't1' AND call_id = 'c'"); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := toolCall(s, "t1", "c", "/v1/search"); err != nil || res.ToolBudget == nil || res.ToolBudget.Used != 3 {
+		t.Fatalf("无记录值的旧调用按当前计数：%+v, %v", res, err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM budgets WHERE task_id = 't1' AND tool_calls_used = 3"); n != 1 {
+		t.Fatal("重放与接管不应计数")
+	}
+	if res, err := toolCall(s, "t1", "chat-1", "/v1/chat/completions"); err != nil || res.ToolBudget != nil {
+		t.Fatalf("模型调用 = %+v, %v", res, err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM calls WHERE call_id = 'chat-1' AND tool_budget_used IS NULL"); n != 1 {
+		t.Fatal("模型调用不记录工具计数")
+	}
+}
+
+// TestSupersededPausedTurnClosesSubruns：停止后由 attempt 裁决为 paused 的会话 turn（sub-run 保持 started/end_proposed，
+// 留待继续时重新绑定）被新消息取代（D5）：ApplyControl paused → cancelled 在同一事务中把它们收尾为
+// cancelled{task_cancel}，I13 无违反（服务器验收的二进制早于 P14-T11，被取代 turn 的 sub-run 停在 started）。
+func TestSupersededPausedTurnClosesSubruns(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	alice := mustUser(t, s, "alice")
+	liveSession(t, s, "s1", alice)
+	mustTurn(t, s, turnReq("s1", "ta", alice))
+	a1 := turnAttempt("s1", "ta", 1)
+	if _, err := s.CreateAttempt(ctx, a1); err != nil {
+		t.Fatal(err)
+	}
+	mustStartSubrun(t, s, "ta", a1.AttemptID, "st1")
+	mustStartSubrun(t, s, "ta", a1.AttemptID, "st2")
+	if _, err := s.ProposeSubrunEnd(ctx, "ta", a1.AttemptID, "st2", "succeeded", "ok"); err != nil {
+		t.Fatal(err)
+	}
+	pc, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "p-ta", BodyHash: []byte("h"), TaskID: "ta", Desired: "pause"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.FinalizeAttempt(ctx, turnVerdictFor(a1, pc.ControlVersion, "paused", "paused")); err != nil {
+		t.Fatal(err)
+	}
+	if g := subrunRow(t, s, "ta", "st1"); g != "started|"+a1.AttemptID+"|-|||false" {
+		t.Fatalf("暂停裁决不应收尾 st1：%s", g)
+	}
+	releaseIncarnation(t, s, "s1")
+	if r := mustTurn(t, s, turnReq("s1", "tb", alice)); r.SupersededTurnID != "ta" {
+		t.Fatalf("新消息应取代 ta：%+v", r)
+	}
+	cs, err := s.GetControlState(ctx, "ta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ApplyControl(ctx, task.ApplyControl{TaskID: "ta", ControlVersion: cs.ControlVersion, Status: "cancelled",
+		StatusReason: "superseded"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"st1", "st2"} {
+		if g := subrunRow(t, s, "ta", id); g != "cancelled|"+a1.AttemptID+"|-|task_cancel|task_cancel|true" {
+			t.Errorf("取代后 %s = %s", id, g)
+		}
+	}
+	if got := violationsOf(t, s, "I13"); len(got) != 0 {
+		t.Fatalf("I13 违反：%q", got)
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestMigration0009：全新库迁移到 0009；0008 的库中遗留的终态任务的未终态 sub-run（P14-T11 之前的取消路径）在升级时
+// 按 closeOpenSubrunsTx 的规则收尾，I13 由报告违反变为无违反；非终态任务的 sub-run 与已终态的 sub-run 不变。
+func TestMigration0009(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	if n := count(t, s, "SELECT count(*) FROM schema_migrations WHERE version <= 9"); n != 9 {
+		t.Fatalf("应依次应用 0001–0009，得到 %d 个", n)
+	}
+	for _, id := range []string{"t1", "t2", "t3", "t4"} {
+		fixture(t, s, id)
+	}
+	mustStartSubrun(t, s, "t1", "att-t1", "a")
+	mustStartSubrun(t, s, "t1", "att-t1", "b")
+	mustStartSubrun(t, s, "t1", "att-t1", "c")
+	mustStartSubrun(t, s, "t1", "att-t1", "d")
+	if _, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "b", "succeeded", "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RequestSubrunCancel(ctx, "t1", "c", subrun.ReasonDeadline); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RequestSubrunCancel(ctx, "t1", "d", subrun.ReasonOrchestrator); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "d", "cancelled", "x"); err != nil {
+		t.Fatal(err)
+	}
+	mustStartSubrun(t, s, "t2", "att-t2", "a")
+	mustStartSubrun(t, s, "t3", "att-t3", "a")
+	mustStartSubrun(t, s, "t4", "att-t4", "a")
+	// 旧二进制的结果：任务终态而 sub-run 未收尾（直接改写任务状态模拟）。
+	setTask(t, s, "t1", "cancelled", "cancelled")
+	setTask(t, s, "t2", "failed", "worker_error")
+	setTask(t, s, "t3", "succeeded", "succeeded")
+	setTask(t, s, "t4", "paused", "paused")
+	if got := violationsOf(t, s, "I13"); len(got) != 5 {
+		t.Fatalf("升级前 I13 应报告 5 个未收尾的 sub-run：%q", got)
+	}
+	if _, err := s.pool.Exec(ctx, undo0009); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for k, w := range map[string]string{
+		"t1/a": "cancelled|att-t1|-|task_cancel|task_cancel|true",
+		"t1/b": "cancelled|att-t1|-|task_cancel|task_cancel|true",
+		"t1/c": "cancelled|att-t1|-|task_cancel|deadline|true",
+		"t1/d": "cancelled|att-t1|-||orchestrator|true",
+		"t2/a": "failed|att-t2|-|task_failed||true",
+		"t3/a": "failed|att-t3|-|not_completed_at_result||true",
+		"t4/a": "started|att-t4|-|||false",
+	} {
+		taskID, id, _ := strings.Cut(k, "/")
+		if g := subrunRow(t, s, taskID, id); g != w {
+			t.Errorf("升级后 %s = %s，期望 %s", k, g, w)
+		}
+	}
+	if got := violationsOf(t, s, "I13"); len(got) != 0 {
+		t.Fatalf("升级后 I13 违反：%q", got)
+	}
+	toolTask(t, s, "t5", nil)
+	if res, err := toolCall(s, "t5", "x", "/v1/search"); err != nil || res.ToolBudget != nil {
+		t.Fatalf("升级后登记 = %+v, %v", res, err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM calls WHERE call_id = 'x' AND tool_budget_used = 1"); n != 1 {
+		t.Fatal("不限额的任务也记录工具计数")
+	}
+}
+
+// ==== M4 真实验收修复段结束 ====

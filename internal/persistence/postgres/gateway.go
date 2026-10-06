@@ -145,7 +145,9 @@ func (s *Store) CheckAccess(ctx context.Context, taskID, attemptID, subrunID str
 // 工具额度（/v1/search、/v1/fetch）：在同一 Tx1 中先锁 budgets（锁顺序 budgets → calls）；需要新插入 calls 行时，
 // tool_call_limit 非空且 tool_calls_used ≥ tool_call_limit 为 ErrRejected(tool_budget_exhausted)（不插入调用），否则
 // tool_calls_used + 1。同 call_id 的重放与复位后接管不计数；缓存命中与合并在其后的 Tx2 完成，此处已计数。
-// 有上限时结果（含拒绝）带 ToolBudget：新登记后的计数，或已有记录时的当前值。
+// 新插入的行在 calls.tool_budget_used 记录登记后的计数（migration 0009）。有上限时结果（含拒绝）带 ToolBudget：
+// 新登记后的计数；已有记录（重放、复位后接管、提交结果未知后的重跑）时为该调用首次登记时记录的计数，与之后登记了
+// 多少调用无关——Worker 把它写进提示，重放必须得到相同的值（0009 之前登记、没有记录值的调用为当前计数）。
 func (s *Store) BeginCall(ctx context.Context, r call.BeginCallRequest) (call.BeginCallResult, error) {
 	if r.TaskID == "" || r.CallID == "" || r.AttemptID == "" || r.Fingerprint == "" || r.Endpoint == "" || r.Deadline <= 0 {
 		return call.BeginCallResult{}, invalidf("BeginCall 缺少 task_id、call_id、attempt_id、指纹、端点，或期限不为正")
@@ -182,12 +184,13 @@ func (s *Store) BeginCall(ctx context.Context, r call.BeginCallRequest) (call.Be
 			}
 		}
 		rec, err := scanCall(tx.QueryRow(ctx, `INSERT INTO calls (task_id, call_id, fingerprint, endpoint, state, source,
-				created_at, deadline_at, first_attempt_id, supersedes_call_id, supersede_reason, resolving_since, model, subrun_id)
+				created_at, deadline_at, first_attempt_id, supersedes_call_id, supersede_reason, resolving_since, model, subrun_id,
+				tool_budget_used)
 			VALUES ($1, $2, $3, $4, 'resolving', 'upstream', now(), now() + $5::bigint * interval '1 microsecond', $6, NULLIF($7, ''), NULLIF($8, ''), now(), $9,
-				NULLIF($10, ''))
+				NULLIF($10, ''), $11)
 			ON CONFLICT (task_id, call_id) DO NOTHING RETURNING `+callColumns,
 			r.TaskID, r.CallID, r.Fingerprint, r.Endpoint, r.Deadline.Microseconds(), r.AttemptID, r.SupersedesCallID, r.SupersedeReason,
-			r.Model, r.SubrunID))
+			r.Model, r.SubrunID, toolBudgetUsed(tool, used)))
 		if err == nil {
 			if tool {
 				if err := tx.QueryRow(ctx, "UPDATE budgets SET tool_calls_used = tool_calls_used + 1 WHERE task_id = $1 RETURNING tool_calls_used",
@@ -208,6 +211,16 @@ func (s *Store) BeginCall(ctx context.Context, r call.BeginCallRequest) (call.Be
 		rec = out.Record
 		if err := sameSubrun(rec, r.SubrunID); err != nil {
 			return err
+		}
+		if tool {
+			var first *int64
+			if err := tx.QueryRow(ctx, "SELECT tool_budget_used FROM calls WHERE task_id = $1 AND call_id = $2", r.TaskID, r.CallID).
+				Scan(&first); err != nil {
+				return err
+			}
+			if first != nil {
+				used = *first
+			}
 		}
 		if rec.State == call.StateResolving && rec.ResolvingSince == nil && rec.TriesUsed == 0 && rec.Fingerprint == r.Fingerprint {
 			out.Record, err = scanCall(tx.QueryRow(ctx, `UPDATE calls SET resolving_since = now() WHERE task_id = $1 AND call_id = $2
@@ -231,6 +244,16 @@ func sameSubrun(rec call.CallRecord, subrunID string) error {
 			rec.SubrunID, subrunID)
 	}
 	return nil
+}
+
+// toolBudgetUsed 是新插入的调用行的 tool_budget_used：工具端点为本次登记后的计数（budgets 行已锁，used + 1 即随后
+// UPDATE 的结果），模型调用为 NULL。
+func toolBudgetUsed(tool bool, used int64) *int64 {
+	if !tool {
+		return nil
+	}
+	n := used + 1
+	return &n
 }
 
 // isToolEndpoint 报告端点是否计入每 turn 的工具调用额度（搜索与抓取；模型调用不计）。
