@@ -6587,6 +6587,10 @@ func TestExecCleanupCandidateAndInspect(t *testing.T) {
 		try.CPUUsec == nil || *try.CPUUsec != 250 || try.ExecStartedAt == nil {
 		t.Fatalf("inspect 的 exec try = %+v", try)
 	}
+	// exec 环境同样记录 attempt_id：attempt 行仍只有一行，环境是任务环境（Plan 15 Task 12 发现的重复行）。
+	if len(in.Attempts) != 1 || in.Attempts[0].EnvID != "env-t1" {
+		t.Fatalf("inspect 的 attempts = %+v，期望 1 行、环境 env-t1", in.Attempts)
+	}
 
 	if _, err := s.UpdateCleanup(ctx, resource.CleanupUpdate{EnvID: tr.EnvID, State: resource.CleanupDone}); err != nil {
 		t.Fatal(err)

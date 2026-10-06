@@ -54,7 +54,8 @@ func (s *Store) listTasks(ctx context.Context, op string, owner int64, after str
 	return out, out[len(out)-1].TaskID, nil
 }
 
-// Inspect 读取任务的诊断时间线（实现 api.Store；规格 §14.6）。
+// Inspect 读取任务的诊断时间线（实现 api.Store；规格 §14.6）。attempt 行的环境是它的任务环境：exec 环境同样记录
+// attempt_id，但出现在调用的 try 中（TryView.EnvID），不参与 attempt 的连接（否则每个 exec 环境复制一行 attempt）。
 func (s *Store) Inspect(ctx context.Context, taskID string) (api.Inspection, error) {
 	task, err := s.GetTask(ctx, taskID)
 	if err != nil {
@@ -65,7 +66,7 @@ func (s *Store) Inspect(ctx context.Context, taskID string) (api.Inspection, err
 		rows, err := q.Query(ctx, `SELECT a.attempt_id, a.status, a.outcome_class, a.attempt_no, a.exit_code, a.exit_signal,
 				a.oom_kill_delta, a.platform_killed, COALESCE(e.env_id, ''), COALESCE(e.status, ''), COALESCE(e.cleanup_state, ''),
 				e.stopped_at, COALESCE(e.cleanup_tries, 0), COALESCE(e.cleanup_error, '')
-			FROM attempts a LEFT JOIN environments e ON e.attempt_id = a.attempt_id
+			FROM attempts a LEFT JOIN environments e ON e.attempt_id = a.attempt_id AND e.kind <> 'exec'
 			WHERE a.task_id = $1 ORDER BY a.attempt_no`, taskID)
 		if err != nil {
 			return err

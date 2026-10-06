@@ -25,7 +25,8 @@
 | 用户账号与 DeepResearch 助手（M3 Plan 11） | **已验收**（2026-10-06，[账号验收](docs/evidence/2026-10-06-m3-accounts.md)） | 开放注册、服务端会话、用户只见自己的研究、内部细节仅运维可见；`internal/account`、`/auth/*`、`POST /research`、`agentbox user` |
 | 搜索供应商 serper（Google 结果）与按端点的调用期限 | **已验收**（2026-10-06） | `--search-provider serper`；`--call-deadline`（120 s）、`--model-call-deadline`（300 s） |
 | 会话后端：每会话一个长期 incarnation（冻结、驱逐、冷恢复、关闭）、turn 与工具额度（M4 Plan 12） | **已实现**（以脚本化会话 Worker 验收，待 Plan 13 联调） | `internal/session`、会话 API 与整会话 SSE、`--turn-tool-budget`、`--session-idle-freeze`、`--session-evict-after`、`--session-worker-argv`；E28–E33 在真实沙箱中以 root 运行，见"会话"；面向用户的会话 Agent 与聊天界面是 Plan 13 |
-| exec 沙箱、sub-run | 进行中 | M4 Plan 14、15 |
+| 独立 exec 沙箱与沙箱加固（M4 Plan 15） | **已实现**（WSL2 真实沙箱 root 验收；服务器验收与 CI 待协调者联合验收） | `POST /v1/exec`、`--exec-*` 标志、Worker 工具 `run_python`；E35–E38 在真实沙箱中以 root 通过，E39 由 provider 测试覆盖，见"代码执行沙箱"与[验收记录](docs/evidence/2026-10-06-m4-exec-hardening.md) |
+| sub-run | 进行中 | M4 Plan 14 |
 
 ## 现在可以运行的命令
 
@@ -226,6 +227,27 @@ CI=true go test -count=1 -run 'Session|ToolBudget' ./tests/e2e/
 CI=true CGO_ENABLED=0 go test -count=1 -p 1 -timeout 60m -run 'E2[89]|E3[0-3]' ./tests/e2e/   # 以 root 运行
 ```
 
+### 代码执行沙箱（M4 Plan 15）
+
+编排 Worker 经 Gateway 的 `POST /v1/exec` 请求运行一段 Python（SDK：`ctx.gateway.exec(step_id, code, inputs=[(sha256, path)], wall_ms=...)`；工具 `run_python` 已在 `agentbox_worker.tools` 中提供，对话 Agent 的默认工具表尚未注册它）。server 为**每次**调用新建一个 exec 环境，运行 `python3 -I -B /in/.agentbox/main.py`（cwd `/out`），收集 `/out` 后销毁环境。
+
+**保证与边界**：
+
+- **单次、无状态**：调用之间不保留任何状态；需要上一次的文件时，把它的输出 sha 作为下一次的 `inputs` 显式传入（输入 blob 须已授权到本任务，放在只读 `/in/<path>`）。
+- **无网络、无 Gateway**：exec 环境的网络命名空间只有 `lo`；不挂载 Gateway socket、不挂载 `/workspace`、不含 `/opt/agentbox`，`/sys` 与 cgroupfs 不挂载；独立的 user namespace 与 UID 范围，seccomp 与编排环境相同。
+- **结果**：`completed`（主进程退出）、`timed_out`（超过 wall，整个执行树被杀死）、`cancelled`（attempt 结束、被替换或任务取消时 exec 总是被终止）、`unknown`（无法确认停止或结果，例如 server 崩溃）。主进程退出后仍在运行的后台进程会被一并停止，`/out` 在执行树清空后才收集；stdout/stderr 各保留前 1 MiB（`*_truncated`）；`/out` 至多收集 256 个普通文件（符号链接、FIFO 与超额文件在 `skipped_outputs` 中报告）。
+- **不保证 exactly-once**：`unknown` 的调用在确认此前的 exec 环境已停止后可以重跑，`cancelled` 的调用由新 attempt 以 `X-Agentbox-Retry: true` 重跑（每调用累计 3 次 try）；**重跑可能产生不同结果并消耗额外配额**。用户取消的任务不会重跑。
+- **配额与默认值**（server 标志，见 `deploy/agentbox.env.example`）：全局 `--exec-slots 4`（0 关闭 exec）、每任务 `--exec-per-task 2`；每任务 50 次、600 CPU 秒、累计 wall 30 min；单次 wall 默认 60 s（上限 300 s）、内存默认 512 MiB（上限 1 GiB）、`pids.max` 128、1 核、`/tmp` 与 `/out` 各 64 MiB（`/out` 1024 inode；单文件上限 64 MiB）；排队至多 60 s。CPU 按 `1 核 × wall × 1.1` 预留，停止后按实测结算，超额后该任务的后续 exec 被阻止。
+- **内存规划**：exec 环境的内存**不计入** `--memory-bytes`（任务环境内存池）；exec 内存总量 = `--exec-slots × --exec-memory-max`（默认 4 × 1 GiB），须与 `--memory-bytes` 一并留出。
+- **隔离强度**：容器级，共享宿主内核。权限边界测试（seccomp 拒绝探针、能力集 {KILL} 与无 ptrace 的回归锁）是回归测试，**不是无逃逸证明**；不应在不可信的多租户场景中依赖它隔离恶意代码。
+- server 启动时检查 exec 模板（宿主 `/usr/bin/python3` 等系统路径）并计算其摘要（进入调用指纹）；缺失时拒绝启动，可用 `--exec-slots 0` 关闭 exec。
+
+exec 的真实沙箱端到端测试（PostgreSQL 与上文相同；以 root、`CGO_ENABLED=0` 运行，约 1 分钟）：
+
+```bash
+CI=true CGO_ENABLED=0 go test -count=1 -p 1 -run 'TestRealExec|TestRealE3[5-8]' ./tests/e2e/   # 以 root 运行
+```
+
 ## 文档
 
 | 文档 | 内容 |
@@ -237,6 +259,7 @@ CI=true CGO_ENABLED=0 go test -count=1 -p 1 -timeout 60m -run 'E2[89]|E3[0-3]' .
 | [持久化设计](docs/design/2026-10-04-m1-4-persistence-design.md)、[安装身份修订](docs/design/2026-10-05-installation-identity-amendment.md) | Plan 4 的设计依据 |
 | [Provider 契约](docs/design/2026-10-05-provider-contract.md) | 环境生命周期的 Go 接口、错误、并发边界；会话环境的冻结、解冻、进程表与恢复暂存（第 10 节） |
 | [M4 计划索引](docs/plans/2026-10-06-m4-index.md)、[Plan 12 会话后端](docs/plans/2026-10-06-m4-12-sessions.md)、[会话后端验收记录](docs/evidence/2026-10-06-m4-sessions.md) | M4 计划、Plan 12/13 共享契约与状态 |
+| [Plan 15 exec 与加固](docs/plans/2026-10-06-m4-15-exec-hardening.md)、[exec 加固验收记录](docs/evidence/2026-10-06-m4-exec-hardening.md) | 独立 exec 沙箱的决定 D1–D16、E34–E39 的证据与边界 |
 | [Plan 2](docs/plans/2026-10-05-m1-2-local-provider.md)、[Plan 5](docs/plans/2026-10-05-m1-5-control-plane.md)、[Plan 6](docs/plans/2026-10-05-m1-6-recovery-entry.md) | M1 第 2 批计划、执行中修订与验收记录 |
 | [M2 计划索引](docs/plans/2026-10-05-m2-index.md)、[Plan 7 Gateway](docs/plans/2026-10-05-m2-7-gateway.md)、[Plan 8 DeepResearch](docs/plans/2026-10-05-m2-8-deepresearch.md) | M2 计划、执行中修订与验收记录 |
 | [M3 工作台验证记录](docs/evidence/2026-10-05-m3-workbench.md) | E26、E27 的自动化证据；浏览器联调待在演示服务器上补入 |
