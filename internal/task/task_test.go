@@ -335,7 +335,7 @@ func TestDecideMatrix(t *testing.T) {
 }
 
 // checkEffects 检查每个决策都遵守共享规则：ApplyControl 的目标状态等于 ControlTransition 的结果；
-// 判决满足 VerdictAllowed，not_before 只用于回到 queued，终态事件为 task_terminal。
+// 判决满足 VerdictAllowedReason（与 Store 的校验相同），not_before 只用于回到 queued，终态事件为 task_terminal。
 func checkEffects(t *testing.T, prev State, d Decision) {
 	t.Helper()
 	status := prev.TaskStatus
@@ -348,7 +348,7 @@ func checkEffects(t *testing.T, prev State, d Decision) {
 			status = e.Status
 		case Finalize:
 			v := e.Verdict
-			if !VerdictAllowed(d.Next.Desired, v.TaskStatus) || v.ControlVersion != d.Next.ControlVersion {
+			if !VerdictAllowedReason(d.Next.Desired, v.TaskStatus, v.TaskStatusReason) || v.ControlVersion != d.Next.ControlVersion {
 				t.Fatalf("判决 %s 不符合 desired = %s（控制版本 %d/%d）", v.TaskStatus, d.Next.Desired, v.ControlVersion, d.Next.ControlVersion)
 			}
 			if (v.NotBefore != nil) != (v.TaskStatus == "queued") {
@@ -1026,6 +1026,9 @@ func (m *memStore) CreateAttempt(_ context.Context, a NewAttempt) (Attempt, erro
 		return *at, nil
 	}
 	ts := m.tasks[a.TaskID]
+	if ts.SessionID != "" && (a.SessionID != ts.SessionID || a.IncarnationID == "") { // 会话 turn 须经授予（Task 4）
+		return Attempt{}, persistence.ErrInvalid
+	}
 	if ts.Status != "queued" || ts.Desired != "run" {
 		return Attempt{}, &persistence.RejectedError{Code: persistence.CodeNotRunnable}
 	}
@@ -1097,7 +1100,29 @@ func (m *memStore) FinalizeAttempt(_ context.Context, v Verdict) (Attempt, error
 	at.Status, at.OutcomeClass = "ended", v.OutcomeClass
 	ts.Status, ts.StatusReason, ts.NotBefore = v.TaskStatus, v.TaskStatusReason, v.NotBefore
 	ts.AppliedControlVersion = max(ts.AppliedControlVersion, v.ControlVersion)
+	if ts.SessionID != "" { // 会话 turn：成功推进指针到新 checkpoint，其余保持 base
+		at.CommittedSessionCheckpointID = "sc-base"
+		if v.TaskStatus == "succeeded" {
+			at.CommittedSessionCheckpointID = "sc-" + v.AttemptID
+		}
+	}
 	return *at, nil
+}
+
+// FailQueuedTurn 实现 TurnStore（与 postgres 相同的前置条件）。
+func (m *memStore) FailQueuedTurn(_ context.Context, taskID, reason string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.log.add("fail_turn:%s:%s", taskID, reason)
+	ts := m.tasks[taskID]
+	switch {
+	case ts.Status == "failed" && ts.StatusReason == reason:
+		return nil
+	case ts.Status != "queued":
+		return &persistence.RejectedError{Code: persistence.CodeNotRunnable}
+	}
+	ts.Status, ts.StatusReason = "failed", reason
+	return nil
 }
 
 func (m *memStore) LoadTask(_ context.Context, taskID string) (TaskState, error) {
@@ -1340,6 +1365,7 @@ type actorHarness struct {
 	env    *fkEnv
 	rn     *fkRunner
 	acc    *FakeAccess
+	sess   *fkSession
 	ctx    context.Context
 	cancel context.CancelFunc
 	actor  *Actor
@@ -1372,7 +1398,7 @@ func newActorHarness(t *testing.T, tasks ...TaskState) *actorHarness {
 	h := &actorHarness{t: t, clk: clk, log: log, st: newMemStore(log, clk, tasks...),
 		adm: &fkAdmission{log: log, clk: clk, held: map[uint64]bool{}},
 		env: &fkEnv{log: log, clk: clk, acc: acc}, rn: &fkRunner{log: log, runs: make(chan *fkRun, 8)},
-		acc: acc, fatal: make(chan error, 8)}
+		acc: acc, sess: &fkSession{log: log}, fatal: make(chan error, 8)}
 	h.ctx, h.cancel = context.WithCancel(context.Background())
 	t.Cleanup(func() {
 		h.cancel()
@@ -1391,6 +1417,7 @@ func (h *actorHarness) deps() Deps {
 	var mu sync.Mutex
 	n := 0
 	return Deps{Store: h.st, Admission: h.adm, Env: h.env, Runner: h.rn, Access: logAccess{h.acc, h.log, h.bindErr}, Clock: h.clk,
+		Session: h.sess,
 		IDs: func() string {
 			mu.Lock()
 			defer mu.Unlock()
@@ -2131,3 +2158,251 @@ func TestActorStopBlockedAccountsUnrecordedRunTime(t *testing.T) {
 		t.Errorf("OnStopRecorded 调用 = %v，期望同一事实一次失败、一次成功", got)
 	}
 }
+
+// ==== M4 Plan 12 Task 7：会话 turn 的授予与交还 ====
+
+// fkSession 是 SessionGate 的替身：Grant 依次授予 inc-<n>/senv-<n>（grantErr 非空时依次返回其中的错误）；Handoff
+// 记录交还并依次返回 reports（用完后为已记录）。
+type fkSession struct {
+	log      *fkLog
+	mu       sync.Mutex
+	n        int
+	grantErr []error
+	reports  []StopReport
+	handoffs []SessionHandoff
+}
+
+func (f *fkSession) Grant(ctx context.Context, sessionID, taskID string) (SessionGrant, error) {
+	f.mu.Lock()
+	f.n++
+	n := f.n
+	var err error
+	if len(f.grantErr) > 0 {
+		err, f.grantErr = f.grantErr[0], f.grantErr[1:]
+	}
+	f.mu.Unlock()
+	f.log.add("grant:%s:%s:%d", sessionID, taskID, n)
+	if err != nil {
+		return SessionGrant{}, err
+	}
+	return SessionGrant{IncarnationID: fmt.Sprintf("inc-%d", n), EnvID: fmt.Sprintf("senv-%d", n)}, ctx.Err()
+}
+
+func (f *fkSession) Handoff(_ context.Context, sessionID string, h SessionHandoff) (StopReport, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.handoffs = append(f.handoffs, h)
+	f.log.add("handoff:%s:%s:%s destroy=%v verdict=%s committed=%s", sessionID, h.AttemptID, h.EnvID, h.Destroy, h.Verdict,
+		h.CommittedSessionCheckpointID)
+	if len(f.reports) > 0 {
+		r := f.reports[0]
+		f.reports = f.reports[1:]
+		return r, nil
+	}
+	return StopReport{Stopped: true, Recorded: true}, nil
+}
+
+func (f *fkSession) all() []SessionHandoff {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]SessionHandoff(nil), f.handoffs...)
+}
+
+func turnTask(id string) TaskState {
+	ts := queuedTask(id)
+	ts.SessionID = "s1"
+	return ts
+}
+
+func turnState() State {
+	s := base()
+	s.SessionID = "s1"
+	return s
+}
+
+func awaitingInput() Outcome {
+	return Outcome{Class: ClassAwaitingInput, ProposalKind: "awaiting_input"}
+}
+
+// Decide 的会话路径：槽位 → 授予 → 以授予的环境创建 attempt → 不建环境直接启动；正常结果先裁决、裁决提交后才交还
+// （Release，带提交后的会话指针）；故障立即交还销毁；awaiting_input 裁决为 paused/awaiting_input 并经 Release 交还。
+func TestDecideSessionTurnPath(t *testing.T) {
+	s, fx := run(t, turnState(), Tick{}, SlotGranted{})
+	if kinds(fx) != "RequestSlot,RequestSessionGrant" || !s.SessionRequested {
+		t.Fatalf("授予之前不应创建 attempt：%s", kinds(fx))
+	}
+	d := mustDecide(t, s, SessionGranted{IncarnationID: "inc-1", EnvID: "senv-1"})
+	ca, ok := d.Effects[0].(CreateAttempt)
+	if kinds(d.Effects) != "CreateAttempt" || !ok || ca.Session == nil || *ca.Session != (SessionGrant{IncarnationID: "inc-1", EnvID: "senv-1"}) {
+		t.Fatalf("授予后应以授予的 incarnation 创建 attempt：%+v", d.Effects)
+	}
+	s, fx = run(t, d.Next, AttemptCreated{AttemptID: "a1", EnvID: "senv-1", Status: "starting"})
+	if kinds(fx) != "StartWorker" || attStatus(s) != "handshaking" {
+		t.Fatalf("会话 turn 不创建任务环境：%s", kinds(fx))
+	}
+	running, _ := run(t, s, WorkerStarted{AttemptID: "a1", EnvID: "senv-1"})
+
+	for _, tc := range []struct {
+		name     string
+		o        Outcome
+		status   string
+		reason   string
+		early    bool // 裁决之前即交还销毁
+		verdict  string
+		destroys bool
+	}{
+		{"成功", success(), "succeeded", ClassSucceeded, false, "succeeded", false},
+		{"awaiting_input", awaitingInput(), "paused", ReasonAwaitingInput, false, "paused", false},
+		{"业务错误", Outcome{Class: "worker_error", ProposalKind: "error"}, "failed", "worker_error", false, "failed", false},
+		{"崩溃（故障重试）", crash(), "queued", "crashed_signal", true, "failed", true},
+		{"协议违规", Outcome{Class: "protocol_violation", ProposalKind: "result"}, "failed", "protocol_violation", true, "failed", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := mustDecide(t, running, AttemptFinished{AttemptID: "a1", EnvID: "senv-1", Outcome: tc.o})
+			v := finalizeOf(t, d.Effects)
+			if v.TaskStatus != tc.status || v.TaskStatusReason != tc.reason {
+				t.Fatalf("判决 = %s/%s", v.TaskStatus, v.TaskStatusReason)
+			}
+			if stop, ok := firstStop(d.Effects); ok != tc.early || (ok && (stop.Session == nil || !stop.Session.Destroy)) {
+				t.Fatalf("裁决之前的交还 = %+v（%v），期望 %v 且为销毁", stop, ok, tc.early)
+			}
+			d2 := mustDecide(t, d.Next, VerdictCommitted{Verdict: v, CommittedSessionCheckpointID: "sc-9"})
+			stop, ok := firstStop(d2.Effects)
+			if ok == tc.early {
+				t.Fatalf("裁决提交后的交还 = %s（已提前交还：%v）", kinds(d2.Effects), tc.early)
+			}
+			if !tc.early {
+				h := stop.Session
+				if h == nil || h.Destroy != tc.destroys || h.Verdict != tc.verdict || h.CommittedSessionCheckpointID != "sc-9" ||
+					h.AttemptID != "a1" || h.EnvID != "senv-1" || !has[RevokeAccess](d2.Effects) {
+					t.Fatalf("交还 = %+v（%s）", h, kinds(d2.Effects))
+				}
+			}
+			n := mustDecide(t, d2.Next, EnvStopped{AttemptID: "a1", EnvID: "senv-1"})
+			if !has[ReleaseSlot](n.Effects) {
+				t.Fatalf("交还确认后应归还 run slot：%s", kinds(n.Effects))
+			}
+		})
+	}
+}
+
+// 授予失败：会话不可用 → 没有 attempt 的 turn 失败；授予等待期间取消 → 撤回申请，结果到来时归还槽位；暂时失败退避。
+func TestDecideSessionUnavailableAndWithdraw(t *testing.T) {
+	s, _ := run(t, turnState(), Tick{}, SlotGranted{})
+	n, fx := run(t, s, SessionUnavailable{Err: fmt.Errorf("适配: %w", ErrSessionUnavailable)})
+	if kinds(fx) != "ReleaseSlot,FailTurn" || n.TaskStatus != "failed" || fx[1].(FailTurn).Reason != ReasonSessionUnavailable {
+		t.Fatalf("会话不可用：%s，状态 %s", kinds(fx), n.TaskStatus)
+	}
+
+	n, fx = run(t, s, ControlChanged{Desired: "cancel", ControlVersion: 2})
+	if !has[WithdrawSessionGrant](fx) || n.TaskStatus != "cancelled" {
+		t.Fatalf("等待授予时取消应撤回申请：%s，状态 %s", kinds(fx), n.TaskStatus)
+	}
+	n, fx = run(t, n, SessionUnavailable{Err: context.Canceled})
+	if kinds(fx) != "ReleaseSlot" || n.SlotHeld {
+		t.Fatalf("撤回的结果应只归还槽位：%s", kinds(fx))
+	}
+
+	n, fx = run(t, s, SessionUnavailable{Err: errors.New("暂时失败")})
+	if kinds(fx) != "ReleaseSlot,WakeAt" || n.TaskStatus != "queued" || n.NotBefore == nil {
+		t.Fatalf("暂时失败应退避后重新申请：%s", kinds(fx))
+	}
+	if _, err := Decide(base(), SessionGranted{IncarnationID: "i", EnvID: "e"}); err == nil {
+		t.Errorf("没有申请时的授予应不合法")
+	}
+}
+
+// task actor 的会话 turn：不调用 CreateEnv 与 Access.Bind；授予在 CreateAttempt 之前，attempt 使用授予的 incarnation
+// 环境；成功裁决提交后才交还（Destroy=false，带提交后的会话指针），交还确认后才归还槽位。
+func TestActorSessionTurnUsesGrantAndHandoff(t *testing.T) {
+	h := newActorHarness(t, turnTask("t1"))
+	h.spawn("t1")
+	r := h.nextRun()
+	if r.spec.EnvID != "senv-1" || r.attemptID() != "id-1" {
+		t.Fatalf("RunSpec = %+v", r.spec)
+	}
+	r.ready()
+	r.finish(success())
+	h.waitDone()
+	h.before("acquire:1", "grant:s1:t1:1")
+	h.before("grant:s1:t1:1", "create_attempt:id-1")
+	h.before("finalize:id-1:succeeded", "handoff:s1:id-1:senv-1 destroy=false verdict=succeeded committed=sc-id-1")
+	h.before("revoke_db:id-1", "handoff:")
+	h.before("handoff:", "release:1")
+	if h.log.count("create_env") != 0 || h.log.count("bind:") != 0 || h.log.count("stop:") != 0 {
+		t.Errorf("会话 turn 不应创建、绑定或停止任务环境；日志: %v", h.log.all())
+	}
+	created, _, _, _ := h.st.snapshot()
+	if len(created) != 1 || created[0].SessionID != "s1" || created[0].IncarnationID != "inc-1" || created[0].EnvID != "senv-1" {
+		t.Errorf("attempt 应带授予的 incarnation：%+v", created)
+	}
+}
+
+// Worker 崩溃：立即交还销毁（Destroy=true）；交还确认（Recorded）之后才归还槽位、重新申请授予，并以 RetryFault 创建
+// 新 attempt。
+func TestActorSessionTurnCrashDestroysBeforeRetry(t *testing.T) {
+	h := newActorHarness(t, turnTask("t1"))
+	h.sess.reports = []StopReport{{Stopped: true}} // 第一次交还未记录：退避重试
+	h.spawn("t1")
+	r := h.nextRun()
+	r.ready()
+	r.finish(crash())
+	h.advanceUntil("交还重试并确认", 250*time.Millisecond, h.logged("handoff:", 2))
+	h.advanceUntil("重新申请授予", 250*time.Millisecond, h.logged("grant:s1:t1:2", 1))
+	r2 := h.nextRun()
+	if r2.spec.EnvID != "senv-2" {
+		t.Fatalf("重试应在新授予的 incarnation 中：%+v", r2.spec)
+	}
+	if hs := h.sess.all(); len(hs) != 2 || !hs[0].Destroy || !hs[1].Destroy {
+		t.Fatalf("崩溃应交还销毁：%+v", hs)
+	}
+	if i, j := h.log.index("handoff:", 2), h.log.index("release:1", 1); j < i {
+		t.Errorf("交还确认之前不应归还槽位；日志: %v", h.log.all())
+	}
+	if i, j := h.log.index("handoff:", 2), h.log.index("grant:s1:t1:2", 1); j < i {
+		t.Errorf("交还确认之后才重新申请授予；日志: %v", h.log.all())
+	}
+	if created, _, _, _ := h.st.snapshot(); len(created) != 2 || created[1].Retry != RetryFault || created[1].IncarnationID != "inc-2" {
+		t.Errorf("重试 attempt = %+v", created)
+	}
+	r2.ready()
+	r2.finish(success())
+	h.waitDone()
+}
+
+// awaiting_input：turn 进入 paused/awaiting_input，经 Release 交还（verdict = paused），并归还 run slot；actor 等待回答。
+func TestActorSessionTurnAwaitingInputReleasesSlot(t *testing.T) {
+	h := newActorHarness(t, turnTask("t1"))
+	h.spawn("t1")
+	r := h.nextRun()
+	r.ready()
+	r.finish(awaitingInput())
+	h.waitFor("归还 run slot", h.logged("release:1", 1))
+	if ts := h.st.task("t1"); ts.Status != "paused" || ts.StatusReason != ReasonAwaitingInput {
+		t.Fatalf("turn = %s/%s", ts.Status, ts.StatusReason)
+	}
+	if hs := h.sess.all(); len(hs) != 1 || hs[0].Destroy || hs[0].Verdict != "paused" || hs[0].CommittedSessionCheckpointID != "sc-base" {
+		t.Fatalf("交还 = %+v", hs)
+	}
+	select {
+	case <-h.actor.Done():
+		t.Fatalf("paused 的 turn 的 actor 不应退出")
+	default:
+	}
+}
+
+// 会话不可用：没有 attempt 的 turn 失败（failed/session_unavailable），槽位归还，actor 退出。
+func TestActorSessionUnavailableFailsTurn(t *testing.T) {
+	h := newActorHarness(t, turnTask("t1"))
+	h.sess.grantErr = []error{fmt.Errorf("会话 s1: %w", ErrSessionUnavailable)}
+	h.spawn("t1")
+	h.waitDone()
+	if ts := h.st.task("t1"); ts.Status != "failed" || ts.StatusReason != ReasonSessionUnavailable {
+		t.Fatalf("turn = %s/%s", ts.Status, ts.StatusReason)
+	}
+	if h.log.count("create_attempt") != 0 || h.log.count("fail_turn:t1:session_unavailable") != 1 || h.log.count("release:1") != 1 {
+		t.Errorf("日志: %v", h.log.all())
+	}
+}
+
+// ==== M4 Plan 12 Task 7 段结束 ====

@@ -5642,3 +5642,46 @@ func TestSubrunReserveConcurrent(t *testing.T) {
 }
 
 // ==== M4 Plan 14 Task 4 段结束 ====
+
+// ==== M4 Plan 12 Task 7：会话 turn 没有 attempt 即失败（task.TurnStore） ====
+
+// TestFailQueuedTurn：会话不可用时 queued 的 turn 失败（status_reason = session_unavailable），同事务清除它对会话的
+// 占用、追加 task_terminal（会话序号连续）；重跑幂等；非 queued 为 not_runnable。
+func TestFailQueuedTurn(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	alice := mustUser(t, s, "alice")
+	liveSession(t, s, "s1", alice)
+	mustTurn(t, s, turnReq("s1", "ta", alice))
+	// 故障重试之后的 turn 仍占用会话（current_task_id），恢复两次失败后由 task actor 裁决为失败。
+	if _, err := s.pool.Exec(ctx, "UPDATE sessions SET current_task_id = 'ta' WHERE session_id = 's1'"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := s.FailQueuedTurn(ctx, "ta", task.ReasonSessionUnavailable); err != nil {
+			t.Fatalf("第 %d 次 FailQueuedTurn: %v", i+1, err)
+		}
+	}
+	var status, reason string
+	var terminal int
+	if err := s.pool.QueryRow(ctx, `SELECT t.status, t.status_reason,
+			(SELECT count(*) FROM events e WHERE e.task_id = t.task_id AND e.type = 'task_terminal')
+		FROM tasks t WHERE t.task_id = 'ta'`).Scan(&status, &reason, &terminal); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" || reason != task.ReasonSessionUnavailable || terminal != 1 {
+		t.Fatalf("turn = %s/%s，task_terminal 事件 %d 条", status, reason, terminal)
+	}
+	if got := sessionRow(t, s, "s1"); got != "idle|-|-|-|0|idle" {
+		t.Fatalf("失败的 turn 应不再占用会话：%s", got)
+	}
+	expectSessionSeqContiguous(t, s, "s1")
+
+	mustTurn(t, s, turnReq("s1", "tb", alice))
+	setTask(t, s, "tb", "paused", "paused")
+	err := s.FailQueuedTurn(ctx, "tb", task.ReasonSessionUnavailable)
+	expectRejected(t, err, persistence.CodeNotRunnable)
+	expectNoDBViolations(t, s)
+}
+
+// ==== M4 Plan 12 Task 7 段结束 ====

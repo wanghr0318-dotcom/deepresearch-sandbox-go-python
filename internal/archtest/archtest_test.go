@@ -108,11 +108,13 @@ func TestDecisionCodeHasNoSideEffectDeps(t *testing.T) {
 
 // TestSessionDecisionCodeDeps：规则 2 用于 session（M4 Plan 12）——session 的决策代码（Decide）与 actor 同包，
 // 只经窄接口（session.Store、provider 契约等）产生副作用：不依赖 HTTP、Redis、PostgreSQL 驱动与进程，也不依赖
-// 低层实现（provider/local、sandbox、cgroup、rootfs）。
+// 低层实现（provider/local、sandbox、cgroup、rootfs）。session actor（Plan 12 Task 7）经窄接口使用 runner 与 Gateway
+// 入口，同样不得导入 internal/runner 与 internal/gateway/*（装配在 internal/app）。
 func TestSessionDecisionCodeDeps(t *testing.T) {
 	forbid(t, "internal/session", []string{
 		"net/http", "os/exec", "github.com/jackc/pgx", "github.com/redis",
 		module + "/internal/provider/local", module + "/internal/sandbox", module + "/internal/cgroup", module + "/internal/rootfs",
+		module + "/internal/runner", module + "/internal/gateway",
 	})
 }
 
