@@ -27,6 +27,7 @@ from agentbox_worker.errors import (
     CallDivergence,
     CallInProgress,
     GatewayError,
+    ToolBudgetExhausted,
 )
 
 DEFAULT_SOCKET_PATH = "/run/agentbox/gateway.sock"
@@ -48,6 +49,9 @@ ENDPOINTS: dict[str, str] = {
 }
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+# 工具额度头（M4）：search/fetch 的每个成功响应带 "<used>/<limit>"
+TOOL_BUDGET_HEADER = "x-agentbox-tool-budget"
+_TOOL_BUDGET = re.compile(r"(\d{1,9})/(\d{1,9})")
 
 
 class CallIds:
@@ -98,6 +102,8 @@ class GatewayResult:
     blob_sha256: str | None
     replayed: bool
     status: int
+    # X-Agentbox-Tool-Budget 的 (used, limit)；无头或格式错为 None（调用方按本地计数）
+    tool_budget: tuple[int, int] | None = None
 
 
 class _UnixHTTPConnection(http.client.HTTPConnection):
@@ -151,7 +157,15 @@ def _error_from(status: int, data: bytes) -> GatewayError:
         return CallDivergence(status, code, message)
     if status == 409 and code == "call_in_progress":
         return CallInProgress(status, code, message)
+    if status == 429 and code == "tool_budget_exhausted":
+        return ToolBudgetExhausted(status, code, message)
     return GatewayError(status, code, message)
+
+
+def _tool_budget(raw: str | None) -> tuple[int, int] | None:
+    """解析 X-Agentbox-Tool-Budget: <used>/<limit>；缺失或格式错误为 None。"""
+    m = _TOOL_BUDGET.fullmatch(raw.strip()) if raw else None
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def default_timeout_s() -> float:
@@ -198,27 +212,40 @@ class GatewayClient:
     def chat(
         self,
         step_id: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         model: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
     ) -> GatewayResult:
         """model 为 None 时不写入请求体（Gateway 用服务端默认模型）；给出时须在服务端
         声明的白名单中，否则为 400 unsupported_model。模型名进入调用指纹：恢复后重发
-        同一调用须给出同一模型。"""
-        body = self.chat_body(messages, model=model, max_tokens=max_tokens, temperature=temperature)
+        同一调用须给出同一模型。tools/tool_choice 为 OpenAI 兼容的函数调用参数，None 时不写入。"""
+        body = self.chat_body(
+            messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
         return self._call("chat", self.call_ids.next(step_id, "chat"), body, {})
 
     @staticmethod
     def chat_body(
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         *,
         model: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
     ) -> dict[str, Any]:
-        """chat 的请求体（取代重发须发送与原调用相同的请求体）。"""
+        """chat 的请求体（取代重发须发送与原调用相同的请求体）。
+
+        值为 None 的可选字段不写入，故不带工具的调用与之前的请求体（调用指纹）相同。"""
         body: dict[str, Any] = {"messages": messages}
         if model is not None:
             body["model"] = model
@@ -226,6 +253,10 @@ class GatewayClient:
             body["max_tokens"] = max_tokens
         if temperature is not None:
             body["temperature"] = temperature
+        if tools is not None:
+            body["tools"] = tools
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
         return body
 
     def search(
@@ -306,7 +337,8 @@ class GatewayClient:
         if blob is not None and not _SHA256.fullmatch(blob):
             raise GatewayError(resp.status, "invalid_response", f"X-Agentbox-Blob 不合法：{blob!r}")
         replayed = resp.headers.get("x-agentbox-replayed", "").lower() == "true"
-        return GatewayResult(call_id, self._json(resp), blob, replayed, resp.status)
+        budget = _tool_budget(resp.headers.get(TOOL_BUDGET_HEADER))
+        return GatewayResult(call_id, self._json(resp), blob, replayed, resp.status, budget)
 
     @staticmethod
     def _json(resp: _Response) -> dict:

@@ -59,6 +59,10 @@ class BudgetExhausted(GatewayError):
     """402 budget_exhausted / budget_insufficient_for_request（规格 §9.6：不等于任务终止）。"""
 
 
+class ToolBudgetExhausted(GatewayError):
+    """429 tool_budget_exhausted：本轮 web_search + web_fetch 已达上限（Gateway 计数）。"""
+
+
 class CallDivergence(GatewayError):
     """409 fingerprint_mismatch：同一 call id 的请求内容与已记录的不同（规格 §9.4）。
 

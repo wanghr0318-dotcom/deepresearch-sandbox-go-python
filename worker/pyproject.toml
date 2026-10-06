@@ -101,3 +101,26 @@ type = "forbidden"
 source_modules = ["deepresearch"]
 forbidden_modules = ["socket"]
 allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Agent 工具不碰数据库、HTTP 客户端与子进程（含间接导入）"
+type = "forbidden"
+source_modules = ["agentbox_worker.tools"]
+forbidden_modules = [
+  "sqlite3",
+  "psycopg",
+  "redis",
+  "requests",
+  "httpx",
+  "urllib",
+  "subprocess",
+  "multiprocessing",
+]
+
+[[tool.importlinter.contracts]]
+# 工具经 SDK 的 Gateway 客户端访问外部（其内部使用 AF_UNIX），故只禁止直接导入
+name = "Agent 工具不直接使用 socket（网络只经 SDK 的 Gateway 客户端）"
+type = "forbidden"
+source_modules = ["agentbox_worker.tools"]
+forbidden_modules = ["socket"]
+allow_indirect_imports = true
