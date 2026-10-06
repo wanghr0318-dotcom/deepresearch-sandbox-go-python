@@ -2263,7 +2263,8 @@ func subrunWorker(dataDir string, rec *subrunRec, fixture subrunScenario) fake.P
 //     st4 取消后崩溃（E40）；新 attempt 的 init.resume.subruns = [st1 completed+result_ref, st2 started, st3 started,
 //     st4 cancelled]，st2、st3 绑定到新 attempt，st4 不重新绑定；成功裁决把仍未终态的 st2、st3 置为
 //     failed{not_completed_at_result}。
-//   - E45：暂停任务，把 deadline_at 置为过去，恢复 → timed_out，并在 init.resume.subruns 中告知。
+//   - E45（§13.5 执行中修订）：deadline 在暂停之前已过 → 暂停裁决记录剩余 0，恢复 → timed_out，并在
+//     init.resume.subruns 中告知。
 //   - task 取消裁决：全部非终态（started、end_proposed）→ cancelled{task_cancel}。
 //   - fixture subrun_end_without_checkpoint：st1 由成功裁决事务置为 failed。
 func TestSubrunAttemptLifecycle(t *testing.T) {
@@ -2345,9 +2346,11 @@ func TestSubrunAttemptLifecycle(t *testing.T) {
 		}
 		switch id {
 		case ids["pause"]:
+			// deadline 在暂停之前已过（宿主计时器按原期限，尚未触发）：暂停裁决记录剩余 0，继续时 timed_out。
+			// 暂停期间才过期的情形不再超时（暂停期间不计时，见 postgres 的 TestSubrunDeadlineSuspendedWhilePaused 与 e2e E45）。
+			h.exec("UPDATE subruns SET deadline_at = now() - interval '1 second' WHERE task_id = $1", id)
 			control(id, "pause")
 			waitStatus(h, id, "paused")
-			h.exec("UPDATE subruns SET deadline_at = now() - interval '1 second' WHERE task_id = $1", id)
 			control(id, "resume")
 		case ids["cancel"]:
 			control(id, "cancel")

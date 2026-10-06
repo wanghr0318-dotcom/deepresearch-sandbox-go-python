@@ -7544,8 +7544,10 @@ func testE44(t *testing.T, h *harness) {
 	h.finish()
 }
 
-// TestE45PausePastDeadline：E45——暂停期间 deadline 过期（deadline 为绝对时间，暂停期间继续计时）→ 继续时新 attempt
-// 的 init.resume.subruns 告知 st1 为 timed_out，st1 的其余步骤不再执行；任务成功。
+// TestE45PausePastDeadline：E45（规格 §13.5 执行中修订，M4 验收 2026-10-06）——暂停期间 sub-run 的 deadline 不计时：
+// 暂停久于剩余时间（原 deadline_at 在暂停期间过去）后继续，新 attempt 的 init.resume.subruns 告知 st1 为 started，
+// deadline 按暂停时记录的剩余时间重新起算，st1 完成其余步骤；任务成功。暂停前已过期仍为 timed_out 见 internal/app 的
+// TestSubrunAttemptLifecycle 与 postgres 的 TestSubrunDeadlineSuspendedWhilePaused。
 func TestE45PausePastDeadline(t *testing.T) { testE45(t, newHarness(t)) }
 
 func TestRealE45PausePastDeadline(t *testing.T) { testE45(t, newRealHarness(t)) }
@@ -7554,8 +7556,8 @@ func testE45(t *testing.T, h *harness) {
 	fu := fakeupstream.New()
 	t.Cleanup(fu.Close)
 	u := cachePage(fu, "/e45-"+randSuffix()+"/a", nil)
-	steps := []step{srStartStep("st1", 4000)}
-	for i := range 40 { // 每 100 ms 一个 checkpoint：暂停请求在下一个提交边界生效
+	steps := []step{srStartStep("st1", 6000)}
+	for i := range 20 { // 每 100 ms 一个 checkpoint：暂停请求在下一个提交边界生效
 		steps = append(steps, step{"op": "sleep", "ms": 100, "subrun": "st1"}, checkpointStep(fmt.Sprintf("k%d", i)))
 	}
 	steps = append(steps, srFetchStep("st1", u), srEndStep("st1"), checkpointStep("done"))
@@ -7574,7 +7576,12 @@ func testE45(t *testing.T, h *harness) {
 	if g := h.subrunRow(id, "st1"); g != "started|1||" {
 		t.Fatalf("暂停时 st1 = %s（应在 deadline 之前暂停）", g)
 	}
-	eventuallyWithin(t, "st1 的 deadline 在暂停期间过期", 10*time.Second, 100*time.Millisecond, func() bool {
+	var remaining int64
+	h.queryRow("SELECT COALESCE(remaining_ms, -1) FROM subruns WHERE task_id = $1 AND subrun_id = 'st1'", []any{id}, &remaining)
+	if remaining <= 0 || remaining > 6000 {
+		t.Fatalf("暂停裁决应记录 st1 的剩余时间，得到 %d ms", remaining)
+	}
+	eventuallyWithin(t, "st1 的原 deadline 在暂停期间过去", 15*time.Second, 100*time.Millisecond, func() bool {
 		var past bool
 		h.queryRow("SELECT now() > deadline_at FROM subruns WHERE task_id = $1 AND subrun_id = 'st1'", []any{id}, &past)
 		return past
@@ -7583,14 +7590,14 @@ func testE45(t *testing.T, h *harness) {
 	if v := h.waitTerminal(id); v.Status != "succeeded" {
 		t.Fatalf("任务结束为 %+v", v)
 	}
-	if got := h.resumeSubruns(id, 2); got["st1"] != "timed_out" {
-		t.Fatalf("attempt 2 的 resume.subruns = %v", got)
+	if got := h.resumeSubruns(id, 2); got["st1"] != "started" {
+		t.Fatalf("attempt 2 的 resume.subruns = %v（暂停期间不计时，st1 应继续）", got)
 	}
-	if g := h.subrunRow(id, "st1"); !strings.HasPrefix(g, "timed_out|") {
+	if g := h.subrunRow(id, "st1"); !strings.HasPrefix(g, "completed|2") {
 		t.Fatalf("st1 = %s", g)
 	}
-	if pathCount(t, fu, u) != 0 || len(h.subrunCalls(id, "st1/")) != 0 {
-		t.Fatalf("timed_out 的 st1 不应再发出调用：/a 抓取 %d 次", pathCount(t, fu, u))
+	if pathCount(t, fu, u) != 1 {
+		t.Fatalf("继续后 st1 应完成抓取：/a 抓取 %d 次", pathCount(t, fu, u))
 	}
 	h.finish()
 }

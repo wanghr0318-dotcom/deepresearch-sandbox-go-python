@@ -271,6 +271,12 @@ func (s *Store) ApplyControl(ctx context.Context, c task.ApplyControl) (task.Con
 		if err := closeOpenSubrunsTx(ctx, tx, c.TaskID, c.Status); err != nil {
 			return err
 		}
+		// 没有 attempt 的暂停（queued → paused）同样暂停 sub-run 的 deadline 计时（规格 §13.5 执行中修订）。
+		if c.Status == "paused" {
+			if err := suspendSubrunDeadlinesTx(ctx, tx, c.TaskID); err != nil {
+				return err
+			}
+		}
 		st.AppliedControlVersion, st.Status = c.ControlVersion, c.Status
 		out = st
 		return nil
@@ -444,6 +450,13 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 		// 留待恢复时重新绑定。
 		if err := closeOpenSubrunsTx(ctx, tx, v.TaskID, v.TaskStatus); err != nil {
 			return err
+		}
+		// 暂停裁决（停止、awaiting_input）暂停 sub-run 的 deadline 计时：记录剩余时间，继续时重新起算（规格 §13.5
+		// 执行中修订，M4 验收 2026-10-06）。故障重试（queued）不记录，恢复不重置。
+		if v.TaskStatus == "paused" {
+			if err := suspendSubrunDeadlinesTx(ctx, tx, v.TaskID); err != nil {
+				return err
+			}
 		}
 		if _, err := appendHostEvent(ctx, tx, hostEvent{taskID: v.TaskID, key: "attempt_finalized:" + v.AttemptID,
 			attemptID: v.AttemptID, typ: v.EventType, payload: []byte(v.EventPayload)}); err != nil {

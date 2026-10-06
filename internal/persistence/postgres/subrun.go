@@ -387,9 +387,19 @@ func applyCheckpointSubrunsTx(ctx context.Context, tx pgx.Tx, taskID string, ent
 // sub-run（规格 §13.5）：cancel_requested 按取消原因收尾为 cancelled / timed_out（E40）；deadline_at 已过的
 // started / end_proposed → timed_out（E45）；其余 started / end_proposed 绑定到新 attempt 并回到 started（E42）；
 // 终态不变。返回告知 Worker 的列表（按 subrun_id 排序）。时间取数据库 now()，与 deadline_at 同源。
+//
+// 暂停期间不计时（规格 §13.5 执行中修订，M4 验收 2026-10-06）：暂停时记录了 remaining_ms 的未终态 sub-run 先按
+// deadline_at = now() + remaining_ms 重新起算（剩余 0 即在此刻过期 → timed_out），并清除 remaining_ms；没有记录的
+// （故障重试、server 重启）按原 deadline_at 判定，恢复不重置。
 func rebindSubrunsTx(ctx context.Context, tx pgx.Tx, taskID, newAttemptID string) ([]protocol.ResumeSubrun, error) {
 	var now time.Time
 	if err := tx.QueryRow(ctx, "SELECT now()").Scan(&now); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE subruns SET remaining_ms = NULL,
+			deadline_at = CASE WHEN status IN ('started', 'end_proposed', 'cancel_requested')
+				THEN now() + remaining_ms * interval '1 millisecond' ELSE deadline_at END
+		WHERE task_id = $1 AND remaining_ms IS NOT NULL`, taskID); err != nil {
 		return nil, err
 	}
 	rows, err := tx.Query(ctx, "SELECT "+subrunColumns+" FROM subruns WHERE task_id = $1 ORDER BY subrun_id FOR UPDATE", taskID)
@@ -497,4 +507,14 @@ func adjustSubrunBudgetTx(ctx context.Context, tx pgx.Tx, taskID, subrunID strin
 		return notFoundf("任务 %s 的 sub-run %s 的账本", taskID, subrunID)
 	}
 	return nil
+}
+
+// suspendSubrunDeadlinesTx 在任务被暂停的事务中（暂停裁决 FinalizeAttempt、没有 attempt 的 ApplyControl queued →
+// paused）为未终态 sub-run 记录剩余时间 remaining_ms = GREATEST(deadline_at − now(), 0)（规格 §13.5 执行中修订：
+// 暂停期间 deadline 不计时，恢复时 rebindSubrunsTx 重新起算）。已记录的不覆盖：恢复前再次暂停（例如继续后尚未
+// 创建 attempt 又暂停）时 deadline_at 仍是暂停前的值，重算会把暂停时间计入。调用方已按锁顺序持有 subruns 之前的锁。
+func suspendSubrunDeadlinesTx(ctx context.Context, tx pgx.Tx, taskID string) error {
+	_, err := tx.Exec(ctx, `UPDATE subruns SET remaining_ms = GREATEST(0, floor(extract(epoch FROM deadline_at - now()) * 1000))::bigint
+		WHERE task_id = $1 AND status IN ('started', 'end_proposed', 'cancel_requested') AND remaining_ms IS NULL`, taskID)
+	return err
 }

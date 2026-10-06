@@ -258,7 +258,7 @@ func TestInstallationBootstrapE46(t *testing.T) {
 			t.Fatal(err)
 		}
 		// 还原为只应用了 0001 的旧库
-		if _, err := s.pool.Exec(ctx, undo0009+undo0008+undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions;
+		if _, err := s.pool.Exec(ctx, undo0010+undo0009+undo0008+undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions;
 			ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
 			ALTER TABLE installation DROP COLUMN bootstrap_token_hash; DELETE FROM schema_migrations WHERE version >= 2`); err != nil {
 			t.Fatal(err)
@@ -2602,7 +2602,7 @@ func TestMigrationBackfillsBudgets(t *testing.T) {
 	s := newStore(t, Options{})
 	fixture(t, s, "t1")
 	// 还原为只应用了 0001、0002 的旧库：任务 t1 没有预算行
-	if _, err := s.pool.Exec(ctx, undo0009+undo0008+undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions; ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
+	if _, err := s.pool.Exec(ctx, undo0010+undo0009+undo0008+undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions; ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
 		DELETE FROM schema_migrations WHERE version >= 3`); err != nil {
 		t.Fatal(err)
 	}
@@ -3119,7 +3119,7 @@ func TestMigration0006(t *testing.T) {
 	t.Run("从 0005 升级", func(t *testing.T) {
 		s := newStore(t, Options{})
 		fixture(t, s, "old")
-		if _, err := s.pool.Exec(ctx, undo0009+undo0008+undo0007+undo0006); err != nil {
+		if _, err := s.pool.Exec(ctx, undo0010+undo0009+undo0008+undo0007+undo0006); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := s.pool.Exec(ctx, `INSERT INTO users (username, username_key, password_hash) VALUES ('carol', 'carol', 'h');
@@ -4130,7 +4130,7 @@ func TestMigration0007(t *testing.T) {
 	}
 	gwFixture(t, s, "t1", 1000)
 	beginCall(t, s, "t1", "c1")
-	if _, err := s.pool.Exec(ctx, undo0009+undo0008+undo0007); err != nil {
+	if _, err := s.pool.Exec(ctx, undo0010+undo0009+undo0008+undo0007); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Migrate(ctx); err != nil {
@@ -5794,7 +5794,7 @@ func TestMigration0008(t *testing.T) {
 	gwFixture(t, s, "t1", 1000)
 	beginCall(t, s, "t1", "c1")
 	mustReserve(t, s, "t1", "c1", 10)
-	if _, err := s.pool.Exec(ctx, undo0009+undo0008); err != nil {
+	if _, err := s.pool.Exec(ctx, undo0010+undo0009+undo0008); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Migrate(ctx); err != nil {
@@ -7061,7 +7061,7 @@ func TestMigration0009(t *testing.T) {
 	if got := violationsOf(t, s, "I13"); len(got) != 5 {
 		t.Fatalf("升级前 I13 应报告 5 个未收尾的 sub-run：%q", got)
 	}
-	if _, err := s.pool.Exec(ctx, undo0009); err != nil {
+	if _, err := s.pool.Exec(ctx, undo0010+undo0009); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Migrate(ctx); err != nil {
@@ -7091,6 +7091,137 @@ func TestMigration0009(t *testing.T) {
 	if n := count(t, s, "SELECT count(*) FROM calls WHERE call_id = 'x' AND tool_budget_used = 1"); n != 1 {
 		t.Fatal("不限额的任务也记录工具计数")
 	}
+}
+
+// undo0010 把库还原为只应用了 0009 的形状；回滚到更早迁移的测试先执行它。
+const undo0010 = `ALTER TABLE subruns DROP COLUMN remaining_ms;
+	DELETE FROM schema_migrations WHERE version >= 10;
+`
+
+// remainingMs 返回 sub-run 的 remaining_ms（NULL 为 -1）。
+func remainingMs(t *testing.T, s *Store, taskID, subrunID string) int64 {
+	t.Helper()
+	var v *int64
+	if err := s.pool.QueryRow(context.Background(), "SELECT remaining_ms FROM subruns WHERE task_id = $1 AND subrun_id = $2",
+		taskID, subrunID).Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v == nil {
+		return -1
+	}
+	return *v
+}
+
+// TestSubrunDeadlineSuspendedWhilePaused（规格 §13.5 执行中修订，M4 验收 2026-10-06）：暂停裁决（以及没有 attempt
+// 的 queued → paused）为未终态 sub-run 记录剩余时间 remaining_ms，恢复时重新绑定的事务按 deadline_at = now() +
+// remaining_ms 重新起算并清除它——暂停期间不计时：暂停久于剩余时间后继续不超时；暂停前已过期（剩余 0）仍为
+// timed_out。故障重试（queued 裁决）不记录剩余时间，恢复不重置（deadline 仍为绝对时间）。
+func TestSubrunDeadlineSuspendedWhilePaused(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	if n := count(t, s, "SELECT count(*) FROM schema_migrations WHERE version <= 10"); n != 10 {
+		t.Fatalf("应依次应用 0001–0010，得到 %d 个", n)
+	}
+	fixture(t, s, "t1")
+	for _, id := range []string{"a", "b", "c", "d"} {
+		mustStartSubrun(t, s, "t1", "att-t1", id)
+	}
+	if _, err := s.pool.Exec(ctx, "UPDATE subruns SET deadline_at = now() - interval '1s' WHERE task_id = 't1' AND subrun_id = 'b'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "c", "succeeded", "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "d", "failed", "bad"); err != nil {
+		t.Fatal(err)
+	}
+	pc, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "p-t1", BodyHash: []byte("h"), TaskID: "t1", Desired: "pause"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := verdict("t1", 0)
+	v.ControlVersion, v.OutcomeClass, v.TaskStatus, v.TaskStatusReason = pc.ControlVersion, "paused", "paused", "paused"
+	if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+		t.Fatal(err)
+	}
+	if r := remainingMs(t, s, "t1", "a"); r < 55_000 || r > 60_000 {
+		t.Fatalf("暂停裁决时 a 的剩余时间 = %d ms，期望约 60 s", r)
+	}
+	if r := remainingMs(t, s, "t1", "b"); r != 0 {
+		t.Fatalf("暂停前已过期的 b 剩余 = %d，期望 0", r)
+	}
+	if r := remainingMs(t, s, "t1", "c"); r < 55_000 {
+		t.Fatalf("end_proposed 的 c 也应记录剩余时间：%d", r)
+	}
+	if r := remainingMs(t, s, "t1", "d"); r != -1 {
+		t.Fatalf("终态 d 不记录剩余时间：%d", r)
+	}
+	// 暂停了很久：原 deadline 早已过去。
+	if _, err := s.pool.Exec(ctx, "UPDATE subruns SET deadline_at = now() - interval '1 hour' WHERE task_id = 't1' AND subrun_id IN ('a', 'c')"); err != nil {
+		t.Fatal(err)
+	}
+	var got []protocol.ResumeSubrun
+	if err := subrunTx(s, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		got, err = rebindSubrunsTx(ctx, tx, "t1", "att-t1")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []protocol.ResumeSubrun{{SubrunID: "a", Status: "started"}, {SubrunID: "b", Status: "timed_out"},
+		{SubrunID: "c", Status: "started"}, {SubrunID: "d", Status: "failed"}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("继续时 rebind = %+v，期望 %+v", got, want)
+	}
+	if g := subrunRow(t, s, "t1", "b"); g != "timed_out|att-t1|-||deadline|true" {
+		t.Fatalf("b = %s", g)
+	}
+	for _, id := range []string{"a", "c"} {
+		var left float64
+		if err := s.pool.QueryRow(ctx, "SELECT extract(epoch FROM deadline_at - now()) FROM subruns WHERE task_id = 't1' AND subrun_id = $1",
+			id).Scan(&left); err != nil {
+			t.Fatal(err)
+		}
+		if left < 50 || left > 60 || remainingMs(t, s, "t1", id) != -1 {
+			t.Fatalf("继续后 %s 的 deadline 应为 now() + 剩余时间（剩 %.1f s）且清除 remaining_ms（%d）", id, left, remainingMs(t, s, "t1", id))
+		}
+	}
+
+	// 故障重试（queued 裁决）不记录剩余时间：恢复按原 deadline_at 判定（恢复不重置）。
+	fixture(t, s, "t2")
+	mustStartSubrun(t, s, "t2", "att-t2", "a")
+	q := verdict("t2", 1)
+	q.TaskStatus = "queued"
+	if _, err := s.FinalizeAttempt(ctx, q); err != nil {
+		t.Fatal(err)
+	}
+	if r := remainingMs(t, s, "t2", "a"); r != -1 {
+		t.Fatalf("故障重试不应记录剩余时间：%d", r)
+	}
+	// 之后在没有 attempt 时暂停（queued → paused）：此时记录剩余时间；再次暂停（剩余已记录）不覆盖。
+	pc2, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "p-t2", BodyHash: []byte("h"), TaskID: "t2", Desired: "pause"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ApplyControl(ctx, task.ApplyControl{TaskID: "t2", ControlVersion: pc2.ControlVersion, Status: "paused",
+		StatusReason: "paused"}); err != nil {
+		t.Fatal(err)
+	}
+	if r := remainingMs(t, s, "t2", "a"); r < 55_000 || r > 60_000 {
+		t.Fatalf("queued → paused 时 a 的剩余时间 = %d", r)
+	}
+	if _, err := s.pool.Exec(ctx, "UPDATE subruns SET remaining_ms = 1234 WHERE task_id = 't2'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := subrunTx(s, func(ctx context.Context, tx pgx.Tx) error {
+		return suspendSubrunDeadlinesTx(ctx, tx, "t2")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if r := remainingMs(t, s, "t2", "a"); r != 1234 {
+		t.Fatalf("已记录的剩余时间不应被再次暂停覆盖：%d", r)
+	}
+	expectNoDBViolations(t, s)
 }
 
 // ==== M4 真实验收修复段结束 ====
