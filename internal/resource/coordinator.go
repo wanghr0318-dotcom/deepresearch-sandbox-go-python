@@ -22,6 +22,10 @@ type Provider interface {
 	Destroy(ctx context.Context, envID string) error
 	List(ctx context.Context) ([]provider.EnvInfo, error)
 	Scan(ctx context.Context) (provider.ScanReport, error)
+	// 会话环境（M4 Plan 12）：冻结、解冻与进程表（session.go）。
+	Freeze(ctx context.Context, envID string) error
+	Thaw(ctx context.Context, envID string) error
+	Procs(ctx context.Context, envID string) ([]int, error)
 }
 
 // EnvRequest 描述要创建的环境。environments 行由调用方（task/session actor、gateway）先行创建；
@@ -33,6 +37,9 @@ type EnvRequest struct {
 	Template  string
 	Limits    provider.Limits
 	Mounts    provider.Mounts
+	// UIDOwner 非空（"session:<session_id>"）时 UID 范围按 owner 分配并在环境清理后保留，直至
+	// ReleaseOwnerUIDRange（规格 §12.1；session.go）。Store 须实现 OwnerUIDStore。
+	UIDOwner string
 }
 
 // StopResult 是 StopEnv 报告的事实。
@@ -156,11 +163,18 @@ func (c *Coordinator) notifyFreed() {
 
 // assignUIDRange 分配 UID 范围；池耗尽时唤醒清理并等待归还（每个清理间隔至少重试一次），直到成功或 ctx 结束。
 func (c *Coordinator) assignUIDRange(ctx context.Context, envID string) (UIDRange, error) {
+	return c.waitFreeRange(ctx, func(ctx context.Context) (UIDRange, error) {
+		return c.store.AssignUIDRange(ctx, envID, allocationID(envID))
+	})
+}
+
+// waitFreeRange 重复 assign 直到它不再报告 ErrNoFreeUIDRange 或 ctx 结束（等待期间唤醒清理）。
+func (c *Coordinator) waitFreeRange(ctx context.Context, assign func(context.Context) (UIDRange, error)) (UIDRange, error) {
 	for {
 		c.mu.Lock()
 		freed := c.freed
 		c.mu.Unlock()
-		ur, err := c.store.AssignUIDRange(ctx, envID, allocationID(envID))
+		ur, err := assign(ctx)
 		if !errors.Is(err, ErrNoFreeUIDRange) {
 			return ur, err
 		}
@@ -270,7 +284,7 @@ func (c *Coordinator) create(ctx context.Context, r EnvRequest) (provider.EnvInf
 	if _, err := c.store.RecordIntent(ctx, Intent{IntentID: id, EnvID: r.EnvID, Kind: intentKindEnvironment, Name: r.EnvID}); err != nil {
 		return provider.EnvInfo{}, err
 	}
-	ur, err := c.assignUIDRange(ctx, r.EnvID)
+	ur, err := c.assignRange(ctx, r)
 	if err != nil {
 		return provider.EnvInfo{}, err
 	}

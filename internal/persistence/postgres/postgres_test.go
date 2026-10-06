@@ -3984,3 +3984,62 @@ func TestEvictSessionsOnRestart(t *testing.T) {
 		t.Fatalf("重跑不应追加事件：%d", n)
 	}
 }
+
+// ---- 按 owner 保留的 UID 范围（M4 Plan 12 Task 5；规格 §12.1、§4.5） ----
+
+// TestOwnerUIDRange：同一 owner 的多个环境共用一段范围（重试返回原分配）；不同 owner 范围不同（I11）；
+// 仍有环境未停止并完成清理时归还为冲突；之后归还，再归还为 ErrNotFound；owner 范围不出现在启动核对的未归还范围中。
+func TestOwnerUIDRange(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	for _, id := range []string{"t1", "t2", "t3"} {
+		fixture(t, s, id)
+	}
+	if err := s.SeedUIDRanges(ctx, 100000, 4096, 2); err != nil {
+		t.Fatal(err)
+	}
+	const a1 = "owner-uid:session:s1"
+	r1, err := s.AssignOwnerUIDRange(ctx, "session:s1", "env-t1", a1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, err := s.AssignOwnerUIDRange(ctx, "session:s1", "env-t1", a1); err != nil || again.UIDRangeID != r1.UIDRangeID {
+		t.Fatalf("重试 = %+v, %v，期望原分配 %s", again, err, r1.UIDRangeID)
+	}
+	r2, err := s.AssignOwnerUIDRange(ctx, "session:s2", "env-t2", "owner-uid:session:s2")
+	if err != nil || r2.UIDRangeID == r1.UIDRangeID {
+		t.Fatalf("另一 owner 的范围 = %+v, %v，期望不同于 %s", r2, err, r1.UIDRangeID)
+	}
+	stopEnv(t, s, "env-t1")
+	if _, err := s.UpdateCleanup(ctx, resource.CleanupUpdate{EnvID: "env-t1", State: resource.CleanupDone}); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM uid_ranges WHERE uid_range_id = $1 AND state = 'assigned' AND owner_id = 'session:s1'", r1.UIDRangeID); n != 1 {
+		t.Fatal("环境清理后 owner 范围应保留")
+	}
+	f, err := s.LoadRecoveryFacts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range f.UnreleasedRanges {
+		if u.UIDRangeID == r1.UIDRangeID {
+			t.Fatalf("owner 范围出现在启动核对的未归还范围中：%+v", u)
+		}
+	}
+	if r3, err := s.AssignOwnerUIDRange(ctx, "session:s1", "env-t3", a1); err != nil || r3.UIDRangeID != r1.UIDRangeID {
+		t.Fatalf("同一 owner 的新环境 = %+v, %v，期望沿用 %s", r3, err, r1.UIDRangeID)
+	}
+	if _, err := s.ReleaseOwnerUIDRange(ctx, "session:s1", a1); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("env-t3 未停止时归还 = %v，期望冲突", err)
+	}
+	stopEnv(t, s, "env-t3")
+	if _, err := s.UpdateCleanup(ctx, resource.CleanupUpdate{EnvID: "env-t3", State: resource.CleanupDone}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.ReleaseOwnerUIDRange(ctx, "session:s1", a1); err != nil || got.State != "free" {
+		t.Fatalf("归还 = %+v, %v", got, err)
+	}
+	if _, err := s.ReleaseOwnerUIDRange(ctx, "session:s1", a1); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("重复归还 = %v，期望 ErrNotFound（coordinator 视为幂等）", err)
+	}
+}

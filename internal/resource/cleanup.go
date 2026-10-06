@@ -118,6 +118,13 @@ func (c *Coordinator) finishIntent(ctx context.Context, envID string) error {
 // 的逐层核对保证）。成功、没有范围或冲突（分配已变化，重试无意义，交给启动核对）时移出待归还集合。
 func (c *Coordinator) releaseUIDRange(ctx context.Context, envID string) error {
 	ur, err := c.store.GetUIDRange(ctx, envID)
+	if err == nil && isOwnerRange(ur) {
+		// 按 owner 保留的范围（session.go）不随环境清理归还，由 ReleaseOwnerUIDRange 归还。
+		c.mu.Lock()
+		delete(c.pendingFree, envID)
+		c.mu.Unlock()
+		return nil
+	}
 	if err == nil {
 		_, err = c.store.ReleaseUIDRange(ctx, ur.UIDRangeID, ur.AllocationID)
 	}

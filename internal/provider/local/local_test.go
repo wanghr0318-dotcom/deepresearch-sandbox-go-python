@@ -1253,6 +1253,12 @@ func TestLaunchSpecForFillsInit(t *testing.T) {
 		ls.Init.In != "" || ls.Init.Out != "" {
 		t.Fatalf("默认值未填充或编排环境带了 /in、/out：%+v", ls.Init)
 	}
+	// session 的冷恢复暂存目录（M4 Plan 12）原样交给 init。
+	ls, err = launchSpecFor(provider.EnvSpec{Kind: provider.KindSession, UIDBase: 100000, UIDSize: 4096,
+		Mounts: provider.Mounts{Workspace: "/var/ws", RestoreDir: "/d/restore/s1"}}, "/d/envs/s1")
+	if err != nil || ls.Init.Kind != "session" || ls.Init.Restore != "/d/restore/s1" {
+		t.Fatalf("session Init = %+v, %v", ls.Init, err)
+	}
 	if _, err := launchSpecFor(provider.EnvSpec{Kind: provider.KindTask, UIDBase: 100000, UIDSize: 4096, Template: "no-such"}, "/d"); err == nil {
 		t.Fatal("未知模板应报错")
 	}
@@ -1719,4 +1725,218 @@ func TestExecEnvOutQuota(t *testing.T) {
 		t.Fatal(err)
 	}
 	layersGone(t, p, oom.EnvID)
+}
+
+// ---------------------------------------------------------------------------
+// M4 Plan 12 Task 5：会话环境的冻结、解冻、进程表与冷恢复暂存（规格 §12.2、§12.4；E31）。生产启动路径
+// （真实 init + stage-2 helper）、默认模板；需要 root。
+
+// runSh 在环境中以 /usr/bin/sh -c script 运行一次执行并返回 stdout（退出码须为 0）。
+func runSh(ctx context.Context, t *testing.T, p *Provider, envID, script string) string {
+	t.Helper()
+	h, err := p.StartExec(ctx, envID, provider.ExecSpec{ExecID: "sh-" + randHex(3), Argv: []string{"/usr/bin/sh", "-c", script}})
+	if err != nil {
+		t.Fatalf("StartExec: %v", err)
+	}
+	if err := h.Stdin().Close(); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	errDone := make(chan struct{})
+	go func() { _, _ = io.Copy(&stderr, h.Stderr()); close(errDone) }()
+	out, err := io.ReadAll(h.Stdout())
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-errDone
+	if es, err := h.Wait(); err != nil || es.Code != 0 || es.Signal != 0 {
+		t.Fatalf("%q = %+v, %v；stderr %q", script, es, err, stderr.String())
+	}
+	return string(out)
+}
+
+// frozenState 读取环境 cgroup.events 的 frozen。
+func frozenState(t *testing.T, p *Provider, envID string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(mustGroup(t, p, envID).Path(), "cgroup.events"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "frozen "); ok {
+			return v
+		}
+	}
+	t.Fatalf("cgroup.events 中没有 frozen：%q", b)
+	return ""
+}
+
+// readCounter 读取 workload 每 100 ms 递增的计数文件；写入瞬间可能读到空内容，此时重读。
+func readCounter(t *testing.T, path string) int {
+	t.Helper()
+	for i := 0; i < 50; i++ {
+		b, err := os.ReadFile(path)
+		if err == nil {
+			var n int
+			if _, err := fmt.Sscanf(string(b), "%d", &n); err == nil {
+				return n
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("读取计数文件 %s 失败", path)
+	return 0
+}
+
+// waitCounterAbove 等待计数超过 n（解冻后恢复递增）。
+func waitCounterAbove(t *testing.T, path string, n int) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if readCounter(t, path) > n {
+			return
+		}
+	}
+	t.Fatalf("计数在 5 s 内未超过 %d：环境未恢复运行", n)
+}
+
+// TestSessionEnvFreezeThawRestore：session 环境（workspace + 冷恢复暂存目录）：
+//   - RestoreDir 只读可见于 /run/agentbox/restore（写入失败），宿主删除暂存文件后沙箱内随即不可见；
+//   - Procs 含 init 与 workload；
+//   - Freeze 后 cgroup.events 为 frozen 1，环境内每 100 ms 递增的计数在冻结期间不变；Thaw 后 frozen 0 且恢复递增；
+//   - E31：冻结确认失败（注入不存在的 cgroup 事件文件）→ ErrFreezeUnconfirmed，并已解冻（计数继续递增）；
+//   - 冻结状态下 Stop 成功、populated 0；Destroy 后三层不存在，调用方的暂存目录保留（由调用方删除）。
+func TestSessionEnvFreezeThawRestore(t *testing.T) {
+	requireRoot(t)
+	st, err := NewProcessStarter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.initEnv = []string{envRealInit + "=1"}
+	install := "s" + randHex(4)
+	p := newProviderWith(t, install, st)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	ws := filepath.Join(p.dataDir, "ws")
+	restore := filepath.Join(p.dataDir, "restore")
+	const sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	for _, d := range []string{ws, restore} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(restore, sha), []byte("state-v1"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	spec := testEnvSpec(install, "env-sess")
+	spec.Kind = provider.KindSession
+	spec.Mounts = provider.Mounts{Workspace: ws, RestoreDir: restore}
+	if info, err := p.Create(ctx, spec); err != nil || !info.Complete {
+		t.Fatalf("Create = %+v, %v", info, err)
+	}
+
+	// 冷恢复暂存：只读可见；写入失败且宿主上没有出现文件。
+	got := runSh(ctx, t, p, spec.EnvID, "cat /run/agentbox/restore/"+sha+"; echo; "+
+		"if (echo x > /run/agentbox/restore/w) 2>/dev/null; then echo writable; else echo readonly; fi")
+	if got != "state-v1\nreadonly\n" {
+		t.Fatalf("恢复暂存读取 = %q，期望 state-v1 且只读", got)
+	}
+	if _, err := os.Lstat(filepath.Join(restore, "w")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("沙箱写入了恢复暂存目录（%v）", err)
+	}
+	// incarnation 进入 idle 后宿主删除暂存文件：沙箱内随即不可见。
+	if err := os.Remove(filepath.Join(restore, sha)); err != nil {
+		t.Fatal(err)
+	}
+	if got := runSh(ctx, t, p, spec.EnvID, "if [ -e /run/agentbox/restore/"+sha+" ]; then echo present; else echo absent; fi"); got != "absent\n" {
+		t.Fatalf("删除暂存文件后沙箱内 = %q，期望 absent", got)
+	}
+
+	// 计数 workload（后台运行）。
+	h, err := p.StartExec(ctx, spec.EnvID, provider.ExecSpec{ExecID: "counter", Argv: []string{"/usr/bin/sh", "-c",
+		"i=0; while :; do i=$((i+1)); echo $i > /workspace/counter; sleep 0.1; done"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Stdin().Close(); err != nil {
+		t.Fatal(err)
+	}
+	go func() { _, _ = io.Copy(io.Discard, h.Stdout()) }()
+	go func() { _, _ = io.Copy(io.Discard, h.Stderr()) }()
+	counter := filepath.Join(ws, "counter")
+	waitCounterAbove(t, counter, 2)
+
+	pids, err := p.Procs(ctx, spec.EnvID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initPid := p.state(spec.EnvID).pid
+	hasInit := false
+	for _, pid := range pids {
+		hasInit = hasInit || pid == initPid
+	}
+	if !hasInit || len(pids) < 2 {
+		t.Fatalf("Procs = %v，期望含 init %d 与 workload", pids, initPid)
+	}
+
+	// Freeze：frozen 1 后计数不变；Thaw：frozen 0 后恢复递增。
+	if err := p.Freeze(ctx, spec.EnvID); err != nil {
+		t.Fatal(err)
+	}
+	if s := frozenState(t, p, spec.EnvID); s != "1" {
+		t.Fatalf("Freeze 后 frozen = %s", s)
+	}
+	before := readCounter(t, counter)
+	time.Sleep(600 * time.Millisecond)
+	if after := readCounter(t, counter); after != before {
+		t.Fatalf("冻结期间计数由 %d 变为 %d", before, after)
+	}
+	if err := p.Thaw(ctx, spec.EnvID); err != nil {
+		t.Fatal(err)
+	}
+	if s := frozenState(t, p, spec.EnvID); s != "0" {
+		t.Fatalf("Thaw 后 frozen = %s", s)
+	}
+	waitCounterAbove(t, counter, before)
+
+	// E31：无法确认冻结 → ErrFreezeUnconfirmed，provider 已尝试解冻（计数继续递增）。
+	p.eventsFile = "cgroup.nonexistent"
+	short, cancelShort := context.WithTimeout(ctx, time.Second)
+	err = p.Freeze(short, spec.EnvID)
+	cancelShort()
+	p.eventsFile = ""
+	if !errors.Is(err, provider.ErrFreezeUnconfirmed) {
+		t.Fatalf("冻结确认失败时 Freeze = %v，期望 ErrFreezeUnconfirmed", err)
+	}
+	if s := frozenState(t, p, spec.EnvID); s != "0" {
+		t.Fatalf("冻结失败后 frozen = %s，期望已解冻", s)
+	}
+	waitCounterAbove(t, counter, readCounter(t, counter))
+
+	// 冻结状态下 Stop：cgroup.kill 杀死冻结中的进程，populated 0。
+	if err := p.Freeze(ctx, spec.EnvID); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Stop(ctx, spec.EnvID); err != nil {
+		t.Fatalf("冻结状态下 Stop: %v", err)
+	}
+	if populated, err := mustGroup(t, p, spec.EnvID).Populated(); err != nil || populated {
+		t.Fatalf("Stop 后 populated = %v, %v", populated, err)
+	}
+	if es, err := h.Wait(); err == nil && es.Signal == 0 && es.Code == 0 {
+		t.Fatalf("计数 workload 在 Stop 后正常退出（%+v），期望被杀死或连接断开", es)
+	}
+	if err := p.Destroy(ctx, spec.EnvID); err != nil {
+		t.Fatal(err)
+	}
+	layersGone(t, p, spec.EnvID)
+	if _, err := os.Stat(restore); err != nil {
+		t.Fatalf("Destroy 不应删除调用方的暂存目录：%v", err)
+	}
+	if _, err := p.Procs(ctx, spec.EnvID); !errors.Is(err, provider.ErrNotFound) {
+		t.Fatalf("Destroy 后 Procs = %v，期望 ErrNotFound", err)
+	}
+	if err := p.Freeze(ctx, spec.EnvID); !errors.Is(err, provider.ErrNotFound) {
+		t.Fatalf("Destroy 后 Freeze = %v，期望 ErrNotFound", err)
+	}
 }

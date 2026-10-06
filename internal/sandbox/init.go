@@ -45,6 +45,9 @@ type InitSpec struct {
 	// init 以 O_PATH 固定后 open_tree(OPEN_TREE_CLONE) 克隆，mount_setattr 设 NOSUID|NODEV（不设 RDONLY）后
 	// move_mount 到 /out；回退路径 mount(2) MS_BIND。执行树停止后挂载仍在宿主上，供收集输出。
 	Out string `json:"out,omitempty"`
+	// Restore 仅 session 环境（可为空）：冷恢复暂存的宿主目录，只读 bind 到 /run/agentbox/restore（规格 §12.2，
+	// M4 Plan 12）。bind 的是目录：宿主删除其中的文件后沙箱内随即不可见。
+	Restore string `json:"restore,omitempty"`
 	// NoFile 是 workload 的 RLIMIT_NOFILE（软、硬限相同），0 由 validate 填为 workloadNoFile；FSize 是 exec 环境 workload 的 RLIMIT_FSIZE，
 	// 0 表示由 init 取可写 tmpfs（/tmp、/out）中最大者。二者来自 provider.Limits（规格 §4.5）。
 	NoFile uint64 `json:"nofile"`
@@ -67,12 +70,18 @@ func (s *InitSpec) validate() error {
 		}
 		return nil
 	}
+	if s.Restore != "" && s.Kind != KindSession {
+		return fmt.Errorf("%s 环境不能有恢复暂存目录（restore）", s.Kind)
+	}
 	switch s.Kind {
 	case KindTask, KindSession:
 		if s.In != "" || s.OutBytes != 0 || s.Out != "" {
 			return fmt.Errorf("%s 环境不能有 /in 或 /out", s.Kind)
 		}
 		if err := abs("workspace", s.Workspace); err != nil {
+			return err
+		}
+		if err := abs("restore", s.Restore); err != nil {
 			return err
 		}
 		return abs("gateway_socket", s.GatewaySocket)
@@ -108,6 +117,7 @@ const (
 	stepMountDev       = "mount_dev"
 	stepMountGateway   = "mount_gateway"
 	stepMountWorkspace = "mount_workspace"
+	stepMountRestore   = "mount_restore"
 	stepMountProc      = "mount_proc"
 	stepMaskProc       = "mask_proc"
 	stepOpenSelf       = "open_self"

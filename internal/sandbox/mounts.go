@@ -53,6 +53,7 @@ const stagingDir = "/tmp"
 const (
 	gatewayDir    = "/run/agentbox"
 	gatewaySocket = gatewayDir + "/gateway.sock" // 规格 §4.5：编排环境的 Gateway socket
+	restoreDir    = gatewayDir + "/restore"      // 规格 §12.2：session 冷恢复暂存（只读）
 )
 
 // workloadID 是 workload 在命名空间内的 uid/gid（规格 §4.5、§4.6）。
@@ -321,8 +322,16 @@ func setupMounts(s *InitSpec, check func(string) error, logf func(string, ...any
 		}
 		tmpl = append(tmpl, src)
 	}
-	in, out, ws, gw := source{fd: -1}, source{fd: -1}, source{fd: -1}, source{fd: -1}
+	in, out, ws, gw, rs := source{fd: -1}, source{fd: -1}, source{fd: -1}, source{fd: -1}, source{fd: -1}
 	var err error
+	if s.Restore != "" {
+		if rs, err = pin(stepMountRestore, s.Restore); err != nil {
+			return err
+		}
+		if !rs.dir {
+			return &stepErr{stepMountRestore, fmt.Errorf("%s 不是目录", s.Restore)}
+		}
+	}
 	if s.In != "" {
 		if in, err = pin(stepMountIn, s.In); err != nil {
 			return err
@@ -493,6 +502,20 @@ func setupMounts(s *InitSpec, check func(string) error, logf func(string, ...any
 		}
 		if err := m.bind(ws.fd, root("/workspace"), false); err != nil {
 			return &stepErr{stepMountWorkspace, err}
+		}
+	}
+
+	// 冷恢复暂存（仅 session，规格 §12.2）：宿主目录只读 bind 到 /run/agentbox/restore（ro、nosuid、nodev）。
+	// bind 的是目录而非文件：宿主删除其中的暂存文件后沙箱内随即不可见，无需在沙箱内卸载。
+	if rs.fd >= 0 {
+		if err := check(stepMountRestore); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(root(restoreDir), 0o755); err != nil {
+			return &stepErr{stepMountRestore, err}
+		}
+		if err := m.bind(rs.fd, root(restoreDir), true); err != nil {
+			return &stepErr{stepMountRestore, err}
 		}
 	}
 

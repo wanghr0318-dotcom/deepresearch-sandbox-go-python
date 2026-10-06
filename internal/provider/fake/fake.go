@@ -32,17 +32,20 @@ type Provider struct {
 }
 
 type env struct {
-	spec     provider.EnvSpec
-	hash     string
-	complete bool // 各层齐全且 init 就绪
-	foreign  bool // 无法证明属于本安装
-	open     bool // 执行闸门
-	stopped  bool // Stop 的权威检查已成立
-	running  map[*handle]struct{}
-	diag     provider.ResourceDiag
-	block    *startBlock
-	stopErr  error  // 注入：Stop 返回该错误
-	dir      string // 仅 exec：临时目录，其下 in/（Mounts.In 为空时）与 out/ 模拟 /in 暂存与宿主侧 /out
+	spec      provider.EnvSpec
+	hash      string
+	complete  bool // 各层齐全且 init 就绪
+	foreign   bool // 无法证明属于本安装
+	open      bool // 执行闸门
+	stopped   bool // Stop 的权威检查已成立
+	running   map[*handle]struct{}
+	diag      provider.ResourceDiag
+	block     *startBlock
+	stopErr   error  // 注入：Stop 返回该错误
+	dir       string // 仅 exec：临时目录，其下 in/（Mounts.In 为空时）与 out/ 模拟 /in 暂存与宿主侧 /out
+	frozen    bool   // Freeze 已确认、尚未 Thaw
+	freezeErr error  // 注入：Freeze 返回该错误（且不冻结）
+	procs     []int  // SetProcs 设置的 Procs 结果
 }
 
 type startBlock struct {
@@ -331,7 +334,72 @@ func (p *Provider) ResourceDiag(_ context.Context, envID string) (provider.Resou
 	return e.diag, nil
 }
 
+// Freeze 记录环境已冻结（契约第 3 节修订）。不存在或外来 → ErrNotFound；FailFreeze 注入的错误原样返回且不冻结
+// （与 local 的"未确认即尝试解冻"一致）。冻结不影响 Stop。
+func (p *Provider) Freeze(_ context.Context, envID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.envs[envID]
+	switch {
+	case !ok || e.foreign:
+		return provider.ErrNotFound
+	case e.freezeErr != nil:
+		return e.freezeErr
+	}
+	e.frozen = true
+	return nil
+}
+
+// Thaw 清除冻结标记。不存在或外来 → ErrNotFound。
+func (p *Provider) Thaw(_ context.Context, envID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.envs[envID]
+	if !ok || e.foreign {
+		return provider.ErrNotFound
+	}
+	e.frozen = false
+	return nil
+}
+
+// Procs 返回 SetProcs 设置的 pid（默认为空）。不存在或外来 → ErrNotFound。
+func (p *Provider) Procs(_ context.Context, envID string) ([]int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.envs[envID]
+	if !ok || e.foreign {
+		return nil, provider.ErrNotFound
+	}
+	return append([]int(nil), e.procs...), nil
+}
+
+// Frozen 报告 envID 是否处于冻结状态。
+func (p *Provider) Frozen(envID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.envs[envID]
+	return ok && e.frozen
+}
+
 // ---- 故障注入 ----
+
+// FailFreeze 使 envID 上的 Freeze 返回 err（例如包装 provider.ErrFreezeUnconfirmed）；nil 取消注入。
+func (p *Provider) FailFreeze(envID string, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.envs[envID]; ok {
+		e.freezeErr = err
+	}
+}
+
+// SetProcs 设置 envID 的 Procs 结果（释放核验的进程基线测试）。
+func (p *Provider) SetProcs(envID string, pids []int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.envs[envID]; ok {
+		e.procs = append([]int(nil), pids...)
+	}
+}
 
 // InjectResidue 使 spec 对应的环境成为属于本安装但不完整的残留。
 func (p *Provider) InjectResidue(spec provider.EnvSpec) {

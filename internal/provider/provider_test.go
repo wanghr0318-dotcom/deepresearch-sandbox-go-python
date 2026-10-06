@@ -45,7 +45,14 @@ func TestValidate(t *testing.T) {
 	if err := exec.Validate(); err != nil {
 		t.Fatalf("不带 /in 的 exec spec 被拒：%v", err)
 	}
+	sess := spec()
+	sess.Kind, sess.Mounts.RestoreDir = KindSession, "/d/restore/env-1" // M4 Plan 12：冷恢复暂存只属于 session
+	if err := sess.Validate(); err != nil {
+		t.Fatalf("带恢复暂存的 session spec 被拒：%v", err)
+	}
 	for name, mutate := range map[string]func(*EnvSpec){
+		"task 带恢复暂存":            func(s *EnvSpec) { s.Mounts.RestoreDir = "/r" },
+		"exec 带恢复暂存":            func(s *EnvSpec) { s.Kind, s.Mounts = KindExec, Mounts{OutBytes: 1, RestoreDir: "/r"} },
 		"exec 带 Gateway socket": func(s *EnvSpec) { s.Kind, s.Mounts = KindExec, Mounts{GatewaySocket: "/gw"} },
 		"编排环境带 /in":             func(s *EnvSpec) { s.Mounts.In = "/in" },
 		"exec 缺少 /out 大小":       func(s *EnvSpec) { s.Kind, s.Mounts = KindExec, Mounts{} },

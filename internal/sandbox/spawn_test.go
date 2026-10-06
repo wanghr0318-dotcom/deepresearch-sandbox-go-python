@@ -2230,6 +2230,15 @@ func initTestSpec(t *testing.T, kind string, classic bool) LaunchSpec {
 			t.Fatal(err)
 		}
 		is.GatewaySocket = gatewayTestSocket(t, dir, hostWorkload)
+		if kind == KindSession { // M4 Plan 12：冷恢复暂存目录（root 0755，文件 0444）
+			is.Restore = filepath.Join(dir, "restore")
+			if err := os.Mkdir(is.Restore, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(is.Restore, "state"), []byte("st"), 0o444); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	spec := LaunchSpec{
 		UIDBase: initTestIDBase, UIDSize: 4096, GIDBase: initTestIDBase, GIDSize: 4096,
@@ -2359,7 +2368,7 @@ func procStatusFields(t *testing.T, path string) map[string]string {
 //   - init 已进入 Serve：start 经生产 Launcher（stage-2 helper）运行 /bin/true，得到 start_ack 然后 exit 0。
 func TestInitEnvironment(t *testing.T) {
 	testutil.RequireLinuxRoot(t)
-	for _, kind := range []string{KindTask, KindExec} {
+	for _, kind := range []string{KindTask, KindExec, KindSession} {
 		for _, classic := range []bool{false, true} {
 			name := kind + "/new-mount-api"
 			if classic {
@@ -2413,7 +2422,7 @@ func checkInitEnvironment(t *testing.T, kind string, classic bool) {
 		if !ok {
 			t.Errorf("意外的挂载点 %s（%s）：旧根未脱离或多余挂载", m.point, m.fstype)
 		}
-		ro := kind == KindExec && under(m.point, "/in")
+		ro := (kind == KindExec && under(m.point, "/in")) || (kind == KindSession && under(m.point, restoreDir))
 		for _, p := range is.Template.Paths {
 			ro = ro || under(m.point, p)
 		}
@@ -2530,6 +2539,30 @@ func checkInitEnvironment(t *testing.T, kind string, classic bool) {
 		}
 		if m := find("/workspace"); m == nil || !hasAll(m.opts, "rw", "nosuid", "nodev") {
 			t.Errorf("/workspace 挂载 = %+v，期望 rw,nosuid,nodev", m)
+		}
+		// session 的冷恢复暂存（§12.2）：只读 bind 宿主目录；宿主删除暂存文件后沙箱内随即不可见。task 没有它。
+		m := find(restoreDir)
+		if kind != KindSession {
+			if m != nil {
+				t.Errorf("%s 环境有恢复暂存挂载 %+v", kind, m)
+			}
+		} else {
+			if m == nil || !hasAll(m.opts, "ro", "nosuid", "nodev") {
+				t.Errorf("%s 挂载 = %+v，期望 ro,nosuid,nodev", restoreDir, m)
+			}
+			var st, hst syscall.Stat_t
+			if err := syscall.Stat(rootDir+restoreDir, &st); err != nil || syscall.Stat(is.Restore, &hst) != nil || hst.Dev != st.Dev || hst.Ino != st.Ino {
+				t.Errorf("%s 不是宿主 %s 的 bind（%v）", restoreDir, is.Restore, err)
+			}
+			if b, err := os.ReadFile(rootDir + restoreDir + "/state"); err != nil || string(b) != "st" {
+				t.Errorf("%s/state = %q, %v", restoreDir, b, err)
+			}
+			if err := os.Remove(filepath.Join(is.Restore, "state")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Lstat(rootDir + restoreDir + "/state"); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("宿主删除暂存文件后沙箱内仍可见（%v）", err)
+			}
 		}
 	}
 
@@ -2683,7 +2716,7 @@ func TestInitSpecValidate(t *testing.T) {
 	execSpec := func() InitSpec {
 		return InitSpec{Kind: KindExec, Template: rootfs.Template{Paths: []string{"/usr"}}, TmpBytes: 1 << 20, In: "/i", Out: "/o", OutBytes: 1 << 20}
 	}
-	for _, ok := range []InitSpec{base(), execSpec(), {Kind: KindSession, Template: rootfs.Template{Paths: []string{"/usr"}}, TmpBytes: 1}} {
+	for _, ok := range []InitSpec{base(), execSpec(), {Kind: KindSession, Template: rootfs.Template{Paths: []string{"/usr"}}, TmpBytes: 1, Restore: "/r"}} {
 		if err := ok.validate(); err != nil {
 			t.Errorf("%+v: %v", ok, err)
 		}
@@ -2705,6 +2738,9 @@ func TestInitSpecValidate(t *testing.T) {
 	add("exec 缺少宿主 out", execSpec(), func(s *InitSpec) { s.Out = "" })
 	add("exec 的 out 相对路径", execSpec(), func(s *InitSpec) { s.Out = "o" })
 	add("exec 的 out 不规范", execSpec(), func(s *InitSpec) { s.Out = "/o/" })
+	add("task 带恢复暂存", base(), func(s *InitSpec) { s.Restore = "/r" })
+	add("exec 带恢复暂存", execSpec(), func(s *InitSpec) { s.Restore = "/r" })
+	add("session 的恢复暂存相对路径", base(), func(s *InitSpec) { s.Kind, s.Restore = KindSession, "r" })
 	for name, s := range bad {
 		if err := s.validate(); err == nil {
 			t.Errorf("%s: validate 通过，期望拒绝", name)

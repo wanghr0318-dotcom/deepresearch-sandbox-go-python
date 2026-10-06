@@ -53,6 +53,10 @@ type Mounts struct {
 	GatewaySocket string // 宿主 socket 路径，挂到 /run/agentbox/gateway.sock；exec 为空
 	In            string // 仅 exec：只读输入目录
 	OutBytes      int64  // 仅 exec：/out tmpfs 大小
+	// RestoreDir 仅 session：宿主目录，只读 bind 到 /run/agentbox/restore（规格 §12.2 冷恢复暂存）。bind 的是目录，
+	// 宿主删除其中的暂存文件后沙箱内随即不可见（incarnation 进入 idle 后的"卸载"）。目录由调用方建立
+	// （root 属主、0755，文件 0444，上级目录须 o+x）与删除；provider 只挂载，不删除它。
+	RestoreDir string
 }
 
 // ExecSpec 描述环境内一次执行。workload 身份固定为映射 uid/gid 1000，seccomp 配置由环境类型决定，
@@ -153,19 +157,28 @@ type Provider interface {
 	// OpenOutputs 打开 exec 环境 /out 下的普通文件（递归、按路径字典序、至多 max 个）。环境须已确认停止，
 	// 否则 ErrNotStopped；非 exec 环境返回错误；环境不存在为 ErrNotFound。出错时不留下已打开的文件。
 	OpenOutputs(ctx context.Context, envID string, max int) ([]OutputFile, []SkippedOutput, error)
+	// Freeze 冻结环境的执行树（规格 §12.2；契约第 3 节修订，M4 Plan 12）：写 cgroup.freeze=1 并等待 cgroup.events
+	// 中 frozen 1（ctx 为期限，无期限时取默认上限）。期限内未确认 → ErrFreezeUnconfirmed，并已尝试解冻。
+	// 冻结只停调度、不释放内存；冻结中的环境仍可 Stop。环境 cgroup 不存在 → ErrNotFound。
+	Freeze(ctx context.Context, envID string) error
+	// Thaw 写 cgroup.freeze=0 并等待 frozen 0（期限同 Freeze）。环境 cgroup 不存在 → ErrNotFound。
+	Thaw(ctx context.Context, envID string) error
+	// Procs 返回环境 cgroup.procs 中的宿主 pid（释放核验的进程基线比较，规格 §12.4）。环境 cgroup 不存在 → ErrNotFound。
+	Procs(ctx context.Context, envID string) ([]int, error)
 }
 
 // 错误（契约第 4 节）。ErrNotFound 只说明本次操作需要的那一层资源不存在，不说明其他层是否已清理。
 var (
-	ErrNotFound        = errors.New("provider: 不存在")
-	ErrIncomplete      = errors.New("provider: 环境不完整")
-	ErrConflict        = errors.New("provider: 同一 env_id 已存在且 spec 不同")
-	ErrForeign         = errors.New("provider: 资源不属于本安装或归属无法判定")
-	ErrStopping        = errors.New("provider: 环境已停止接受新的执行")
-	ErrStartFailed     = errors.New("provider: 启动失败，workload 未运行")
-	ErrControlLost     = errors.New("provider: 控制连接断开") // ACK 前：启动结果未知；ACK 后（Wait）：退出状态未知
-	ErrStopUnconfirmed = errors.New("provider: 期限内未确认执行树清空")
-	ErrNotStopped      = errors.New("provider: 环境尚未确认停止") // Destroy、OpenOutputs 的前置条件不成立
+	ErrNotFound          = errors.New("provider: 不存在")
+	ErrIncomplete        = errors.New("provider: 环境不完整")
+	ErrConflict          = errors.New("provider: 同一 env_id 已存在且 spec 不同")
+	ErrForeign           = errors.New("provider: 资源不属于本安装或归属无法判定")
+	ErrStopping          = errors.New("provider: 环境已停止接受新的执行")
+	ErrStartFailed       = errors.New("provider: 启动失败，workload 未运行")
+	ErrControlLost       = errors.New("provider: 控制连接断开") // ACK 前：启动结果未知；ACK 后（Wait）：退出状态未知
+	ErrStopUnconfirmed   = errors.New("provider: 期限内未确认执行树清空")
+	ErrNotStopped        = errors.New("provider: 环境尚未确认停止") // Destroy、OpenOutputs 的前置条件不成立
+	ErrFreezeUnconfirmed = errors.New("provider: 期限内未确认冻结")
 )
 
 // StartError 是 init 回复的 start_err：启动序列某步失败，workload 未运行。Reason 的取值由
@@ -199,9 +212,12 @@ func (s EnvSpec) Validate() error {
 		if s.Mounts.In != "" || s.Mounts.OutBytes != 0 {
 			return fmt.Errorf("provider: %s 环境不能有 /in 或 /out", s.Kind)
 		}
+		if s.Mounts.RestoreDir != "" && s.Kind != KindSession {
+			return errors.New("provider: 只有 session 环境可以有恢复暂存目录（RestoreDir）")
+		}
 	case KindExec:
-		if s.Mounts.Workspace != "" || s.Mounts.GatewaySocket != "" {
-			return errors.New("provider: exec 环境不能有 workspace 或 Gateway socket")
+		if s.Mounts.Workspace != "" || s.Mounts.GatewaySocket != "" || s.Mounts.RestoreDir != "" {
+			return errors.New("provider: exec 环境不能有 workspace、Gateway socket 或恢复暂存目录")
 		}
 		if s.Mounts.OutBytes <= 0 {
 			return errors.New("provider: exec 环境须给出 /out 的大小（OutBytes）")

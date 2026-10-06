@@ -54,6 +54,8 @@ type Provider struct {
 
 	// afterOwner 是测试钩子：Create 写完 owner.json 之后、建 cgroup 之前调用。
 	afterOwner func()
+	// eventsFile 是测试钩子：Freeze/Thaw 确认冻结状态所读的 cgroup 文件名，空为 cgroup.events（E31 以不存在的文件注入失败）。
+	eventsFile string
 
 	mu   sync.Mutex
 	envs map[string]*envState // 本进程创建的环境；进程重启后为空（不接管存活环境）
@@ -461,7 +463,8 @@ func (p *Provider) StartExec(ctx context.Context, envID string, spec provider.Ex
 
 // Stop 关闭执行闸门 → cgroup.kill → 等待 populated 0（契约第 3 节）。成功仅当权威检查成立：
 // 环境 cgroup 不存在，或存在且 populated 为 0。期限内未确认 → ErrStopUnconfirmed。
-// 不等待在途启动；不卸载、不删除。
+// 不等待在途启动；不卸载、不删除。已冻结的环境同样适用：冻结中的进程收到 cgroup.kill 的 SIGKILL 即退出，
+// 不需要先解冻（规格 §12.2"从 frozen 直接销毁"）。
 func (p *Provider) Stop(ctx context.Context, envID string) error {
 	if err := checkName("env_id", envID); err != nil {
 		return err
@@ -601,6 +604,118 @@ func (p *Provider) Destroy(ctx context.Context, envID string) error {
 	delete(p.envs, envID)
 	p.mu.Unlock()
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Freeze、Thaw、Procs（契约第 3 节修订，M4 Plan 12；规格 §12.2、§12.4）
+
+// defaultFreezeTimeout 是 ctx 没有期限时 Freeze/Thaw 等待确认的上限。
+const defaultFreezeTimeout = 10 * time.Second
+
+// Freeze 写 cgroup.freeze=1 并等待 cgroup.events 中 frozen 1（规格 §12.2"宿主写 cgroup.freeze = 1 并等到
+// frozen 1（有期限）后才记录 frozen"）。期限内未确认（或无法读取冻结状态）→ ErrFreezeUnconfirmed，返回前
+// 写 cgroup.freeze=0 尝试解冻（不等待确认；调用方随后驱逐，Stop 对冻结与否都成立）。
+func (p *Provider) Freeze(ctx context.Context, envID string) error {
+	g, err := p.existingGroup(envID)
+	if err != nil {
+		return err
+	}
+	if err := g.Freeze(); err != nil {
+		return fmt.Errorf("local: 冻结环境 %s: %w", envID, err)
+	}
+	if err := p.waitFrozen(ctx, g, true); err != nil {
+		if terr := g.Thaw(); terr != nil {
+			err = errors.Join(err, fmt.Errorf("尝试解冻: %w", terr))
+		}
+		return fmt.Errorf("%w: 环境 %s: %w", provider.ErrFreezeUnconfirmed, envID, err)
+	}
+	return nil
+}
+
+// Thaw 写 cgroup.freeze=0 并等待 frozen 0（期限同 Freeze）。
+func (p *Provider) Thaw(ctx context.Context, envID string) error {
+	g, err := p.existingGroup(envID)
+	if err != nil {
+		return err
+	}
+	if err := g.Thaw(); err != nil {
+		return fmt.Errorf("local: 解冻环境 %s: %w", envID, err)
+	}
+	if err := p.waitFrozen(ctx, g, false); err != nil {
+		return fmt.Errorf("local: 环境 %s 期限内未确认解冻: %w", envID, err)
+	}
+	return nil
+}
+
+// Procs 返回环境 cgroup.procs 中的宿主 pid（规格 §12.4 释放核验的进程基线比较）。
+func (p *Provider) Procs(ctx context.Context, envID string) ([]int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	g, err := p.existingGroup(envID)
+	if err != nil {
+		return nil, err
+	}
+	return g.Procs()
+}
+
+// existingGroup 返回已存在的环境 cgroup；不存在 → ErrNotFound。
+func (p *Provider) existingGroup(envID string) (*cgroup.Group, error) {
+	if err := checkName("env_id", envID); err != nil {
+		return nil, err
+	}
+	g, ok, err := p.group(envID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("%w: 环境 %q 的 cgroup", provider.ErrNotFound, envID)
+	}
+	return g, nil
+}
+
+// waitFrozen 轮询 cgroup.events 的 frozen 直到等于 want；ctx 结束（无期限时取 defaultFreezeTimeout）或读取失败时返回错误。
+func (p *Provider) waitFrozen(ctx context.Context, g *cgroup.Group, want bool) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultFreezeTimeout)
+		defer cancel()
+	}
+	name := p.eventsFile
+	if name == "" {
+		name = "cgroup.events"
+	}
+	path := filepath.Join(g.Path(), name)
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		frozen, err := readFrozen(path)
+		if err != nil {
+			return err
+		}
+		if frozen == want {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("frozen 仍为 %v: %w", frozen, ctx.Err())
+		case <-tick.C:
+		}
+	}
+}
+
+// readFrozen 读取 cgroup.events 中的 frozen 键。
+func readFrozen(path string) (bool, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false, fmt.Errorf("读取 %s: %w", path, err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "frozen "); ok {
+			return strings.TrimSpace(v) == "1", nil
+		}
+	}
+	return false, fmt.Errorf("%s 中没有 frozen", path)
 }
 
 // ---------------------------------------------------------------------------

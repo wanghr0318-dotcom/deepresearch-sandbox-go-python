@@ -510,3 +510,78 @@ func TestExecGateUnusableCapacityRejected(t *testing.T) {
 		checkExecUsage(t, g, 0, 0, map[string]int{})
 	}
 }
+
+// ---- M4 Plan 12：仅内存授予与内存压力回调（规格 §12.2） ----
+
+// TestMemoryOnlyGrantAndPressure：MemoryOnly 授予不占 run slot（frozen 会话的环境内存仍计入内存）；队首因内存
+// 不足等待时 pressure 回调以缺口调用，同一排队状态只调用一次、不持锁（回调中可读 Snapshot）；释放后队首被授予。
+func TestMemoryOnlyGrantAndPressure(t *testing.T) {
+	a := New(Capacity{RunSlots: 1, MemoryBytes: 100})
+	type call struct {
+		need int64
+		used int64
+	}
+	calls := make(chan call, 8)
+	a.SetPressureHandler(func(need int64) { calls <- call{need, a.Snapshot().MemoryUsed} })
+
+	inc1, err := a.Acquire(context.Background(), Request{TaskID: "inc-1", MemoryBytes: 40, MemoryOnly: true})
+	if err != nil || !inc1.MemoryOnly {
+		t.Fatalf("MemoryOnly 授予 = %+v, %v", inc1, err)
+	}
+	inc2, err := a.Acquire(context.Background(), Request{TaskID: "inc-2", MemoryBytes: 30, MemoryOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 两个 incarnation 不占 run slot：普通任务仍能拿到唯一的 slot。
+	task, err := a.Acquire(context.Background(), Request{TaskID: "t1", MemoryBytes: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u := a.Snapshot(); u.RunSlotsUsed != 1 || u.MemoryUsed != 80 {
+		t.Fatalf("用量 = %+v，期望 1 个 slot、80 字节", u)
+	}
+	// 第三个 incarnation 需要 50：缺口 30。
+	ch := startAcquire(t, a, context.Background(), Request{TaskID: "inc-3", MemoryBytes: 50, MemoryOnly: true}, 1)
+	select {
+	case c := <-calls:
+		if c.need != 30 || c.used != 80 {
+			t.Fatalf("pressure 回调 = %+v，期望缺口 30（已用 80）", c)
+		}
+	case <-time.After(deadline):
+		t.Fatal("内存不足时没有 pressure 回调")
+	}
+	// 排队状态不变（释放一个不存在的授予）不再回调；归还 run slot 而内存仍不足时，缺口变化后再回调一次。
+	a.Release(Grant{ID: 9999})
+	a.Release(task)
+	select {
+	case c := <-calls:
+		if c.need != 20 {
+			t.Fatalf("释放 10 字节后的 pressure 回调 = %+v，期望缺口 20", c)
+		}
+	case <-time.After(deadline):
+		t.Fatal("已用内存变化后没有再次回调")
+	}
+	select {
+	case c := <-calls:
+		t.Fatalf("同一排队状态重复回调：%+v", c)
+	default:
+	}
+	notReady(t, ch)
+	// 驱逐（归还 inc-1 的 40）后队首被授予。
+	a.Release(inc1)
+	if r := recv(t, ch); r.err != nil || r.g.TaskID != "inc-3" || !r.g.MemoryOnly {
+		t.Fatalf("释放后队首授予 = %+v", r)
+	}
+	if u := a.Snapshot(); u.RunSlotsUsed != 0 || u.MemoryUsed != 80 || u.Queued != 0 {
+		t.Fatalf("用量 = %+v", u)
+	}
+	a.Release(inc2)
+	// 没有 run slot 的闸门仍可授予 MemoryOnly；普通请求永远无法满足。
+	b := New(Capacity{RunSlots: 0, MemoryBytes: 10})
+	if _, err := b.Acquire(context.Background(), Request{TaskID: "inc", MemoryBytes: 10, MemoryOnly: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Acquire(context.Background(), Request{TaskID: "t", MemoryBytes: 1}); !errors.Is(err, ErrExceedsCapacity) {
+		t.Fatalf("没有 run slot 时普通请求 = %v", err)
+	}
+}

@@ -100,7 +100,7 @@ func launchSpecFor(spec provider.EnvSpec, dir string) (sandbox.LaunchSpec, error
 		Hostname: envHostname,
 		Init: sandbox.InitSpec{
 			Kind: string(spec.Kind), Template: tpl, TmpBytes: tmp,
-			Workspace: spec.Mounts.Workspace, GatewaySocket: spec.Mounts.GatewaySocket,
+			Workspace: spec.Mounts.Workspace, GatewaySocket: spec.Mounts.GatewaySocket, Restore: spec.Mounts.RestoreDir,
 			In: in, Out: out, OutBytes: spec.Mounts.OutBytes,
 			NoFile: nofile, FSize: spec.Limits.FSize,
 		},
@@ -181,7 +181,7 @@ func (s *ProcessStarter) StartInit(ctx context.Context, spec provider.EnvSpec, d
 	if err != nil {
 		return nil, 0, err
 	}
-	for _, p := range []string{ls.Init.In, ls.Init.Out} {
+	for _, p := range []string{ls.Init.In, ls.Init.Out, ls.Init.Restore} {
 		if p == "" {
 			continue
 		}

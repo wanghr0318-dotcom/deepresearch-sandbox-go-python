@@ -57,6 +57,7 @@ type memStore struct {
 	intents    map[string]Intent
 	ranges     []*UIDRange
 	quarantine map[string]Quarantine
+	envRange   map[string]string   // env_id → 使用的 UID 范围（environments.uid_range_id；owner 范围也记录）
 	fail       map[string]int      // 方法名 → 接下来失败的次数（ErrUnavailable）
 	onFail     func(method string) // 每次注入失败后调用（锁外）
 }
@@ -64,7 +65,7 @@ type memStore struct {
 func newMemStore(r *rec) *memStore {
 	return &memStore{
 		rec: r, envs: map[string]*Environment{}, ended: map[string]bool{},
-		intents: map[string]Intent{}, quarantine: map[string]Quarantine{}, fail: map[string]int{},
+		intents: map[string]Intent{}, quarantine: map[string]Quarantine{}, fail: map[string]int{}, envRange: map[string]string{},
 	}
 }
 
@@ -236,9 +237,60 @@ func (s *memStore) GetUIDRange(_ context.Context, envID string) (UIDRange, error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, r := range s.ranges {
-		if r.State == "assigned" && r.OwnerID == envID {
+		// owner 范围也按使用它的环境返回（比 postgres 的 owner_id 查询更严：使 cleanup 的 owner 判断真正被检验）。
+		if r.State == "assigned" && (r.OwnerID == envID || s.envRange[envID] == r.UIDRangeID) {
 			return *r, nil
 		}
+	}
+	return UIDRange{}, persistence.ErrNotFound
+}
+
+// AssignOwnerUIDRange 实现 OwnerUIDStore：owner 已有范围则复用，否则分配空闲范围给 owner。
+func (s *memStore) AssignOwnerUIDRange(_ context.Context, owner, envID, alloc string) (UIDRange, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rec.add("AssignOwnerUIDRange")
+	if _, ok := s.envs[envID]; !ok {
+		return UIDRange{}, persistence.ErrNotFound
+	}
+	for _, r := range s.ranges {
+		if r.State == "assigned" && r.OwnerID == owner {
+			if r.AllocationID != alloc {
+				return UIDRange{}, persistence.ErrConflict
+			}
+			s.envRange[envID] = r.UIDRangeID
+			return *r, nil
+		}
+	}
+	for _, r := range s.ranges {
+		if r.State == "free" {
+			r.State, r.OwnerID, r.AllocationID = "assigned", owner, alloc
+			s.envRange[envID] = r.UIDRangeID
+			return *r, nil
+		}
+	}
+	return UIDRange{}, ErrNoFreeUIDRange
+}
+
+// ReleaseOwnerUIDRange 实现 OwnerUIDStore：使用过该范围的环境须全部已停止且清理完成。
+func (s *memStore) ReleaseOwnerUIDRange(_ context.Context, owner, alloc string) (UIDRange, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rec.add("ReleaseOwnerUIDRange")
+	for _, r := range s.ranges {
+		if r.State != "assigned" || r.OwnerID != owner {
+			continue
+		}
+		if r.AllocationID != alloc {
+			return UIDRange{}, persistence.ErrConflict
+		}
+		for envID, id := range s.envRange {
+			if e := s.envs[envID]; id == r.UIDRangeID && (e.StoppedAt == nil || e.CleanupState != CleanupDone) {
+				return UIDRange{}, fmt.Errorf("%w: 环境 %s 尚未停止并完成清理", persistence.ErrConflict, envID)
+			}
+		}
+		r.State, r.OwnerID = "free", ""
+		return *r, nil
 	}
 	return UIDRange{}, persistence.ErrNotFound
 }
@@ -948,5 +1000,142 @@ func TestStopRecordedKicksCleanup(t *testing.T) {
 	case <-runs:
 	case <-time.After(10 * time.Second):
 		t.Fatal("停止记录后 cleanup loop 未被唤醒")
+	}
+}
+
+// ---- 会话环境（M4 Plan 12 Task 5；规格 §12.1、§12.2、§4.5） ----
+
+func sessionReq(envID, owner string) EnvRequest {
+	r := req(envID)
+	r.Kind, r.UIDOwner = provider.KindSession, owner
+	return r
+}
+
+// TestOwnerUIDRangeKeptForSession：同一 UIDOwner 的两次 CreateEnv（第二个在第一个清理后）得到同一 UID 范围；
+// 清理第一个环境不归还该范围（不调用 ReleaseUIDRange）；ReleaseOwnerUIDRange 在仍有未清理的环境时为冲突，
+// 之后归还且幂等；I11：两个存活 session 环境的范围不同。
+func TestOwnerUIDRangeKeptForSession(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	baseOf := func(envID string) uint32 {
+		t.Helper()
+		for _, s := range f.prov.specs {
+			if s.EnvID == envID {
+				return s.UIDBase
+			}
+		}
+		t.Fatalf("没有 %s 的 spec", envID)
+		return 0
+	}
+	f.store.addEnv("s1-a", true)
+	f.store.addEnv("s2-a", true)
+	if _, err := f.c.CreateEnv(ctx, sessionReq("s1-a", "session:s1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.c.CreateEnv(ctx, sessionReq("s2-a", "session:s2")); err != nil {
+		t.Fatal(err)
+	}
+	if baseOf("s1-a") == baseOf("s2-a") {
+		t.Fatalf("I11：两个存活 session 环境共用 UID 范围 %d", baseOf("s1-a"))
+	}
+	r1, err := f.store.GetUIDRange(ctx, "s1-a")
+	if err != nil || r1.OwnerID != "session:s1" {
+		t.Fatalf("s1-a 的范围 = %+v, %v，期望属于 owner session:s1", r1, err)
+	}
+
+	if res, err := f.c.StopEnv(ctx, "s1-a"); err != nil || !res.Recorded {
+		t.Fatalf("StopEnv = %+v, %v", res, err)
+	}
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if e := f.store.env("s1-a"); e.CleanupState != CleanupDone {
+		t.Fatalf("s1-a 清理状态 = %s", e.CleanupState)
+	}
+	if got := f.store.rangeOf(r1.UIDRangeID); got.State != "assigned" || got.OwnerID != "session:s1" {
+		t.Fatalf("环境清理后 owner 范围 = %+v，期望保留", got)
+	}
+	if n := f.rec.count("ReleaseUIDRange"); n != 0 {
+		t.Fatalf("cleanup 对 owner 范围调用了 ReleaseUIDRange %d 次", n)
+	}
+
+	f.store.addEnv("s1-b", true)
+	if _, err := f.c.CreateEnv(ctx, sessionReq("s1-b", "session:s1")); err != nil {
+		t.Fatal(err)
+	}
+	if baseOf("s1-b") != baseOf("s1-a") {
+		t.Fatalf("同一 owner 的新环境 UID 范围 %d，期望沿用 %d", baseOf("s1-b"), baseOf("s1-a"))
+	}
+	if err := f.c.ReleaseOwnerUIDRange(ctx, "session:s1"); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("仍有未清理的环境时 ReleaseOwnerUIDRange = %v，期望冲突", err)
+	}
+	if res, err := f.c.StopEnv(ctx, "s1-b"); err != nil || !res.Recorded {
+		t.Fatalf("StopEnv = %+v, %v", res, err)
+	}
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.c.ReleaseOwnerUIDRange(ctx, "session:s1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.store.rangeOf(r1.UIDRangeID); got.State != "free" {
+		t.Fatalf("ReleaseOwnerUIDRange 后范围 = %+v，期望归还", got)
+	}
+	if err := f.c.ReleaseOwnerUIDRange(ctx, "session:s1"); err != nil {
+		t.Fatalf("重复归还应幂等：%v", err)
+	}
+	f.store.addEnv("s3", false)
+	if _, err := f.c.CreateEnv(ctx, sessionReq("s3", "task:x")); err == nil || !strings.Contains(err.Error(), "UIDOwner") {
+		t.Fatalf("非 session: 前缀的 UIDOwner 应被拒绝，得到 %v", err)
+	}
+}
+
+// TestFreezeEnvSerializedAndReported：FreezeEnv 经环境的串行执行者（等待在途 CreateEnv）；冻结、解冻与进程表转交
+// provider；provider 未确认冻结时错误保持 ErrFreezeUnconfirmed（session actor 据此驱逐，E31）。
+func TestFreezeEnvSerializedAndReported(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	f.store.addEnv("s1", false)
+	entered, release := make(chan struct{}), make(chan struct{})
+	f.prov.beforeCreate = func(context.Context) error {
+		close(entered)
+		<-release
+		return nil
+	}
+	created := make(chan error, 1)
+	go func() { _, err := f.c.CreateEnv(ctx, sessionReq("s1", "session:s1")); created <- err }()
+	<-entered
+	waiting := make(chan string, 1)
+	f.c.mu.Lock()
+	f.c.onLockWait = func(id string) { waiting <- id }
+	f.c.mu.Unlock()
+	frozen := make(chan error, 1)
+	go func() { frozen <- f.c.FreezeEnv(ctx, "s1") }()
+	if id := <-waiting; id != "s1" {
+		t.Fatalf("等待的环境 = %s", id)
+	}
+	if f.prov.Frozen("s1") {
+		t.Fatal("创建完成之前已冻结")
+	}
+	close(release)
+	if err := <-created; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-frozen; err != nil || !f.prov.Frozen("s1") {
+		t.Fatalf("FreezeEnv = %v，Frozen = %v", err, f.prov.Frozen("s1"))
+	}
+	if err := f.c.ThawEnv(ctx, "s1"); err != nil || f.prov.Frozen("s1") {
+		t.Fatalf("ThawEnv = %v，Frozen = %v", err, f.prov.Frozen("s1"))
+	}
+	f.prov.SetProcs("s1", []int{11, 12})
+	if pids, err := f.c.EnvProcs(ctx, "s1"); err != nil || !slices.Equal(pids, []int{11, 12}) {
+		t.Fatalf("EnvProcs = %v, %v", pids, err)
+	}
+	f.prov.FailFreeze("s1", fmt.Errorf("%w: 注入", provider.ErrFreezeUnconfirmed))
+	if err := f.c.FreezeEnv(ctx, "s1"); !errors.Is(err, provider.ErrFreezeUnconfirmed) {
+		t.Fatalf("未确认冻结时 FreezeEnv = %v，期望 ErrFreezeUnconfirmed", err)
+	}
+	if _, err := f.c.EnvProcs(ctx, "nope"); !errors.Is(err, provider.ErrNotFound) {
+		t.Fatalf("不存在的环境 EnvProcs = %v，期望 ErrNotFound", err)
 	}
 }
