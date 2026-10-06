@@ -35,6 +35,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -277,9 +278,13 @@ func (w *worker) run() error {
 	if err := w.resume(in); err != nil {
 		return err
 	}
-	if err := w.send(&protocol.Ready{EventHeader: w.hdr(protocol.TypeReady, ""), ProtocolVersion: protocol.Version,
+	ready := &protocol.Ready{EventHeader: w.hdr(protocol.TypeReady, ""), ProtocolVersion: protocol.Version,
 		Mode: protocol.ModeSession, Worker: protocol.WorkerInfo{Name: "sessionworker", Version: "e2e"},
-		Capabilities: []string{}, SessionExt: protocol.SessionExtVersion}); err != nil {
+		Capabilities: []string{}, SessionExt: protocol.SessionExtVersion}
+	if slices.Contains(in.Extensions, protocol.ExtensionSubruns) { // 扩展确认：当且仅当宿主请求（规格 §5.2；不使用 sub-run）
+		ready.Subruns = protocol.SubrunsExtVersion
+	}
+	if err := w.send(ready); err != nil {
 		return err
 	}
 	for {

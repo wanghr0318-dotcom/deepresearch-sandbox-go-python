@@ -52,10 +52,26 @@ func (s *Store) LoadTask(ctx context.Context, taskID string) (task.TaskState, er
 		if st.Latest, err = cp.latest(); err != nil {
 			return err
 		}
-		st.SessionLatest, err = scp.latest()
+		if st.SessionLatest, err = scp.latest(); err != nil {
+			return err
+		}
+		st.Subruns, err = selectSubrunStates(ctx, q, taskID)
 		return err
 	})
 	return st, err
+}
+
+// selectSubrunStates 读取任务全部 sub-run 的状态（按 subrun_id 排序，与 rebindSubrunsTx 的返回一致）。
+func selectSubrunStates(ctx context.Context, q queryer, taskID string) ([]task.SubrunState, error) {
+	rows, err := q.Query(ctx, "SELECT subrun_id, status, COALESCE(result_ref, '') FROM subruns WHERE task_id = $1 ORDER BY subrun_id", taskID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (task.SubrunState, error) {
+		var s task.SubrunState
+		err := row.Scan(&s.SubrunID, &s.Status, &s.ResultRef)
+		return s, err
+	})
 }
 
 // checkpointCols 是 LEFT JOIN 读出的一行 checkpoint（不存在时 id 为 nil）。

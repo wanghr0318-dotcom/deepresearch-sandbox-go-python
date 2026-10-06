@@ -136,6 +136,10 @@ type Config struct {
 	// chatagent）。为空时不启用会话：会话端点 503 sessions_unavailable。启用会话需要用户账号（Accounts）。会话 Worker
 	// 的环境变量与任务 Worker 相同（WorkerEnv）。
 	SessionWorkerArgv []string
+	// WorkerSubruns 在 init 与会话 init 中请求 sub-run 扩展（--worker-subruns，server 默认开启；M4 Plan 14，规格 §5.2）：
+	// Worker 的 ready 须回 subruns: 1。关闭时不请求，Worker 的任何 subrun_* 为 extension_not_negotiated。
+	// T_subrun_cancel 为 Runner.SubrunCancelTimeout（--subrun-cancel-timeout）。
+	WorkerSubruns bool
 }
 
 // ModelConfig 是模型上游的配置。APIKey 只从宿主环境变量 AGENTBOX_MODEL_API_KEY 加载，只交给 chat adapter
@@ -351,6 +355,7 @@ type Store interface {
 	turnFactsStore
 	EnvUIDRangeID(ctx context.Context, envID string) (string, error)
 	Sessions() api.Sessions
+	subrunStore // sub-run 生命周期（M4 Plan 14），经 subrunHost 交给 runner
 	// Migrate 执行尚未应用的迁移（安装引导之后）。
 	Migrate(ctx context.Context) error
 	Close()
@@ -604,7 +609,8 @@ func (s *server) assemble() error {
 		return err
 	}
 	access := newAccessRouter(s.edge, s.cfg.Runner.ReleaseTimeout)
-	s.sessions = &sessionRuntime{access: access, facts: s.store, blobs: blobs, log: s.log}
+	subruns := subrunHost{store: s.store, calls: s.calls}
+	s.sessions = &sessionRuntime{access: access, facts: s.store, blobs: blobs, log: s.log, subruns: subruns}
 	if s.cfg.sessionsEnabled() {
 		s.sessDeps = session.Deps{
 			Store:     s.store,
@@ -630,7 +636,7 @@ func (s *server) assemble() error {
 		Store:     s.store,
 		Admission: admissionAdapter{a: s.adm, cfg: s.cfg},
 		Env:       envAdapter{c: s.coord, cfg: s.cfg, dataDir: s.d.DataDir},
-		Runner:    runnerAdapter{r: run, cfg: s.cfg, dataDir: s.d.DataDir, sess: s.sessions},
+		Runner:    runnerAdapter{r: run, cfg: s.cfg, dataDir: s.d.DataDir, sess: s.sessions, subruns: subruns},
 		Access:    access,
 		Session:   sessionGate{rt: s.sessions},
 		Clock:     s.d.Clock,

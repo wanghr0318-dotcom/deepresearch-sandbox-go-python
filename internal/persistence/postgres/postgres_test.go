@@ -6543,3 +6543,94 @@ func TestInspectSubruns(t *testing.T) {
 }
 
 // ==== M4 Plan 14 Task 10 段结束 ====
+
+// ==== M4 Plan 14 Task 7：CreateAttempt 重新绑定、LoadTask 的 sub-run 状态、裁决收尾 ====
+
+// TestAttemptSubrunLifecycle：新建 attempt 的事务重新绑定 sub-run（结果随 Attempt.Subruns 返回，LoadTask 读到同一
+// 列表，重放已存在的 attempt 不再返回）；回到 queued 的裁决不收尾；成功裁决把非终态置为 failed{not_completed_at_result}；
+// 取消裁决把非终态（含 cancel_requested）置为 cancelled{task_cancel}。
+func TestAttemptSubrunLifecycle(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	for _, id := range []string{"a", "b", "c"} {
+		mustStartSubrun(t, s, "t1", "att-t1", id)
+	}
+	if _, err := s.RequestSubrunCancel(ctx, "t1", "b", subrun.ReasonOrchestrator); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "c", "succeeded", "ok"); err != nil {
+		t.Fatal(err)
+	}
+	v := verdict("t1", 1)
+	v.TaskStatus = "queued"
+	if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+		t.Fatal(err)
+	}
+	if g := subrunRow(t, s, "t1", "a"); g != "started|att-t1|-|||false" {
+		t.Fatalf("回到 queued 的裁决不应收尾：a = %s", g)
+	}
+	stopEnv(t, s, "env-t1")
+	if err := s.RevokeAttemptAccess(ctx, "att-t1", "test"); err != nil {
+		t.Fatal(err)
+	}
+	na := task.NewAttempt{TaskID: "t1", AttemptID: "att2-t1", AttemptNo: 2, EnvID: "env2-t1"}
+	a2, err := s.CreateAttempt(ctx, na)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprint([]task.SubrunState{{SubrunID: "a", Status: "started"}, {SubrunID: "b", Status: "cancelled"},
+		{SubrunID: "c", Status: "started"}})
+	if fmt.Sprint(a2.Subruns) != want {
+		t.Fatalf("CreateAttempt.Subruns = %+v，期望 %s", a2.Subruns, want)
+	}
+	if again, err := s.CreateAttempt(ctx, na); err != nil || again.Subruns != nil {
+		t.Fatalf("重放 = %+v, %v", again, err)
+	}
+	if st, err := s.LoadTask(ctx, "t1"); err != nil || fmt.Sprint(st.Subruns) != want {
+		t.Fatalf("LoadTask.Subruns = %+v, %v", st.Subruns, err)
+	}
+	for id, w := range map[string]string{"a": "started|att2-t1|-|||false", "b": "cancelled|att-t1|-||orchestrator|true",
+		"c": "started|att2-t1|-|||false"} {
+		if g := subrunRow(t, s, "t1", id); g != w {
+			t.Errorf("%s = %s，期望 %s", id, g, w)
+		}
+	}
+	zero := int64(0)
+	ok := task.Verdict{AttemptID: "att2-t1", TaskID: "t1", ControlVersion: 1, FromStatus: "starting", AttemptStatus: "ended",
+		OutcomeClass: "succeeded", ExitCode: &zero, TaskStatus: "succeeded", Result: json.RawMessage(`{"ok":true}`),
+		EventType: "task_terminal", EventPayload: json.RawMessage(`{"exit":0}`)}
+	if _, err := s.FinalizeAttempt(ctx, ok); err != nil {
+		t.Fatal(err)
+	}
+	for id, w := range map[string]string{"a": "failed|att2-t1|-|not_completed_at_result||true",
+		"b": "cancelled|att-t1|-||orchestrator|true", "c": "failed|att2-t1|-|not_completed_at_result||true"} {
+		if g := subrunRow(t, s, "t1", id); g != w {
+			t.Errorf("成功裁决后 %s = %s，期望 %s", id, g, w)
+		}
+	}
+
+	// 取消裁决：started 与 cancel_requested 都收尾为 cancelled（task_cancel；已请求的取消原因保留）。
+	fixture(t, s, "t2")
+	mustStartSubrun(t, s, "t2", "att-t2", "a")
+	mustStartSubrun(t, s, "t2", "att-t2", "b")
+	if _, err := s.RequestSubrunCancel(ctx, "t2", "b", subrun.ReasonDeadline); err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "c-t2", BodyHash: []byte("h"), TaskID: "t2", Desired: "cancel"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cv := verdict("t2", 1)
+	cv.ControlVersion, cv.TaskStatus, cv.TaskStatusReason, cv.EventType = c.ControlVersion, "cancelled", "cancelled", "task_terminal"
+	if _, err := s.FinalizeAttempt(ctx, cv); err != nil {
+		t.Fatal(err)
+	}
+	for id, w := range map[string]string{"a": "cancelled|att-t2|-|task_cancel|task_cancel|true",
+		"b": "cancelled|att-t2|-|task_cancel|deadline|true"} {
+		if g := subrunRow(t, s, "t2", id); g != w {
+			t.Errorf("取消裁决后 %s = %s，期望 %s", id, g, w)
+		}
+	}
+	expectNoDBViolations(t, s)
+}

@@ -28,6 +28,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider/local"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/rootfs"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/subrun"
 )
 
 const (
@@ -101,6 +102,8 @@ func runServer(args []string, stderr io.Writer) int {
 	sessionIdleFreeze := fs.Duration("session-idle-freeze", app.DefaultSessionIdleFreeze, "会话空闲多久后冻结（须 > 0）")
 	sessionEvictAfter := fs.Duration("session-evict-after", app.DefaultSessionEvictAfter, "会话自空闲起多久后驱逐（须大于 --session-idle-freeze；内存压力下按 LRU 提前驱逐）")
 	sessionWorkerArgv := fs.String("session-worker-argv", "", "会话 incarnation 内启动 Worker 的命令（逗号分隔的 argv，例如 python3,-m,chatagent）；为空时不启用会话（会话端点 503 sessions_unavailable），非空时需要 --model-base-url")
+	workerSubruns := fs.Bool("worker-subruns", true, "在 init 中请求 sub-run 扩展（init.extensions = [\"subruns\"]；Worker 的 ready 须回 subruns: 1，否则以 extension_mismatch 拒绝）")
+	subrunCancelTimeout := fs.Duration("subrun-cancel-timeout", subrun.DefaultCancelTimeout, "宿主取消 sub-run 后等待其 subrun_end 的时限 T_subrun_cancel（须 > 0；超时终止整个 attempt，会话模式终止 incarnation）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -142,6 +145,10 @@ func runServer(args []string, stderr io.Writer) int {
 	}
 	sess := app.Config{Accounts: accounts}
 	if err := sessionFlags(&sess, *turnToolBudget, *sessionIdleFreeze, *sessionEvictAfter, *sessionWorkerArgv); err != nil {
+		fmt.Fprintln(stderr, "agentbox server:", err)
+		return 2
+	}
+	if err := subrunFlags(&sess, *workerSubruns, *subrunCancelTimeout); err != nil {
 		fmt.Fprintln(stderr, "agentbox server:", err)
 		return 2
 	}
@@ -189,6 +196,8 @@ func runServer(args []string, stderr io.Writer) int {
 		SessionIdleFreeze:     sess.SessionIdleFreeze,
 		SessionEvictAfter:     sess.SessionEvictAfter,
 		SessionWorkerArgv:     sess.SessionWorkerArgv,
+		WorkerSubruns:         sess.WorkerSubruns,
+		Runner:                sess.Runner,
 	}
 	if _, err := os.Stat(filepath.Join(dir, api.TokenFile)); err == nil {
 		if cfg.APIToken, err = api.LoadToken(dir); err != nil {

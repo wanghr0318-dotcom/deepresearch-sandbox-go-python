@@ -19,7 +19,8 @@ var _ task.Store = (*Store)(nil)
 // CreateAttempt 创建 attempt、attempt_access（active）与任务环境记录，并把任务从 queued 推进到 running
 // （实现 task.Store）。同一 attempt_id 已存在时只比较内容并返回原结果；新建时在同一事务内检查准入
 // 前置条件（规格 §8.1）：任务处于 queued、desired = run、旧执行的环境均已确认停止。
-// 锁顺序：tasks → task_control → task_event_seq → attempts → attempt_access → environments。
+// 锁顺序：tasks → task_control → task_event_seq → subruns → attempts → attempt_access → environments。新建时同事务
+// 重新绑定 sub-run（rebindSubrunsTx，规格 §13.5），结果随 Attempt.Subruns 返回。
 func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Attempt, error) {
 	if a.TaskID == "" || a.AttemptID == "" || a.EnvID == "" || a.AttemptNo < 1 {
 		return task.Attempt{}, invalidf("CreateAttempt 缺少 task_id、attempt_id、env_id 或 attempt_no")
@@ -58,6 +59,9 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 			return err
 		}
 		if err := lockEventSeq(ctx, tx, a.TaskID); err != nil {
+			return err
+		}
+		if err := lockTaskSubrunsTx(ctx, tx, a.TaskID); err != nil {
 			return err
 		}
 		existing, err := selectAttempt(ctx, tx, a.AttemptID, true)
@@ -106,6 +110,11 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 			a.AttemptID, a.TaskID, a.AttemptNo, a.EnvID); err != nil {
 			return err
 		}
+		// sub-run 在新 attempt 行插入之后重新绑定（bound_attempt_id 外键）；行锁已在上面按锁顺序取得（规格 §13.5）。
+		subruns, err := rebindSubrunsTx(ctx, tx, a.TaskID, a.AttemptID)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, "INSERT INTO attempt_access (attempt_id, task_id, state) VALUES ($1, $2, 'active')", a.AttemptID, a.TaskID); err != nil {
 			return err
 		}
@@ -137,9 +146,19 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 			return err
 		}
 		out = task.Attempt{AttemptID: a.AttemptID, TaskID: a.TaskID, AttemptNo: a.AttemptNo, EnvID: a.EnvID, Status: "starting"}
+		for _, r := range subruns {
+			out.Subruns = append(out.Subruns, task.SubrunState{SubrunID: r.SubrunID, Status: r.Status, ResultRef: r.ResultRef})
+		}
 		return nil
 	})
 	return out, err
+}
+
+// lockTaskSubrunsTx 按锁顺序（task_event_seq → subruns → attempts）以 FOR UPDATE 锁住任务的全部 sub-run 行（按
+// subrun_id 升序）。创建 attempt 与最终裁决先取得它们，之后的 rebindSubrunsTx / closeOpenSubrunsTx 不再取新锁。
+func lockTaskSubrunsTx(ctx context.Context, tx pgx.Tx, taskID string) error {
+	_, err := tx.Exec(ctx, "SELECT 1 FROM subruns WHERE task_id = $1 ORDER BY subrun_id FOR UPDATE", taskID)
+	return err
 }
 
 // admitAttempt 检查创建 attempt 的准入前置条件（规格 §8.1）。旧环境的 stopped_at 只会从空变为
@@ -301,7 +320,7 @@ func verdictHash(v task.Verdict) ([]byte, error) {
 // 提交者必须仍是当前 attempt，且任务仍处于 running、pausing 或 cancelling（stale_attempt）；
 // 判决依据的控制版本必须是最新（control_changed，调用方按最新控制重算）；任务状态必须与 desired
 // 相符；attempt 必须处于 FromStatus。判决同时把 applied_control_version 推进到该控制版本。
-// 锁顺序：tasks → task_control → task_event_seq → attempts。
+// 锁顺序：tasks → task_control → task_event_seq → subruns → attempts。
 func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attempt, error) {
 	if v.AttemptID == "" || v.TaskID == "" || v.ControlVersion < 1 || v.FromStatus == "" || v.AttemptStatus == "" ||
 		v.TaskStatus == "" || v.EventType == "" {
@@ -366,6 +385,9 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 		if err := lockEventSeq(ctx, tx, v.TaskID); err != nil {
 			return err
 		}
+		if err := lockTaskSubrunsTx(ctx, tx, v.TaskID); err != nil {
+			return err
+		}
 		a, err := selectAttempt(ctx, tx, v.AttemptID, true)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return notFoundf("attempt %s", v.AttemptID)
@@ -410,6 +432,11 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 			applied_control_version = GREATEST(applied_control_version, $5), not_before = $6, row_version = row_version + 1,
 			resume_directive = CASE WHEN $2 = 'queued' THEN resume_directive END
 			WHERE task_id = $1`, v.TaskID, v.TaskStatus, v.TaskStatusReason, nullJSON(v.Result), controlVersion, v.NotBefore); err != nil {
+			return err
+		}
+		// 最终裁决收尾仍未终态的 sub-run（§8.4）：cancelled → cancelled（task_cancel），succeeded → failed
+		// （not_completed_at_result）；其他裁决（回到 queued、paused、failed）不改动，留待恢复时重新绑定。
+		if err := closeOpenSubrunsTx(ctx, tx, v.TaskID, v.TaskStatus); err != nil {
 			return err
 		}
 		if _, err := appendHostEvent(ctx, tx, hostEvent{taskID: v.TaskID, key: "attempt_finalized:" + v.AttemptID,

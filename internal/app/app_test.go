@@ -7,6 +7,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -47,6 +48,8 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider/fake"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/recovery"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/session"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
 )
 
@@ -1674,5 +1677,438 @@ func TestSessionsWiring(t *testing.T) {
 	h.cancel()
 	if err := h.wait(); err != nil {
 		t.Fatalf("Run 返回 %v", err)
+	}
+}
+
+// ==== M4 Plan 14 Task 7：sub-run 扩展协商、恢复时重新绑定与裁决收尾 ====
+
+// subrunPeer 是脚本化 Worker 的协议对端：逐行读取宿主消息，按类型等待答复。
+type subrunPeer struct {
+	ctx   context.Context
+	lines chan []byte
+	out   io.Writer
+	seq   int64
+}
+
+func newSubrunPeer(ctx context.Context, stdin io.Reader, stdout io.Writer) *subrunPeer {
+	p := &subrunPeer{ctx: ctx, lines: make(chan []byte, 16), out: stdout}
+	go func() {
+		defer close(p.lines)
+		r := bufio.NewReader(stdin)
+		for {
+			b, err := r.ReadBytes('\n')
+			if len(bytes.TrimSpace(b)) > 0 {
+				select {
+				case p.lines <- b:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return p
+}
+
+// emit 发出一条 Worker 事件（补上 v 与递增的 seq）。
+func (p *subrunPeer) emit(m map[string]any) {
+	p.seq++
+	m["v"], m["seq"] = 1, p.seq
+	b, _ := json.Marshal(m)
+	_, _ = p.out.Write(append(b, '\n'))
+}
+
+// await 读到类型为 typ 的宿主消息为止（其他消息跳过）；stdin 结束或 ctx 结束时 ok = false。
+func (p *subrunPeer) await(typ string) (raw []byte, msg map[string]any, ok bool) {
+	for {
+		select {
+		case b, open := <-p.lines:
+			if !open {
+				return nil, nil, false
+			}
+			var m map[string]any
+			if json.Unmarshal(b, &m) == nil && m["type"] == typ {
+				return b, m, true
+			}
+		case <-p.ctx.Done():
+			return nil, nil, false
+		}
+	}
+}
+
+// subrunRec 记录每个 attempt 的原始 init（task → attempt_no → 行）、Worker 等待控制的信号与脚本内的意外。
+type subrunRec struct {
+	mu      sync.Mutex
+	inits   map[string]map[int64]string
+	waiting chan string // Worker 已到达等待 pause/cancel 的位置：task_id
+	fail    chan string
+}
+
+func newSubrunRec() *subrunRec {
+	return &subrunRec{inits: map[string]map[int64]string{}, waiting: make(chan string, 8), fail: make(chan string, 8)}
+}
+
+func (r *subrunRec) init(taskID string, no int64) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.inits[taskID][no]
+	return s, ok
+}
+
+// subrunScenario 是 protocol/fixtures/v1/scenarios 中的一个场景（只取行）。
+type subrunScenario struct {
+	Lines []struct {
+		From    string          `json:"from"`
+		Message json.RawMessage `json:"message"`
+	} `json:"lines"`
+}
+
+// subrunWorker 按 config.script 与 attempt_no 执行脚本；ready 回 subruns: 1 当且仅当 init 请求了扩展。
+func subrunWorker(dataDir string, rec *subrunRec, fixture subrunScenario) fake.Program {
+	return func(ctx context.Context, _ provider.ExecSpec, stdin io.Reader, stdout, _ io.Writer) provider.ExitStatus {
+		killed := provider.ExitStatus{Signal: syscall.SIGKILL}
+		p := newSubrunPeer(ctx, stdin, stdout)
+		raw, _, ok := p.await("init")
+		if !ok {
+			return killed
+		}
+		var in protocol.Init
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return provider.ExitStatus{Code: 2}
+		}
+		rec.mu.Lock()
+		if rec.inits[in.TaskID] == nil {
+			rec.inits[in.TaskID] = map[int64]string{}
+		}
+		rec.inits[in.TaskID][in.AttemptNo] = string(raw)
+		rec.mu.Unlock()
+		var cfg struct {
+			Script string `json:"script"`
+		}
+		_ = json.Unmarshal(in.Config, &cfg) // 没有 script 时按 plain 处理
+		failf := func(format string, args ...any) provider.ExitStatus {
+			rec.fail <- fmt.Sprintf("%s/%d: ", cfg.Script, in.AttemptNo) + fmt.Sprintf(format, args...)
+			return provider.ExitStatus{Code: 3}
+		}
+		if cfg.Script == "fixture" { // 原样重放 fixture 的 Worker 行；宿主行只等待同类型的答复
+			for _, l := range fixture.Lines[1:] {
+				var head struct {
+					Type string `json:"type"`
+				}
+				if err := json.Unmarshal(l.Message, &head); err != nil {
+					return failf("fixture: %v", err)
+				}
+				if l.From == "host" {
+					if _, _, ok := p.await(head.Type); !ok {
+						return killed
+					}
+					continue
+				}
+				_, _ = stdout.Write(append(bytes.Clone(l.Message), '\n'))
+			}
+			return provider.ExitStatus{Code: 0}
+		}
+		ready := map[string]any{"type": "ready", "protocol_version": 1, "mode": "task",
+			"worker": map[string]any{"name": "app-subrun-test", "version": "0"}, "capabilities": []string{}}
+		if slices.Contains(in.Extensions, protocol.ExtensionSubruns) {
+			ready["subruns"] = 1
+		}
+		p.emit(ready)
+		start := func(id string) bool {
+			p.emit(map[string]any{"type": "subrun_start", "subrun_id": id, "parent_step_id": "research", "deadline_ms": 600000})
+			_, m, ok := p.await("subrun_started")
+			return ok && m["subrun_id"] == id && m["status"] == "started"
+		}
+		checkpoint := func(id string, subs []map[string]any) bool {
+			m := map[string]any{"type": "checkpoint", "checkpoint_id": id, "scope": "task", "step_id": "research",
+				"state": map[string]any{"cp": id}}
+			if subs != nil {
+				m["subruns"] = subs
+			}
+			p.emit(m)
+			_, r, ok := p.await("checkpoint_result")
+			return ok && r["status"] == "committed"
+		}
+		waitControl := func(typ string) provider.ExitStatus {
+			rec.waiting <- in.TaskID
+			if _, _, ok := p.await(typ); !ok {
+				return killed
+			}
+			return provider.ExitStatus{Code: 0} // 收到控制即退出：裁决按 desired（paused / cancelled）
+		}
+		if in.AttemptNo == 1 {
+			switch cfg.Script {
+			case "rebind":
+				for _, id := range []string{"st1", "st2", "st3"} {
+					if !start(id) {
+						return failf("subrun_start %s 未被接受", id)
+					}
+				}
+				p.emit(map[string]any{"type": "subrun_end", "subrun_id": "st1", "status": "succeeded", "summary": "s1"})
+				body := []byte(`{"summary":"s1","sources":[],"partial":false}`)
+				dir := filepath.Join(workspaceDir(dataDir, in.TaskID), "out", in.AttemptID, "subruns")
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					return failf("%v", err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "st1.json"), body, 0o644); err != nil {
+					return failf("%v", err)
+				}
+				sum := sha256.Sum256(body)
+				sha := hex.EncodeToString(sum[:])
+				p.emit(map[string]any{"type": "artifact", "artifact_id": "subrun-st1", "path": "subruns/st1.json", "declared_sha256": sha,
+					"declared_size": len(body), "media_type": "application/json", "visibility": "internal"})
+				if _, m, ok := p.await("artifact_result"); !ok || m["status"] != "saved" {
+					return failf("artifact_result = %v", m)
+				}
+				if !checkpoint("cp-1", []map[string]any{{"subrun_id": "st1", "status": "completed", "result_ref": sha}}) {
+					return failf("cp-1 未提交")
+				}
+				// E42：st3 的 end{succeeded} 之后没有 checkpoint 列出它；E40：st4 取消后崩溃。
+				p.emit(map[string]any{"type": "subrun_end", "subrun_id": "st3", "status": "succeeded", "summary": "s3"})
+				if !start("st4") {
+					return failf("subrun_start st4 未被接受")
+				}
+				p.emit(map[string]any{"type": "subrun_cancel", "subrun_id": "st4", "reason": "abandon"})
+				if !checkpoint("cp-2", nil) { // 同步：之前的事件都已处理
+					return failf("cp-2 未提交")
+				}
+				return killed // 被杀死（crashed_signal）：故障重试
+			case "pause":
+				if !start("st1") || !checkpoint("cp-1", nil) {
+					return failf("st1 或 cp-1 失败")
+				}
+				return waitControl("pause")
+			case "cancel":
+				if !start("st1") || !start("st2") {
+					return failf("subrun_start 未被接受")
+				}
+				p.emit(map[string]any{"type": "subrun_end", "subrun_id": "st2", "status": "succeeded", "summary": "s2"})
+				if !checkpoint("cp-1", nil) {
+					return failf("cp-1 未提交")
+				}
+				return waitControl("cancel")
+			}
+		}
+		// 恢复后的 attempt（与 plain）直接给出结果：成功裁决收尾仍未终态的 sub-run。
+		p.emit(map[string]any{"type": "result", "summary": "done", "outputs": []string{}})
+		return provider.ExitStatus{Code: 0}
+	}
+}
+
+// TestSubrunAttemptLifecycle（M4 Plan 14 Task 7）：真实库 + 脚本化 Worker。
+//   - 协商：init.extensions = ["subruns"]，ready 回 subruns: 1；--worker-subruns=false 时 init 无 extensions。
+//   - 重新绑定：第 1 个 attempt 启动 st1–st3，checkpoint 列出 st1 completed，st3 end{succeeded} 之后未入 checkpoint（E42），
+//     st4 取消后崩溃（E40）；新 attempt 的 init.resume.subruns = [st1 completed+result_ref, st2 started, st3 started,
+//     st4 cancelled]，st2、st3 绑定到新 attempt，st4 不重新绑定；成功裁决把仍未终态的 st2、st3 置为
+//     failed{not_completed_at_result}。
+//   - E45：暂停任务，把 deadline_at 置为过去，恢复 → timed_out，并在 init.resume.subruns 中告知。
+//   - task 取消裁决：全部非终态（started、end_proposed）→ cancelled{task_cancel}。
+//   - fixture subrun_end_without_checkpoint：st1 由成功裁决事务置为 failed。
+func TestSubrunAttemptLifecycle(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "protocol", "fixtures", "v1", "scenarios", "subrun_end_without_checkpoint.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture subrunScenario
+	if err := json.Unmarshal(b, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t)
+	rec := newSubrunRec()
+	h.prov = fake.New(subrunWorker(h.dir, rec, fixture))
+	cfg := testConfig()
+	cfg.WorkerSubruns = true
+	h.start(cfg, task.SystemClock())
+	base := h.waitAddr()
+
+	ids := map[string]string{}
+	for _, s := range []string{"rebind", "pause", "cancel", "fixture"} {
+		ids[s] = submit(t, base, "sr-"+s, `{"script":"`+s+`"}`)
+	}
+	checkFail := func() {
+		select {
+		case f := <-rec.fail:
+			t.Fatalf("Worker 脚本：%s", f)
+		default:
+		}
+	}
+	waitStatus := func(h *harness, id, want string) {
+		t.Helper()
+		eventually(t, "任务 "+id+" 到达 "+want, checkFail, func() bool {
+			st, _ := h.taskStatus(id)
+			return st == want || task.IsTerminal(st)
+		})
+		if st, _ := h.taskStatus(id); st != want {
+			var events string
+			h.queryRow("SELECT COALESCE(string_agg(type || ' ' || payload::text, E'\n' ORDER BY task_seq), '') FROM events WHERE task_id = $1",
+				[]any{id}, &events)
+			t.Fatalf("任务 %s 为 %s，期望 %s；事件：\n%s", id, st, want, events)
+		}
+	}
+	control := func(id, action string) {
+		t.Helper()
+		st, b := httpDo(t, "POST", base+"/tasks/"+id+"/"+action, `{"request_id":"`+action+"-"+id+`","reason":"test"}`)
+		if st != http.StatusAccepted && st != http.StatusOK {
+			t.Fatalf("POST %s = %d %s", action, st, b)
+		}
+	}
+	// row 返回 status|绑定 attempt 的序号|result_ref|failure_reason|cancel_reason。
+	row := func(id, subrunID string) string {
+		var out string
+		h.queryRow(`SELECT concat_ws('|', s.status, COALESCE(a.attempt_no::text, '?'), COALESCE(s.result_ref, '-'),
+				COALESCE(s.failure_reason, ''), COALESCE(s.cancel_reason, ''))
+			FROM subruns s LEFT JOIN attempts a ON a.attempt_id = s.bound_attempt_id WHERE s.task_id = $1 AND s.subrun_id = $2`,
+			[]any{id, subrunID}, &out)
+		return out
+	}
+	initOf := func(rec *subrunRec, id string, no int64) protocol.Init {
+		t.Helper()
+		raw, ok := rec.init(id, no)
+		var in protocol.Init
+		if !ok || json.Unmarshal([]byte(raw), &in) != nil {
+			t.Fatalf("任务 %s 没有第 %d 个 attempt 的 init", id, no)
+		}
+		return in
+	}
+
+	// 暂停与取消：等 Worker 到达等待控制的位置。
+	for range 2 {
+		var id string
+		select {
+		case id = <-rec.waiting:
+		case f := <-rec.fail:
+			t.Fatalf("Worker 脚本：%s", f)
+		case <-time.After(60 * time.Second):
+			t.Fatal("Worker 未到达等待控制的位置")
+		}
+		switch id {
+		case ids["pause"]:
+			control(id, "pause")
+			waitStatus(h, id, "paused")
+			h.exec("UPDATE subruns SET deadline_at = now() - interval '1 second' WHERE task_id = $1", id)
+			control(id, "resume")
+		case ids["cancel"]:
+			control(id, "cancel")
+		}
+	}
+
+	// 重新绑定（E40、E42）与成功裁决收尾。
+	id := ids["rebind"]
+	waitStatus(h, id, "succeeded")
+	first := initOf(rec, id, 1)
+	if !slices.Equal(first.Extensions, []string{protocol.ExtensionSubruns}) || first.Resume != nil {
+		t.Fatalf("第 1 个 attempt 的 init：extensions = %v，resume = %+v", first.Extensions, first.Resume)
+	}
+	st1 := row(id, "st1")
+	sha := strings.Split(st1, "|")[2]
+	want := fmt.Sprint([]protocol.ResumeSubrun{{SubrunID: "st1", Status: "completed", ResultRef: sha},
+		{SubrunID: "st2", Status: "started"}, {SubrunID: "st3", Status: "started"}, {SubrunID: "st4", Status: "cancelled"}})
+	if r := initOf(rec, id, 2).Resume; r == nil || r.CheckpointID != "cp-2" || fmt.Sprint(r.Subruns) != want || len(sha) != 64 {
+		t.Fatalf("第 2 个 attempt 的 init.resume = %+v，期望 cp-2 与 %s", r, want)
+	}
+	for subrunID, w := range map[string]string{
+		"st1": "completed|1|" + sha + "||",
+		"st2": "failed|2|-|not_completed_at_result|",
+		"st3": "failed|2|-|not_completed_at_result|",
+		"st4": "cancelled|1|-||orchestrator",
+	} {
+		if g := row(id, subrunID); g != w {
+			t.Errorf("rebind %s = %s，期望 %s", subrunID, g, w)
+		}
+	}
+
+	// E45：暂停期间过期 → 恢复时 timed_out，并告知 Worker。
+	id = ids["pause"]
+	waitStatus(h, id, "succeeded")
+	if r := initOf(rec, id, 2).Resume; r == nil ||
+		fmt.Sprint(r.Subruns) != fmt.Sprint([]protocol.ResumeSubrun{{SubrunID: "st1", Status: "timed_out"}}) {
+		t.Fatalf("E45 的 init.resume = %+v", r)
+	}
+	if g := row(id, "st1"); g != "timed_out|1|-||deadline" {
+		t.Errorf("E45 st1 = %s", g)
+	}
+
+	// task 取消裁决：started 与 end_proposed 都收尾为 cancelled。
+	id = ids["cancel"]
+	waitStatus(h, id, "cancelled")
+	for _, subrunID := range []string{"st1", "st2"} {
+		if g := row(id, subrunID); g != "cancelled|1|-|task_cancel|task_cancel" {
+			t.Errorf("取消裁决 %s = %s", subrunID, g)
+		}
+	}
+
+	// fixture：subrun_end{succeeded} 未入 checkpoint 即 result → 成功裁决把 st1 置为 failed。
+	id = ids["fixture"]
+	waitStatus(h, id, "succeeded")
+	if g := row(id, "st1"); g != "failed|1|-|not_completed_at_result|" {
+		t.Errorf("fixture st1 = %s", g)
+	}
+	h.cancel()
+	if err := h.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
+
+	// --worker-subruns=false：init 不请求扩展（无 extensions 字段）。
+	off := newHarness(t)
+	offRec := newSubrunRec()
+	off.prov = fake.New(subrunWorker(off.dir, offRec, fixture))
+	off.start(testConfig(), task.SystemClock())
+	id = submit(t, off.waitAddr(), "sr-off", `{"script":"plain"}`)
+	waitStatus(off, id, "succeeded")
+	if raw, ok := offRec.init(id, 1); !ok || strings.Contains(raw, `"extensions"`) {
+		t.Fatalf("--worker-subruns=false 的 init = %s", raw)
+	}
+	off.cancel()
+	if err := off.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
+}
+
+// startCapture 记录 StartIncarnation 收到的 spec，并以错误返回（不启动 Worker）。
+type startCapture struct{ spec runner.IncarnationSpec }
+
+func (s *startCapture) StartIncarnation(_ context.Context, spec runner.IncarnationSpec) (*runner.Incarnation, error) {
+	s.spec = spec
+	return nil, errors.New("test: 不启动")
+}
+
+// TestSessionSubrunWiring（M4 Plan 14 Task 7）：会话 init 按 --worker-subruns 请求扩展；task_start.resume 与 task 模式的
+// init.resume 由同一函数组装（含 resume.subruns），没有 checkpoint 时不下发 resume。
+func TestSessionSubrunWiring(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		c := &startCapture{}
+		cfg := testConfig()
+		cfg.WorkerSubruns = on
+		w := sessionWorkers{r: c, cfg: cfg, dataDir: t.TempDir()}
+		if _, err := w.Start(context.Background(), session.WorkerStart{SessionID: "s1", IncarnationID: "i1", EnvID: "e1"}); err == nil {
+			t.Fatal("StartIncarnation 的错误应原样返回")
+		}
+		if got := c.spec.Extensions; on != slices.Equal(got, []string{protocol.ExtensionSubruns}) || (!on && got != nil) {
+			t.Errorf("--worker-subruns=%v：会话 init.extensions = %v", on, got)
+		}
+	}
+	ts := task.TaskState{Subruns: []task.SubrunState{{SubrunID: "st1", Status: "completed", ResultRef: strings.Repeat("a", 64)},
+		{SubrunID: "st2", Status: "timed_out"}}}
+	if r := taskResume(ts); r != nil {
+		t.Fatalf("没有 checkpoint 时 resume = %+v", r)
+	}
+	ts.Latest = &task.LatestCheckpoint{CheckpointID: "cp-1", StepID: "research", State: json.RawMessage(`{}`), Refs: []string{}}
+	r := taskResume(ts)
+	want := fmt.Sprint([]protocol.ResumeSubrun{{SubrunID: "st1", Status: "completed", ResultRef: strings.Repeat("a", 64)},
+		{SubrunID: "st2", Status: "timed_out"}})
+	if r == nil || r.CheckpointID != "cp-1" || fmt.Sprint(r.Subruns) != want {
+		t.Fatalf("resume = %+v", r)
+	}
+	in := protocol.Init{Type: protocol.TypeInit, Bootstrap: protocol.BootstrapVersion, ProtocolVersions: []int64{protocol.Version},
+		Mode: protocol.ModeTask, TaskID: "t", AttemptID: "a", AttemptNo: 2, OutDir: "/workspace/out/a", Resume: r,
+		Extensions: Config{WorkerSubruns: true}.workerExtensions()}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := protocol.DecodeLine(protocol.HostToWorker, b); err != nil {
+		t.Fatalf("组装的 init 未通过协议校验：%v（%s）", err, b)
 	}
 }

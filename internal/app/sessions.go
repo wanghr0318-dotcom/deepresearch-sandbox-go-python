@@ -425,7 +425,7 @@ func (x sessionWorkers) Start(ctx context.Context, w session.WorkerStart) (sessi
 		Procs: func(ctx context.Context) ([]int, error) { return x.coord.EnvProcs(ctx, envID) },
 		GatewayIdle: func(ctx context.Context, attemptID string) error {
 			return x.access.detach(ctx, incID, attemptID, ReleaseReasonReleased)
-		}}
+		}, Extensions: x.cfg.workerExtensions()}
 	if r := w.Resume; r != nil {
 		spec.Resume = &protocol.SessionResume{CheckpointID: r.CheckpointID, State: r.State, StagedStatePath: r.StagedPath, Refs: r.Refs}
 	}
@@ -473,6 +473,8 @@ type sessionRuntime struct {
 	facts  turnFactsStore
 	blobs  blob.Store
 	log    *slog.Logger
+	// subruns 是 sub-run 扩展的宿主实现（subruns.go）；会话 init 请求了 subruns 时每个 turn 的 attempt 都须提供。
+	subruns runner.SubrunHost
 }
 
 // errSessionsOff：会话未启用或 session Scheduler 尚未启动（暂时性：turn 保持 queued 并退避重试，不失败）。
@@ -532,18 +534,14 @@ func (rt *sessionRuntime) runTurn(ctx context.Context, s task.RunSpec, controls 
 	if err := rt.access.attach(ctx, h.incID, s.AttemptID); err != nil {
 		return startFailure(ctx, fmt.Errorf("app: 附着 attempt %s 到 incarnation %s 的入口: %w", s.AttemptID, h.incID, err))
 	}
-	in := protocol.Init{Config: s.Task.Spec, ConfigVersion: s.Task.ConfigVersion, BudgetLimits: budgetLimits(l)}
-	if cp := s.Task.Latest; cp != nil {
-		in.Resume = &protocol.Resume{CheckpointID: cp.CheckpointID, StepID: cp.StepID, State: cp.State,
-			StateRef: cp.StateRef, Refs: cp.Refs}
-	}
+	in := protocol.Init{Config: s.Task.Spec, ConfigVersion: s.Task.ConfigVersion, BudgetLimits: budgetLimits(l), Resume: taskResume(s.Task)}
 	rc := make(chan runner.Control, 4)
 	done := make(chan struct{})
 	defer close(done)
 	go forwardControls(controls, rc, done)
 	out := h.inc.RunTask(ctx, runner.SessionAttempt{
 		Attempt: runner.Attempt{TaskID: s.Task.TaskID, AttemptID: s.AttemptID, AttemptNo: s.AttemptNo, EnvID: s.EnvID,
-			Init: in, OnReady: s.OnReady},
+			Init: in, OnReady: s.OnReady, Subruns: rt.subruns},
 		BaseSessionCheckpointID: s.Task.BaseSessionCheckpointID, Directive: directive,
 		RestoredFromTaskID: s.Task.RestoredFromTaskID, Carryover: rt.carryover(ctx, s.Task),
 	}, rc)

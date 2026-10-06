@@ -79,6 +79,15 @@ type Attempt struct {
 	// CommittedSessionCheckpointID 只由会话 turn 的 FinalizeAttempt 返回：裁决后的会话指针（成功时为新提交的
 	// session checkpoint，未推进时为 base；会话还没有 checkpoint 时为空）。
 	CommittedSessionCheckpointID string
+	// Subruns 只由新建 attempt 的 CreateAttempt 返回：同事务重新绑定后任务全部 sub-run 的宿主裁定状态（规格 §13.5，
+	// 按 subrun_id 排序；重放已存在的 attempt 时为空）。
+	Subruns []SubrunState
+}
+
+// SubrunState 是告知 Worker 的一个 sub-run 状态（init.resume.subruns[] / task_start.resume.subruns[]）：Status 为
+// started | completed | cancelled | failed | timed_out；ResultRef 只在 completed 时非空。
+type SubrunState struct {
+	SubrunID, Status, ResultRef string
 }
 
 // SessionState 是成功裁决提交的新 session checkpoint（来自 result.session_state）；State 与 StateRef 恰有一个。
@@ -141,6 +150,9 @@ type TaskState struct {
 	MaxFaultRetries, OOMRetriesUsed, RunTimeMs     int64
 	NotBefore                                      *time.Time
 	Latest                                         *LatestCheckpoint // 最新已提交 checkpoint；无则 nil
+	// Subruns 是任务全部 sub-run 的当前状态（按 subrun_id 排序；M4 Plan 14）。启动 Worker 时读取：此时 CreateAttempt
+	// 已在同一事务中重新绑定，非终态都已是 started，即 init.resume.subruns。
+	Subruns []SubrunState
 
 	// 会话 turn 的事实（独立任务为零值）。
 	SessionID, BaseSessionCheckpointID, RestoredFromTaskID string

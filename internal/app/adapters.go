@@ -315,7 +315,8 @@ type runnerAdapter struct {
 	r       attemptRunner
 	cfg     Config
 	dataDir string
-	sess    *sessionRuntime // 会话 turn 在授予的 incarnation 中执行（nil：没有会话 turn）
+	sess    *sessionRuntime   // 会话 turn 在授予的 incarnation 中执行（nil：没有会话 turn）
+	subruns runner.SubrunHost // sub-run 扩展的宿主实现（subruns.go）
 }
 
 var _ task.AttemptRunner = runnerAdapter{}
@@ -345,11 +346,7 @@ func (x runnerAdapter) Run(ctx context.Context, s task.RunSpec, controls <-chan 
 		ProtocolVersions: []int64{protocol.Version}, Mode: protocol.ModeTask,
 		TaskID: s.Task.TaskID, AttemptID: s.AttemptID, AttemptNo: s.AttemptNo,
 		Config: s.Task.Spec, ConfigVersion: s.Task.ConfigVersion, BudgetLimits: budgetLimits(l),
-		OutDir: "/workspace/out/" + s.AttemptID}
-	if cp := s.Task.Latest; cp != nil {
-		in.Resume = &protocol.Resume{CheckpointID: cp.CheckpointID, StepID: cp.StepID, State: cp.State,
-			StateRef: cp.StateRef, Refs: cp.Refs}
-	}
+		OutDir: "/workspace/out/" + s.AttemptID, Resume: taskResume(s.Task), Extensions: x.cfg.workerExtensions()}
 	rc := make(chan runner.Control, 4)
 	done := make(chan struct{})
 	defer close(done)
@@ -357,7 +354,7 @@ func (x runnerAdapter) Run(ctx context.Context, s task.RunSpec, controls <-chan 
 	out := x.r.Run(ctx, runner.Attempt{TaskID: s.Task.TaskID, AttemptID: s.AttemptID, AttemptNo: s.AttemptNo,
 		EnvID: s.EnvID, Init: in, OutDir: filepath.Join(ws, "out", s.AttemptID),
 		Exec:    provider.ExecSpec{ExecID: s.AttemptID, Argv: x.cfg.WorkerArgv, Env: x.cfg.WorkerEnv, Dir: "/workspace"},
-		OnReady: s.OnReady}, rc)
+		OnReady: s.OnReady, Subruns: x.subruns}, rc)
 	return outcome(out)
 }
 

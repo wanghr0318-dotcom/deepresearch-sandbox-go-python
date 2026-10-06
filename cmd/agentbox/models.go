@@ -177,3 +177,13 @@ func sessionFlags(cfg *app.Config, budget int, idleFreeze, evictAfter time.Durat
 	cfg.TurnToolBudget, cfg.SessionIdleFreeze, cfg.SessionEvictAfter, cfg.SessionWorkerArgv = budget, idleFreeze, evictAfter, argv
 	return nil
 }
+
+// subrunFlags 校验并写入 sub-run 扩展的标志（M4 Plan 14）：--worker-subruns（默认 true）→ init.extensions =
+// ["subruns"]；--subrun-cancel-timeout（默认 10 s，须 > 0）→ T_subrun_cancel。
+func subrunFlags(cfg *app.Config, enabled bool, cancelTimeout time.Duration) error {
+	if cancelTimeout <= 0 {
+		return fmt.Errorf("--subrun-cancel-timeout 须大于 0，得到 %s", cancelTimeout)
+	}
+	cfg.WorkerSubruns, cfg.Runner.SubrunCancelTimeout = enabled, cancelTimeout
+	return nil
+}

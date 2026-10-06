@@ -386,11 +386,22 @@ func TestSessionFlags(t *testing.T) {
 			t.Errorf("%+v：%v，期望指出 %s", tc, err, tc.wantInMessage)
 		}
 	}
+	// sub-run 扩展的标志（M4 Plan 14）：T_subrun_cancel 须 > 0。
+	if err := subrunFlags(&cfg, true, 10*time.Second); err != nil || !cfg.WorkerSubruns || cfg.Runner.SubrunCancelTimeout != 10*time.Second {
+		t.Fatalf("合法的 sub-run 标志 = %v，cfg = %+v", err, cfg)
+	}
+	for _, d := range []time.Duration{0, -time.Second} {
+		if err := subrunFlags(&app.Config{}, true, d); err == nil || !strings.Contains(err.Error(), "--subrun-cancel-timeout") {
+			t.Errorf("--subrun-cancel-timeout %s：%v，期望拒绝", d, err)
+		}
+	}
 	if runtime.GOOS != "linux" {
 		t.Skip("runServer 只在 Linux 上可用")
 	}
 	var stderr strings.Builder
-	if code := runServer([]string{"-help"}, &stderr); code != 2 || !strings.Contains(stderr.String(), "-turn-tool-budget int") ||
+	if code := runServer([]string{"-help"}, &stderr); code != 2 || !strings.Contains(stderr.String(), "-worker-subruns") ||
+		!strings.Contains(stderr.String(), "-subrun-cancel-timeout duration") || !strings.Contains(stderr.String(), "(default 10s)") ||
+		!strings.Contains(stderr.String(), "-turn-tool-budget int") ||
 		!strings.Contains(stderr.String(), "(default 30)") || !strings.Contains(stderr.String(), "(default 10m0s)") ||
 		!strings.Contains(stderr.String(), "(default 1h0m0s)") || !strings.Contains(stderr.String(), "-session-worker-argv string") {
 		t.Fatalf("-help 退出码 %d：%s", code, stderr.String())
@@ -399,6 +410,7 @@ func TestSessionFlags(t *testing.T) {
 	for _, extra := range [][]string{
 		{"--session-idle-freeze", "1h", "--session-evict-after", "1h"},
 		{"--turn-tool-budget", "0"},
+		{"--subrun-cancel-timeout", "0s"},
 	} {
 		stderr.Reset()
 		if code := runServer(append(append([]string{}, base...), extra...), &stderr); code != 2 {
