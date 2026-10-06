@@ -474,6 +474,9 @@ func TestHandlersMatchOpenAPI(t *testing.T) {
 	for k, v := range spec {
 		sort.Ints(v)
 		got, ok := impl[k]
+		if !ok && slices.Contains(sessionOperations, k) {
+			continue // 会话契约由 Plan 12 Task 1 定稿，处理器由 Task 8 实现；实现后即按下文比较状态码
+		}
 		if !ok {
 			t.Errorf("openapi.yaml 声明了 %s，处理器未实现", k)
 			continue
@@ -487,13 +490,8 @@ func TestHandlersMatchOpenAPI(t *testing.T) {
 			t.Errorf("处理器实现了 %s，openapi.yaml 未声明", k)
 		}
 	}
-	if len(spec) != 17 {
-		t.Errorf("openapi.yaml 解析出 %d 个操作，期望 17（M1 范围加产物最新版本下载，加账号的 5 个操作）", len(spec))
-	}
-	for k := range spec {
-		if strings.Contains(k, "/sessions") {
-			t.Errorf("sessions 属于 M4，不应出现在本版契约: %s", k)
-		}
+	if n := len(spec) - len(sessionOperations); n != 17 {
+		t.Errorf("openapi.yaml 解析出 %d 个非会话操作，期望 17（M1 范围加产物最新版本下载，加账号的 5 个操作）", n)
 	}
 }
 
@@ -2032,5 +2030,353 @@ func TestTaskViewTopicAndCreatedAt(t *testing.T) {
 	expect(t, st, b, 200, "")
 	if strings.Contains(string(b), `"topic"`) || !strings.Contains(string(b), created) {
 		t.Fatalf("spec 无 topic 的任务视图 = %s", b)
+	}
+}
+
+// ---- 会话契约（M4 Plan 12 Task 1）----
+
+// sessionOperations 是 openapi.yaml 中的会话操作全集；Task 8 实现处理器之前 TestHandlersMatchOpenAPI 允许其未路由。
+var sessionOperations = []string{
+	"POST /sessions", "GET /sessions",
+	"GET /sessions/{id}", "PATCH /sessions/{id}", "DELETE /sessions/{id}",
+	"POST /sessions/{id}/wake", "POST /sessions/{id}/messages",
+	"GET /sessions/{id}/turns", "GET /sessions/{id}/events",
+	"POST /turns/{id}/stop", "POST /turns/{id}/continue", "POST /turns/{id}/finish",
+	"POST /turns/{id}/answer", "POST /turns/{id}/restore",
+	"GET /turns/{id}/raw/{sha256}",
+}
+
+func sessionRec(source, typ, payload string) SessionEventRecord {
+	r := SessionEventRecord{SessionSeq: 7, Source: source, Type: typ, Payload: json.RawMessage(payload),
+		TS: time.Date(2026, 10, 6, 8, 0, 0, 0, time.UTC)}
+	if source != "session" {
+		r.TaskID, r.TaskSeq, r.AttemptID = "t1", 3, "att_1"
+	}
+	return r
+}
+
+func eventData(t *testing.T, ev SessionEvent) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(ev.Data, &m); err != nil {
+		t.Fatalf("data 不是 JSON 对象: %s: %v", ev.Data, err)
+	}
+	return m
+}
+
+// hasKey 递归报告 JSON 值中是否出现名为 key 的对象键。
+func hasKey(v any, key string) bool {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, c := range x {
+			if k == key || hasKey(c, key) {
+				return true
+			}
+		}
+	case []any:
+		for _, c := range x {
+			if hasKey(c, key) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func TestSessionEventMapping(t *testing.T) {
+	sha := strings.Repeat("ab", 32)
+	t.Run("工具结果去掉费用、模型与内部 ID，保留预览与响应引用", func(t *testing.T) {
+		payload := `{"step_id":"orch","kind":"tool_result","message":"搜索完成","data":{` +
+			`"tool_call_id":"tc_1","call_id":"root/orch/search/1","cost_micro":12,"tool":"web_search","ok":true,` +
+			`"preview":{"results":[{"title":"A","url":"https://a.example/x","site":"a.example","snippet":"s","cost_micro":1}]},` +
+			`"raw":{"request":{"model":"kimi-k3","query":"固态电池","usage":{"total_tokens":3},"messages":[{"role":"user","content":"q"}]},` +
+			`"response_ref":"` + sha + `","call_id":"root/orch/search/1","inline":{"x":1}}}}`
+		r := sessionRec("worker", "progress", payload)
+		ev, ok := ToSessionEvent(r, false)
+		if !ok || ev.Type != SEvToolResult || ev.Seq != 7 || ev.TurnID != "t1" || ev.Internal != nil || !ev.TS.Equal(r.TS) {
+			t.Fatalf("用户视图 = %+v, %v", ev, ok)
+		}
+		d := eventData(t, ev)
+		for _, k := range []string{"call_id", "cost_micro", "model", "usage", "attempt_id", "inline"} {
+			if hasKey(d, k) {
+				t.Errorf("用户 data 含 %q: %s", k, ev.Data)
+			}
+		}
+		if d["step_id"] != "orch" || d["tool_call_id"] != "tc_1" || d["tool"] != "web_search" || d["ok"] != true {
+			t.Errorf("用户 data = %s", ev.Data)
+		}
+		raw, _ := d["raw"].(map[string]any)
+		req, _ := raw["request"].(map[string]any)
+		if raw["response_ref"] != sha || req["query"] != "固态电池" || req["messages"] == nil {
+			t.Errorf("raw = %s", ev.Data)
+		}
+		res, _ := d["preview"].(map[string]any)["results"].([]any)
+		if len(res) != 1 || res[0].(map[string]any)["url"] != "https://a.example/x" {
+			t.Errorf("preview = %s", ev.Data)
+		}
+
+		adm, ok := ToSessionEvent(r, true)
+		if !ok || adm.Type != SEvToolResult || adm.Internal == nil || !bytes.Equal(adm.Internal.Payload, r.Payload) ||
+			adm.Internal.Source != "worker" || adm.Internal.Type != "progress" || adm.Internal.AttemptID != "att_1" || adm.Internal.TaskSeq != 3 {
+			t.Fatalf("运维视图 = %+v, %v", adm, ok)
+		}
+		if !bytes.Equal(adm.Data, ev.Data) {
+			t.Errorf("运维 data = %s，用户 data = %s", adm.Data, ev.Data)
+		}
+	})
+
+	t.Run("未知进度种类与内部事件对用户不可见，运维视为 internal", func(t *testing.T) {
+		for _, r := range []SessionEventRecord{
+			sessionRec("worker", "progress", `{"step_id":"s","kind":"debug","message":"x","data":{}}`),
+			sessionRec("worker", "checkpoint", `{"checkpoint_id":"c1","step_id":"s"}`),
+			sessionRec("host", "replay_divergence", `{"call_id":"c"}`),
+			sessionRec("host", "control_accepted", `{"desired":"pause","control_version":2}`),
+		} {
+			if ev, ok := ToSessionEvent(r, false); ok {
+				t.Errorf("%s/%s 对用户可见: %+v", r.Source, r.Type, ev)
+			}
+			ev, ok := ToSessionEvent(r, true)
+			if !ok || ev.Type != SEvInternal || ev.Internal == nil || !bytes.Equal(ev.Internal.Payload, r.Payload) || ev.Seq != 7 {
+				t.Errorf("%s/%s 运维视图 = %+v, %v", r.Source, r.Type, ev, ok)
+			}
+		}
+	})
+
+	t.Run("turn 状态映射与面向用户的失败文案", func(t *testing.T) {
+		cases := []struct {
+			typ, payload, status, reason, msg string
+		}{
+			{"task_terminal", `{"attempt_id":"att_1","task_status":"paused","status_reason":"awaiting_input","outcome_class":"x"}`, "awaiting_input", "", ""},
+			{"task_terminal", `{"attempt_id":"att_1","task_status":"failed","status_reason":"model_unavailable"}`, "failed", "model_unavailable", "模型服务暂时不可用，请重试"},
+			{"control_applied", `{"control_version":2,"status":"pausing"}`, "stopping", "", ""},
+			{"control_applied", `{"control_version":3,"status":"cancelling"}`, "stopping", "", ""},
+			{"attempt_ended", `{"attempt_id":"att_1","task_status":"queued","status_reason":"worker_crash"}`, "queued", "worker_crash", ""},
+			{"task_terminal", `{"attempt_id":"att_1","task_status":"succeeded","status_reason":"ok"}`, "succeeded", "ok", ""},
+		}
+		for _, c := range cases {
+			ev, ok := ToSessionEvent(sessionRec("host", c.typ, c.payload), false)
+			if !ok || ev.Type != SEvTurnStatus {
+				t.Fatalf("%s %s → %+v, %v", c.typ, c.payload, ev, ok)
+			}
+			d := eventData(t, ev)
+			want := map[string]any{"status": c.status}
+			if c.reason != "" {
+				want["reason"] = c.reason
+			}
+			if c.msg != "" {
+				want["user_message"] = c.msg
+			}
+			if !mapsEqualJSON(d, want) {
+				t.Errorf("%s %s → data %s，期望 %v", c.typ, c.payload, ev.Data, want)
+			}
+		}
+		if s := UserTurnStatus("paused", "paused"); s != "paused" {
+			t.Errorf("paused/paused → %q", s)
+		}
+	})
+
+	t.Run("会话生命周期：过渡态不可见，驱逐可见", func(t *testing.T) {
+		if ev, ok := ToSessionEvent(sessionRec("session", SEvSessionState, `{"state":"quiescing"}`), false); ok {
+			t.Errorf("quiescing 对用户可见: %+v", ev)
+		}
+		ev, ok := ToSessionEvent(sessionRec("session", SEvSessionState, `{"state":"evicted","user_message":"会话暂时无法恢复","last_error":"boom"}`), false)
+		if !ok || ev.Type != SEvSessionState || ev.TurnID != "" {
+			t.Fatalf("evicted → %+v, %v", ev, ok)
+		}
+		if d := eventData(t, ev); !mapsEqualJSON(d, map[string]any{"state": "evicted", "user_message": "会话暂时无法恢复"}) {
+			t.Errorf("evicted data = %s", ev.Data)
+		}
+		for in, want := range map[string]string{"creating": "idle", "quiescing": "idle", "evicting": "frozen", "frozen": "frozen", "closing": "closing", "running": "running"} {
+			if got := UserSessionState(in); got != want {
+				t.Errorf("UserSessionState(%q) = %q，期望 %q", in, got, want)
+			}
+		}
+	})
+
+	t.Run("turn 创建与结果只保留契约字段", func(t *testing.T) {
+		ev, ok := ToSessionEvent(sessionRec("host", "task_created",
+			`{"turn_index":2,"text":"你好","deep_research":true,"restored_from_turn_id":"t0","spec":{"model":"kimi-k3"},"owner_user_id":5}`), false)
+		if !ok || ev.Type != SEvTurnCreated ||
+			!mapsEqualJSON(eventData(t, ev), map[string]any{"turn_index": 2.0, "text": "你好", "deep_research": true, "restored_from_turn_id": "t0"}) {
+			t.Errorf("task_created → %+v %s, %v", ev, ev.Data, ok)
+		}
+		ev, ok = ToSessionEvent(sessionRec("worker", "result",
+			`{"attempt_id":"att_1","summary":"答复","outputs":["report"],"session_state":{"state":{"k":1}}}`), false)
+		if !ok || ev.Type != SEvTurnResult ||
+			!mapsEqualJSON(eventData(t, ev), map[string]any{"summary": "答复", "outputs": []any{"report"}}) {
+			t.Errorf("result → %+v %s, %v", ev, ev.Data, ok)
+		}
+	})
+}
+
+func mapsEqualJSON(a, b map[string]any) bool {
+	x, err1 := json.Marshal(a)
+	y, err2 := json.Marshal(b)
+	return err1 == nil && err2 == nil && bytes.Equal(x, y)
+}
+
+func TestRedactRaw(t *testing.T) {
+	in := `{"id":"chatcmpl-1","object":"chat.completion","model":"kimi-k3","system_fingerprint":"fp",` +
+		`"choices":[{"index":0,"message":{"role":"assistant","content":"<b>答</b> & 1.0","id":"keep-nested"}}],` +
+		`"usage":{"prompt_tokens":1},"cost_micro":9,"meta":{"call_id":"c","upstream_request_id":"u","n":12345678901234567890}}`
+	var got map[string]any
+	if err := json.Unmarshal(RedactRaw([]byte(in)), &got); err != nil {
+		t.Fatalf("RedactRaw 输出不是 JSON: %v", err)
+	}
+	for _, k := range []string{"model", "system_fingerprint", "usage", "cost_micro", "call_id", "upstream_request_id"} {
+		if hasKey(got, k) {
+			t.Errorf("脱敏后仍含 %q: %v", k, got)
+		}
+	}
+	if _, ok := got["id"]; ok {
+		t.Errorf("顶层 id 未去掉: %v", got)
+	}
+	msg := got["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "<b>答</b> & 1.0" || msg["id"] != "keep-nested" || got["object"] != "chat.completion" {
+		t.Errorf("正文被改动: %v", got)
+	}
+	if out := string(RedactRaw([]byte(in))); !strings.Contains(out, "12345678901234567890") || !strings.Contains(out, "<b>") {
+		t.Errorf("数字精度或字符被改写: %s", out)
+	}
+	for _, b := range [][]byte{[]byte("not json {"), {0xff, 0x00, 0x01}, nil} {
+		if got := RedactRaw(b); !bytes.Equal(got, b) {
+			t.Errorf("非 JSON 被改动: %q → %q", b, got)
+		}
+	}
+}
+
+// openAPISchemaBlock 返回 components.schemas 下名为 name 的模式的各行（不含首行）。
+func openAPISchemaBlock(t *testing.T, lines []string, name string) []string {
+	t.Helper()
+	inSchemas := false
+	for i, line := range lines {
+		if line == "  schemas:" {
+			inSchemas = true
+			continue
+		}
+		if !inSchemas || line != "    "+name+":" {
+			continue
+		}
+		var out []string
+		for _, l := range lines[i+1:] {
+			if strings.TrimSpace(l) != "" && len(l)-len(strings.TrimLeft(l, " ")) <= 4 {
+				break
+			}
+			out = append(out, l)
+		}
+		return out
+	}
+	t.Fatalf("components.schemas 缺少 %s", name)
+	return nil
+}
+
+func flowEnum(t *testing.T, block []string) []string {
+	t.Helper()
+	for _, l := range block {
+		if _, rest, ok := strings.Cut(l, "enum: ["); ok {
+			items, _, _ := strings.Cut(rest, "]")
+			var out []string
+			for _, it := range strings.Split(items, ",") {
+				out = append(out, strings.TrimSpace(it))
+			}
+			sort.Strings(out)
+			return out
+		}
+	}
+	t.Fatal("模式中没有 enum")
+	return nil
+}
+
+// keysAt 返回 block 中 header 行（缩进 indent）之下、缩进 indent+2 的键名。
+func keysAt(block []string, header string, indent int) []string {
+	var out []string
+	in := false
+	for _, l := range block {
+		n := len(l) - len(strings.TrimLeft(l, " "))
+		switch {
+		case strings.TrimSpace(l) == "":
+		case n == indent && strings.TrimSpace(l) == header:
+			in = true
+		case in && n <= indent:
+			in = false
+		case in && n == indent+2:
+			k, _, _ := strings.Cut(strings.TrimSpace(l), ":")
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestOpenAPISessionContract(t *testing.T) {
+	spec := openAPIOperations(t)
+	for _, op := range sessionOperations {
+		st, ok := spec[op]
+		if !ok {
+			t.Errorf("openapi.yaml 缺少 %s", op)
+			continue
+		}
+		need := []int{401, 403, 500, 503}
+		if op != "POST /sessions" && op != "GET /sessions" {
+			need = append(need, 404) // 他人、无主与不存在的会话或 turn 回答相同的 404
+		}
+		for _, s := range need {
+			if !slices.Contains(st, s) {
+				t.Errorf("%s 未声明 %d", op, s)
+			}
+		}
+	}
+
+	b, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+
+	types := slices.Sorted(slices.Values(SessionEventTypes))
+	if got := flowEnum(t, openAPISchemaBlock(t, lines, "SessionEventType")); !slices.Equal(got, types) {
+		t.Errorf("SessionEventType 枚举 %v，Go 常量 %v", got, types)
+	}
+	if got := keysAt(openAPISchemaBlock(t, lines, "SessionEvent"), "mapping:", 8); !slices.Equal(got, types) {
+		t.Errorf("SessionEvent discriminator mapping %v，期望 %v", got, types)
+	}
+	// 每种对外事件的 data 模式（<CamelType>Data）的字段与 Go 的允许列表一致。
+	for _, typ := range types {
+		if typ == SEvInternal {
+			continue
+		}
+		var camel strings.Builder
+		for _, part := range strings.Split(typ, "_") {
+			camel.WriteString(strings.ToUpper(part[:1]) + part[1:])
+		}
+		got := keysAt(openAPISchemaBlock(t, lines, camel.String()+"Data"), "properties:", 6)
+		if want := slices.Sorted(slices.Values(sessionEventDataFields[typ])); !slices.Equal(got, want) {
+			t.Errorf("%sData 字段 %v，允许列表 %v", camel.String(), got, want)
+		}
+	}
+	for _, st := range []string{"Session", "Turn"} {
+		block := openAPISchemaBlock(t, lines, st)
+		var enum []string
+		for i, l := range block {
+			if strings.TrimSpace(l) == "state:" || strings.TrimSpace(l) == "status:" || strings.HasPrefix(strings.TrimSpace(l), "state: {") || strings.HasPrefix(strings.TrimSpace(l), "status: {") {
+				enum = flowEnum(t, block[i:i+1])
+				break
+			}
+		}
+		want := slices.Sorted(slices.Values(userSessionStates))
+		if st == "Turn" {
+			want = slices.Sorted(slices.Values(userTurnStatuses))
+		}
+		if !slices.Equal(enum, want) {
+			t.Errorf("%s 状态枚举 %v，期望 %v", st, enum, want)
+		}
+	}
+	codes := flowEnum(t, openAPISchemaBlock(t, lines, "SessionErrorCode"))
+	for _, c := range []string{"session_not_found", "turn_not_found", "not_found", "session_closed", "turn_in_progress",
+		"invalid_turn_state", "not_restorable", "invalid_text", "invalid_title", "invalid_answers", "sessions_unavailable",
+		"user_task_running", "request_conflict", "invalid_cursor", "invalid_request", "forbidden"} {
+		if !slices.Contains(codes, c) {
+			t.Errorf("SessionErrorCode 缺少 %s", c)
+		}
 	}
 }
