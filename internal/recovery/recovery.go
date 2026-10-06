@@ -29,6 +29,10 @@ type Coordinator interface {
 	// ReclaimOrphan 回收属于本安装、无对应记录的环境资源（§14.1 扫描表）：在该环境的串行执行者内
 	// 停止并逐层销毁；幂等，资源已不存在时返回 nil。
 	ReclaimOrphan(ctx context.Context, envID string) error
+	// ReleaseCheckedUIDRange 归还清理已完成的环境的 UID 范围，归还前与 cleanup loop 相同地回收 workspace 属主并以
+	// provider.ScanUIDFiles 核查残留（M4 Plan 15 D13）：仍有归该范围的文件时隔离该范围并报警（released 为假、无错误）。
+	// 分配代次已变化为 persistence.ErrConflict。
+	ReleaseCheckedUIDRange(ctx context.Context, ur resource.UIDRange) (released bool, err error)
 }
 
 var _ Coordinator = (*resource.Coordinator)(nil)
@@ -464,7 +468,8 @@ func (x *executor) resolveIntent(ctx context.Context, s reconcile.Step) error {
 	return nil
 }
 
-// releaseUIDRange：范围已不属于该环境或该分配代次（已归还或已被复用）则跳过。
+// releaseUIDRange：范围已不属于该环境或该分配代次（已归还、已隔离或已被复用）则跳过；否则经 coordinator 回收、
+// 核查并归还（M4 Plan 15 D13）：仍有归该范围的文件时该范围已被隔离并报警（不归还、不计入占用）。
 func (x *executor) releaseUIDRange(ctx context.Context, s reconcile.Step) error {
 	ur, err := x.d.Resources.GetUIDRange(ctx, s.EnvID)
 	switch {
@@ -477,13 +482,20 @@ func (x *executor) releaseUIDRange(ctx context.Context, s reconcile.Step) error 
 		x.result(s, StepSkipped, "UID 范围已归还")
 		return nil
 	}
-	_, err = x.d.Resources.ReleaseUIDRange(ctx, s.UIDRangeID, s.AllocationID)
-	if errors.Is(err, persistence.ErrConflict) {
+	released, err := x.d.Coordinator.ReleaseCheckedUIDRange(ctx, ur)
+	switch {
+	case errors.Is(err, persistence.ErrConflict):
 		x.result(s, StepSkipped, "UID 范围已被后来的分配复用")
 		return nil
-	}
-	if err != nil {
+	case err != nil:
 		return err
+	case !released:
+		path := resource.UIDRangeQuarantinePath(ur.UIDRangeID)
+		if x.once("q:" + path) {
+			x.r.Quarantined = append(x.r.Quarantined, path)
+		}
+		x.result(s, StepQuarantined, "UID 范围仍拥有数据目录中的文件，已隔离并报警")
+		return nil
 	}
 	x.result(s, StepDone, "")
 	return nil

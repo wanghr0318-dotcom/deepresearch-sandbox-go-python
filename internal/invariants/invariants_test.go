@@ -342,6 +342,11 @@ func TestEachInvariantIsReported(t *testing.T) {
 			"/data/workspaces/t1/a": 101000, // uid-100000：已分配给 e1
 			"/data/stray/x":         105000, // uid-104096：free
 		}}, true},
+		// I12 [Q]（M4 Plan 15 Task 10）：清理完成的 exec 环境仍有挂载（宿主侧 /out 的 tmpfs）——与 I1 同一扫描，按 kind 报告为 I12。
+		{"I12 已清理的 exec 环境仍有挂载", "I12/Q", func(e *env, _ blob.Ref) {
+			e.exec(`INSERT INTO environments (env_id, kind, attempt_id, status, stopped_at, cleanup_state)
+				VALUES ('exec-x', 'exec', 'a1', 'creating', now(), 'done')`)
+		}, scanner{Items: []provider.ScanItem{{Layer: "mount", Path: "/data/envs/exec-x/out", EnvID: "exec-x", Owner: provider.OwnedPartial}}}, true},
 		{"I16 请求对应的资源不存在", "I16/A", func(e *env, _ blob.Ref) {
 			e.exec("INSERT INTO api_requests (request_id, kind, body_hash, resource_id, response) VALUES ('r9', 'create_task', 'x', 'missing', 'null')")
 		}, scanner{}, false},

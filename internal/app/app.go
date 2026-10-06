@@ -140,6 +140,10 @@ type Config struct {
 	// Worker 的 ready 须回 subruns: 1。关闭时不请求，Worker 的任何 subrun_* 为 extension_not_negotiated。
 	// T_subrun_cancel 为 Runner.SubrunCancelTimeout（--subrun-cancel-timeout）。
 	WorkerSubruns bool
+
+	// Exec 是独立 exec 沙箱（M4 Plan 15，规格 §10）的策略；Exec.Slots 为 0（零值）时不启用，/v1/exec 为 404。
+	// 启用时 Deps.ExecImageDigest 必填。
+	Exec ExecConfig
 }
 
 // ModelConfig 是模型上游的配置。APIKey 只从宿主环境变量 AGENTBOX_MODEL_API_KEY 加载，只交给 chat adapter
@@ -246,6 +250,7 @@ func (c Config) withDefaults() Config {
 	if c.SessionEvictAfter == 0 {
 		c.SessionEvictAfter = DefaultSessionEvictAfter
 	}
+	c.Exec = c.Exec.withDefaults()
 	if p := &c.Model.Pricing; p.Version == "" {
 		p.Version = configPricingVersion(*p)
 	}
@@ -328,6 +333,9 @@ func (c Config) validate() error {
 			return fmt.Errorf("app: Worker 环境变量 %q 不在白名单中（凭据不得进入沙箱）", k)
 		}
 	}
+	if err := c.Exec.Validate(); err != nil {
+		return fmt.Errorf("app: %w", err)
+	}
 	return c.validateSessions()
 }
 
@@ -347,6 +355,7 @@ type Store interface {
 	api.Store
 	api.Accounts
 	call.Store
+	call.ExecStore // exec 的预留、启动标记与结算（M4 Plan 15）
 	// 会话（M4 Plan 12）：session actor 的用例、queued turn 的失败、按 owner 保留的 UID 范围、会话 turn 的 task_start
 	// 事实，以及会话 API（以接口返回，装配不导入 persistence/postgres）。
 	session.Store
@@ -398,6 +407,10 @@ type Deps struct {
 	// Logger 是结构化日志（§14.6）；默认 stderr 上的 JSON。
 	Logger *slog.Logger
 	Hooks  Hooks
+	// ExecImageDigest 确认 exec 模板可用（rootfs.ExecTemplate().EnsureExec，缺失时报告路径）并返回其摘要（exec 指纹
+	// 的 image_digest，Plan 15 D5）。启用 exec（Config.Exec.Slots > 0）时必填，Run 在取得任何锁之前调用一次，
+	// 失败即拒绝启动。
+	ExecImageDigest func() (string, error)
 }
 
 func (d Deps) withDefaults() Deps {
@@ -472,6 +485,19 @@ func Run(ctx context.Context, cfg Config, d Deps) error {
 		return errors.New("app: 缺少 AcquireOwnership、OpenStore 或 NewProvider")
 	}
 	s := &server{cfg: cfg, d: d, log: d.Logger, fatalCh: make(chan error, 1)}
+	if cfg.Exec.Enabled() {
+		if d.ExecImageDigest == nil {
+			return errors.New("app: 启用 exec 需要 ExecImageDigest")
+		}
+		digest, err := d.ExecImageDigest()
+		if err != nil {
+			return fmt.Errorf("%w: %w", errExecImage, err)
+		}
+		if digest == "" {
+			return fmt.Errorf("%w: 摘要为空", errExecImage)
+		}
+		s.execDigest = digest
+	}
 	s.mode.Store(api.Mode("")) // API 启动前总先设置模式
 	deadline, stopDeadline := d.Clock.At(d.Clock.Now().Add(cfg.RecoveryDeadline))
 	defer stopDeadline()
@@ -496,6 +522,9 @@ type server struct {
 	blobs     blob.Store        // runner、Gateway 与 API 产物下载共用的 BlobStore
 	sessions  *sessionRuntime   // 会话：session Scheduler（启动执行时建立）与会话 turn 的执行
 	sessDeps  session.Deps      // session actor 的依赖（启用会话时）
+
+	execGate   *admission.ExecGate // exec slots（启用 exec 时；nil 表示关闭）
+	execDigest string              // exec 模板摘要（指纹的 image_digest）
 
 	cache *cache.Source // Gateway 的共享缓存；nil 表示关闭
 	redis *cache.Redis
@@ -603,7 +632,12 @@ func (s *server) assemble() error {
 	s.blobs = blobs
 	s.adm = admission.New(s.cfg.Capacity)
 	s.coord = resource.NewCoordinator(s.store, prov, resource.Options{InstallID: s.installID,
-		UIDBase: s.cfg.UIDBase, UIDCount: s.cfg.UIDCount, Backoff: s.cfg.RetryBackoff})
+		UIDBase: s.cfg.UIDBase, UIDCount: s.cfg.UIDCount, Backoff: s.cfg.RetryBackoff,
+		// 隔离报警（cleanup 与启动核对的 UID 范围隔离）写到服务日志，字段与启动恢复的报警相同。
+		Alert: func(q resource.Quarantine) {
+			s.log.Error("隔离资源报警", "alert", "quarantine", "layer", q.Layer, "path", q.Path,
+				"observed_owner", q.ObservedOwner, "reason", q.Reason)
+		}})
 	run := runner.New(s.store, blobs, prov, prov.ResourceDiag, s.cfg.Runner)
 	if err := s.assembleGateway(blobs); err != nil {
 		return err
@@ -685,6 +719,13 @@ func (s *server) assembleGateway(blobs blob.Store) error {
 	}
 	if s.cache != nil {
 		cfg.Cache = s.cache
+	}
+	if s.cfg.Exec.Enabled() {
+		s.execGate = admission.NewExecGate(admission.ExecCapacity{Slots: s.cfg.Exec.Slots, PerTask: s.cfg.Exec.PerTask})
+		cfg.Exec = s.cfg.Exec.callConfig(s.store, execEnvAdapter{c: s.coord, p: s.prov, cfg: s.cfg.Exec},
+			execSlots{g: s.execGate}, s.execDigest)
+		s.log.Info("exec 已启用", "slots", s.cfg.Exec.Slots, "per_task", s.cfg.Exec.PerTask,
+			"memory_max", s.cfg.Exec.MemoryMax, "image_digest", s.execDigest)
 	}
 	calls, err := call.New(cfg)
 	if err != nil {
@@ -916,6 +957,8 @@ func (s *server) startExecution(r recovery.Report) error {
 			orphans = append(orphans, orphanStop{EnvID: env, Grant: h.grants[taskID], HasGrant: true})
 		}
 	}
+	// stop_blocked 的 exec 环境改占 exec slot（不占任务 run slot，Plan 15 D11）。
+	orphans = s.occupyExecOrphans(s.workCtx, orphans)
 	for _, o := range orphans {
 		s.bg.Add(1)
 		go s.stopRetrier(o)
@@ -999,6 +1042,8 @@ type orphanStop struct {
 	EnvID    string
 	Grant    admission.Grant
 	HasGrant bool
+	// ExecGrant 非 nil：stop_blocked 的 exec 环境占用的 exec slot（ExecGate.Occupy），确认停止后归还。
+	ExecGrant *admission.ExecGrant
 }
 
 // stopRetrier 停止没有 actor 负责的 stop_blocked 环境（§14.1"停止失败"：占用容量、退避重试）：按
@@ -1015,6 +1060,9 @@ func (s *server) stopRetrier(o orphanStop) {
 		if err == nil && r.Recorded {
 			if o.HasGrant {
 				s.adm.Release(o.Grant)
+			}
+			if o.ExecGrant != nil {
+				s.execGate.Release(*o.ExecGrant)
 			}
 			s.log.Info("stop_blocked 环境已确认停止，归还占用", "env_id", o.EnvID, "grant_id", o.Grant.ID, "tries", try+1)
 			return

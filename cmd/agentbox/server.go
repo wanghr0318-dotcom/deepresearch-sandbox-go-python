@@ -24,6 +24,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/app"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/hostcheck"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence/postgres"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider/local"
@@ -43,21 +44,32 @@ const (
 const defaultWorkerEnv = "PYTHONPATH=" + rootfs.WorkerDir
 
 // prepareIsolation 在取得任何锁、连接数据库之前确认能够以隔离方式执行任务（规格 §4.5、§4.6）：
-// 默认 rootfs 模板的宿主路径齐全（缺失时报告路径），并构造生产启动器（本进程成为 child subreaper）。
-// 任何一项失败都拒绝启动，不以未隔离的方式运行任务。
-func prepareIsolation() (local.EnvStarter, error) {
+// 默认 rootfs 模板的宿主路径齐全（缺失时报告路径）；启用 exec 时 exec 模板齐全且 python3 可解析
+// （rootfs.ExecTemplate().EnsureExec），并计算其摘要（exec 指纹的 image_digest，Plan 15 D5）；构造生产启动器
+// （本进程成为 child subreaper）。任何一项失败都拒绝启动，不以未隔离的方式运行任务。
+func prepareIsolation(exec bool) (local.EnvStarter, string, error) {
 	tpl, err := rootfs.ResolveTemplate(rootfs.DefaultTemplateName)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if err := tpl.Ensure(); err != nil {
-		return nil, fmt.Errorf("rootfs 模板 %q 不可用（worker 包须安装在 %s）: %w", rootfs.DefaultTemplateName, rootfs.WorkerDir, err)
+		return nil, "", fmt.Errorf("rootfs 模板 %q 不可用（worker 包须安装在 %s）: %w", rootfs.DefaultTemplateName, rootfs.WorkerDir, err)
+	}
+	digest := ""
+	if exec {
+		et := rootfs.ExecTemplate()
+		if err := et.EnsureExec(); err != nil {
+			return nil, "", fmt.Errorf("exec 模板 %q 不可用（--exec-slots 0 可关闭 exec）: %w", rootfs.ExecTemplateName, err)
+		}
+		if digest, err = rootfs.TemplateDigest(et); err != nil {
+			return nil, "", fmt.Errorf("exec 模板 %q 的摘要: %w", rootfs.ExecTemplateName, err)
+		}
 	}
 	starter, err := local.NewProcessStarter()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return starter, nil
+	return starter, digest, nil
 }
 
 func runServer(args []string, stderr io.Writer) int {
@@ -104,6 +116,21 @@ func runServer(args []string, stderr io.Writer) int {
 	sessionWorkerArgv := fs.String("session-worker-argv", "", "会话 incarnation 内启动 Worker 的命令（逗号分隔的 argv，例如 python3,-m,chatagent）；为空时不启用会话（会话端点 503 sessions_unavailable），非空时需要 --model-base-url")
 	workerSubruns := fs.Bool("worker-subruns", true, "在 init 中请求 sub-run 扩展（init.extensions = [\"subruns\"]；Worker 的 ready 须回 subruns: 1，否则以 extension_mismatch 拒绝）")
 	subrunCancelTimeout := fs.Duration("subrun-cancel-timeout", subrun.DefaultCancelTimeout, "宿主取消 sub-run 后等待其 subrun_end 的时限 T_subrun_cancel（须 > 0；超时终止整个 attempt，会话模式终止 incarnation）")
+	var ex app.ExecConfig
+	fs.IntVar(&ex.Slots, "exec-slots", app.DefaultExecSlots, "全局并发 exec 数（/v1/exec 的独立沙箱）；0 关闭 exec（/v1/exec 为 404）。exec 内存总量 = 本值 × --exec-memory-max，不计入 --memory-bytes，须一并规划")
+	fs.IntVar(&ex.PerTask, "exec-per-task", app.DefaultExecPerTask, "每个任务的并发 exec 上限（不超过 --exec-slots）")
+	fs.Int64Var(&ex.CountLimit, "exec-count-limit", app.DefaultExecCountLimit, "每个任务的 exec 次数配额")
+	fs.Int64Var(&ex.CPUSeconds, "exec-cpu-seconds", app.DefaultExecCPUSeconds, "每个任务的 exec CPU 配额（CPU 秒）")
+	fs.DurationVar(&ex.WallLimit, "exec-wall-limit", app.DefaultExecWallLimit, "每个任务的 exec 累计运行时间配额")
+	fs.DurationVar(&ex.WallDefault, "exec-wall-default", app.DefaultExecWallDefault, "单次 exec 未指定 limits.wall_ms 时的运行时限")
+	fs.DurationVar(&ex.WallMax, "exec-wall-max", app.DefaultExecWallMax, "单次 exec 运行时限的上限（请求值截断到它）")
+	fs.Int64Var(&ex.MemoryDefault, "exec-memory-default", app.DefaultExecMemoryDefault, "单次 exec 未指定 limits.memory_bytes 时的内存（字节）")
+	fs.Int64Var(&ex.MemoryMax, "exec-memory-max", app.DefaultExecMemoryMax, "单次 exec 内存的上限（字节；请求值截断到它）")
+	fs.DurationVar(&ex.QueueTimeout, "exec-queue-timeout", app.DefaultExecQueueTimeout, "exec 等待 slot 的上限（超过为 504 exec_queue_timeout）")
+	fs.Int64Var(&ex.PidsMax, "exec-pids-max", app.DefaultExecPidsMax, "exec 环境的 pids.max")
+	fs.Int64Var(&ex.CPUQuotaUs, "exec-cpu-quota-us", app.DefaultExecCPUQuotaUs, "exec 环境 cpu.max 的 quota（period 100000；100000 = 1 核），也是 CPU 预留的速率")
+	fs.Int64Var(&ex.TmpBytes, "exec-tmp-bytes", app.DefaultExecTmpBytes, "exec 环境 /tmp tmpfs 的大小（字节）")
+	fs.Int64Var(&ex.OutBytes, "exec-out-bytes", app.DefaultExecOutBytes, "exec 环境 /out tmpfs 的大小（字节；也是 RLIMIT_FSIZE）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -152,11 +179,20 @@ func runServer(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agentbox server:", err)
 		return 2
 	}
+	execCfg, err := execFlags(ex)
+	if err != nil {
+		fmt.Fprintln(stderr, "agentbox server:", err)
+		return 2
+	}
 	if w := plaintextListenWarning(*listen, *tlsCert != ""); w != "" {
 		fmt.Fprintln(stderr, w)
 	}
+	// 宿主自检的警告（例如 aarch64 未经单独验证）只记录，不阻止启动（Plan 15 Task 4）。
+	for _, w := range hostcheck.Check().Warnings {
+		fmt.Fprintln(stderr, "warning: hostcheck:", w)
+	}
 	// 在取得任何锁、连接数据库之前确认能够安全执行任务。
-	starter, err := prepareIsolation()
+	starter, execDigest, err := prepareIsolation(execCfg.Enabled())
 	if err != nil {
 		fmt.Fprintln(stderr, "agentbox server: 拒绝启动:", err)
 		return 1
@@ -198,6 +234,7 @@ func runServer(args []string, stderr io.Writer) int {
 		SessionWorkerArgv:     sess.SessionWorkerArgv,
 		WorkerSubruns:         sess.WorkerSubruns,
 		Runner:                sess.Runner,
+		Exec:                  execCfg,
 	}
 	if _, err := os.Stat(filepath.Join(dir, api.TokenFile)); err == nil {
 		if cfg.APIToken, err = api.LoadToken(dir); err != nil {
@@ -206,7 +243,8 @@ func runServer(args []string, stderr io.Writer) int {
 		}
 	}
 	deps := app.Deps{
-		DataDir: dir,
+		DataDir:         dir,
+		ExecImageDigest: func() (string, error) { return execDigest, nil }, // prepareIsolation 已检查并计算
 		AcquireOwnership: func(ctx context.Context) (app.Ownership, error) {
 			o, err := postgres.AcquireOwnership(ctx, *dsn, postgres.OwnershipOptions{})
 			if err != nil {

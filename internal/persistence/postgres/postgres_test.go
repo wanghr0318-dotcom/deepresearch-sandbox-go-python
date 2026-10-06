@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/datadir"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/invariants"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
@@ -6543,6 +6545,106 @@ func TestInspectSubruns(t *testing.T) {
 }
 
 // ==== M4 Plan 14 Task 10 段结束 ====
+
+// ==== M4 Plan 15 Task 10：exec 环境的清理候选、inspect 的 exec 列、CleanedEnvs 的 kind 与 OwnerUIDRange ====
+
+// TestExecCleanupCandidateAndInspect：kind = exec 的环境只要 stopped_at 已记录即为 cleanup 候选（所属 attempt 尚无
+// 判决，D8）；inspect 的 exec try 带 env_id、queue_ms、wall_ms、cpu_usec 与 exec_started_at，其他端点为 nil；
+// CleanedEnvs 报告 kind。
+func TestExecCleanupCandidateAndInspect(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	gwFixture(t, s, "t1", 1000)
+	execBegin(t, s, "t1", "x1")
+	tr := mustReserveExec(t, s, execReq("t1", "x1", 100, execPolicy))
+	mustMarkStarting(t, s, tr)
+	settleExec(t, s, execDone(tr, 250))
+	candidate := func(envID string) bool {
+		t.Helper()
+		envs, err := s.ListCleanupCandidates(ctx, time.Now().Add(time.Minute), 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return slices.ContainsFunc(envs, func(e resource.Environment) bool { return e.EnvID == envID })
+	}
+	if candidate(tr.EnvID) {
+		t.Fatal("未记录 stopped_at 的 exec 环境不应是候选")
+	}
+	stopExecEnv(t, s, tr.EnvID)
+	if n := count(t, s, "SELECT count(*) FROM attempts WHERE attempt_id = 'att-t1' AND verdict_hash IS NULL"); n != 1 {
+		t.Fatal("前提：att-t1 尚无判决")
+	}
+	if !candidate(tr.EnvID) {
+		t.Fatal("stopped_at 已记录的 exec 环境应是候选，不等待 attempt 判决")
+	}
+	stopEnv(t, s, "env-t1")
+	if candidate("env-t1") {
+		t.Fatal("task 环境仍要求 attempt 已有判决")
+	}
+
+	in, err := s.Inspect(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var try *api.TryView
+	for i := range in.Calls {
+		if in.Calls[i].CallID == "x1" && len(in.Calls[i].Tries) == 1 {
+			try = &in.Calls[i].Tries[0]
+		}
+	}
+	if try == nil || try.EnvID != tr.EnvID || try.QueueMs == nil || *try.QueueMs != 7 || try.WallMs == nil || *try.WallMs != 100 ||
+		try.CPUUsec == nil || *try.CPUUsec != 250 || try.ExecStartedAt == nil {
+		t.Fatalf("inspect 的 exec try = %+v", try)
+	}
+
+	if _, err := s.UpdateCleanup(ctx, resource.CleanupUpdate{EnvID: tr.EnvID, State: resource.CleanupDone}); err != nil {
+		t.Fatal(err)
+	}
+	cleaned, err := s.CleanedEnvs(ctx)
+	if err != nil || !slices.Contains(cleaned, invariants.CleanedEnv{EnvID: tr.EnvID, Kind: "exec"}) {
+		t.Fatalf("CleanedEnvs = %+v, %v", cleaned, err)
+	}
+}
+
+// TestOwnerUIDRangeState：OwnerUIDRange 返回 owner 的 assigned 范围与使用它而未"已停止且清理完成"的环境数；owner 没有范围
+// 为 ErrNotFound（归还之后同样）。
+func TestOwnerUIDRangeState(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	if err := s.SeedUIDRanges(ctx, 100000, 4096, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.OwnerUIDRange(ctx, "session:s1"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("没有范围时 = %v，期望 ErrNotFound", err)
+	}
+	const alloc = "owner-uid:session:s1"
+	r1, err := s.AssignOwnerUIDRange(ctx, "session:s1", "env-t1", alloc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, pending, err := s.OwnerUIDRange(ctx, "session:s1"); err != nil || got != r1 || pending != 1 {
+		t.Fatalf("OwnerUIDRange = %+v, %d, %v；期望 %+v 与 1 个未清理环境", got, pending, err, r1)
+	}
+	stopEnv(t, s, "env-t1")
+	if _, pending, err := s.OwnerUIDRange(ctx, "session:s1"); err != nil || pending != 1 {
+		t.Fatalf("已停止未清理：%d, %v", pending, err)
+	}
+	if _, err := s.UpdateCleanup(ctx, resource.CleanupUpdate{EnvID: "env-t1", State: resource.CleanupDone}); err != nil {
+		t.Fatal(err)
+	}
+	if _, pending, err := s.OwnerUIDRange(ctx, "session:s1"); err != nil || pending != 0 {
+		t.Fatalf("清理完成：%d, %v", pending, err)
+	}
+	if _, err := s.ReleaseOwnerUIDRange(ctx, "session:s1", alloc); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.OwnerUIDRange(ctx, "session:s1"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("归还之后 = %v，期望 ErrNotFound", err)
+	}
+}
+
+// ==== M4 Plan 15 Task 10 段结束 ====
 
 // ==== M4 Plan 14 Task 7：CreateAttempt 重新绑定、LoadTask 的 sub-run 状态、裁决收尾 ====
 

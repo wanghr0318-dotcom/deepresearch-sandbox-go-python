@@ -296,6 +296,26 @@ func (s *memStore) ReleaseOwnerUIDRange(_ context.Context, owner, alloc string) 
 	return UIDRange{}, persistence.ErrNotFound
 }
 
+// OwnerUIDRange 实现 OwnerUIDStore：owner 的 assigned 范围与使用过它而未清理完成的环境数。
+func (s *memStore) OwnerUIDRange(_ context.Context, owner string) (UIDRange, int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rec.add("OwnerUIDRange")
+	for _, r := range s.ranges {
+		if r.State != "assigned" || r.OwnerID != owner {
+			continue
+		}
+		pending := 0
+		for envID, id := range s.envRange {
+			if e := s.envs[envID]; id == r.UIDRangeID && (e.StoppedAt == nil || e.CleanupState != CleanupDone) {
+				pending++
+			}
+		}
+		return *r, pending, nil
+	}
+	return UIDRange{}, 0, persistence.ErrNotFound
+}
+
 func (s *memStore) MarkStopped(_ context.Context, envID string, at time.Time) (Environment, error) {
 	if err := s.enter("MarkStopped"); err != nil {
 		return Environment{}, err
@@ -1310,5 +1330,130 @@ func TestSessionRangeNotReclaimedOnEnvCleanup(t *testing.T) {
 		if strings.HasPrefix(s, "ReclaimUIDFiles") || strings.HasPrefix(s, "UIDFiles") {
 			t.Fatalf("会话环境清理回收或核查了 owner 范围的文件：%v", f.rec.snapshot())
 		}
+	}
+}
+
+// ==== M4 Plan 15 Task 10：exec 环境的同步清理、启动核对与会话关闭的 UID 范围核查 ====
+
+// TestCleanupNowExecEnv（D8）：exec 环境在 attempt 尚无判决时即可同步清理——stopped_at 未记录时拒绝且不触碰 provider；
+// 记录之后 Destroy → intent released → done → 回收、核查并归还范围。Destroy 失败时按退避记入 cleanup 列并返回错误。
+func TestCleanupNowExecEnv(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	f.store.addEnv("exec-1", false) // 所属 attempt 尚无判决
+	r := req("exec-1")
+	r.Kind, r.Mounts = provider.KindExec, provider.Mounts{OutBytes: 1 << 20}
+	if _, err := f.c.CreateEnv(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.c.CleanupNow(ctx, "exec-1"); err == nil || !strings.Contains(err.Error(), "stopped_at") {
+		t.Fatalf("未停止时 CleanupNow = %v，期望拒绝", err)
+	}
+	if n := f.rec.count("Destroy:ok") + f.rec.count("Destroy:ErrNotStopped"); n != 0 {
+		t.Fatalf("未停止时调用了 Destroy：%v", f.rec.snapshot())
+	}
+	if res, err := f.c.StopEnv(ctx, "exec-1"); err != nil || !res.Recorded {
+		t.Fatalf("StopEnv = %+v, %v", res, err)
+	}
+	f.prov.mu.Lock()
+	f.prov.destroyErrs = []error{errors.New("EBUSY")}
+	f.prov.mu.Unlock()
+	f.rec.mu.Lock()
+	f.rec.log = nil
+	f.rec.mu.Unlock()
+	if err := f.c.CleanupNow(ctx, "exec-1"); err == nil || !strings.Contains(err.Error(), "EBUSY") {
+		t.Fatalf("Destroy 失败时 CleanupNow = %v，期望返回该错误", err)
+	}
+	if e := f.store.env("exec-1"); e.CleanupState != CleanupPending || e.NextRetryAt == nil || e.CleanupError != "EBUSY" {
+		t.Fatalf("Destroy 失败后 env = %+v，期望 pending 并记录退避", e)
+	}
+	if err := f.c.CleanupNow(ctx, "exec-1"); err != nil {
+		t.Fatal(err)
+	}
+	assertLog(t, f.rec, "Destroy:err", "UpdateCleanup:pending", "Destroy:ok", "ResolveIntent:released", "UpdateCleanup:done",
+		"ReclaimUIDFiles:ok", "UIDFiles:0", "ReleaseUIDRange")
+	if got := f.store.rangeOf(fmt.Sprintf("uid-%d", testUIDBase)); got.State != "free" {
+		t.Fatalf("UID 范围 = %+v，期望归还", got)
+	}
+	if err := f.c.CleanupNow(ctx, "exec-1"); err != nil { // 已清理完成：空操作
+		t.Fatal(err)
+	}
+}
+
+// TestReleaseCheckedUIDRange：启动核对的归还与 cleanup loop 相同——先回收 workspace，数据目录其他位置仍有文件则
+// 隔离并报警（released 为假、无错误），否则归还。
+func TestReleaseCheckedUIDRange(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	var alerts []Quarantine
+	f.c.opt.Alert = func(q Quarantine) { alerts = append(alerts, q) }
+	for _, id := range []string{"e1", "e2"} {
+		f.createStopped(t, id, false) // 未结束：cleanup loop 不处理，模拟"清理完成而范围未归还"
+		e := f.store.envs[id]
+		e.CleanupState = CleanupDone
+	}
+	r1, err := f.store.GetUIDRange(ctx, "e1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := f.store.GetUIDRange(ctx, "e2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.prov.PlantUIDFile("/data/workspaces/t1/a", uint32(r1.Base)+1000, true)
+	f.prov.PlantUIDFile("/data/stray/y", uint32(r2.Base)+1000, false)
+	if released, err := f.c.ReleaseCheckedUIDRange(ctx, r1); err != nil || !released {
+		t.Fatalf("ReleaseCheckedUIDRange(r1) = %v, %v，期望归还", released, err)
+	}
+	if uid, _ := f.prov.UIDFileOwner("/data/workspaces/t1/a"); uid != 0 || f.store.rangeOf(r1.UIDRangeID).State != "free" {
+		t.Fatalf("r1 未回收或未归还：属主 %d，范围 %+v", uid, f.store.rangeOf(r1.UIDRangeID))
+	}
+	if released, err := f.c.ReleaseCheckedUIDRange(ctx, r2); err != nil || released {
+		t.Fatalf("ReleaseCheckedUIDRange(r2) = %v, %v，期望隔离", released, err)
+	}
+	if got := f.store.rangeOf(r2.UIDRangeID); got.State != "quarantined" || len(alerts) != 1 ||
+		!strings.Contains(alerts[0].Reason, "/data/stray/y") || !f.store.alerted[alerts[0].Path] {
+		t.Fatalf("r2 = %+v，报警 %+v", got, alerts)
+	}
+}
+
+// TestOwnerRangeCheckedOnSessionClose：会话关闭归还 owner 范围之前，先确认使用过它的环境全部清理完成（未完成时冲突，
+// 不回收、不核查文件），之后才核查：仍有归该范围的文件 → 隔离并报警、不归还，返回 nil。
+func TestOwnerRangeCheckedOnSessionClose(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	var alerts []Quarantine
+	f.c.opt.Alert = func(q Quarantine) { alerts = append(alerts, q) }
+	f.store.addEnv("s1-a", true)
+	if _, err := f.c.CreateEnv(ctx, sessionReq("s1-a", "session:s1")); err != nil {
+		t.Fatal(err)
+	}
+	base := f.prov.specs[len(f.prov.specs)-1].UIDBase
+	f.prov.PlantUIDFile("/data/sessions/s1/leftover", base+1000, false)
+	f.rec.mu.Lock()
+	f.rec.log = nil
+	f.rec.mu.Unlock()
+	if err := f.c.ReleaseOwnerUIDRange(ctx, "session:s1"); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("环境未清理时 ReleaseOwnerUIDRange = %v，期望冲突", err)
+	}
+	assertLog(t, f.rec, "OwnerUIDRange")
+	if res, err := f.c.StopEnv(ctx, "s1-a"); err != nil || !res.Recorded {
+		t.Fatalf("StopEnv = %+v, %v", res, err)
+	}
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.c.ReleaseOwnerUIDRange(ctx, "session:s1"); err != nil {
+		t.Fatalf("有残留文件时 ReleaseOwnerUIDRange = %v，期望隔离后返回 nil", err)
+	}
+	id := fmt.Sprintf("uid-%d", base)
+	if got := f.store.rangeOf(id); got.State != "quarantined" || f.rec.count("ReleaseOwnerUIDRange") != 0 {
+		t.Fatalf("范围 = %+v，调用 %v", got, f.rec.snapshot())
+	}
+	if len(alerts) != 1 || alerts[0].ObservedOwner != "session:s1" || !strings.Contains(alerts[0].Reason, "leftover") {
+		t.Fatalf("报警 = %+v", alerts)
+	}
+	if err := f.c.ReleaseOwnerUIDRange(ctx, "session:s1"); err != nil { // 已隔离：不再有 assigned 范围
+		t.Fatal(err)
 	}
 }

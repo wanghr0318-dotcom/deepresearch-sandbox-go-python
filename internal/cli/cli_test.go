@@ -470,3 +470,40 @@ func TestInspectTextWithoutSubruns(t *testing.T) {
 }
 
 // ==== M4 Plan 14 Task 10 段结束 ====
+
+// ==== M4 Plan 15 Task 10：inspect 的 exec 列 ====
+
+// TestInspectTextExecTries：--format text 为 exec 调用的每个 try 输出环境、排队、运行、CPU、启动时间与结局；未测得的
+// 列为 -；非 exec 调用不列出。
+func TestInspectTextExecTries(t *testing.T) {
+	const body = `{"task":{"task_id":"t5","status":"running"},"attempts":[],"checkpoints":[],"subruns":[],"calls":[
+		{"call_id":"root/s1/chat/1","endpoint":"/v1/chat/completions","tries":[{"try_no":1,"state":"settled","outcome":"ok"}]},
+		{"call_id":"root/s2/exec/1","endpoint":"/v1/exec","tries":[
+			{"try_no":1,"env_id":"exec-aaa","state":"settled","outcome":"unknown","error":"lost_on_restart"},
+			{"try_no":2,"env_id":"exec-bbb","state":"settled","outcome":"ok","queue_ms":12,"wall_ms":1500,"cpu_usec":250000,
+			 "exec_started_at":"2026-10-06T08:00:00Z"}]}]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := fmt.Fprint(w, body); err != nil {
+			t.Errorf("写响应: %v", err)
+		}
+	}))
+	defer srv.Close()
+	res := run(t, srv, nil, "task", "inspect", "t5", "--format", "text")
+	if res.code != 0 {
+		t.Fatalf("code=%d err=%s", res.code, res.err)
+	}
+	var rows []string
+	for _, l := range strings.Split(res.stdout, "\n") {
+		if strings.HasPrefix(l, "root/") || strings.HasPrefix(l, "EXEC CALL") {
+			rows = append(rows, strings.Join(strings.Fields(l), " "))
+		}
+	}
+	want := []string{
+		"EXEC CALL TRY ENV QUEUE WALL CPU STARTED OUTCOME",
+		"root/s2/exec/1 1 exec-aaa - - - - unknown (lost_on_restart)",
+		"root/s2/exec/1 2 exec-bbb 12ms 1.5s 250ms 2026-10-06T08:00:00Z ok",
+	}
+	if strings.Join(rows, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("exec 行\n%s\n期望\n%s\n完整输出：\n%s", strings.Join(rows, "\n"), strings.Join(want, "\n"), res.stdout)
+	}
+}

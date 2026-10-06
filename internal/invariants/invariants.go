@@ -2,7 +2,8 @@
 // M2 Gateway：I3 的 task 层账本、I14 的 journal 部分——已完成调用的结果不变且在 blobs 与 scope_blobs(task) 中；
 // M3 缓存：I14 的缓存部分——source = cache|coalesced 的调用同样登记并授权到 scope_blobs(task)、结果是 Tx2 记录的
 // blob 且没有 try；I15——恢复完成后不存在没有活跃 attempt 的进行中 resolving 调用；M4 Plan 15：I11——存活环境的
-// UID 范围互不相同 [A]、已归还范围不拥有任何文件 [Q]；M4 Plan 12：I9——每个会话至多一个非 ended 的 incarnation、frozen
+// UID 范围互不相同 [A]、已归还范围不拥有任何文件 [Q]；I12 [Q]——清理完成的 exec 环境没有挂载、cgroup 与目录（与 I1 同一
+// 扫描，按 kind 报告；I12 [A]、[B] 在数据库检查中）；M4 Plan 12：I9——每个会话至多一个非 ended 的 incarnation、frozen
 // 会话最近一次 quiesced 的 checkpoint 等于会话指针；I10——session checkpoint 只由 succeeded turn 提交、commit_seq 与指针
 // 单调；I6 的 attempt 关联对 seed- 恢复种子豁免）。
 //
@@ -42,13 +43,19 @@ type Store interface {
 	// DBViolations 返回只依赖数据库即可判定的违反：I2、I3、I4、I6（授权、指针与 attempt 关联）、I7、I8、I9、I10、I14（登记与授权，含缓存
 	// 来源）、I15、I16。可以含 Q 类违反：Verify 只在 quiescent 为真时保留它们。
 	DBViolations(ctx context.Context) ([]Violation, error)
-	// CleanedEnvIDs 返回 cleanup_state = done 的环境（I1）。
-	CleanedEnvIDs(ctx context.Context) ([]string, error)
+	// CleanedEnvs 返回 cleanup_state = done 的环境及其 kind（I1；kind = exec 的报告为 I12 [Q]）。
+	CleanedEnvs(ctx context.Context) ([]CleanedEnv, error)
 	// ReferencedBlobs 返回已登记产物、已提交 checkpoint 引用与已完成调用结果的 blob（I5、I6、I14 的内容部分；
 	// Origin 分别以 "artifact"、"checkpoint"、"call" 开头）。
 	ReferencedBlobs(ctx context.Context) ([]BlobRef, error)
 	// FreeUIDRanges 返回未分配（free）的 UID 范围（I11 [Q]）。
 	FreeUIDRanges(ctx context.Context) ([]UIDRange, error)
+}
+
+// CleanedEnv 是一个 cleanup_state = done 的环境。
+type CleanedEnv struct {
+	EnvID string
+	Kind  string // provider.EnvKind 的取值：task | session | exec
 }
 
 // UIDRange 是 uid_ranges 中的一段 [Base, Base+Size)。
@@ -160,9 +167,11 @@ func freeRangesOwnNoFiles(ctx context.Context, s Store, scan Scanner) ([]Violati
 	return out, nil
 }
 
-// cleanedEnvsHaveNoResources：I1——cleanup_state = done 的环境不存在任何实际挂载、cgroup、listener 或目录。
+// cleanedEnvsHaveNoResources：I1——cleanup_state = done 的环境不存在任何实际挂载、cgroup、listener 或目录；
+// exec 环境（kind = exec）以同一扫描报告为 I12 [Q]（M4 Plan 15：exec 环境清理完成后没有挂载、cgroup 与目录，
+// 含宿主侧 /out 的 tmpfs）。
 func cleanedEnvsHaveNoResources(ctx context.Context, s Store, scan Scanner) ([]Violation, error) {
-	ids, err := s.CleanedEnvIDs(ctx)
+	envs, err := s.CleanedEnvs(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("invariants: 读取已清理环境: %w", err)
 	}
@@ -170,16 +179,22 @@ func cleanedEnvsHaveNoResources(ctx context.Context, s Store, scan Scanner) ([]V
 	if err != nil {
 		return nil, fmt.Errorf("invariants: 扫描: %w", err)
 	}
-	cleaned := make(map[string]bool, len(ids))
-	for _, id := range ids {
-		cleaned[id] = true
+	cleaned := make(map[string]string, len(envs))
+	for _, e := range envs {
+		cleaned[e.EnvID] = e.Kind
 	}
 	var out []Violation
 	for _, it := range report.Items {
-		if it.EnvID != "" && cleaned[it.EnvID] {
-			out = append(out, Violation{ID: "I1", Class: "Q",
-				Detail: fmt.Sprintf("环境 %s 已清理完成，但仍有 %s %s", it.EnvID, it.Layer, it.Path)})
+		kind, ok := cleaned[it.EnvID]
+		if it.EnvID == "" || !ok {
+			continue
 		}
+		id := "I1"
+		if kind == string(provider.KindExec) {
+			id = "I12"
+		}
+		out = append(out, Violation{ID: id, Class: "Q",
+			Detail: fmt.Sprintf("%s 环境 %s 已清理完成，但仍有 %s %s", kind, it.EnvID, it.Layer, it.Path)})
 	}
 	return out, nil
 }

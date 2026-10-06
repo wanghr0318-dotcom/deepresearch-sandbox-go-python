@@ -443,12 +443,30 @@ type inspectView struct {
 		Calls         int64      `json:"calls"`
 	} `json:"subruns"`
 	Calls []struct {
-		SubrunID string `json:"subrun_id"`
+		CallID     string `json:"call_id"`
+		Endpoint   string `json:"endpoint"`
+		SubrunID   string `json:"subrun_id"`
+		FailReason string `json:"fail_reason"`
+		Tries      []struct {
+			TryNo         int64      `json:"try_no"`
+			EnvID         string     `json:"env_id"`
+			State         string     `json:"state"`
+			Outcome       string     `json:"outcome"`
+			Error         string     `json:"error"`
+			QueueMs       *int64     `json:"queue_ms"`
+			WallMs        *int64     `json:"wall_ms"`
+			CPUUsec       *int64     `json:"cpu_usec"`
+			ExecStartedAt *time.Time `json:"exec_started_at"`
+		} `json:"tries"`
 	} `json:"calls"`
 }
 
+// execEndpoint 是 exec 调用的端点（inspect 文本输出为它的每个 try 列出 exec 列）。
+const execEndpoint = "/v1/exec"
+
 // inspectText 以文本输出 inspect 的摘要：任务、task 层账本（两层费用的总额）、sub-run 段（每个 sub-run 一行：
-// 状态、时间线、sub-run 层费用、调用数与失败/取消原因；规格 §15.4）与调用的归属统计。
+// 状态、时间线、sub-run 层费用、调用数与失败/取消原因；规格 §15.4）、调用的归属统计，以及 exec 调用的每个 try
+// （环境、排队与运行时间、CPU 实测、启动时间与结局；M4 Plan 15）。
 func (c *cmd) inspectText(path string) error {
 	b, _, err := c.doRetry(http.MethodGet, path, nil)
 	if err != nil {
@@ -513,8 +531,53 @@ func (c *cmd) inspectText(path string) error {
 		}
 	}
 	fmt.Fprintf(&buf, "calls %d (root %d, sub-run %d)\n", len(in.Calls), root, len(in.Calls)-root)
+	if err := writeExecTries(&buf, in); err != nil {
+		return err
+	}
 	_, err = c.out.Write(buf.Bytes())
 	return err
+}
+
+// writeExecTries 为 exec 调用的每个 try 输出一行：调用、try、环境、排队、运行、CPU、启动时间与结局（未测得为 -）。
+func writeExecTries(buf *bytes.Buffer, in inspectView) error {
+	n := 0
+	tw := tabwriter.NewWriter(buf, 0, 0, 2, ' ', 0)
+	ms := func(v *int64) string {
+		if v == nil {
+			return "-"
+		}
+		return (time.Duration(*v) * time.Millisecond).String()
+	}
+	for _, cl := range in.Calls {
+		if cl.Endpoint != execEndpoint {
+			continue
+		}
+		for _, t := range cl.Tries {
+			if n == 0 {
+				fmt.Fprintln(tw, "EXEC CALL\tTRY\tENV\tQUEUE\tWALL\tCPU\tSTARTED\tOUTCOME")
+			}
+			n++
+			cpu, started := "-", "-"
+			if t.CPUUsec != nil {
+				cpu = (time.Duration(*t.CPUUsec) * time.Microsecond).String()
+			}
+			if t.ExecStartedAt != nil {
+				started = t.ExecStartedAt.UTC().Format(time.RFC3339)
+			}
+			outcome := t.State
+			if t.Outcome != "" {
+				outcome = t.Outcome
+			}
+			if t.Error != "" {
+				outcome += " (" + t.Error + ")"
+			}
+			fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n", cl.CallID, t.TryNo, t.EnvID, ms(t.QueueMs), ms(t.WallMs), cpu, started, outcome)
+		}
+	}
+	if n == 0 {
+		return nil
+	}
+	return tw.Flush()
 }
 
 // usd 把 micro-USD 格式化为美元（6 位小数）。

@@ -57,6 +57,25 @@ func (s *Store) AssignOwnerUIDRange(ctx context.Context, owner, envID, allocatio
 	return out, err
 }
 
+// OwnerUIDRange 实现 resource.OwnerUIDStore：owner 的 assigned 范围，以及使用过它（environments.uid_range_id）而
+// 尚未"已停止且清理完成"的环境数（只读；归还时 ReleaseOwnerUIDRange 在事务内再次核对）。
+func (s *Store) OwnerUIDRange(ctx context.Context, owner string) (resource.UIDRange, int, error) {
+	var out resource.UIDRange
+	var pending int
+	err := s.read(ctx, "OwnerUIDRange", func(ctx context.Context, q queryer) error {
+		err := q.QueryRow(ctx, `SELECT r.uid_range_id, r.base, r.size, r.state, r.owner_id, r.allocation_id,
+				(SELECT count(*) FROM environments e WHERE e.uid_range_id = r.uid_range_id
+					AND NOT (e.stopped_at IS NOT NULL AND e.cleanup_state = 'done'))
+			FROM uid_ranges r WHERE r.owner_id = $1 AND r.state = 'assigned'`, owner).Scan(
+			&out.UIDRangeID, &out.Base, &out.Size, &out.State, &out.OwnerID, &out.AllocationID, &pending)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("owner %s 没有 UID 范围", owner)
+		}
+		return err
+	})
+	return out, pending, err
+}
+
 // ReleaseOwnerUIDRange 实现 resource.OwnerUIDStore：使用过该范围的环境（environments.uid_range_id）须全部已停止且
 // 清理完成，否则为冲突（规格 §4.5）。环境行不加锁读取，理由同 ReleaseUIDRange。
 func (s *Store) ReleaseOwnerUIDRange(ctx context.Context, owner, allocationID string) (resource.UIDRange, error) {

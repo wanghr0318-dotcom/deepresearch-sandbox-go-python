@@ -1153,6 +1153,10 @@ components:
         latency_ms: {type: integer, format: int64}
         cost_micro: {type: integer, format: int64, description: Settled cost in micro-USD (ok tries only)}
         error: {type: string}
+        queue_ms: {type: integer, format: int64, description: Exec tries only — time spent waiting for an exec slot}
+        wall_ms: {type: integer, format: int64, description: Exec tries only — wall time of the run}
+        cpu_usec: {type: integer, format: int64, description: Exec tries only — measured CPU (cpu.stat usage_usec); omitted when unknown (charged at the full reservation)}
+        exec_started_at: {type: string, format: date-time, description: Exec tries only — when the host marked the exec as starting; omitted if it never started}
     Call:
       type: object
       description: A Gateway logical call (journal entry). Metadata only — no request or response bodies, prompts or credentials.

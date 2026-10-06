@@ -31,6 +31,7 @@ type world struct {
 	accounted  map[string]time.Time
 	reclaimed  map[string]bool
 	stopMode   map[string]string // "" 正常 | blocked | unrecorded
+	uidResidue map[string]bool   // UID 范围 → 归还前核查发现残留文件（M4 Plan 15 Task 10）
 	verdicts   map[string]task.Verdict
 	ledger     ledgerState
 
@@ -334,6 +335,28 @@ func (w *world) ReclaimOrphan(_ context.Context, envID string) error {
 		w.reclaimed[envID] = true
 		return nil
 	})
+}
+
+// ReleaseCheckedUIDRange 模拟 coordinator 的回收、核查与归还：uidResidue 中的范围仍拥有文件 → 隔离（不归还）。
+func (w *world) ReleaseCheckedUIDRange(_ context.Context, ur resource.UIDRange) (bool, error) {
+	released := false
+	err := w.call(func() error {
+		r := w.ranges[ur.UIDRangeID]
+		if r.State != "assigned" || r.AllocationID != ur.AllocationID {
+			w.dup++
+			return persistence.ErrConflict
+		}
+		if w.uidResidue[ur.UIDRangeID] {
+			r.State = "quarantined"
+			path := resource.UIDRangeQuarantinePath(ur.UIDRangeID)
+			w.quarantine[path] = resource.Quarantine{Layer: "uid_files", Path: path, ObservedOwner: r.OwnerID, Reason: "残留文件"}
+			return nil
+		}
+		r.State, r.OwnerID = "free", ""
+		released = true
+		return nil
+	})
+	return released, err
 }
 
 func (w *world) deps() Deps {
@@ -772,5 +795,32 @@ func TestRestartEvictsSessions(t *testing.T) {
 	r2, err := Execute(context.Background(), plan, w.deps())
 	if err != nil || !r2.Ready || len(r2.EvictedSessions) != 0 || w.dup != 0 || w.finalizes != 1 {
 		t.Fatalf("重跑 = %+v, %v（dup %d，判决 %d 次）", r2.EvictedSessions, err, w.dup, w.finalizes)
+	}
+}
+
+// TestReleaseUIDRangeQuarantinesResidue（M4 Plan 15 Task 10）：启动核对的 ReleaseUIDRange 步骤经 coordinator 回收并
+// 核查文件，不直接归还：仍有归该范围的文件 → 范围隔离（不归还、不计入占用），步骤为 quarantined；重跑时范围已不是
+// assigned，跳过。
+func TestReleaseUIDRangeQuarantinesResidue(t *testing.T) {
+	w, plan := scenario(t)
+	w.uidResidue = map[string]bool{"r5": true}
+	r, err := Execute(context.Background(), plan, w.deps())
+	if err != nil || !r.Ready {
+		t.Fatalf("Execute = %+v, %v", r, err)
+	}
+	st := statuses(r)
+	path := resource.UIDRangeQuarantinePath("r5")
+	if w.ranges["r5"].State != "quarantined" || st["release_uid_range:r5:al5"] != StepQuarantined {
+		t.Fatalf("r5 = %s，步骤 %s", w.ranges["r5"].State, st["release_uid_range:r5:al5"])
+	}
+	if _, ok := w.quarantine[path]; !ok || !slices.Contains(r.Quarantined, path) {
+		t.Fatalf("隔离记录 %v，报告 %v", w.quarantine, r.Quarantined)
+	}
+	if len(r.Occupied) != 2 {
+		t.Fatalf("UID 范围的隔离不应占用 run slot：%+v", r.Occupied)
+	}
+	r2, err := Execute(context.Background(), plan, w.deps())
+	if err != nil || statuses(r2)["release_uid_range:r5:al5"] != StepSkipped || w.dup != 0 {
+		t.Fatalf("重跑 = %v，步骤 %s，dup %d", err, statuses(r2)["release_uid_range:r5:al5"], w.dup)
 	}
 }

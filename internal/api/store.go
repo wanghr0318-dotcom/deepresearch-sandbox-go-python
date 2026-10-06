@@ -150,12 +150,17 @@ type CallView struct {
 	Tries                             []TryView
 }
 
-// TryView 是一次 try 的审计视图（call_tries）。
+// TryView 是一次 try 的审计视图（call_tries）。exec 调用（/v1/exec，M4 Plan 15）的 try 另有：EnvID 是该 try 的
+// exec 环境，QueueMs 与 WallMs 是排队与运行时间，CPUUsec 是 cpu.stat 的实测（nil = 未结算或读取失败，按全额预留
+// 计入），ExecStartedAt 是 MarkExecStarting 的时间（nil = 未启动）。其他端点这四项为 nil。
 type TryView struct {
 	TryNo                 int64
 	AttemptID, EnvID      string
 	State, Outcome, Error string
 	LatencyMs, CostMicro  int64
+	QueueMs, WallMs       *int64
+	CPUUsec               *int64
+	ExecStartedAt         *time.Time
 }
 
 // AttemptView 是一个 attempt 及其环境的诊断视图。

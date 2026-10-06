@@ -784,6 +784,26 @@ export interface components {
              */
             cost_micro: number;
             error?: string;
+            /**
+             * Format: int64
+             * @description Exec tries only — time spent waiting for an exec slot
+             */
+            queue_ms?: number;
+            /**
+             * Format: int64
+             * @description Exec tries only — wall time of the run
+             */
+            wall_ms?: number;
+            /**
+             * Format: int64
+             * @description Exec tries only — measured CPU (cpu.stat usage_usec); omitted when unknown (charged at the full reservation)
+             */
+            cpu_usec?: number;
+            /**
+             * Format: date-time
+             * @description Exec tries only — when the host marked the exec as starting; omitted if it never started
+             */
+            exec_started_at?: string;
         };
         /** @description A Gateway logical call (journal entry). Metadata only — no request or response bodies, prompts or credentials. */
         Call: {

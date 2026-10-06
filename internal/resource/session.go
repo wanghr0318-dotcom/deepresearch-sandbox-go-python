@@ -25,6 +25,9 @@ type OwnerUIDStore interface {
 	// ReleaseOwnerUIDRange 归还 owner 的范围：使用过该范围的环境须全部已停止且清理完成（规格 §4.5），否则
 	// 为 persistence.ErrConflict；owner 没有 assigned 范围为 persistence.ErrNotFound；allocationID 不符为冲突。
 	ReleaseOwnerUIDRange(ctx context.Context, owner, allocationID string) (UIDRange, error)
+	// OwnerUIDRange 读取 owner 的 assigned 范围，以及使用过它而尚未"已停止且清理完成"的环境数（归还前先确认这一
+	// 条件，再核查文件；M4 Plan 15 Task 10）。owner 没有 assigned 范围为 persistence.ErrNotFound。
+	OwnerUIDRange(ctx context.Context, owner string) (ur UIDRange, pendingEnvs int, err error)
 }
 
 // ownerAllocationID 是 owner 范围的分配代次：每个 owner 只分配一次（会话关闭后不再分配）。
@@ -60,6 +63,10 @@ func (c *Coordinator) assignRange(ctx context.Context, r EnvRequest) (UIDRange, 
 
 // ReleaseOwnerUIDRange 在会话 workspace 删除后归还该 owner 的 UID 范围（规格 §4.5 回收条件：使用过它的环境
 // 均已停止且清理完成）。幂等：owner 没有范围时返回 nil。条件未满足时返回 persistence.ErrConflict（调用方稍后重试）。
+//
+// 先确认使用过该范围的环境全部清理完成（否则存活会话的文件会被误判为残留），再与环境范围一样回收并核查文件
+// （ReclaimUIDFiles → provider.ScanUIDFiles，M4 Plan 15 D13）：数据目录中仍有归该范围的文件时隔离该范围并报警、
+// 不归还，返回 nil（范围不再分配，会话关闭照常完成）。
 func (c *Coordinator) ReleaseOwnerUIDRange(ctx context.Context, owner string) error {
 	if !strings.HasPrefix(owner, OwnerPrefixSession) || owner == OwnerPrefixSession {
 		return fmt.Errorf("resource: 非法的 owner %q", owner)
@@ -68,9 +75,26 @@ func (c *Coordinator) ReleaseOwnerUIDRange(ctx context.Context, owner string) er
 	if err != nil {
 		return err
 	}
+	var ur UIDRange
+	var pending int
 	err = c.persist(ctx, func(ctx context.Context) error {
-		_, err := ost.ReleaseOwnerUIDRange(ctx, owner, ownerAllocationID(owner))
+		var err error
+		ur, pending, err = ost.OwnerUIDRange(ctx, owner)
 		return err
+	})
+	switch {
+	case errors.Is(err, persistence.ErrNotFound):
+		return nil
+	case err != nil:
+		return fmt.Errorf("resource: 读取 %s 的 UID 范围: %w", owner, err)
+	case pending > 0:
+		return fmt.Errorf("resource: 归还 %s 的 UID 范围: %w（%d 个环境尚未停止并完成清理）", owner, persistence.ErrConflict, pending)
+	}
+	released, err := c.checkAndRelease(ctx, ur, func(ctx context.Context) error {
+		return c.persist(ctx, func(ctx context.Context) error {
+			_, err := ost.ReleaseOwnerUIDRange(ctx, owner, ownerAllocationID(owner))
+			return err
+		})
 	})
 	switch {
 	case errors.Is(err, persistence.ErrNotFound):
@@ -78,7 +102,9 @@ func (c *Coordinator) ReleaseOwnerUIDRange(ctx context.Context, owner string) er
 	case err != nil:
 		return fmt.Errorf("resource: 归还 %s 的 UID 范围: %w", owner, err)
 	}
-	c.notifyFreed()
+	if released {
+		c.notifyFreed()
+	}
 	return nil
 }
 

@@ -197,15 +197,19 @@ func (s *Store) DBViolations(ctx context.Context) ([]invariants.Violation, error
 	return out, err
 }
 
-// CleanedEnvIDs 返回 cleanup_state = done 的环境（实现 invariants.Store）。
-func (s *Store) CleanedEnvIDs(ctx context.Context) ([]string, error) {
-	var out []string
-	err := s.read(ctx, "CleanedEnvIDs", func(ctx context.Context, q queryer) error {
-		rows, err := q.Query(ctx, "SELECT env_id FROM environments WHERE cleanup_state = 'done' ORDER BY env_id")
+// CleanedEnvs 返回 cleanup_state = done 的环境及其 kind（实现 invariants.Store；I1，exec 环境为 I12 [Q]）。
+func (s *Store) CleanedEnvs(ctx context.Context) ([]invariants.CleanedEnv, error) {
+	var out []invariants.CleanedEnv
+	err := s.read(ctx, "CleanedEnvs", func(ctx context.Context, q queryer) error {
+		rows, err := q.Query(ctx, "SELECT env_id, kind FROM environments WHERE cleanup_state = 'done' ORDER BY env_id")
 		if err != nil {
 			return err
 		}
-		out, err = pgx.CollectRows(rows, pgx.RowTo[string])
+		out, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (invariants.CleanedEnv, error) {
+			var e invariants.CleanedEnv
+			err := r.Scan(&e.EnvID, &e.Kind)
+			return e, err
+		})
 		return err
 	})
 	return out, err

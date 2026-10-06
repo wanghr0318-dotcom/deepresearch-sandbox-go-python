@@ -945,6 +945,11 @@ type tryJSON struct {
 	LatencyMs int64  `json:"latency_ms"`
 	CostMicro int64  `json:"cost_micro"`
 	Error     string `json:"error,omitempty"`
+	// exec try（/v1/exec）：排队与运行时间、CPU 实测（未测得时省略）、启动时间；其他端点省略。
+	QueueMs       *int64     `json:"queue_ms,omitempty"`
+	WallMs        *int64     `json:"wall_ms,omitempty"`
+	CPUUsec       *int64     `json:"cpu_usec,omitempty"`
+	ExecStartedAt *time.Time `json:"exec_started_at,omitempty"`
 }
 
 type callJSON struct {
@@ -1003,7 +1008,8 @@ func (h *Handler) inspect(w http.ResponseWriter, r *http.Request) {
 			PossibleExternalDuplicate: c.PossibleExternalDuplicate, CreatedAt: c.CreatedAt, DeadlineAt: c.DeadlineAt, Tries: []tryJSON{}}
 		for _, t := range c.Tries {
 			cj.Tries = append(cj.Tries, tryJSON{TryNo: t.TryNo, AttemptID: t.AttemptID, EnvID: t.EnvID, State: t.State,
-				Outcome: t.Outcome, LatencyMs: t.LatencyMs, CostMicro: t.CostMicro, Error: t.Error})
+				Outcome: t.Outcome, LatencyMs: t.LatencyMs, CostMicro: t.CostMicro, Error: t.Error,
+				QueueMs: t.QueueMs, WallMs: t.WallMs, CPUUsec: t.CPUUsec, ExecStartedAt: t.ExecStartedAt})
 		}
 		out.Calls = append(out.Calls, cj)
 	}
