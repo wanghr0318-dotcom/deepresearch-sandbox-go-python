@@ -14,7 +14,8 @@ func (s *Store) ListTasks(ctx context.Context, after string, limit int) ([]api.T
 	return s.listTasks(ctx, "ListTasks", 0, after, limit)
 }
 
-// ListTasksByOwner 同 ListTasks，只含 owner_user_id = ownerID 的任务（实现 api.Accounts）。
+// ListTasksByOwner 同 ListTasks，只含 owner_user_id = ownerID 的独立研究任务（实现 api.Accounts）；会话的 turn
+// 属于会话视图，不出现在"我的研究"列表中（M4 Plan 12）。
 func (s *Store) ListTasksByOwner(ctx context.Context, ownerID int64, after string, limit int) ([]api.TaskView, string, error) {
 	if ownerID <= 0 {
 		return nil, "", invalidf("ListTasksByOwner 的 ownerID 必须为正")
@@ -32,7 +33,7 @@ func (s *Store) listTasks(ctx context.Context, op string, owner int64, after str
 		rows, err := q.Query(ctx, `SELECT t.task_id, t.status, t.status_reason, COALESCE(t.current_attempt_id, ''), c.desired,
 				c.control_version, t.applied_control_version, t.attempts_total, t.created_at, COALESCE(t.spec_json->>'topic', '')
 			FROM tasks t JOIN task_control c USING (task_id)
-			WHERE ($3::bigint = 0 OR t.owner_user_id = $3::bigint)
+			WHERE ($3::bigint = 0 OR (t.owner_user_id = $3::bigint AND t.session_id IS NULL))
 				AND ($1 = '' OR (t.created_at, t.task_id) < (SELECT created_at, task_id FROM tasks WHERE task_id = $1))
 			ORDER BY t.created_at DESC, t.task_id DESC LIMIT $2`, after, limit, owner)
 		if err != nil {
