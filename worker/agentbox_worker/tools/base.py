@@ -21,6 +21,7 @@ from agentbox_worker.gateway import GatewayResult
 
 if TYPE_CHECKING:
     from agentbox_worker.tools.budget import TurnBudget
+    from agentbox_worker.tools.skills import SkillCatalog
     from agentbox_worker.tools.sources import SourceStore
 
 
@@ -73,7 +74,8 @@ class ToolContext:
     sources: SourceStore
     flags: TurnFlags
     subtopic_id: str | None = None
-    skills: Any = None  # SkillCatalog | None（Task 3 的 tools.skills）
+    skills: SkillCatalog | None = None
+    call_index: int = 0  # 本步骤内第几次工具调用（由 Agent 循环给出；ask_user 的 question_id 用它）
 
 
 class Tool(Protocol):
