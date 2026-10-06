@@ -1716,6 +1716,48 @@ def test_concurrent_completions_are_both_in_next_checkpoint(tmp_path):
     check_stream(events)
 
 
+def test_queued_checkpoint_snapshots_subruns_and_call_ids_with_its_state(tmp_path):
+    """§5.5 规则 4：subruns[] 与 call id 计数器须与 state 同一时刻生成。另一个提交在途时排队的
+    checkpoint，其 state 在调用时已定；排队期间 sub-run 完成、发起新调用，都不得进入它——否则
+    恢复时宿主说 completed 而 state 里该 sub-run 仍在进行（结果被当作不可读），或计数器越过了
+    state 里没有的调用（恢复后以新 id 重发）。"""
+    held: dict[str, Any] = {}
+    sent = asyncio.Event()
+    respond_subruns = subrun_host()
+
+    def respond(msg, transport):
+        if msg["type"] in ("checkpoint", "checkpoint_query") and msg["checkpoint_id"] == "cp-1":
+            held["transport"] = transport  # 第一个提交保持在途，直到应用放行
+            sent.set()
+            return
+        respond_subruns(msg, transport)
+
+    async def app(ctx):
+        handle = await ctx.subruns.start("st1", **START_ARGS)
+        first = asyncio.create_task(ctx.checkpoint("a", state={"n": 1}))
+        await sent.wait()
+        queued = asyncio.create_task(ctx.checkpoint("b", state={"n": 2}))
+        await asyncio.sleep(0)  # queued 已调用 checkpoint 并在等待在途提交
+        ctx.gateway.call_ids.next("s1", "chat")
+        await ctx.subruns.run(handle, lambda h: asyncio.sleep(0))
+        await ctx.subruns.complete(handle, summary="done", result_ref=REF1)
+        release = {"type": "checkpoint", "checkpoint_id": "cp-1"}
+        checkpoint_reply("committed")(release, held["transport"])
+        await first
+        await queued
+        await ctx.checkpoint("c", state={"n": 3})
+        return Result("ok")
+
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=respond)
+    assert code == 0, events
+    cps = {e["step_id"]: e for e in of_type(events, "checkpoint")}
+    assert cps["b"]["state"] == {"n": 2}  # 计数器在调用时尚无调用
+    assert cps["b"]["subruns"] == [{"subrun_id": "st1", "status": "started"}]
+    assert cps["c"]["state"] == {"n": 3, "_agentbox": {"call_ids": {"root/s1/chat": 1}}}
+    assert cps["c"]["subruns"] == [{"subrun_id": "st1", "status": "completed", "result_ref": REF1}]
+    check_stream(events)
+
+
 def test_failed_subrun_cannot_restart_in_same_turn(tmp_path):
     async def app(ctx):
         handle = await ctx.subruns.start("st1", **START_ARGS)

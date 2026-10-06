@@ -290,29 +290,30 @@ class TaskContext:
         （state 须为对象，不能用 state_ref），恢复时取出并续号；应用的 resume.state 不含该键。
 
         存在 sub-run 时自动附加 subruns=self.subruns.snapshot()（与 state 同一时刻生成）。
+
+        state、call id 计数器与 subruns[] 都在调用时（等待在途提交之前、无 await）一并取快照：
+        排队期间 sub-run 完成或发起新调用都不进入本 checkpoint，否则宿主会看到 state 里仍在进行的
+        sub-run 已 completed，或计数器越过 state 里没有的调用（恢复后以新 id 重发）。锁按 FIFO
+        交接，快照顺序即提交顺序。
         """
+        snap: dict[str, Any] = {"scope": "task", "step_id": step_id}
+        call_ids = self._call_ids.snapshot()
+        if state_ref is None:
+            snap["state"] = _snapshot(_with_call_ids(state, call_ids))
+        elif call_ids:
+            raise WorkerFailure(
+                "invalid_field",
+                "已发起 Gateway 调用后不能用 state_ref 提交（call id 计数器无处保存）",
+            )
+        else:
+            snap["state_ref"] = state_ref
+        snap["refs"] = list(refs)
+        subruns = self.subruns.snapshot()
+        if subruns:
+            snap["subruns"] = subruns
         async with self._checkpoint_lock:
             checkpoint_id = self._new_id()
-            body: dict[str, Any] = {
-                "type": "checkpoint",
-                "checkpoint_id": checkpoint_id,
-                "scope": "task",
-                "step_id": step_id,
-            }
-            call_ids = self._call_ids.snapshot()
-            if state_ref is None:
-                body["state"] = _snapshot(_with_call_ids(state, call_ids))
-            elif call_ids:
-                raise WorkerFailure(
-                    "invalid_field",
-                    "已发起 Gateway 调用后不能用 state_ref 提交（call id 计数器无处保存）",
-                )
-            else:
-                body["state_ref"] = state_ref
-            body["refs"] = list(refs)
-            subruns = self.subruns.snapshot()
-            if subruns:
-                body["subruns"] = subruns
+            body: dict[str, Any] = {"type": "checkpoint", "checkpoint_id": checkpoint_id, **snap}
             status, code = await self._submit_checkpoint(checkpoint_id, body)
         if status == "committed":
             return checkpoint_id
