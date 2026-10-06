@@ -390,6 +390,10 @@ func (d *decider) opDone(e OpDone) error {
 			d.s.StartTries, d.s.LastError = 0, ""
 		case StatusEvicted:
 			d.s.EvictWanted, d.s.EvictReason = false, ""
+			if d.s.StartTries >= MaxStartTries { // 启动两次失败的 evicted 已提交：答复触发唤醒的等待者
+				d.failWaiters(true)
+				d.s.StartTries = 0
+			}
 		}
 	case OpStart:
 		if e.Failed != nil {
@@ -620,9 +624,9 @@ func (d *decider) stepStarting(inc *Incarnation) {
 		return // 新会话在首个 turn 的授予（或 wake）到来时才创建 incarnation
 	}
 	if s.StartTries >= MaxStartTries {
+		// 等待者在 evicted（含 last_error 与 user_message）提交之后才得到 ErrUnavailable（见 opDone）：先答复会让
+		// 申请者看到仍是 restoring 的会话；转换冲突或暂时失败时 StartTries 保留，重新决策会再次尝试这次转换。
 		wake, msg := st.WakeRequestedVersion, s.LastError
-		d.failWaiters(true)
-		s.StartTries = 0
 		d.transition(StatusEvicted, []string{st.Status}, func(t *Transition) {
 			t.AppliedWake, t.LastError, t.Event = &wake, &msg, stateEvent(StatusEvicted, UnavailableMessage)
 		})

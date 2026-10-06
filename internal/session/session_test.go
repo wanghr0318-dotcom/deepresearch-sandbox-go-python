@@ -144,7 +144,7 @@ func TestDecideTransitions(t *testing.T) {
 			noInc(s)
 			waiter(s)
 			s.Session.Status, s.StartTries, s.LastError = StatusRestoring, 2, "启动失败"
-		}), "Reply(t1,unavailable),→evicted"},
+		}), "→evicted"},
 		{"running 释放后 → idle", with(idleState(), status(StatusRunning)), "→idle"},
 		{"running 中 incarnation 忙", with(idleState(), func(s *ActorState) {
 			s.Session.Status, s.Session.CurrentTaskID, s.Session.Incarnation.Status = StatusRunning, "t1", IncBusy
@@ -254,6 +254,29 @@ func TestDecideTransitionDetails(t *testing.T) {
 		s.Session.Status, s.Session.Latest, s.Waiters = StatusCreating, cp, []string{"t1"}
 	})).(StartIncarnation); st.Resume != nil {
 		t.Errorf("新会话不恢复：%+v", st)
+	}
+}
+
+// TestDecideRestoreFailureRepliesAfterEvictedCommitted：启动两次失败时，等待者只在 evicted（last_error、user_message）
+// 提交之后得到 ErrUnavailable；转换冲突时不答复、保留 StartTries，重新决策再次转换。
+func TestDecideRestoreFailureRepliesAfterEvictedCommitted(t *testing.T) {
+	failing := with(idleState(), func(s *ActorState) {
+		noInc(s)
+		s.Waiters, s.Session.Status, s.StartTries, s.LastError = []string{"t1"}, StatusRestoring, 2, "boom"
+	})
+	d := Decide(failing, Tick{})
+	if got := describe(d.Effects); got != "→evicted" || !slices.Equal(d.Next.Waiters, []string{"t1"}) {
+		t.Fatalf("转换提交之前不答复：副作用 %q，等待者 %v", got, d.Next.Waiters)
+	}
+	conflict := Decide(d.Next, OpDone{Op: OpTransition, To: StatusEvicted, Conflict: true, State: &failing.Session})
+	if got := describe(conflict.Effects); got != "→evicted" || conflict.Next.StartTries != 2 {
+		t.Fatalf("冲突后应重试转换且不答复：副作用 %q，StartTries %d", got, conflict.Next.StartTries)
+	}
+	evicted := failing.Session
+	evicted.Status, evicted.RowVersion = StatusEvicted, 4
+	done := Decide(conflict.Next, OpDone{Op: OpTransition, To: StatusEvicted, State: &evicted})
+	if got := describe(done.Effects); got != "Reply(t1,unavailable)" || len(done.Next.Waiters) != 0 || done.Next.StartTries != 0 {
+		t.Fatalf("提交后答复：副作用 %q，等待者 %v，StartTries %d", got, done.Next.Waiters, done.Next.StartTries)
 	}
 }
 
