@@ -99,6 +99,26 @@ def _obj(spec: dict[str, Pred]) -> Pred:
 
 
 _STRS = _list_of(_is_str)
+
+# sub-run 扩展（规格 §5.4 sub-run 扩展、§13；M4 Plan 14），与 Go 的 internal/protocol/subrun.go 对应
+EXTENSION_SUBRUNS = "subruns"
+SUBRUNS_EXT_VERSION = 1
+MAX_SUBRUN_ID_BYTES = 32
+MAX_SUBRUN_DEADLINE = 3_600_000  # ms
+MAX_SUBRUN_SUMMARY = 4096  # subrun_end.summary 与 result.subruns[].summary，UTF-8 字节
+MAX_SUBRUNS_PER_TASK = 4
+MAX_PARENT_STEP_ID_BYTES = 256
+SUBRUN_STARTED_STATUSES = ("started", "rejected")
+SUBRUN_END_STATUSES = ("succeeded", "failed", "cancelled")
+SUBRUN_CANCEL_REASONS = ("deadline", "task_cancel", "policy")
+CHECKPOINT_SUBRUN_STATUSES = ("started", "completed", "failed", "cancelled")
+# 宿主裁定的状态（resume.subruns[]）与 result.subruns[] 另含 timed_out
+SUBRUN_STATES = ("started", "completed", "cancelled", "failed", "timed_out")
+_SUBRUN_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+
+_CHECKPOINT_SUBRUN = {"subrun_id": _is_str, "status": _is_str, "result_ref": _is_str}
+_RESULT_SUBRUN = {"id": _is_str, "status": _is_str, "summary": _is_str}
+
 _HOST = {"type": _is_str, "v": _is_int}
 # attempt_id 在 session 模式下由 task 相关事件携带；task 模式不要求，但类型同样检查（与 Go 一致）
 _EVENT = {"type": _is_str, "v": _is_int, "seq": _is_int, "ts": _is_str, "attempt_id": _is_str}
@@ -110,6 +130,7 @@ _RESUME = {
     "state": _any,
     "state_ref": _is_str,
     "refs": _STRS,
+    "subruns": _list_of(_obj(_CHECKPOINT_SUBRUN)),
 }
 _SESSION_RESUME = {
     "checkpoint_id": _is_str,
@@ -139,6 +160,7 @@ _FIELD_TYPES: dict[str, dict[str, Pred]] = {
         "session_id": _is_str,
         "incarnation_id": _is_str,
         "session_resume": _obj(_SESSION_RESUME),
+        "extensions": _STRS,
     },
     "checkpoint_result": {
         **_HOST,
@@ -191,6 +213,7 @@ _FIELD_TYPES: dict[str, dict[str, Pred]] = {
         "worker": _obj({"name": _is_str, "version": _is_str}),
         "capabilities": _STRS,
         "session_ext": _is_int,
+        "subruns": _is_int,
     },
     "task_accepted": _EVENT,
     "task_outcome_query": _EVENT,
@@ -198,7 +221,14 @@ _FIELD_TYPES: dict[str, dict[str, Pred]] = {
     "quiesced": {**_EVENT, "session_checkpoint_id": _is_str},
     "closed": _EVENT,
     "awaiting_input": {**_EVENT, "checkpoint_id": _is_str, "question_id": _is_str},
-    "progress": {**_EVENT, "step_id": _is_str, "kind": _is_str, "message": _is_str, "data": _any},
+    "progress": {
+        **_EVENT,
+        "step_id": _is_str,
+        "kind": _is_str,
+        "message": _is_str,
+        "data": _any,
+        "subrun_id": _is_str,
+    },
     "artifact": {
         **_EVENT,
         "artifact_id": _is_str,
@@ -216,6 +246,7 @@ _FIELD_TYPES: dict[str, dict[str, Pred]] = {
         "state": _any,
         "state_ref": _is_str,
         "refs": _STRS,
+        "subruns": _list_of(_obj(_CHECKPOINT_SUBRUN)),
     },
     "checkpoint_query": {**_EVENT, "checkpoint_id": _is_str, "scope": _is_str},
     "paused": {**_EVENT, "checkpoint_id": _is_str},
@@ -224,9 +255,21 @@ _FIELD_TYPES: dict[str, dict[str, Pred]] = {
         "summary": _is_str,
         "outputs": _STRS,
         "session_state": _obj(_SESSION_STATE),
+        "subruns": _list_of(_obj(_RESULT_SUBRUN)),
     },
     "error": {**_EVENT, "code": _is_str, "message": _is_str, "retryable": _is_bool},
     "handshake_error": {"type": _is_str, "bootstrap": _is_int, "code": _is_str},
+    "subrun_start": {
+        **_EVENT,
+        "subrun_id": _is_str,
+        "parent_step_id": _is_str,
+        "budget_cap_micro": _is_int,
+        "deadline_ms": _is_int,
+    },
+    "subrun_started": {**_HOST, "subrun_id": _is_str, "status": _is_str, "code": _is_str},
+    "subrun_end": {**_EVENT, "subrun_id": _is_str, "status": _is_str, "summary": _is_str},
+    "subrun_cancel": {**_EVENT, "subrun_id": _is_str, "reason": _is_str},
+    "subrun_cancel_requested": {**_HOST, "subrun_id": _is_str, "reason": _is_str},
 }
 
 
@@ -316,6 +359,7 @@ def _v_init(m: dict[str, Any]) -> None:
         raise ProtocolError("missing_field", "protocol_versions 不能为空")
     mode = _s(m, "mode")
     _one_of("mode", mode, MODE_TASK, MODE_SESSION)
+    _check_extensions(m.get("extensions"))
     if mode == MODE_SESSION:
         _v_session_init(m)
         return
@@ -336,6 +380,9 @@ def _check_attempt_fields(m: dict[str, Any]) -> None:
     _required("resume.step_id", _s(resume, "step_id"))
     _check_state(resume)
     _check_refs("resume.refs", resume.get("refs"), MAX_REFS_PER_CHECKPOINT)
+    _check_subrun_entries(
+        "resume.subruns", resume.get("subruns"), "subrun_id", SUBRUN_STATES, with_ref=True
+    )
 
 
 def _v_session_init(m: dict[str, Any]) -> None:
@@ -448,11 +495,16 @@ def _v_ready(m: dict[str, Any]) -> None:
         raise ProtocolError("version_mismatch", f"protocol_version={_n(m, 'protocol_version')}")
     _one_of("mode", _s(m, "mode"), MODE_TASK, MODE_SESSION)
     _required("worker.name", _s(m.get("worker") or {}, "name"))
+    if _n(m, "subruns") not in (0, SUBRUNS_EXT_VERSION):
+        raise ProtocolError("invalid_field", f"subruns={_n(m, 'subruns')}，只能是 0 或 1")
 
 
 def _v_progress(m: dict[str, Any]) -> None:
     _check_event(m)
     _required("kind", _s(m, "kind"))
+    subrun_id = _s(m, "subrun_id")
+    if subrun_id and not valid_subrun_id(subrun_id):
+        raise ProtocolError("invalid_field", f"subrun_id={subrun_id!r} 不合法")
 
 
 def _v_artifact(m: dict[str, Any]) -> None:
@@ -475,6 +527,15 @@ def _v_checkpoint(m: dict[str, Any]) -> None:
     _one_of("scope", _s(m, "scope"), SCOPE_TASK)  # session scope 只能经 result 提议写入
     _check_state(m)
     _check_refs("refs", m.get("refs"), MAX_REFS_PER_CHECKPOINT)
+    entries = _check_subrun_entries(
+        "subruns", m.get("subruns"), "subrun_id", CHECKPOINT_SUBRUN_STATUSES, with_ref=True
+    )
+    total = len(m.get("refs") or []) + sum(1 for e in entries if _s(e, "result_ref"))
+    if total > MAX_REFS_PER_CHECKPOINT:
+        raise ProtocolError(
+            "too_many_refs",
+            f"refs 与 subruns[].result_ref 合计 {total} 个，上限 {MAX_REFS_PER_CHECKPOINT}",
+        )
 
 
 def _v_checkpoint_query(m: dict[str, Any]) -> None:
@@ -493,6 +554,133 @@ def _v_result(m: dict[str, Any]) -> None:
     for output in m.get("outputs") or []:
         if not output:
             raise ProtocolError("invalid_field", "outputs 中不能有空的 artifact_id")
+    for entry in _check_subrun_entries(
+        "result.subruns", m.get("subruns"), "id", SUBRUN_STATES, with_ref=False
+    ):
+        _check_summary("result.subruns[].summary", _s(entry, "summary"))
+
+
+# ---- sub-run 扩展 ----
+
+
+def valid_subrun_id(subrun_id: str) -> bool:
+    """^[a-z0-9][a-z0-9_-]{0,31}$ 且不等于 root（同 Go 的 validSubrunID）。"""
+    return subrun_id != "root" and _SUBRUN_ID.fullmatch(subrun_id) is not None
+
+
+def _check_subrun_id(field: str, subrun_id: str) -> None:
+    _required(field, subrun_id)
+    if not valid_subrun_id(subrun_id):
+        raise ProtocolError(
+            "invalid_field",
+            f"{field}={subrun_id!r} 须匹配 ^[a-z0-9][a-z0-9_-]{{0,31}}$ 且不是 root",
+        )
+
+
+def _utf8_len(s: str) -> int:
+    return len(s.encode("utf-8", "surrogatepass"))  # 孤立代理项按 3 字节计，同 Go 的 U+FFFD
+
+
+def _check_summary(field: str, summary: str) -> None:
+    if _utf8_len(summary) > MAX_SUBRUN_SUMMARY:
+        raise ProtocolError(
+            "invalid_field", f"{field} {_utf8_len(summary)} 字节，上限 {MAX_SUBRUN_SUMMARY}"
+        )
+
+
+def _check_subrun_entries(
+    field: str, items: list[Any] | None, id_key: str, statuses: tuple[str, ...], *, with_ref: bool
+) -> list[dict[str, Any]]:
+    """subruns[]：至多 4 项、ID 合法且不重复、status 在允许范围内；with_ref 时 completed 必须带
+    合法 sha256 的 result_ref，其他状态不得带。返回各项（null 项按空对象处理，同 Go 的零值）。"""
+    entries = [item if isinstance(item, dict) else {} for item in items or []]
+    if len(entries) > MAX_SUBRUNS_PER_TASK:
+        raise ProtocolError(
+            "invalid_field", f"{field} 有 {len(entries)} 项，上限 {MAX_SUBRUNS_PER_TASK}"
+        )
+    seen: set[str] = set()
+    for entry in entries:
+        subrun_id, status = _s(entry, id_key), _s(entry, "status")
+        _check_subrun_id(f"{field}[].id", subrun_id)
+        _one_of(f"{field}[].status", status, *statuses)
+        if subrun_id in seen:
+            raise ProtocolError("invalid_field", f"{field} 中 ID {subrun_id!r} 重复")
+        seen.add(subrun_id)
+        if not with_ref:
+            continue
+        ref = _s(entry, "result_ref")
+        if status == "completed":
+            if not valid_sha256(ref):
+                raise ProtocolError(
+                    "invalid_field",
+                    f"{field} 中 completed 的 {subrun_id!r} 必须带合法 sha256 的 result_ref",
+                )
+        elif ref:
+            raise ProtocolError(
+                "invalid_field", f"{field} 中 {status} 的 {subrun_id!r} 不得带 result_ref"
+            )
+    return entries
+
+
+def _check_extensions(extensions: list[Any] | None) -> None:
+    """init.extensions 每项非空（未知扩展名忽略，便于前向兼容）。"""
+    if any(not e for e in extensions or []):
+        raise ProtocolError("invalid_field", "extensions 中不能有空串")
+
+
+def requests_subruns(extensions: list[Any] | None) -> bool:
+    """init.extensions 是否请求了 sub-run 扩展。"""
+    return EXTENSION_SUBRUNS in (extensions or [])
+
+
+def _v_subrun_start(m: dict[str, Any]) -> None:
+    _check_event(m)
+    _check_subrun_id("subrun_id", _s(m, "subrun_id"))
+    parent = _s(m, "parent_step_id")
+    _required("parent_step_id", parent)
+    if _utf8_len(parent) > MAX_PARENT_STEP_ID_BYTES:
+        raise ProtocolError(
+            "invalid_field",
+            f"parent_step_id {_utf8_len(parent)} 字节，上限 {MAX_PARENT_STEP_ID_BYTES}",
+        )
+    deadline = _n(m, "deadline_ms")
+    if not 1 <= deadline <= MAX_SUBRUN_DEADLINE:
+        raise ProtocolError(
+            "invalid_field", f"deadline_ms={deadline}，须在 1–{MAX_SUBRUN_DEADLINE} 之间"
+        )
+    cap = m.get("budget_cap_micro")
+    if cap is not None and cap < 0:
+        raise ProtocolError("invalid_field", f"budget_cap_micro={cap}，必须 ≥ 0")
+
+
+def _v_subrun_started(m: dict[str, Any]) -> None:
+    _check_version(m)
+    _check_subrun_id("subrun_id", _s(m, "subrun_id"))
+    status = _s(m, "status")
+    _one_of("status", status, *SUBRUN_STARTED_STATUSES)
+    if status == "rejected" and not _s(m, "code"):
+        raise ProtocolError("invalid_field", "rejected 的 subrun_started 必须带 code")
+    if status == "started" and _s(m, "code"):
+        raise ProtocolError("invalid_field", "started 的 subrun_started 不得带 code")
+
+
+def _v_subrun_end(m: dict[str, Any]) -> None:
+    _check_event(m)
+    _check_subrun_id("subrun_id", _s(m, "subrun_id"))
+    _one_of("status", _s(m, "status"), *SUBRUN_END_STATUSES)
+    _check_summary("summary", _s(m, "summary"))
+
+
+def _v_subrun_cancel(m: dict[str, Any]) -> None:
+    _check_event(m)
+    _check_subrun_id("subrun_id", _s(m, "subrun_id"))
+    _required("reason", _s(m, "reason"))
+
+
+def _v_subrun_cancel_requested(m: dict[str, Any]) -> None:
+    _check_version(m)
+    _check_subrun_id("subrun_id", _s(m, "subrun_id"))
+    _one_of("reason", _s(m, "reason"), *SUBRUN_CANCEL_REASONS)
 
 
 def _v_error(m: dict[str, Any]) -> None:
@@ -513,8 +701,13 @@ _VALIDATORS: dict[str, dict[str, Callable[[dict[str, Any]], None]]] = {
         "artifact_result": _v_artifact_result,
         "cancel": _v_stop,
         "pause": _v_stop,
+        "subrun_started": _v_subrun_started,
+        "subrun_cancel_requested": _v_subrun_cancel_requested,
     },
     WORKER: {
+        "subrun_start": _v_subrun_start,
+        "subrun_end": _v_subrun_end,
+        "subrun_cancel": _v_subrun_cancel,
         "ready": _v_ready,
         "progress": _v_progress,
         "artifact": _v_artifact,
@@ -559,6 +752,9 @@ _SESSION_ATTEMPT_REQUIRED = frozenset(
         "checkpoint_query",
         "paused",
         "result",
+        "subrun_start",
+        "subrun_end",
+        "subrun_cancel",
     )
 )
 

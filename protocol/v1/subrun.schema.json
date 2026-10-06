@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/wanghr0318-dotcom/go-agentbox/protocol/v1/subrun.schema.json",
+  "title": "sub-run 扩展（M4 Plan 14）",
+  "description": "五个 sub-run 消息：宿主消息按 #/$defs/host，Worker 事件按 #/$defs/worker。task/session 消息中的扩展字段（init.extensions、resume.subruns、ready.subruns、progress.subrun_id、checkpoint.subruns、result.subruns）由 #/$defs/fields 描述，与 task/control/event/session 各 schema 叠加使用。不能表达的规则由编解码器检查：subruns[] 中 ID 不重复、summary 与 parent_step_id 按 UTF-8 字节计、refs 与 result_ref 合计 ≤ 1024；session 模式下 Worker 的 sub-run 事件另需 attempt_id。",
+  "oneOf": [{"$ref": "#/$defs/host"}, {"$ref": "#/$defs/worker"}],
+  "$defs": {
+    "nonEmpty": {"type": "string", "minLength": 1},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "subrunId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$", "not": {"const": "root"}},
+    "summary": {"type": "string", "maxLength": 4096},
+    "event": {
+      "type": "object",
+      "required": ["type", "v", "seq"],
+      "properties": {
+        "v": {"const": 1},
+        "seq": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
+        "ts": {"type": "string"},
+        "attempt_id": {"type": "string"}
+      }
+    },
+    "control": {
+      "type": "object",
+      "required": ["type", "v"],
+      "properties": {"v": {"const": 1}}
+    },
+
+    "host": {"oneOf": [{"$ref": "#/$defs/subrun_started"}, {"$ref": "#/$defs/subrun_cancel_requested"}]},
+    "worker": {"oneOf": [{"$ref": "#/$defs/subrun_start"}, {"$ref": "#/$defs/subrun_end"}, {"$ref": "#/$defs/subrun_cancel"}]},
+
+    "subrun_start": {
+      "allOf": [{"$ref": "#/$defs/event"}],
+      "required": ["subrun_id", "parent_step_id", "deadline_ms"],
+      "properties": {
+        "type": {"const": "subrun_start"},
+        "subrun_id": {"$ref": "#/$defs/subrunId"},
+        "parent_step_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "budget_cap_micro": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+        "deadline_ms": {"type": "integer", "minimum": 1, "maximum": 3600000}
+      }
+    },
+    "subrun_started": {
+      "allOf": [{"$ref": "#/$defs/control"}],
+      "required": ["subrun_id", "status"],
+      "properties": {
+        "type": {"const": "subrun_started"},
+        "subrun_id": {"$ref": "#/$defs/subrunId"},
+        "status": {"enum": ["started", "rejected"]},
+        "code": {"type": "string", "description": "rejected 时必填：subrun_limit、conflict、subrun_closed、invalid_field、retryable_error"}
+      },
+      "if": {"properties": {"status": {"const": "rejected"}}},
+      "then": {"required": ["code"], "properties": {"code": {"$ref": "#/$defs/nonEmpty"}}},
+      "else": {"properties": {"code": {"const": ""}}}
+    },
+    "subrun_end": {
+      "allOf": [{"$ref": "#/$defs/event"}],
+      "required": ["subrun_id", "status"],
+      "properties": {
+        "type": {"const": "subrun_end"},
+        "subrun_id": {"$ref": "#/$defs/subrunId"},
+        "status": {"enum": ["succeeded", "failed", "cancelled"]},
+        "summary": {"$ref": "#/$defs/summary"}
+      }
+    },
+    "subrun_cancel": {
+      "allOf": [{"$ref": "#/$defs/event"}],
+      "required": ["subrun_id", "reason"],
+      "properties": {
+        "type": {"const": "subrun_cancel"},
+        "subrun_id": {"$ref": "#/$defs/subrunId"},
+        "reason": {"$ref": "#/$defs/nonEmpty"}
+      }
+    },
+    "subrun_cancel_requested": {
+      "allOf": [{"$ref": "#/$defs/control"}],
+      "required": ["subrun_id", "reason"],
+      "properties": {
+        "type": {"const": "subrun_cancel_requested"},
+        "subrun_id": {"$ref": "#/$defs/subrunId"},
+        "reason": {"enum": ["deadline", "task_cancel", "policy"]}
+      }
+    },
+
+    "checkpoint_subrun": {
+      "type": "object",
+      "required": ["subrun_id", "status"],
+      "properties": {
+        "subrun_id": {"$ref": "#/$defs/subrunId"},
+        "status": {"enum": ["started", "completed", "failed", "cancelled"]},
+        "result_ref": {"$ref": "#/$defs/sha256"}
+      },
+      "if": {"properties": {"status": {"const": "completed"}}},
+      "then": {"required": ["result_ref"]},
+      "else": {"not": {"required": ["result_ref"]}}
+    },
+    "resume_subrun": {
+      "type": "object",
+      "required": ["subrun_id", "status"],
+      "properties": {
+        "subrun_id": {"$ref": "#/$defs/subrunId"},
+        "status": {"enum": ["started", "completed", "cancelled", "failed", "timed_out"]},
+        "result_ref": {"$ref": "#/$defs/sha256"}
+      },
+      "if": {"properties": {"status": {"const": "completed"}}},
+      "then": {"required": ["result_ref"]},
+      "else": {"not": {"required": ["result_ref"]}}
+    },
+    "result_subrun": {
+      "type": "object",
+      "required": ["id", "status"],
+      "properties": {
+        "id": {"$ref": "#/$defs/subrunId"},
+        "status": {"enum": ["started", "completed", "failed", "cancelled", "timed_out"]},
+        "summary": {"$ref": "#/$defs/summary"}
+      }
+    },
+    "resume_fields": {
+      "properties": {
+        "subruns": {"type": "array", "maxItems": 4, "items": {"$ref": "#/$defs/resume_subrun"}}
+      }
+    },
+
+    "fields": {
+      "description": "task/session 消息中的 sub-run 扩展字段，按 type 叠加在对应 schema 之上",
+      "type": "object",
+      "allOf": [
+        {
+          "if": {"properties": {"type": {"const": "init"}}, "required": ["type"]},
+          "then": {
+            "properties": {
+              "extensions": {"type": "array", "items": {"$ref": "#/$defs/nonEmpty"}},
+              "resume": {"$ref": "#/$defs/resume_fields"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "task_start"}}, "required": ["type"]},
+          "then": {"properties": {"resume": {"$ref": "#/$defs/resume_fields"}}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "ready"}}, "required": ["type"]},
+          "then": {"properties": {"subruns": {"enum": [0, 1]}}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "progress"}}, "required": ["type"]},
+          "then": {"properties": {"subrun_id": {"$ref": "#/$defs/subrunId"}}}
+        },
+        {
+          "if": {"properties": {"type": {"const": "checkpoint"}}, "required": ["type"]},
+          "then": {
+            "properties": {
+              "subruns": {"type": "array", "maxItems": 4, "items": {"$ref": "#/$defs/checkpoint_subrun"}}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "result"}}, "required": ["type"]},
+          "then": {
+            "properties": {
+              "subruns": {"type": "array", "maxItems": 4, "items": {"$ref": "#/$defs/result_subrun"}}
+            }
+          }
+        }
+      ]
+    }
+  }
+}

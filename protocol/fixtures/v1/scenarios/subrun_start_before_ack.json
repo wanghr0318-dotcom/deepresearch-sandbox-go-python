@@ -1,0 +1,14 @@
+{
+  "name": "subrun_start_before_ack",
+  "description": "subrun_start 可以在收到 subrun_started 之前接着发出其他事件（含该 sub-run 的 progress），但 subrun_end 引用从未 subrun_start 的 ID 是协议违规 subrun_unknown",
+  "layers": ["protocol"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "task", "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1", "extensions": ["subruns"]}},
+    {"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "task", "worker": {"name": "research-worker", "version": "0.1.0"}, "capabilities": [], "subruns": 1}},
+    {"from": "worker", "message": {"type": "subrun_start", "v": 1, "seq": 2, "subrun_id": "st1", "parent_step_id": "research", "deadline_ms": 600000, "budget_cap_micro": 200000}},
+    {"from": "worker", "message": {"type": "progress", "v": 1, "seq": 3, "step_id": "research", "kind": "subrun_waiting", "message": "等待 st1 启动", "subrun_id": "st1"}},
+    {"from": "worker", "message": {"type": "subrun_end", "v": 1, "seq": 4, "subrun_id": "st2", "status": "failed", "summary": "未启动"}},
+    {"from": "host", "message": {"type": "subrun_started", "v": 1, "subrun_id": "st1", "status": "started"}}
+  ],
+  "expect": {"stream": "violation", "violation": "subrun_unknown", "at": 4}
+}

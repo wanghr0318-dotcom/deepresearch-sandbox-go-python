@@ -202,7 +202,7 @@ func validateSessionMode(m Message) error {
 		return required("attempt_id", m.AttemptID)
 	case *Ready:
 		return m.validateSessionExt()
-	case *Progress, *Artifact, *Checkpoint, *CheckpointQuery, *Paused:
+	case *Progress, *Artifact, *Checkpoint, *CheckpointQuery, *Paused, *SubrunStart, *SubrunEnd, *SubrunCancel:
 		return required("attempt_id", m.(event).header().AttemptID)
 	case *Result:
 		if err := required("attempt_id", m.AttemptID); err != nil {
@@ -384,7 +384,8 @@ type SessionStream struct {
 	current     string // 当前 attempt_id；idle、quiescing、quiesced、closing、closed 时为空
 	outcomeSent bool   // 宿主已对当前 attempt 发送 task_outcome
 	lastSeq     int64
-	handshake   bool // 以 handshake_error 结束
+	handshake   bool          // 以 handshake_error 结束
+	subruns     subrunTracker // sub-run 扩展：协商结果来自 init，已启动的 ID 按 attempt 清空
 }
 
 // NewSessionStream 返回处于 awaiting_init 阶段的状态机。
@@ -407,6 +408,7 @@ func (s *SessionStream) HostSent(m Message) error {
 		if in.Mode != ModeSession {
 			return newError(CodeInvalidField, "session 流的 init.mode=%q", in.Mode)
 		}
+		s.subruns.negotiated = requestsSubruns(in.Extensions)
 		s.phase = PhaseReady
 		return nil
 	}
@@ -421,6 +423,7 @@ func (s *SessionStream) HostSent(m Message) error {
 			return newError(CodeNotIdle, "%s 阶段不能发送 task_start", s.phase)
 		}
 		s.phase, s.current, s.outcomeSent = PhaseStarting, m.AttemptID, false
+		s.subruns.known = nil
 	case *Quiesce:
 		if s.phase != PhaseIdle {
 			return newError(CodeNotIdle, "%s 阶段不能发送 quiesce", s.phase)
@@ -444,6 +447,12 @@ func (s *SessionStream) HostSent(m Message) error {
 		return s.checkCurrent(m.AttemptID)
 	case *ArtifactResult:
 		return s.checkCurrent(m.AttemptID)
+	case *SubrunStarted, *SubrunCancelRequested:
+		// 不带 attempt_id：针对当前 attempt 中已 subrun_start 的 sub-run
+		if s.current == "" {
+			return newError(CodeWrongAttempt, "%s 阶段没有当前 attempt，不能发送 %s", s.phase, m.MessageType())
+		}
+		return s.subruns.hostSent(m)
 	default:
 		return newError(CodeUnknownType, "%s 不是 session 模式的宿主消息", m.MessageType())
 	}
@@ -482,6 +491,9 @@ func (s *SessionStream) advance(m Message, attemptID string) error {
 		switch r := m.(type) {
 		case *Ready:
 			if err := r.validateSessionExt(); err != nil {
+				return err
+			}
+			if err := s.subruns.checkReady(r); err != nil {
 				return err
 			}
 			s.phase = PhaseIdle
@@ -532,6 +544,9 @@ func (s *SessionStream) advance(m Message, attemptID string) error {
 		}
 		s.phase = PhaseActive
 	case PhaseActive:
+		if err := s.subruns.observe(m); err != nil {
+			return err
+		}
 		switch {
 		case isSessionTerminal(typ):
 			s.phase = PhaseProposed

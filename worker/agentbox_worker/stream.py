@@ -5,10 +5,64 @@ from __future__ import annotations
 
 from typing import Any
 
-from agentbox_worker.protocol import ProtocolError, check_session_ext
+from agentbox_worker.protocol import (
+    SUBRUNS_EXT_VERSION,
+    ProtocolError,
+    check_session_ext,
+    requests_subruns,
+)
 
 _TERMINAL = {"result", "error", "paused"}
 _SESSION_TERMINAL = _TERMINAL | {"awaiting_input"}
+
+
+class _SubrunTracker:
+    """sub-run 扩展的事件流状态（同 Go 的 subrunTracker）：是否已协商，以及本 attempt 中
+    已 subrun_start 的 ID。checkpoint 的 subruns[] 可以列出恢复前已结束、本 attempt 未启动
+    的 sub-run。"""
+
+    def __init__(self) -> None:
+        self.negotiated = False
+        self.known: set[str] = set()
+
+    def check_ready(self, msg: dict[str, Any]) -> None:
+        subruns = msg.get("subruns") or 0
+        if (subruns == SUBRUNS_EXT_VERSION) != self.negotiated:
+            raise ProtocolError(
+                "extension_mismatch",
+                f"ready.subruns={subruns}，宿主请求 subruns 扩展：{self.negotiated}",
+            )
+
+    def observe(self, msg: dict[str, Any]) -> None:
+        typ = msg["type"]
+        if typ in ("checkpoint", "result"):
+            self._require_negotiated(bool(msg.get("subruns")), f"{typ}.subruns")
+            return
+        if typ not in ("subrun_start", "subrun_end", "subrun_cancel", "progress"):
+            return
+        subrun_id = msg.get("subrun_id") or ""
+        if not subrun_id:
+            return
+        self._require_negotiated(True, typ)
+        if typ == "subrun_start":
+            self.known.add(subrun_id)
+        else:
+            self._require_known(subrun_id, typ)
+
+    def host_sent(self, msg: dict[str, Any]) -> None:
+        typ = msg["type"]
+        self._require_negotiated(True, typ)
+        self._require_known(msg.get("subrun_id") or "", typ)
+
+    def _require_negotiated(self, uses: bool, what: str) -> None:
+        if uses and not self.negotiated:
+            raise ProtocolError("extension_not_negotiated", f"未协商 subruns 扩展却出现 {what}")
+
+    def _require_known(self, subrun_id: str, what: str) -> None:
+        if subrun_id not in self.known:
+            raise ProtocolError(
+                "subrun_unknown", f"{what} 引用了尚未 subrun_start 的 sub-run {subrun_id!r}"
+            )
 
 
 class StreamChecker:
@@ -19,6 +73,11 @@ class StreamChecker:
     def __init__(self) -> None:
         self._phase = "awaiting_ready"
         self._last_seq = 0
+        self._subruns = _SubrunTracker()
+
+    def negotiate(self, extensions: list[Any] | None) -> None:
+        """记录宿主在 init 中请求的扩展；须在 ready 之前调用，未调用视为未请求任何扩展。"""
+        self._subruns.negotiated = requests_subruns(extensions)
 
     def observe(self, msg: dict[str, Any]) -> None:
         typ = msg["type"]
@@ -33,11 +92,12 @@ class StreamChecker:
         if seq != self._last_seq + 1:
             raise ProtocolError("seq_invalid", f"seq={seq}，期望 {self._last_seq + 1}")
         self._last_seq += 1
-        self._advance(typ)
+        self._advance(msg, typ)
 
-    def _advance(self, typ: str) -> None:
+    def _advance(self, msg: dict[str, Any], typ: str) -> None:
         if self._phase == "awaiting_ready":
             if typ == "ready":
+                self._subruns.check_ready(msg)
                 self._phase = "running"
             elif typ == "error":
                 self._phase = "terminal_sent"
@@ -46,6 +106,7 @@ class StreamChecker:
         elif self._phase == "running":
             if typ == "ready":
                 raise ProtocolError("duplicate_ready", "重复的 ready")
+            self._subruns.observe(msg)
             if typ in _TERMINAL:
                 self._phase = "terminal_sent"
         elif typ != "checkpoint_query":
@@ -81,6 +142,7 @@ class SessionStreamChecker:
         self._outcome_sent = False
         self._last_seq = 0
         self._handshake = False
+        self._subruns = _SubrunTracker()  # 协商结果来自 init，已启动的 ID 按 attempt 清空
 
     @property
     def phase(self) -> str:
@@ -98,6 +160,7 @@ class SessionStreamChecker:
                 raise _err("unexpected_event", f"init 之前发送了 {typ}")
             if msg.get("mode") != "session":
                 raise _err("invalid_field", f"session 流的 init.mode={msg.get('mode')!r}")
+            self._subruns.negotiated = requests_subruns(msg.get("extensions"))
             self._phase = PHASE_READY
             return
         if self._phase in (PHASE_CLOSING, PHASE_CLOSED):
@@ -112,6 +175,7 @@ class SessionStreamChecker:
                 msg["attempt_id"],
                 False,
             )
+            self._subruns.known = set()
         elif typ == "quiesce":
             if self._phase != PHASE_IDLE:
                 raise _err("not_idle", f"{self._phase} 阶段不能发送 quiesce")
@@ -125,6 +189,11 @@ class SessionStreamChecker:
             self._phase, self._outcome_sent = PHASE_PROPOSED, True
         elif typ in ("cancel", "pause", "checkpoint_result", "artifact_result"):
             self._check_current(msg.get("attempt_id") or "")
+        elif typ in ("subrun_started", "subrun_cancel_requested"):
+            # 不带 attempt_id：针对当前 attempt 中已 subrun_start 的 sub-run
+            if not self._current:
+                raise _err("wrong_attempt", f"{self._phase} 阶段没有当前 attempt，不能发送 {typ}")
+            self._subruns.host_sent(msg)
         else:
             raise _err("unknown_type", f"{typ} 不是 session 模式的宿主消息")
 
@@ -160,7 +229,7 @@ class SessionStreamChecker:
         if not attempt_id:  # 其余事件都属于某个 attempt
             raise _err("missing_field", "attempt_id 不能为空")
         self._check_current(attempt_id)
-        self._advance_attempt(typ)
+        self._advance_attempt(msg, typ)
 
     def _before_attempt_phases(self, msg: dict[str, Any], typ: str) -> bool:
         """处理 init/ready 之前与 close 之后的阶段；返回是否已处理。"""
@@ -169,6 +238,7 @@ class SessionStreamChecker:
         if self._phase == PHASE_READY:
             if typ == "ready":
                 check_session_ext(msg)
+                self._subruns.check_ready(msg)
                 self._phase = PHASE_IDLE
             elif typ == "error":  # 启动失败
                 self._phase = PHASE_CLOSED
@@ -184,12 +254,13 @@ class SessionStreamChecker:
             raise _err("after_terminal", f"incarnation 结束之后出现 {typ}")
         return False
 
-    def _advance_attempt(self, typ: str) -> None:
+    def _advance_attempt(self, msg: dict[str, Any], typ: str) -> None:
         if self._phase == PHASE_STARTING:
             if typ != "task_accepted":
                 raise _err("unexpected_event", f"task_accepted 之前出现 {typ}")
             self._phase = PHASE_ACTIVE
         elif self._phase == PHASE_ACTIVE:
+            self._subruns.observe(msg)
             if typ in _SESSION_TERMINAL:
                 self._phase = PHASE_PROPOSED
             elif typ in ("task_accepted", "task_outcome_query", "task_released"):

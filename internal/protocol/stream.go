@@ -30,9 +30,12 @@ const (
 // 终态提议（result、error、paused）至多一个，其后只允许 checkpoint_query；
 // handshake_error 只能是第一条且是唯一一条消息。
 // Observe 返回错误后，流即视为违规，不应继续使用。
+// sub-run 扩展（subrun.go）：ready.subruns 须与 NegotiateExtensions 记录的请求一致；
+// subrun_* 与 sub-run 字段是业务事件，须已协商，且引用的 ID 须已在本 attempt 中 subrun_start。
 type WorkerStream struct {
 	phase   streamPhase
 	lastSeq int64
+	subruns subrunTracker
 }
 
 // Observe 检查下一条 Worker 消息。
@@ -55,14 +58,18 @@ func (s *WorkerStream) Observe(m Message) error {
 		return newError(CodeSeqInvalid, "seq=%d，期望 %d", seq, s.lastSeq+1)
 	}
 	s.lastSeq++
-	return s.advance(m.MessageType())
+	return s.advance(m)
 }
 
-func (s *WorkerStream) advance(typ string) error {
+func (s *WorkerStream) advance(m Message) error {
+	typ := m.MessageType()
 	switch s.phase {
 	case phaseAwaitingReady:
 		switch typ {
 		case TypeReady:
+			if err := s.subruns.checkReady(m.(*Ready)); err != nil {
+				return err
+			}
 			s.phase = phaseRunning
 		case TypeError:
 			s.phase = phaseTerminalSent
@@ -72,6 +79,9 @@ func (s *WorkerStream) advance(typ string) error {
 	case phaseRunning:
 		if typ == TypeReady {
 			return newError(CodeDuplicateReady, "重复的 ready")
+		}
+		if err := s.subruns.observe(m); err != nil {
+			return err
 		}
 		if isTerminal(typ) {
 			s.phase = phaseTerminalSent

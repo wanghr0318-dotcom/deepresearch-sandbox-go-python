@@ -1,6 +1,6 @@
 # Worker 协议 v1
 
-宿主（Go 控制面）与 Worker 进程之间的协议：stdin 承载宿主控制消息，stdout 承载 Worker 事件，均为每行一个 JSON 对象（JSONL）；stderr 是自由格式日志。完整语义见 [v0.2 规格](../docs/design/2026-10-03-v0.2-first-release-design.md) §5。本目录覆盖 **task 模式**与 **session 扩展**（见文末一节）；sub-run 扩展属于后续里程碑。
+宿主（Go 控制面）与 Worker 进程之间的协议：stdin 承载宿主控制消息，stdout 承载 Worker 事件，均为每行一个 JSON 对象（JSONL）；stderr 是自由格式日志。完整语义见 [v0.2 规格](../docs/design/2026-10-03-v0.2-first-release-design.md) §5。本目录覆盖 **task 模式**、**session 扩展**与 **sub-run 扩展**（见文末两节）。
 
 ## 三份契约
 
@@ -8,6 +8,7 @@
 |---|---|
 | `v1/task.schema.json`、`v1/control.schema.json`、`v1/event.schema.json` | task 模式单条消息的格式（JSON Schema 2020-12） |
 | `v1/session.schema.json` | session 模式单条消息的格式：宿主消息按 `#/$defs/host`，Worker 事件按 `#/$defs/worker` |
+| `v1/subrun.schema.json` | sub-run 扩展：五个 `subrun_*` 消息按 `#/$defs/host` / `#/$defs/worker`；其他消息中的扩展字段按 `#/$defs/fields` 与上面各 schema 叠加 |
 | 本文件 | 语义、顺序、错误码、提交规则 |
 | `fixtures/v1/` | 可执行样例：Go（`internal/protocol`）与 Python（`agentbox_worker`）都必须通过 |
 
@@ -131,3 +132,43 @@ task 模式的编解码器忽略 `result.session_state`（仅 session 模式有�
 - `fixtures/v1/session_messages.json`：格式同 `messages.json`，按 session 模式解码；`valid` 中每条重新编码后与原消息语义一致（键序与空白不计）。
 - `fixtures/v1/scenarios/session_*.jsonl`：每行一个 JSON 对象；带 `scenario` 键的行开始一个新场景（含 `description` 与 `expect`），其后带 `from` 的行是该场景按时间顺序的消息（`from` 为 `host` 或 `worker`）。宿主消息送入 `HostSent`，Worker 事件送入 `Accept`；`expect.stream = ok` 时另给最终阶段 `expect.phase`，`violation` 时给错误码与行号 `at`（从 0 起，只计消息行）。扩展名为 `.jsonl`，task 模式按 `scenarios/*.json` 读取的测试不受影响。
 - Python SDK 的 session 模式（M4 Plan 13）必须通过同一组 fixtures。
+
+## sub-run 扩展（M4 Plan 14）
+
+sub-run 是同一 task/attempt 内的并发研究单元（规格 §13）。扩展经协商启用（规格 §5.2）：宿主在 `init`（task 模式或会话 `init`）中携带 `extensions: ["subruns"]`，Worker 的 `ready` 必须回 `subruns: 1`；未请求时 `ready.subruns` 必须缺省或为 0。task 与 session 两种模式的编解码器都认识下表的消息；session 模式下 Worker 的三种 sub-run 事件另需 `attempt_id`，宿主的两种答复不带 `attempt_id`（针对当前 attempt）。
+
+**sub-run ID**：`^[a-z0-9][a-z0-9_-]{0,31}$` 且不等于 `root`。**summary**：≤ 4096 UTF-8 字节。
+
+| 方向 | type | 必需字段与规则 |
+|---|---|---|
+| Worker→宿主 | `subrun_start` | `subrun_id`、`parent_step_id`（非空，≤ 256 字节）、`deadline_ms`（1–3 600 000）；`budget_cap_micro?`（≥ 0；缺省表示 sub-run 层只做归属、不设上限）。同 ID 同定义重发是幂等的（恢复时使用） |
+| 宿主→Worker | `subrun_started` | `subrun_id`、`status ∈ {started, rejected}`；`rejected` 必须带 `code`（`subrun_limit`、`conflict`（同 ID 不同定义）、`subrun_closed`（该 ID 已是终态）、`invalid_field`、`retryable_error`（Store 暂时故障，以同一定义重试）），`started` 不得带 `code`。**`status`/`code` 是对规格 §5.4（只列 `subrun_id`）的补充** |
+| Worker→宿主 | `subrun_end` | `subrun_id`、`status ∈ {succeeded, failed, cancelled}`、`summary`；`succeeded` 只是提议，已提交 checkpoint 的 `subruns[]` 列出 `completed` 后才成立 |
+| Worker→宿主 | `subrun_cancel` | `subrun_id`、`reason`（非空自由文本）：编排层放弃 |
+| 宿主→Worker | `subrun_cancel_requested` | `subrun_id`、`reason ∈ {deadline, task_cancel, policy}`；Worker 取消后回 `subrun_end{cancelled}` |
+
+扩展字段：
+
+| 消息 | 字段 | 规则 |
+|---|---|---|
+| `init` | `extensions?` | 字符串数组，每项非空；未知扩展名忽略 |
+| `init.resume`、`task_start.resume` | `subruns?[]{subrun_id, status, result_ref?}` | 宿主裁定的状态 `started \| completed \| cancelled \| failed \| timed_out`；至多 4 项、ID 不重复；`completed` 必须带 sha256 `result_ref`，其他状态不得带 |
+| `ready` | `subruns?` | 0 或 1 |
+| `progress` | `subrun_id?` | 该进度所属 sub-run |
+| `checkpoint` | `subruns?[]{subrun_id, status, result_ref?}` | `status ∈ {started, completed, failed, cancelled}`；至多 4 项、ID 不重复；`completed` 必须带 sha256 `result_ref`，其他状态不得带；`result_ref` 与 `refs` 合计 ≤ 1024（`too_many_refs`），且同样须已授权到当前 scope（规格 §5.5 规则 2）；状态转换是否合法由宿主判定（`invalid_transition`） |
+| `result` | `subruns?[]{id, status, summary}` | `status ∈ {started, completed, failed, cancelled, timed_out}`；至多 4 项、ID 不重复；只供展示，不改变 sub-run 状态 |
+
+### 事件流
+
+`subrun_*`、带 `subrun_id` 的 `progress`、带 `subruns` 的 `checkpoint`/`result` 都是业务事件：`ready` 之前为 `before_ready`，终态提议之后为 `after_terminal`。另有（task 模式 `WorkerStream` 经 `NegotiateExtensions` 记录 init 的请求；`SessionStream` 从 `HostSent(init)` 读取）：
+
+- `extension_mismatch`：请求了 `subruns` 而 `ready.subruns ≠ 1`，或未请求却回 1。
+- `extension_not_negotiated`：未协商时出现上述任何 sub-run 事件或字段。
+- `subrun_unknown`：`subrun_end`、`subrun_cancel`、带 `subrun_id` 的 `progress` 引用本 attempt 中尚未 `subrun_start` 的 ID（session 模式下 `subrun_started`/`subrun_cancel_requested` 同理）。已启动的 ID 按 attempt 计：恢复后的 attempt 须先以同一定义重发 `subrun_start` 才能再引用该 sub-run；`checkpoint.subruns[]` 不受此限（可列出恢复前已结束的 sub-run）。`subrun_start` 发出后、`subrun_started` 到达前即可发送该 sub-run 的事件。
+- session 模式：没有当前 attempt 时宿主发 `subrun_started`/`subrun_cancel_requested` 为 `wrong_attempt`。
+
+### sub-run fixtures
+
+- `messages.json` 中名称含 `subrun` 的条目（及 `init_with_extensions_*`、`ready_with_subruns`、`progress_*subrun*`、`checkpoint_*subrun*`、`result_*subrun*`）。"ID 不重复" 无法用 JSON Schema 表达，相应非法条目以 `raw` 给出。
+- `scenarios/subrun_start_before_ack.json`、`subrun_late_complete_after_cancel.json`（E41）、`subrun_end_without_checkpoint.json`（规格 §5.11）：`expect.subruns` 是宿主侧期望的 sub-run 最终状态，供 runner 测试使用，协议层回放忽略它。
+- `scenarios/session_subruns.jsonl`：session 模式下的协商、`attempt_id` 与按 attempt 计的已启动 ID。
