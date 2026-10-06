@@ -34,6 +34,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/subrun"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
 )
 
@@ -388,6 +389,7 @@ type tcase struct {
 	init    *protocol.Init
 	onReady func()
 	hold    bool
+	subs    runner.SubrunHost       // 非 nil：Attempt.Subruns（init 须请求 subruns 扩展）
 	cancel  context.CancelCauseFunc // 本次 Run 的 ctx 的取消函数（run 开始时设置）
 }
 
@@ -424,7 +426,7 @@ func (c *tcase) run(t *testing.T, exitCode int, script ...step) (runner.Outcome,
 	defer cancel(nil)
 	c.cancel = cancel
 	out := r.Run(ctx, runner.Attempt{TaskID: c.taskID, AttemptID: c.att, AttemptNo: init.AttemptNo, EnvID: "env-" + c.taskID,
-		Init: *init, OutDir: c.outDir, OnReady: onReady}, controls)
+		Init: *init, OutDir: c.outDir, OnReady: onReady, Subruns: c.subs}, controls)
 	<-p.stdinDone // Run 返回前已关闭 stdin；等记录完它写出的全部消息
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -561,6 +563,8 @@ type scenario struct {
 		Stream    string `json:"stream"`
 		Violation string `json:"violation"`
 		At        int    `json:"at"`
+		// Subruns 是宿主侧期望的最终 sub-run 状态（sub-run 场景）。
+		Subruns map[string]string `json:"subruns"`
 	} `json:"expect"`
 	SDK *struct {
 		ExitCode int `json:"exit_code"`
@@ -600,14 +604,10 @@ func TestScenarioFixtures(t *testing.T) {
 		if err := json.Unmarshal(raw, &sc); err != nil {
 			t.Fatalf("%s: %v", ent.Name(), err)
 		}
-		// sub-run 场景需要 runner 的 sub-run 支持（M4 Plan 14 Task 6 加入；届时删除这一行排除）。
-		if strings.HasPrefix(ent.Name(), "subrun_") {
-			continue
-		}
 		ran++
 		t.Run(sc.Name, func(t *testing.T) { replay(t, e, sc) })
 	}
-	if ran < 22 {
+	if ran < 25 {
 		t.Fatalf("只回放了 %d 个场景", ran)
 	}
 }
@@ -643,6 +643,30 @@ func replay(t *testing.T, e *env, sc scenario) {
 		if _, err := e.store.CommitCheckpoint(ctx, runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: c.taskID},
 			CheckpointID: "cp-1", AttemptID: c.att, StepID: "s1", State: json.RawMessage(`{"n":1}`)}); err != nil {
 			t.Fatal(err)
+		}
+	}
+	var subs *pgSubruns
+	if strings.HasPrefix(sc.Name, "subrun_") {
+		subs = &pgSubruns{s: e.store}
+		c.subs = subs
+		// 转录中 sub-run 结果产物的哈希是占位值：写出真实文件（声明大小），并把占位哈希替换为其 sha256
+		const placeholder = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		for _, l := range sc.Lines {
+			m := decodeMap(t, l.Message)
+			if m["type"] != "artifact" || m["declared_sha256"] != placeholder {
+				continue
+			}
+			content := strings.Repeat("r", int(m["declared_size"].(float64)))
+			p := filepath.Join(c.outDir, m["path"].(string))
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			for j := range sc.Lines {
+				sc.Lines[j].Message = bytes.ReplaceAll(sc.Lines[j].Message, []byte(placeholder), []byte(sum(content)))
+			}
 		}
 	}
 
@@ -756,6 +780,14 @@ func replay(t *testing.T, e *env, sc scenario) {
 	}
 	if out.Exit.Code != exit || out.ExitErr != nil {
 		t.Fatalf("退出 = %+v %v，期望 %d", out.Exit, out.ExitErr, exit)
+	}
+	for id, want := range sc.Expect.Subruns {
+		got := subs.status(t, c.taskID, id)
+		// failed 是成功裁决对仍非终态者的收尾（not_completed_at_result，Plan 14 Task 7 的裁决事务）；runner 只保证
+		// 它不是 completed
+		if got != want && (want != string(subrun.Failed) || (got != string(subrun.Started) && got != string(subrun.EndProposed))) {
+			t.Fatalf("sub-run %s 状态 %s，期望 %s", id, got, want)
+		}
 	}
 }
 
@@ -1424,6 +1456,7 @@ func TestRunnerDeadlinesAndControls(t *testing.T) {
 // attempt 要经会话授予路径（Task 7）才能在真实 Store 中创建，runner 层只关心事件、checkpoint、产物与提议的
 // 记录。追加规则与 postgres 实现相同：同一 attempt 的 seq 严格递增、允许缺号，同序号必须同内容。
 type memStore struct {
+	subs        *memSubruns // 非 nil：CommitCheckpoint 同时应用 subruns[]
 	mu          sync.Mutex
 	events      map[string][]runner.WorkerEvent // attempt → 已追加的事件
 	taskAppends int                             // AppendWorkerEvents（task 模式）的调用次数
@@ -1497,6 +1530,11 @@ func (m *memStore) CommitCheckpoint(_ context.Context, c runner.Checkpoint) (run
 	key := c.Scope.ID + "/" + c.CheckpointID
 	seq, ok := m.cps[key]
 	if !ok {
+		if m.subs != nil { // 与 postgres 相同：subruns[] 的转换与 checkpoint 同一"事务"，非法转换时都不生效
+			if err := m.subs.applyCheckpoint(c.Scope.ID, c.Subruns); err != nil {
+				return runner.CommittedCheckpoint{}, err
+			}
+		}
 		m.commitSeq++
 		seq = m.commitSeq
 		m.cps[key] = seq
@@ -1665,6 +1703,7 @@ func sattempt(taskID, att string, no int64) runner.SessionAttempt {
 // sess 是一个由脚本驱动的会话 incarnation。
 type sess struct {
 	st  *memStore
+	bl  *blob.Local
 	ws  string
 	p   *fakeProc
 	r   *runner.Runner
@@ -1688,7 +1727,7 @@ func startSess(t *testing.T, opt runner.Options, drop func(map[string]any) bool,
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &sess{st: newMemStore(), ws: t.TempDir()}
+	s := &sess{st: newMemStore(), ws: t.TempDir(), bl: bl}
 	s.p = &fakeProc{script: script, drop: drop, readied: make(chan struct{})}
 	s.r = runner.New(s.st, bl, &fakeStarter{proc: s.p}, nil, opt)
 	is := runner.IncarnationSpec{SessionID: "s-1", IncarnationID: "inc-1", EnvID: "senv-1", WorkspaceRoot: s.ws,
@@ -2202,15 +2241,12 @@ func TestSessionScenarioFixtures(t *testing.T) {
 	}
 	ran := 0
 	for _, f := range files {
-		if filepath.Base(f) == "session_subruns.jsonl" { // sub-run 扩展：M4 Plan 14 Task 6 加入后删除这一行排除
-			continue
-		}
 		for _, sc := range loadSessScenarios(t, f) {
 			ran++
 			t.Run(sc.Name, func(t *testing.T) { replaySession(t, sc) })
 		}
 	}
-	if ran < 21 {
+	if ran < 25 {
 		t.Fatalf("只回放了 %d 个场景", ran)
 	}
 }
@@ -2220,6 +2256,10 @@ func replaySession(t *testing.T, sc sessScenario) {
 	opt.ReleaseTimeout = 2 * time.Second
 	violation := sc.Expect.Stream == "violation"
 	ws := t.TempDir()
+	bl, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// 场景的产物是占位哈希：写出真实文件，并把占位哈希替换为其 sha256
 	const placeholder = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -2239,6 +2279,20 @@ func replaySession(t *testing.T, sc sessScenario) {
 		for j := range sc.Lines {
 			sc.Lines[j].Message = bytes.ReplaceAll(sc.Lines[j].Message, []byte(placeholder), []byte(sum(content)))
 		}
+	}
+	// 没有对应产物的占位哈希（例如 checkpoint.subruns[].result_ref）：存入一个 blob 并替换为其 sha256
+	for _, l := range sc.Lines {
+		if !bytes.Contains(l.Message, []byte(placeholder)) {
+			continue
+		}
+		ref, err := bl.Put(context.Background(), strings.NewReader("sub-run result"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for j := range sc.Lines {
+			sc.Lines[j].Message = bytes.ReplaceAll(sc.Lines[j].Message, []byte(placeholder), []byte(ref.SHA256))
+		}
+		break
 	}
 
 	// 丢弃：task_outcome_lost 中第一条 task_outcome 与由第一次查询触发的重发都"在传输中丢失"
@@ -2296,6 +2350,10 @@ func replaySession(t *testing.T, sc sessScenario) {
 			t.Fatal(err)
 		}
 		script = append(script, w(compact.String()))
+		if m["type"] == "subrun_start" && !(violation && i >= sc.Expect.At) && !repliedInTranscript(t, sc.Lines[i+1:], m["subrun_id"]) {
+			// 宿主总会答复 subrun_start；转录省略了这条答复（场景只关心之后的行）时由脚本收下它
+			script = append(script, h())
+		}
 	}
 	script = append(script, untilEnd())
 
@@ -2303,11 +2361,8 @@ func replaySession(t *testing.T, sc sessScenario) {
 	if err := json.Unmarshal(sc.Lines[0].Message, &initMsg); err != nil {
 		t.Fatal(err)
 	}
-	bl, err := blob.NewLocal(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
 	st := newMemStore()
+	st.subs = newMemSubruns()
 	p := &fakeProc{script: script, drop: drop, readied: make(chan struct{})}
 	r := runner.New(st, bl, &fakeStarter{proc: p}, nil, opt)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -2328,7 +2383,7 @@ func replaySession(t *testing.T, sc sessScenario) {
 	})
 
 	inc, err = r.StartIncarnation(ctx, runner.IncarnationSpec{SessionID: initMsg.SessionID, IncarnationID: initMsg.IncarnationID,
-		EnvID: "senv", WorkspaceRoot: ws, Config: initMsg.Config, Resume: initMsg.SessionResume})
+		EnvID: "senv", WorkspaceRoot: ws, Config: initMsg.Config, Resume: initMsg.SessionResume, Extensions: initMsg.Extensions})
 	if err != nil {
 		inc = nil
 		var se *runner.StartError
@@ -2376,7 +2431,7 @@ func replaySession(t *testing.T, sc sessScenario) {
 			hostBefore++
 		}
 		switch m["type"] {
-		case "init", "checkpoint_result", "artifact_result":
+		case "init", "checkpoint_result", "artifact_result", "subrun_started", "subrun_cancel_requested":
 		case "task_start":
 			var ts protocol.TaskStart
 			if err := json.Unmarshal(l.Message, &ts); err != nil {
@@ -2386,6 +2441,7 @@ func replaySession(t *testing.T, sc sessScenario) {
 				Init: protocol.Init{Config: ts.Config, ConfigVersion: ts.ConfigVersion, BudgetLimits: ts.BudgetLimits,
 					InputRefs: ts.InputRefs, Traceparent: ts.Traceparent, OutDir: ts.OutDir, Resume: ts.Resume}},
 				BaseSessionCheckpointID: ts.BaseSessionCheckpointID, RestoredFromTaskID: ts.RestoredFromTaskID, Carryover: ts.Carryover}
+			a.Subruns = st.subs // 未协商时不使用
 			if ts.Directive != nil {
 				if a.Directive, err = json.Marshal(ts.Directive); err != nil {
 					t.Fatal(err)
@@ -2594,4 +2650,567 @@ func waitScript(t *testing.T, p *fakeProc, checkErr bool) []map[string]any {
 		t.Fatalf("脚本: %v（宿主消息 %v）", p.scriptErr, p.all)
 	}
 	return append([]map[string]any(nil), p.got...)
+}
+
+// ==== M4 Plan 14 Task 6：sub-run 事件、deadline 与取消超时 ====
+
+// pgSubruns 以真实 Store 实现 runner.SubrunHost；CancelGateway 只记录调用（Gateway 的按 sub-run 取消由 Task 7 装配）。
+type pgSubruns struct {
+	s          *postgres.Store
+	startFault func(n int) error // 返回非 nil 错误：第 n 次 Start 不写入并返回该错误
+
+	mu      sync.Mutex
+	starts  int
+	cancels []string
+}
+
+func (h *pgSubruns) Start(ctx context.Context, taskID, attemptID, id string, d subrun.Definition) (subrun.Record, error) {
+	h.mu.Lock()
+	h.starts++
+	n := h.starts
+	h.mu.Unlock()
+	if h.startFault != nil {
+		if err := h.startFault(n); err != nil {
+			return subrun.Record{}, err
+		}
+	}
+	return h.s.StartSubrun(ctx, taskID, attemptID, id, d)
+}
+
+func (h *pgSubruns) ProposeEnd(ctx context.Context, taskID, attemptID, id, status, summary string) (subrun.Record, error) {
+	return h.s.ProposeSubrunEnd(ctx, taskID, attemptID, id, status, summary)
+}
+
+func (h *pgSubruns) RequestCancel(ctx context.Context, taskID, id, reason string) (subrun.Record, error) {
+	return h.s.RequestSubrunCancel(ctx, taskID, id, reason)
+}
+
+func (h *pgSubruns) List(ctx context.Context, taskID string) ([]subrun.Record, error) {
+	return h.s.ListSubruns(ctx, taskID)
+}
+
+func (h *pgSubruns) CancelGateway(_, _, id string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cancels = append(h.cancels, id)
+}
+
+func (h *pgSubruns) cancelled() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.cancels...)
+}
+
+func (h *pgSubruns) status(t *testing.T, taskID, id string) string {
+	t.Helper()
+	recs, err := h.List(context.Background(), taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range recs {
+		if r.SubrunID == id {
+			return string(r.Status)
+		}
+	}
+	return ""
+}
+
+// memSubruns 是内存中的 SubrunHost（session 模式测试），转换规则取 subrun.Next，错误与 postgres 实现同类。
+type memSubruns struct {
+	mu      sync.Mutex
+	recs    map[string]*subrun.Record // task/id
+	cancels []string
+}
+
+func newMemSubruns() *memSubruns { return &memSubruns{recs: map[string]*subrun.Record{}} }
+
+func rejected(code, detail string) error {
+	return &persistence.RejectedError{Code: code, Detail: detail}
+}
+
+func (m *memSubruns) Start(_ context.Context, taskID, attemptID, id string, d subrun.Definition) (subrun.Record, error) {
+	if err := d.Validate(); err != nil {
+		return subrun.Record{}, fmt.Errorf("%w: %v", persistence.ErrInvalid, err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r, ok := m.recs[taskID+"/"+id]; ok {
+		switch {
+		case !bytes.Equal(r.DefinitionHash, d.Hash()):
+			return subrun.Record{}, rejected(persistence.CodeConflict, id)
+		case r.Status.Terminal():
+			return subrun.Record{}, rejected(persistence.CodeSubrunClosed, id)
+		}
+		return *r, nil
+	}
+	n := 0
+	for k := range m.recs {
+		if strings.HasPrefix(k, taskID+"/") {
+			n++
+		}
+	}
+	if n >= subrun.MaxPerTask {
+		return subrun.Record{}, rejected(persistence.CodeSubrunLimit, id)
+	}
+	now := time.Now()
+	r := &subrun.Record{TaskID: taskID, SubrunID: id, ParentStepID: d.ParentStepID, DefinitionHash: d.Hash(), Status: subrun.Started,
+		BoundAttemptID: attemptID, DeadlineAt: now.Add(time.Duration(d.DeadlineMS) * time.Millisecond), BudgetCapMicro: d.BudgetCapMicro,
+		StartedAt: now}
+	m.recs[taskID+"/"+id] = r
+	return *r, nil
+}
+
+func (m *memSubruns) ProposeEnd(_ context.Context, taskID, _, id, status, _ string) (subrun.Record, error) {
+	ev := map[string]subrun.Event{protocol.SubrunEndSucceeded: subrun.EvEndSucceeded, protocol.SubrunEndFailed: subrun.EvEndFailed,
+		protocol.SubrunEndCancelled: subrun.EvEndCancelled}[status]
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.recs[taskID+"/"+id]
+	if !ok {
+		return subrun.Record{}, fmt.Errorf("%w: sub-run %s", persistence.ErrNotFound, id)
+	}
+	to, err := subrun.Next(r.Status, ev, r.CancelReason)
+	if err != nil {
+		return subrun.Record{}, rejected(persistence.CodeInvalidTransition, err.Error())
+	}
+	if (to == subrun.Cancelled || to == subrun.TimedOut) && r.CancelReason == "" {
+		r.CancelReason = subrun.ReasonOrchestrator
+	}
+	r.Status = to
+	return *r, nil
+}
+
+func (m *memSubruns) RequestCancel(_ context.Context, taskID, id, reason string) (subrun.Record, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.recs[taskID+"/"+id]
+	if !ok {
+		return subrun.Record{}, fmt.Errorf("%w: sub-run %s", persistence.ErrNotFound, id)
+	}
+	if r.Status == subrun.CancelRequested || r.Status.Terminal() {
+		return *r, nil
+	}
+	r.Status, r.CancelReason = subrun.CancelRequested, reason
+	return *r, nil
+}
+
+func (m *memSubruns) List(_ context.Context, taskID string) ([]subrun.Record, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []subrun.Record
+	for k, r := range m.recs {
+		if strings.HasPrefix(k, taskID+"/") {
+			out = append(out, *r)
+		}
+	}
+	return out, nil
+}
+
+func (m *memSubruns) CancelGateway(_, _, id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cancels = append(m.cancels, id)
+}
+
+func (m *memSubruns) cancelled() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.cancels...)
+}
+
+func (m *memSubruns) status(taskID, id string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r, ok := m.recs[taskID+"/"+id]; ok {
+		return string(r.Status)
+	}
+	return ""
+}
+
+// applyCheckpoint 全部或全不应用 checkpoint 的 subruns[]（与 postgres 的 applyCheckpointSubrunsTx 同一规则）。
+func (m *memSubruns) applyCheckpoint(taskID string, entries []protocol.CheckpointSubrun) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	next := map[string]subrun.Record{}
+	for _, e := range entries {
+		key := taskID + "/" + e.SubrunID
+		r, ok := m.recs[key]
+		if !ok {
+			return rejected(persistence.CodeInvalidTransition, "unknown "+e.SubrunID)
+		}
+		ev := map[string]subrun.Event{protocol.CheckpointSubrunStarted: subrun.EvCheckpointStarted,
+			protocol.CheckpointSubrunCompleted: subrun.EvCheckpointCompleted, protocol.CheckpointSubrunFailed: subrun.EvCheckpointFailed,
+			protocol.CheckpointSubrunCancelled: subrun.EvCheckpointCancelled}[e.Status]
+		to, err := subrun.Next(r.Status, ev, r.CancelReason)
+		if err != nil {
+			return rejected(persistence.CodeInvalidTransition, err.Error())
+		}
+		rr := *r
+		rr.Status = to
+		if to == subrun.Completed {
+			rr.ResultRef = e.ResultRef
+		}
+		next[key] = rr
+	}
+	for k, r := range next {
+		*m.recs[k] = r
+	}
+	return nil
+}
+
+var (
+	_ runner.SubrunHost = (*pgSubruns)(nil)
+	_ runner.SubrunHost = (*memSubruns)(nil)
+)
+
+// repliedInTranscript：转录在下一个 task_start 之前含有对 subrun_start(id) 的 subrun_started 答复。
+func repliedInTranscript(t *testing.T, rest []sessLine, id any) bool {
+	t.Helper()
+	for _, l := range rest {
+		if l.From != "host" {
+			continue
+		}
+		m := decodeMap(t, l.Message)
+		switch {
+		case m["type"] == "task_start":
+			return false
+		case m["type"] == "subrun_started" && m["subrun_id"] == id:
+			return true
+		}
+	}
+	return false
+}
+
+func subInit(c *tcase) *protocol.Init {
+	return &protocol.Init{Type: protocol.TypeInit, Bootstrap: 1, ProtocolVersions: []int64{1}, Mode: protocol.ModeTask,
+		TaskID: c.taskID, AttemptID: c.att, AttemptNo: 1, OutDir: "/workspace/out/" + c.att, Extensions: []string{protocol.ExtensionSubruns}}
+}
+
+func subReady(seq int) map[string]any {
+	m := ready(seq)
+	m["subruns"] = 1
+	return m
+}
+
+func subStart(seq int, id string, deadlineMs int) map[string]any {
+	return ev("subrun_start", seq, "subrun_id", id, "parent_step_id", "research", "deadline_ms", deadlineMs)
+}
+
+func subEnd(seq int, id, status string) map[string]any {
+	return ev("subrun_end", seq, "subrun_id", id, "status", status, "summary", "s-"+id)
+}
+
+func (e *env) newSubCase(t *testing.T, taskID string, opt runner.Options) (*tcase, *pgSubruns) {
+	t.Helper()
+	c := e.newCase(t, taskID)
+	hs := &pgSubruns{s: e.store}
+	c.subs, c.init, c.opt = hs, subInit(c), opt
+	return c, hs
+}
+
+func TestRunnerSubruns(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	slow := runner.Options{SubrunCancelTimeout: 5 * time.Second}
+	fast := runner.Options{SubrunCancelTimeout: 100 * time.Millisecond}
+
+	expectClass := func(t *testing.T, out runner.Outcome, class, retry, kill string, killed bool) {
+		t.Helper()
+		if out.Class != class || out.Retry != retry || out.PlatformKill != kill || out.PlatformKilled != killed {
+			t.Fatalf("结果 = %s/%q kill=%q killed=%v（violation %q），期望 %s/%q kill=%q killed=%v",
+				out.Class, out.Retry, out.PlatformKill, out.PlatformKilled, out.Violation, class, retry, kill, killed)
+		}
+	}
+	isCancelRequested := func(t *testing.T, m map[string]any, id, reason string) {
+		t.Helper()
+		if m["type"] != "subrun_cancel_requested" || m["subrun_id"] != id || m["reason"] != reason {
+			t.Fatalf("宿主消息 %v，期望 subrun_cancel_requested{%s, %s}", m, id, reason)
+		}
+	}
+
+	t.Run("fifth_start_rejected_subrun_limit", func(t *testing.T) {
+		c, _ := e.newSubCase(t, "sub-limit", slow)
+		script := []step{w(subReady(1))}
+		for i := 1; i <= 5; i++ {
+			script = append(script, w(subStart(1+i, fmt.Sprintf("st%d", i), 600000)), h())
+		}
+		script = append(script, w(result(7)))
+		out, p := c.run(t, 0, script...)
+		noViolation(t, out)
+		for i := 0; i < 4; i++ {
+			reply(t, p.got[i], "subrun_started", "started", "")
+			if p.got[i]["subrun_id"] != fmt.Sprintf("st%d", i+1) {
+				t.Fatalf("答复 %v", p.got[i])
+			}
+		}
+		reply(t, p.got[4], "subrun_started", "rejected", "subrun_limit")
+		expectClass(t, out, runner.ClassSucceeded, "", "", false)
+	})
+
+	t.Run("store_failure_rejected_retryable_then_started", func(t *testing.T) {
+		c, hs := e.newSubCase(t, "sub-retry", slow)
+		hs.startFault = func(n int) error {
+			if n == 1 {
+				return persistence.ErrUnavailable
+			}
+			return nil
+		}
+		out, p := c.run(t, 0, w(subReady(1)), w(subStart(2, "st1", 600000)), h(), w(subStart(3, "st1", 600000)), h(), w(result(4)))
+		noViolation(t, out)
+		reply(t, p.got[0], "subrun_started", "rejected", "retryable_error")
+		reply(t, p.got[1], "subrun_started", "started", "")
+		if got := hs.status(t, c.taskID, "st1"); got != "started" {
+			t.Fatalf("状态 %s", got)
+		}
+	})
+
+	t.Run("deadline_cancel_requested_then_end_cancelled", func(t *testing.T) {
+		c, hs := e.newSubCase(t, "sub-deadline", slow)
+		out, p := c.run(t, 0, w(subReady(1)), w(subStart(2, "st1", 50)), h(), h(), w(subEnd(3, "st1", "cancelled")), w(result(4)))
+		noViolation(t, out)
+		expectClass(t, out, runner.ClassSucceeded, "", "", false)
+		reply(t, p.got[0], "subrun_started", "started", "")
+		isCancelRequested(t, p.got[1], "st1", "deadline")
+		if got := hs.cancelled(); !reflect.DeepEqual(got, []string{"st1"}) {
+			t.Fatalf("CancelGateway %v", got)
+		}
+		if got := hs.status(t, c.taskID, "st1"); got != "timed_out" {
+			t.Fatalf("状态 %s，期望 timed_out", got)
+		}
+		if wm := c.watermark(t); wm != 4 {
+			t.Fatalf("水位 %d", wm)
+		}
+	})
+
+	t.Run("cancel_timeout_kills_attempt_e44", func(t *testing.T) {
+		c, hs := e.newSubCase(t, "sub-e44", fast)
+		out, p := c.run(t, 0, w(subReady(1)), w(subStart(2, "st1", 50)), h(), h(), untilKilled())
+		isCancelRequested(t, p.got[1], "st1", "deadline")
+		expectClass(t, out, runner.ClassSubrunCancelTimeout, runner.RetryFault, runner.KillSubrunCancelTimeout, true)
+		if got := hs.status(t, c.taskID, "st1"); got != "cancel_requested" {
+			t.Fatalf("状态 %s", got)
+		}
+	})
+
+	t.Run("succeeded_after_cancel_requested_is_not_violation", func(t *testing.T) {
+		c, hs := e.newSubCase(t, "sub-race", slow)
+		out, _ := c.run(t, 0, w(subReady(1)), w(subStart(2, "st1", 50)), h(), h(),
+			w(subEnd(3, "st1", "succeeded")), w(subEnd(4, "st1", "cancelled")), w(result(5)))
+		noViolation(t, out)
+		expectClass(t, out, runner.ClassSucceeded, "", "", false)
+		if got := hs.status(t, c.taskID, "st1"); got != "timed_out" {
+			t.Fatalf("状态 %s", got)
+		}
+	})
+
+	t.Run("succeeded_after_cancel_requested_does_not_stop_cancel_timer", func(t *testing.T) {
+		c, _ := e.newSubCase(t, "sub-race-timeout", fast)
+		out, _ := c.run(t, 0, w(subReady(1)), w(subStart(2, "st1", 50)), h(), h(), w(subEnd(3, "st1", "succeeded")), untilKilled())
+		expectClass(t, out, runner.ClassSubrunCancelTimeout, runner.RetryFault, runner.KillSubrunCancelTimeout, true)
+	})
+
+	t.Run("worker_cancel_then_end_cancelled", func(t *testing.T) {
+		c, hs := e.newSubCase(t, "sub-wcancel", fast)
+		out, p := c.run(t, 0, w(subReady(1)), w(subStart(2, "st1", 600000)), h(),
+			w(ev("subrun_cancel", 3, "subrun_id", "st1", "reason", "enough sources")), w(subEnd(4, "st1", "cancelled")), w(result(5)))
+		noViolation(t, out)
+		expectClass(t, out, runner.ClassSucceeded, "", "", false)
+		if len(p.all) != 1 { // Worker 发起的取消不回发 subrun_cancel_requested
+			t.Fatalf("宿主消息 %v", p.all)
+		}
+		if got := hs.cancelled(); !reflect.DeepEqual(got, []string{"st1"}) {
+			t.Fatalf("CancelGateway %v", got)
+		}
+		if got := hs.status(t, c.taskID, "st1"); got != "cancelled" {
+			t.Fatalf("状态 %s", got)
+		}
+	})
+
+	t.Run("worker_cancel_without_end_kills", func(t *testing.T) {
+		c, _ := e.newSubCase(t, "sub-wcancel-timeout", fast)
+		out, _ := c.run(t, 0, w(subReady(1)), w(subStart(2, "st1", 600000)), h(),
+			w(ev("subrun_cancel", 3, "subrun_id", "st1", "reason", "enough sources")), untilKilled())
+		expectClass(t, out, runner.ClassSubrunCancelTimeout, runner.RetryFault, runner.KillSubrunCancelTimeout, true)
+	})
+
+	t.Run("terminal_proposal_stops_cancel_timer", func(t *testing.T) {
+		c, _ := e.newSubCase(t, "sub-proposal-stops", fast)
+		out, p := c.run(t, 0, w(subReady(1)), w(subStart(2, "st1", 50)), h(), h(), w(result(3)), pause(300*time.Millisecond))
+		isCancelRequested(t, p.got[1], "st1", "deadline")
+		expectClass(t, out, runner.ClassSucceeded, "", "", false)
+	})
+
+	t.Run("checkpoint_completes_subrun_and_result_keeps_subruns", func(t *testing.T) {
+		c, hs := e.newSubCase(t, "sub-checkpoint", slow)
+		content := `{"summary":"s","sources":[],"partial":false}`
+		if err := os.MkdirAll(filepath.Join(c.outDir, "subruns"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		sha := c.write(t, "subruns/st1.json", content)
+		missing := strings.Repeat("d", 64)
+		cp := func(seq int, id, ref string) map[string]any {
+			return checkpoint(seq, id, "state", map[string]any{"n": seq}, "refs", []string{},
+				"subruns", []map[string]any{{"subrun_id": "st1", "status": "completed", "result_ref": ref}})
+		}
+		res := result(7)
+		res["subruns"] = []map[string]any{{"id": "st1", "status": "completed", "summary": "s"}}
+		out, p := c.run(t, 0, w(subReady(1)), w(subStart(2, "st1", 600000)), h(),
+			w(artifact(3, "subrun-st1", "subruns/st1.json", sha, len(content))), h(),
+			w(subEnd(4, "st1", "succeeded")), w(cp(5, "cp-1", sha)), h(), w(cp(6, "cp-2", missing)), h(), w(res))
+		noViolation(t, out)
+		reply(t, p.got[1], "artifact_result", "saved", "")
+		reply(t, p.got[2], "checkpoint_result", "committed", "")
+		reply(t, p.got[3], "checkpoint_result", "rejected", "missing_ref") // result_ref 与 refs 一样须已保存
+		if got := hs.status(t, c.taskID, "st1"); got != "completed" {
+			t.Fatalf("状态 %s", got)
+		}
+		if got := c.latest(t); got != "cp-1" {
+			t.Fatalf("最新 checkpoint %s", got)
+		}
+		var payload struct {
+			Subruns []protocol.ResultSubrun `json:"subruns"`
+		}
+		if err := json.Unmarshal(out.ResultPayload, &payload); err != nil ||
+			!reflect.DeepEqual(payload.Subruns, []protocol.ResultSubrun{{ID: "st1", Status: "completed", Summary: "s"}}) {
+			t.Fatalf("提议内容未原样保存 result.subruns: %s (%v)", out.ResultPayload, err)
+		}
+	})
+
+	t.Run("extension_mismatch_requested_but_not_confirmed", func(t *testing.T) {
+		c, _ := e.newSubCase(t, "sub-mismatch-1", slow)
+		out, _ := c.run(t, 0, w(ready(1)))
+		if out.Violation != runner.ViolationExtensionMismatch || out.Class != runner.ClassProtocolMismatch || out.Retry != "" {
+			t.Fatalf("violation %q 分类 %s/%q", out.Violation, out.Class, out.Retry)
+		}
+	})
+
+	t.Run("extension_mismatch_confirmed_but_not_requested", func(t *testing.T) {
+		c := e.newCase(t, "sub-mismatch-2")
+		out, _ := c.run(t, 0, w(subReady(1)))
+		if out.Violation != runner.ViolationExtensionMismatch {
+			t.Fatalf("violation %q", out.Violation)
+		}
+	})
+
+	t.Run("not_negotiated", func(t *testing.T) {
+		c := e.newCase(t, "sub-not-negotiated")
+		out, _ := c.run(t, 0, w(ready(1)), w(subStart(2, "st1", 600000)))
+		if out.Violation != runner.ViolationExtensionNotNegotiated || out.Retry != "" {
+			t.Fatalf("violation %q 分类 %s/%q", out.Violation, out.Class, out.Retry)
+		}
+		if wm := c.watermark(t); wm != 1 {
+			t.Fatalf("水位 %d", wm)
+		}
+	})
+
+	t.Run("requested_without_host_fails_before_start", func(t *testing.T) {
+		c := e.newCase(t, "sub-no-host")
+		r := runner.New(c.fs, e.blobs, &fakeStarter{proc: &fakeProc{}}, nil, runner.Options{})
+		out := r.Run(ctx, runner.Attempt{TaskID: c.taskID, AttemptID: c.att, AttemptNo: 1, EnvID: "env", Init: *subInit(c), OutDir: c.outDir}, nil)
+		if out.ExitErr == nil || out.Class != runner.ClassCreateFailedEnv {
+			t.Fatalf("结果 %s %v", out.Class, out.ExitErr)
+		}
+	})
+}
+
+func TestClassifySubruns(t *testing.T) {
+	if c, r := runner.Classify(runner.ClassifyInput{PlatformKill: runner.KillSubrunCancelTimeout,
+		Exit: provider.ExitStatus{Code: -1, Signal: 9}}); c != runner.ClassSubrunCancelTimeout || r != runner.RetryFault {
+		t.Fatalf("subrun_cancel_timeout → %s/%q", c, r)
+	}
+	if c, r := runner.Classify(runner.ClassifyInput{Violation: runner.ViolationExtensionMismatch}); c != runner.ClassProtocolMismatch || r != "" {
+		t.Fatalf("extension_mismatch → %s/%q", c, r)
+	}
+	for _, v := range []string{runner.ViolationExtensionNotNegotiated, runner.ViolationSubrunUnknown} {
+		if c, r := runner.Classify(runner.ClassifyInput{Violation: v}); c != runner.ClassProtocolViolation || r != "" {
+			t.Fatalf("%s → %s/%q", v, c, r)
+		}
+	}
+}
+
+func TestSessionSubruns(t *testing.T) {
+	opt := sessOptions()
+	opt.SubrunCancelTimeout = 100 * time.Millisecond
+	ext := func(is *runner.IncarnationSpec) { is.Extensions = []string{protocol.ExtensionSubruns} }
+	ready1 := func() map[string]any {
+		m := sready(1)
+		m["subruns"] = 1
+		return m
+	}
+	start := func(seq int, id string, ms int) map[string]any {
+		return aev("subrun_start", seq, "a-1", "subrun_id", id, "parent_step_id", "research", "deadline_ms", ms)
+	}
+	end := func(seq int, id, status string) map[string]any {
+		return aev("subrun_end", seq, "a-1", "subrun_id", id, "status", status, "summary", "")
+	}
+	attempt := func(hs runner.SubrunHost) runner.SessionAttempt {
+		a := sattempt("t-1", "a-1", 1)
+		a.Subruns = hs
+		return a
+	}
+
+	t.Run("deadline_cancel_timeout_kills_incarnation", func(t *testing.T) {
+		hs := newMemSubruns()
+		s := mustStartSess(t, opt, nil, ext, w(ready1()), h(), w(aev("task_accepted", 2, "a-1")), w(start(3, "st1", 50)), h(), h(), untilEnd())
+		out := s.run(t, attempt(hs))
+		if out.Class != runner.ClassSubrunCancelTimeout || out.Retry != runner.RetryFault || out.PlatformKill != runner.KillSubrunCancelTimeout {
+			t.Fatalf("结果 %s/%q kill=%q violation=%q", out.Class, out.Retry, out.PlatformKill, out.Violation)
+		}
+		got := s.got(t)
+		if len(got) != 3 || got[1]["type"] != "subrun_started" || got[2]["type"] != "subrun_cancel_requested" ||
+			got[2]["reason"] != "deadline" || got[2]["attempt_id"] != nil {
+			t.Fatalf("宿主消息 %v", got)
+		}
+		if got := hs.cancelled(); !reflect.DeepEqual(got, []string{"st1"}) {
+			t.Fatalf("CancelGateway %v", got)
+		}
+	})
+
+	t.Run("deadline_then_end_cancelled_released", func(t *testing.T) {
+		hs := newMemSubruns()
+		s := mustStartSess(t, opt, nil, ext, w(ready1()), h(), w(aev("task_accepted", 2, "a-1")), w(start(3, "st1", 50)), h(), h(),
+			w(end(4, "st1", "cancelled")), w(sresult(5, "a-1", "")), h(), w(aev("task_released", 6, "a-1")), untilEnd())
+		out := s.run(t, attempt(hs))
+		noViolation(t, out)
+		if out.Class != runner.ClassSucceeded || s.killed() {
+			t.Fatalf("结果 %s killed=%v", out.Class, s.killed())
+		}
+		if rr := s.release(t, "a-1", protocol.VerdictSucceeded, ""); !rr.Released {
+			t.Fatalf("释放失败: %+v", rr)
+		}
+		if got := hs.status("t-1", "st1"); got != "timed_out" {
+			t.Fatalf("状态 %s", got)
+		}
+	})
+
+	t.Run("late_complete_after_cancel_rejected_e41", func(t *testing.T) {
+		hs := newMemSubruns()
+		ref := sum("sub-run result")
+		cp := aev("checkpoint", 4, "a-1", "checkpoint_id", "cp-1", "scope", "task", "step_id", "research", "state", map[string]any{},
+			"refs", []string{}, "subruns", []map[string]any{{"subrun_id": "st1", "status": "completed", "result_ref": ref}})
+		s := mustStartSess(t, opt, nil, ext, w(ready1()), h(), w(aev("task_accepted", 2, "a-1")), w(start(3, "st1", 50)), h(), h(),
+			w(cp), h(), w(end(5, "st1", "cancelled")), w(sresult(6, "a-1", "")), untilEnd())
+		s.st.subs = hs
+		if _, err := s.bl.Put(context.Background(), strings.NewReader("sub-run result")); err != nil {
+			t.Fatal(err)
+		}
+		out := s.run(t, attempt(hs))
+		noViolation(t, out)
+		got := s.got(t)
+		reply(t, got[3], "checkpoint_result", "rejected", "invalid_transition")
+		if got[3]["attempt_id"] != "a-1" {
+			t.Fatalf("checkpoint_result %v", got[3])
+		}
+		if got := hs.status("t-1", "st1"); got != "timed_out" {
+			t.Fatalf("状态 %s", got)
+		}
+	})
+
+	t.Run("requested_without_host_fails", func(t *testing.T) {
+		s := mustStartSess(t, opt, nil, ext, w(ready1()), untilEnd())
+		out := s.run(t, attempt(nil))
+		if out.ExitErr == nil {
+			t.Fatalf("未提供 SubrunHost 时 RunTask 应失败: %+v", out)
+		}
+	})
 }

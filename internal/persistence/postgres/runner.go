@@ -11,7 +11,9 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/subrun"
 )
 
 var _ runner.Store = (*Store)(nil)
@@ -110,15 +112,33 @@ func (s *Store) WorkerEventWatermark(ctx context.Context, attemptID string) (run
 	return out, err
 }
 
+// 带 subruns[] 时其 JSON 作为第 6 段参与哈希；没有时公式与 M4 之前相同（已有 checkpoint 的重放仍是同一内容）。
 func checkpointHash(c runner.Checkpoint) []byte {
-	return contentHash([]byte(c.AttemptID), []byte(c.StepID), c.State, []byte(c.StateRef), []byte(strings.Join(c.Refs, "\n")))
+	parts := [][]byte{[]byte(c.AttemptID), []byte(c.StepID), c.State, []byte(c.StateRef), []byte(strings.Join(c.Refs, "\n"))}
+	if len(c.Subruns) > 0 {
+		parts = append(parts, subrunsJSON(c.Subruns))
+	}
+	return contentHash(parts...)
+}
+
+// subrunsJSON 是 checkpoints.subruns_json 的内容（没有时为 []）。
+func subrunsJSON(s []protocol.CheckpointSubrun) []byte {
+	if s == nil {
+		s = []protocol.CheckpointSubrun{}
+	}
+	b, err := json.Marshal(s)
+	if err != nil { // 只含字符串
+		panic(fmt.Sprintf("postgres: 编码 subruns: %v", err))
+	}
+	return b
 }
 
 // CommitCheckpoint 以 (scope, checkpoint_id) 为身份提交 checkpoint（实现 runner.Store）。
 // 已存在的 ID 只比较内容并返回原结果（规格 §5.5 第 3 条）；新 checkpoint 在同一事务内检查
 // fencing（提交者是当前 attempt 且访问有效）与引用授权（refs、state_ref 已保存并授权到当前 scope），
 // 不通过时指针与事件都不改变。commit_seq 来自 task_progress 的行锁（规格 §7.2）。
-// 锁顺序：tasks → task_progress → task_event_seq → attempt_access。
+// subruns[] 在同一事务中按状态机转换（applyCheckpointSubrunsTx），不允许时整体回滚为 invalid_transition。
+// 锁顺序：tasks → task_progress → task_event_seq → subruns → attempt_access。
 func (s *Store) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runner.CommittedCheckpoint, error) {
 	if c.Scope.Kind != "task" || c.Scope.ID == "" {
 		return runner.CommittedCheckpoint{}, invalidf("M1 只支持 task 范围的 checkpoint，得到 %+v", c.Scope)
@@ -154,9 +174,10 @@ func (s *Store) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runn
 		}
 		refs, _ := json.Marshal(nonNil(c.Refs))
 		if _, err := tx.Exec(ctx, `INSERT INTO checkpoints (scope_kind, scope_id, checkpoint_id, commit_seq, attempt_id, step_id,
-				content_hash, state_inline, state_ref, refs_json)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10)`,
-			c.Scope.Kind, c.Scope.ID, c.CheckpointID, latest+1, c.AttemptID, c.StepID, hash, nullJSON(c.State), c.StateRef, refs); err != nil {
+				content_hash, state_inline, state_ref, refs_json, subruns_json)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10, $11)`,
+			c.Scope.Kind, c.Scope.ID, c.CheckpointID, latest+1, c.AttemptID, c.StepID, hash, nullJSON(c.State), c.StateRef, refs,
+			subrunsJSON(c.Subruns)); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, "UPDATE task_progress SET latest_checkpoint_id = $2, latest_commit_seq = $3 WHERE task_id = $1",
@@ -164,6 +185,10 @@ func (s *Store) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runn
 			return err
 		}
 		if err := lockEventSeq(ctx, tx, c.Scope.ID); err != nil {
+			return err
+		}
+		// subruns[] 与 checkpoint 同一事务（锁顺序 task_event_seq → subruns）：非法转换回滚整个 checkpoint（E41）
+		if err := applyCheckpointSubrunsTx(ctx, tx, c.Scope.ID, c.Subruns); err != nil {
 			return err
 		}
 		payload, _ := json.Marshal(map[string]any{"checkpoint_id": c.CheckpointID, "commit_seq": latest + 1, "step_id": c.StepID})
@@ -208,6 +233,11 @@ func authorizeRefs(ctx context.Context, tx pgx.Tx, c runner.Checkpoint) error {
 	refs := append([]string(nil), c.Refs...)
 	if c.StateRef != "" {
 		refs = append(refs, c.StateRef)
+	}
+	for _, e := range c.Subruns { // subruns[].result_ref 与 refs 同一授权规则（规格 §5.5 第 2 条）
+		if e.ResultRef != "" {
+			refs = append(refs, e.ResultRef)
+		}
 	}
 	if len(refs) == 0 {
 		return nil
@@ -525,9 +555,20 @@ func insertWorkerEvent(ctx context.Context, tx pgx.Tx, taskID, attemptID string,
 		ts = e.TS
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO events (task_id, task_seq, event_key, attempt_id, worker_seq, source, type, payload, content_hash,
-			ts, session_id, session_seq)
-		VALUES ($1, $2, $3, $4, $5, 'worker', $6, $7, $8, COALESCE($9::timestamptz, now()), NULLIF($10, ''), $11)`,
+			ts, session_id, session_seq, subrun_id)
+		VALUES ($1, $2, $3, $4, $5, 'worker', $6, $7, $8, COALESCE($9::timestamptz, now()), NULLIF($10, ''), $11, NULLIF($12, ''))`,
 		taskID, seq, fmt.Sprintf("w:%s:%d", attemptID, e.Seq), attemptID, e.Seq, e.Type, []byte(e.Payload), workerEventHash(e),
-		ts, sessionID, nullSeq(sessionSeq))
+		ts, sessionID, nullSeq(sessionSeq), eventSubrunID(e.Payload))
 	return err
+}
+
+// eventSubrunID 是 Worker 事件载荷顶层的 subrun_id（subrun_* 与带 subrun_id 的 progress）；没有、无法解析或不合法时为空。
+func eventSubrunID(payload []byte) string {
+	var p struct {
+		SubrunID string `json:"subrun_id"`
+	}
+	if json.Unmarshal(payload, &p) != nil || !subrun.ValidID(p.SubrunID) {
+		return ""
+	}
+	return p.SubrunID
 }

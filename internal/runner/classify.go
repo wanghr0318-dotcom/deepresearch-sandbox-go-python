@@ -101,7 +101,7 @@ func Classify(in ClassifyInput) (class string, retry string) {
 		switch in.Violation {
 		case ViolationOutputLimit:
 			return ClassOutputLimitExceeded, RetryNone
-		case ViolationHandshakeError, ViolationModeMismatch, protocol.CodeSessionExtMissing:
+		case ViolationHandshakeError, ViolationModeMismatch, protocol.CodeSessionExtMissing, ViolationExtensionMismatch:
 			return ClassProtocolMismatch, RetryNone
 		}
 		return ClassProtocolViolation, RetryNone
@@ -115,6 +115,8 @@ func Classify(in ClassifyInput) (class string, retry string) {
 		return ClassReadyTimeout, RetryOf(ClassReadyTimeout)
 	case KillShutdown:
 		return ClassLostOnRestart, RetryOf(ClassLostOnRestart)
+	case KillSubrunCancelTimeout: // §13.4：终止整个 attempt（session 模式为 incarnation），故障重试，从 checkpoint 恢复
+		return ClassSubrunCancelTimeout, RetryOf(ClassSubrunCancelTimeout)
 	case KillStdinBroken:
 		// 部分写出说明 Worker 停止读取控制通道（写期限到期）或在写入中途关闭它。规格只规定"关闭
 		// stdin 并终止"，未给类别；保守地按协议违规，不重试、不判成功。

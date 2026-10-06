@@ -19,6 +19,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/subrun"
 )
 
 // Starter 是 runner 需要的 provider 子集（消费者窄接口）。
@@ -39,6 +40,9 @@ type Attempt struct {
 	// OnReady 可选：合法的 ready 处理完毕后同步调用恰好一次，调用时不等待 Store。
 	// 调用方据此知道 Worker 已能接收协作式 cancel/pause。
 	OnReady func()
+	// Subruns 是 sub-run 扩展的宿主实现（M4 Plan 14）。Init.Extensions（session 模式为 IncarnationSpec.Extensions）
+	// 请求了 subruns 时必须提供，否则 Run / RunTask 在启动前失败；未请求时不使用。
+	Subruns SubrunHost
 }
 
 // Control 是 actor 发给 runner 的控制请求。runner 向 Worker 发送协议 cancel/pause（grace_ms），
@@ -127,6 +131,8 @@ type Options struct {
 
 	TaskAcceptTimeout time.Duration // session 模式 T_task_accept：task_start 之后等 task_accepted，默认 10 s
 	ReleaseTimeout    time.Duration // session 模式 T_release：task_outcome 之后到释放核验完成，默认 30 s
+
+	SubrunCancelTimeout time.Duration // T_subrun_cancel：宿主取消 sub-run 后等其 subrun_end，默认 10 s（§13.4）
 }
 
 func (o Options) withDefaults() Options {
@@ -148,6 +154,7 @@ func (o Options) withDefaults() Options {
 	dur(&o.StoreFailureWindow, 30*time.Second)
 	dur(&o.TaskAcceptTimeout, 10*time.Second)
 	dur(&o.ReleaseTimeout, 30*time.Second)
+	dur(&o.SubrunCancelTimeout, subrun.DefaultCancelTimeout)
 	if o.StoreFailureCount <= 0 {
 		o.StoreFailureCount = 5
 	}
@@ -204,6 +211,9 @@ func (r *Runner) Run(ctx context.Context, a Attempt, controls <-chan Control) Ou
 	if err != nil {
 		return fail(fmt.Errorf("runner: init 不合法: %w", err))
 	}
+	if requestsSubruns(a.Init.Extensions) && a.Subruns == nil {
+		return fail(errNoSubrunHost)
+	}
 	dir, err := openOutDir(a.OutDir)
 	if err != nil {
 		return fail(fmt.Errorf("runner: 打开 out_dir: %w", err))
@@ -218,6 +228,11 @@ func (r *Runner) Run(ctx context.Context, a Attempt, controls <-chan Control) Ou
 		stdin: h.Stdin(), stderr: &tailBuffer{max: r.opt.StderrTail},
 		readyCh: make(chan struct{}), finishing: make(chan struct{})}
 	at.sendFn, at.appendFn = at.sendTask, r.store.AppendWorkerEvents
+	at.ctlFn, at.killFn = at.sendTaskControl, at.kill
+	at.stream.NegotiateExtensions(a.Init.Extensions)
+	if requestsSubruns(a.Init.Extensions) {
+		at.subs = newSubrunTracker(a.Subruns, r.opt.SubrunCancelTimeout)
+	}
 	return at.run(ctx, initLine, controls)
 }
 
@@ -245,6 +260,11 @@ type processor struct {
 
 	sendFn   func(protocol.Message) // 写出一条回复（编码方式与 0 字节/部分写出的处理由模式决定）
 	appendFn func(ctx context.Context, attemptID string, events []WorkerEvent) (Watermark, error)
+	// ctlFn 写出一条宿主发起的消息（subrun_cancel_requested），返回是否完整送达；killFn 终止执行（task 模式为 attempt，
+	// session 模式为 incarnation）。
+	ctlFn  func(protocol.Message) bool
+	killFn func(reason string)
+	subs   *subrunTracker // nil：未协商 sub-run 扩展
 
 	storeDown       chan struct{} // Store 故障达阈值（§14.5），由处理器关闭一次
 	storeDownClosed bool
@@ -538,24 +558,39 @@ func controlLine(attemptID string, c Control) []byte {
 // process 是唯一的事件处理器：按到达顺序（即 seq 顺序）逐条处理，产物保存完成后才处理其后的
 // 事件（含 checkpoint，规格 §5.7）。队列暂时为空或批次满时持久化已接受的事件。ctx 取消（屏障 B
 // 超时或调用方取消）后其余的行只读出丢弃。
+//
+// sub-run 定时器的到期经 subrunFired 进入同一循环，与事件串行处理。
 func (at *attemptRun) process(ctx context.Context, lines <-chan lineItem) {
-	for item := range lines {
-		if at.stopped || ctx.Err() != nil {
-			continue // 违规之后只读出丢弃，避免 Worker 因管道写满而阻塞
+	defer at.stopSubruns()
+	fired := at.subrunFired()
+	for {
+		select {
+		case item, ok := <-lines:
+			if !ok {
+				if ctx.Err() == nil {
+					at.flush(ctx)
+				}
+				return
+			}
+			if at.stopped || ctx.Err() != nil {
+				continue // 违规之后只读出丢弃，避免 Worker 因管道写满而阻塞
+			}
+			at.handle(ctx, item)
+			if len(lines) == 0 || len(at.pending) >= at.r.opt.EventBatch {
+				at.flush(ctx)
+			}
+		case f := <-fired:
+			if !at.stopped && ctx.Err() == nil {
+				at.subrunTimer(ctx, f)
+			}
 		}
-		at.handle(ctx, item)
-		if len(lines) == 0 || len(at.pending) >= at.r.opt.EventBatch {
-			at.flush(ctx)
-		}
-	}
-	if ctx.Err() == nil {
-		at.flush(ctx)
 	}
 }
 
 func (at *attemptRun) violate(code string) {
 	at.out.Violation = code
 	at.stopped = true
+	at.stopSubruns()
 	at.finish()
 }
 
@@ -615,12 +650,19 @@ func (at *attemptRun) handle(ctx context.Context, item lineItem) {
 	case *protocol.CheckpointQuery:
 		at.flush(ctx)
 		at.send(at.queryCheckpoint(ctx, m))
+	case *protocol.SubrunStart, *protocol.SubrunEnd, *protocol.SubrunCancel:
+		at.flush(ctx)
+		if v := at.handleSubrun(ctx, m); v != "" {
+			at.violate(v)
+		}
 	case *protocol.Result, *protocol.ErrorEvent:
 		at.flush(ctx)
+		at.stopSubruns()
 		at.recordProposal(ctx, m)
 		at.finish()
 	case *protocol.Paused:
 		at.flush(ctx)
+		at.stopSubruns()
 		at.recordProposal(ctx, m)
 		if !at.pausedIsLatest(ctx, m.CheckpointID) {
 			at.violate(ViolationPausedNotLatest)
@@ -698,6 +740,12 @@ func eventSeq(m protocol.Message) int64 {
 		return m.Seq
 	case *protocol.ErrorEvent:
 		return m.Seq
+	case *protocol.SubrunStart:
+		return m.Seq
+	case *protocol.SubrunEnd:
+		return m.Seq
+	case *protocol.SubrunCancel:
+		return m.Seq
 	}
 	return 0
 }
@@ -763,6 +811,7 @@ func (at *processor) commitCheckpoint(ctx context.Context, m *protocol.Checkpoin
 		State:        stateOrNil(m.State),
 		StateRef:     m.StateRef,
 		Refs:         m.Refs,
+		Subruns:      m.Subruns,
 	})
 	faultinject.Point(faultinject.CheckpointCommitAfter)
 	at.noteStore(err)
@@ -788,12 +837,17 @@ func (at *processor) commitCheckpoint(ctx context.Context, m *protocol.Checkpoin
 	return res
 }
 
-// checkRefs 在提交前检查 refs 与 state_ref 指向的 blob 已完整保存（missing_ref）、state_ref 不超过
-// 上限（state_too_large）。授权到当前 scope 由 CommitCheckpoint 在事务内检查（ref_not_authorized）。
+// checkRefs 在提交前检查 refs、subruns[].result_ref 与 state_ref 指向的 blob 已完整保存（missing_ref）、state_ref
+// 不超过上限（state_too_large）。授权到当前 scope 由 CommitCheckpoint 在事务内检查（ref_not_authorized）。
 func (at *processor) checkRefs(m *protocol.Checkpoint) (status, code string) {
-	refs := m.Refs
+	refs := append([]string(nil), m.Refs...)
+	for _, s := range m.Subruns {
+		if s.ResultRef != "" {
+			refs = append(refs, s.ResultRef)
+		}
+	}
 	if m.StateRef != "" {
-		refs = append(append([]string(nil), m.Refs...), m.StateRef)
+		refs = append(refs, m.StateRef)
 	}
 	for _, ref := range refs {
 		b, err := at.r.blobs.Stat(ref)
@@ -966,11 +1020,13 @@ func (at *processor) recordProposal(ctx context.Context, m protocol.Message) {
 			state = m.SessionState
 			at.out.SessionState = m.SessionState
 		}
+		// result.subruns[] 原样保存（供 inspect 与 API，规格 §13.6）；不据此改变 sub-run 状态
 		content = struct {
-			Summary      string                 `json:"summary"`
-			Outputs      []pinnedRef            `json:"outputs"`
-			SessionState *protocol.SessionState `json:"session_state,omitempty"`
-		}{m.Summary, outputs, state}
+			Summary      string                  `json:"summary"`
+			Outputs      []pinnedRef             `json:"outputs"`
+			SessionState *protocol.SessionState  `json:"session_state,omitempty"`
+			Subruns      []protocol.ResultSubrun `json:"subruns,omitempty"`
+		}{m.Summary, outputs, state, m.Subruns}
 	case *protocol.AwaitingInput:
 		content = struct {
 			CheckpointID string `json:"checkpoint_id"`
@@ -1018,6 +1074,19 @@ func (at *attemptRun) sendTask(m protocol.Message) {
 	if _, partial := at.sendLine(line); partial {
 		at.kill(KillStdinBroken)
 	}
+}
+
+// sendTaskControl 写出宿主发起的消息（subrun_cancel_requested）并返回是否完整送达；部分写出终止执行（stdin_broken）。
+func (at *attemptRun) sendTaskControl(m protocol.Message) bool {
+	line, err := protocol.EncodeLine(protocol.HostToWorker, m)
+	if err != nil { // 由本包构造，编码失败是程序错误
+		panic(fmt.Sprintf("runner: 编码 %s: %v", m.MessageType(), err))
+	}
+	ok, partial := at.sendLine(line)
+	if partial {
+		at.kill(KillStdinBroken)
+	}
+	return ok
 }
 
 // sendLine 写一行到 stdin（规格 §5.5 第 8 条）：0 字节写出视为未送达（回复类消息由 Worker 重试或

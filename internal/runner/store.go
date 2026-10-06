@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
 )
 
 // Store 是 runner 的窄接口。每个方法是一个完整、幂等的事务用例（设计 §2.3、§2.4）。
@@ -67,6 +69,9 @@ type Checkpoint struct {
 	State        json.RawMessage
 	StateRef     string
 	Refs         []string
+	// Subruns 是 checkpoint 的 subruns[]（sub-run 扩展，规格 §5.5 规则 2、6）：与 checkpoint 在同一事务中按状态机转换，
+	// 不允许的转换以 invalid_transition 拒绝整个 checkpoint（指针不变，E41）；参与内容哈希。
+	Subruns []protocol.CheckpointSubrun
 }
 
 // CommittedCheckpoint 是已提交的 checkpoint。

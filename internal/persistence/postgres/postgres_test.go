@@ -6351,3 +6351,120 @@ func TestInvariantI12(t *testing.T) {
 }
 
 // ==== M4 Plan 15 Task 7 段结束 ====
+
+// ==== M4 Plan 14 Task 6：CommitCheckpoint 的 subruns[] 与 events.subrun_id ====
+
+// TestCommitCheckpointSubruns：checkpoint 的 subruns[] 与 checkpoint 在同一事务中转换并写入 subruns_json；非法转换
+// （E41）时 checkpoint、指针与 sub-run 都不变；result_ref 须授权到任务 scope；subruns 参与内容哈希，没有 subruns 的
+// checkpoint 的哈希与之前相同（已有数据的重放仍是同一内容）。
+func TestCommitCheckpointSubruns(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	mustStartSubrun(t, s, "t1", "att-t1", "a")
+	mustStartSubrun(t, s, "t1", "att-t1", "b")
+	if _, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "a", "succeeded", "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RequestSubrunCancel(ctx, "t1", "b", subrun.ReasonDeadline); err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("e", 64)
+	if _, err := s.RegisterArtifact(ctx, runner.Artifact{TaskID: "t1", AttemptID: "att-t1", ArtifactID: "subrun-a", SHA256: sha,
+		Size: 10, MediaType: "application/json", Visibility: "internal"}); err != nil {
+		t.Fatal(err)
+	}
+	cp := func(id string, subs ...protocol.CheckpointSubrun) runner.Checkpoint {
+		return runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "t1"}, CheckpointID: id, AttemptID: "att-t1", StepID: "s",
+			State: json.RawMessage(`{"n":1}`), Refs: []string{}, Subruns: subs}
+	}
+	completedA := protocol.CheckpointSubrun{SubrunID: "a", Status: "completed", ResultRef: sha}
+
+	// E41：b 已 cancel_requested，不能 completed；同一 checkpoint 中 a 的合法转换也不生效
+	_, err := s.CommitCheckpoint(ctx, cp("cp-1", completedA, protocol.CheckpointSubrun{SubrunID: "b", Status: "completed", ResultRef: sha}))
+	expectRejected(t, err, persistence.CodeInvalidTransition)
+	if n := count(t, s, "SELECT count(*) FROM checkpoints WHERE scope_id = 't1'"); n != 0 {
+		t.Fatalf("被拒绝的 checkpoint 不应写入，得到 %d 行", n)
+	}
+	if n := count(t, s, "SELECT latest_commit_seq FROM task_progress WHERE task_id = 't1'"); n != 0 {
+		t.Fatalf("指针不应改变，latest_commit_seq = %d", n)
+	}
+	if got := subrunRow(t, s, "t1", "a"); got != "end_proposed|att-t1|-|||false" {
+		t.Fatalf("回滚后 a = %s", got)
+	}
+	// result_ref 未授权到任务 scope
+	_, err = s.CommitCheckpoint(ctx, cp("cp-1", protocol.CheckpointSubrun{SubrunID: "a", Status: "completed", ResultRef: strings.Repeat("f", 64)}))
+	expectRejected(t, err, persistence.CodeRefNotAuthorized)
+
+	entries := []protocol.CheckpointSubrun{completedA, {SubrunID: "b", Status: "cancelled"}}
+	c1, err := s.CommitCheckpoint(ctx, cp("cp-1", entries...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := subrunRow(t, s, "t1", "a"); got != "completed|att-t1|"+sha+"|||true" {
+		t.Fatalf("a = %s", got)
+	}
+	if got := subrunRow(t, s, "t1", "b"); got != "timed_out|att-t1|-||deadline|true" {
+		t.Fatalf("b = %s", got)
+	}
+	var raw []byte
+	if err := s.pool.QueryRow(ctx, "SELECT subruns_json FROM checkpoints WHERE scope_id = 't1' AND checkpoint_id = 'cp-1'").Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var stored []protocol.CheckpointSubrun
+	if err := json.Unmarshal(raw, &stored); err != nil || fmt.Sprint(stored) != fmt.Sprint(entries) {
+		t.Fatalf("subruns_json = %s (%v)", raw, err)
+	}
+	// 同 ID 同内容：原结果；同 ID 只差 subruns：冲突
+	again, err := s.CommitCheckpoint(ctx, cp("cp-1", entries...))
+	if err != nil || again.CommitSeq != c1.CommitSeq {
+		t.Fatalf("重放 = %+v %v", again, err)
+	}
+	if _, err := s.CommitCheckpoint(ctx, cp("cp-1", completedA)); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("只差 subruns 的同 ID checkpoint 应冲突，得到 %v", err)
+	}
+	// 没有 subruns 的 checkpoint：哈希公式不变
+	plain := cp("cp-2")
+	if want := contentHash([]byte(plain.AttemptID), []byte(plain.StepID), plain.State, []byte(plain.StateRef),
+		[]byte(strings.Join(plain.Refs, "\n"))); string(checkpointHash(plain)) != string(want) {
+		t.Fatal("没有 subruns 的 checkpoint 哈希改变了")
+	}
+	if _, err := s.CommitCheckpoint(ctx, plain); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM checkpoints WHERE checkpoint_id = 'cp-2' AND subruns_json = '[]'::jsonb"); n != 1 {
+		t.Fatal("没有 subruns 的 checkpoint 应写入 []")
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestWorkerEventSubrunID：Worker 事件的 events.subrun_id 取自载荷的 subrun_id（subrun_* 与带 subrun_id 的 progress）；
+// 没有或不合法时为 NULL。task 与 session 两种追加路径相同。
+func TestWorkerEventSubrunID(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	evs := []runner.WorkerEvent{
+		{Seq: 1, Type: "ready", Payload: json.RawMessage(`{"type":"ready","v":1,"seq":1}`)},
+		{Seq: 2, Type: "subrun_start", Payload: json.RawMessage(`{"type":"subrun_start","v":1,"seq":2,"subrun_id":"st1"}`)},
+		{Seq: 3, Type: "progress", Payload: json.RawMessage(`{"type":"progress","v":1,"seq":3,"subrun_id":"st1"}`)},
+		{Seq: 4, Type: "progress", Payload: json.RawMessage(`{"type":"progress","v":1,"seq":4}`)},
+		{Seq: 5, Type: "progress", Payload: json.RawMessage(`{"type":"progress","v":1,"seq":5,"subrun_id":"Root!"}`)},
+	}
+	if _, err := s.AppendWorkerEvents(ctx, "att-t1", evs); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.pool.Query(ctx, "SELECT COALESCE(subrun_id, '-') FROM events WHERE attempt_id = 'att-t1' AND worker_seq IS NOT NULL ORDER BY worker_seq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"-", "st1", "st1", "-", "-"}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("subrun_id = %v，期望 %v", got, want)
+	}
+}
+
+// ==== M4 Plan 14 Task 6 段结束 ====

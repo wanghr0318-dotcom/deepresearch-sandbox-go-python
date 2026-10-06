@@ -34,6 +34,9 @@ type IncarnationSpec struct {
 	Procs func(ctx context.Context) ([]int, error)
 	// GatewayIdle 等该 attempt 绑定的 Gateway 连接无在途请求且已关闭（edge.Detach）；nil 时不核验。
 	GatewayIdle func(ctx context.Context, attemptID string) error
+	// Extensions 是会话 init.extensions（规格 §5.2）：请求 subruns 时 ready 须回 subruns: 1，且每个 SessionAttempt
+	// 须提供 Subruns。
+	Extensions []string
 }
 
 // SessionAttempt 是会话中一次 task attempt 的输入。Attempt 中使用 TaskID、AttemptID、AttemptNo、
@@ -190,7 +193,7 @@ func (r *Runner) StartIncarnation(ctx context.Context, s IncarnationSpec) (*Inca
 	}
 	init := &protocol.Init{Type: protocol.TypeInit, Bootstrap: protocol.BootstrapVersion,
 		ProtocolVersions: []int64{protocol.Version}, Mode: protocol.ModeSession,
-		SessionID: s.SessionID, IncarnationID: s.IncarnationID, Config: s.Config, SessionResume: s.Resume}
+		SessionID: s.SessionID, IncarnationID: s.IncarnationID, Config: s.Config, SessionResume: s.Resume, Extensions: s.Extensions}
 	if _, err := protocol.EncodeSessionLine(protocol.HostToWorker, init); err != nil {
 		return nil, startErr(fmt.Errorf("runner: init 不合法: %w", err))
 	}
@@ -259,10 +262,27 @@ func (inc *Incarnation) loops() {
 	}()
 	go func() {
 		defer close(inc.procDone)
-		for item := range inc.lines {
-			inc.handle(item)
+		for {
+			// 当前 attempt 的 sub-run 定时器到期与事件串行处理。定时器只在处理一行时登记，因此在阻塞前取到的
+			// 通道总是最新的（attempt 切换之后的第一个定时器必然由之后的某一行登记）。
+			inc.mu.Lock()
+			att := inc.att
+			inc.mu.Unlock()
+			var fired <-chan subrunFire
+			if att != nil {
+				fired = att.subrunFired()
+			}
+			select {
+			case item, ok := <-inc.lines:
+				if !ok {
+					inc.flushCurrent()
+					return
+				}
+				inc.handle(item)
+			case f := <-fired:
+				inc.subrunFire(att, f)
+			}
 		}
-		inc.flushCurrent()
 	}()
 	go func() {
 		st, err := inc.h.Wait()
@@ -555,6 +575,11 @@ func (att *sessionRun) handle(m protocol.Message, seq int64, line []byte) {
 	case *protocol.CheckpointQuery:
 		att.flush(ctx)
 		att.send(att.queryCheckpoint(ctx, m))
+	case *protocol.SubrunStart, *protocol.SubrunEnd, *protocol.SubrunCancel:
+		att.flush(ctx)
+		if v := att.handleSubrun(ctx, m); v != "" {
+			inc.violate(att, v, eventHeader{Seq: seq, Type: m.MessageType(), AttemptID: att.attemptID})
+		}
 	case *protocol.Result, *protocol.ErrorEvent:
 		att.flush(ctx)
 		att.recordProposal(ctx, m)
@@ -615,9 +640,29 @@ func (att *sessionRun) propose() {
 	if att.proposedC {
 		return
 	}
+	att.stopSubruns()
 	att.proposedC = true
 	att.result = att.out
 	close(att.proposed)
+}
+
+// subrunFire 处理当前 attempt 的一次 sub-run 定时器到期（处理器 goroutine）：终态提议之后或 RunTask 返回之后不再处理。
+func (inc *Incarnation) subrunFire(att *sessionRun, f subrunFire) {
+	att.handleMu.Lock()
+	defer att.handleMu.Unlock()
+	inc.mu.Lock()
+	skip := inc.att != att || att.returned || inc.broken
+	inc.mu.Unlock()
+	if skip || att.proposedC {
+		return
+	}
+	att.subrunTimer(att.pctx, f)
+}
+
+// sendControl 写出宿主发起的消息（subrun_cancel_requested），返回是否完整送达（部分写出时 sendHost 已终止）。
+func (att *sessionRun) sendControl(m protocol.Message) bool {
+	ok, _, err := att.inc.sendHost(m)
+	return err == nil && ok
 }
 
 // postVerdict 记录终态提议（或裁决）之后该 attempt 的协议违规：不改写结果，写诊断 host 事件，
@@ -657,8 +702,11 @@ func (att *sessionRun) sendReply(m protocol.Message) {
 	case *protocol.ArtifactResult:
 		m.AttemptID = att.attemptID
 	}
-	if _, _, err := att.inc.sendHost(m); err != nil { // 由本包构造且阶段必然允许：程序错误
-		panic(fmt.Sprintf("runner: 写出 %s: %v", m.MessageType(), err))
+	if _, _, err := att.inc.sendHost(m); err != nil {
+		if _, ok := m.(*protocol.SubrunStarted); ok {
+			return // 会话已在关闭（没有当前 attempt）：不再答复，Worker 随会话结束
+		}
+		panic(fmt.Sprintf("runner: 写出 %s: %v", m.MessageType(), err)) // 由本包构造且阶段必然允许：程序错误
 	}
 }
 
@@ -728,6 +776,10 @@ func (inc *Incarnation) RunTask(ctx context.Context, a SessionAttempt, controls 
 	if err != nil {
 		return fail(err)
 	}
+	negotiated := requestsSubruns(inc.spec.Extensions)
+	if negotiated && a.Subruns == nil {
+		return fail(errNoSubrunHost)
+	}
 	inc.mu.Lock()
 	switch {
 	case inc.running || inc.att != nil:
@@ -759,6 +811,10 @@ func (inc *Incarnation) RunTask(ctx context.Context, a SessionAttempt, controls 
 		abandon: abandon, accepted: make(chan struct{}), proposed: make(chan struct{}), released: make(chan struct{})}
 	att.session, att.pctx = true, pctx
 	att.sendFn, att.appendFn = att.sendReply, inc.r.store.AppendSessionWorkerEvents
+	att.ctlFn, att.killFn = att.sendControl, inc.kill
+	if negotiated {
+		att.subs = newSubrunTracker(a.Subruns, inc.r.opt.SubrunCancelTimeout)
+	}
 
 	inc.mu.Lock()
 	inc.att = att
@@ -901,6 +957,9 @@ func (inc *Incarnation) finishRun(ctx context.Context, att *sessionRun, ctrl str
 	inc.mu.Lock()
 	att.returned = true
 	inc.mu.Unlock()
+	if att.subs != nil {
+		att.subs.stop() // 结果已交给调用方：之后到期的 sub-run 定时器不再处理（定时器本身由 stop 失效）
+	}
 	if inc.r.diag != nil {
 		if d, err := inc.r.diag(context.WithoutCancel(ctx), inc.spec.EnvID); err == nil {
 			out.Diag = d
