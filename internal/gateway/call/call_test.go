@@ -3432,3 +3432,60 @@ func TestExecStatusCodes(t *testing.T) {
 		}
 	}
 }
+
+// ---- M4 真实验收修复：暂停时不再为在途调用安排新的 try ----
+
+// TestPauseStopsAutoRetry：暂停（desired = pause）不撤销访问，在途 try 照常结束；但该 try 以可重试失败结束后，
+// Gateway 不再自动新建 try——调用以该 try 的原因（可重试类别）置为 failed 并立即返回，Worker 可以尽快写 checkpoint
+// （验收中对不可达站点的抓取按 3 × 10 s 重试，停止要 20–39 s）。继续后（desired = run）带 X-Agentbox-Retry 在上限内
+// 新建 try。未暂停时同样的失败照常自动重试（TestRetryableExhaustsTries）。
+func TestPauseStopsAutoRetry(t *testing.T) {
+	timeout := &upstream.Error{Outcome: upstream.OutcomeRetryable, Status: 502, Code: upstream.CodeUpstreamUnreachable}
+	gate := make(chan struct{})
+	ad := newAdapter("p", step{gate: gate, hold: true, err: timeout}, step{body: `{"answer":"later"}`})
+	h := newHarness(t, testLimits(), ad)
+	done := make(chan Result, 1)
+	go func() {
+		r, err := h.c.Invoke(context.Background(), inv("c1", chatBody))
+		if err != nil {
+			t.Errorf("Invoke：%v", err)
+		}
+		done <- r
+	}()
+	waitEntered(t, ad)
+	h.store.mu.Lock()
+	h.store.desired["t1"] = "pause"
+	h.store.mu.Unlock()
+	close(gate)
+	var r Result
+	select {
+	case r = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("暂停后调用没有返回")
+	}
+	if r.Status != 502 || r.Code != upstream.CodeUpstreamUnreachable {
+		t.Fatalf("得到 %+v", r)
+	}
+	if calls, _, _ := ad.stats(); calls != 1 {
+		t.Fatalf("暂停后不应再新建 try，上游被调用 %d 次", calls)
+	}
+	rec, tries := h.call(t, "t1", "c1")
+	if rec.State != StateFailed || rec.FailReason != upstream.CodeUpstreamUnreachable || rec.TriesUsed != 1 || len(tries) != 1 ||
+		!retryableReason(rec.FailReason) {
+		t.Fatalf("调用记录 %+v，try %d", rec, len(tries))
+	}
+	if b := h.budget(t, "t1"); b.ReservedMicro != 0 {
+		t.Fatalf("账本 %+v", b)
+	}
+	h.store.mu.Lock()
+	h.store.desired["t1"] = "run"
+	h.store.mu.Unlock()
+	in := inv("c1", chatBody)
+	in.Retry = true
+	if r := h.invoke(t, in); r.Status != 200 {
+		t.Fatalf("继续后带 Retry：%+v", r)
+	}
+	if rec, _ := h.call(t, "t1", "c1"); rec.State != StateCompleted || rec.TriesUsed != 2 {
+		t.Fatalf("继续后调用记录 %+v", rec)
+	}
+}

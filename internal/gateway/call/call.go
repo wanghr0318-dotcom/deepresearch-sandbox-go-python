@@ -1066,6 +1066,11 @@ func (c *Coordinator) execute(j *job, rec CallRecord) (Result, error) {
 				return Result{Status: status, Code: code}, nil
 			}
 		}
+		// 暂停（desired = pause）不撤销访问，刚结束的 try 照常结算（§9.1）；但不再为本调用自动新建 try：以该 try 的
+		// 原因（可重试类别）结束，Worker 尽快到达提交边界写 checkpoint，继续后可带 X-Agentbox-Retry 在上限内重试。
+		if c.pauseRequested(in) {
+			return c.giveUp(j, state, code)
+		}
 		// 4. 退避：基数翻倍、上限、抖动；遵从 Retry-After；不超过剩余期限（会超过则不再新建 try）。
 		wait := c.backoff(n, resp.RetryAfter)
 		if !c.now().Add(wait).Before(deadline) {
@@ -1078,7 +1083,23 @@ func (c *Coordinator) execute(j *job, rec CallRecord) (Result, error) {
 			t.Stop()
 			return c.giveUp(j, state, c.stopCode(ctx, deadline))
 		}
+		if c.pauseRequested(in) { // 退避期间到达的暂停
+			return c.giveUp(j, state, code)
+		}
 	}
+}
+
+// pauseRequested 报告调用所属任务是否已请求暂停（task_control.desired = pause）：try 循环据此不再自动新建 try。
+// 读取失败时按未暂停处理（照常重试，与修复前相同）。
+func (c *Coordinator) pauseRequested(in Invoke) bool {
+	ctx, cancel := c.opCtx()
+	defer cancel()
+	f, err := c.store.CheckAccess(ctx, in.TaskID, in.AttemptID, in.SubrunID)
+	if err != nil {
+		c.log.Warn("gateway: 重试前读取控制意图失败，照常重试", "task_id", in.TaskID, "call_id", in.CallID, "err", err)
+		return false
+	}
+	return f.Desired == "pause"
 }
 
 // complete 是第二个原子提交点：先完整保存结果 blob，再在单个事务中结算、completed 与 scope_blobs。
