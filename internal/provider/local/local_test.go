@@ -2092,10 +2092,16 @@ func TestE39UIDRangeReuse(t *testing.T) {
 	}
 
 	// 环境 B 复用范围 R：同一宿主 uid，看不到 A 的任何文件。
+	// find 跳过模板项（宿主 /usr、/lib* 等的只读 bind，环境写不进去）：CI runner 的 /usr 有数百万个文件，
+	// 遍历它会耗尽 ctx，使随后的 Stop 拿到已过期的 ctx 而报 ErrStopUnconfirmed。
+	prune := "-path /proc -o -path /sys"
+	for _, tp := range rootfs.DefaultTemplate().Paths {
+		prune += " -o -path " + tp
+	}
 	newTask("env-b", "t-b")
 	got := runSh(ctx, t, p, "env-b", "id -u; for f in /tmp/secret /workspace/a.txt /workspace/d /workspace/ln; do "+
 		"if [ -e \"$f\" ] || [ -L \"$f\" ]; then echo present \"$f\"; fi; done; "+
-		"find / \\( -path /proc -o -path /sys \\) -prune -o -user 1000 -print 2>/dev/null; true")
+		"find / \\( "+prune+" \\) -prune -o -user 1000 -print 2>/dev/null; true")
 	lines := strings.Split(strings.TrimSpace(got), "\n")
 	if lines[0] != "1000" {
 		t.Fatalf("环境 B 的 uid = %q", lines[0])
