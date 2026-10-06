@@ -57,6 +57,16 @@ const (
 	CodeCallInProgress       = "call_in_progress"                // 该调用已有执行中的 try 或仍在解析
 )
 
+// sub-run 用例的原因码（规格 §8.4、§9.2、§9.6、§13；M4 Plan 14）。值与协议 subrun_started.code 及 Gateway 的
+// 错误码一致；invalid_transition 与 session.CodeInvalidTransition 同值。
+const (
+	CodeConflict              = "conflict"                // 同一 sub-run ID 的定义不同
+	CodeSubrunClosed          = "subrun_closed"           // sub-run 已终态，或不是 started / 未绑定当前 attempt
+	CodeSubrunBudgetExhausted = "subrun_budget_exhausted" // sub-run 层可用 ≤ 0
+	CodeSubrunLimit           = "subrun_limit"            // 该任务已有 4 个逻辑 sub-run
+	CodeInvalidTransition     = "invalid_transition"      // 状态机不允许的转换（含 checkpoint 列出未知 sub-run）
+)
+
 // RejectedError 携带前置条件不满足的原因。
 type RejectedError struct {
 	Code   string

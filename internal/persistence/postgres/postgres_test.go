@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"strings"
@@ -22,10 +23,12 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/recovery"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/resource"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/session"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/subrun"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
 )
 
@@ -253,7 +256,7 @@ func TestInstallationBootstrapE46(t *testing.T) {
 			t.Fatal(err)
 		}
 		// 还原为只应用了 0001 的旧库
-		if _, err := s.pool.Exec(ctx, undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions;
+		if _, err := s.pool.Exec(ctx, undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions;
 			ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
 			ALTER TABLE installation DROP COLUMN bootstrap_token_hash; DELETE FROM schema_migrations WHERE version >= 2`); err != nil {
 			t.Fatal(err)
@@ -2597,7 +2600,7 @@ func TestMigrationBackfillsBudgets(t *testing.T) {
 	s := newStore(t, Options{})
 	fixture(t, s, "t1")
 	// 还原为只应用了 0001、0002 的旧库：任务 t1 没有预算行
-	if _, err := s.pool.Exec(ctx, undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions; ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
+	if _, err := s.pool.Exec(ctx, undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions; ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
 		DELETE FROM schema_migrations WHERE version >= 3`); err != nil {
 		t.Fatal(err)
 	}
@@ -3103,8 +3106,8 @@ func TestMigration0006(t *testing.T) {
 	ctx := context.Background()
 	t.Run("全新库", func(t *testing.T) {
 		s := newStore(t, Options{})
-		if n := count(t, s, "SELECT max(version) FROM schema_migrations"); n != 6 {
-			t.Fatalf("应迁移到 0006，得到 %d", n)
+		if n := count(t, s, "SELECT count(*) FROM schema_migrations WHERE version <= 6"); n != 6 {
+			t.Fatalf("应依次应用 0001–0006，得到 %d 个", n)
 		}
 		st, err := s.InspectInstallation(ctx)
 		if err != nil || !st.HasAgentboxTables {
@@ -3114,7 +3117,7 @@ func TestMigration0006(t *testing.T) {
 	t.Run("从 0005 升级", func(t *testing.T) {
 		s := newStore(t, Options{})
 		fixture(t, s, "old")
-		if _, err := s.pool.Exec(ctx, undo0006); err != nil {
+		if _, err := s.pool.Exec(ctx, undo0007+undo0006); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := s.pool.Exec(ctx, `INSERT INTO users (username, username_key, password_hash) VALUES ('carol', 'carol', 'h');
@@ -4041,5 +4044,510 @@ func TestOwnerUIDRange(t *testing.T) {
 	}
 	if _, err := s.ReleaseOwnerUIDRange(ctx, "session:s1", a1); !errors.Is(err, persistence.ErrNotFound) {
 		t.Fatalf("重复归还 = %v，期望 ErrNotFound（coordinator 视为幂等）", err)
+	}
+}
+
+// --- sub-run（migration 0007，M4 Plan 14 Task 3；规格 §6、§8.4、§13） ---
+
+// undo0007 把库还原为只应用了 0006 的形状；回滚到更早迁移的测试先执行它（再执行 undo0006）。
+const undo0007 = `DROP INDEX reservations_subrun_held;
+	ALTER TABLE reservations DROP CONSTRAINT reservations_subrun_fk;
+	ALTER TABLE calls DROP CONSTRAINT calls_subrun_fk;
+	DROP TABLE subrun_budgets, subruns;
+	DELETE FROM schema_migrations WHERE version >= 7;
+`
+
+func capOf(v int64) *int64 { return &v }
+
+// subrunDef 是一个合法定义：parent_step_id = step，deadline 60 s。
+func subrunDef(step string, budgetCap *int64) subrun.Definition {
+	return subrun.Definition{ParentStepID: step, BudgetCapMicro: budgetCap, DeadlineMS: 60_000}
+}
+
+func mustStartSubrun(t *testing.T, s *Store, taskID, attemptID, subrunID string) subrun.Record {
+	t.Helper()
+	r, err := s.StartSubrun(context.Background(), taskID, attemptID, subrunID, subrunDef("plan", nil))
+	if err != nil {
+		t.Fatalf("StartSubrun(%s): %v", subrunID, err)
+	}
+	return r
+}
+
+// subrunTx 在一个事务中执行包内事务辅助（测试包装：生产中由 CommitCheckpoint、CreateAttempt、裁决事务调用）。
+func subrunTx(s *Store, fn txFunc) error {
+	return s.run(context.Background(), "subrunTest", "", fn)
+}
+
+// subrunRow 返回 status|bound_attempt_id|result_ref|failure_reason|cancel_reason|ended?。
+func subrunRow(t *testing.T, s *Store, taskID, subrunID string) string {
+	t.Helper()
+	var out string
+	if err := s.pool.QueryRow(context.Background(), `SELECT concat_ws('|', status, bound_attempt_id, COALESCE(result_ref, '-'),
+			failure_reason, cancel_reason, (ended_at IS NOT NULL)::text)
+		FROM subruns WHERE task_id = $1 AND subrun_id = $2`, taskID, subrunID).Scan(&out); err != nil {
+		t.Fatalf("读取 sub-run %s/%s: %v", taskID, subrunID, err)
+	}
+	return out
+}
+
+// retrySubrunTask 走一次故障重试（retryWithNewAttempt）并撤销旧 attempt 的访问（生产中由 runner 撤销；I7）。
+func retrySubrunTask(t *testing.T, s *Store, taskID string) {
+	t.Helper()
+	retryWithNewAttempt(t, s, taskID)
+	if err := s.RevokeAttemptAccess(context.Background(), "att-"+taskID, "test"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMigration0007：全新库迁移到 0007；0006 的库（含已有任务与调用）升级到 0007；calls/reservations 的 subrun_id
+// 外键对 root（NULL）不生效、对未知 sub-run 生效。
+func TestMigration0007(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	if n := count(t, s, "SELECT max(version) FROM schema_migrations"); n != 7 {
+		t.Fatalf("应迁移到 0007，得到 %d", n)
+	}
+	gwFixture(t, s, "t1", 1000)
+	beginCall(t, s, "t1", "c1")
+	if _, err := s.pool.Exec(ctx, undo0007); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM calls WHERE task_id = 't1' AND subrun_id IS NULL"); n != 1 {
+		t.Fatal("升级后 root 调用应保留")
+	}
+	_, err := s.pool.Exec(ctx, "UPDATE calls SET subrun_id = 'st9' WHERE task_id = 't1'")
+	if sqlState(err) != "23503" {
+		t.Fatalf("未知 sub-run 的调用应违反外键，得到 %v", err)
+	}
+	mustStartSubrun(t, s, "t1", "att-t1", "st1")
+	if _, err := s.pool.Exec(ctx, "UPDATE calls SET subrun_id = 'st1' WHERE task_id = 't1'"); err != nil {
+		t.Fatalf("已存在的 sub-run 的调用：%v", err)
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestSubrunStart：4 个逻辑 sub-run 上限（第 5 个 subrun_limit）；同 ID 同定义重发返回原记录、deadline_at 不变；
+// 同 ID 不同定义 conflict；非当前 attempt stale_attempt；终态上重发 subrun_closed；非法 ID/定义 ErrInvalid。
+func TestSubrunStart(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	first, err := s.StartSubrun(ctx, "t1", "att-t1", "st1", subrunDef("plan", capOf(500)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != subrun.Started || first.BoundAttemptID != "att-t1" || first.ParentStepID != "plan" ||
+		first.BudgetCapMicro == nil || *first.BudgetCapMicro != 500 ||
+		string(first.DefinitionHash) != string(subrunDef("plan", capOf(500)).Hash()) {
+		t.Fatalf("首次启动 = %+v", first)
+	}
+	if d := first.DeadlineAt.Sub(first.StartedAt); d != time.Minute {
+		t.Fatalf("deadline_at - started_at = %v，期望 60 s（数据库 now() + deadline_ms）", d)
+	}
+	if b, err := s.LoadSubrunBudget(ctx, "t1", "st1"); err != nil || b.CapMicro == nil || *b.CapMicro != 500 || b.Available() != 500 {
+		t.Fatalf("sub-run 账本 = %+v, %v", b, err)
+	}
+	for _, id := range []string{"st2", "st3", "st4"} {
+		mustStartSubrun(t, s, "t1", "att-t1", id)
+	}
+	if b, err := s.LoadSubrunBudget(ctx, "t1", "st2"); err != nil || b.CapMicro != nil || b.Available() != math.MaxInt64 {
+		t.Fatalf("无上限的 sub-run 账本 = %+v, %v", b, err)
+	}
+	_, err = s.StartSubrun(ctx, "t1", "att-t1", "st5", subrunDef("plan", nil))
+	expectRejected(t, err, persistence.CodeSubrunLimit)
+
+	time.Sleep(10 * time.Millisecond)
+	again, err := s.StartSubrun(ctx, "t1", "att-t1", "st1", subrunDef("plan", capOf(500)))
+	if err != nil || !again.DeadlineAt.Equal(first.DeadlineAt) || !again.StartedAt.Equal(first.StartedAt) {
+		t.Fatalf("同定义重发 = %+v, %v；期望原 deadline_at %v", again, err, first.DeadlineAt)
+	}
+	_, err = s.StartSubrun(ctx, "t1", "att-t1", "st1", subrunDef("plan", capOf(501)))
+	expectRejected(t, err, persistence.CodeConflict)
+
+	if _, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "st2", "failed", "boom"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.StartSubrun(ctx, "t1", "att-t1", "st2", subrunDef("plan", nil))
+	expectRejected(t, err, persistence.CodeSubrunClosed)
+
+	fixture(t, s, "t2")
+	retrySubrunTask(t, s, "t2")
+	_, err = s.StartSubrun(ctx, "t2", "att-t2", "st1", subrunDef("plan", nil))
+	expectRejected(t, err, persistence.CodeStaleAttempt)
+	if n := count(t, s, "SELECT count(*) FROM subruns WHERE task_id = 't2'"); n != 0 {
+		t.Fatalf("被拒绝的启动留下了 %d 行", n)
+	}
+
+	for name, d := range map[string]subrun.Definition{
+		"空 parent_step_id": {DeadlineMS: 1},
+		"deadline 为 0":     {ParentStepID: "p"},
+		"上限为负":             {ParentStepID: "p", DeadlineMS: 1, BudgetCapMicro: capOf(-1)},
+	} {
+		if _, err := s.StartSubrun(ctx, "t2", "att2-t2", "st1", d); !errors.Is(err, persistence.ErrInvalid) {
+			t.Errorf("%s: %v，期望 ErrInvalid", name, err)
+		}
+	}
+	for _, id := range []string{"root", "St1", "_a", ""} {
+		if _, err := s.StartSubrun(ctx, "t2", "att2-t2", id, subrunDef("plan", nil)); !errors.Is(err, persistence.ErrInvalid) {
+			t.Errorf("ID %q: %v，期望 ErrInvalid", id, err)
+		}
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestSubrunStartConcurrentLimit：已有 3 个 sub-run 时并发启动第 4、第 5 个不同 ID，恰一个得到 subrun_limit。
+func TestSubrunStartConcurrentLimit(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	for i := 0; i < 5; i++ {
+		taskID := fmt.Sprintf("t%d", i)
+		fixture(t, s, taskID)
+		for _, id := range []string{"st1", "st2", "st3"} {
+			mustStartSubrun(t, s, taskID, "att-"+taskID, id)
+		}
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		for j, id := range []string{"st4", "st5"} {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, errs[j] = s.StartSubrun(ctx, taskID, "att-"+taskID, id, subrunDef("plan", nil))
+			}()
+		}
+		wg.Wait()
+		limited := 0
+		for _, err := range errs {
+			var rej *persistence.RejectedError
+			switch {
+			case err == nil:
+			case errors.As(err, &rej) && rej.Code == persistence.CodeSubrunLimit:
+				limited++
+			default:
+				t.Fatalf("%s: 意外错误 %v", taskID, err)
+			}
+		}
+		if limited != 1 || count(t, s, "SELECT count(*) FROM subruns WHERE task_id = $1", taskID) != 4 {
+			t.Fatalf("%s: %d 个 subrun_limit（期望 1），错误 %v", taskID, limited, errs)
+		}
+	}
+}
+
+// TestSubrunEndAndCancel：subrun_end 与取消请求经状态机转换：succeeded → end_proposed；deadline 取消后 cancelled →
+// timed_out；orchestrator 取消后 → cancelled；未请求取消时 cancelled 视为 orchestrator；failed 截断原因；
+// cancel_requested 上的 succeeded 为 invalid_transition；取消请求在 cancel_requested 与终态上幂等。
+func TestSubrunEndAndCancel(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	for _, id := range []string{"a", "b", "c", "d"} {
+		mustStartSubrun(t, s, "t1", "att-t1", id)
+	}
+	if r, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "a", "succeeded", "done"); err != nil || r.Status != subrun.EndProposed {
+		t.Fatalf("succeeded = %+v, %v", r, err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM subruns WHERE subrun_id = 'a' AND end_summary = 'done' AND ended_at IS NULL"); n != 1 {
+		t.Fatal("end_proposed 应保存 summary 且未结束")
+	}
+	_, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "a", "succeeded", "again")
+	expectRejected(t, err, persistence.CodeInvalidTransition)
+
+	if r, err := s.RequestSubrunCancel(ctx, "t1", "b", subrun.ReasonDeadline); err != nil || r.Status != subrun.CancelRequested || r.CancelReason != subrun.ReasonDeadline {
+		t.Fatalf("deadline 取消请求 = %+v, %v", r, err)
+	}
+	if r, err := s.RequestSubrunCancel(ctx, "t1", "b", subrun.ReasonOrchestrator); err != nil || r.CancelReason != subrun.ReasonDeadline {
+		t.Fatalf("重复取消请求应返回原记录：%+v, %v", r, err)
+	}
+	_, err = s.ProposeSubrunEnd(ctx, "t1", "att-t1", "b", "succeeded", "late")
+	expectRejected(t, err, persistence.CodeInvalidTransition)
+	if r, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "b", "cancelled", ""); err != nil || r.Status != subrun.TimedOut || r.EndedAt.IsZero() {
+		t.Fatalf("deadline 取消后 cancelled = %+v, %v，期望 timed_out", r, err)
+	}
+	if r, err := s.RequestSubrunCancel(ctx, "t1", "b", subrun.ReasonOrchestrator); err != nil || r.Status != subrun.TimedOut {
+		t.Fatalf("终态上的取消请求应幂等：%+v, %v", r, err)
+	}
+
+	if _, err := s.RequestSubrunCancel(ctx, "t1", "c", subrun.ReasonOrchestrator); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "c", "cancelled", ""); err != nil || r.Status != subrun.Cancelled {
+		t.Fatalf("orchestrator 取消后 cancelled = %+v, %v", r, err)
+	}
+	if r, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "c", "cancelled", ""); err != nil || r.Status != subrun.Cancelled {
+		t.Fatalf("终态的重复确认 = %+v, %v", r, err)
+	}
+
+	long := strings.Repeat("错", 100) // 300 字节
+	if r, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "a", "failed", long); err != nil || r.Status != subrun.Failed ||
+		len(r.FailureReason) > 256 || !strings.HasPrefix(long, r.FailureReason) || len(r.FailureReason) < 250 {
+		t.Fatalf("failed = %+v, %v，期望按 UTF-8 截断到 256 字节内", r, err)
+	}
+
+	if r, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "d", "cancelled", ""); err != nil || r.Status != subrun.Cancelled || r.CancelReason != subrun.ReasonOrchestrator {
+		t.Fatalf("未请求取消时 cancelled = %+v, %v，期望 orchestrator 取消", r, err)
+	}
+
+	if _, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "zz", "failed", ""); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("未知 sub-run = %v，期望 ErrNotFound", err)
+	}
+	if _, err := s.RequestSubrunCancel(ctx, "t1", "zz", subrun.ReasonOrchestrator); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("未知 sub-run 的取消 = %v，期望 ErrNotFound", err)
+	}
+	if _, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "a", "done", ""); !errors.Is(err, persistence.ErrInvalid) {
+		t.Fatalf("未知状态 = %v，期望 ErrInvalid", err)
+	}
+	if _, err := s.RequestSubrunCancel(ctx, "t1", "a", "whim"); !errors.Is(err, persistence.ErrInvalid) {
+		t.Fatalf("未知原因 = %v，期望 ErrInvalid", err)
+	}
+	_, err = s.ProposeSubrunEnd(ctx, "t1", "att-x", "a", "failed", "")
+	expectRejected(t, err, persistence.CodeStaleAttempt)
+
+	list, err := s.ListSubruns(ctx, "t1")
+	if err != nil || len(list) != 4 || list[0].SubrunID != "a" || list[3].SubrunID != "d" {
+		t.Fatalf("ListSubruns = %+v, %v", list, err)
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestSubrunCheckpointTx：checkpoint 列出 completed + result_ref 时 end_proposed → completed；cancel_requested 上
+// 列 completed 为 invalid_transition 且整个事务回滚（E41）；列出未知 ID 为 invalid_transition；started 为空转换。
+func TestSubrunCheckpointTx(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	for _, id := range []string{"a", "b", "c"} {
+		mustStartSubrun(t, s, "t1", "att-t1", id)
+	}
+	if _, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "a", "succeeded", "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RequestSubrunCancel(ctx, "t1", "b", subrun.ReasonOrchestrator); err != nil {
+		t.Fatal(err)
+	}
+	apply := func(entries ...protocol.CheckpointSubrun) error {
+		return subrunTx(s, func(ctx context.Context, tx pgx.Tx) error {
+			return applyCheckpointSubrunsTx(ctx, tx, "t1", entries)
+		})
+	}
+	// E41：一个合法转换与一个非法转换在同一 checkpoint 中，整体不提交。
+	err := apply(protocol.CheckpointSubrun{SubrunID: "a", Status: "completed", ResultRef: "sha-a"},
+		protocol.CheckpointSubrun{SubrunID: "b", Status: "completed", ResultRef: "sha-b"})
+	expectRejected(t, err, persistence.CodeInvalidTransition)
+	if got := subrunRow(t, s, "t1", "a"); got != "end_proposed|att-t1|-|||false" {
+		t.Fatalf("回滚后 a = %s", got)
+	}
+	err = apply(protocol.CheckpointSubrun{SubrunID: "zz", Status: "started"})
+	expectRejected(t, err, persistence.CodeInvalidTransition)
+	err = apply(protocol.CheckpointSubrun{SubrunID: "a", Status: "completed"})
+	expectRejected(t, err, persistence.CodeInvalidTransition)
+
+	if err := apply(protocol.CheckpointSubrun{SubrunID: "a", Status: "completed", ResultRef: "sha-a"},
+		protocol.CheckpointSubrun{SubrunID: "b", Status: "cancelled"},
+		protocol.CheckpointSubrun{SubrunID: "c", Status: "started"}); err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[string]string{
+		"a": "completed|att-t1|sha-a|||true",
+		"b": "cancelled|att-t1|-||orchestrator|true",
+		"c": "started|att-t1|-|||false",
+	} {
+		if got := subrunRow(t, s, "t1", id); got != want {
+			t.Errorf("%s = %s，期望 %s", id, got, want)
+		}
+	}
+	// 同一终态的重复确认可以；completed 的 result_ref 不能改。
+	if err := apply(protocol.CheckpointSubrun{SubrunID: "a", Status: "completed", ResultRef: "sha-a"}); err != nil {
+		t.Fatalf("重复确认：%v", err)
+	}
+	err = apply(protocol.CheckpointSubrun{SubrunID: "a", Status: "completed", ResultRef: "sha-other"})
+	expectRejected(t, err, persistence.CodeInvalidTransition)
+	if err := apply(protocol.CheckpointSubrun{SubrunID: "c", Status: "failed"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := subrunRow(t, s, "t1", "c"); !strings.HasPrefix(got, "failed|") || !strings.HasSuffix(got, "|true") {
+		t.Fatalf("checkpoint failed 后 c = %s", got)
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestSubrunRebindTx：恢复时 started 未过期 → 重新绑定；deadline 已过 → timed_out（E45）；cancel_requested →
+// cancelled（E40）；end_proposed → 回到 started 并重新绑定（E42）；终态不变。
+func TestSubrunRebindTx(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	for _, id := range []string{"a", "b", "c", "d"} {
+		mustStartSubrun(t, s, "t1", "att-t1", id)
+	}
+	if _, err := s.pool.Exec(ctx, "UPDATE subruns SET deadline_at = now() - interval '1s' WHERE subrun_id = 'b'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RequestSubrunCancel(ctx, "t1", "c", subrun.ReasonOrchestrator); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "d", "succeeded", "ok"); err != nil {
+		t.Fatal(err)
+	}
+	fixture(t, s, "t2")
+	mustStartSubrun(t, s, "t2", "att-t2", "x")
+	if _, err := s.ProposeSubrunEnd(ctx, "t2", "att-t2", "x", "failed", "bad"); err != nil {
+		t.Fatal(err)
+	}
+	retrySubrunTask(t, s, "t1")
+	retrySubrunTask(t, s, "t2")
+
+	var got []protocol.ResumeSubrun
+	if err := subrunTx(s, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		got, err = rebindSubrunsTx(ctx, tx, "t1", "att2-t1")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []protocol.ResumeSubrun{{SubrunID: "a", Status: "started"}, {SubrunID: "b", Status: "timed_out"},
+		{SubrunID: "c", Status: "cancelled"}, {SubrunID: "d", Status: "started"}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("rebind = %+v，期望 %+v", got, want)
+	}
+	for id, w := range map[string]string{
+		"a": "started|att2-t1|-|||false",
+		"b": "timed_out|att-t1|-||deadline|true",
+		"c": "cancelled|att-t1|-||orchestrator|true",
+		"d": "started|att2-t1|-|||false",
+	} {
+		if g := subrunRow(t, s, "t1", id); g != w {
+			t.Errorf("%s = %s，期望 %s", id, g, w)
+		}
+	}
+	// 重新绑定后旧 attempt 不能再用这个 sub-run 发起调用，新 attempt 可以。
+	if err := subrunTx(s, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := lockSubrunForCallTx(ctx, tx, "t1", "a", "att-t1")
+		return err
+	}); err == nil {
+		t.Fatal("旧 attempt 应得到 subrun_closed")
+	} else {
+		expectRejected(t, err, persistence.CodeSubrunClosed)
+	}
+	if again, err := s.StartSubrun(ctx, "t1", "att2-t1", "d", subrunDef("plan", nil)); err != nil || again.Status != subrun.Started {
+		t.Fatalf("恢复后以同定义重发 = %+v, %v", again, err)
+	}
+
+	var t2 []protocol.ResumeSubrun
+	if err := subrunTx(s, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		t2, err = rebindSubrunsTx(ctx, tx, "t2", "att2-t2")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(t2) != 1 || t2[0].Status != "failed" || subrunRow(t, s, "t2", "x") != "failed|att-t2|-|bad||true" {
+		t.Fatalf("终态应保持：%+v / %s", t2, subrunRow(t, s, "t2", "x"))
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestSubrunCloseOpenTx：cancelled 裁决把非终态置 cancelled（task_cancel）；succeeded 裁决置 failed
+// （not_completed_at_result）；其他裁决不改动；终态不受影响。
+func TestSubrunCloseOpenTx(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	for _, taskID := range []string{"t1", "t2", "t3"} {
+		fixture(t, s, taskID)
+		mustStartSubrun(t, s, taskID, "att-"+taskID, "open")
+		mustStartSubrun(t, s, taskID, "att-"+taskID, "done")
+		if _, err := s.ProposeSubrunEnd(ctx, taskID, "att-"+taskID, "done", "failed", "x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.RequestSubrunCancel(ctx, "t2", "open", subrun.ReasonDeadline); err != nil {
+		t.Fatal(err)
+	}
+	for taskID, v := range map[string]string{"t1": "cancelled", "t2": "succeeded", "t3": "failed"} {
+		if err := subrunTx(s, func(ctx context.Context, tx pgx.Tx) error { return closeOpenSubrunsTx(ctx, tx, taskID, v) }); err != nil {
+			t.Fatalf("%s: %v", taskID, err)
+		}
+	}
+	for key, want := range map[string]string{
+		"t1/open": "cancelled|att-t1|-|task_cancel|task_cancel|true",
+		"t2/open": "failed|att-t2|-|not_completed_at_result|deadline|true",
+		"t3/open": "started|att-t3|-|||false",
+		"t1/done": "failed|att-t1|-|x||true",
+		"t2/done": "failed|att-t2|-|x||true",
+	} {
+		taskID, id, _ := strings.Cut(key, "/")
+		if got := subrunRow(t, s, taskID, id); got != want {
+			t.Errorf("%s = %s，期望 %s", key, got, want)
+		}
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestSubrunCallLockAndBudget：lockSubrunForCallTx 只接受 started 且绑定当前 attempt 的 sub-run（end_proposed、
+// cancel_requested、未知 ID 均 subrun_closed）；sub-run 层账本的加锁与增量调整，负值被约束拒绝。
+func TestSubrunCallLockAndBudget(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	if _, err := s.StartSubrun(ctx, "t1", "att-t1", "a", subrunDef("plan", capOf(1000))); err != nil {
+		t.Fatal(err)
+	}
+	mustStartSubrun(t, s, "t1", "att-t1", "b")
+	mustStartSubrun(t, s, "t1", "att-t1", "c")
+	if _, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "b", "succeeded", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RequestSubrunCancel(ctx, "t1", "c", subrun.ReasonDeadline); err != nil {
+		t.Fatal(err)
+	}
+	lock := func(id, attemptID string) (subrun.Record, error) {
+		var r subrun.Record
+		err := subrunTx(s, func(ctx context.Context, tx pgx.Tx) error {
+			var err error
+			r, err = lockSubrunForCallTx(ctx, tx, "t1", id, attemptID)
+			return err
+		})
+		return r, err
+	}
+	if r, err := lock("a", "att-t1"); err != nil || r.Status != subrun.Started {
+		t.Fatalf("started = %+v, %v", r, err)
+	}
+	for _, id := range []string{"b", "c", "zz"} {
+		_, err := lock(id, "att-t1")
+		expectRejected(t, err, persistence.CodeSubrunClosed)
+	}
+
+	if err := subrunTx(s, func(ctx context.Context, tx pgx.Tx) error {
+		b, err := lockSubrunBudgetTx(ctx, tx, "t1", "a")
+		if err != nil {
+			return err
+		}
+		if b.Available() != 1000 {
+			return fmt.Errorf("可用 %d", b.Available())
+		}
+		if err := adjustSubrunBudgetTx(ctx, tx, "t1", "a", 300, 0, 0); err != nil {
+			return err
+		}
+		return adjustSubrunBudgetTx(ctx, tx, "t1", "a", -300, 200, 50)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := s.LoadSubrunBudget(ctx, "t1", "a"); err != nil || b.ReservedMicro != 0 || b.SpentMicro != 200 || b.UnknownMicro != 50 || b.Available() != 750 {
+		t.Fatalf("账本 = %+v, %v", b, err)
+	}
+	if err := subrunTx(s, func(ctx context.Context, tx pgx.Tx) error {
+		return adjustSubrunBudgetTx(ctx, tx, "t1", "a", -1, 0, 0)
+	}); err == nil {
+		t.Fatal("预留为负应被约束拒绝")
+	}
+	if err := subrunTx(s, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := lockSubrunBudgetTx(ctx, tx, "t1", "zz")
+		return err
+	}); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("未知 sub-run 的账本 = %v", err)
+	}
+	if _, err := s.LoadSubrunBudget(ctx, "t1", "zz"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("LoadSubrunBudget 未知 = %v", err)
 	}
 }
