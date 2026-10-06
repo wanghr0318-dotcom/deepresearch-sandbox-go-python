@@ -1362,6 +1362,33 @@ func TestSchedulerMemoryPressureEvictsLRUFrozen(t *testing.T) {
 }
 
 // 驱逐时限：idle 之后 EvictAfter → 驱逐；frozen 状态下到期直接 StopEnv，不调用 ThawEnv。
+// 真实验收（P13-T9）：冻结 → 新消息唤醒（thaw）→ turn 结束 → 再次空闲到时限，应重新 quiesce 并再次冻结；上一轮遗留的
+// Quiesced 标志曾使 quiesce 被跳过、判为 quiesce_failed 而驱逐（每个被唤醒过的会话第二次空闲都会被驱逐）。
+func TestActorRefreezesAfterThaw(t *testing.T) {
+	h := newHarness(t)
+	g := h.idleSession("s1")
+	h.advanceUntil("frozen", 30*time.Second, h.is("s1", StatusFrozen))
+	h.st.with("s1", func(s *fkSession) {
+		s.st.NonTerminalTurns = append(s.st.NonTerminalTurns, TurnFact{TaskID: "t2", Status: "queued", TurnIndex: 1})
+	})
+	g2 := h.grant("s1", "t2")
+	if g2 != g || h.log.count("thaw:"+g.EnvID) != 1 {
+		t.Fatalf("唤醒应 thaw 同一 incarnation：%+v；日志: %v", g2, h.log.all())
+	}
+	h.st.startTurn(t, "s1", "t2", g2)
+	h.st.verdict("s1", "t2", "succeeded")
+	if r := h.handoff("s1", Handoff{TaskID: "t2", AttemptID: "a-2", EnvID: g2.EnvID, Verdict: "succeeded"}); !r.Recorded {
+		t.Fatalf("释放应报告 Recorded：%+v", r)
+	}
+	h.waitFor("会话回到 idle", h.is("s1", StatusIdle))
+	h.advanceUntil("再次 frozen", 30*time.Second, func() bool {
+		return h.is("s1", StatusFrozen)() || h.is("s1", StatusEvicted)()
+	})
+	if !h.is("s1", StatusFrozen)() || h.log.count("quiesce:"+g.IncarnationID) != 2 || h.log.count("freeze:"+g.EnvID) != 2 {
+		t.Fatalf("第二次空闲应重新 quiesce 并冻结；incarnation %+v；日志: %v", h.st.incarnation(g.IncarnationID), h.log.all())
+	}
+}
+
 func TestActorEvictAfterFromFrozenWithoutThaw(t *testing.T) {
 	h := newHarness(t)
 	g := h.idleSession("s1")

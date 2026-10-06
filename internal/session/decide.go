@@ -419,6 +419,11 @@ func (d *decider) opDone(e OpDone) error {
 		}
 	case OpThaw:
 		d.s.ThawFail = e.Failed != nil
+		if e.Failed == nil {
+			// 唤醒后 Worker 会继续运行 turn：上一次 quiesce 的结果作废，下次空闲须重新 quiesce（否则 stepQuiescing
+			// 跳过 quiesce 并判为 quiesce_failed 而驱逐）。
+			d.s.Quiesced = false
+		}
 	case OpRelease:
 		if len(d.s.Handoffs) == 0 {
 			return invalid("没有待处理的交还时收到释放结果")
