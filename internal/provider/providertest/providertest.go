@@ -29,6 +29,9 @@ type Harness struct {
 	// BlockStart 使 envID 上的下一次 StartExec 在登记在途启动之后、发送 start 之前阻塞；
 	// blocked 在阻塞发生时关闭，release 放行。
 	BlockStart func(t *testing.T, p provider.Provider, envID string) (blocked <-chan struct{}, release func())
+	// ExecSpec 返回 exec 环境的 spec（Mounts.In 为空，由 provider 建立 InDir）。为 nil 时（实现不支持 exec 环境）
+	// 不运行 exec 环境的用例。
+	ExecSpec func(envID string) provider.EnvSpec
 }
 
 const wait = 10 * time.Second
@@ -186,6 +189,44 @@ func Run(t *testing.T, h Harness) {
 			t.Fatalf("Destroy 后 ResourceDiag 应为 ErrNotFound，得到 %v", err)
 		}
 	})
+	t.Run("OpenOutputs 对编排环境报错、未知环境为 ErrNotFound", func(t *testing.T) {
+		p, ctx := h.New(t), context.Background()
+		create(t, p, h.Spec("env-a"))
+		if err := p.Stop(ctx, "env-a"); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+		files, _, err := p.OpenOutputs(ctx, "env-a", provider.MaxOutputFiles)
+		if err == nil || errors.Is(err, provider.ErrNotStopped) || len(files) != 0 {
+			t.Fatalf("编排环境的 OpenOutputs 应报错（非 ErrNotStopped），得到 %d 个文件、%v", len(files), err)
+		}
+		if _, _, err := p.OpenOutputs(ctx, "missing", provider.MaxOutputFiles); !errors.Is(err, provider.ErrNotFound) {
+			t.Fatalf("未知环境的 OpenOutputs 应为 ErrNotFound，得到 %v", err)
+		}
+		stopDestroy(t, p, "env-a")
+	})
+	if h.ExecSpec != nil {
+		t.Run("exec 环境：InDir 幂等，OpenOutputs 要求先停止", func(t *testing.T) {
+			p, ctx := h.New(t), context.Background()
+			info := create(t, p, h.ExecSpec("env-x"))
+			if info.InDir == "" || info.Kind != provider.KindExec {
+				t.Fatalf("exec 环境应返回 InDir：%+v", info)
+			}
+			if again, err := p.Create(ctx, h.ExecSpec("env-x")); err != nil || again.InDir != info.InDir {
+				t.Fatalf("幂等 Create 应返回同一 InDir：%+v %v（原 %q）", again, err, info.InDir)
+			}
+			if _, _, err := p.OpenOutputs(ctx, "env-x", provider.MaxOutputFiles); !errors.Is(err, provider.ErrNotStopped) {
+				t.Fatalf("停止前 OpenOutputs 应为 ErrNotStopped，得到 %v", err)
+			}
+			if err := p.Stop(ctx, "env-x"); err != nil {
+				t.Fatalf("Stop: %v", err)
+			}
+			files, skipped, err := p.OpenOutputs(ctx, "env-x", provider.MaxOutputFiles)
+			if err != nil || len(files) != 0 || len(skipped) != 0 {
+				t.Fatalf("停止后空 /out 的 OpenOutputs = %d、%v、%v", len(files), skipped, err)
+			}
+			stopDestroy(t, p, "env-x")
+		})
+	}
 }
 
 func create(t *testing.T, p provider.Provider, s provider.EnvSpec) provider.EnvInfo {

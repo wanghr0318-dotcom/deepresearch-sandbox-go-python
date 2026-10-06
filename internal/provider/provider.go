@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"syscall"
 	"time"
 )
@@ -91,7 +92,31 @@ type EnvInfo struct {
 	Kind     EnvKind
 	Complete bool // 各层齐全且 init 就绪；false 即 Create 会返回 ErrIncomplete 的残留
 	Running  bool // 环境 cgroup 存在且 populated 为 1
+	// InDir 只对 exec 环境且 Mounts.In 为空时非空：provider 建立的输入暂存目录（宿主路径，root 0755），
+	// 调用方在 StartExec 之前写入（文件 0444、目录 0755），沙箱内只读可见于 /in。幂等 Create 返回同一路径。
+	InDir string
 }
+
+// MaxOutputFiles 是 exec /out 收集的文件上限（规格 §10.2、§19）。
+const MaxOutputFiles = 256
+
+// OutputFile 是 /out 中一个已打开的普通文件（O_RDONLY|O_NOFOLLOW，按规格 §5.6 的规则打开）。调用方负责关闭。
+type OutputFile struct {
+	Path string // 相对 /out 的规范路径，例如 "a/b.txt"
+	Size int64  // 打开后 fstat 得到的大小
+	File *os.File
+}
+
+// SkippedOutput 是 /out 中未收集的条目。Reason 取值见 Skip* 常量。
+type SkippedOutput struct{ Path, Reason string }
+
+// SkippedOutput.Reason 的取值。
+const (
+	SkipSymlink    = "symlink"     // 符号链接（不跟随）
+	SkipNotRegular = "not_regular" // FIFO、设备、socket 等
+	SkipTooMany    = "too_many"    // 普通文件超过上限
+	SkipOpenFailed = "open_failed" // 打开或 fstat 失败（例如收集期间被替换）
+)
 
 // Owner 是扫描项的归属分类（规格 §14.1 扫描表）。
 type Owner int
@@ -125,6 +150,9 @@ type Provider interface {
 	List(ctx context.Context) ([]EnvInfo, error)
 	Scan(ctx context.Context) (ScanReport, error)
 	ResourceDiag(ctx context.Context, envID string) (ResourceDiag, error)
+	// OpenOutputs 打开 exec 环境 /out 下的普通文件（递归、按路径字典序、至多 max 个）。环境须已确认停止，
+	// 否则 ErrNotStopped；非 exec 环境返回错误；环境不存在为 ErrNotFound。出错时不留下已打开的文件。
+	OpenOutputs(ctx context.Context, envID string, max int) ([]OutputFile, []SkippedOutput, error)
 }
 
 // 错误（契约第 4 节）。ErrNotFound 只说明本次操作需要的那一层资源不存在，不说明其他层是否已清理。
@@ -137,7 +165,7 @@ var (
 	ErrStartFailed     = errors.New("provider: 启动失败，workload 未运行")
 	ErrControlLost     = errors.New("provider: 控制连接断开") // ACK 前：启动结果未知；ACK 后（Wait）：退出状态未知
 	ErrStopUnconfirmed = errors.New("provider: 期限内未确认执行树清空")
-	ErrNotStopped      = errors.New("provider: 环境尚未确认停止")
+	ErrNotStopped      = errors.New("provider: 环境尚未确认停止") // Destroy、OpenOutputs 的前置条件不成立
 )
 
 // StartError 是 init 回复的 start_err：启动序列某步失败，workload 未运行。Reason 的取值由
@@ -174,6 +202,9 @@ func (s EnvSpec) Validate() error {
 	case KindExec:
 		if s.Mounts.Workspace != "" || s.Mounts.GatewaySocket != "" {
 			return errors.New("provider: exec 环境不能有 workspace 或 Gateway socket")
+		}
+		if s.Mounts.OutBytes <= 0 {
+			return errors.New("provider: exec 环境须给出 /out 的大小（OutBytes）")
 		}
 	default:
 		return fmt.Errorf("provider: 未知的环境类型 %q", s.Kind)

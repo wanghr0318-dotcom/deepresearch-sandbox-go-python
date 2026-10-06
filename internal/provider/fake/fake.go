@@ -6,7 +6,13 @@ package fake
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -35,7 +41,8 @@ type env struct {
 	running  map[*handle]struct{}
 	diag     provider.ResourceDiag
 	block    *startBlock
-	stopErr  error // 注入：Stop 返回该错误
+	stopErr  error  // 注入：Stop 返回该错误
+	dir      string // 仅 exec：临时目录，其下 in/（Mounts.In 为空时）与 out/ 模拟 /in 暂存与宿主侧 /out
 }
 
 type startBlock struct {
@@ -68,8 +75,34 @@ func (p *Provider) Create(_ context.Context, spec provider.EnvSpec) (provider.En
 		return p.info(e), nil
 	}
 	e := &env{spec: spec, hash: hash, complete: true, open: true, running: make(map[*handle]struct{})}
+	if spec.Kind == provider.KindExec {
+		dir, err := makeExecDir(spec)
+		if err != nil {
+			return provider.EnvInfo{}, err
+		}
+		e.dir = dir
+	}
 	p.envs[spec.EnvID] = e
 	return p.info(e), nil
+}
+
+// makeExecDir 建立 exec 环境的临时目录：out/ 总是建立，in/ 只在调用方未提供 Mounts.In 时建立。
+func makeExecDir(spec provider.EnvSpec) (string, error) {
+	dir, err := os.MkdirTemp("", "agentbox-fake-exec-")
+	if err != nil {
+		return "", fmt.Errorf("fake: exec 环境目录: %w", err)
+	}
+	sub := []string{"out"}
+	if spec.Mounts.In == "" {
+		sub = append(sub, "in")
+	}
+	for _, s := range sub {
+		if err := os.Mkdir(filepath.Join(dir, s), 0o755); err != nil {
+			_ = os.RemoveAll(dir) // 尽力清理；Create 已失败
+			return "", fmt.Errorf("fake: exec 环境目录: %w", err)
+		}
+	}
+	return dir, nil
 }
 
 // StartExec 实现契约第 3 节与第 5 节：闸门锁内检查并登记在途启动，"发送"在锁外。
@@ -160,8 +193,100 @@ func (p *Provider) Destroy(_ context.Context, envID string) error {
 	case !e.stopped: // 前置条件只能是 Stop 的权威检查成立，"当前没有进程"不算
 		return provider.ErrNotStopped
 	}
+	if e.dir != "" {
+		if err := os.RemoveAll(e.dir); err != nil {
+			return fmt.Errorf("fake: 删除 exec 环境目录: %w", err)
+		}
+	}
 	delete(p.envs, envID)
 	return nil
+}
+
+// OutDir 返回 exec 环境模拟 /out 的宿主目录（测试的 Program 在其中写输出）；非 exec 或不存在时为空。
+func (p *Provider) OutDir(envID string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.envs[envID]; ok && e.dir != "" {
+		return filepath.Join(e.dir, "out")
+	}
+	return ""
+}
+
+// OpenOutputs 实现契约：要求 Stop 的权威检查成立；按路径字典序收集 out/ 下的普通文件，至多 max 个；
+// 符号链接、非普通文件与超额的普通文件记入跳过列表（分类与 provider/local 相同，但不做 openat2 级别的防护：
+// fake 只供测试，没有不可信的写入者）。
+func (p *Provider) OpenOutputs(ctx context.Context, envID string, max int) ([]provider.OutputFile, []provider.SkippedOutput, error) {
+	p.mu.Lock()
+	e, ok := p.envs[envID]
+	var dir string
+	var stopped, foreign bool
+	if ok {
+		dir, stopped, foreign = e.dir, e.stopped, e.foreign
+	}
+	p.mu.Unlock()
+	switch {
+	case !ok:
+		return nil, nil, provider.ErrNotFound
+	case foreign:
+		return nil, nil, provider.ErrForeign
+	case dir == "":
+		return nil, nil, errors.New("fake: 不是 exec 环境，没有 /out")
+	case !stopped:
+		return nil, nil, provider.ErrNotStopped
+	}
+	out := filepath.Join(dir, "out")
+	type entry struct {
+		rel  string
+		mode fs.FileMode
+	}
+	var ents []entry
+	err := filepath.WalkDir(out, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return ctx.Err()
+		}
+		rel, err := filepath.Rel(out, path)
+		if err != nil {
+			return err
+		}
+		ents = append(ents, entry{filepath.ToSlash(rel), d.Type()})
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	sort.Slice(ents, func(i, j int) bool { return ents[i].rel < ents[j].rel })
+	var files []provider.OutputFile
+	var skipped []provider.SkippedOutput
+	skip := func(rel, reason string) {
+		skipped = append(skipped, provider.SkippedOutput{Path: rel, Reason: reason})
+	}
+	for _, en := range ents {
+		switch {
+		case en.mode&fs.ModeSymlink != 0:
+			skip(en.rel, provider.SkipSymlink)
+		case !en.mode.IsRegular():
+			skip(en.rel, provider.SkipNotRegular)
+		case len(files) >= max:
+			skip(en.rel, provider.SkipTooMany)
+		default:
+			f, err := os.Open(filepath.Join(out, filepath.FromSlash(en.rel)))
+			if err != nil {
+				skip(en.rel, provider.SkipOpenFailed)
+				continue
+			}
+			fi, err := f.Stat()
+			if err != nil {
+				_ = f.Close() // 已按 open_failed 跳过，关闭错误无关紧要
+				skip(en.rel, provider.SkipOpenFailed)
+				continue
+			}
+			files = append(files, provider.OutputFile{Path: en.rel, Size: fi.Size(), File: f})
+		}
+	}
+	return files, skipped, nil
 }
 
 // List 报告本安装的环境。
@@ -253,7 +378,11 @@ func (p *Provider) SetDiag(envID string, d provider.ResourceDiag) {
 }
 
 func (p *Provider) info(e *env) provider.EnvInfo {
-	return provider.EnvInfo{EnvID: e.spec.EnvID, Kind: e.spec.Kind, Complete: e.complete && e.open, Running: len(e.running) > 0}
+	info := provider.EnvInfo{EnvID: e.spec.EnvID, Kind: e.spec.Kind, Complete: e.complete && e.open, Running: len(e.running) > 0}
+	if e.dir != "" && e.spec.Mounts.In == "" {
+		info.InDir = filepath.Join(e.dir, "in")
+	}
+	return info
 }
 
 // ---- 执行句柄 ----

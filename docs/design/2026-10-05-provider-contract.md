@@ -166,3 +166,15 @@ ResourceDiag(ctx, envID string) (ResourceDiag, error)
 1. `Create` 只把完整且 init 就绪的环境作为成功返回；同名残留为 `ErrIncomplete`，由 coordinator 清理后重建；无 owner.json 的目录不认领，进入扫描与隔离流程（第 3 节）。
 2. 删除"`ErrNotFound` 视为已停止/已清理"；停止与清理完成只由 `Stop` 的权威检查与 `Destroy` 的逐层核对确认（第 3、4 节）。
 3. 固定执行与停止的并发边界：provider 内的执行闸门、仲裁顺序、停止后无迟到进程、未确认停止不能清理或归还，以及确定性的"start 在途时 stop"测试（第 5 节）。
+
+## 9. 执行中修订（Plan 15）
+
+Plan 15（独立 exec 沙箱，规格 §10）对 exec 环境补充以下契约，决定见计划的 D1、D2、D5：
+
+- **`EnvSpec.Validate`**：exec 环境须给出 `Mounts.OutBytes > 0`；`Mounts.In` 可以为空（由 provider 建立输入暂存目录）。
+- **`EnvInfo.InDir`**：只对 exec 环境且 `Mounts.In` 为空时非空，是 provider 建立的输入暂存目录 `<data>/envs/<env_id>/in` 的宿主路径（root 属主、0755）。调用方在 `StartExec` 之前写入（文件 0444、目录 0755），沙箱内只读可见于 `/in`。幂等 `Create`（完整且 spec 一致）返回同一路径；目录随环境目录由 `Destroy` 删除。
+- **环境目录权限**：`<data>/envs` 为 0711；exec 环境的目录为 0711（init 在 user namespace 中以映射 root 运行，只有"其他人"的权限，须能经过它们到达 `in/` 与 `out/`；数据目录本身由装配以 0711 建立），`owner.json` 仍 0600；编排环境的目录仍 0700。
+- **宿主侧 `/out`**：`Create` 在写 owner.json 之后、启动 init 之前建立 `<envdir>/out` 并挂载 tmpfs（`size=OutBytes,nr_inodes=1024,mode=0700,uid=gid=UIDBase+1000`，`nosuid,nodev`），init 把它可写 bind 到沙箱内的 `/out`。页面按写入者计入环境 cgroup（与匿名内存合计受 `memory.max` 约束）。挂载之后的任何失败都使环境成为残留（`ErrIncomplete`），由 `Stop` → `Destroy` 清理。执行树停止后挂载仍在，`/out` 的内容可供收集。`Scan` 把它作为该环境的 `mount` 层报告，不新增层。
+- **`OpenOutputs(ctx, envID, max) ([]OutputFile, []SkippedOutput, error)`**：前置条件是 `Stop` 的权威检查成立（否则 `ErrNotStopped`）；环境目录不存在 → `ErrNotFound`；归属无法证明 → `ErrForeign`；编排环境（没有 `/out`）→ 错误。从 `<envdir>/out` 的目录 FD 起逐级以 `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_XDEV)` 解析：子目录 `O_DIRECTORY|O_NOFOLLOW`，文件 `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` 后 `fstat` 须为普通文件（规格 §5.6 的打开规则）。递归、按相对路径字典序；收集至多 `max` 个普通文件（`MaxOutputFiles = 256`），其余条目报告为跳过：`symlink`、`not_regular`（FIFO、设备、socket）、`too_many`（超过 `max` 的普通文件）、`open_failed`。返回的文件由调用方关闭；出错时不留下已打开的文件。
+- **`Destroy` 的卸载顺序**：不变——数据目录下的挂载（含 `<envdir>/out` 的 tmpfs，深者先卸）→ 环境 cgroup → 环境目录。`OpenOutputs` 返回的文件仍打开时 tmpfs 卸载失败（`EBUSY`），`Destroy` 返回该宿主错误且不触碰后续各层；**调用方须先关闭全部输出文件再 `Destroy`**，之后重做即可。
+- **一致性测试**：`providertest` 增加"`OpenOutputs` 对编排环境报错、未知环境为 `ErrNotFound`"，以及（`Harness.ExecSpec` 非空时）"exec 环境 `InDir` 幂等、`OpenOutputs` 要求先停止"。fake 以临时目录模拟 `InDir` 与 `/out`（`OutDir(envID)` 供测试写入输出）。

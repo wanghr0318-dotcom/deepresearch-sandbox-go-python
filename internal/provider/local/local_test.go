@@ -564,6 +564,10 @@ func newProviderWith(t *testing.T, installID string, starter EnvStarter) *Provid
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 与装配相同（app 以 0711 建立数据目录）：exec 环境的 init 须经过它到达 /in 与 /out 的宿主目录。
+	if err := os.Chmod(data, 0o711); err != nil {
+		t.Fatal(err)
+	}
 	p, err := New(Options{DataDir: data, CgroupRoot: root, InstallID: installID, Starter: starter})
 	if err != nil {
 		t.Fatal(err)
@@ -581,6 +585,7 @@ func newProviderWith(t *testing.T, installID string, starter EnvStarter) *Provid
 			_ = p.Stop(ctx, id)
 		}
 		killRemove(p.installCgroup())
+		_ = unmountUnder(p.dataDir) // 失败用例留下的 exec /out tmpfs；尽力而为
 		_ = os.RemoveAll(data)
 	})
 	return p
@@ -592,6 +597,14 @@ func testEnvSpec(installID, envID string) provider.EnvSpec {
 		UIDBase: 100000, UIDSize: 4096, Template: rootfs.DefaultTemplateName, // 测试 init 忽略模板内容；名称须可解析
 		Limits: provider.Limits{MemoryMax: 256 << 20, PidsMax: 512, CPUQuotaUs: 100000},
 	}
+}
+
+// testExecSpec 是 exec 环境的 spec：exec 模板、不提供 /in（provider 建立 InDir）、/out 1 MiB。
+func testExecSpec(installID, envID string) provider.EnvSpec {
+	s := testEnvSpec(installID, envID)
+	s.Kind, s.Template, s.UIDBase = provider.KindExec, rootfs.ExecTemplateName, 400000
+	s.Mounts = provider.Mounts{OutBytes: 1 << 20}
+	return s
 }
 
 // blockStart 让 envID 上的下一次 StartExec 在登记在途启动之后、发送 start 之前阻塞（beforeSend 钩子）。
@@ -644,6 +657,7 @@ func TestLocalContract(t *testing.T) {
 		BlockStart: func(t *testing.T, p provider.Provider, envID string) (<-chan struct{}, func()) {
 			return blockStart(t, p.(*Provider), envID)
 		},
+		ExecSpec: func(envID string) provider.EnvSpec { return testExecSpec(install, envID) },
 	})
 }
 
@@ -1194,17 +1208,19 @@ func TestLocalContractProductionStarter(t *testing.T) {
 		BlockStart: func(t *testing.T, p provider.Provider, envID string) (<-chan struct{}, func()) {
 			return blockStart(t, p.(*Provider), envID)
 		},
+		ExecSpec: func(envID string) provider.EnvSpec { return testExecSpec(install, envID) },
 	})
 }
 
 // TestLaunchSpecForFillsInit：生产启动器把 EnvSpec 的 Limits/Mounts/Template 填入 LaunchSpec.Init（规格 §4.5）；
 // 规格未给出时取默认值（nofile 1024、/tmp 64 MiB、默认模板）；未知模板名报错。不需要 root。
 func TestLaunchSpecForFillsInit(t *testing.T) {
-	ls, err := launchSpecFor(provider.EnvSpec{
+	ex := provider.EnvSpec{
 		EnvID: "e1", Kind: provider.KindExec, UIDBase: 100000, UIDSize: 4096,
 		Limits: provider.Limits{NoFile: 256, FSize: 1 << 20, TmpBytes: 8 << 20},
 		Mounts: provider.Mounts{In: "/srv/in", OutBytes: 4 << 20},
-	})
+	}
+	ls, err := launchSpecFor(ex, "/d/envs/e1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1212,22 +1228,32 @@ func TestLaunchSpecForFillsInit(t *testing.T) {
 	if ls.GIDBase != 100000 || ls.GIDSize != 4096 || ls.Hostname != envHostname {
 		t.Fatalf("LaunchSpec = %+v", ls)
 	}
-	if in.Kind != "exec" || in.NoFile != 256 || in.FSize != 1<<20 || in.TmpBytes != 8<<20 || in.In != "/srv/in" || in.OutBytes != 4<<20 {
+	if in.Kind != "exec" || in.NoFile != 256 || in.FSize != 1<<20 || in.TmpBytes != 8<<20 || in.In != "/srv/in" || in.OutBytes != 4<<20 ||
+		in.Out != "/d/envs/e1/out" {
 		t.Fatalf("Init = %+v", in)
 	}
 	if len(in.Template.Paths) == 0 {
 		t.Fatal("默认模板未解析")
 	}
+	// 不提供 /in：使用 provider 建立的 <envdir>/in（D2）；exec 模板按名称解析。
+	ex.Mounts.In, ex.Template = "", rootfs.ExecTemplateName
+	if ls, err = launchSpecFor(ex, "/d/envs/e1"); err != nil || ls.Init.In != "/d/envs/e1/in" || ls.Init.Out != "/d/envs/e1/out" {
+		t.Fatalf("Init = %+v, %v", ls.Init, err)
+	}
+	if !reflect.DeepEqual(ls.Init.Template.Paths, rootfs.ExecTemplate().Paths) {
+		t.Fatalf("exec 模板未解析：%v", ls.Init.Template.Paths)
+	}
 
 	ls, err = launchSpecFor(provider.EnvSpec{Kind: provider.KindTask, UIDBase: 100000, UIDSize: 4096,
-		Mounts: provider.Mounts{Workspace: "/var/ws", GatewaySocket: "/run/gw.sock"}})
+		Mounts: provider.Mounts{Workspace: "/var/ws", GatewaySocket: "/run/gw.sock"}}, "/d/envs/t1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ls.Init.NoFile != defaultNoFile || ls.Init.TmpBytes != defaultTmpBytes || ls.Init.Workspace != "/var/ws" || ls.Init.GatewaySocket != "/run/gw.sock" {
-		t.Fatalf("默认值未填充：%+v", ls.Init)
+	if ls.Init.NoFile != defaultNoFile || ls.Init.TmpBytes != defaultTmpBytes || ls.Init.Workspace != "/var/ws" || ls.Init.GatewaySocket != "/run/gw.sock" ||
+		ls.Init.In != "" || ls.Init.Out != "" {
+		t.Fatalf("默认值未填充或编排环境带了 /in、/out：%+v", ls.Init)
 	}
-	if _, err := launchSpecFor(provider.EnvSpec{Kind: provider.KindTask, UIDBase: 100000, UIDSize: 4096, Template: "no-such"}); err == nil {
+	if _, err := launchSpecFor(provider.EnvSpec{Kind: provider.KindTask, UIDBase: 100000, UIDSize: 4096, Template: "no-such"}, "/d"); err == nil {
 		t.Fatal("未知模板应报错")
 	}
 }
@@ -1376,4 +1402,321 @@ func TestPrepareWorkspace(t *testing.T) {
 	if err := syscall.Stat(outside, &st); err != nil || st.Uid != 0 {
 		t.Fatalf("符号链接的目标 %s 被改变属主（%d，%v）", outside, st.Uid, err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Plan 15 Task 2：exec 环境的 /in 暂存、宿主侧 /out 与 OpenOutputs（规格 §10.2，D1、D2）。生产启动路径
+// （真实 init + stage-2 helper）、exec 模板；需要 root 与宿主 /usr/bin/python3。
+
+// newExecEnv 返回走生产启动路径的 Provider 与 exec 环境的 spec（exec 模板、Mounts{OutBytes: 1 MiB}）。
+func newExecEnv(t *testing.T) (*Provider, provider.EnvSpec) {
+	t.Helper()
+	requireRoot(t)
+	if err := rootfs.ExecTemplate().EnsureExec(); err != nil {
+		t.Fatalf("宿主上的 exec 模板不可用: %v", err)
+	}
+	st, err := NewProcessStarter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.initEnv = []string{envRealInit + "=1"}
+	install := "x" + randHex(4)
+	p := newProviderWith(t, install, st)
+	spec := testExecSpec(install, "env-x")
+	spec.Limits.NoFile, spec.Limits.FSize = 256, 64<<20
+	return p, spec
+}
+
+// execEnv 是 exec 请求的固定执行环境（Plan 15 Global Constraints）。
+var execEnv = []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/tmp", "LANG=C.UTF-8", "PYTHONDONTWRITEBYTECODE=1", "PYTHONUNBUFFERED=1"}
+
+// stageMain 把 code 写入 <inDir>/.agentbox/main.py（目录 0755、文件 0444，root 属主）。
+func stageMain(t *testing.T, inDir, code string) {
+	t.Helper()
+	dir := filepath.Join(inDir, ".agentbox")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte(code), 0o444); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// runMain 以 exec 的固定形式（python3 -I -B /in/.agentbox/main.py，cwd /out，stdin 立即关闭）运行，返回 stdout、
+// stderr 与退出状态。
+func runMain(ctx context.Context, t *testing.T, p *Provider, envID string) (string, string, provider.ExitStatus) {
+	t.Helper()
+	h, err := p.StartExec(ctx, envID, provider.ExecSpec{ExecID: "main", Argv: []string{"python3", "-I", "-B", "/in/.agentbox/main.py"},
+		Env: execEnv, Dir: "/out"})
+	if err != nil {
+		t.Fatalf("StartExec: %v", err)
+	}
+	if err := h.Stdin().Close(); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	errDone := make(chan struct{})
+	go func() { _, _ = io.Copy(&stderr, h.Stderr()); close(errDone) }()
+	out, err := io.ReadAll(h.Stdout())
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-errDone
+	es, err := h.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v（stderr %q）", err, stderr.String())
+	}
+	return string(out), stderr.String(), es
+}
+
+const execInOutScript = `
+import errno, os
+print(open('/in/data/x.csv').read().strip())
+os.makedirs('/out/r')
+with open('/out/r/a.txt', 'w') as f:
+    f.write('result-a')
+os.symlink('/etc/passwd', '/out/l')
+os.mkfifo('/out/f')
+os.makedirs('/out/x')
+for i in range(300):
+    open('/out/x/%03d' % i, 'w').close()
+for probe, fn in (('opt', lambda: os.listdir('/opt/agentbox')), ('in', lambda: open('/in/w', 'w'))):
+    try:
+        fn()
+        print(probe, 'ok')
+    except OSError as e:
+        print(probe, errno.errorcode[e.errno])
+`
+
+// TestExecEnvInOut：exec 环境的 /in 暂存与宿主侧 /out（§10.2，D1、D2）。
+func TestExecEnvInOut(t *testing.T) {
+	p, spec := newExecEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	info, err := p.Create(ctx, spec)
+	if err != nil || !info.Complete {
+		t.Fatalf("Create = %+v, %v", info, err)
+	}
+	envDir := p.envDir(spec.EnvID)
+	if info.InDir != filepath.Join(envDir, "in") {
+		t.Fatalf("InDir = %q，期望 %s/in", info.InDir, envDir)
+	}
+	for path, want := range map[string]uint32{envDir: 0o711, info.InDir: 0o755, filepath.Join(envDir, "owner.json"): 0o600} {
+		var st syscall.Stat_t
+		if err := syscall.Lstat(path, &st); err != nil {
+			t.Fatal(err)
+		}
+		if st.Mode&0o7777 != want || st.Uid != 0 || st.Gid != 0 {
+			t.Errorf("%s：权限 %#o、属主 %d:%d，期望 %#o、root", path, st.Mode&0o7777, st.Uid, st.Gid, want)
+		}
+	}
+	stageMain(t, info.InDir, execInOutScript)
+	if err := os.Mkdir(filepath.Join(info.InDir, "data"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(info.InDir, "data", "x.csv"), []byte("1,2\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, es := runMain(ctx, t, p, spec.EnvID)
+	if es.Code != 0 || es.Signal != 0 {
+		t.Fatalf("workload = %+v；stderr %q", es, stderr)
+	}
+	if want := "1,2\nopt ENOENT\nin EROFS\n"; stdout != want {
+		t.Fatalf("stdout = %q，期望 %q（stderr %q）", stdout, want, stderr)
+	}
+	if _, _, err := p.OpenOutputs(ctx, spec.EnvID, provider.MaxOutputFiles); !errors.Is(err, provider.ErrNotStopped) {
+		t.Fatalf("Stop 之前 OpenOutputs = %v，期望 ErrNotStopped", err)
+	}
+	if err := p.Stop(ctx, spec.EnvID); err != nil {
+		t.Fatal(err)
+	}
+
+	files, skipped, err := p.OpenOutputs(ctx, spec.EnvID, provider.MaxOutputFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeAll := func() {
+		for _, f := range files {
+			_ = f.File.Close() // 只读文件，关闭错误无关紧要
+		}
+		files = nil
+	}
+	defer closeAll()
+	// 字典序：f、l、r/a.txt、x/000…x/299。普通文件中 r/a.txt 与 x/000…x/254 共 256 个被收集。
+	if len(files) != provider.MaxOutputFiles {
+		t.Fatalf("收集 %d 个文件，期望 %d", len(files), provider.MaxOutputFiles)
+	}
+	if files[0].Path != "r/a.txt" || files[0].Size != int64(len("result-a")) {
+		t.Fatalf("第一个输出 = %+v", files[0])
+	}
+	if b, err := io.ReadAll(files[0].File); err != nil || string(b) != "result-a" {
+		t.Fatalf("r/a.txt 内容 = %q, %v", b, err)
+	}
+	for i, f := range files[1:] {
+		if want := fmt.Sprintf("x/%03d", i); f.Path != want || f.Size != 0 {
+			t.Fatalf("第 %d 个输出 = %+v，期望 %s", i+1, f, want)
+		}
+	}
+	wantSkipped := []provider.SkippedOutput{{Path: "f", Reason: provider.SkipNotRegular}, {Path: "l", Reason: provider.SkipSymlink}}
+	for i := 255; i < 300; i++ {
+		wantSkipped = append(wantSkipped, provider.SkippedOutput{Path: fmt.Sprintf("x/%03d", i), Reason: provider.SkipTooMany})
+	}
+	if !reflect.DeepEqual(skipped, wantSkipped) {
+		t.Fatalf("跳过 = %v，期望 %v", skipped, wantSkipped)
+	}
+
+	// 已停止的环境不完整：同 spec 的 Create 为 ErrIncomplete（不补完）；完整时的幂等见 TestExecEnvInDirIdempotent。
+	if _, err := p.Create(ctx, spec); !errors.Is(err, provider.ErrIncomplete) {
+		t.Fatalf("停止后再次 Create = %v，期望 ErrIncomplete", err)
+	}
+	// 输出文件打开期间 /out 的 tmpfs 无法卸载：调用方须先关闭全部输出再 Destroy（契约"执行中修订（Plan 15）"）。
+	if err := p.Destroy(ctx, spec.EnvID); err == nil || !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("输出文件仍打开时 Destroy = %v，期望 EBUSY", err)
+	}
+	closeAll()
+	if err := p.Destroy(ctx, spec.EnvID); err != nil {
+		t.Fatal(err)
+	}
+	layersGone(t, p, spec.EnvID)
+	r, err := p.Scan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range r.Items {
+		if it.EnvID == spec.EnvID {
+			t.Fatalf("Destroy 后 Scan 仍报告 %+v", it)
+		}
+	}
+}
+
+// TestExecEnvInDirIdempotent：完整的 exec 环境上重复 Create（同 spec）返回同一 InDir；/out 是宿主上
+// 属主为映射 uid 1000、0700 的 tmpfs（D1），Scan 把它报告为该环境的 mount 层。
+func TestExecEnvInDirIdempotent(t *testing.T) {
+	p, spec := newExecEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	info, err := p.Create(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := p.Create(ctx, spec)
+	if err != nil || again.InDir != info.InDir || info.InDir == "" {
+		t.Fatalf("再次 Create = %+v, %v；原 InDir %q", again, err, info.InDir)
+	}
+	out := filepath.Join(p.envDir(spec.EnvID), "out")
+	var st syscall.Stat_t
+	if err := syscall.Stat(out, &st); err != nil {
+		t.Fatal(err)
+	}
+	if id := spec.UIDBase + workloadID; st.Uid != id || st.Gid != id || st.Mode&0o7777 != 0o700 {
+		t.Fatalf("/out 属主 %d:%d 权限 %#o，期望 %d、0700", st.Uid, st.Gid, st.Mode&0o7777, id)
+	}
+	var fs syscall.Statfs_t
+	if err := syscall.Statfs(out, &fs); err != nil || fs.Type != 0x01021994 { // TMPFS_MAGIC
+		t.Fatalf("/out 不是 tmpfs：%#x, %v", fs.Type, err)
+	}
+	r, err := p.Scan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, it := range r.Items {
+		found = found || (it.Layer == "mount" && it.Path == out && it.EnvID == spec.EnvID && it.Owner == provider.OwnedComplete)
+	}
+	if !found {
+		t.Fatalf("Scan 未把 %s 报告为该环境的 mount 层：%+v", out, r.Items)
+	}
+	if err := p.Stop(ctx, spec.EnvID); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Destroy(ctx, spec.EnvID); err != nil {
+		t.Fatal(err)
+	}
+	layersGone(t, p, spec.EnvID)
+}
+
+const execQuotaScript = `
+import errno, os
+def code(e):
+    return errno.errorcode.get(e.errno, str(e.errno))
+try:
+    with open('/out/big', 'wb') as f:
+        for _ in range(64):
+            f.write(b'\0' * 65536)
+    print('size ok')
+except OSError as e:
+    print('size', code(e))
+os.unlink('/out/big')
+n = 0
+try:
+    while n < 4096:
+        open('/out/i%d' % n, 'w').close()
+        n += 1
+    print('inodes ok')
+except OSError as e:
+    print('inodes', code(e), n > 900)
+`
+
+const execOOMScript = `
+with open('/out/fill', 'wb') as f:
+    for _ in range(32):
+        f.write(b'\1' * (1 << 20))
+print('filled', flush=True)
+hog = b'\1' * (48 << 20)
+print('survived', len(hog))
+`
+
+// TestExecEnvOutQuota（E38 provider 部分）：/out 写满 → ENOSPC；inode 耗尽 → ENOSPC；/out 的 tmpfs 页面
+// 计入环境 cgroup，与进程匿名内存合计超过 memory.max → 环境内 OOM（OOMKillDelta ≥ 1），宿主进程不受影响，
+// Stop + Destroy 成功。
+func TestExecEnvOutQuota(t *testing.T) {
+	p, spec := newExecEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	info, err := p.Create(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageMain(t, info.InDir, execQuotaScript)
+	stdout, stderr, es := runMain(ctx, t, p, spec.EnvID)
+	if es.Code != 0 || stdout != "size ENOSPC\ninodes ENOSPC True\n" {
+		t.Fatalf("workload = %+v，stdout %q，stderr %q", es, stdout, stderr)
+	}
+	if err := p.Stop(ctx, spec.EnvID); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Destroy(ctx, spec.EnvID); err != nil {
+		t.Fatal(err)
+	}
+	layersGone(t, p, spec.EnvID)
+
+	oom := spec
+	oom.EnvID, oom.UIDBase = "env-oom", 404096
+	oom.Limits.MemoryMax = 64 << 20
+	oom.Mounts.OutBytes = 48 << 20
+	info, err = p.Create(ctx, oom)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageMain(t, info.InDir, execOOMScript)
+	stdout, stderr, es = runMain(ctx, t, p, oom.EnvID)
+	if es.Signal != syscall.SIGKILL || stdout != "filled\n" {
+		t.Fatalf("workload = %+v，stdout %q，stderr %q；期望写入 /out 后被 OOM SIGKILL", es, stdout, stderr)
+	}
+	d, err := p.ResourceDiag(ctx, oom.EnvID)
+	if err != nil || d.OOMKillDelta < 1 || !d.OOMObserved {
+		t.Fatalf("ResourceDiag = %+v, %v；期望 OOMKillDelta ≥ 1", d, err)
+	}
+	if err := syscall.Kill(os.Getpid(), 0); err != nil { // 宿主（测试）进程不受影响
+		t.Fatal(err)
+	}
+	if err := p.Stop(ctx, oom.EnvID); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Destroy(ctx, oom.EnvID); err != nil {
+		t.Fatal(err)
+	}
+	layersGone(t, p, oom.EnvID)
 }

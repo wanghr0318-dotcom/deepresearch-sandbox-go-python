@@ -725,6 +725,21 @@ func (p *Provider) ResourceDiag(_ context.Context, envID string) (provider.Resou
 	return provider.ResourceDiag{}, nil
 }
 
+// OpenOutputs：进程型 provider 不支持 exec 环境（没有宿主侧 /out），存在的环境一律报错。
+func (p *Provider) OpenOutputs(_ context.Context, envID string, _ int) ([]provider.OutputFile, []provider.SkippedOutput, error) {
+	if err := checkName(envID); err != nil {
+		return nil, nil, err
+	}
+	own, _, err := p.readOwner(envID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if own != dirOwned {
+		return nil, nil, provider.ErrNotFound
+	}
+	return nil, nil, errors.New("procprov: 不支持 exec 环境，没有 /out")
+}
+
 // ---- 测试注入 ----
 
 // BlockStart 使 envID 上的下一次 StartExec 在通过闸门之后、启动进程之前阻塞；blocked 在阻塞时关闭。
