@@ -50,6 +50,7 @@ type taskLimits struct {
 	TmpBytes     int64 `json:"tmp_bytes"`       // /tmp、/run tmpfs 限额
 	MaxRunTimeMs int64 `json:"max_run_time_ms"` // 累计运行时限（§14.4）
 	BudgetMicro  int64 `json:"budget_micro"`    // task 层预算上限（微美元，§9.6）；创建时写入 budgets.limit_micro
+	MaxToolCalls int64 `json:"max_tool_calls"`  // 每 turn 的工具调用额度（M4 Plan 12）；创建时写入 budgets.tool_call_limit
 }
 
 // parseLimits 解析 limits；空为全部未设置。字段类型不符或为负数是错误。
@@ -62,7 +63,8 @@ func parseLimits(raw json.RawMessage) (taskLimits, error) {
 		return taskLimits{}, fmt.Errorf("limits 不合法: %w", err)
 	}
 	for name, v := range map[string]int64{"memory_max": l.MemoryMax, "pids_max": l.PidsMax, "cpu_quota_us": l.CPUQuotaUs,
-		"nofile": l.NoFile, "tmp_bytes": l.TmpBytes, "max_run_time_ms": l.MaxRunTimeMs, "budget_micro": l.BudgetMicro} {
+		"nofile": l.NoFile, "tmp_bytes": l.TmpBytes, "max_run_time_ms": l.MaxRunTimeMs, "budget_micro": l.BudgetMicro,
+		"max_tool_calls": l.MaxToolCalls} {
 		if v < 0 {
 			return taskLimits{}, fmt.Errorf("limits.%s 不能为负数", name)
 		}
@@ -118,6 +120,9 @@ func (c Config) effectiveLimits(raw json.RawMessage) (json.RawMessage, error) {
 	} else {
 		fields["budget_micro"] = json.RawMessage(fmt.Sprint(c.DefaultBudgetMicro))
 	}
+	if _, set := fields["max_tool_calls"]; set && (l.MaxToolCalls <= 0 || l.MaxToolCalls > MaxTurnToolBudget) {
+		return nil, fmt.Errorf("limits.max_tool_calls 须为 1..%d 之间的整数", MaxTurnToolBudget)
+	}
 	return json.Marshal(fields)
 }
 
@@ -170,7 +175,11 @@ func (x admissionAdapter) Acquire(ctx context.Context, r task.SlotRequest) (task
 	if err != nil {
 		return task.SlotGrant{}, err
 	}
-	g, err := x.a.Acquire(ctx, admission.Request{TaskID: r.TaskID, MemoryBytes: x.cfg.memory(l)})
+	mem := x.cfg.memory(l)
+	if r.SessionID != "" { // 会话 turn 只占 run slot：incarnation 的内存由 session actor 以 MemoryOnly 授予持有
+		mem = 0
+	}
+	g, err := x.a.Acquire(ctx, admission.Request{TaskID: r.TaskID, MemoryBytes: mem})
 	if err != nil {
 		return task.SlotGrant{}, err
 	}
@@ -306,6 +315,7 @@ type runnerAdapter struct {
 	r       attemptRunner
 	cfg     Config
 	dataDir string
+	sess    *sessionRuntime // 会话 turn 在授予的 incarnation 中执行（nil：没有会话 turn）
 }
 
 var _ task.AttemptRunner = runnerAdapter{}
@@ -315,6 +325,12 @@ var _ task.AttemptRunner = runnerAdapter{}
 func (x runnerAdapter) Run(ctx context.Context, s task.RunSpec, controls <-chan task.Control) task.Outcome {
 	if s.StartErr != nil {
 		return startFailure(ctx, s.StartErr)
+	}
+	if s.Task.SessionID != "" {
+		if x.sess == nil {
+			return startFailure(ctx, errSessionsOff)
+		}
+		return x.sess.runTurn(ctx, s, controls)
 	}
 	l, err := parseLimits(s.Task.Limits)
 	if err != nil {

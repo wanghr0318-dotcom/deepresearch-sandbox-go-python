@@ -71,9 +71,11 @@ type ActorState struct {
 	HandleInc string
 	Exited    bool // HandleInc 的进程已退出
 	Quiesced  bool // HandleInc 已 quiesce，且报告的 checkpoint 等于最新已提交 checkpoint
-	CloseSent bool // 已对 HandleInc 发送 session_close
-	ThawFail  bool // HandleInc 的 thaw 失败
-	RelFail   bool // Handoffs[0] 的 Release 失败（释放核验未通过）
+	// QuiescedID 是最近一次成功 quiesce 报告的 session_checkpoint_id（随 frozen 事件持久化，I9）。
+	QuiescedID string
+	CloseSent  bool // 已对 HandleInc 发送 session_close
+	ThawFail   bool // HandleInc 的 thaw 失败
+	RelFail    bool // Handoffs[0] 的 Release 失败（释放核验未通过）
 
 	Waiters   []string  // 等待授予的 turn（到达顺序）
 	Granted   string    // 已授予、attempt 尚未创建的 turn
@@ -149,6 +151,7 @@ type OpDone struct {
 	Failed        error
 	State         *State
 	IncarnationID string // OpStart 成功时的新 incarnation；OpDestroy 结束的 incarnation
+	CheckpointID  string // OpQuiesce 成功时 quiesced 报告的 session_checkpoint_id（空串 = 会话尚无 checkpoint）
 }
 
 func (Loaded) isEvent()            {}
@@ -408,6 +411,7 @@ func (d *decider) opDone(e OpDone) error {
 		d.s.Exited, d.s.Quiesced, d.s.CloseSent, d.s.ThawFail = false, false, false, false
 	case OpQuiesce:
 		d.s.Quiesced = e.Failed == nil
+		d.s.QuiescedID = e.CheckpointID
 	case OpFreeze:
 		if e.Failed != nil {
 			d.s.Quiesced = false
@@ -481,6 +485,12 @@ func stateEvent(state, userMessage string) json.RawMessage {
 		m["user_message"] = userMessage
 	}
 	b, _ := json.Marshal(m)
+	return b
+}
+
+// frozenEvent 是 session_state{frozen} 的 payload，另带 quiesced 报告的 checkpoint（内部字段，I9 据此核对）。
+func frozenEvent(quiescedID string) json.RawMessage {
+	b, _ := json.Marshal(map[string]string{"state": StatusFrozen, "quiesced_checkpoint_id": quiescedID})
 	return b
 }
 
@@ -700,7 +710,12 @@ func (d *decider) stepQuiescing(inc *Incarnation) {
 		}
 		d.op(QuiesceIncarnation{IncarnationID: inc.IncarnationID, Expect: expect})
 	case inc.Status == IncFrozen && !s.EvictWanted:
-		d.transition(StatusFrozen, []string{StatusQuiescing}, nil)
+		// 事件 payload 带 quiesced 报告的 checkpoint（I9：frozen 会话最近一次 quiesced 的 ID 等于会话指针）；
+		// 用户视图只保留 state 与 user_message。
+		qid := s.QuiescedID
+		d.transition(StatusFrozen, []string{StatusQuiescing}, func(t *Transition) {
+			t.Event = frozenEvent(qid)
+		})
 	case inc.Status == IncQuiescing && s.Quiesced && !s.EvictWanted:
 		d.op(FreezeIncarnation{IncarnationID: inc.IncarnationID, EnvID: inc.EnvID})
 	default:

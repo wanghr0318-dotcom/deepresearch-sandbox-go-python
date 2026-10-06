@@ -178,3 +178,16 @@ Plan 15（独立 exec 沙箱，规格 §10）对 exec 环境补充以下契约�
 - **`OpenOutputs(ctx, envID, max) ([]OutputFile, []SkippedOutput, error)`**：前置条件是 `Stop` 的权威检查成立（否则 `ErrNotStopped`）；环境目录不存在 → `ErrNotFound`；归属无法证明 → `ErrForeign`；编排环境（没有 `/out`）→ 错误。从 `<envdir>/out` 的目录 FD 起逐级以 `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_XDEV)` 解析：子目录 `O_DIRECTORY|O_NOFOLLOW`，文件 `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` 后 `fstat` 须为普通文件（规格 §5.6 的打开规则）。递归、按相对路径字典序；收集至多 `max` 个普通文件（`MaxOutputFiles = 256`），其余条目报告为跳过：`symlink`、`not_regular`（FIFO、设备、socket）、`too_many`（超过 `max` 的普通文件）、`open_failed`。返回的文件由调用方关闭；出错时不留下已打开的文件。
 - **`Destroy` 的卸载顺序**：不变——数据目录下的挂载（含 `<envdir>/out` 的 tmpfs，深者先卸）→ 环境 cgroup → 环境目录。`OpenOutputs` 返回的文件仍打开时 tmpfs 卸载失败（`EBUSY`），`Destroy` 返回该宿主错误且不触碰后续各层；**调用方须先关闭全部输出文件再 `Destroy`**，之后重做即可。
 - **一致性测试**：`providertest` 增加"`OpenOutputs` 对编排环境报错、未知环境为 `ErrNotFound`"，以及（`Harness.ExecSpec` 非空时）"exec 环境 `InDir` 幂等、`OpenOutputs` 要求先停止"。fake 以临时目录模拟 `InDir` 与 `/out`（`OutDir(envID)` 供测试写入输出）。
+
+## 10. 执行中修订（Plan 12：会话环境）
+
+Plan 12（规格 §12 会话：每会话一个长期 incarnation，冻结、驱逐、冷恢复）对 `kind = session` 的环境补充以下契约（Task 5 实现，Task 9 装配）：
+
+- **`Mounts.RestoreDir`**（仅 session；task 与 exec 设置它时 `Validate` 拒绝）：宿主目录，只读 bind 到沙箱内的 `/run/agentbox/restore`（`ro,nosuid,nodev`，在 workspace 之后挂载）。冷恢复时宿主把会话 checkpoint 的 `state_ref` 内容暂存为其中的文件 `<sha256>`，Worker 以 `init.session_resume.staged_state_path = /run/agentbox/restore/<sha256>` 读取。bind 的是目录：宿主删除其中的文件后沙箱内随即不可见（incarnation 进入 idle 后的"卸载"）。**目录由调用方建立与删除**（root 属主、0755，文件 0444，上级目录 o+x），provider 只挂载；它不能在环境目录内（`Create` 要求环境目录不存在）。装配取 `<data>/restore/<env_id>`，incarnation ready 之后删除，环境停止之后再次删除（幂等）。
+- **`Freeze(ctx, envID) error`**：写 `cgroup.freeze = 1`，轮询 `cgroup.events` 直到 `frozen 1`。期限为 ctx（没有期限时 10 s）；超时或无法读取冻结状态 → `ErrFreezeUnconfirmed`，返回前已写回 `cgroup.freeze = 0`（不等待解冻完成）。环境 cgroup 不存在 → `ErrNotFound`。**调用方只在 `Freeze` 成功返回之后记录 frozen**（E31：冻结未确认即驱逐）。
+- **`Thaw(ctx, envID) error`**：写 `cgroup.freeze = 0` 并等待 `frozen 0`；cgroup 不存在 → `ErrNotFound`。
+- **`Procs(ctx, envID) ([]int, error)`**：返回环境 cgroup 的 `cgroup.procs`（释放核验：每个 turn 释放后进程表须回到 incarnation ready 时的基线，§12.4、E30）；cgroup 不存在 → `ErrNotFound`。
+- **`Stop` 与冻结**：语义不变；`cgroup.kill` 直接终止冻结的进程，权威检查仍是 `populated 0`。因此重启恢复（§14.1 第 6 步）以普通的 `StopEnv` 停止 frozen 会话的环境，不需要先解冻（E33）。
+- **UID 范围按 owner 保留**：会话环境以 `resource.EnvRequest.UIDOwner = "session:<session_id>"` 创建，coordinator 经 `resource.OwnerUIDStore` 为 owner 分配一段范围并在该会话的各个环境之间复用（workspace 的属主因此跨 incarnation 不变）；环境清理时不归还，会话关闭时 `ReleaseOwnerUIDRange`（要求使用过它的环境全部停止且清理完成）。provider 接口不变：仍只经 `EnvSpec.UIDBase/UIDSize` 收到范围。
+- **清理候选**：会话环境没有 `attempt_id`；它在 `stopped_at` 已记录且使用它的 incarnation 已 `ended` 时成为 cleanup 候选（task 环境仍要求 attempt 已有判决）。
+- **一致性与 fake**：`provider/fake` 实现 `Freeze`/`Thaw`/`Procs`（`Frozen`、`FailFreeze`、`SetProcs` 供测试注入）；`tests/e2e/procprov` 以 SIGSTOP/SIGCONT 模拟冻结，`Procs` 返回存活进程。

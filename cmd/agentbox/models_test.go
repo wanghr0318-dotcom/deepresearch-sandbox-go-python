@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/account"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/app"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
@@ -352,5 +353,56 @@ func TestUserCommand(t *testing.T) {
 	t.Setenv("AGENTBOX_DATABASE_URL", "")
 	if code, _, errb := run("list"); code != 2 || !strings.Contains(errb, "--database-url") {
 		t.Fatalf("没有连接串时 user list = %d %q", code, errb)
+	}
+}
+
+// ---- M4 Plan 12 Task 9：会话标志 ----
+
+// 会话标志：--turn-tool-budget 为 1–1000（默认 30），--session-evict-after 须大于 --session-idle-freeze，
+// --session-worker-argv 需要用户账号；违反时 runServer 在取得锁与连接数据库之前以退出码 2 返回。
+func TestSessionFlags(t *testing.T) {
+	var cfg app.Config
+	cfg.Accounts = true
+	if err := sessionFlags(&cfg, 30, 10*time.Minute, time.Hour, "python3,-m,chatagent"); err != nil ||
+		cfg.TurnToolBudget != 30 || cfg.SessionIdleFreeze != 10*time.Minute || cfg.SessionEvictAfter != time.Hour ||
+		strings.Join(cfg.SessionWorkerArgv, " ") != "python3 -m chatagent" {
+		t.Fatalf("合法的会话标志 = %v，cfg = %+v", err, cfg)
+	}
+	for _, tc := range []struct {
+		budget        int
+		idle, evict   time.Duration
+		argv          string
+		accounts      bool
+		wantInMessage string
+	}{
+		{0, time.Minute, time.Hour, "", true, "--turn-tool-budget"},
+		{1001, time.Minute, time.Hour, "", true, "--turn-tool-budget"},
+		{30, 0, time.Hour, "", true, "--session-idle-freeze"},
+		{30, time.Hour, time.Hour, "", true, "--session-evict-after"},
+		{30, time.Minute, time.Hour, "w", false, "--model-base-url"},
+	} {
+		c := app.Config{Accounts: tc.accounts}
+		if err := sessionFlags(&c, tc.budget, tc.idle, tc.evict, tc.argv); err == nil || !strings.Contains(err.Error(), tc.wantInMessage) {
+			t.Errorf("%+v：%v，期望指出 %s", tc, err, tc.wantInMessage)
+		}
+	}
+	if runtime.GOOS != "linux" {
+		t.Skip("runServer 只在 Linux 上可用")
+	}
+	var stderr strings.Builder
+	if code := runServer([]string{"-help"}, &stderr); code != 2 || !strings.Contains(stderr.String(), "-turn-tool-budget int") ||
+		!strings.Contains(stderr.String(), "(default 30)") || !strings.Contains(stderr.String(), "(default 10m0s)") ||
+		!strings.Contains(stderr.String(), "(default 1h0m0s)") || !strings.Contains(stderr.String(), "-session-worker-argv string") {
+		t.Fatalf("-help 退出码 %d：%s", code, stderr.String())
+	}
+	base := []string{"--data-dir", t.TempDir(), "--database-url", "postgres://x"}
+	for _, extra := range [][]string{
+		{"--session-idle-freeze", "1h", "--session-evict-after", "1h"},
+		{"--turn-tool-budget", "0"},
+	} {
+		stderr.Reset()
+		if code := runServer(append(append([]string{}, base...), extra...), &stderr); code != 2 {
+			t.Errorf("%v：退出码 %d（%s），期望 2", extra, code, stderr.String())
+		}
 	}
 }

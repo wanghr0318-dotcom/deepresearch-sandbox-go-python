@@ -564,12 +564,16 @@ func (a *SessionAPI) ListTurns(ctx context.Context, sessionID string, afterIndex
 		if !exists {
 			return notFoundf("会话 %s", sessionID)
 		}
-		rows, err := q.Query(ctx, `SELECT t.task_id, t.turn_index, t.status, t.status_reason, COALESCE(t.restored_from_task_id, ''),
+		// 取消的 turn 以取消控制的原因（superseded、session_closed）作为对外 status_reason（OpenAPI Turn.status_reason）。
+		rows, err := q.Query(ctx, `SELECT t.task_id, t.turn_index, t.status,
+				CASE WHEN t.status = 'cancelled' AND tc.desired = 'cancel' AND tc.reason <> '' THEN tc.reason ELSE t.status_reason END,
+				COALESCE(t.restored_from_task_id, ''),
 				t.created_at, COALESCE(ev.payload, '{}'), COALESCE(b.tool_calls_used, 0), COALESCE(b.tool_call_limit, 0),
 				t.result_json, p.latest_checkpoint_id IS NOT NULL,
 				COALESCE((SELECT e.payload->'data'->>'route' FROM events e WHERE e.task_id = t.task_id AND e.source = 'worker'
 					AND e.type = 'progress' AND e.payload->>'kind' = 'route' ORDER BY e.task_seq DESC LIMIT 1), '')
 			FROM tasks t JOIN task_progress p USING (task_id) LEFT JOIN budgets b USING (task_id)
+			JOIN task_control tc ON tc.task_id = t.task_id
 			LEFT JOIN events ev ON ev.task_id = t.task_id AND ev.event_key = 'task_created'
 			WHERE t.session_id = $1 AND t.turn_index > $2 ORDER BY t.turn_index LIMIT $3`, sessionID, afterIndex, limit)
 		if err != nil {

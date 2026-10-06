@@ -239,8 +239,10 @@ func TestDecideTransitionDetails(t *testing.T) {
 	if tr := op(t, with(idleState(), func(s *ActorState) { s.Now = t0.Add(time.Hour) })).(DoTransition); tr.T.Event != nil {
 		t.Errorf("quiescing 是过渡态，不产生用户事件：%s", tr.T.Event)
 	}
-	if tr := op(t, with(idleState(), func(s *ActorState) { s.Session.Status, s.Session.Incarnation.Status = StatusQuiescing, IncFrozen })).(DoTransition); string(tr.T.Event) != `{"state":"frozen"}` {
-		t.Errorf("frozen 事件 = %s", tr.T.Event)
+	if tr := op(t, with(idleState(), func(s *ActorState) {
+		s.Session.Status, s.Session.Incarnation.Status, s.QuiescedID = StatusQuiescing, IncFrozen, "sc-7"
+	})).(DoTransition); string(tr.T.Event) != `{"quiesced_checkpoint_id":"sc-7","state":"frozen"}` {
+		t.Errorf("frozen 事件须带 quiesced 报告的 checkpoint（I9）= %s", tr.T.Event)
 	}
 	cp := &Checkpoint{CheckpointID: "sc-1", StateRef: "ab"}
 	if st := op(t, with(idleState(), func(s *ActorState) {
@@ -1122,8 +1124,13 @@ func TestActorFreezeOnlyAfterConfirmed(t *testing.T) {
 	h.advanceUntil("frozen", time.Second, h.is("s1", StatusFrozen))
 	h.before("frozen:"+g.EnvID, "incarnation:"+g.IncarnationID+":quiescing→frozen")
 	h.before("incarnation:"+g.IncarnationID+":quiescing→frozen", "transition:s1:quiescing→frozen")
-	if _, _, ev := h.st.session("s1"); ev[len(ev)-1] != `{"state":"frozen"}` {
-		t.Errorf("事件 = %v", ev)
+	st, _, ev := h.st.session("s1")
+	want := ""
+	if st.Latest != nil {
+		want = st.Latest.CheckpointID
+	}
+	if ev[len(ev)-1] != `{"quiesced_checkpoint_id":"`+want+`","state":"frozen"}` {
+		t.Errorf("事件 = %v（会话指针 %+v）", ev, st.Latest)
 	}
 	if h.adm.heldCount() != 1 {
 		t.Errorf("frozen 的内存保留（计入容量）")

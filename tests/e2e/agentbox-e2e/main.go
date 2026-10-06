@@ -54,18 +54,26 @@ const modelKeyEnv = "AGENTBOX_MODEL_API_KEY"
 // gatewaySocketEnv 是 Worker SDK 读取的 Gateway socket 路径覆盖（worker/agentbox_worker/runtime.py）。
 const gatewaySocketEnv = "AGENTBOX_GATEWAY_SOCKET"
 
-// socketProv 包装 procprov：记录每个环境的 Gateway socket 宿主路径，并在启动执行时把它交给 Worker。
+// 会话 Worker（tests/e2e/sessionworker）的路径映射：procprov 没有挂载，环境内的 /workspace 与
+// /run/agentbox/restore 以这两个变量给出宿主目录。
+const (
+	sessionWorkspaceEnv = "AGENTBOX_SW_WORKSPACE"
+	sessionRestoreEnv   = "AGENTBOX_SW_RESTORE"
+)
+
+// socketProv 包装 procprov：记录每个环境的挂载（Gateway socket、会话 workspace 与恢复暂存目录的宿主路径），并在
+// 启动执行时把它们交给 Worker。
 type socketProv struct {
 	*procprov.Provider
-	mu      sync.Mutex
-	sockets map[string]string // env_id → socket 宿主路径
+	mu     sync.Mutex
+	mounts map[string]provider.Mounts // env_id → 挂载
 }
 
 func (p *socketProv) Create(ctx context.Context, spec provider.EnvSpec) (provider.EnvInfo, error) {
 	info, err := p.Provider.Create(ctx, spec)
-	if err == nil && spec.Mounts.GatewaySocket != "" {
+	if err == nil {
 		p.mu.Lock()
-		p.sockets[spec.EnvID] = spec.Mounts.GatewaySocket
+		p.mounts[spec.EnvID] = spec.Mounts
 		p.mu.Unlock()
 	}
 	return info, err
@@ -73,10 +81,17 @@ func (p *socketProv) Create(ctx context.Context, spec provider.EnvSpec) (provide
 
 func (p *socketProv) StartExec(ctx context.Context, envID string, spec provider.ExecSpec) (provider.ExecHandle, error) {
 	p.mu.Lock()
-	sock := p.sockets[envID]
+	m := p.mounts[envID]
 	p.mu.Unlock()
-	if sock != "" {
-		spec.Env = append(slices.Clone(spec.Env), gatewaySocketEnv+"="+sock)
+	spec.Env = slices.Clone(spec.Env)
+	if m.GatewaySocket != "" {
+		spec.Env = append(spec.Env, gatewaySocketEnv+"="+m.GatewaySocket)
+	}
+	if m.Workspace != "" {
+		spec.Env = append(spec.Env, sessionWorkspaceEnv+"="+m.Workspace)
+	}
+	if m.RestoreDir != "" {
+		spec.Env = append(spec.Env, sessionRestoreEnv+"="+m.RestoreDir)
 	}
 	return p.Provider.StartExec(ctx, envID, spec)
 }
@@ -131,6 +146,11 @@ func runServer(args []string, stderr io.Writer) int {
 	modelCallDeadline := fs.Duration("model-call-deadline", 0, "Gateway 模型调用的调用期限（0 取默认 300 s）")
 	backoffBase := fs.Duration("gateway-backoff-base", 0, "Gateway 退避基数（0 取默认 2 s）")
 	perTask := fs.Int("gateway-per-task-inflight", 0, "每任务上游在途上限（0 取默认 4）")
+	sessionWorker := fs.String("session-worker", "", "会话 Worker 的路径（tests/e2e/sessionworker）：启用账号与会话（需要 --fake-upstream）")
+	turnToolBudget := fs.Int("turn-tool-budget", 0, "每 turn 的工具调用额度（0 取默认 30）")
+	idleFreeze := fs.Duration("session-idle-freeze", 0, "会话空闲冻结时限（0 取默认 10 min）")
+	evictAfter := fs.Duration("session-evict-after", 0, "会话驱逐时限（0 取默认 1 h）")
+	releaseTimeout := fs.Duration("release-timeout", 0, "session 模式 T_release（0 取默认 30 s）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -168,6 +188,16 @@ func runServer(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agentbox-e2e server:", err)
 		return 2
 	}
+	if *sessionWorker != "" {
+		if *fakeUpstream == "" {
+			fmt.Fprintln(stderr, "agentbox-e2e server: --session-worker 需要 --fake-upstream（会话需要用户账号）")
+			return 2
+		}
+		cfg.Accounts, cfg.UserOrchestratorModel, cfg.UserWorkerModel = true, fakeupstream.Model, fakeupstream.Model
+		cfg.SessionWorkerArgv = []string{*sessionWorker}
+	}
+	cfg.TurnToolBudget, cfg.SessionIdleFreeze, cfg.SessionEvictAfter = *turnToolBudget, *idleFreeze, *evictAfter
+	cfg.Runner.ReleaseTimeout = *releaseTimeout
 	deps := app.Deps{
 		DataDir: dir,
 		AcquireOwnership: func(ctx context.Context) (app.Ownership, error) {
@@ -193,7 +223,7 @@ func runServer(args []string, stderr io.Writer) int {
 			if err != nil {
 				return nil, err
 			}
-			return &socketProv{Provider: p, sockets: map[string]string{}}, nil
+			return &socketProv{Provider: p, mounts: map[string]provider.Mounts{}}, nil
 		},
 		Logger: slog.New(slog.NewJSONHandler(stderr, nil)),
 		Hooks: app.Hooks{Listening: func(addr string) {

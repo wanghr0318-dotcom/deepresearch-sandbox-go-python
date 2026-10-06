@@ -101,6 +101,36 @@ var invariantQueries = []struct {
 		WHERE COALESCE(m.max_seq, 0) <> p.latest_commit_seq
 			OR (p.latest_checkpoint_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM checkpoints x WHERE x.scope_kind = 'task'
 				AND x.scope_id = p.task_id AND x.checkpoint_id = p.latest_checkpoint_id AND x.commit_seq = p.latest_commit_seq))`},
+	// I6：task checkpoint 由该任务的 attempt 提交。恢复种子（checkpoint_id 以 seed- 开头，Plan 12 Task 3）是宿主从源
+	// turn 复制的，attempt_id 沿用源 attempt，豁免这一关联（其引用授权由上面第一条检查）。
+	{"I6", "A", `SELECT c.scope_id, format('checkpoint %s 的 attempt %s 不属于该任务', c.checkpoint_id, c.attempt_id)
+		FROM checkpoints c WHERE c.scope_kind = 'task' AND c.checkpoint_id NOT LIKE 'seed-%'
+			AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.attempt_id = c.attempt_id AND a.task_id = c.scope_id)`},
+	// I9：每个会话至多一个非 ended 的 incarnation。
+	{"I9", "A", `SELECT session_id, count(*)::text || ' 个非 ended 的 incarnation：' || string_agg(incarnation_id, ', ' ORDER BY incarnation_id)
+		FROM incarnations WHERE status <> 'ended' GROUP BY session_id HAVING count(*) > 1`},
+	// I9：frozen 会话最近一次 quiesced 报告的 checkpoint（随 session_state{frozen} 事件的 payload 持久化）等于
+	// session_progress.latest_checkpoint_id（空串 = 会话尚无 checkpoint）。
+	{"I9", "A", `SELECT s.session_id, format('frozen 会话最近一次 quiesced 报告 %s，会话指针为 %s',
+			COALESCE(ev.qid, '∅'), COALESCE(p.latest_checkpoint_id, '∅'))
+		FROM sessions s JOIN session_progress p ON p.session_id = s.session_id
+		LEFT JOIN LATERAL (SELECT e.payload->>'quiesced_checkpoint_id' AS qid FROM session_events e
+			WHERE e.session_id = s.session_id AND e.type = 'session_state' AND e.payload->>'state' = 'frozen'
+			ORDER BY e.session_seq DESC LIMIT 1) ev ON true
+		WHERE s.status = 'frozen' AND ev.qid IS DISTINCT FROM COALESCE(p.latest_checkpoint_id, '')`},
+	// I10：每个 session checkpoint 由该会话中一个 succeeded 的 turn 的 attempt 提交（只有成功裁决推进会话指针）。
+	{"I10", "A", `SELECT c.scope_id, format('session checkpoint %s 的 attempt %s 不属于该会话 succeeded 的 turn', c.checkpoint_id, c.attempt_id)
+		FROM checkpoints c WHERE c.scope_kind = 'session' AND NOT EXISTS (SELECT 1 FROM attempts a JOIN tasks t ON t.task_id = a.task_id
+			WHERE a.attempt_id = c.attempt_id AND t.session_id = c.scope_id AND t.status = 'succeeded')`},
+	// I10：session checkpoint 的 commit_seq 在会话内互不相同（单调分配），指针指向 commit_seq 最大者。
+	{"I10", "A", `SELECT p.session_id, format('指针为 %s@%s，最新已提交为 commit_seq %s（%s 个 checkpoint，%s 个不同 commit_seq）',
+			COALESCE(p.latest_checkpoint_id, '∅'), p.latest_commit_seq, COALESCE(m.max_seq, 0), COALESCE(m.n, 0), COALESCE(m.d, 0))
+		FROM session_progress p
+		LEFT JOIN (SELECT scope_id, max(commit_seq) AS max_seq, count(*) AS n, count(DISTINCT commit_seq) AS d
+			FROM checkpoints WHERE scope_kind = 'session' GROUP BY scope_id) m ON m.scope_id = p.session_id
+		WHERE COALESCE(m.max_seq, 0) <> p.latest_commit_seq OR COALESCE(m.n, 0) <> COALESCE(m.d, 0)
+			OR (p.latest_checkpoint_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM checkpoints x WHERE x.scope_kind = 'session'
+				AND x.scope_id = p.session_id AND x.checkpoint_id = p.latest_checkpoint_id AND x.commit_seq = p.latest_commit_seq))`},
 	{"I7", "A", `SELECT task_id, count(*)::text || ' 个 active 访问身份'
 		FROM attempt_access WHERE state = 'active' GROUP BY task_id HAVING count(*) > 1`},
 	{"I8", "B", `SELECT resource_path, format('%s 自 %s 起隔离，超过期限仍未报警', kind, detected_at)

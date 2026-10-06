@@ -1547,3 +1547,132 @@ func TestAccountsWiring(t *testing.T) {
 		t.Fatalf("Run 返回 %v", err)
 	}
 }
+
+// ---- M4 Plan 12 Task 9：会话装配 ----
+
+// userSession 注册用户并返回带会话 cookie 的请求函数。
+func userSession(t *testing.T, base, name string) func(method, path, body string) (int, []byte) {
+	t.Helper()
+	resp, err := http.Post(base+"/auth/register", "application/json", strings.NewReader(`{"username":"`+name+`","password":"correct horse"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	var cookie string
+	for _, c := range resp.Cookies() {
+		if c.Name == "agentbox_session" {
+			cookie = c.Name + "=" + c.Value
+		}
+	}
+	if resp.StatusCode != http.StatusCreated || cookie == "" {
+		t.Fatalf("注册 %s = %d", name, resp.StatusCode)
+	}
+	return func(method, path, body string) (int, []byte) {
+		t.Helper()
+		req, err := http.NewRequest(method, base+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Cookie", cookie)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode, b
+	}
+}
+
+// 会话标志与装配：额度 1–1000、evict 须大于 idle-freeze、会话需要账号（Run 拒绝启动）；未配置会话 Worker 时会话端点
+// 503 sessions_unavailable；配置后 turn 的 spec 由 server 固定模型，limits 为 server 默认值加 max_tool_calls = 30，
+// budgets.tool_call_limit = 30。
+func TestSessionsWiring(t *testing.T) {
+	model := ModelConfig{BaseURL: "https://m.example/v1", Name: "kimi-k2.6", Models: []string{"kimi-k2.6", "kimi-k3"},
+		PricingByModel: map[string]upstream.Pricing{"kimi-k3": {InputMicroPerMTok: 1, OutputMicroPerMTok: 7_000_000}}}
+	model.Pricing.OutputMicroPerMTok = 2_000_000
+	accounts := func(c Config) Config {
+		c.Model, c.Accounts, c.UserOrchestratorModel, c.UserWorkerModel = model, true, "kimi-k3", "kimi-k2.6"
+		return c
+	}
+	for _, tc := range []struct {
+		mut  func(*Config)
+		want string
+	}{
+		{func(c *Config) { c.TurnToolBudget = -1 }, "--turn-tool-budget"},
+		{func(c *Config) { c.TurnToolBudget = 1001 }, "--turn-tool-budget"},
+		{func(c *Config) { c.SessionIdleFreeze, c.SessionEvictAfter = time.Hour, time.Hour }, "--session-evict-after"},
+		{func(c *Config) { c.SessionIdleFreeze = -time.Second }, "--session-idle-freeze"},
+		{func(c *Config) { c.Accounts, c.Model = false, ModelConfig{}; c.SessionWorkerArgv = []string{"w"} }, "需要用户账号"},
+	} {
+		c := accounts(testConfig())
+		tc.mut(&c)
+		if err := Run(context.Background(), c, Deps{}); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("Run = %v，期望配置错误（%s）", err, tc.want)
+		}
+	}
+	c := accounts(testConfig()).withDefaults()
+	spec, limits, err := c.turnSpec("你好", true)
+	if err != nil || string(spec) != `{"kind":"turn","text":"你好","deep_research":true,"orchestrator_model":"kimi-k3","worker_model":"kimi-k2.6",`+
+		`"research":{"orchestrator_output_micro_per_mtok":7000000,"worker_output_micro_per_mtok":2000000}}` {
+		t.Fatalf("TurnSpec spec = %s, %v", spec, err)
+	}
+	var l map[string]int64
+	if err := json.Unmarshal(limits, &l); err != nil || l["max_tool_calls"] != 30 || l["budget_micro"] != c.DefaultBudgetMicro || l["max_run_time_ms"] <= 0 {
+		t.Fatalf("TurnSpec limits = %s, %v", limits, err)
+	}
+	for in, ok := range map[string]bool{`{"max_tool_calls":1}`: true, `{"max_tool_calls":1000}`: true, `{"max_tool_calls":0}`: false,
+		`{"max_tool_calls":1001}`: false, `{"max_tool_calls":-3}`: false} {
+		if _, err := c.effectiveLimits(json.RawMessage(in)); (err == nil) != ok {
+			t.Errorf("effectiveLimits(%s) = %v，期望接受 = %v", in, err, ok)
+		}
+	}
+
+	// 未配置会话 Worker：会话端点 503 sessions_unavailable。
+	h := newHarness(t)
+	h.start(accounts(testConfig()), task.SystemClock())
+	do := userSession(t, h.waitAddr(), "alice")
+	if code, b := do("POST", "/sessions", `{"request_id":"s-1"}`); code != http.StatusServiceUnavailable || errorCode(t, b) != "sessions_unavailable" {
+		t.Fatalf("未启用会话时 POST /sessions = %d %s", code, b)
+	}
+	h.cancel()
+	if err := h.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
+
+	// 配置会话 Worker：turn 的 spec 与 limits 由 server 生成，工具额度写入 budgets。
+	h = newHarness(t)
+	cfg := accounts(testConfig())
+	cfg.SessionWorkerArgv = []string{"session-worker"}
+	h.start(cfg, task.SystemClock())
+	do = userSession(t, h.waitAddr(), "bob")
+	code, b := do("POST", "/sessions", `{"request_id":"s-1"}`)
+	var sess struct {
+		SessionID string `json:"session_id"`
+	}
+	if code != http.StatusCreated || json.Unmarshal(b, &sess) != nil || sess.SessionID == "" {
+		t.Fatalf("POST /sessions = %d %s", code, b)
+	}
+	code, b = do("POST", "/sessions/"+sess.SessionID+"/messages", `{"request_id":"m-1","text":"第一条消息","deep_research":false}`)
+	var turn struct {
+		TurnID string `json:"turn_id"`
+	}
+	if code != http.StatusAccepted || json.Unmarshal(b, &turn) != nil || turn.TurnID == "" {
+		t.Fatalf("POST messages = %d %s", code, b)
+	}
+	var gotSpec, gotLimits []byte
+	var toolLimit int64
+	h.queryRow(`SELECT t.spec_json::text, t.limits_json::text, b.tool_call_limit FROM tasks t JOIN budgets b ON b.task_id = t.task_id
+		WHERE t.task_id = $1`, []any{turn.TurnID}, &gotSpec, &gotLimits, &toolLimit)
+	if err := json.Unmarshal(gotLimits, &l); err != nil || l["max_tool_calls"] != 30 || toolLimit != 30 ||
+		!strings.Contains(string(gotSpec), `"worker_model": "kimi-k2.6"`) {
+		t.Fatalf("turn spec = %s，limits = %s，tool_call_limit = %d", gotSpec, gotLimits, toolLimit)
+	}
+	h.cancel()
+	if err := h.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
+}

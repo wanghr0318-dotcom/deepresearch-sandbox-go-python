@@ -34,6 +34,12 @@ type world struct {
 	verdicts   map[string]task.Verdict
 	ledger     ledgerState
 
+	// 会话（M4 Plan 12）：重启驱逐返回的项、会话环境与调用记录。
+	evictable       []EvictedSession
+	sessionEnvs     []string
+	evictCalls      int
+	evictBeforeStop bool
+
 	stopAt         time.Time
 	calls, failAt  int
 	commitThenFail bool
@@ -96,8 +102,21 @@ func (w *world) LoadRecoveryFacts(context.Context) (Facts, error) {
 func (w *world) RevokeAllActive(context.Context, string) (int, error) {
 	return 0, errors.New("未使用")
 }
+
+// EvictSessionsOnRestart 返回 evictable（之后为空：幂等），并记录调用时会话环境是否都已停止（第 7 步在第 6 步之后）。
 func (w *world) EvictSessionsOnRestart(context.Context) ([]EvictedSession, error) {
-	return nil, errors.New("未使用")
+	var out []EvictedSession
+	err := w.call(func() error {
+		w.evictCalls++
+		for _, id := range w.sessionEnvs {
+			if e := w.envs[id]; e == nil || e.StoppedAt == nil {
+				w.evictBeforeStop = true
+			}
+		}
+		out, w.evictable = w.evictable, nil
+		return nil
+	})
+	return out, err
 }
 func (w *world) AccountUnrecordedRunTime(_ context.Context, taskID, attemptID string, until time.Time) error {
 	return w.call(func() error {
@@ -711,4 +730,47 @@ func mustJSON(t *testing.T, v any) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// ---- M4 Plan 12 Task 9：重启驱逐会话（E33） ----
+
+// 重启（§12.6、§14.1 第 6–7 步）：frozen 会话与运行中会话的环境（kind = session，没有 attempt_id）都被停止；运行中
+// turn 的 attempt 提交 lost_on_restart（故障重试，下一次授予走冷恢复）；全部停止之后才调用 EvictSessionsOnRestart，
+// 结果进入报告。重跑幂等：不重复停止、不重复裁决，驱逐返回空。
+func TestRestartEvictsSessions(t *testing.T) {
+	w := newWorld()
+	w.envs["se-frozen"] = &resource.Environment{EnvID: "se-frozen", CleanupState: resource.CleanupNone}
+	w.envs["se-run"] = &resource.Environment{EnvID: "se-run", CleanupState: resource.CleanupNone}
+	w.sessionEnvs = []string{"se-frozen", "se-run"}
+	w.tasks["turn-1"] = &task.TaskState{TaskID: "turn-1", Status: "running", Desired: "run", ControlVersion: 1,
+		AppliedControlVersion: 1, CurrentAttemptID: "a-t1", MaxFaultRetries: 3, SessionID: "s-run"}
+	w.attempts["a-t1"] = &task.Attempt{AttemptID: "a-t1", TaskID: "turn-1", EnvID: "se-run", Status: "active"}
+	evicted := []EvictedSession{{SessionID: "s-frozen", IncarnationID: "inc-f", EnvID: "se-frozen"},
+		{SessionID: "s-run", IncarnationID: "inc-r", EnvID: "se-run"}}
+	w.evictable = slices.Clone(evicted)
+	f := Facts{
+		Tasks: []TaskFact{{TaskID: "turn-1", Status: "running", Desired: "run", ControlVersion: 1,
+			CurrentAttempt: &AttemptFact{AttemptID: "a-t1", Status: "active", EnvID: "se-run"}}},
+		Environments: []EnvFact{{EnvID: "se-frozen", CleanupState: resource.CleanupNone}, {EnvID: "se-run", CleanupState: resource.CleanupNone}},
+	}
+	plan := reconcile.Plan(ReconcileFacts(f), provider.ScanReport{}, "inst-1")
+	r, err := Execute(context.Background(), plan, w.deps())
+	if err != nil || !r.Ready {
+		t.Fatalf("Execute = %+v, %v", r, err)
+	}
+	for _, id := range w.sessionEnvs {
+		if w.envs[id].StoppedAt == nil {
+			t.Errorf("会话环境 %s 未停止", id)
+		}
+	}
+	if ts := w.tasks["turn-1"]; ts.Status != "queued" || ts.StatusReason != classLostOnRestart || w.attempts["a-t1"].Status != attemptEnded {
+		t.Errorf("运行中 turn = %s/%s，attempt %s；期望 lost_on_restart 故障重试", ts.Status, ts.StatusReason, w.attempts["a-t1"].Status)
+	}
+	if w.evictCalls != 1 || w.evictBeforeStop || !reflect.DeepEqual(r.EvictedSessions, evicted) {
+		t.Errorf("驱逐调用 %d 次（停止之前：%v），报告 %+v", w.evictCalls, w.evictBeforeStop, r.EvictedSessions)
+	}
+	r2, err := Execute(context.Background(), plan, w.deps())
+	if err != nil || !r2.Ready || len(r2.EvictedSessions) != 0 || w.dup != 0 || w.finalizes != 1 {
+		t.Fatalf("重跑 = %+v, %v（dup %d，判决 %d 次）", r2.EvictedSessions, err, w.dup, w.finalizes)
+	}
 }

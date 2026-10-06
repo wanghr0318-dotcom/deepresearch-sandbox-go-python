@@ -24,7 +24,8 @@
 | 下载端点与 Vue 工作台（M3 Plan 10） | **已验收**（2026-10-06，[服务器验收](docs/evidence/2026-10-06-m3-server-acceptance.md)） | `GET /tasks/{id}/result`、产物下载；`web/`（Vite + Vue 3），由 `agentbox server --web-dir` 同源提供，见"工作台" |
 | 用户账号与 DeepResearch 助手（M3 Plan 11） | **已验收**（2026-10-06，[账号验收](docs/evidence/2026-10-06-m3-accounts.md)） | 开放注册、服务端会话、用户只见自己的研究、内部细节仅运维可见；`internal/account`、`/auth/*`、`POST /research`、`agentbox user` |
 | 搜索供应商 serper（Google 结果）与按端点的调用期限 | **已验收**（2026-10-06） | `--search-provider serper`；`--call-deadline`（120 s）、`--model-call-deadline`（300 s） |
-| 会话、exec 沙箱、sub-run | 未开始 | M4 |
+| 会话后端：每会话一个长期 incarnation（冻结、驱逐、冷恢复、关闭）、turn 与工具额度（M4 Plan 12） | **已实现**（以脚本化会话 Worker 验收，待 Plan 13 联调） | `internal/session`、会话 API 与整会话 SSE、`--turn-tool-budget`、`--session-idle-freeze`、`--session-evict-after`、`--session-worker-argv`；E28–E33 在真实沙箱中以 root 运行，见"会话"；面向用户的会话 Agent 与聊天界面是 Plan 13 |
+| exec 沙箱、sub-run | 进行中 | M4 Plan 14、15 |
 
 ## 现在可以运行的命令
 
@@ -197,6 +198,34 @@ sudo AGENTBOX_DATABASE_URL=... agentbox user enable <username>
 
 演示服务器的常驻服务见 `deploy/systemd/agentbox-demo.service`（HTTPS 443、自签证书、serper、Redis、4C8G 资源与预算上限）。
 
+### 会话（M4 Plan 12，后端）
+
+会话是用户与研究助手的一段对话：每条消息是一个 turn（一个任务），同一会话的 turn 在同一个长期运行的沙箱进程（incarnation）中依次执行，并共享会话状态（最新的 session checkpoint）与 `/workspace`。
+
+**用户**（登录后，API 见 [OpenAPI](api/openapi.yaml) 的 `/sessions`、`/turns`）：
+
+- **会话列表**：`GET /sessions` 只列出自己的会话；他人的会话与 turn 一律 404。新建 `POST /sessions`，首条消息的前 40 个字符作为标题，可重命名或删除（`DELETE /sessions/{id}`：取消未完成的 turn、停止环境后删除 workspace）。
+- **发消息**：`POST /sessions/{id}/messages`。已有进行中的 turn 时为 `409 turn_in_progress`；有已停止（paused）的 turn 时，它被取消但内容全部保留（`status_reason = superseded`），其最新 checkpoint 作为新一轮的上下文（carryover）。
+- **停止 / 继续 / 恢复**：`POST /turns/{id}/stop` 暂停运行中的 turn；`/continue` 从停止处继续，`/finish` 让它立即收尾；被取代的 turn 可 `POST /turns/{id}/restore`——在同一会话开新一轮，从它的最后一个 checkpoint 继续，并获得新的工具额度。Agent 提问时 turn 处于 `awaiting_input`（释放执行槽位），`POST /turns/{id}/answer` 回答后同一 turn 从原位置继续。
+- **工具额度**：每个 turn 的 `web_search` 与 `web_fetch` 合计至多 `--turn-tool-budget` 次（默认 30；缓存命中与合并也计数，同一调用的重放不计数，server 重启后计数延续），第 31 次得到 `429 tool_budget_exhausted`；`Turn.tool_calls_used/tool_call_limit` 与响应头 `X-Agentbox-Tool-Budget` 给出用量。
+- **事件**：`GET /sessions/{id}/events` 是整个会话的 SSE（`id` = 会话内序号，可用 `Last-Event-ID` 续传）；用户视图去掉费用、模型与内部 ID。
+
+**生命周期**：会话空闲 `--session-idle-freeze`（默认 10 min）后冻结（cgroup freezer；冻结前要求 Worker 报告的会话 checkpoint 等于最新已提交者），空闲 `--session-evict-after`（默认 1 h，须大于前者）或内存不足时（按最久未用）驱逐；新消息唤醒：冻结的解冻，驱逐的以最新会话 checkpoint 冷恢复到新的 incarnation（同一 workspace 与 UID 范围）。server 重启时全部会话转为驱逐（保留最新 checkpoint），下一条消息冷恢复。
+
+**运维**：
+
+- `--session-worker-argv`：会话 incarnation 内的 Worker 命令（逗号分隔）。**为空时不启用会话**，会话端点返回 `503 sessions_unavailable`；启用会话需要用户账号（`--model-base-url`）。面向用户的会话 Agent（`python3 -m chatagent`）由 Plan 13 提供并在其验收中启用；本计划的端到端验收使用脚本化的 Go 会话 Worker `tests/e2e/sessionworker`。
+- `--turn-tool-budget`（1–1000）、`--session-idle-freeze`（> 0）、`--session-evict-after`（> idle-freeze）：违反时 server 拒绝启动（退出码 2）。
+- 运维工作台（`#/admin`，Bearer token）可见全部用户的会话与内部状态；会话的写操作只允许所有者（运维为 403）。
+- 不变量检查（`agentbox verify-invariants`）另核对 I9（每个会话至多一个存活 incarnation；冻结的会话最近一次 quiesce 报告的 checkpoint 等于会话指针）与 I10（会话 checkpoint 只由成功的 turn 提交，序号与指针单调）。
+
+会话的端到端测试（PostgreSQL 与上文相同；非 root 用 `agentbox-e2e` 的进程型 provider，root 时另在真实沙箱中运行 E28–E33，测试会把 sessionworker 复制到 `/opt/agentbox`）：
+
+```bash
+CI=true go test -count=1 -run 'Session|ToolBudget' ./tests/e2e/
+CI=true CGO_ENABLED=0 go test -count=1 -p 1 -timeout 60m -run 'E2[89]|E3[0-3]' ./tests/e2e/   # 以 root 运行
+```
+
 ## 文档
 
 | 文档 | 内容 |
@@ -206,7 +235,8 @@ sudo AGENTBOX_DATABASE_URL=... agentbox user enable <username>
 | [代码组织设计](docs/design/2026-10-03-code-organization.md) | 模块职责、允许依赖、事务用例、所有权、测试布局 |
 | [M1 计划索引](docs/plans/2026-10-03-m1-index.md) | M1 各计划、依赖与验收归属 |
 | [持久化设计](docs/design/2026-10-04-m1-4-persistence-design.md)、[安装身份修订](docs/design/2026-10-05-installation-identity-amendment.md) | Plan 4 的设计依据 |
-| [Provider 契约](docs/design/2026-10-05-provider-contract.md) | 环境生命周期的 Go 接口、错误、并发边界 |
+| [Provider 契约](docs/design/2026-10-05-provider-contract.md) | 环境生命周期的 Go 接口、错误、并发边界；会话环境的冻结、解冻、进程表与恢复暂存（第 10 节） |
+| [M4 计划索引](docs/plans/2026-10-06-m4-index.md)、[Plan 12 会话后端](docs/plans/2026-10-06-m4-12-sessions.md)、[会话后端验收记录](docs/evidence/2026-10-06-m4-sessions.md) | M4 计划、Plan 12/13 共享契约与状态 |
 | [Plan 2](docs/plans/2026-10-05-m1-2-local-provider.md)、[Plan 5](docs/plans/2026-10-05-m1-5-control-plane.md)、[Plan 6](docs/plans/2026-10-05-m1-6-recovery-entry.md) | M1 第 2 批计划、执行中修订与验收记录 |
 | [M2 计划索引](docs/plans/2026-10-05-m2-index.md)、[Plan 7 Gateway](docs/plans/2026-10-05-m2-7-gateway.md)、[Plan 8 DeepResearch](docs/plans/2026-10-05-m2-8-deepresearch.md) | M2 计划、执行中修订与验收记录 |
 | [M3 工作台验证记录](docs/evidence/2026-10-05-m3-workbench.md) | E26、E27 的自动化证据；浏览器联调待在演示服务器上补入 |

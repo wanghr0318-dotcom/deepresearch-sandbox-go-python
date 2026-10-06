@@ -41,6 +41,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/recovery"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/resource"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/session"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
 )
 
@@ -124,6 +125,17 @@ type Config struct {
 	// UserOrchestratorModel 与 UserWorkerModel 是用户研究 spec 的 orchestrator_model 与 worker_model（用户不能
 	// 指定模型；server 默认 kimi-k3 与 kimi-k2.6）。
 	UserOrchestratorModel, UserWorkerModel string
+
+	// 会话（M4 Plan 12，规格 §12；设计 D3、D4）。
+	// TurnToolBudget 是每个 turn 的 web_search 与 web_fetch 调用额度（--turn-tool-budget，默认 30，1–1000）：写入每个
+	// turn 的 limits.max_tool_calls，Gateway 在 Tx1 新建调用时计数，第 31 次 429 tool_budget_exhausted。
+	TurnToolBudget int
+	// SessionIdleFreeze（默认 10 min，> 0）与 SessionEvictAfter（默认 1 h，须大于前者）是会话空闲冻结与驱逐的时限。
+	SessionIdleFreeze, SessionEvictAfter time.Duration
+	// SessionWorkerArgv 是会话 incarnation 内启动 Worker 的命令（--session-worker-argv；Plan 13 为 python3 -m
+	// chatagent）。为空时不启用会话：会话端点 503 sessions_unavailable。启用会话需要用户账号（Accounts）。会话 Worker
+	// 的环境变量与任务 Worker 相同（WorkerEnv）。
+	SessionWorkerArgv []string
 }
 
 // ModelConfig 是模型上游的配置。APIKey 只从宿主环境变量 AGENTBOX_MODEL_API_KEY 加载，只交给 chat adapter
@@ -221,6 +233,15 @@ func (c Config) withDefaults() Config {
 	if c.SearchProvider == "" {
 		c.SearchProvider = upstream.SearchDDGLite
 	}
+	if c.TurnToolBudget == 0 {
+		c.TurnToolBudget = DefaultTurnToolBudget
+	}
+	if c.SessionIdleFreeze == 0 {
+		c.SessionIdleFreeze = DefaultSessionIdleFreeze
+	}
+	if c.SessionEvictAfter == 0 {
+		c.SessionEvictAfter = DefaultSessionEvictAfter
+	}
 	if p := &c.Model.Pricing; p.Version == "" {
 		p.Version = configPricingVersion(*p)
 	}
@@ -303,7 +324,7 @@ func (c Config) validate() error {
 			return fmt.Errorf("app: Worker 环境变量 %q 不在白名单中（凭据不得进入沙箱）", k)
 		}
 	}
-	return nil
+	return c.validateSessions()
 }
 
 // Ownership 是数据库所有权（会话级 advisory lock，§7.4）。Lost 在失去所有权时关闭（不可逆）。
@@ -322,6 +343,14 @@ type Store interface {
 	api.Store
 	api.Accounts
 	call.Store
+	// 会话（M4 Plan 12）：session actor 的用例、queued turn 的失败、按 owner 保留的 UID 范围、会话 turn 的 task_start
+	// 事实，以及会话 API（以接口返回，装配不导入 persistence/postgres）。
+	session.Store
+	task.TurnStore
+	resource.OwnerUIDStore
+	turnFactsStore
+	EnvUIDRangeID(ctx context.Context, envID string) (string, error)
+	Sessions() api.Sessions
 	// Migrate 执行尚未应用的迁移（安装引导之后）。
 	Migrate(ctx context.Context) error
 	Close()
@@ -460,6 +489,8 @@ type server struct {
 	calls     *call.Coordinator // Gateway 的记账与 journal 所有者
 	edge      *edge.Edge        // Gateway 的每 attempt 入口（task.Access）
 	blobs     blob.Store        // runner、Gateway 与 API 产物下载共用的 BlobStore
+	sessions  *sessionRuntime   // 会话：session Scheduler（启动执行时建立）与会话 turn 的执行
+	sessDeps  session.Deps      // session actor 的依赖（启用会话时）
 
 	cache *cache.Source // Gateway 的共享缓存；nil 表示关闭
 	redis *cache.Redis
@@ -572,12 +603,36 @@ func (s *server) assemble() error {
 	if err := s.assembleGateway(blobs); err != nil {
 		return err
 	}
+	access := newAccessRouter(s.edge, s.cfg.Runner.ReleaseTimeout)
+	s.sessions = &sessionRuntime{access: access, facts: s.store, blobs: blobs, log: s.log}
+	if s.cfg.sessionsEnabled() {
+		s.sessDeps = session.Deps{
+			Store:     s.store,
+			Env:       sessionEnv{c: s.coord, store: s.store, blobs: blobs, cfg: s.cfg, dataDir: s.d.DataDir, log: s.log},
+			Workers:   sessionWorkers{r: run, coord: s.coord, access: access, cfg: s.cfg, dataDir: s.d.DataDir, log: s.log},
+			Gateway:   access,
+			Admission: sessionAdmission{a: s.adm},
+			Clock:     s.d.Clock,
+			IDs:       s.d.NewID,
+			Config: session.Config{IdleFreeze: s.cfg.SessionIdleFreeze, EvictAfter: s.cfg.SessionEvictAfter,
+				IncarnationMemory: s.cfg.DefaultMemoryBytes},
+			Notify: func(taskID string) {
+				if sc := s.sched.Load(); sc != nil && s.workCtx.Err() == nil {
+					sc.Submit(taskID)
+				}
+			},
+			OnFatal: func(sessionID string, err error) {
+				s.fail(fmt.Errorf("app: 会话 %s 的 actor 致命错误: %w", sessionID, err))
+			},
+		}
+	}
 	s.taskDeps = task.Deps{
 		Store:     s.store,
 		Admission: admissionAdapter{a: s.adm, cfg: s.cfg},
 		Env:       envAdapter{c: s.coord, cfg: s.cfg, dataDir: s.d.DataDir},
-		Runner:    runnerAdapter{r: run, cfg: s.cfg, dataDir: s.d.DataDir},
-		Access:    s.edge,
+		Runner:    runnerAdapter{r: run, cfg: s.cfg, dataDir: s.d.DataDir, sess: s.sessions},
+		Access:    access,
+		Session:   sessionGate{rt: s.sessions},
 		Clock:     s.d.Clock,
 		IDs:       s.d.NewID,
 		OnFatal: func(taskID string, err error) {
@@ -831,6 +886,16 @@ func (s *server) startExecution(r recovery.Report) error {
 	}()
 	s.step("cleanup_loop")
 
+	// §14.1 第 10 步：恢复完成（重启驱逐已结束全部遗留 incarnation）→ session Scheduler → task Scheduler → API。
+	if s.cfg.sessionsEnabled() {
+		ss := session.NewScheduler(s.workCtx, s.sessDeps)
+		if err := ss.Start(); err != nil {
+			return fmt.Errorf("app: 启动 session actor: %w", err)
+		}
+		s.sessions.sched.Store(ss)
+		s.adm.SetPressureHandler(ss.OnMemoryPressure)
+		s.step("session_scheduler")
+	}
 	h := stopBlockedHandoff(r)
 	sched := task.NewScheduler(s.workCtx, s.taskDeps)
 	if err := sched.Start(h.opts); err != nil {
@@ -1042,6 +1107,10 @@ func (s *server) startAPI() error {
 	if s.cfg.Accounts {
 		accounts = notifyingAccounts{Accounts: s.store, n: store}
 	}
+	var sessions api.Sessions // 未启用会话时保持 nil 接口：会话端点 503 sessions_unavailable
+	if s.cfg.sessionsEnabled() {
+		sessions = notifyingSessions{Sessions: s.store.Sessions(), s: s}
+	}
 	h, err := api.New(api.Config{
 		Store: store, Blobs: s.blobs, Mode: s.currentMode, ListenAddr: ln.Addr().String(),
 		Token: s.cfg.APIToken, AllowedHosts: s.cfg.AllowedHosts, AllowedOrigins: s.cfg.AllowedOrigins,
@@ -1049,6 +1118,7 @@ func (s *server) startAPI() error {
 		Logger: s.log, ConfigVersion: s.cfg.ConfigVersion, MaxFaultRetries: s.cfg.MaxFaultRetries,
 		EffectiveLimits: s.cfg.effectiveLimits, CacheMetrics: s.cacheMetrics,
 		Accounts: accounts, ResearchSpec: s.cfg.researchSpec, SecureCookies: tlsCfg != nil,
+		Sessions: sessions, TurnSpec: s.cfg.turnSpec,
 	})
 	if err != nil {
 		_ = ln.Close()
@@ -1101,6 +1171,11 @@ func (s *server) shutdown(reason error) error {
 	waitOrTimeout(ctx, func() {
 		if sc := s.sched.Load(); sc != nil {
 			sc.Wait()
+		}
+		if s.sessions != nil {
+			if ss := s.sessions.sched.Load(); ss != nil {
+				ss.Wait()
+			}
 		}
 		s.bg.Wait()
 	}, func() { s.log.Error("等待 actor 与后台任务退出超时") })

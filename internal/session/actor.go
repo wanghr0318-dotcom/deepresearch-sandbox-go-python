@@ -546,6 +546,8 @@ func (a *Actor) runOp(ctx context.Context, eff Effect, handle IncarnationHandle,
 				r.done.Failed = err
 			case id != f.Expect:
 				r.done.Failed = fmt.Errorf("quiesced 报告 checkpoint %q，最新已提交为 %q", id, f.Expect)
+			default:
+				r.done.CheckpointID = id
 			}
 		}
 	case FreezeIncarnation:

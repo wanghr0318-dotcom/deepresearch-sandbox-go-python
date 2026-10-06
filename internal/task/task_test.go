@@ -2224,6 +2224,13 @@ func awaitingInput() Outcome {
 	return Outcome{Class: ClassAwaitingInput, ProposalKind: "awaiting_input"}
 }
 
+// turnSuccess 是会话 turn 的有效 result：内容带 session_state（成功裁决据此提交新的 session checkpoint）。
+func turnSuccess() Outcome {
+	o := success()
+	o.Result = json.RawMessage(`{"summary":"ok","outputs":[],"session_state":{"checkpoint_id":"sc-new","state":{"n":1}}}`)
+	return o
+}
+
 // Decide 的会话路径：槽位 → 授予 → 以授予的环境创建 attempt → 不建环境直接启动；正常结果先裁决、裁决提交后才交还
 // （Release，带提交后的会话指针）；故障立即交还销毁；awaiting_input 裁决为 paused/awaiting_input 并经 Release 交还。
 func TestDecideSessionTurnPath(t *testing.T) {
@@ -2251,7 +2258,8 @@ func TestDecideSessionTurnPath(t *testing.T) {
 		verdict  string
 		destroys bool
 	}{
-		{"成功", success(), "succeeded", ClassSucceeded, false, "succeeded", false},
+		{"成功", turnSuccess(), "succeeded", ClassSucceeded, false, "succeeded", false},
+		{"成功但缺 session_state", success(), "failed", "protocol_violation", false, "failed", false},
 		{"awaiting_input", awaitingInput(), "paused", ReasonAwaitingInput, false, "paused", false},
 		{"业务错误", Outcome{Class: "worker_error", ProposalKind: "error"}, "failed", "worker_error", false, "failed", false},
 		{"崩溃（故障重试）", crash(), "queued", "crashed_signal", true, "failed", true},
@@ -2262,6 +2270,10 @@ func TestDecideSessionTurnPath(t *testing.T) {
 			v := finalizeOf(t, d.Effects)
 			if v.TaskStatus != tc.status || v.TaskStatusReason != tc.reason {
 				t.Fatalf("判决 = %s/%s", v.TaskStatus, v.TaskStatusReason)
+			}
+			if wantSS := tc.status == "succeeded"; (v.SessionState != nil) != wantSS ||
+				(wantSS && (v.SessionState.CheckpointID != "sc-new" || string(v.SessionState.State) != `{"n":1}`)) {
+				t.Fatalf("成功裁决须带 result 中的 session_state，其余不带：%+v", v.SessionState)
 			}
 			if stop, ok := firstStop(d.Effects); ok != tc.early || (ok && (stop.Session == nil || !stop.Session.Destroy)) {
 				t.Fatalf("裁决之前的交还 = %+v（%v），期望 %v 且为销毁", stop, ok, tc.early)
@@ -2322,7 +2334,7 @@ func TestActorSessionTurnUsesGrantAndHandoff(t *testing.T) {
 		t.Fatalf("RunSpec = %+v", r.spec)
 	}
 	r.ready()
-	r.finish(success())
+	r.finish(turnSuccess())
 	h.waitDone()
 	h.before("acquire:1", "grant:s1:t1:1")
 	h.before("grant:s1:t1:1", "create_attempt:id-1")
@@ -2366,7 +2378,7 @@ func TestActorSessionTurnCrashDestroysBeforeRetry(t *testing.T) {
 		t.Errorf("重试 attempt = %+v", created)
 	}
 	r2.ready()
-	r2.finish(success())
+	r2.finish(turnSuccess())
 	h.waitDone()
 }
 

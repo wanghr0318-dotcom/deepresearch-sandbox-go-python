@@ -779,8 +779,14 @@ func (d *decider) verdict(o Outcome) Verdict {
 		}
 	case o.Class == ClassAwaitingInput: // 一种不经暂停请求的暂停（契约 A；VerdictAllowedReason）
 		v.TaskStatus, v.TaskStatusReason = "paused", ReasonAwaitingInput
+	case valid && d.s.SessionID != "" && resultSessionState(o.Result) == nil:
+		// 会话 turn 的成功裁决须提交 session_state（§12.3）：缺失或不完整的 result 不是有效结果
+		v.OutcomeClass, v.TaskStatus, v.TaskStatusReason = "protocol_violation", "failed", "protocol_violation"
 	case valid:
 		v.TaskStatus, v.TaskStatusReason, v.Result = "succeeded", o.Class, o.Result
+		if d.s.SessionID != "" {
+			v.SessionState = resultSessionState(o.Result)
+		}
 	case d.retryAllowed(o):
 		at := d.s.Now.Add(RetryBackoff(d.s.FaultRetriesUsed+d.s.OOMRetriesUsed, d.s.Jitter))
 		v.TaskStatus, v.TaskStatusReason, v.NotBefore = "queued", o.Class, &at
@@ -803,6 +809,32 @@ type verdictEvent struct {
 	StatusReason     string `json:"status_reason"`
 	PlatformKilled   bool   `json:"platform_killed"`
 	OutputIncomplete bool   `json:"output_incomplete"`
+}
+
+// resultSessionState 取出 result 内容（runner 记录的 {summary, outputs, session_state}）中的 session_state，作为成功
+// 裁决提交的新 session checkpoint（§12.3）；缺失或不完整（无 checkpoint_id，或 state 与 state_ref 不是恰有一个）时为 nil。
+func resultSessionState(result json.RawMessage) *SessionState {
+	var c struct {
+		SessionState *struct {
+			CheckpointID string          `json:"checkpoint_id"`
+			State        json.RawMessage `json:"state"`
+			StateRef     string          `json:"state_ref"`
+			Refs         []string        `json:"refs"`
+		} `json:"session_state"`
+	}
+	if json.Unmarshal(result, &c) != nil || c.SessionState == nil {
+		return nil
+	}
+	ss := c.SessionState
+	hasState := len(ss.State) > 0 && string(ss.State) != "null"
+	if ss.CheckpointID == "" || hasState == (ss.StateRef != "") {
+		return nil
+	}
+	out := &SessionState{CheckpointID: ss.CheckpointID, StateRef: ss.StateRef, Refs: ss.Refs}
+	if hasState {
+		out.State = ss.State
+	}
+	return out
 }
 
 // validResult：Worker 的 result 已被接受为有效结果（分类为成功）。

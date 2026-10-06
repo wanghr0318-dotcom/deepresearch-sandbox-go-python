@@ -94,6 +94,8 @@ type Report struct {
 	Steps    []StepResult
 	// Ledger 是本次执行的账本转换结果（§14.1 第 4 步；重跑时已转换的记录不再计入）。
 	Ledger LedgerConversion
+	// EvictedSessions 是重启驱逐（§12.6、§14.1 第 7 步）的结果：被驱逐的会话与被结束的 incarnation（重跑时为空）。
+	EvictedSessions []EvictedSession
 }
 
 const (
@@ -153,6 +155,14 @@ func Execute(ctx context.Context, plan reconcile.RecoveryPlan, d Deps) (Report, 
 			return x.r, fmt.Errorf("recovery: 步骤 %s: %w", s.ID, err)
 		}
 	}
+	// 第 7 步（规格 §12.6）：会话的环境（kind = session，含 frozen 的：provider.Stop 直接 kill 冻结的进程并等
+	// populated 0）已由计划的 StopEnv 停止；运行中 turn 的 attempt 已按 §14.2 提交 lost_on_restart（故障重试，下一次
+	// 授予走冷恢复）。此后单事务驱逐全部未关闭会话、结束遗留 incarnation，最新 session checkpoint 保留。
+	evicted, err := d.Store.EvictSessionsOnRestart(ctx)
+	if err != nil {
+		return x.r, fmt.Errorf("recovery: 重启驱逐会话: %w", err)
+	}
+	x.r.EvictedSessions = evicted
 	occupied, err := x.occupied(ctx)
 	if err != nil {
 		return x.r, fmt.Errorf("recovery: 计算占用: %w", err)

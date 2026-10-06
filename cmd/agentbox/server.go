@@ -97,6 +97,10 @@ func runServer(args []string, stderr io.Writer) int {
 	modelCallDeadline := fs.Duration("model-call-deadline", call.DefaultModelCallDeadline, "模型调用（/v1/chat/completions）的调用期限：推理模型的长输出可能超过 120 s（须 > 0）")
 	userOrchestrator := fs.String("user-orchestrator-model", "kimi-k3", "用户研究的编排模型（spec.orchestrator_model；须为声明的模型）。配置了 --model-base-url 时启用用户账号")
 	userWorker := fs.String("user-worker-model", "kimi-k2.6", "用户研究的 worker 模型（spec.worker_model；须为声明的模型）")
+	turnToolBudget := fs.Int("turn-tool-budget", app.DefaultTurnToolBudget, "会话每个 turn 的 web_search 与 web_fetch 调用额度（1–1000；第 N+1 次 429 tool_budget_exhausted）")
+	sessionIdleFreeze := fs.Duration("session-idle-freeze", app.DefaultSessionIdleFreeze, "会话空闲多久后冻结（须 > 0）")
+	sessionEvictAfter := fs.Duration("session-evict-after", app.DefaultSessionEvictAfter, "会话自空闲起多久后驱逐（须大于 --session-idle-freeze；内存压力下按 LRU 提前驱逐）")
+	sessionWorkerArgv := fs.String("session-worker-argv", "", "会话 incarnation 内启动 Worker 的命令（逗号分隔的 argv，例如 python3,-m,chatagent）；为空时不启用会话（会话端点 503 sessions_unavailable），非空时需要 --model-base-url")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -135,6 +139,11 @@ func runServer(args []string, stderr io.Writer) int {
 				return 2
 			}
 		}
+	}
+	sess := app.Config{Accounts: accounts}
+	if err := sessionFlags(&sess, *turnToolBudget, *sessionIdleFreeze, *sessionEvictAfter, *sessionWorkerArgv); err != nil {
+		fmt.Fprintln(stderr, "agentbox server:", err)
+		return 2
 	}
 	if w := plaintextListenWarning(*listen, *tlsCert != ""); w != "" {
 		fmt.Fprintln(stderr, w)
@@ -176,6 +185,10 @@ func runServer(args []string, stderr io.Writer) int {
 		Accounts:              accounts,
 		UserOrchestratorModel: *userOrchestrator,
 		UserWorkerModel:       *userWorker,
+		TurnToolBudget:        sess.TurnToolBudget,
+		SessionIdleFreeze:     sess.SessionIdleFreeze,
+		SessionEvictAfter:     sess.SessionEvictAfter,
+		SessionWorkerArgv:     sess.SessionWorkerArgv,
 	}
 	if _, err := os.Stat(filepath.Join(dir, api.TokenFile)); err == nil {
 		if cfg.APIToken, err = api.LoadToken(dir); err != nil {

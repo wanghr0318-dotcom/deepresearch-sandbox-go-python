@@ -157,3 +157,23 @@ func gatewayLimits(callDeadline, modelCallDeadline time.Duration) (call.Limits, 
 	}
 	return call.Limits{CallDeadline: callDeadline, ModelCallDeadline: modelCallDeadline}, nil
 }
+
+// sessionFlags 校验会话标志（M4 Plan 12）并写入 cfg：--turn-tool-budget 为 1–1000；--session-idle-freeze > 0；
+// --session-evict-after 须大于 --session-idle-freeze；--session-worker-argv（逗号分隔）为空时不启用会话，非空时需要
+// 用户账号（--model-base-url）。不合法时 runServer 在取得锁与连接数据库之前以退出码 2 返回。
+func sessionFlags(cfg *app.Config, budget int, idleFreeze, evictAfter time.Duration, workerArgv string) error {
+	switch {
+	case budget < 1 || budget > app.MaxTurnToolBudget:
+		return fmt.Errorf("--turn-tool-budget 须为 1–%d，得到 %d", app.MaxTurnToolBudget, budget)
+	case idleFreeze <= 0:
+		return fmt.Errorf("--session-idle-freeze 须大于 0，得到 %s", idleFreeze)
+	case evictAfter <= idleFreeze:
+		return fmt.Errorf("--session-evict-after（%s）须大于 --session-idle-freeze（%s）", evictAfter, idleFreeze)
+	}
+	argv := splitList(workerArgv)
+	if len(argv) > 0 && !cfg.Accounts {
+		return errors.New("--session-worker-argv 需要用户账号（--model-base-url）：会话只属于登录用户")
+	}
+	cfg.TurnToolBudget, cfg.SessionIdleFreeze, cfg.SessionEvictAfter, cfg.SessionWorkerArgv = budget, idleFreeze, evictAfter, argv
+	return nil
+}

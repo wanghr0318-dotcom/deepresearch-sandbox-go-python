@@ -132,10 +132,11 @@ jobs:
           sudo ./bin/agentbox doctor
       # go test 的退出码是主判据；citestjson 只补充检查 skip、中断与执行数量，不能替代退出码。
       # 两者都先执行完（以便都留下诊断输出），最后一起判定。
+      # tests/e2e 的真实沙箱会话用例（E28–E33；E29、E30 各等待一次 T_release = 30 s）使该测试二进制可能超过默认的 10 min。
       - name: root 测试与判定
         run: |
           set +e
-          sudo -E env "PATH=$PATH" CGO_ENABLED=0 go test -json -count=1 ./... > test.json
+          sudo -E env "PATH=$PATH" CGO_ENABLED=0 go test -json -count=1 -timeout 40m ./... > test.json
           test_exit=$?
           go run ./tools/citestjson test.json scripts/ci/allowed-skips.txt
           judge_exit=$?
