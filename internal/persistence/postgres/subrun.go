@@ -28,6 +28,7 @@ const failureReasonMaxBytes = 256
 const (
 	failureTaskCancel           = "task_cancel"
 	failureNotCompletedAtResult = "not_completed_at_result"
+	failureTaskFailed           = "task_failed"       // 任务以 failed 结束时仍未终态（P14-T11）
 	failureCheckpoint           = "checkpoint_failed" // checkpoint 列出 failed（Worker 未给原因）
 )
 
@@ -417,16 +418,20 @@ func rebindSubrunsTx(ctx context.Context, tx pgx.Tx, taskID, newAttemptID string
 	return out, nil
 }
 
-// closeOpenSubrunsTx 在最终裁决事务中收尾非终态 sub-run（规格 §8.4）：verdict 为 cancelled → cancelled
-// （failure_reason = task_cancel）；succeeded → failed（not_completed_at_result）；其他裁决不改动（留待恢复）。
-func closeOpenSubrunsTx(ctx context.Context, tx pgx.Tx, taskID, verdict string) error {
+// closeOpenSubrunsTx 在任务进入终态的事务中收尾非终态 sub-run（规格 §8.4；I13：终态任务不留下未终态的 sub-run）：
+// status 为 cancelled → cancelled（failure_reason = task_cancel）；succeeded → failed（not_completed_at_result）；
+// failed → failed（task_failed）；非终态（queued、paused 等）不改动，留待恢复时重新绑定。调用方：最终裁决
+// （FinalizeAttempt）、没有 attempt 的控制转换（ApplyControl → cancelled）与会话 turn 的 FailQueuedTurn。
+func closeOpenSubrunsTx(ctx context.Context, tx pgx.Tx, taskID, status string) error {
 	var ev subrun.Event
 	var reason string
-	switch verdict {
+	switch status {
 	case "cancelled":
 		ev, reason = subrun.EvTaskCancelled, failureTaskCancel
 	case "succeeded":
 		ev, reason = subrun.EvTaskSucceeded, failureNotCompletedAtResult
+	case "failed":
+		ev, reason = subrun.EvTaskFailed, failureTaskFailed
 	default:
 		return nil
 	}

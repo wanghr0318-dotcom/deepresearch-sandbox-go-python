@@ -4390,7 +4390,11 @@ func TestSubrunCheckpointTx(t *testing.T) {
 	if got := subrunRow(t, s, "t1", "c"); !strings.HasPrefix(got, "failed|") || !strings.HasSuffix(got, "|true") {
 		t.Fatalf("checkpoint failed 后 c = %s", got)
 	}
-	expectNoDBViolations(t, s)
+	// 只检验事务辅助本身：没有写 checkpoints 行，completed 的 a 没有已提交 checkpoint 列出（I13 正确报告，P14-T11）。
+	vs, err := s.DBViolations(ctx)
+	if err != nil || len(vs) != 1 || vs[0].ID != "I13" || !strings.Contains(vs[0].Detail, "sub-run a 为 completed") {
+		t.Fatalf("不变量违反：%+v, %v（期望只有 a 缺 checkpoint 的 I13）", vs, err)
+	}
 }
 
 // TestSubrunRebindTx：恢复时 started 未过期 → 重新绑定；deadline 已过 → timed_out（E45）；cancel_requested →
@@ -4470,11 +4474,12 @@ func TestSubrunRebindTx(t *testing.T) {
 }
 
 // TestSubrunCloseOpenTx：cancelled 裁决把非终态置 cancelled（task_cancel）；succeeded 裁决置 failed
-// （not_completed_at_result）；其他裁决不改动；终态不受影响。
+// （not_completed_at_result）；failed 裁决置 failed（task_failed，P14-T11）；非终态裁决（queued、paused）不改动；
+// 终态不受影响。
 func TestSubrunCloseOpenTx(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t, Options{})
-	for _, taskID := range []string{"t1", "t2", "t3"} {
+	for _, taskID := range []string{"t1", "t2", "t3", "t4", "t5"} {
 		fixture(t, s, taskID)
 		mustStartSubrun(t, s, taskID, "att-"+taskID, "open")
 		mustStartSubrun(t, s, taskID, "att-"+taskID, "done")
@@ -4485,7 +4490,7 @@ func TestSubrunCloseOpenTx(t *testing.T) {
 	if _, err := s.RequestSubrunCancel(ctx, "t2", "open", subrun.ReasonDeadline); err != nil {
 		t.Fatal(err)
 	}
-	for taskID, v := range map[string]string{"t1": "cancelled", "t2": "succeeded", "t3": "failed"} {
+	for taskID, v := range map[string]string{"t1": "cancelled", "t2": "succeeded", "t3": "failed", "t4": "queued", "t5": "paused"} {
 		if err := subrunTx(s, func(ctx context.Context, tx pgx.Tx) error { return closeOpenSubrunsTx(ctx, tx, taskID, v) }); err != nil {
 			t.Fatalf("%s: %v", taskID, err)
 		}
@@ -4493,7 +4498,9 @@ func TestSubrunCloseOpenTx(t *testing.T) {
 	for key, want := range map[string]string{
 		"t1/open": "cancelled|att-t1|-|task_cancel|task_cancel|true",
 		"t2/open": "failed|att-t2|-|not_completed_at_result|deadline|true",
-		"t3/open": "started|att-t3|-|||false",
+		"t3/open": "failed|att-t3|-|task_failed||true",
+		"t4/open": "started|att-t4|-|||false",
+		"t5/open": "started|att-t5|-|||false",
 		"t1/done": "failed|att-t1|-|x||true",
 		"t2/done": "failed|att-t2|-|x||true",
 	} {
@@ -5240,35 +5247,19 @@ func srSHA(s string) string {
 	return hex.EncodeToString(b)
 }
 
-// checkI3Layers 断言两层的 I3：task 层见 checkI3；每个 sub-run 层 reserved = Σ 该 sub-run 的 held、unknown = Σ charged_unknown、
-// spent = Σ ok try 的实际费用；Σ sub-run reserved/spent/unknown 不超过 task 层对应的桶；reservation 的 subrun_id 与其调用一致。
+// checkI3Layers 断言两层账本：task 层见 checkI3；sub-run 层与归属、Σ sub-run ≤ task 层由生产检查（DBViolations 的 I3 与
+// I13，P14-T11 自本 helper 移入 invariants.go）判定。这些用例的结果 blob 不落盘（I14 等不适用），只看 I3 与 I13。
 func checkI3Layers(t *testing.T, s *Store) {
 	t.Helper()
 	checkI3(t, s)
-	var bad *string
-	if err := s.pool.QueryRow(context.Background(), `SELECT string_agg(v, '; ') FROM (
-		SELECT format('sub-run %s/%s：reserved %s / held %s，unknown %s / charged_unknown %s，spent %s / ok %s', sb.task_id, sb.subrun_id,
-				sb.reserved_micro, h.held, sb.unknown_micro, h.unk, sb.spent_micro, h.ok) AS v
-			FROM subrun_budgets sb, LATERAL (SELECT
-				COALESCE((SELECT sum(amount) FROM reservations r WHERE r.task_id = sb.task_id AND r.subrun_id = sb.subrun_id AND r.state = 'held'), 0) AS held,
-				COALESCE((SELECT sum(amount) FROM reservations r WHERE r.task_id = sb.task_id AND r.subrun_id = sb.subrun_id AND r.state = 'charged_unknown'), 0) AS unk,
-				COALESCE((SELECT sum(c.cost_micro) FROM call_tries c JOIN reservations r USING (reservation_id)
-					WHERE r.task_id = sb.task_id AND r.subrun_id = sb.subrun_id AND c.outcome = 'ok'), 0) AS ok) h
-			WHERE sb.reserved_micro <> h.held OR sb.unknown_micro <> h.unk OR sb.spent_micro <> h.ok
-		UNION ALL
-		SELECT format('任务 %s：Σ sub-run reserved %s / spent %s / unknown %s 超过 task 层 %s / %s / %s', b.task_id,
-				x.r, x.s, x.u, b.reserved_micro, b.spent_micro, b.unknown_micro)
-			FROM budgets b JOIN (SELECT task_id, sum(reserved_micro) AS r, sum(spent_micro) AS s, sum(unknown_micro) AS u
-				FROM subrun_budgets GROUP BY task_id) x USING (task_id)
-			WHERE x.r > b.reserved_micro OR x.s > b.spent_micro OR x.u > b.unknown_micro
-		UNION ALL
-		SELECT format('reservation %s 的 subrun_id %s 与调用 %s 的 %s 不同', r.reservation_id, r.subrun_id, r.call_id, c.subrun_id)
-			FROM reservations r JOIN calls c USING (task_id, call_id) WHERE r.subrun_id IS DISTINCT FROM c.subrun_id
-		) x`).Scan(&bad); err != nil {
+	vs, err := s.DBViolations(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if bad != nil {
-		t.Fatalf("违反两层 I3：%s", *bad)
+	for _, v := range vs {
+		if v.ID == "I3" || v.ID == "I13" {
+			t.Fatalf("违反两层账本（%s）：%s", v.ID, v.Detail)
+		}
 	}
 }
 
@@ -6736,3 +6727,177 @@ func TestAttemptSubrunLifecycle(t *testing.T) {
 	}
 	expectNoDBViolations(t, s)
 }
+
+// ==== M4 Plan 14 Task 7 段结束 ====
+
+// ==== M4 Plan 14 Task 11：终态任务收尾 sub-run、I13 与 I3 两层（本段到此结束前不含其他任务的用例） ====
+
+// violationsOf 返回 DBViolations 中编号为 id 的违反。
+func violationsOf(t *testing.T, s *Store, id string) []string {
+	t.Helper()
+	vs, err := s.DBViolations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, v := range vs {
+		if v.ID == id {
+			out = append(out, v.Detail)
+		}
+	}
+	return out
+}
+
+// expectViolation 断言恰有一条编号为 id 的违反，且其描述含 want。
+func expectViolation(t *testing.T, s *Store, id, want string) {
+	t.Helper()
+	got := violationsOf(t, s, id)
+	if len(got) != 1 || !strings.Contains(got[0], want) {
+		t.Fatalf("%s 违反 = %q，期望恰一条含 %q", id, got, want)
+	}
+}
+
+// TestTerminalTaskClosesSubruns：任务以任何终态结束时都不留下未终态的 sub-run（I13）——failed 裁决（FinalizeAttempt）
+// 置 failed{task_failed}；没有 attempt 的取消（ApplyControl queued → cancelled，例如暂停或故障重试之间取消）置
+// cancelled{task_cancel}；会话 turn 没有 attempt 即失败（FailQueuedTurn）置 failed{task_failed}。已终态的 sub-run 不变。
+func TestTerminalTaskClosesSubruns(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+
+	// failed 裁决
+	fixture(t, s, "t1")
+	mustStartSubrun(t, s, "t1", "att-t1", "a")
+	mustStartSubrun(t, s, "t1", "att-t1", "b")
+	mustStartSubrun(t, s, "t1", "att-t1", "c")
+	if _, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "b", "succeeded", "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RequestSubrunCancel(ctx, "t1", "c", subrun.ReasonOrchestrator); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "c", "cancelled", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.FinalizeAttempt(ctx, verdict("t1", 1)); err != nil {
+		t.Fatal(err)
+	}
+	for id, w := range map[string]string{"a": "failed|att-t1|-|task_failed||true", "b": "failed|att-t1|-|task_failed||true",
+		"c": "cancelled|att-t1|-||orchestrator|true"} {
+		if g := subrunRow(t, s, "t1", id); g != w {
+			t.Errorf("failed 裁决后 %s = %s，期望 %s", id, g, w)
+		}
+	}
+
+	// 故障重试回到 queued（sub-run 保持 started，留待重新绑定），随后在没有 attempt 时取消。
+	fixture(t, s, "t2")
+	mustStartSubrun(t, s, "t2", "att-t2", "a")
+	v := verdict("t2", 1)
+	v.TaskStatus = "queued"
+	if _, err := s.FinalizeAttempt(ctx, v); err != nil {
+		t.Fatal(err)
+	}
+	if g := subrunRow(t, s, "t2", "a"); g != "started|att-t2|-|||false" {
+		t.Fatalf("回到 queued 不应收尾：%s", g)
+	}
+	c, err := s.AcceptControl(ctx, api.ControlRequest{RequestID: "c-t2", BodyHash: []byte("h"), TaskID: "t2", Desired: "cancel"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ApplyControl(ctx, task.ApplyControl{TaskID: "t2", ControlVersion: c.ControlVersion, Status: "cancelled",
+		StatusReason: "cancelled"}); err != nil {
+		t.Fatal(err)
+	}
+	if g := subrunRow(t, s, "t2", "a"); g != "cancelled|att-t2|-|task_cancel|task_cancel|true" {
+		t.Fatalf("无 attempt 的取消后 a = %s", g)
+	}
+	if got := violationsOf(t, s, "I13"); len(got) != 0 {
+		t.Fatalf("I13 违反：%q", got)
+	}
+
+	// 会话 turn：attempt 启动 sub-run 后故障重试回到 queued，会话不可用时 FailQueuedTurn。
+	alice := mustUser(t, s, "alice")
+	liveSession(t, s, "s1", alice)
+	mustTurn(t, s, turnReq("s1", "ta", alice))
+	na := turnAttempt("s1", "ta", 1)
+	if _, err := s.CreateAttempt(ctx, na); err != nil {
+		t.Fatal(err)
+	}
+	mustStartSubrun(t, s, "ta", na.AttemptID, "st1")
+	setTask(t, s, "ta", "queued", "")
+	if err := s.FailQueuedTurn(ctx, "ta", task.ReasonSessionUnavailable); err != nil {
+		t.Fatal(err)
+	}
+	if g := subrunRow(t, s, "ta", "st1"); g != "failed|"+na.AttemptID+"|-|task_failed||true" {
+		t.Fatalf("FailQueuedTurn 后 st1 = %s", g)
+	}
+	if got := violationsOf(t, s, "I13"); len(got) != 0 {
+		t.Fatalf("I13 违反：%q", got)
+	}
+}
+
+// TestInvariantI13：I13 与 I3 两层的检查各自报告人为制造的违反——completed 而没有 checkpoint 列出；checkpoint 列为
+// completed 之后状态回退；终态任务仍有 started 的 sub-run；sub-run 层 spent 超过 task 层（同时破坏 sub-run 层 I3）；
+// reservation 归属与调用不一致。合法状态（checkpoint 列出 completed、exec 的 cpu 预留不归属 sub-run）不报告。
+func TestInvariantI13(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := s.pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+
+	// completed 而没有已提交的 checkpoint 列出 → 违反；提交一个列出它的 checkpoint 后成立。
+	fixture(t, s, "t1")
+	mustStartSubrun(t, s, "t1", "att-t1", "a")
+	sha := strings.Repeat("e", 64)
+	if _, err := s.RegisterArtifact(ctx, runner.Artifact{TaskID: "t1", AttemptID: "att-t1", ArtifactID: "subrun-a", SHA256: sha,
+		Size: 10, MediaType: "application/json", Visibility: "internal"}); err != nil {
+		t.Fatal(err)
+	}
+	exec("UPDATE subruns SET status = 'completed', result_ref = $1, ended_at = now() WHERE task_id = 't1' AND subrun_id = 'a'", sha)
+	expectViolation(t, s, "I13", "没有已提交的 checkpoint")
+	if _, err := s.CommitCheckpoint(ctx, runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "t1"}, CheckpointID: "cp-1",
+		AttemptID: "att-t1", StepID: "s", State: json.RawMessage(`{}`), Refs: []string{},
+		Subruns: []protocol.CheckpointSubrun{{SubrunID: "a", Status: "completed", ResultRef: sha}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := violationsOf(t, s, "I13"); len(got) != 0 {
+		t.Fatalf("checkpoint 列出 completed 后仍有 I13 违反：%q", got)
+	}
+	// 状态回退：checkpoint 列为 completed 之后被改回 started。
+	exec("UPDATE subruns SET status = 'started', result_ref = NULL, ended_at = NULL WHERE task_id = 't1' AND subrun_id = 'a'")
+	expectViolation(t, s, "I13", "最终为 started，checkpoint cp-1")
+	exec("UPDATE subruns SET status = 'completed', result_ref = $1, ended_at = now() WHERE task_id = 't1' AND subrun_id = 'a'", sha)
+	// 之后的 checkpoint 又把已完成的 sub-run 列为 started（直接写入，绕过状态机）。
+	exec(`INSERT INTO checkpoints (scope_kind, scope_id, checkpoint_id, commit_seq, attempt_id, step_id, content_hash, state_inline, subruns_json)
+		VALUES ('task', 't1', 'cp-2', 2, 'att-t1', 's', '\x00', '{}', '[{"subrun_id":"a","status":"started"}]')`)
+	expectViolation(t, s, "I13", "又列为 started")
+	exec("DELETE FROM checkpoints WHERE checkpoint_id = 'cp-2'")
+
+	// 终态任务仍有未终态的 sub-run。
+	fixture(t, s, "t2")
+	mustStartSubrun(t, s, "t2", "att-t2", "a")
+	setTask(t, s, "t2", "failed", "worker_error")
+	expectViolation(t, s, "I13", "仍为 started")
+	setTask(t, s, "t2", "running", "")
+
+	// 两层账本：一笔 sub-run 调用结算后成立；sub-run 层 spent 人为超过 task 层 → I13（Σ）与 I3（sub-run 层）。
+	srFixture(t, s, "t3", 1000, map[string]*int64{"b": capOf(500)})
+	srBegin(t, s, "t3", "b", "b/x/chat/1")
+	srSettle(t, s, srMustReserve(t, s, "t3", "b", "b/x/chat/1", 100), "ok", 40)
+	if got := append(violationsOf(t, s, "I3"), violationsOf(t, s, "I13")...); len(got) != 0 {
+		t.Fatalf("合法的两层账本被报告：%q", got)
+	}
+	exec("UPDATE subrun_budgets SET spent_micro = 41 WHERE task_id = 't3' AND subrun_id = 'b'")
+	expectViolation(t, s, "I13", "超过 task 层")
+	expectViolation(t, s, "I3", "sub-run b：")
+	exec("UPDATE subrun_budgets SET spent_micro = 40 WHERE task_id = 't3' AND subrun_id = 'b'")
+	// 归属：reservation 记在 root 层而调用属于 sub-run b。
+	exec("UPDATE reservations SET subrun_id = NULL WHERE task_id = 't3'")
+	exec("UPDATE subrun_budgets SET spent_micro = 0 WHERE task_id = 't3' AND subrun_id = 'b'")
+	expectViolation(t, s, "I3", "记在 root 层")
+}
+
+// ==== M4 Plan 14 Task 11 段结束 ====

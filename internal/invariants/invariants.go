@@ -5,7 +5,9 @@
 // UID 范围互不相同 [A]、已归还范围不拥有任何文件 [Q]；I12 [Q]——清理完成的 exec 环境没有挂载、cgroup 与目录（与 I1 同一
 // 扫描，按 kind 报告；I12 [A]、[B] 在数据库检查中）；M4 Plan 12：I9——每个会话至多一个非 ended 的 incarnation、frozen
 // 会话最近一次 quiesced 的 checkpoint 等于会话指针；I10——session checkpoint 只由 succeeded turn 提交、commit_seq 与指针
-// 单调；I6 的 attempt 关联对 seed- 恢复种子豁免）。
+// 单调；I6 的 attempt 关联对 seed- 恢复种子豁免；M4 Plan 14：I3 的 sub-run 层账本与归属（只核对 kind = money 的预留）、
+// I13——completed 的 sub-run 出现在已提交 checkpoint 中且 result_ref 一致、sub-run 终态不回退、各 sub-run 账本之和每桶
+// 不超过 task 账本、终态任务没有未终态的 sub-run）。
 //
 // 资源类检查独立扫描实际资源（provider.Scan、UID 范围文件属主）与 BlobStore 内容，不只从数据库推导。每条违反带类别：
 // [A] 始终成立、[B] 期限内成立、[Q] 静止时成立；Q 类只在 quiescent 为真时检查。
@@ -40,8 +42,8 @@ type BlobRef struct {
 
 // Store 是不变量检查需要的数据库读取（实现位于 internal/persistence/postgres）。
 type Store interface {
-	// DBViolations 返回只依赖数据库即可判定的违反：I2、I3、I4、I6（授权、指针与 attempt 关联）、I7、I8、I9、I10、I14（登记与授权，含缓存
-	// 来源）、I15、I16。可以含 Q 类违反：Verify 只在 quiescent 为真时保留它们。
+	// DBViolations 返回只依赖数据库即可判定的违反：I2、I3、I4、I6（授权、指针与 attempt 关联）、I7、I8、I9、I10、I13、I14（登记与授权，
+	// 含缓存来源）、I15、I16。可以含 Q 类违反：Verify 只在 quiescent 为真时保留它们。
 	DBViolations(ctx context.Context) ([]Violation, error)
 	// CleanedEnvs 返回 cleanup_state = done 的环境及其 kind（I1；kind = exec 的报告为 I12 [Q]）。
 	CleanedEnvs(ctx context.Context) ([]CleanedEnv, error)

@@ -68,6 +68,60 @@ var invariantQueries = []struct {
 		WHERE r.kind = 'cpu' AND (t.reservation_id IS NULL OR NOT ((r.state = 'held' AND t.state = 'in_flight')
 			OR (r.state = 'settled' AND t.outcome IN ('ok', 'retryable', 'fatal'))
 			OR (r.state = 'charged_unknown' AND t.outcome = 'unknown')))`},
+	// I3 sub-run 层（两层账本，规格 §9.6；只有 money 预留归属 sub-run，exec 的 cpu 预留 subrun_id 为 NULL）：每个 sub-run
+	// reserved = Σ 该 sub-run 的 held、unknown = Σ charged_unknown、spent = Σ settled try 的实际费用。task 层见上。
+	{"I3", "A", `SELECT sb.task_id, format('sub-run %s：reserved=%s（held 之和 %s），unknown=%s（charged_unknown 之和 %s），spent=%s（settled 之和 %s）',
+			sb.subrun_id, sb.reserved_micro, COALESCE(r.held, 0), sb.unknown_micro, COALESCE(r.unk, 0), sb.spent_micro, COALESCE(s.spent, 0))
+		FROM subrun_budgets sb
+		LEFT JOIN (SELECT task_id, subrun_id, sum(amount) FILTER (WHERE state = 'held') AS held,
+				sum(amount) FILTER (WHERE state = 'charged_unknown') AS unk
+			FROM reservations WHERE kind = 'money' AND subrun_id IS NOT NULL GROUP BY task_id, subrun_id) r
+			ON r.task_id = sb.task_id AND r.subrun_id = sb.subrun_id
+		LEFT JOIN (SELECT x.task_id, x.subrun_id, sum(t.cost_micro) AS spent FROM call_tries t
+				JOIN reservations x ON x.reservation_id = t.reservation_id
+				WHERE x.state = 'settled' AND x.kind = 'money' AND x.subrun_id IS NOT NULL GROUP BY x.task_id, x.subrun_id) s
+			ON s.task_id = sb.task_id AND s.subrun_id = sb.subrun_id
+		WHERE sb.reserved_micro <> COALESCE(r.held, 0) OR sb.unknown_micro <> COALESCE(r.unk, 0) OR sb.spent_micro <> COALESCE(s.spent, 0)`},
+	// I3 归属：money reservation 记在其调用所属的层（reservations.subrun_id 与 calls.subrun_id 相同；root 为 NULL）。
+	{"I3", "A", `SELECT r.task_id, format('money reservation %s 记在 %s 层，调用 %s 属于 %s', r.reservation_id,
+			COALESCE(r.subrun_id, 'root'), r.call_id, COALESCE(c.subrun_id, 'root'))
+		FROM reservations r JOIN calls c ON c.task_id = r.task_id AND c.call_id = r.call_id
+		WHERE r.kind = 'money' AND r.subrun_id IS DISTINCT FROM c.subrun_id`},
+	// I13：各 sub-run 账本之和每桶（reserved、spent、unknown 分别比较）不超过 task 账本。
+	{"I13", "A", `SELECT b.task_id, format('Σ sub-run reserved=%s / spent=%s / unknown=%s 超过 task 层 %s / %s / %s',
+			x.r, x.s, x.u, b.reserved_micro, b.spent_micro, b.unknown_micro)
+		FROM budgets b JOIN (SELECT task_id, sum(reserved_micro) AS r, sum(spent_micro) AS s, sum(unknown_micro) AS u
+			FROM subrun_budgets GROUP BY task_id) x ON x.task_id = b.task_id
+		WHERE x.r > b.reserved_micro OR x.s > b.spent_micro OR x.u > b.unknown_micro`},
+	// I13：completed 的 sub-run 出现在该任务某个已提交 checkpoint 的 subruns[] 中（completed 且 result_ref 相同，§13.5）。
+	{"I13", "A", `SELECT s.task_id, format('sub-run %s 为 completed（result_ref %s），没有已提交的 checkpoint 以同一 result_ref 列出它',
+			s.subrun_id, COALESCE(s.result_ref, '∅'))
+		FROM subruns s WHERE s.status = 'completed' AND NOT EXISTS (SELECT 1 FROM checkpoints c, jsonb_array_elements(c.subruns_json) e
+			WHERE c.scope_kind = 'task' AND c.scope_id = s.task_id AND e->>'subrun_id' = s.subrun_id
+				AND e->>'status' = 'completed' AND e->>'result_ref' = s.result_ref)`},
+	// I13：状态不回退。终态的 ended_at 非空；已提交 checkpoint 列出的终态（completed、cancelled、failed）与该 sub-run 的
+	// 最终状态一致（cancelled 对应 cancelled|timed_out，completed 的 result_ref 相同）；列为终态之后（commit_seq 更大）
+	// 不再被列为 started。sub-run 的状态转换没有单独的宿主事件，提交顺序以 checkpoint 的 commit_seq 为准。
+	{"I13", "A", `SELECT s.task_id, format('sub-run %s 为 %s，但终态未记录 ended_at', s.subrun_id, s.status)
+		FROM subruns s WHERE s.status IN ('completed', 'cancelled', 'failed', 'timed_out') AND s.ended_at IS NULL`},
+	{"I13", "A", `WITH l AS (SELECT c.scope_id AS task_id, c.checkpoint_id, c.commit_seq, e->>'subrun_id' AS subrun_id,
+				e->>'status' AS st, e->>'result_ref' AS ref
+			FROM checkpoints c, jsonb_array_elements(c.subruns_json) e
+			WHERE c.scope_kind = 'task' AND c.checkpoint_id NOT LIKE 'seed-%')
+		SELECT s.task_id, format('sub-run %s 最终为 %s，checkpoint %s（commit_seq %s）列为 %s', s.subrun_id, s.status,
+				l.checkpoint_id, l.commit_seq, l.st)
+			FROM subruns s JOIN l ON l.task_id = s.task_id AND l.subrun_id = s.subrun_id
+			WHERE l.st <> 'started' AND NOT ((l.st = 'completed' AND s.status = 'completed' AND l.ref = s.result_ref)
+				OR (l.st = 'cancelled' AND s.status IN ('cancelled', 'timed_out')) OR (l.st = 'failed' AND s.status = 'failed'))
+		UNION ALL
+		SELECT t.task_id, format('sub-run %s 在 checkpoint %s（commit_seq %s）列为 %s 之后，checkpoint %s（commit_seq %s）又列为 started',
+				t.subrun_id, t.checkpoint_id, t.commit_seq, t.st, l.checkpoint_id, l.commit_seq)
+			FROM l t JOIN l ON l.task_id = t.task_id AND l.subrun_id = t.subrun_id AND l.commit_seq > t.commit_seq
+			WHERE t.st <> 'started' AND l.st = 'started'`},
+	// I13：终态任务没有未终态的 sub-run（裁决事务、无 attempt 的取消与失败在同一事务中收尾，§8.4）。
+	{"I13", "A", `SELECT s.task_id, format('任务已 %s，sub-run %s 仍为 %s', t.status, s.subrun_id, s.status)
+		FROM subruns s JOIN tasks t ON t.task_id = s.task_id
+		WHERE t.status IN ('succeeded', 'failed', 'cancelled') AND s.status IN ('started', 'end_proposed', 'cancel_requested')`},
 	// I12 [A]：已结束（访问已撤销）的 attempt 不启动新 exec——exec_started_at 不晚于所属 attempt 的 revoked_at。
 	// MarkExecStarting 与撤销在 attempt_access 上串行，先提交的启动标记早于撤销。
 	{"I12", "A", `SELECT t.task_id, format('调用 %s 的 exec try %s 于 %s 标记启动，晚于 attempt %s 的访问撤销（%s）',

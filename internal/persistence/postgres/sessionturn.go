@@ -60,7 +60,12 @@ func (s *Store) FailQueuedTurn(ctx context.Context, taskID, reason string) error
 			return err
 		}
 		payload, _ := json.Marshal(map[string]any{"task_status": "failed", "status_reason": reason})
-		_, err = appendHostEvent(ctx, tx, hostEvent{taskID: taskID, key: "task_terminal:" + reason, typ: "task_terminal", payload: payload})
-		return err
+		if _, err := appendHostEvent(ctx, tx, hostEvent{taskID: taskID, key: "task_terminal:" + reason, typ: "task_terminal",
+			payload: payload}); err != nil {
+			return err
+		}
+		// 故障重试之后留下的未终态 sub-run 随 turn 失败收尾（I13）；在追加事件（task_event_seq → session_event_seq）
+		// 之后加锁，符合 … → session_event_seq → subruns 的锁顺序。
+		return closeOpenSubrunsTx(ctx, tx, taskID, "failed")
 	})
 }

@@ -2190,3 +2190,141 @@ def test_sim_worker_exec_op_fails_task_on_status_mismatch_or_gateway_error(
     code, events = run(sim_app, tmp_path, init={"config": {"steps": steps}})
     assert code == 1
     assert events[-1]["type"] == "error" and events[-1]["code"] == error_code
+
+
+# ---- sim-worker 的 sub-run 操作（M4 Plan 14 Task 11）----
+
+
+def sim_subrun_host(closed: frozenset[str] = frozenset()) -> Responder:
+    """最小宿主：subrun_start → started（closed 中的 ID → rejected/subrun_closed）；
+    产物 → saved；checkpoint 把已取消的 sub-run 列为 completed 时 rejected/invalid_transition
+    （E41），否则 committed。"""
+    cancelled: set[str] = set()
+
+    def respond(msg: dict[str, Any], transport: MemoryTransport) -> None:
+        typ = msg["type"]
+        if typ == "subrun_start":
+            sid = msg["subrun_id"]
+            answer = {"type": "subrun_started", "subrun_id": sid, "status": "started"}
+            if sid in closed:
+                answer = {**answer, "status": "rejected", "code": "subrun_closed"}
+            reply(transport, answer)
+        elif typ == "subrun_end" and msg["status"] == "cancelled":
+            cancelled.add(msg["subrun_id"])
+        elif typ == "artifact":
+            saved = {"artifact_id": msg["artifact_id"], "status": "saved", "version": 1}
+            reply(
+                transport,
+                {"type": "artifact_result", **saved, "sha256": msg["declared_sha256"]},
+            )
+        elif typ == "checkpoint":
+            bad = any(
+                e["subrun_id"] in cancelled and e["status"] == "completed"
+                for e in msg.get("subruns", [])
+            )
+            result = {"type": "checkpoint_result", "checkpoint_id": msg["checkpoint_id"]}
+            result |= {"scope": "task", "status": "committed"}
+            if bad:
+                result |= {"status": "rejected", "code": "invalid_transition"}
+            reply(transport, result)
+
+    return respond
+
+
+SUBRUN_STEPS: list[dict[str, Any]] = [
+    {"op": "subrun_start", "subrun_id": "st1", "deadline_ms": 60000},
+    {"op": "subrun_start", "subrun_id": "st2", "deadline_ms": 60000, "budget_cap_micro": 0},
+    {"op": "checkpoint", "step_id": "c1"},
+    {"op": "subrun_cancel", "subrun_id": "st2"},
+    {"op": "subrun_end", "subrun_id": "st1", "summary": "st1 摘要"},
+    {
+        "op": "checkpoint",
+        "step_id": "forged",
+        "forge_completed": ["st2"],
+        "expect_rejected": "invalid_transition",
+    },
+    {"op": "sleep", "ms": 1, "subrun": "st2"},
+    {"op": "fail", "code": "sim_attempt2", "attempt": 2},
+    {"op": "checkpoint", "step_id": "c2"},
+]
+
+
+def test_sim_worker_subrun_ops(tmp_path):
+    # 启动、取消、完成（登记 internal 结果产物为 result_ref）、伪造 completed 被拒
+    # （之后的 checkpoint 列出真实状态）；引用已关闭 sub-run 的步骤与其他 attempt 的步骤跳过。
+    init = {"extensions": ["subruns"], "config": {"steps": SUBRUN_STEPS}}
+    code, events = run(sim_app, tmp_path, init=init, responder=sim_subrun_host())
+    assert code == 0 and events[-1]["type"] == "result"
+    assert events[0]["subruns"] == 1  # ready 确认扩展
+    assert [e["subrun_id"] for e in events if e["type"] == "subrun_start"] == ["st1", "st2"]
+    ends = [(e["subrun_id"], e["status"]) for e in events if e["type"] == "subrun_end"]
+    assert ends == [("st2", "cancelled"), ("st1", "succeeded")]
+    artifacts = [e for e in events if e["type"] == "artifact" and e["artifact_id"] == "subrun-st1"]
+    assert artifacts[0]["path"] == "subruns/st1.json"
+    assert artifacts[0]["visibility"] == "internal"
+    content = json.loads((tmp_path / "subruns" / "st1.json").read_text(encoding="utf-8"))
+    assert content == {"summary": "st1 摘要", "sources": [], "partial": False}
+    c1, forged, c2 = [e for e in events if e["type"] == "checkpoint"]
+    assert c1["subruns"] == [
+        {"subrun_id": "st1", "status": "started"},
+        {"subrun_id": "st2", "status": "started"},
+    ]
+    assert forged["subruns"][1]["status"] == "completed"
+    assert c2["subruns"] == [
+        {"subrun_id": "st1", "status": "completed", "result_ref": artifacts[0]["declared_sha256"]},
+        {"subrun_id": "st2", "status": "cancelled"},
+    ]
+
+
+def test_sim_worker_subrun_resume_restarts_open_and_skips_closed(tmp_path):
+    # 恢复：next_index 之前的 subrun_start 以同一定义重发——st1 重新绑定，st2（resume.subruns
+    # 中 cancelled）在本地拒绝、不发消息；之后引用 st2 的步骤跳过；只在 attempt 2 执行的 fail 生效。
+    resume = {
+        "checkpoint_id": "cp-1",
+        "step_id": "c1",
+        "state": {"next_index": 6},
+        "subruns": [
+            {"subrun_id": "st1", "status": "started"},
+            {"subrun_id": "st2", "status": "cancelled"},
+        ],
+    }
+    init = {
+        "attempt_no": 2,
+        "extensions": ["subruns"],
+        "resume": resume,
+        "config": {"steps": SUBRUN_STEPS},
+    }
+    code, events = run(sim_app, tmp_path, init=init, responder=sim_subrun_host())
+    assert code == 1 and events[-1]["code"] == "sim_attempt2"
+    assert [e["subrun_id"] for e in events if e["type"] == "subrun_start"] == ["st1"]
+    assert [e for e in events if e["type"] in ("subrun_end", "subrun_cancel")] == []
+
+
+def test_sim_worker_subrun_gateway_and_expect_error(fake_gateway, tmp_path, monkeypatch):
+    # Gateway 操作经 sub-run 视图（归属头、call id 前缀）；expect_error 命中时继续、未命中时失败；
+    # 宿主答复 subrun_closed 的 sub-run 记为已关闭，其步骤跳过。
+    monkeypatch.setenv(GATEWAY_SOCKET_ENV, fake_gateway.socket_path)
+    fake_gateway.replies.append(error_reply(402, "subrun_budget_exhausted"))
+    chat = {"op": "chat", "step_id": "s", "subrun": "st1", "messages": [{"role": "user"}]}
+    steps = [
+        {"op": "subrun_start", "subrun_id": "st1"},
+        {"op": "subrun_start", "subrun_id": "st9"},
+        {**chat, "expect_error": "subrun_budget_exhausted"},
+        {"op": "fetch", "step_id": "s", "subrun": "st1", "url": "https://example.com/a"},
+        {"op": "fetch", "step_id": "s", "subrun": "st9", "url": "https://example.com/b"},
+        {"op": "subrun_end", "subrun_id": "st1"},
+    ]
+    init = {"extensions": ["subruns"], "config": {"steps": steps}}
+    host = sim_subrun_host(closed=frozenset({"st9"}))
+    code, events = run(sim_app, tmp_path, init=init, responder=host)
+    assert code == 0 and events[-1]["type"] == "result"
+    sent = [
+        (r.headers["x-agentbox-call-id"], r.headers["x-agentbox-subrun"])
+        for r in fake_gateway.requests
+    ]
+    assert sent == [("st1/s/chat/1", "st1"), ("st1/s/fetch/1", "st1")]
+
+    steps[2] = {**chat, "expect_error": "budget_exhausted"}
+    fake_gateway.replies.append(error_reply(402, "subrun_budget_exhausted"))
+    code, events = run(sim_app, tmp_path, init=init, responder=sim_subrun_host())
+    assert code == 1 and events[-1]["code"] == "subrun_budget_exhausted"

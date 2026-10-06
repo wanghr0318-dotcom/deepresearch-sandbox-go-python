@@ -134,6 +134,7 @@ const (
 	EvExpired           // 恢复时 deadline_at 已过
 	EvTaskCancelled     // task 取消裁决
 	EvTaskSucceeded     // task 成功裁决时仍未终态
+	EvTaskFailed        // task 以 failed 裁决时仍未终态（P14-T11：终态任务不留下未终态 sub-run）
 )
 
 // cancelFamily 是表中的占位目标：按 cancelReason 解析为 TimedOut（deadline）或 Cancelled（其他）。
@@ -162,6 +163,7 @@ var transitions = map[Status]map[Event]Status{
 		EvExpired:             TimedOut,
 		EvTaskCancelled:       Cancelled,
 		EvTaskSucceeded:       Failed,
+		EvTaskFailed:          Failed,
 	},
 	EndProposed: {
 		EvEndFailed:           Failed,
@@ -174,6 +176,7 @@ var transitions = map[Status]map[Event]Status{
 		EvExpired:             TimedOut,
 		EvTaskCancelled:       Cancelled,
 		EvTaskSucceeded:       Failed,
+		EvTaskFailed:          Failed,
 	},
 	CancelRequested: {
 		EvEndFailed:           Failed,
@@ -185,6 +188,7 @@ var transitions = map[Status]map[Event]Status{
 		EvExpired:             cancelFamily,
 		EvTaskCancelled:       Cancelled,
 		EvTaskSucceeded:       Failed,
+		EvTaskFailed:          Failed,
 	},
 	Completed: {
 		EvCheckpointCompleted: Completed,

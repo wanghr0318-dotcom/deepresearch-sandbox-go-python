@@ -85,7 +85,7 @@ func TestDefinitionHash(t *testing.T) {
 	}
 }
 
-// TestNextTable 穷举 7 状态 × 11 事件。"X" 表示 ErrInvalidTransition；"C" 表示取消族终态（按 cancelReason：
+// TestNextTable 穷举 7 状态 × 12 事件。"X" 表示 ErrInvalidTransition；"C" 表示取消族终态（按 cancelReason：
 // deadline → timed_out，其他 → cancelled），对每个此类单元分别以 deadline 与 orchestrator 验证。
 func TestNextTable(t *testing.T) {
 	const (
@@ -93,16 +93,16 @@ func TestNextTable(t *testing.T) {
 		C = Status("C")
 	)
 	events := []Event{EvEndSucceeded, EvEndFailed, EvEndCancelled, EvCancelRequest, EvCheckpointCompleted,
-		EvCheckpointFailed, EvCheckpointCancelled, EvCheckpointStarted, EvExpired, EvTaskCancelled, EvTaskSucceeded}
-	table := map[Status][11]Status{
-		//               EndSucc      EndFail  EndCancel  CancelReq        CkCompleted CkFailed CkCancelled CkStarted    Expired  TaskCancel TaskSucc
-		Started:         {EndProposed, Failed, C, CancelRequested, Completed, Failed, C, Started, TimedOut, Cancelled, Failed},
-		EndProposed:     {X, Failed, C, CancelRequested, Completed, Failed, C, EndProposed, TimedOut, Cancelled, Failed},
-		CancelRequested: {X, Failed, C, CancelRequested, X, Failed, C, CancelRequested, C, Cancelled, Failed},
-		Completed:       {X, X, X, X, Completed, X, X, X, X, X, X},
-		Failed:          {X, Failed, X, X, X, Failed, X, X, X, X, X},
-		Cancelled:       {X, X, Cancelled, X, X, X, Cancelled, X, X, X, X},
-		TimedOut:        {X, X, TimedOut, X, X, X, TimedOut, X, X, X, X},
+		EvCheckpointFailed, EvCheckpointCancelled, EvCheckpointStarted, EvExpired, EvTaskCancelled, EvTaskSucceeded, EvTaskFailed}
+	table := map[Status][12]Status{
+		//               EndSucc      EndFail  EndCancel  CancelReq        CkCompleted CkFailed CkCancelled CkStarted    Expired  TaskCancel TaskSucc TaskFail
+		Started:         {EndProposed, Failed, C, CancelRequested, Completed, Failed, C, Started, TimedOut, Cancelled, Failed, Failed},
+		EndProposed:     {X, Failed, C, CancelRequested, Completed, Failed, C, EndProposed, TimedOut, Cancelled, Failed, Failed},
+		CancelRequested: {X, Failed, C, CancelRequested, X, Failed, C, CancelRequested, C, Cancelled, Failed, Failed},
+		Completed:       {X, X, X, X, Completed, X, X, X, X, X, X, X},
+		Failed:          {X, Failed, X, X, X, Failed, X, X, X, X, X, X},
+		Cancelled:       {X, X, Cancelled, X, X, X, Cancelled, X, X, X, X, X},
+		TimedOut:        {X, X, TimedOut, X, X, X, TimedOut, X, X, X, X, X},
 	}
 	if len(table) != 7 {
 		t.Fatalf("表应覆盖 7 个状态，实际 %d", len(table))
@@ -151,6 +151,8 @@ func TestNextNamedCases(t *testing.T) {
 		{"终态不因过期改变", Completed, EvExpired, "", "", true},
 		{"成功裁决时未完成为 failed", Started, EvTaskSucceeded, "", Failed, false},
 		{"E42：end_proposed 未入 checkpoint 不视为完成", EndProposed, EvTaskSucceeded, "", Failed, false},
+		{"失败裁决时未终态为 failed（已请求的取消同样收尾）", CancelRequested, EvTaskFailed, ReasonDeadline, Failed, false},
+		{"失败裁决不改写终态", Completed, EvTaskFailed, "", "", true},
 		{"同一终态重复确认", Completed, EvCheckpointCompleted, "", Completed, false},
 		{"timed_out 被 checkpoint 列为 cancelled 是确认", TimedOut, EvCheckpointCancelled, "", TimedOut, false},
 		{"未知状态", Status("bogus"), EvCheckpointStarted, "", "", true},

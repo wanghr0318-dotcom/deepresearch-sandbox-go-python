@@ -266,6 +266,11 @@ func (s *Store) ApplyControl(ctx context.Context, c task.ApplyControl) (task.Con
 			typ: "control_applied", payload: payload}); err != nil {
 			return err
 		}
+		// 没有 attempt 的取消（queued/paused → cancelled）同样收尾未终态的 sub-run（I13）；在追加事件
+		// （task_event_seq → session_event_seq）之后加锁，符合 … → session_event_seq → subruns 的锁顺序。
+		if err := closeOpenSubrunsTx(ctx, tx, c.TaskID, c.Status); err != nil {
+			return err
+		}
 		st.AppliedControlVersion, st.Status = c.ControlVersion, c.Status
 		out = st
 		return nil
@@ -435,7 +440,8 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 			return err
 		}
 		// 最终裁决收尾仍未终态的 sub-run（§8.4）：cancelled → cancelled（task_cancel），succeeded → failed
-		// （not_completed_at_result）；其他裁决（回到 queued、paused、failed）不改动，留待恢复时重新绑定。
+		// （not_completed_at_result），failed → failed（task_failed）；非终态裁决（回到 queued、paused）不改动，
+		// 留待恢复时重新绑定。
 		if err := closeOpenSubrunsTx(ctx, tx, v.TaskID, v.TaskStatus); err != nil {
 			return err
 		}
