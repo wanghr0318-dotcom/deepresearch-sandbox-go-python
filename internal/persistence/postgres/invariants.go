@@ -82,8 +82,11 @@ var invariantQueries = []struct {
 	{"I15", "Q", `SELECT c.task_id, format('调用 %s 自 %s 起处于 resolving，任务没有 active 的 attempt', c.call_id, c.resolving_since)
 		FROM calls c WHERE c.state = 'resolving' AND c.resolving_since IS NOT NULL
 			AND NOT EXISTS (SELECT 1 FROM attempt_access a WHERE a.task_id = c.task_id AND a.state = 'active')`},
+	// I16：已提交的请求都指向存在的资源——会话请求（create_session、wake_session）指向会话，其余指向任务。
 	{"I16", "A", `SELECT r.request_id, format('%s 请求对应的资源 %L 不存在', r.kind, r.resource_id)
-		FROM api_requests r WHERE r.resource_id = '' OR NOT EXISTS (SELECT 1 FROM tasks t WHERE t.task_id = r.resource_id)`},
+		FROM api_requests r WHERE r.resource_id = '' OR CASE WHEN r.kind IN ('create_session', 'wake_session')
+			THEN NOT EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = r.resource_id)
+			ELSE NOT EXISTS (SELECT 1 FROM tasks t WHERE t.task_id = r.resource_id) END`},
 }
 
 // DBViolations 运行只依赖数据库的不变量检查（实现 invariants.Store）。

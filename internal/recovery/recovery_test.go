@@ -96,6 +96,9 @@ func (w *world) LoadRecoveryFacts(context.Context) (Facts, error) {
 func (w *world) RevokeAllActive(context.Context, string) (int, error) {
 	return 0, errors.New("未使用")
 }
+func (w *world) EvictSessionsOnRestart(context.Context) ([]EvictedSession, error) {
+	return nil, errors.New("未使用")
+}
 func (w *world) AccountUnrecordedRunTime(_ context.Context, taskID, attemptID string, until time.Time) error {
 	return w.call(func() error {
 		w.accounted[taskID+"/"+attemptID] = until

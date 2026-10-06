@@ -447,15 +447,18 @@ func insertWorkerEvent(ctx context.Context, tx pgx.Tx, taskID, attemptID string,
 	if err != nil {
 		return err
 	}
-	ts := e.TS
-	if ts.IsZero() {
-		_, err = tx.Exec(ctx, `INSERT INTO events (task_id, task_seq, event_key, attempt_id, worker_seq, source, type, payload, content_hash)
-			VALUES ($1, $2, $3, $4, $5, 'worker', $6, $7, $8)`,
-			taskID, seq, fmt.Sprintf("w:%s:%d", attemptID, e.Seq), attemptID, e.Seq, e.Type, []byte(e.Payload), workerEventHash(e))
+	sessionID, sessionSeq, err := appendSessionSeq(ctx, tx, taskID) // 会话 task：同事务分配 session_seq
+	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO events (task_id, task_seq, event_key, attempt_id, worker_seq, source, type, payload, content_hash, ts)
-		VALUES ($1, $2, $3, $4, $5, 'worker', $6, $7, $8, $9)`,
-		taskID, seq, fmt.Sprintf("w:%s:%d", attemptID, e.Seq), attemptID, e.Seq, e.Type, []byte(e.Payload), workerEventHash(e), ts)
+	var ts any // 零值时用数据库时间
+	if !e.TS.IsZero() {
+		ts = e.TS
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO events (task_id, task_seq, event_key, attempt_id, worker_seq, source, type, payload, content_hash,
+			ts, session_id, session_seq)
+		VALUES ($1, $2, $3, $4, $5, 'worker', $6, $7, $8, COALESCE($9::timestamptz, now()), NULLIF($10, ''), $11)`,
+		taskID, seq, fmt.Sprintf("w:%s:%d", attemptID, e.Seq), attemptID, e.Seq, e.Type, []byte(e.Payload), workerEventHash(e),
+		ts, sessionID, nullSeq(sessionSeq))
 	return err
 }

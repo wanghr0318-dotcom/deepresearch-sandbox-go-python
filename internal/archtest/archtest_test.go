@@ -32,7 +32,7 @@ func deps(t *testing.T, pkg string) []string {
 func TestConsumersDoNotDependOnPostgres(t *testing.T) {
 	forbidden := []string{module + "/internal/persistence/postgres", "github.com/jackc/pgx"}
 	for _, pkg := range []string{
-		"internal/api", "internal/task", "internal/runner", "internal/resource",
+		"internal/api", "internal/task", "internal/session", "internal/runner", "internal/resource",
 		"internal/ownership", "internal/persistence", "internal/datadir", "internal/blob",
 		"internal/gateway/call", "internal/gateway/edge", "internal/gateway/upstream", "internal/gateway/cache",
 	} {
@@ -104,6 +104,16 @@ func TestLowLevelDoesNotDependOnControlPlane(t *testing.T) {
 // 文件系统访问（os）无法按包排除，由代码评审保证。
 func TestDecisionCodeHasNoSideEffectDeps(t *testing.T) {
 	forbid(t, "internal/task", []string{"net/http", "os/exec", "github.com/jackc/pgx", "github.com/redis"})
+}
+
+// TestSessionDecisionCodeDeps：规则 2 用于 session（M4 Plan 12）——session 的决策代码（Decide）与 actor 同包，
+// 只经窄接口（session.Store、provider 契约等）产生副作用：不依赖 HTTP、Redis、PostgreSQL 驱动与进程，也不依赖
+// 低层实现（provider/local、sandbox、cgroup、rootfs）。
+func TestSessionDecisionCodeDeps(t *testing.T) {
+	forbid(t, "internal/session", []string{
+		"net/http", "os/exec", "github.com/jackc/pgx", "github.com/redis",
+		module + "/internal/provider/local", module + "/internal/sandbox", module + "/internal/cgroup", module + "/internal/rootfs",
+	})
 }
 
 // TestAccountIsPureLogic：account 是账号的纯逻辑（哈希、规则、会话 ID、限速），不导入 persistence、net/http 与 api

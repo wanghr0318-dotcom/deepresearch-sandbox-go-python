@@ -25,6 +25,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/recovery"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/resource"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/session"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
 )
 
@@ -252,7 +253,7 @@ func TestInstallationBootstrapE46(t *testing.T) {
 			t.Fatal(err)
 		}
 		// 还原为只应用了 0001 的旧库
-		if _, err := s.pool.Exec(ctx, `DROP TABLE call_tries, reservations, calls, budgets, sessions;
+		if _, err := s.pool.Exec(ctx, undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions;
 			ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
 			ALTER TABLE installation DROP COLUMN bootstrap_token_hash; DELETE FROM schema_migrations WHERE version >= 2`); err != nil {
 			t.Fatal(err)
@@ -2596,7 +2597,7 @@ func TestMigrationBackfillsBudgets(t *testing.T) {
 	s := newStore(t, Options{})
 	fixture(t, s, "t1")
 	// 还原为只应用了 0001、0002 的旧库：任务 t1 没有预算行
-	if _, err := s.pool.Exec(ctx, `DROP TABLE call_tries, reservations, calls, budgets, sessions; ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
+	if _, err := s.pool.Exec(ctx, undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions; ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
 		DELETE FROM schema_migrations WHERE version >= 3`); err != nil {
 		t.Fatal(err)
 	}
@@ -2845,8 +2846,13 @@ func TestGatewayTaskFactsAndInspect(t *testing.T) {
 // TestAccountUsersAndSessions：用户名大小写不敏感唯一；登录读取；会话命中、过期、删除；停用吊销全部会话，
 // 启用后可重新建会话。
 func TestAccountUsersAndSessions(t *testing.T) {
+	checkAccounts(t, newStore(t, Options{}))
+}
+
+// checkAccounts 是 Plan 11 的账号与登录会话用例（迁移 0006 之后登录会话表为 auth_sessions）；s 中尚无用户。
+func checkAccounts(t *testing.T, s *Store) {
+	t.Helper()
 	ctx := context.Background()
-	s := newStore(t, Options{})
 	alice, err := s.CreateUser(ctx, "Alice", "alice", "hash-a")
 	if err != nil || alice.ID <= 0 || alice.Username != "Alice" || alice.Role != "user" || alice.Disabled {
 		t.Fatalf("CreateUser = %+v, %v", alice, err)
@@ -2891,7 +2897,7 @@ func TestAccountUsersAndSessions(t *testing.T) {
 	if err := s.SetDisabled(ctx, "alice", true); err != nil {
 		t.Fatal(err)
 	}
-	if n := count(t, s, "SELECT count(*) FROM sessions WHERE user_id = $1", alice.ID); n != 0 {
+	if n := count(t, s, "SELECT count(*) FROM auth_sessions WHERE user_id = $1", alice.ID); n != 0 {
 		t.Fatalf("停用应删除全部会话，剩 %d", n)
 	}
 	if _, err := s.SessionUser(ctx, other); !errors.Is(err, persistence.ErrNotFound) {
@@ -3072,5 +3078,909 @@ func TestAccountCreateResearch(t *testing.T) {
 	}
 	if views, _, err := s.ListTasksByOwner(ctx, alice.ID, "", 10); err != nil || len(views) != 3 || views[2].Topic != "x" || !views[2].CreatedAt.Equal(dbCreated) {
 		t.Fatalf("ListTasksByOwner 的 topic/created_at = %+v, %v", views, err)
+	}
+}
+
+// ---- 会话（migration 0006，M4 Plan 12） ----
+
+// undo0006 把库还原为只应用了 0005 的形状（登录会话表改回 sessions）；回滚到更早迁移的测试先执行它。
+const undo0006 = `DROP TABLE incarnations, session_events, session_event_seq, session_progress, session_control;
+	ALTER TABLE tasks DROP CONSTRAINT tasks_session_fk, DROP COLUMN turn_index, DROP COLUMN restored_from_task_id,
+		DROP COLUMN resume_directive;
+	DROP TABLE sessions;
+	ALTER TABLE events DROP COLUMN session_id, DROP COLUMN session_seq;
+	ALTER TABLE budgets DROP CONSTRAINT budgets_tool_within, DROP COLUMN tool_call_limit, DROP COLUMN tool_calls_used;
+	ALTER TABLE auth_sessions RENAME TO sessions;
+	ALTER INDEX auth_sessions_user_id RENAME TO sessions_user_id;
+	ALTER TABLE sessions RENAME CONSTRAINT auth_sessions_pkey TO sessions_pkey;
+	ALTER TABLE sessions RENAME CONSTRAINT auth_sessions_user_id_fkey TO sessions_user_id_fkey;
+	DELETE FROM schema_migrations WHERE version >= 6;
+`
+
+// TestMigration0006：全新库一次迁移到 0006；0005 的库升级到 0006 后原有登录会话仍有效（auth_sessions），Plan 11 的
+// 账号与登录用例全部通过，迁移前的任务与事件不带会话序号。
+func TestMigration0006(t *testing.T) {
+	ctx := context.Background()
+	t.Run("全新库", func(t *testing.T) {
+		s := newStore(t, Options{})
+		if n := count(t, s, "SELECT max(version) FROM schema_migrations"); n != 6 {
+			t.Fatalf("应迁移到 0006，得到 %d", n)
+		}
+		st, err := s.InspectInstallation(ctx)
+		if err != nil || !st.HasAgentboxTables {
+			t.Fatalf("InspectInstallation = %+v, %v", st, err)
+		}
+	})
+	t.Run("从 0005 升级", func(t *testing.T) {
+		s := newStore(t, Options{})
+		fixture(t, s, "old")
+		if _, err := s.pool.Exec(ctx, undo0006); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.pool.Exec(ctx, `INSERT INTO users (username, username_key, password_hash) VALUES ('carol', 'carol', 'h');
+			INSERT INTO sessions (id_hash, user_id, expires_at) SELECT '\x01', id, now() + interval '1 hour' FROM users`); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if u, err := s.SessionUser(ctx, []byte{1}); err != nil || u.Username != "carol" {
+			t.Fatalf("迁移前的登录会话应仍有效：%+v, %v", u, err)
+		}
+		if n := count(t, s, "SELECT count(*) FROM events WHERE task_id = 'old' AND session_id IS NULL AND session_seq IS NULL"); n == 0 {
+			t.Fatal("迁移前的事件应保留且没有会话序号")
+		}
+		if _, err := s.pool.Exec(ctx, "DELETE FROM auth_sessions; DELETE FROM users"); err != nil {
+			t.Fatal(err)
+		}
+		checkAccounts(t, s)
+	})
+}
+
+// ---- 会话测试的辅助 ----
+
+func mustUser(t *testing.T, s *Store, name string) int64 {
+	t.Helper()
+	u, err := s.CreateUser(context.Background(), name, name, "hash-"+name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u.ID
+}
+
+// newSession 创建会话 id（owner 为 0 时无主）。
+func newSession(t *testing.T, s *Store, id string, owner int64) {
+	t.Helper()
+	if _, _, err := s.SessionAPI().CreateSession(context.Background(), api.CreateSessionRequest{RequestID: "rs-" + id,
+		BodyHash: []byte("h-" + id), SessionID: id, OwnerUserID: owner}); err != nil {
+		t.Fatalf("CreateSession(%s): %v", id, err)
+	}
+}
+
+func turnReq(sessionID, taskID string, owner int64) api.CreateTurnRequest {
+	return api.CreateTurnRequest{RequestID: "rt-" + taskID, BodyHash: []byte("h-" + taskID), SessionID: sessionID, TaskID: taskID,
+		OwnerUserID: owner, Text: "问题 " + taskID, DeepResearch: true, Spec: json.RawMessage(`{"kind":"turn"}`),
+		Limits: json.RawMessage(`{"budget_micro":100,"max_tool_calls":30}`), MaxFaultRetries: 1}
+}
+
+func mustTurn(t *testing.T, s *Store, req api.CreateTurnRequest) api.CreateTurnResult {
+	t.Helper()
+	res, err := s.SessionAPI().CreateTurn(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CreateTurn(%s): %v", req.TaskID, err)
+	}
+	return res
+}
+
+// setTask 直接改写任务状态（模拟 task actor 的推进）。
+func setTask(t *testing.T, s *Store, taskID, status, reason string) {
+	t.Helper()
+	if _, err := s.pool.Exec(context.Background(), "UPDATE tasks SET status = $2, status_reason = $3 WHERE task_id = $1",
+		taskID, status, reason); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// setSession 直接改写会话状态（模拟 session actor 的推进）。
+func setSession(t *testing.T, s *Store, sessionID, status string) {
+	t.Helper()
+	if _, err := s.pool.Exec(context.Background(), "UPDATE sessions SET status = $2 WHERE session_id = $1", sessionID, status); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// authorize 登记 blob 并授权到 (kind, id) scope。
+func authorize(t *testing.T, s *Store, sha, kind, id string) {
+	t.Helper()
+	if _, err := s.pool.Exec(context.Background(), `INSERT INTO blobs (sha256, size) VALUES ($1, 1) ON CONFLICT DO NOTHING;`, sha); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(context.Background(), "INSERT INTO scope_blobs (scope_kind, scope_id, sha256) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+		kind, id, sha); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustAttempt(t *testing.T, s *Store, taskID string) {
+	t.Helper()
+	if _, err := s.CreateAttempt(context.Background(), task.NewAttempt{TaskID: taskID, AttemptID: "att-" + taskID, AttemptNo: 1,
+		EnvID: "env-" + taskID}); err != nil {
+		t.Fatalf("CreateAttempt(%s): %v", taskID, err)
+	}
+}
+
+func workerEvents(t *testing.T, s *Store, attemptID string, from, to int64, payload string) {
+	t.Helper()
+	var evs []runner.WorkerEvent
+	for i := from; i <= to; i++ {
+		evs = append(evs, runner.WorkerEvent{Seq: i, Type: "progress", Payload: json.RawMessage(payload)})
+	}
+	if _, err := s.AppendWorkerEvents(context.Background(), attemptID, evs); err != nil {
+		t.Fatalf("AppendWorkerEvents(%s): %v", attemptID, err)
+	}
+}
+
+// expectNoDBViolations 断言只依赖数据库的不变量（含 I4、I6、I16）全部成立。
+func expectNoDBViolations(t *testing.T, s *Store) {
+	t.Helper()
+	vs, err := s.DBViolations(context.Background())
+	if err != nil || len(vs) != 0 {
+		t.Fatalf("不变量违反：%+v, %v", vs, err)
+	}
+}
+
+// expectSessionSeqContiguous 断言会话的 session_seq（events 与 session_events 合计）从 1 起连续、无重复。
+func expectSessionSeqContiguous(t *testing.T, s *Store, sessionID string) int {
+	t.Helper()
+	var n, distinct, lo, hi int
+	if err := s.pool.QueryRow(context.Background(), `SELECT count(*), count(DISTINCT seq), COALESCE(min(seq), 0), COALESCE(max(seq), 0) FROM (
+			SELECT session_seq AS seq FROM events WHERE session_id = $1
+			UNION ALL SELECT session_seq FROM session_events WHERE session_id = $1) x`, sessionID).Scan(&n, &distinct, &lo, &hi); err != nil {
+		t.Fatal(err)
+	}
+	if n != distinct || (n > 0 && (lo != 1 || hi != n)) {
+		t.Fatalf("session_seq 应从 1 起连续无重复：%d 条（不同 %d），范围 %d..%d", n, distinct, lo, hi)
+	}
+	return n
+}
+
+// TestSessionEventSeq：同一会话两个 turn 的 host 与 worker 事件、会话生命周期事件交错追加，session_seq 连续且等于
+// 提交顺序；独立任务的事件没有会话序号；ListSessionEvents 按序分页。
+func TestSessionEventSeq(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	a := s.SessionAPI()
+	alice := mustUser(t, s, "alice")
+	newSession(t, s, "s1", alice)
+	fixture(t, s, "solo") // 独立任务
+
+	mustTurn(t, s, turnReq("s1", "ta", alice))
+	mustAttempt(t, s, "ta")
+	workerEvents(t, s, "att-ta", 1, 2, `{"kind":"thinking","data":{"text":"x"}}`)
+	if _, err := s.Transition(ctx, session.Transition{SessionID: "s1", FromRowVersion: 0, From: []string{session.StatusCreating},
+		To: session.StatusIdle, Event: json.RawMessage(`{"state":"idle"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	setTask(t, s, "ta", "paused", "")
+	mustTurn(t, s, turnReq("s1", "tb", alice)) // ta 的 control_accepted，tb 的 task_created
+	mustAttempt(t, s, "tb")
+	workerEvents(t, s, "att-tb", 1, 1, `{"kind":"thinking","data":{"text":"y"}}`)
+	workerEvents(t, s, "att-ta", 3, 3, `{"kind":"thinking","data":{"text":"z"}}`)
+	if err := s.AppendHostEvent(ctx, "ta", "", "probe", json.RawMessage(`{"n":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"ta/host/task_created", "ta/host/attempt_created", "ta/worker/progress", "ta/worker/progress",
+		"/session/session_state", "ta/host/control_accepted", "tb/host/task_created", "tb/host/attempt_created",
+		"tb/worker/progress", "ta/worker/progress", "ta/host/probe"}
+	recs, err := a.ListSessionEvents(ctx, "s1", 0, 100)
+	if err != nil || len(recs) != len(want) {
+		t.Fatalf("ListSessionEvents = %d 条, %v；期望 %d", len(recs), err, len(want))
+	}
+	for i, r := range recs {
+		if got := r.TaskID + "/" + r.Source + "/" + r.Type; r.SessionSeq != int64(i+1) || got != want[i] {
+			t.Fatalf("第 %d 条：seq %d %s，期望 seq %d %s", i, r.SessionSeq, got, i+1, want[i])
+		}
+	}
+	if recs[4].TaskSeq != 0 || string(recs[4].Payload) != `{"state": "idle"}` || recs[2].AttemptID != "att-ta" || recs[2].TaskSeq != 3 {
+		t.Fatalf("记录字段：%+v / %+v", recs[4], recs[2])
+	}
+	page, err := a.ListSessionEvents(ctx, "s1", 5, 3)
+	if err != nil || len(page) != 3 || page[0].SessionSeq != 6 || page[2].SessionSeq != 8 {
+		t.Fatalf("分页 = %+v, %v", page, err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM events WHERE task_id = 'solo' AND session_id IS NULL AND session_seq IS NULL"); n == 0 ||
+		n != count(t, s, "SELECT count(*) FROM events WHERE task_id = 'solo'") {
+		t.Fatal("独立任务的事件不应有会话序号")
+	}
+	expectSessionSeqContiguous(t, s, "s1")
+	expectNoDBViolations(t, s)
+}
+
+// TestSessionEventSeqConcurrent：两个 goroutine 分别向同一会话的两个 turn 追加事件，同时第三个 goroutine 做生命周期
+// Transition，session_seq 无缺口无重复（建议 -count=20 运行）。
+func TestSessionEventSeqConcurrent(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	alice := mustUser(t, s, "alice")
+	newSession(t, s, "s1", alice)
+	mustTurn(t, s, turnReq("s1", "ta", alice))
+	setTask(t, s, "ta", "paused", "")
+	mustTurn(t, s, turnReq("s1", "tb", alice))
+	if _, err := s.Transition(ctx, session.Transition{SessionID: "s1", From: []string{session.StatusCreating}, To: session.StatusIdle}); err != nil {
+		t.Fatal(err)
+	}
+	const perTurn, transitions = 15, 8
+	var wg sync.WaitGroup
+	errs := make(chan error, 3)
+	start := make(chan struct{})
+	for _, id := range []string{"ta", "tb"} {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < perTurn; i++ {
+				if err := s.AppendHostEvent(ctx, id, "", "probe", json.RawMessage(fmt.Sprintf(`{"i":%d}`, i))); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}(id)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < transitions; i++ {
+			st, err := s.LoadSession(ctx, "s1")
+			if err != nil {
+				errs <- err
+				return
+			}
+			to := session.StatusRunning
+			if st.Status == session.StatusRunning {
+				to = session.StatusIdle
+			}
+			if _, err := s.Transition(ctx, session.Transition{SessionID: "s1", FromRowVersion: st.RowVersion, From: []string{st.Status},
+				To: to, Event: json.RawMessage(`{"state":"` + to + `"}`)}); err != nil {
+				errs <- err
+				return
+			}
+		}
+	}()
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	// 2 个 task_created、1 个 control_accepted（取代 ta）、每 turn perTurn 条、transitions 条生命周期事件
+	if n := expectSessionSeqContiguous(t, s, "s1"); n != 3+2*perTurn+transitions {
+		t.Fatalf("会话事件应有 %d 条，得到 %d", 3+2*perTurn+transitions, n)
+	}
+}
+
+// TestSessionTransition：row_version 过期为 ErrConflict；来源不符为 invalid_transition；To=idle/frozen 写时间戳；
+// 事件写入 session_events，重跑同一转换不重复；SetIncarnation、AppliedWake、LastError 同事务写入。
+func TestSessionTransition(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	newSession(t, s, "s1", 0)
+	st, err := s.LoadSession(ctx, "s1")
+	if err != nil || st.Status != session.StatusCreating || st.RowVersion != 0 || st.Desired != "active" || st.Latest != nil ||
+		st.Incarnation != nil || len(st.NonTerminalTurns) != 0 {
+		t.Fatalf("新会话 = %+v, %v", st, err)
+	}
+	idle := session.Transition{SessionID: "s1", FromRowVersion: 0, From: []string{session.StatusCreating}, To: session.StatusIdle,
+		Event: json.RawMessage(`{"state":"idle"}`)}
+	for i := 0; i < 2; i++ { // 第二次是重跑
+		st, err = s.Transition(ctx, idle)
+		if err != nil || st.Status != session.StatusIdle || st.RowVersion != 1 || st.IdleSince == nil || st.FrozenSince != nil {
+			t.Fatalf("第 %d 次 creating → idle = %+v, %v", i+1, st, err)
+		}
+	}
+	if n := count(t, s, "SELECT count(*) FROM session_events WHERE session_id = 's1' AND event_key = 'idle:1'"); n != 1 {
+		t.Fatalf("重跑不应重复追加事件：%d", n)
+	}
+	if _, err := s.Transition(ctx, session.Transition{SessionID: "s1", FromRowVersion: 0, From: []string{session.StatusIdle},
+		To: session.StatusFrozen}); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("过期的 row_version 应为 ErrConflict，得到 %v", err)
+	}
+	_, err = s.Transition(ctx, session.Transition{SessionID: "s1", FromRowVersion: 1, From: []string{session.StatusRunning},
+		To: session.StatusFrozen})
+	expectRejected(t, err, session.CodeInvalidTransition)
+	inc, wake, lastErr := "inc-x", int64(3), "thaw failed"
+	st, err = s.Transition(ctx, session.Transition{SessionID: "s1", FromRowVersion: 1, From: []string{session.StatusIdle},
+		To: session.StatusFrozen, SetIncarnation: &inc, AppliedWake: &wake, LastError: &lastErr, Event: json.RawMessage(`{"state":"frozen"}`)})
+	if err != nil || st.Status != session.StatusFrozen || st.FrozenSince == nil || st.IdleSince != nil || st.CurrentIncarnationID != "inc-x" ||
+		st.AppliedWakeVersion != 3 || st.RowVersion != 2 {
+		t.Fatalf("idle → frozen = %+v, %v", st, err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM sessions WHERE session_id = 's1' AND last_error = 'thaw failed'"); n != 1 {
+		t.Fatal("LastError 应写入")
+	}
+	empty := ""
+	if st, err = s.Transition(ctx, session.Transition{SessionID: "s1", FromRowVersion: 2, From: []string{session.StatusFrozen},
+		To: session.StatusRunning, SetIncarnation: &empty}); err != nil || st.CurrentIncarnationID != "" || st.FrozenSince != nil {
+		t.Fatalf("frozen → running = %+v, %v", st, err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM session_events WHERE session_id = 's1'"); n != 2 {
+		t.Fatalf("应有 2 条生命周期事件，得到 %d", n)
+	}
+	if _, err := s.Transition(ctx, session.Transition{SessionID: "nope", From: []string{"idle"}, To: "idle"}); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("不存在的会话应为 ErrNotFound，得到 %v", err)
+	}
+	if ids, err := s.ListOpenSessions(ctx); err != nil || len(ids) != 1 || ids[0] != "s1" {
+		t.Fatalf("ListOpenSessions = %v, %v", ids, err)
+	}
+}
+
+// TestSessionIncarnations：一个会话至多一个存活 incarnation（I9）；结束后可再建；以 incarnation_id 幂等；状态 CAS；
+// end_reason 以首次为准；UID 范围只保留一个；LRU 候选顺序；FinishClose 的前置条件。
+func TestSessionIncarnations(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	alice := mustUser(t, s, "alice")
+	newSession(t, s, "s1", alice)
+	first := session.NewIncarnation{IncarnationID: "inc1", SessionID: "s1", EnvID: "senv1"}
+	for i := 0; i < 2; i++ {
+		inc, err := s.CreateIncarnation(ctx, first)
+		if err != nil || inc.Status != session.IncStarting || inc.EnvID != "senv1" {
+			t.Fatalf("第 %d 次 CreateIncarnation = %+v, %v", i+1, inc, err)
+		}
+	}
+	if n := count(t, s, "SELECT count(*) FROM environments WHERE env_id = 'senv1' AND kind = 'session' AND session_id = 's1' AND status = 'creating'"); n != 1 {
+		t.Fatal("应同事务插入会话环境")
+	}
+	st, err := s.LoadSession(ctx, "s1")
+	if err != nil || st.Incarnation == nil || st.Incarnation.IncarnationID != "inc1" || st.RowVersion != 0 {
+		t.Fatalf("LoadSession 的当前 incarnation = %+v, %v", st.Incarnation, err)
+	}
+	if _, err := s.CreateIncarnation(ctx, session.NewIncarnation{IncarnationID: "inc2", SessionID: "s1", EnvID: "senv2"}); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("已有存活 incarnation 应为 ErrConflict，得到 %v", err)
+	}
+	if _, err := s.CreateIncarnation(ctx, session.NewIncarnation{IncarnationID: "inc1", SessionID: "s1", EnvID: "other"}); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("同一 ID 不同内容应为 ErrConflict，得到 %v", err)
+	}
+	if inc, err := s.SetIncarnationStatus(ctx, "inc1", []string{session.IncStarting}, session.IncIdle); err != nil || inc.Status != session.IncIdle {
+		t.Fatalf("starting → idle = %+v, %v", inc, err)
+	}
+	if inc, err := s.SetIncarnationStatus(ctx, "inc1", []string{session.IncStarting}, session.IncIdle); err != nil || inc.Status != session.IncIdle {
+		t.Fatalf("重跑应返回当前行：%+v, %v", inc, err)
+	}
+	_, err = s.SetIncarnationStatus(ctx, "inc1", []string{session.IncBusy}, session.IncFrozen)
+	expectRejected(t, err, session.CodeInvalidTransition)
+	if inc, err := s.EndIncarnation(ctx, "inc1", "release_timeout"); err != nil || inc.Status != session.IncEnded || inc.EndedAt == nil ||
+		inc.EndReason != "release_timeout" {
+		t.Fatalf("EndIncarnation = %+v, %v", inc, err)
+	}
+	if inc, err := s.EndIncarnation(ctx, "inc1", "other"); err != nil || inc.EndReason != "release_timeout" {
+		t.Fatalf("end_reason 应以首次为准：%+v, %v", inc, err)
+	}
+	if st, err := s.LoadSession(ctx, "s1"); err != nil || st.CurrentIncarnationID != "" || st.Incarnation != nil {
+		t.Fatalf("结束当前 incarnation 应清空 current_incarnation_id：%+v, %v", st, err)
+	}
+	if _, err := s.CreateIncarnation(ctx, session.NewIncarnation{IncarnationID: "inc2", SessionID: "s1", EnvID: "senv2", FromRowVersion: 1}); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("row_version 不符应为 ErrConflict，得到 %v", err)
+	}
+	if _, err := s.CreateIncarnation(ctx, session.NewIncarnation{IncarnationID: "inc2", SessionID: "s1", EnvID: "senv2"}); err != nil {
+		t.Fatalf("结束后应可再建：%v", err)
+	}
+
+	if err := s.SetUIDRange(ctx, "s1", "u1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetUIDRange(ctx, "s1", "u1"); err != nil {
+		t.Fatalf("同一范围重跑应成功：%v", err)
+	}
+	if err := s.SetUIDRange(ctx, "s1", "u2"); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("另一个范围应为 ErrConflict，得到 %v", err)
+	}
+
+	for i, c := range []struct{ id, status string }{{"l1", "idle"}, {"l2", "frozen"}, {"l3", "idle"}, {"l4", "frozen"}, {"l5", "running"}} {
+		newSession(t, s, c.id, 0)
+		if _, err := s.pool.Exec(ctx, "UPDATE sessions SET status = $2, last_active_at = now() - make_interval(mins => $3::int) WHERE session_id = $1",
+			c.id, c.status, 10-i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cands, err := s.LRUCandidates(ctx, 3)
+	if err != nil || len(cands) != 3 || cands[0].SessionID != "l2" || cands[1].SessionID != "l4" || cands[2].SessionID != "l1" {
+		t.Fatalf("LRU 应 frozen 先于 idle、各按 last_active_at 升序：%+v, %v", cands, err)
+	}
+
+	// FinishClose：turn 未终态、incarnation 未结束、环境未停止时 close_not_ready。
+	mustTurn(t, s, turnReq("s1", "t1", alice))
+	setSession(t, s, "s1", session.StatusClosing)
+	st, err = s.LoadSession(ctx, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.NonTerminalTurns) != 1 || st.NonTerminalTurns[0].TaskID != "t1" || st.NonTerminalTurns[0].Desired != "run" {
+		t.Fatalf("NonTerminalTurns = %+v", st.NonTerminalTurns)
+	}
+	_, err = s.FinishClose(ctx, "s1", st.RowVersion)
+	expectRejected(t, err, session.CodeCloseNotReady)
+	setTask(t, s, "t1", "cancelled", "")
+	if _, err := s.EndIncarnation(ctx, "inc2", "session_closed"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.FinishClose(ctx, "s1", st.RowVersion)
+	expectRejected(t, err, session.CodeCloseNotReady) // 环境尚未确认停止
+	stopEnv(t, s, "senv1")
+	stopEnv(t, s, "senv2")
+	if _, err := s.FinishClose(ctx, "s1", st.RowVersion+1); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("row_version 不符应为 ErrConflict，得到 %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		closed, err := s.FinishClose(ctx, "s1", st.RowVersion)
+		if err != nil || closed.Status != session.StatusClosed || closed.RowVersion != st.RowVersion+1 {
+			t.Fatalf("第 %d 次 FinishClose = %+v, %v", i+1, closed, err)
+		}
+	}
+	if n := count(t, s, `SELECT count(*) FROM session_events WHERE session_id = 's1' AND payload = '{"state":"closed"}'`); n != 1 {
+		t.Fatalf("应恰有一条 closed 事件，得到 %d", n)
+	}
+	if ids, err := s.ListOpenSessions(ctx); err != nil || slicesContain(ids, "s1") {
+		t.Fatalf("closed 的会话不应在 ListOpenSessions 中：%v, %v", ids, err)
+	}
+}
+
+func slicesContain(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSessionCreateTurnD5：暂停中的 turn 遇到新消息时被取代（cancel/superseded）；进行中的 turn 使新消息
+// turn_in_progress；会话关闭后 session_closed；request_id 重放与冲突；每用户同时 1 个运行中跨会话生效；首个 turn
+// 自动命名；turn 的预算行带工具额度。
+func TestSessionCreateTurnD5(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	a := s.SessionAPI()
+	alice, bob := mustUser(t, s, "alice"), mustUser(t, s, "bob")
+	newSession(t, s, "s1", alice)
+	newSession(t, s, "s2", alice)
+	newSession(t, s, "sb", bob)
+
+	first := turnReq("s1", "ta", alice)
+	first.Text = strings.Repeat("长", 45)
+	if r := mustTurn(t, s, first); r.TurnID != "ta" || r.TurnIndex != 0 || r.SupersededTurnID != "" {
+		t.Fatalf("第一个 turn = %+v", r)
+	}
+	if v, err := a.GetSession(ctx, "s1"); err != nil || v.Title != strings.Repeat("长", 40) || v.State != "idle" {
+		t.Fatalf("首个 turn 应把标题设为前 40 个字符：%+v, %v", v, err)
+	}
+	if n := count(t, s, `SELECT count(*) FROM tasks t JOIN budgets b USING (task_id) WHERE t.task_id = 'ta' AND t.session_id = 's1'
+		AND t.turn_index = 0 AND t.owner_user_id = $1 AND b.tool_call_limit = 30 AND b.limit_micro = 100`, alice); n != 1 {
+		t.Fatal("turn 应带会话、序号、所有者与工具额度")
+	}
+	if _, err := a.CreateTurn(ctx, turnReq("s1", "tb", alice)); !errors.Is(err, api.ErrTurnInProgress) {
+		t.Fatalf("queued 的 turn 应使新消息 turn_in_progress，得到 %v", err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM api_requests WHERE request_id = 'rt-tb'"); n != 0 {
+		t.Fatal("被拒绝的消息不应留下 request 记录")
+	}
+
+	setTask(t, s, "ta", "paused", "awaiting_input")
+	res := mustTurn(t, s, turnReq("s1", "tb", alice))
+	if res.TurnID != "tb" || res.TurnIndex != 1 || res.SupersededTurnID != "ta" || res.Replayed {
+		t.Fatalf("D5 = %+v", res)
+	}
+	if n := count(t, s, `SELECT count(*) FROM task_control WHERE task_id = 'ta' AND desired = 'cancel' AND reason = 'superseded'
+		AND control_version = 2`); n != 1 {
+		t.Fatal("暂停中的 turn 应得到 cancel/superseded 控制")
+	}
+	if n := count(t, s, "SELECT count(*) FROM tasks WHERE task_id = 'tb' AND status = 'queued'"); n != 1 {
+		t.Fatal("新 turn 应为 queued")
+	}
+	if v, err := a.GetSession(ctx, "s1"); err != nil || v.Title != strings.Repeat("长", 40) {
+		t.Fatalf("之后的 turn 不改标题：%+v, %v", v, err)
+	}
+	again, err := a.CreateTurn(ctx, turnReq("s1", "tb", alice))
+	if err != nil || !again.Replayed || again.TurnID != "tb" || again.TurnIndex != 1 || again.SupersededTurnID != "ta" {
+		t.Fatalf("重放应返回原结果：%+v, %v", again, err)
+	}
+	conflict := turnReq("s1", "tb", alice)
+	conflict.BodyHash = []byte("other")
+	if _, err := a.CreateTurn(ctx, conflict); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("同 request_id 不同内容应为 ErrConflict，得到 %v", err)
+	}
+	other := turnReq("s2", "tb", alice) // 同 request_id 用于另一个会话
+	if _, err := a.CreateTurn(ctx, other); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("另一个会话重用 request_id 应为 ErrConflict，得到 %v", err)
+	}
+
+	setTask(t, s, "ta", "cancelled", "superseded")
+	setTask(t, s, "tb", "running", "")
+	if _, err := a.CreateTurn(ctx, turnReq("s1", "tc", alice)); !errors.Is(err, api.ErrTurnInProgress) {
+		t.Fatalf("running 的 turn 应使新消息 turn_in_progress，得到 %v", err)
+	}
+	if _, err := a.CreateTurn(ctx, turnReq("s2", "td", alice)); !errors.Is(err, api.ErrUserTaskRunning) {
+		t.Fatalf("用户在另一会话已有 running turn 应为 ErrUserTaskRunning，得到 %v", err)
+	}
+	if _, err := a.CreateTurn(ctx, turnReq("sb", "te", bob)); err != nil {
+		t.Fatalf("其他用户不受影响：%v", err)
+	}
+	if _, err := a.CreateTurn(ctx, turnReq("sb", "tf", alice)); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("他人的会话应为 ErrNotFound，得到 %v", err)
+	}
+	if _, err := a.CloseSession(ctx, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.CreateTurn(ctx, turnReq("s1", "tg", alice)); !errors.Is(err, api.ErrSessionClosed) {
+		t.Fatalf("关闭中的会话应为 ErrSessionClosed，得到 %v", err)
+	}
+	if again, err := a.CreateTurn(ctx, turnReq("s1", "tb", alice)); err != nil || !again.Replayed {
+		t.Fatalf("关闭后重放仍返回原结果：%+v, %v", again, err)
+	}
+	setSession(t, s, "s1", session.StatusClosed)
+	if _, err := a.CreateTurn(ctx, turnReq("s1", "th", alice)); !errors.Is(err, api.ErrSessionClosed) {
+		t.Fatalf("已关闭的会话应为 ErrSessionClosed，得到 %v", err)
+	}
+	turns, err := a.ListTurns(ctx, "s1", -1, 10)
+	if err != nil || len(turns) != 2 || turns[0].TurnID != "ta" || turns[0].Status != "cancelled" || turns[0].StatusReason != "superseded" ||
+		turns[0].Text != strings.Repeat("长", 45) || !turns[0].DeepResearch || turns[0].ToolCallLimit != 30 || turns[0].Restorable ||
+		turns[1].TurnID != "tb" || turns[1].Status != "running" {
+		t.Fatalf("ListTurns = %+v, %v", turns, err)
+	}
+	if page, err := a.ListTurns(ctx, "s1", 0, 10); err != nil || len(page) != 1 || page[0].TurnID != "tb" {
+		t.Fatalf("ListTurns(after 0) = %+v, %v", page, err)
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestSessionRestoreSeed：恢复把源 turn 的最新 checkpoint 复制为新 turn 的种子 seed-<id>（引用已授权到会话 scope，
+// 同事务授权到新 task scope）；未授权到会话 scope 的引用、succeeded 的源 turn 与其他会话的 turn 不可恢复。ListTurns
+// 读出 route、summary、report 与 restorable。
+func TestSessionRestoreSeed(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	a := s.SessionAPI()
+	alice := mustUser(t, s, "alice")
+	newSession(t, s, "s1", alice)
+	newSession(t, s, "s2", alice)
+	state, ref, private := strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 64)
+
+	mustTurn(t, s, turnReq("s1", "ta", alice))
+	mustAttempt(t, s, "ta")
+	workerEvents(t, s, "att-ta", 1, 2, `{"kind":"route","data":{"route":"research","forced":false}}`)
+	for _, sha := range []string{state, ref} {
+		authorize(t, s, sha, "task", "ta")
+		authorize(t, s, sha, "session", "s1")
+	}
+	if _, err := s.CommitCheckpoint(ctx, runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "ta"}, CheckpointID: "cp1",
+		AttemptID: "att-ta", StepID: "s1", StateRef: state, Refs: []string{ref}}); err != nil {
+		t.Fatal(err)
+	}
+	setTask(t, s, "ta", "cancelled", "superseded")
+
+	restore := turnReq("s1", "tr", alice)
+	restore.RestoredFromTaskID = "ta"
+	res := mustTurn(t, s, restore)
+	if res.TurnIndex != 1 || res.SupersededTurnID != "" {
+		t.Fatalf("恢复 = %+v", res)
+	}
+	ts, err := s.LoadTask(ctx, "tr")
+	if err != nil || ts.Latest == nil || ts.Latest.CheckpointID != "seed-cp1" || ts.Latest.StateRef != state ||
+		len(ts.Latest.Refs) != 1 || ts.Latest.Refs[0] != ref || ts.Status != "queued" {
+		t.Fatalf("LoadTask(tr) = %+v, %v", ts.Latest, err)
+	}
+	if n := count(t, s, `SELECT count(*) FROM checkpoints WHERE scope_kind = 'task' AND scope_id = 'tr' AND checkpoint_id = 'seed-cp1'
+		AND commit_seq = 1 AND attempt_id = ''`); n != 1 {
+		t.Fatal("种子 checkpoint 的 commit_seq 应为 1、attempt_id 为空")
+	}
+	if n := count(t, s, "SELECT count(*) FROM scope_blobs WHERE scope_kind = 'task' AND scope_id = 'tr'"); n != 2 {
+		t.Fatalf("种子引用应授权到新 task scope，得到 %d", n)
+	}
+	if n := count(t, s, `SELECT count(*) FROM tasks t JOIN events e USING (task_id) WHERE t.task_id = 'tr'
+		AND t.restored_from_task_id = 'ta' AND e.event_key = 'task_created' AND e.payload->>'restored_from_turn_id' = 'ta'`); n != 1 {
+		t.Fatal("新 turn 应记录 restored_from_task_id 与 task_created.restored_from_turn_id")
+	}
+	if ok, err := a.TurnBlobAuthorized(ctx, "tr", ref); err != nil || !ok {
+		t.Fatalf("TurnBlobAuthorized(tr) = %v, %v", ok, err)
+	}
+
+	// 不可恢复：succeeded；引用未授权到会话 scope；其他会话的 turn。
+	setTask(t, s, "tr", "succeeded", "")
+	if _, err := s.pool.Exec(ctx, `UPDATE tasks SET result_json = '{"summary":"总结","outputs":[{"artifact_id":"report","version":2,"sha256":"x"}]}'
+		WHERE task_id = 'tr'`); err != nil {
+		t.Fatal(err)
+	}
+	fromSucceeded := turnReq("s1", "tx", alice)
+	fromSucceeded.RestoredFromTaskID = "tr"
+	if _, err := a.CreateTurn(ctx, fromSucceeded); !errors.Is(err, api.ErrNotRestorable) {
+		t.Fatalf("succeeded 的源 turn 应为 ErrNotRestorable，得到 %v", err)
+	}
+	mustTurn(t, s, turnReq("s1", "tp", alice))
+	mustAttempt(t, s, "tp")
+	authorize(t, s, private, "task", "tp") // 只授权到 task scope
+	if _, err := s.CommitCheckpoint(ctx, runner.Checkpoint{Scope: runner.Scope{Kind: "task", ID: "tp"}, CheckpointID: "cp2",
+		AttemptID: "att-tp", StepID: "s1", State: json.RawMessage(`{"x":1}`), Refs: []string{private}}); err != nil {
+		t.Fatal(err)
+	}
+	setTask(t, s, "tp", "failed", "worker_error")
+	fromPrivate := turnReq("s1", "ty", alice)
+	fromPrivate.RestoredFromTaskID = "tp"
+	if _, err := a.CreateTurn(ctx, fromPrivate); !errors.Is(err, api.ErrNotRestorable) {
+		t.Fatalf("引用未授权到会话 scope 应为 ErrNotRestorable，得到 %v", err)
+	}
+	fromOther := turnReq("s2", "tz", alice)
+	fromOther.RestoredFromTaskID = "ta"
+	if _, err := a.CreateTurn(ctx, fromOther); !errors.Is(err, api.ErrNotRestorable) {
+		t.Fatalf("其他会话的 turn 应为 ErrNotRestorable，得到 %v", err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM tasks WHERE task_id IN ('tx', 'ty', 'tz')"); n != 0 {
+		t.Fatal("被拒绝的恢复不应创建任务")
+	}
+
+	turns, err := a.ListTurns(ctx, "s1", -1, 10)
+	if err != nil || len(turns) != 3 {
+		t.Fatalf("ListTurns = %+v, %v", turns, err)
+	}
+	ta, tr, tp := turns[0], turns[1], turns[2]
+	if ta.Route != "research" || !ta.Restorable || ta.Status != "cancelled" {
+		t.Fatalf("ta = %+v", ta)
+	}
+	if tr.Summary != "总结" || tr.Report == nil || tr.Report.Version != 2 || tr.RestoredFromTurnID != "ta" || tr.Restorable || tr.Route != "" {
+		t.Fatalf("tr = %+v", tr)
+	}
+	if tp.Status != "failed" || tp.UserMessage != api.FailedTurnMessage || !tp.Restorable || tp.StatusReason != "worker_error" {
+		t.Fatalf("tp = %+v", tp)
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestSessionTurnControl：stop = pause（queued|running）；continue/finish 要求 paused 且不在等待回答；answer 要求
+// 等待回答；resume_directive 同事务写入；恢复受每用户 1 个运行中约束；以 request_id 幂等。
+func TestSessionTurnControl(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	a := s.SessionAPI()
+	alice := mustUser(t, s, "alice")
+	newSession(t, s, "s1", alice)
+	newSession(t, s, "s2", alice)
+	ctl := func(id, action, taskID string, answers string) (api.ControlResult, error) {
+		req := api.TurnControlRequest{RequestID: id, BodyHash: []byte("h-" + id), TaskID: taskID, Action: action}
+		if answers != "" {
+			req.Answers = json.RawMessage(answers)
+		}
+		return a.TurnControl(ctx, req)
+	}
+	directive := func(taskID string) string {
+		var d string
+		if err := s.pool.QueryRow(ctx, "SELECT COALESCE(resume_directive::text, '') FROM tasks WHERE task_id = $1", taskID).Scan(&d); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+
+	mustTurn(t, s, turnReq("s1", "ta", alice))
+	if _, err := ctl("c0", "continue", "ta", ""); !errors.Is(err, api.ErrInvalidTurnState) {
+		t.Fatalf("queued 的 turn continue 应为 ErrInvalidTurnState，得到 %v", err)
+	}
+	r, err := ctl("c1", "stop", "ta", "")
+	if err != nil || r.TaskID != "ta" || r.ControlVersion != 2 {
+		t.Fatalf("stop = %+v, %v", r, err)
+	}
+	if again, err := ctl("c1", "stop", "ta", ""); err != nil || !again.Replayed || again.ControlVersion != 2 {
+		t.Fatalf("重放 = %+v, %v", again, err)
+	}
+	setTask(t, s, "ta", "paused", "awaiting_input")
+	if _, err := ctl("c2", "continue", "ta", ""); !errors.Is(err, api.ErrInvalidTurnState) {
+		t.Fatalf("等待回答的 turn continue 应为 ErrInvalidTurnState，得到 %v", err)
+	}
+	if _, err := ctl("c3", "stop", "ta", ""); !errors.Is(err, api.ErrInvalidTurnState) {
+		t.Fatalf("paused 的 turn stop 应为 ErrInvalidTurnState，得到 %v", err)
+	}
+
+	// 另一个会话中有 running 的 turn 时，恢复（answer）使用户超过 1 个运行中。
+	mustTurn(t, s, turnReq("s2", "tb", alice))
+	setTask(t, s, "tb", "running", "")
+	if _, err := ctl("c4", "answer", "ta", `[{"question_id":"q1","choice":"A"}]`); !errors.Is(err, api.ErrUserTaskRunning) {
+		t.Fatalf("应为 ErrUserTaskRunning，得到 %v", err)
+	}
+	setTask(t, s, "tb", "paused", "")
+	r, err = ctl("c5", "answer", "ta", `[{"question_id":"q1","choice":"A"}]`)
+	if err != nil || r.ControlVersion != 3 {
+		t.Fatalf("answer = %+v, %v", r, err)
+	}
+	if d := directive("ta"); d != `{"kind": "answer", "answers": [{"choice": "A", "question_id": "q1"}]}` {
+		t.Fatalf("answer 的 resume_directive = %s", d)
+	}
+	if n := count(t, s, "SELECT count(*) FROM task_control WHERE task_id = 'ta' AND desired = 'run'"); n != 1 {
+		t.Fatal("answer 应写 desired = run")
+	}
+	setTask(t, s, "ta", "cancelled", "")
+	if _, err := ctl("c6", "finish", "tb", ""); err != nil {
+		t.Fatal(err)
+	}
+	if d := directive("tb"); d != `{"kind": "finish_now"}` {
+		t.Fatalf("finish 的 resume_directive = %s", d)
+	}
+	if _, err := ctl("c7", "answer", "tb", ""); !errors.Is(err, persistence.ErrInvalid) {
+		t.Fatalf("answer 缺少 answers 应为 ErrInvalid，得到 %v", err)
+	}
+	fixture(t, s, "solo")
+	if _, err := ctl("c8", "stop", "solo", ""); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("独立任务不是 turn，应为 ErrNotFound，得到 %v", err)
+	}
+	if sid, owner, err := a.TurnSession(ctx, "tb"); err != nil || sid != "s2" || owner != alice {
+		t.Fatalf("TurnSession = %s, %d, %v", sid, owner, err)
+	}
+	if _, _, err := a.TurnSession(ctx, "solo"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("独立任务的 TurnSession 应为 ErrNotFound，得到 %v", err)
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestSessionCloseListRenameWake：关闭对 queued 与 paused 的 turn 都写 cancel 控制，重复调用不再递增；用户只见自己
+// 未关闭的会话，运维见全部并带 Owner；改名与唤醒；TurnBlobAuthorized 接受会话 scope。
+func TestSessionCloseListRenameWake(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	a := s.SessionAPI()
+	alice, bob := mustUser(t, s, "alice"), mustUser(t, s, "bob")
+	newSession(t, s, "s1", alice)
+	newSession(t, s, "s2", alice)
+	newSession(t, s, "s3", alice)
+	newSession(t, s, "sb", bob)
+	newSession(t, s, "ops", 0)
+
+	// s1：ta paused（desired pause）与 tb queued。
+	mustTurn(t, s, turnReq("s1", "ta", alice))
+	setTask(t, s, "ta", "paused", "")
+	mustTurn(t, s, turnReq("s1", "tb", alice))
+	if _, err := s.pool.Exec(ctx, "UPDATE task_control SET desired = 'pause', reason = '' WHERE task_id = 'ta'"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		v, err := a.CloseSession(ctx, "s1")
+		if err != nil || v.State != "closing" || v.SessionID != "s1" {
+			t.Fatalf("第 %d 次 CloseSession = %+v, %v", i+1, v, err)
+		}
+	}
+	if n := count(t, s, `SELECT count(*) FROM task_control WHERE task_id IN ('ta', 'tb') AND desired = 'cancel' AND reason = 'session_closed'`); n != 2 {
+		t.Fatalf("queued 与 paused 的 turn 都应得到 cancel，得到 %d", n)
+	}
+	if n := count(t, s, `SELECT count(*) FROM session_control WHERE session_id = 's1' AND desired = 'closed' AND control_version = 1`); n != 1 {
+		t.Fatal("重复关闭不应再递增 control_version")
+	}
+	if n := count(t, s, `SELECT sum(control_version)::int FROM task_control WHERE task_id IN ('ta', 'tb')`); n != 3+2 {
+		t.Fatalf("重复关闭不应再写 turn 控制：control_version 合计 %d", n)
+	}
+	if _, err := a.RenameSession(ctx, "s1", "新名"); !errors.Is(err, api.ErrSessionClosed) {
+		t.Fatalf("关闭中的会话改名应为 ErrSessionClosed，得到 %v", err)
+	}
+	if err := a.WakeSession(ctx, "w0", []byte("h"), "s1"); !errors.Is(err, api.ErrSessionClosed) {
+		t.Fatalf("关闭中的会话唤醒应为 ErrSessionClosed，得到 %v", err)
+	}
+
+	setTask(t, s, "tb", "cancelled", "") // 否则 s1 中 queued 的 tb 使 alice 不能在 s2 发消息
+	if v, err := a.RenameSession(ctx, "s2", "我的研究"); err != nil || v.Title != "我的研究" {
+		t.Fatalf("RenameSession = %+v, %v", v, err)
+	}
+	mustTurn(t, s, turnReq("s2", "tc", alice))
+	if v, err := a.GetSession(ctx, "s2"); err != nil || v.Title != "我的研究" || v.Owner != "" || v.InternalState != "" {
+		t.Fatalf("用户命名后首个 turn 不改标题、GetSession 不含运维字段：%+v, %v", v, err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := a.WakeSession(ctx, "w1", []byte("h"), "s2"); err != nil {
+			t.Fatalf("第 %d 次 WakeSession: %v", i+1, err)
+		}
+	}
+	if err := a.WakeSession(ctx, "w1", []byte("h"), "s3"); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("另一个会话重用 request_id 应为 ErrConflict，得到 %v", err)
+	}
+	if st, err := s.LoadSession(ctx, "s2"); err != nil || st.ControlVersion != 1 || st.WakeRequestedVersion != 1 {
+		t.Fatalf("唤醒应推进 wake_requested_version：%+v, %v", st, err)
+	}
+
+	setSession(t, s, "s3", session.StatusClosed)
+	mine, next, err := a.ListSessions(ctx, alice, "", 10)
+	if err != nil || next != "" || len(mine) != 2 {
+		t.Fatalf("用户只见自己未关闭的会话：%+v, %v", mine, err)
+	}
+	for _, v := range mine {
+		if v.SessionID == "s3" || v.OwnerUserID != alice || v.Owner != "" || v.InternalState != "" {
+			t.Fatalf("用户视图 = %+v", v)
+		}
+	}
+	if mine[0].SessionID != "s2" { // s2 刚有新 turn，last_active_at 最新
+		t.Fatalf("应按 last_active_at 倒序：%+v", mine)
+	}
+	var all []api.SessionView
+	cursor := ""
+	for page := 0; page < 10; page++ {
+		views, next, err := a.ListSessions(ctx, 0, cursor, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		all = append(all, views...)
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	owners := map[string]string{}
+	for _, v := range all {
+		owners[v.SessionID] = v.Owner + "/" + v.InternalState
+	}
+	if len(all) != 5 || owners["sb"] != "bob/creating" || owners["s3"] != "alice/closed" || owners["ops"] != "/creating" {
+		t.Fatalf("运维视图 = %v", owners)
+	}
+
+	sha := strings.Repeat("e", 64)
+	authorize(t, s, sha, "session", "s2")
+	if ok, err := a.TurnBlobAuthorized(ctx, "tc", sha); err != nil || !ok {
+		t.Fatalf("会话 scope 的 blob 应授权给其 turn：%v, %v", ok, err)
+	}
+	if ok, err := a.TurnBlobAuthorized(ctx, "ta", sha); err != nil || ok {
+		t.Fatalf("其他会话的 turn 不应获得授权：%v, %v", ok, err)
+	}
+	if _, err := a.GetSession(ctx, "nope"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("不存在的会话应为 ErrNotFound，得到 %v", err)
+	}
+	if _, replayed, err := a.CreateSession(ctx, api.CreateSessionRequest{RequestID: "rs-s2", BodyHash: []byte("h-s2"), SessionID: "s2",
+		OwnerUserID: alice}); err != nil || !replayed {
+		t.Fatalf("CreateSession 重放 = %v, %v", replayed, err)
+	}
+	if _, _, err := a.CreateSession(ctx, api.CreateSessionRequest{RequestID: "rs-new", BodyHash: []byte("h"), SessionID: "s2",
+		OwnerUserID: alice}); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("重复的 session_id 应为 ErrConflict，得到 %v", err)
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestEvictSessionsOnRestart：frozen 与 running 的会话 → evicted、incarnation ended{lost_on_restart}、各一条事件；
+// closing 只结束 incarnation；evicted 与 closed 不变；重跑无变化。
+func TestEvictSessionsOnRestart(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	for _, c := range []struct{ id, status string }{
+		{"sf", "frozen"}, {"sr", "running"}, {"sc", "closing"}, {"se", "evicted"}, {"si", "idle"},
+	} {
+		newSession(t, s, c.id, 0)
+		if c.id != "se" && c.id != "si" {
+			if _, err := s.CreateIncarnation(ctx, session.NewIncarnation{IncarnationID: "inc-" + c.id, SessionID: c.id, EnvID: "env-" + c.id}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		setSession(t, s, c.id, c.status)
+	}
+	got, err := s.EvictSessionsOnRestart(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"sc": "inc-sc/env-sc", "sf": "inc-sf/env-sf", "si": "/", "sr": "inc-sr/env-sr"}
+	if len(got) != len(want) {
+		t.Fatalf("EvictSessionsOnRestart = %+v", got)
+	}
+	for _, e := range got {
+		if want[e.SessionID] != e.IncarnationID+"/"+e.EnvID {
+			t.Fatalf("EvictSessionsOnRestart = %+v", got)
+		}
+	}
+	for id, status := range map[string]string{"sf": "evicted", "sr": "evicted", "si": "evicted", "sc": "closing", "se": "evicted"} {
+		st, err := s.LoadSession(ctx, id)
+		if err != nil || st.Status != status || st.CurrentIncarnationID != "" {
+			t.Fatalf("%s = %+v, %v", id, st, err)
+		}
+		events := count(t, s, `SELECT count(*) FROM session_events WHERE session_id = $1 AND payload = '{"state":"evicted"}'`, id)
+		if wantEvents := map[bool]int{true: 1, false: 0}[id == "sf" || id == "sr" || id == "si"]; events != wantEvents {
+			t.Fatalf("%s 的 evicted 事件 %d 条，期望 %d", id, events, wantEvents)
+		}
+	}
+	if n := count(t, s, "SELECT count(*) FROM incarnations WHERE status = 'ended' AND end_reason = 'lost_on_restart' AND ended_at IS NOT NULL"); n != 3 {
+		t.Fatalf("应结束 3 个 incarnation，得到 %d", n)
+	}
+	if again, err := s.EvictSessionsOnRestart(ctx); err != nil || len(again) != 0 {
+		t.Fatalf("重跑应无变化：%+v, %v", again, err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM session_events"); n != 3 {
+		t.Fatalf("重跑不应追加事件：%d", n)
 	}
 }
