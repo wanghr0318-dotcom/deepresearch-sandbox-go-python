@@ -1,7 +1,8 @@
 """sim-worker 的步骤执行。配置格式见 Plan 3 Task 7；恢复时从 checkpoint 状态的 next_index 继续。
 
-Gateway 操作（chat/search/fetch）把结果 blob 的 sha256 收集起来，放入之后每个 checkpoint 的
-refs（恢复时从 resume.refs 继续），供 Plan 7/8 的 e2e 验证 refs 授权。
+Gateway 操作（chat/search/fetch/exec）把结果 blob 的 sha256 收集起来，放入之后每个 checkpoint 的
+refs（恢复时从 resume.refs 继续），供 Plan 7/8 的 e2e 验证 refs 授权。exec 另把输出文件的 sha256
+加入 refs；给出 expect_status 而结果状态不符时任务以 sim_exec_status_mismatch 失败（e2e 判定用）。
 """
 
 from __future__ import annotations
@@ -137,13 +138,20 @@ async def _flood(ctx: TaskContext, op: Op, index: int, held: Held) -> None:
         await ctx.progress("flood", message, step_id=op.get("step_id"))
 
 
-async def _gateway_call(ctx: TaskContext, held: Held, call: Callable[[], GatewayResult]) -> None:
+async def _gateway_call(
+    ctx: TaskContext, held: Held, call: Callable[[], GatewayResult]
+) -> GatewayResult:
     try:
         result = await asyncio.to_thread(call)
     except GatewayError as exc:
         raise WorkerFailure(exc.code, str(exc)) from exc
-    if result.blob_sha256 is not None and result.blob_sha256 not in held.refs:
-        held.refs.append(result.blob_sha256)
+    _add_ref(held, result.blob_sha256)
+    return result
+
+
+def _add_ref(held: Held, sha: str | None) -> None:
+    if sha is not None and sha not in held.refs:
+        held.refs.append(sha)
 
 
 async def _chat(ctx: TaskContext, op: Op, index: int, held: Held) -> None:
@@ -168,6 +176,25 @@ async def _fetch(ctx: TaskContext, op: Op, index: int, held: Held) -> None:
     await _gateway_call(ctx, held, lambda: gw.fetch(op["step_id"], op["url"]))
 
 
+async def _exec(ctx: TaskContext, op: Op, index: int, held: Held) -> None:
+    gw = ctx.gateway
+    inputs = [(sha, path) for sha, path in op.get("inputs", [])]
+    result = await _gateway_call(
+        ctx,
+        held,
+        lambda: gw.exec(op["step_id"], op["code"], inputs=inputs, wall_ms=op.get("wall_ms")),
+    )
+    body = result.body if isinstance(result.body, dict) else {}
+    for output in body.get("outputs") or []:
+        _add_ref(held, output.get("sha256"))
+    want = op.get("expect_status")
+    if want is not None and body.get("status") != want:
+        raise WorkerFailure(
+            "sim_exec_status_mismatch",
+            f"第 {index} 步：exec 状态 {body.get('status')!r}，期望 {want!r}",
+        )
+
+
 _HANDLERS: dict[str, Handler] = {
     "progress": _progress,
     "sleep": _sleep,
@@ -181,4 +208,5 @@ _HANDLERS: dict[str, Handler] = {
     "chat": _chat,
     "search": _search,
     "fetch": _fetch,
+    "exec": _exec,
 }

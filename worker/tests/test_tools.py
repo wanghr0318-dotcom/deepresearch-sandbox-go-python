@@ -336,3 +336,231 @@ def test_text_helpers_moved_without_behavior_change():
     assert text.site_of("https://www.Example.com:8443/a?b") == "example.com"
     assert text.site_of("not a url") == ""
     assert text.page_text({"content": "<p>a<script>x</script> b</p>"}) == "a b"
+
+
+# ---- run_python：经 Gateway /v1/exec 运行代码（M4 Plan 15 Task 11） ----
+
+import hashlib
+
+from agentbox_worker.errors import CallDeadlineExceeded, CallDivergence
+from agentbox_worker.gateway import GatewayResult
+from agentbox_worker.tools import RunPython
+
+SHA_A = "a" * 64
+SHA_OUT = hashlib.sha256(b"out").hexdigest()
+
+
+class ExecGateway(ScriptedGateway):
+    """ScriptedGateway 加 exec：记录 (step_id, code, inputs, wall_ms)；返回脚本结果或抛出脚本异常。
+
+    （agentfakes.ScriptedGateway 不含 exec；本任务不改共享替身。）
+    """
+
+    def __init__(self, result: dict[str, Any] | BaseException) -> None:
+        super().__init__()
+        self.result = result
+        self.execs: list[tuple[str, str, list[tuple[str, str]], int | None]] = []
+
+    def exec(self, step_id, code, *, inputs=(), wall_ms=None, memory_bytes=None, retry=False):
+        assert memory_bytes is None and retry is False
+        self.execs.append((step_id, code, [tuple(i) for i in inputs], wall_ms))
+        if isinstance(self.result, BaseException):
+            raise self.result
+        n = len(self.execs)
+        data = json.dumps(self.result).encode()
+        sha = hashlib.sha256(data).hexdigest()
+        return GatewayResult(f"root/{step_id}/exec/{n}", self.result, sha, False, 200)
+
+
+def exec_result(**kw: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "status": "completed",
+        "exit": {"code": 0, "signal": 0},
+        "diag": {"oom_kill_delta": 0, "oom_observed": False, "cpu_usage_usec": 1200},
+        "stdout": "42\n",
+        "stdout_truncated": False,
+        "stdout_invalid_utf8": False,
+        "stderr": "",
+        "stderr_truncated": False,
+        "stderr_invalid_utf8": False,
+        "outputs": [],
+        "skipped_outputs": [],
+        "queue_ms": 3,
+        "wall_ms": 120,
+        "limits": {"wall_ms": 60000, "memory_bytes": 536870912},
+        "image_digest": "d" * 64,
+    }
+    return {**base, **kw}
+
+
+RUN_PYTHON_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "code": {"type": "string", "maxLength": 262144},
+        "inputs": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "path": {"type": "string"},
+                },
+                "required": ["sha256", "path"],
+                "additionalProperties": False,
+            },
+        },
+        "timeout_s": {"type": "integer", "minimum": 1, "maximum": 300},
+    },
+    "required": ["code"],
+    "additionalProperties": False,
+}
+
+
+def test_run_python_schema_from_registry_and_not_counted():
+    (schema,) = ToolRegistry([RunPython()]).schemas()
+    assert schema == {
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": RunPython.description,
+            "parameters": RUN_PYTHON_PARAMETERS,
+        },
+    }
+    assert "/in" in RunPython.description and "/out" in RunPython.description
+    assert RunPython.counts_budget is False
+
+
+def test_run_python_passes_code_inputs_and_timeout_without_using_tool_budget():
+    gw = ExecGateway(exec_result())
+    ctx = tool_ctx(gw)
+    reg = ToolRegistry([RunPython()])
+    args = {
+        "code": "print(6*7)",
+        "inputs": [{"sha256": SHA_A, "path": "data/a.csv"}],
+        "timeout_s": 5,
+    }
+    r = reg.dispatch("run_python", json.dumps(args), ctx)
+    assert r.ok and r.control is None
+    r2 = reg.dispatch("run_python", '{"code": "print(1)"}', ctx)
+    assert r2.ok
+    assert gw.execs == [
+        ("orch", "print(6*7)", [(SHA_A, "data/a.csv")], 5000),
+        ("orch", "print(1)", [], None),
+    ]
+    assert ctx.budget.used == 0 and ctx.flags.researching is False
+    # schema 违规（sha 非小写十六进制、超时越界、未知字段）→ 参数错误，不发起调用
+    for bad in (
+        {"code": "x", "inputs": [{"sha256": "A" * 64, "path": "a"}]},
+        {"code": "x", "inputs": [{"sha256": SHA_A + "\n", "path": "a"}]},
+        {"code": "x", "timeout_s": 301},
+        {"code": "x", "argv": ["sh"]},
+    ):
+        out = reg.dispatch("run_python", json.dumps(bad), ctx)
+        assert not out.ok and out.content.startswith("工具参数错误")
+    assert len(gw.execs) == 2
+
+
+def test_run_python_result_text_truncates_streams_and_lists_outputs():
+    head = "H" * 4096
+    middle = "m" * 3000
+    tail = "T" * 1024
+    body = exec_result(
+        exit={"code": 1, "signal": 0},
+        stdout=head + middle + tail,
+        stdout_truncated=True,
+        stderr="e" * 1000 + "E" * 2048,
+        stderr_invalid_utf8=True,
+        diag={"oom_kill_delta": 1, "oom_observed": True, "cpu_usage_usec": 5},
+        outputs=[{"path": "plot.png", "sha256": SHA_OUT, "size": 2048}],
+        skipped_outputs=[{"path": "link", "reason": "symlink"}],
+    )
+    gw = ExecGateway(body)
+    r = ToolRegistry([RunPython()]).dispatch("run_python", '{"code": "x"}', tool_ctx(gw))
+    c = r.content
+    assert "completed" in c and "退出码 1" in c
+    assert head in c and tail in c and "m" * 10 not in c
+    assert "省略 3000 字节" in c
+    assert "E" * 2048 in c and "e" * 10 not in c
+    assert "省略 1000 字节" in c
+    assert "plot.png" in c and SHA_OUT in c and "2048" in c
+    assert "link" in c and "symlink" in c
+    assert "1 MiB" in c  # Gateway 已截断 stdout 的提示
+    assert "U+FFFD" in c  # stderr 含非法 UTF-8 的提示
+    assert "内存" in c and "536870912" in c  # OOM 提示带内存上限
+    assert r.ok is False  # 非零退出：运行本身完成，但对模型与界面是失败
+    assert r.data == body
+    assert r.raw == {"call_id": "root/orch/exec/1"}
+    result_sha = hashlib.sha256(json.dumps(body).encode()).hexdigest()
+    assert r.blobs == (result_sha, SHA_OUT)
+
+
+def test_run_python_clips_on_utf8_byte_boundaries():
+    # 多字节字符跨越 4 KiB 边界：按字节截取，不产生半个字符
+    stdout = "中" * 3000  # 9000 字节
+    r = ToolRegistry([RunPython()]).dispatch(
+        "run_python", '{"code": "x"}', tool_ctx(ExecGateway(exec_result(stdout=stdout)))
+    )
+    assert "�" not in r.content
+    kept = r.content.replace("中间省略", "").count("中")
+    assert 1364 + 341 - 2 <= kept <= 1365 + 341  # 4096//3 + 1024//3
+
+
+def test_run_python_short_streams_untouched_and_timed_out_explained():
+    ok = ToolRegistry([RunPython()]).dispatch(
+        "run_python", '{"code": "print(42)"}', tool_ctx(ExecGateway(exec_result()))
+    )
+    assert ok.ok and "42\n" in ok.content and "省略" not in ok.content
+    assert "退出码 0" in ok.content and "输出文件：无" in ok.content
+    body = exec_result(
+        status="timed_out",
+        exit={"code": -1, "signal": 9},
+        limits={"wall_ms": 5000, "memory_bytes": 536870912},
+    )
+    r = ToolRegistry([RunPython()]).dispatch(
+        "run_python", '{"code": "while 1: pass", "timeout_s": 5}', tool_ctx(ExecGateway(body))
+    )
+    assert not r.ok and "timed_out" in r.content and "5000 ms" in r.content
+    assert "信号 9" in r.content
+
+
+@pytest.mark.parametrize(
+    ("exc", "phrase"),
+    [
+        (BudgetExhausted(402, "exec_quota_exhausted", "count"), "次数"),
+        (BudgetExhausted(402, "exec_cpu_exhausted"), "CPU"),
+        (BudgetExhausted(402, "exec_wall_exhausted"), "运行时间"),
+        (BudgetExhausted(402, "exec_blocked"), "已停止"),
+        (GatewayError(403, "input_not_authorized"), "输入文件"),
+        (GatewayError(400, "unsupported_field", "inputs[0].path"), "inputs[0].path"),
+        (CallDeadlineExceeded(504, "exec_queue_timeout"), "排队"),
+        (CallDeadlineExceeded(0, "client_timeout"), "client_timeout"),
+        (GatewayError(409, "exec_cancelled"), "取消"),
+        (GatewayError(502, "exec_unknown"), "exec_unknown"),
+        (GatewayError(503, "exec_env_unavailable"), "exec_env_unavailable"),
+    ],
+    ids=lambda v: v.code if isinstance(v, GatewayError) else None,
+)
+def test_run_python_gateway_errors_become_tool_failures(exc, phrase):
+    ctx = tool_ctx(ExecGateway(exc))
+    r = ToolRegistry([RunPython()]).dispatch("run_python", '{"code": "x"}', ctx)
+    assert not r.ok and r.control is None and r.blobs == ()
+    assert phrase in r.content and exc.code in r.content
+    assert ctx.budget.used == 0
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        BudgetExhausted(402, "budget_exhausted"),  # 费用预算（非 exec 配额）仍终止本轮
+        AccessRevoked(403, "access_revoked"),
+        CallDivergence(409, "fingerprint_mismatch"),
+        GatewayError(0, "connection_lost"),
+    ],
+    ids=lambda v: v.code,
+)
+def test_run_python_fatal_gateway_errors_propagate(exc):
+    with pytest.raises(type(exc)):
+        ToolRegistry([RunPython()]).dispatch(
+            "run_python", '{"code": "x"}', tool_ctx(ExecGateway(exc))
+        )

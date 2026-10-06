@@ -7,6 +7,7 @@ validate_args 实现工具参数所需的 JSON Schema 子集；ToolRegistry.disp
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable
 from typing import Any
 
@@ -18,9 +19,11 @@ from agentbox_worker.tools.base import (
     ToolResult,
     TurnFlags,
 )
+from agentbox_worker.tools.run_python import RunPython
 
 __all__ = [
     "GatewayLike",
+    "RunPython",
     "Tool",
     "ToolArgsError",
     "ToolContext",
@@ -44,9 +47,16 @@ def validate_args(schema: dict[str, Any], args: Any) -> None:
     """按 JSON Schema 子集校验 args，不合法时抛 ToolArgsError。
 
     支持 type（object/string/integer/number/boolean/array）、required、properties、
-    additionalProperties=false、enum、minimum/maximum、minLength/maxLength、minItems/maxItems、items。
+    additionalProperties=false、enum、minimum/maximum、minLength/maxLength、minItems/maxItems、items、
+    pattern（按 JSON Schema 语义搜索匹配；末尾 $ 视为字符串结尾，不放过结尾换行）。
     """
     _check(schema, args, "参数")
+
+
+def _pattern_ok(pattern: str, value: str) -> bool:
+    if pattern.endswith("$") and not pattern.endswith("\\$"):
+        pattern = pattern[:-1] + r"\Z"
+    return re.search(pattern, value) is not None
 
 
 def _check(schema: dict[str, Any], value: Any, path: str) -> None:
@@ -62,6 +72,8 @@ def _check(schema: dict[str, Any], value: Any, path: str) -> None:
             raise ToolArgsError(f"{path} 须 ≤ {schema['maximum']}")
     if isinstance(value, str):
         _check_len(schema, len(value), path, "minLength", "maxLength", "字符")
+        if "pattern" in schema and not _pattern_ok(schema["pattern"], value):
+            raise ToolArgsError(f"{path} 须匹配 {schema['pattern']}")
     if isinstance(value, list):
         _check_len(schema, len(value), path, "minItems", "maxItems", "项")
         if isinstance(items := schema.get("items"), dict):

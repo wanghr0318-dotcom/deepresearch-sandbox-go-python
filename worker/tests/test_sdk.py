@@ -2066,3 +2066,85 @@ def test_subrun_gateway_exec_is_tagged(monkeypatch):
     assert path == "/v1/exec"
     assert headers["X-Agentbox-Call-Id"] == "st1/s1/exec/1"
     assert headers["X-Agentbox-Subrun"] == "st1"
+
+
+# ---- sim-worker 的 exec 操作（Plan 15 Task 11；e2e 用） ----
+
+
+def sim_exec_gateway(gw: FakeGateway, status: str) -> tuple[str, str]:
+    """/v1/exec 返回带一个输出文件的结果；返回 (结果 blob sha, 输出 sha)。"""
+    out_sha = gw.put_blob(b"1,2,3\n")
+    result = {
+        "status": status,
+        "exit": {"code": 0, "signal": 0},
+        "stdout": "",
+        "stderr": "",
+        "outputs": [{"path": "r.csv", "sha256": out_sha, "size": 6}],
+        "skipped_outputs": [],
+    }
+    sha = gw.put_blob(json.dumps(result).encode())
+
+    def intercept(req):
+        if req.path != "/v1/exec":
+            return None
+        return Reply(200, result, {"X-Agentbox-Blob": sha})
+
+    gw.interceptor = intercept
+    return sha, out_sha
+
+
+def test_sim_worker_exec_op_sends_request_and_puts_result_and_outputs_into_refs(
+    fake_gateway, tmp_path, monkeypatch
+):
+    monkeypatch.setenv(GATEWAY_SOCKET_ENV, fake_gateway.socket_path)
+    result_sha, out_sha = sim_exec_gateway(fake_gateway, "completed")
+    in_sha = "c" * 64
+    steps = [
+        {
+            "op": "exec",
+            "step_id": "s1",
+            "code": "print(1)",
+            "inputs": [[in_sha, "data/in.csv"]],
+            "wall_ms": 2000,
+            "expect_status": "completed",
+        },
+        {"op": "checkpoint", "step_id": "s1"},
+        {"op": "exec", "step_id": "s1", "code": "print(2)"},  # 无 expect_status：不检查
+        {"op": "checkpoint", "step_id": "s2"},
+    ]
+    code, events = run(
+        sim_app,
+        tmp_path,
+        init={"config": {"steps": steps}},
+        responder=checkpoint_reply("committed"),
+    )
+    assert code == 0 and events[-1]["type"] == "result", events
+    first, second = fake_gateway.requests
+    assert first.path == "/v1/exec" and first.headers["x-agentbox-call-id"] == "root/s1/exec/1"
+    assert first.json() == {
+        "language": "python3",
+        "code": "print(1)",
+        "inputs": [{"sha256": in_sha, "path": "data/in.csv"}],
+        "limits": {"wall_ms": 2000},
+    }
+    assert second.json() == {"language": "python3", "code": "print(2)"}
+    cp1, cp2 = [e for e in events if e["type"] == "checkpoint"]
+    assert cp1["refs"] == [result_sha, out_sha] and cp2["refs"] == [result_sha, out_sha]
+
+
+@pytest.mark.parametrize(
+    ("reply_status", "error_code"),
+    [("timed_out", "sim_exec_status_mismatch"), (None, "exec_quota_exhausted")],
+)
+def test_sim_worker_exec_op_fails_task_on_status_mismatch_or_gateway_error(
+    fake_gateway, tmp_path, monkeypatch, reply_status, error_code
+):
+    monkeypatch.setenv(GATEWAY_SOCKET_ENV, fake_gateway.socket_path)
+    if reply_status is None:
+        fake_gateway.replies.append(error_reply(402, "exec_quota_exhausted"))
+    else:
+        sim_exec_gateway(fake_gateway, reply_status)
+    steps = [{"op": "exec", "step_id": "s1", "code": "x", "expect_status": "completed"}]
+    code, events = run(sim_app, tmp_path, init={"config": {"steps": steps}})
+    assert code == 1
+    assert events[-1]["type"] == "error" and events[-1]["code"] == error_code
