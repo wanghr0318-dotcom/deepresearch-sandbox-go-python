@@ -4,6 +4,7 @@ import App from "../App.vue";
 import { ApiError, NetworkError } from "../api/client";
 import type { User } from "../api/client";
 import type { SessionApiLike } from "../api/session";
+import { fakeChat, fakeSessionStream } from "../components/chat/chatkit";
 import { ev, fakeApi, fakeWatch, flushAll, task } from "../components/testkit";
 import type { FakeWatch } from "../components/testkit";
 import { servicesKey } from "../lib/services";
@@ -49,7 +50,7 @@ function kit(over: Partial<SessionApiLike> = {}, admin?: Services): Kit {
   const api = fakeSessionApi(over);
   const watch = fakeWatch();
   const saveBlob = vi.fn();
-  const us: UserServices = { api, watch: watch.fn, saveBlob };
+  const us: UserServices = { api, chat: fakeChat(), watch: watch.fn, watchSession: fakeSessionStream().fn, saveBlob };
   const provide: Record<symbol, unknown> = { [userServicesKey as symbol]: us };
   if (admin) provide[servicesKey as symbol] = admin;
   return { api, watch, saveBlob, global: { provide } };
