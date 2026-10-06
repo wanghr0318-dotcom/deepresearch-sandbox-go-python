@@ -18,7 +18,7 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["agentbox_worker", "sim_worker", "deepresearch"]
+packages = ["agentbox_worker", "sim_worker", "deepresearch", "chatagent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -69,7 +69,7 @@ max-complexity = 10
 "tests/**" = ["TID251", "E402"]  # 测试文件按关注点分节，各节在节首导入
 
 [tool.importlinter]
-root_packages = ["agentbox_worker", "sim_worker", "deepresearch"]
+root_packages = ["agentbox_worker", "sim_worker", "deepresearch", "chatagent"]
 # 让标准库与第三方模块进入导入图，forbidden 契约才能约束 socket、sqlite3 等外部模块
 include_external_packages = true
 
@@ -77,7 +77,7 @@ include_external_packages = true
 name = "SDK 不依赖具体 Worker"
 type = "forbidden"
 source_modules = ["agentbox_worker"]
-forbidden_modules = ["sim_worker", "deepresearch"]
+forbidden_modules = ["sim_worker", "deepresearch", "chatagent"]
 
 [[tool.importlinter.contracts]]
 name = "deepresearch 不碰数据库、HTTP 客户端与子进程（含间接导入）"
@@ -122,5 +122,28 @@ forbidden_modules = [
 name = "Agent 工具不直接使用 socket（网络只经 SDK 的 Gateway 客户端）"
 type = "forbidden"
 source_modules = ["agentbox_worker.tools"]
+forbidden_modules = ["socket"]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "chatagent 不碰数据库、HTTP 客户端与子进程（含间接导入）"
+type = "forbidden"
+source_modules = ["chatagent"]
+forbidden_modules = [
+  "sqlite3",
+  "psycopg",
+  "redis",
+  "requests",
+  "httpx",
+  "urllib",
+  "subprocess",
+  "multiprocessing",
+]
+
+[[tool.importlinter.contracts]]
+# SDK 的 Gateway 客户端经 AF_UNIX 访问 Gateway，故只禁止直接导入
+name = "chatagent 不直接使用 socket（网络只经 SDK 的 Gateway 客户端）"
+type = "forbidden"
+source_modules = ["chatagent"]
 forbidden_modules = ["socket"]
 allow_indirect_imports = true

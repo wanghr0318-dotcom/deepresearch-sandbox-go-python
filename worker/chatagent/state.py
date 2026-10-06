@@ -1,0 +1,318 @@
+"""每轮的工作状态（task checkpoint）与会话记忆（session_state）。
+
+TurnState 是 checkpoint 的全部内容：编排与子主题的转录、计划、来源、额度与标志；恢复后提示词
+只由它确定性地生成。compact 在写 checkpoint 之前作用于内存中的状态（之后的提示词也使用压缩
+后的状态），保证 inline state ≤ 200 KiB。SessionMemory 是跨轮的会话记忆（最近的轮次与来源）。
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+from agentbox_worker.errors import WorkerFailure
+from agentbox_worker.tools import TurnFlags
+from agentbox_worker.tools.budget import TurnBudget
+from agentbox_worker.tools.sources import Source, SourceStore
+from agentbox_worker.tools.sources import _source as source_from_json
+from agentbox_worker.tools.text import truncate_utf8
+from agentbox_worker.tools.todo import TodoItem
+
+SCHEMA_VERSION = 1
+STATE_LIMIT_BYTES = 200 * 1024
+MEMORY_LIMIT_BYTES = 192 * 1024
+MEMORY_MAX_TURNS = 20
+MEMORY_MAX_SOURCES = 200
+MEMORY_EXCERPT_MAX_BYTES = 300
+REPLY_MAX_CHARS = 2000
+
+PHASES = ("start", "orchestrating", "subtopic", "reporting", "done")
+ROUTES = (None, "answer", "research")
+SUB_STATUSES = ("pending", "running", "done", "skipped", "failed")
+CLOSING_REASONS = (None, "user_finish", "budget", "rounds")
+OMITTED_SOURCE = "[已省略，可用 read_source(n) 重读]"
+OMITTED = "[已省略]"
+_SOURCE_TOOLS = frozenset({"web_fetch", "read_source"})
+
+
+def json_size(value: Any) -> int:
+    """紧凑 JSON 的 UTF-8 字节数（与 SDK 的 checkpoint / session_state 计量一致）。"""
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _check(cond: bool, what: str) -> None:
+    if not cond:
+        raise ValueError(f"轮次状态不合法：{what}")
+
+
+def _messages(v: Any, what: str) -> list[dict[str, Any]]:
+    _check(isinstance(v, list) and all(isinstance(m, dict) for m in v), what)
+    for m in v:
+        _check(m.get("role") in ("system", "user", "assistant", "tool"), f"{what}.role")
+        _check(isinstance(m.get("content"), str), f"{what}.content")
+    return [dict(m) for m in v]
+
+
+def _int(v: Any, what: str) -> int:
+    _check(isinstance(v, int) and not isinstance(v, bool) and v >= 0, what)
+    return v
+
+
+@dataclass
+class SubtopicState:
+    id: str
+    status: str = "pending"  # pending | running | done | skipped | failed
+    messages: list[dict[str, Any]] = field(default_factory=list)  # kimi-k2.6 子循环转录
+    rounds: int = 0
+    summary: str | None = None
+    sources: list[int] = field(default_factory=list)
+    closing: bool = False  # 已要求"现在写子主题摘要"（之后不再提供工具）
+
+    def to_json(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_json(cls, d: Any) -> SubtopicState:
+        _check(isinstance(d, dict), "子主题不是对象")
+        _check(isinstance(d.get("id"), str) and bool(d["id"]), "子主题 id")
+        _check(d.get("status") in SUB_STATUSES, "子主题 status")
+        summary = d.get("summary")
+        _check(summary is None or isinstance(summary, str), "子主题 summary")
+        sources = d.get("sources", [])
+        _check(isinstance(sources, list), "子主题 sources")
+        return cls(
+            id=d["id"],
+            status=d["status"],
+            messages=_messages(d.get("messages", []), "子主题 messages"),
+            rounds=_int(d.get("rounds", 0), "子主题 rounds"),
+            summary=summary,
+            sources=[_int(n, "子主题 sources[]") for n in sources],
+            closing=bool(d.get("closing", False)),
+        )
+
+
+@dataclass
+class TurnState:
+    schema_version: int = SCHEMA_VERSION
+    phase: str = "start"  # start | orchestrating | subtopic | reporting | done
+    route: str | None = None  # answer | research
+    messages: list[dict[str, Any]] = field(default_factory=list)  # 编排转录（OpenAI 格式）
+    rounds: int = 0
+    todo: list[TodoItem] = field(default_factory=list)
+    subtopics: dict[str, SubtopicState] = field(default_factory=dict)
+    current_subtopic: str | None = None
+    sources: SourceStore = field(default_factory=SourceStore)
+    budget: TurnBudget = field(default_factory=TurnBudget)
+    flags: TurnFlags = field(default_factory=TurnFlags)
+    pending_question: dict[str, Any] | None = None  # {"question_id","tool_call_id","questions"}
+    stops: int = 0
+    finish_requested: bool = False
+    partial: bool = False
+    notes: list[str] = field(default_factory=list)  # "已达工具额度（30/30）"、"部分研究"等
+    refs: list[str] = field(default_factory=list)  # 累积的 Gateway 结果 blob，去重保序
+    closing: str | None = None  # 已追加的收尾指令的原因（user_finish | budget | rounds）
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "phase": self.phase,
+            "route": self.route,
+            "messages": self.messages,
+            "rounds": self.rounds,
+            "todo": [i.to_json() for i in self.todo],
+            "subtopics": {k: s.to_json() for k, s in self.subtopics.items()},
+            "current_subtopic": self.current_subtopic,
+            "sources": self.sources.to_json(),
+            "budget": self.budget.to_json(),
+            "flags": asdict(self.flags),
+            "pending_question": self.pending_question,
+            "stops": self.stops,
+            "finish_requested": self.finish_requested,
+            "partial": self.partial,
+            "notes": list(self.notes),
+            "refs": list(self.refs),
+            "closing": self.closing,
+        }
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> TurnState:
+        """版本不符或字段不合法 → ValueError。"""
+        _check(isinstance(d, dict), "不是对象")
+        if d.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError(f"轮次状态版本不符：{d.get('schema_version')!r}")
+        _check(d.get("phase") in PHASES, "phase")
+        _check(d.get("route") in ROUTES, "route")
+        _check(d.get("closing") in CLOSING_REASONS, "closing")
+        subs = d.get("subtopics", {})
+        _check(isinstance(subs, dict), "subtopics")
+        flags = d.get("flags", {})
+        _check(
+            isinstance(flags, dict) and all(isinstance(v, bool) for v in flags.values()), "flags"
+        )
+        try:
+            turn_flags = TurnFlags(**flags)
+        except TypeError as exc:
+            raise ValueError(f"轮次状态不合法：flags（{exc}）") from exc
+        pq = d.get("pending_question")
+        _check(
+            pq is None or (isinstance(pq, dict) and isinstance(pq.get("question_id"), str)),
+            "pending_question",
+        )
+        current = d.get("current_subtopic")
+        _check(current is None or isinstance(current, str), "current_subtopic")
+        notes, refs, todo = d.get("notes", []), d.get("refs", []), d.get("todo", [])
+        _check(isinstance(notes, list) and all(isinstance(n, str) for n in notes), "notes")
+        _check(isinstance(refs, list) and all(isinstance(r, str) for r in refs), "refs")
+        _check(isinstance(todo, list), "todo")
+        return cls(
+            phase=d["phase"],
+            route=d.get("route"),
+            messages=_messages(d.get("messages", []), "messages"),
+            rounds=_int(d.get("rounds", 0), "rounds"),
+            todo=[TodoItem.from_json(i) for i in todo],
+            subtopics={k: SubtopicState.from_json(v) for k, v in subs.items()},
+            current_subtopic=current,
+            sources=SourceStore.from_json(d.get("sources", [])),
+            budget=TurnBudget.from_json(d.get("budget", {})),
+            flags=turn_flags,
+            pending_question=pq,
+            stops=_int(d.get("stops", 0), "stops"),
+            finish_requested=bool(d.get("finish_requested", False)),
+            partial=bool(d.get("partial", False)),
+            notes=list(notes),
+            refs=list(refs),
+            closing=d.get("closing"),
+        )
+
+    def add_refs(self, shas: Any) -> None:
+        for sha in shas:
+            if sha and sha not in self.refs:
+                self.refs.append(sha)
+
+    def todo_item(self, item_id: str) -> TodoItem | None:
+        return next((i for i in self.todo if i.id == item_id), None)
+
+    def compact(self, limit: int = STATE_LIMIT_BYTES) -> None:
+        """超限时从最早的工具消息起把 content 换成占位文本，直到 JSON ≤ limit。
+
+        顺序（确定性）：已结束子主题的转录 → 编排转录 → 进行中子主题的转录，各自从早到晚；
+        来源类（web_fetch、read_source）换成 "[已省略，可用 read_source(n) 重读]"，其余 "[已省略]"。
+        仍超限时清空沿用来源（之前轮次）的摘录；仍超限 → WorkerFailure("state_too_large")。
+        """
+        size = json_size(self.to_json())
+        if size <= limit:
+            return
+        for msg in self._compactable():
+            if msg["content"] in (OMITTED_SOURCE, OMITTED):
+                continue
+            placeholder = OMITTED_SOURCE if msg.get("name") in _SOURCE_TOOLS else OMITTED
+            size -= json_size(msg["content"]) - json_size(placeholder)
+            msg["content"] = placeholder
+            if size <= limit:
+                break
+        if size > limit:
+            for src in self.sources.all():
+                if src.origin and src.excerpt:
+                    size -= json_size(src.excerpt) - json_size("")
+                    src.excerpt = ""
+                    if size <= limit:
+                        break
+        size = json_size(self.to_json())
+        if size > limit:
+            raise WorkerFailure("state_too_large", f"轮次状态压缩后仍有 {size} 字节，上限 {limit}")
+
+    def _compactable(self) -> list[dict[str, Any]]:
+        ended = [s for s in self.subtopics.values() if s.status != "running"]
+        running = [s for s in self.subtopics.values() if s.status == "running"]
+        groups = [
+            [m for s in ended for m in s.messages],
+            self.messages,
+            [m for s in running for m in s.messages],
+        ]
+        return [m for g in groups for m in g if m.get("role") == "tool"]
+
+
+@dataclass
+class TurnRecord:
+    task_id: str
+    user: str
+    reply: str  # ≤ 2000 字（报告轮为报告摘要段）
+    route: str
+    report: dict[str, Any] | None  # {"artifact_id","version","title"}
+
+    def to_json(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_json(cls, d: Any) -> TurnRecord:
+        if not isinstance(d, dict):
+            raise ValueError("会话记忆的轮次不是对象")
+        vals = {k: d.get(k) for k in ("task_id", "user", "reply", "route")}
+        if not all(isinstance(v, str) for v in vals.values()):
+            raise ValueError("会话记忆的轮次字段不合法")
+        report = d.get("report")
+        if report is not None and not isinstance(report, dict):
+            raise ValueError("会话记忆的报告字段不合法")
+        return cls(report=report, **vals)
+
+
+@dataclass
+class SessionMemory:
+    schema_version: int = SCHEMA_VERSION
+    turns: list[TurnRecord] = field(default_factory=list)  # 最近 20 轮
+    sources: list[Source] = field(default_factory=list)  # 最近 200 个，origin=<task_id>
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "turns": [t.to_json() for t in self.turns],
+            "sources": [asdict(s) for s in self.sources],
+        }
+
+    @classmethod
+    def from_json(cls, d: Any) -> SessionMemory:
+        """None → 空记忆；版本不符或字段不合法 → ValueError。"""
+        if d is None:
+            return cls()
+        if not isinstance(d, dict) or d.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError("会话记忆版本不符或不是对象")
+        turns, sources = d.get("turns", []), d.get("sources", [])
+        if not isinstance(turns, list) or not isinstance(sources, list):
+            raise ValueError("会话记忆字段不合法")
+        return cls(
+            turns=[TurnRecord.from_json(t) for t in turns],
+            sources=[source_from_json(s) for s in sources],
+        )
+
+    def with_turn(self, record: TurnRecord, sources: list[Source]) -> SessionMemory:
+        """返回新对象（不修改已提交状态）：追加本轮记录与来源（origin=本轮 task_id），按上限裁剪；
+        to_json 超过 192 KiB 时继续裁剪最旧的轮次（连同其来源），最后裁剪最旧的来源。"""
+        rec = TurnRecord(
+            record.task_id, record.user, record.reply[:REPLY_MAX_CHARS], record.route, record.report
+        )
+        new = [
+            Source(
+                s.n,
+                s.sha256,
+                s.url,
+                s.title,
+                truncate_utf8(s.excerpt, MEMORY_EXCERPT_MAX_BYTES),
+                s.call_id,
+                s.origin or record.task_id,
+            )
+            for s in sources
+        ]
+        mem = SessionMemory(
+            turns=[*self.turns, rec][-MEMORY_MAX_TURNS:],
+            sources=[*self.sources, *new][-MEMORY_MAX_SOURCES:],
+        )
+        while json_size(mem.to_json()) > MEMORY_LIMIT_BYTES:
+            if len(mem.turns) > 1:
+                gone = mem.turns.pop(0).task_id
+                mem.sources = [s for s in mem.sources if s.origin != gone]
+            elif mem.sources:
+                mem.sources.pop(0)
+            else:
+                raise WorkerFailure("state_too_large", "会话记忆超过上限")
+        return mem

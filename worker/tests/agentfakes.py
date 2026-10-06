@@ -1,5 +1,7 @@
 """进程内的测试替身（不依赖 AF_UNIX，Windows 上可运行）。
 
+ScriptedModel：ScriptedGateway 的 chat 脚本，按 step_id 与轮次返回预设的回复或工具调用。
+
 ScriptedGateway：实现 tools.base.GatewayLike，按脚本回答 chat/search/fetch，并像真实 Gateway 一样
 分配确定性的 call id、为每个结果生成 blob、对同一 call id 的重发返回同一结果（replayed=True）。
 
@@ -127,8 +129,10 @@ class ScriptedGateway:
         call_id = self.call_ids.next(step_id, kind)
         self.calls.append(GatewayCall(kind, step_id, call_id, body))
         old = self._results.get(call_id)
-        if old is not None:  # 同一 call id 重发：重放已记录的结果
-            return GatewayResult(old.call_id, old.body, old.blob_sha256, True, old.status, None)
+        if old is not None:  # 同一 call id 重发：重放已记录的结果（真实 Gateway 的重放也带额度头）
+            return GatewayResult(
+                old.call_id, old.body, old.blob_sha256, True, old.status, old.tool_budget
+            )
         budget = None
         if kind in ("search", "fetch"):
             self._counted += 1
@@ -338,3 +342,81 @@ class SessionHost:
             "version": 1,
             "sha256": event["declared_sha256"],
         }
+
+
+# ---- 脚本化的模型（chat 端点） ----
+
+ModelStep = dict[str, Any] | BaseException | Callable[[dict[str, Any]], Any]
+
+
+def reply(
+    text: str, *, reasoning: str | None = None, finish_reason: str = "stop"
+) -> dict[str, Any]:
+    """一次不带工具调用的 assistant 回复（OpenAI 兼容的 message）。"""
+    msg: dict[str, Any] = {"role": "assistant", "content": text}
+    if reasoning is not None:
+        msg["reasoning_content"] = reasoning
+    return {"message": msg, "finish_reason": finish_reason}
+
+
+def call(tool: str, /, **args: Any) -> dict[str, Any]:
+    """一次只含单个工具调用的 assistant 回复；工具调用 id 由 ScriptedModel 分配。"""
+    return calls((tool, args))
+
+
+def calls(*items: tuple[str, dict[str, Any]], content: str = "") -> dict[str, Any]:
+    """一次含多个工具调用的 assistant 回复：calls(("web_search", {...}), ("web_fetch", {...}))。"""
+    tool_calls = [
+        {
+            "type": "function",
+            "function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)},
+        }
+        for n, a in items
+    ]
+    msg = {"role": "assistant", "content": content, "tool_calls": tool_calls}
+    return {"message": msg, "finish_reason": "tool_calls"}
+
+
+class ScriptedModel:
+    """按 step_id 与轮次回答 chat：orch 用于 "orch"，sub[id] 用于 "sub-<id>"，
+    other[step_id] 用于其余。
+
+    每个脚本项是 reply()/call()/calls() 的结果、要抛出的异常（如 GatewayError(502, …)），或接收
+    请求体、返回上述之一的函数。工具调用 id 为全局递增的 "call_<n>"。requests 按顺序记录
+    (step_id, 请求体)（只含真正送达脚本的调用，重放不计）。脚本用完时 AssertionError。
+    """
+
+    def __init__(
+        self,
+        *,
+        orch: list[ModelStep] | None = None,
+        sub: dict[str, list[ModelStep]] | None = None,
+        other: dict[str, list[ModelStep]] | None = None,
+    ) -> None:
+        self.scripts: dict[str, list[ModelStep]] = {"orch": list(orch or [])}
+        for sid, steps in (sub or {}).items():
+            self.scripts[f"sub-{sid}"] = list(steps)
+        self.scripts.update({k: list(v) for k, v in (other or {}).items()})
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+        self._used: Counter[str] = Counter()
+        self._ids = itertools.count(1)
+
+    def __call__(self, step_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        self.requests.append((step_id, json.loads(json.dumps(body))))
+        script = self.scripts.get(step_id)
+        k = self._used[step_id]
+        if script is None or k >= len(script):
+            raise AssertionError(f"ScriptedModel：{step_id} 第 {k + 1} 次调用没有脚本")
+        self._used[step_id] += 1
+        item = script[k]
+        if isinstance(item, BaseException):
+            raise item
+        if callable(item):
+            item = item(body)
+        choice = json.loads(json.dumps(item))
+        for tc in choice["message"].get("tool_calls") or []:
+            tc.setdefault("id", f"call_{next(self._ids)}")
+        return {"id": "resp", "choices": [{"index": 0, **choice}], "usage": {"total_tokens": 1}}
+
+    def bodies(self, step_id: str) -> list[dict[str, Any]]:
+        return [b for s, b in self.requests if s == step_id]
