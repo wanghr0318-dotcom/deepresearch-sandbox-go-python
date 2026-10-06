@@ -42,7 +42,8 @@ import (
 // Redis 的任何问题都只是未命中；PostgreSQL 或访问检查失败返回错误，不绕过（§11.2）。
 //
 // 一次逻辑调用的执行在 Coordinator 自有的后台 goroutine 中进行：Worker 的请求上下文取消或连接断开只让 Invoke
-// 提前返回，不取消 try（继续至期限并结算，供重放，§9.1）；只有 CancelAttempt(attemptID, ReasonCancel) 取消在途 try。
+// 提前返回，不取消 try（继续至期限并结算，供重放，§9.1）；只有 CancelAttempt(attemptID, ReasonCancel) 与
+// CancelSubrun（只限该 sub-run 的调用与共享请求，以 subrun_closed 结束）取消在途 try。
 // 同一 (task_id, call_id) 在进程内同时只有一个执行者，其余请求得到 call_in_progress（不会两个 goroutine 同时进入 Tx2）。
 
 // 本包产生的错误码（其余沿用 persistence.Code* 与 upstream.Code*）。
@@ -64,6 +65,10 @@ var ErrClosed = errors.New("call: coordinator 已关闭")
 // errCancelRequested 是 CancelAttempt 取消在途 try 时的取消原因。
 var errCancelRequested = errors.New("call: 任务已请求取消")
 
+// errSubrunCancelRequested 是 CancelSubrun 取消在途 try 时的取消原因：与 errCancelRequested 同属取消类
+// （同一结算路径，§9.1 表），调用以 subrun_closed 结束（Worker 得到 409）。
+var errSubrunCancelRequested = errors.New("call: sub-run 已请求取消")
+
 // Limits 是 Gateway 的调用限额（§19 默认值）。零值字段取默认值。调用期限在 Tx1 按端点类别选定并写入
 // deadline_at，之后不再改变（deadlineFor）；模型调用单独设期限，因为推理模型的长输出可以合法地超过 120 s。
 type Limits struct {
@@ -72,6 +77,7 @@ type Limits struct {
 	MaxTries            int           // 每逻辑调用累计 try，默认 3
 	PerTaskInflight     int           // 每任务上游在途，默认 4
 	PerProviderInflight int           // 每 provider 上游在途，默认 8
+	PerSubrunInflight   int           // 每 sub-run 上游在途，默认 2（§9.7；root 调用不受它限制）
 	BackoffBase         time.Duration // 退避基数，默认 2 s（翻倍）
 	BackoffMax          time.Duration // 退避上限，默认 60 s
 }
@@ -91,6 +97,9 @@ func (l Limits) withDefaults() Limits {
 	}
 	if l.PerProviderInflight <= 0 {
 		l.PerProviderInflight = 8
+	}
+	if l.PerSubrunInflight <= 0 {
+		l.PerSubrunInflight = 2
 	}
 	if l.BackoffBase <= 0 {
 		l.BackoffBase = 2 * time.Second
@@ -173,7 +182,8 @@ type Invoke struct {
 	Retry                       bool // X-Agentbox-Retry
 	Supersedes, SupersedeReason string
 	NoCache                     bool // X-Agentbox-Cache: no-cache（计入指纹；不读缓存、不合并，结果仍写入）
-	// SubrunID 是 X-Agentbox-Subrun（空为 root）。M3 中只进入 singleflight 合并键（§11.4），不改变记账与访问检查。
+	// SubrunID 是 X-Agentbox-Subrun（空为 root；edge 已校验 ID 规则与 call id 前缀 <subrun_id>/）。它进入
+	// Tx1/Tx2 的访问检查与两层记账、singleflight 合并键（§11.4）与每 sub-run 在途槽位（§9.7）。
 	SubrunID string
 }
 
@@ -210,12 +220,20 @@ type Coordinator struct {
 	mu        sync.Mutex
 	busy      map[callKey]bool
 	byAttempt map[string]map[*job]bool
+	bySubrun  map[subrunKey]map[*job]bool // 只含 sub-run 调用（CancelSubrun）
+	subSem    map[string]*semaphore       // 键 subrunSemKey(task_id, subrun_id)
 	taskSem   map[string]*semaphore
 	provSem   map[string]*semaphore
 	flights   map[flightKey]*flight
 }
 
 type callKey struct{ taskID, callID string }
+
+// subrunKey 标识一个 attempt 内某 sub-run 的在途执行（CancelSubrun 的范围）。
+type subrunKey struct{ taskID, attemptID, subrunID string }
+
+// subrunSemKey 是每 sub-run 在途槽位的键 (task_id, subrun_id)：同一逻辑 sub-run 跨 attempt 共用上限。
+func subrunSemKey(taskID, subrunID string) string { return taskID + "\x00" + subrunID }
 
 // flightKey 是 singleflight 合并键（§11.4）：不跨任务、attempt、sub-run。
 type flightKey struct{ taskID, attemptID, subrun, cacheKey string }
@@ -240,7 +258,7 @@ type job struct {
 	model    string // 解析后的模型（chat）；按它取价格表结算
 	fp       string
 	est      int64
-	ctx      context.Context // Coordinator 自有；CancelAttempt 以 errCancelRequested 取消
+	ctx      context.Context // Coordinator 自有；CancelAttempt / CancelSubrun 以取消类原因取消
 	cancel   context.CancelCauseFunc
 }
 
@@ -263,6 +281,8 @@ func New(cfg Config) (*Coordinator, error) {
 		cache:        cfg.Cache,
 		busy:         map[callKey]bool{},
 		byAttempt:    map[string]map[*job]bool{},
+		bySubrun:     map[subrunKey]map[*job]bool{},
+		subSem:       map[string]*semaphore{},
 		taskSem:      map[string]*semaphore{},
 		provSem:      map[string]*semaphore{},
 		flights:      map[flightKey]*flight{},
@@ -324,9 +344,9 @@ func statusFor(code string) int {
 	case persistence.CodeAccessRevoked, upstream.CodeEgressBlocked:
 		return 403
 	case persistence.CodeNotCurrentAttempt, persistence.CodeCancelRequested,
-		persistence.CodeFingerprintMismatch, persistence.CodeCallInProgress:
+		persistence.CodeFingerprintMismatch, persistence.CodeCallInProgress, persistence.CodeSubrunClosed:
 		return 409
-	case persistence.CodeBudgetExhausted, persistence.CodeBudgetInsufficient:
+	case persistence.CodeBudgetExhausted, persistence.CodeBudgetInsufficient, persistence.CodeSubrunBudgetExhausted:
 		return 402
 	case persistence.CodeTriesExhausted, persistence.CodeToolBudgetExhausted:
 		return 429
@@ -344,11 +364,12 @@ func statusFor(code string) int {
 }
 
 // retryableReason 报告 failed 调用的原因是否属于可重试类别（§9.4：带 X-Agentbox-Retry 时可在上限内新建 try）：
-// 上游的暂时失败、预算或访问在 Tx2 被拒、存储故障与关闭中止。期限与次数耗尽、上游明确拒绝不可重试。
+// 上游的暂时失败、预算或访问在 Tx2 被拒、存储故障与关闭中止。期限与次数耗尽、上游明确拒绝不可重试；
+// subrun_closed 不可重试（sub-run 不会重新打开），sub-run 层预算耗尽与 task 层相同可重试（并发预留释放后可能恢复）。
 func retryableReason(reason string) bool {
 	switch reason {
 	case upstream.CodeUpstreamRateLimited, upstream.CodeUpstreamUnavailable, upstream.CodeUpstreamUnreachable,
-		persistence.CodeBudgetExhausted, persistence.CodeBudgetInsufficient,
+		persistence.CodeBudgetExhausted, persistence.CodeBudgetInsufficient, persistence.CodeSubrunBudgetExhausted,
 		persistence.CodeAccessRevoked, persistence.CodeNotCurrentAttempt, persistence.CodeCancelRequested,
 		CodeStoreUnavailable, CodeGatewayShutdown:
 		return true
@@ -386,8 +407,10 @@ func (c *Coordinator) opCtx() (context.Context, context.CancelFunc) {
 }
 
 // CheckAccess 在一致快照中做 §9.2 访问检查（供 /v1/budget 与 blob 读取使用）。零值 Result 表示允许。
-func (c *Coordinator) CheckAccess(ctx context.Context, taskID, attemptID string) (Result, error) {
-	f, err := c.store.CheckAccess(ctx, taskID, attemptID, "") // sub-run 归属由 Plan 14 Task 5 从 edge 传入
+// subrunID 非空（请求带 X-Agentbox-Subrun）时另须该 sub-run 属于本任务、绑定本 attempt 且为 started，
+// 否则 409 subrun_closed。
+func (c *Coordinator) CheckAccess(ctx context.Context, taskID, attemptID, subrunID string) (Result, error) {
+	f, err := c.store.CheckAccess(ctx, taskID, attemptID, subrunID)
 	if err != nil {
 		return Result{}, err
 	}
@@ -400,6 +423,12 @@ func (c *Coordinator) CheckAccess(ctx context.Context, taskID, attemptID string)
 // Budget 返回任务账本（/v1/budget）。
 func (c *Coordinator) Budget(ctx context.Context, taskID string) (Budget, error) {
 	return c.store.LoadBudget(ctx, taskID)
+}
+
+// SubrunBudget 返回 sub-run 层账本，供 GET /v1/budget（带 X-Agentbox-Subrun 时附加 sub-run 层）；
+// 不存在为 persistence.ErrNotFound。
+func (c *Coordinator) SubrunBudget(ctx context.Context, taskID, subrunID string) (SubrunBudget, error) {
+	return c.store.LoadSubrunBudget(ctx, taskID, subrunID)
 }
 
 // OpenBlob 只读打开任务 scope 内的 blob：sha 须在 scope_blobs(task) 中（Store.BlobAuthorized；调用结果由
@@ -425,6 +454,24 @@ func (c *Coordinator) CancelAttempt(attemptID, reason string) {
 	defer c.mu.Unlock()
 	for j := range c.byAttempt[attemptID] {
 		j.cancel(errCancelRequested)
+	}
+}
+
+// CancelSubrun 取消 attempt 内 sub-run subrunID 的全部在途执行（规格 §13.4；取消类原因，§9.1 表）：在途 try 按
+// "未发出释放 / 有 usage 按实际 / 无法确认转 unknown"结算，等待 sub-run 或 task 槽位的调用不再预留；该 sub-run
+// 的共享请求（合并键含 subrun_id，§11.4）随 leader 取消，follower 以同一原因失败。这些调用以 subrun_closed 结束
+// （Worker 得到 409）。其他 sub-run 与 root 的调用不受影响。幂等；没有在途执行时无操作。
+//
+// 调用方（宿主取消 sub-run 的路径，以及 Plan 15 的 exec 协调）须先在同一事务中把 sub-run 置为 cancel_requested：
+// 之后到达的请求由 Store 的访问复查以 subrun_closed 拒绝，本方法只负责已在进程内执行的调用。
+func (c *Coordinator) CancelSubrun(taskID, attemptID, subrunID string) {
+	if subrunID == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for j := range c.bySubrun[subrunKey{taskID, attemptID, subrunID}] {
+		j.cancel(errSubrunCancelRequested)
 	}
 }
 
@@ -533,6 +580,15 @@ func (c *Coordinator) register(j *job) bool {
 		c.byAttempt[j.in.AttemptID] = m
 	}
 	m[j] = true
+	if j.in.SubrunID != "" {
+		sk := subrunKey{j.in.TaskID, j.in.AttemptID, j.in.SubrunID}
+		sm := c.bySubrun[sk]
+		if sm == nil {
+			sm = map[*job]bool{}
+			c.bySubrun[sk] = sm
+		}
+		sm[j] = true
+	}
 	return true
 }
 
@@ -543,6 +599,14 @@ func (c *Coordinator) unregister(j *job) {
 	delete(m, j)
 	if len(m) == 0 {
 		delete(c.byAttempt, j.in.AttemptID)
+	}
+	if j.in.SubrunID != "" {
+		sk := subrunKey{j.in.TaskID, j.in.AttemptID, j.in.SubrunID}
+		sm := c.bySubrun[sk]
+		delete(sm, j)
+		if len(sm) == 0 {
+			delete(c.bySubrun, sk)
+		}
 	}
 }
 
@@ -556,7 +620,7 @@ func (c *Coordinator) contended(ctx context.Context, in Invoke, fp string) (res 
 			}
 		}()
 	}
-	if r, err := c.CheckAccess(ctx, in.TaskID, in.AttemptID); err != nil || r.Code != "" {
+	if r, err := c.CheckAccess(ctx, in.TaskID, in.AttemptID, in.SubrunID); err != nil || r.Code != "" {
 		return r, err
 	}
 	rec, _, err := c.store.LoadCall(ctx, in.TaskID, in.CallID)
@@ -586,7 +650,7 @@ func (c *Coordinator) run(j *job) (out Result, outErr error) {
 	res, err := c.store.BeginCall(ctx, BeginCallRequest{
 		TaskID: in.TaskID, CallID: in.CallID, AttemptID: in.AttemptID, Fingerprint: j.fp, Endpoint: endpointOf(in.Kind),
 		Deadline: c.limits.deadlineFor(in.Kind), SupersedesCallID: in.Supersedes, SupersedeReason: in.SupersedeReason,
-		Model: j.model,
+		Model: j.model, SubrunID: in.SubrunID,
 	})
 	cancel()
 	if tb := res.ToolBudget; tb != nil {
@@ -719,7 +783,7 @@ func (c *Coordinator) follow(j *job, rec CallRecord, f *flight) (Result, error) 
 	}
 	sctx, scancel := c.opCtx()
 	_, err := c.store.CompleteFromCache(sctx, CacheCompletion{TaskID: in.TaskID, CallID: in.CallID, AttemptID: in.AttemptID,
-		ResultSHA256: lr.BlobSHA256, ResultSize: int64(len(lr.Body)), Source: SourceCoalesced})
+		ResultSHA256: lr.BlobSHA256, ResultSize: int64(len(lr.Body)), Source: SourceCoalesced, SubrunID: in.SubrunID})
 	scancel()
 	if err != nil {
 		var rej *persistence.RejectedError
@@ -770,7 +834,7 @@ func (c *Coordinator) resolveFromCache(j *job) (Result, bool, error) {
 	}
 	ctx, cancel := c.opCtx()
 	_, err = c.store.CompleteFromCache(ctx, CacheCompletion{TaskID: in.TaskID, CallID: in.CallID, AttemptID: in.AttemptID,
-		ResultSHA256: sha, ResultSize: size, Source: SourceCache})
+		ResultSHA256: sha, ResultSize: size, Source: SourceCache, SubrunID: in.SubrunID})
 	cancel()
 	if err != nil {
 		var rej *persistence.RejectedError
@@ -852,11 +916,14 @@ func (c *Coordinator) replay(rec CallRecord) (Result, error) {
 	return Result{Body: body, Replayed: true, BlobSHA256: rec.ResultRef, Status: 200}, nil
 }
 
-// stopCode 报告 try 循环是否必须停止及其原因：取消 → cancel_requested；到期 → call_deadline_exceeded；关闭 → gateway_shutdown。
+// stopCode 报告 try 循环是否必须停止及其原因：取消 → cancel_requested；sub-run 取消 → subrun_closed；
+// 到期 → call_deadline_exceeded；关闭 → gateway_shutdown。
 func (c *Coordinator) stopCode(ctx context.Context, deadline time.Time) string {
 	switch {
 	case errors.Is(context.Cause(ctx), errCancelRequested):
 		return persistence.CodeCancelRequested
+	case errors.Is(context.Cause(ctx), errSubrunCancelRequested):
+		return persistence.CodeSubrunClosed
 	case !c.now().Before(deadline) || errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return persistence.CodeCallDeadlineExceeded
 	case c.root.Err() != nil:
@@ -893,15 +960,15 @@ func (c *Coordinator) execute(j *job, rec CallRecord) (Result, error) {
 		if code := c.stopCode(ctx, deadline); code != "" {
 			return c.giveUp(j, state, code)
 		}
-		release, err := c.acquire(ctx, in.TaskID, provider)
+		release, err := c.acquire(ctx, in.TaskID, in.SubrunID, provider)
 		if err != nil {
 			return c.giveUp(j, state, c.stopCode(ctx, deadline))
 		}
-		// 2. Tx2：复查访问、期限、累计次数与预算后预留；提交之后才发起上游请求（第一个原子提交点）。
+		// 2. Tx2：复查访问、期限、累计次数与预算（两层）后预留；提交之后才发起上游请求（第一个原子提交点）。
 		sctx, scancel := c.opCtx()
 		try, err := c.store.ReserveTry(sctx, ReserveTryRequest{
 			TaskID: in.TaskID, CallID: in.CallID, AttemptID: in.AttemptID, EnvID: in.EnvID,
-			EstimateMicro: j.est, MaxTries: c.limits.MaxTries,
+			EstimateMicro: j.est, MaxTries: c.limits.MaxTries, SubrunID: in.SubrunID,
 		})
 		scancel()
 		if err != nil {
@@ -1082,35 +1149,42 @@ func mulCeil(a, b, div int64) (int64, bool) {
 	return q, true
 }
 
-// acquire 等待每任务与每 provider 的在途槽位（先任务后 provider，避免交叉等待）；等待受 ctx（期限、取消）约束。
-func (c *Coordinator) acquire(ctx context.Context, taskID, provider string) (func(), error) {
-	ts := c.semRef(c.taskSem, taskID, c.limits.PerTaskInflight)
-	ps := c.semRef(c.provSem, provider, c.limits.PerProviderInflight)
-	done := func() {
-		c.semUnref(c.taskSem, taskID)
-		c.semUnref(c.provSem, provider)
+// acquire 等待在途槽位（§9.7）：sub-run 调用先取每 sub-run 槽位，再取每任务、每 provider 槽位（固定顺序，
+// 避免持有 task 槽位等待 sub-run 槽位，也避免交叉等待）；root 调用（subrunID 为空）没有 sub-run 槽位。释放顺序
+// 与获取相反。等待受 ctx（期限、取消）约束；不承诺公平性。
+func (c *Coordinator) acquire(ctx context.Context, taskID, subrunID, provider string) (func(), error) {
+	type slot struct {
+		m   map[string]*semaphore
+		key string
+		s   *semaphore
 	}
-	select {
-	case ts.ch <- struct{}{}:
-	case <-ctx.Done():
-		done()
-		return nil, ctx.Err()
+	var order []slot
+	if subrunID != "" {
+		k := subrunSemKey(taskID, subrunID)
+		order = append(order, slot{c.subSem, k, c.semRef(c.subSem, k, c.limits.PerSubrunInflight)})
 	}
-	select {
-	case ps.ch <- struct{}{}:
-	case <-ctx.Done():
-		<-ts.ch
-		done()
-		return nil, ctx.Err()
+	order = append(order,
+		slot{c.taskSem, taskID, c.semRef(c.taskSem, taskID, c.limits.PerTaskInflight)},
+		slot{c.provSem, provider, c.semRef(c.provSem, provider, c.limits.PerProviderInflight)})
+	// releaseN 释放已取得的前 n 个槽位（逆序），并解除全部引用。
+	releaseN := func(n int) {
+		for i := n - 1; i >= 0; i-- {
+			<-order[i].s.ch
+		}
+		for _, o := range order {
+			c.semUnref(o.m, o.key)
+		}
+	}
+	for i, o := range order {
+		select {
+		case o.s.ch <- struct{}{}:
+		case <-ctx.Done():
+			releaseN(i)
+			return nil, ctx.Err()
+		}
 	}
 	var once sync.Once
-	return func() {
-		once.Do(func() {
-			<-ps.ch
-			<-ts.ch
-			done()
-		})
-	}, nil
+	return func() { once.Do(func() { releaseN(len(order)) }) }, nil
 }
 
 func (c *Coordinator) semRef(m map[string]*semaphore, key string, n int) *semaphore {

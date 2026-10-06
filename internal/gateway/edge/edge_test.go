@@ -34,6 +34,10 @@ type fakeCalls struct {
 	cancels [][2]string // (attemptID, reason)
 	access  call.Result
 	budget  call.Budget
+	// sub-run（Plan 14 Task 5）：subChecks 是每次 CheckAccess 的 subrunID；subBudgets 记录 SubrunBudget 的 subrunID。
+	subChecks  []string
+	subBudgets []string
+	subBudget  call.SubrunBudget
 
 	invoke func(ctx context.Context, in call.Invoke) (call.Result, error)
 	open   func(taskID, sha string) (io.ReadCloser, error)
@@ -50,10 +54,11 @@ func (f *fakeCalls) Invoke(ctx context.Context, in call.Invoke) (call.Result, er
 	return call.Result{Body: []byte(`{"ok":true}`), BlobSHA256: testSHA, Status: 200}, nil
 }
 
-func (f *fakeCalls) CheckAccess(_ context.Context, taskID, attemptID string) (call.Result, error) {
+func (f *fakeCalls) CheckAccess(_ context.Context, taskID, attemptID, subrunID string) (call.Result, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.checks = append(f.checks, [2]string{taskID, attemptID})
+	f.subChecks = append(f.subChecks, subrunID)
 	return f.access, nil
 }
 
@@ -61,6 +66,13 @@ func (f *fakeCalls) Budget(_ context.Context, _ string) (call.Budget, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.budget, nil
+}
+
+func (f *fakeCalls) SubrunBudget(_ context.Context, _, subrunID string) (call.SubrunBudget, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.subBudgets = append(f.subBudgets, subrunID)
+	return f.subBudget, nil
 }
 
 func (f *fakeCalls) OpenBlob(_ context.Context, taskID, sha string) (io.ReadCloser, error) {
@@ -466,7 +478,8 @@ func TestRequestValidation(t *testing.T) {
 	}{
 		{"缺 call id", "POST", "/v1/search", nil, 400, CodeMissingCallID},
 		{"call id 过长", "POST", "/v1/fetch", callHdr(strings.Repeat("x", MaxCallIDBytes+1)), 400, CodeMissingCallID},
-		{"sub-run 头", "POST", "/v1/search", map[string]string{HeaderCallID: "c/1", HeaderSubrun: "sr1"}, 400, CodeSubrunUnsupported},
+		{"sub-run ID 非法", "POST", "/v1/search", map[string]string{HeaderCallID: "Sr1/1", HeaderSubrun: "Sr1"}, 400, CodeInvalidRequest},
+		{"call id 不以 sub-run 开头", "POST", "/v1/search", map[string]string{HeaderCallID: "c/1", HeaderSubrun: "sr1"}, 400, CodeInvalidRequest},
 		{"exec 未实现", "POST", "/v1/exec", callHdr("c/1"), 501, CodeNotImplemented},
 		{"方法不符", "GET", "/v1/chat/completions", callHdr("c/1"), 405, CodeMethodNotAllowed},
 		{"未知端点", "POST", "/v1/other", callHdr("c/1"), 404, CodeNotFound},
@@ -1066,5 +1079,128 @@ func TestIncarnationDetachDeadline(t *testing.T) {
 	}
 	if _, err := e.BindIncarnation(ctx, "i2", "e1"); !errors.Is(err, ErrClosed) {
 		t.Errorf("Close 后 BindIncarnation = %v，期望 ErrClosed", err)
+	}
+}
+
+// ==== M4 Plan 14 Task 5：X-Agentbox-Subrun（规格 §9.2、§9.3） ====
+
+// 计费调用：sub-run ID 须合规、call id 须以 <subrun_id>/ 开头（否则 400 invalid_request，不调用 Invoke）；合法时
+// SubrunID 进入 Invoke；不带头为 root。sub-run 的拒绝（409 subrun_closed、402 subrun_budget_exhausted）原样映射。
+func TestSubrunHeaderOnBillable(t *testing.T) {
+	var mu sync.Mutex
+	var next call.Result
+	calls := &fakeCalls{invoke: func(context.Context, call.Invoke) (call.Result, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if next.Status == 0 {
+			return call.Result{Body: []byte(`{}`), BlobSHA256: testSHA, Status: 200}, nil
+		}
+		return next, nil
+	}}
+	e := newEdge(t, Config{}, calls)
+	p := bind(t, e, "a1", "e1")
+	hdr := func(sr, id string) map[string]string { return map[string]string{HeaderSubrun: sr, HeaderCallID: id} }
+	bad := []map[string]string{
+		hdr("root", "root/s/1"),                 // 保留名
+		hdr("ST1", "ST1/s/1"),                   // 大写
+		hdr("-st1", "-st1/s/1"),                 // 首字符
+		hdr(strings.Repeat("a", 33), "a/s/1"),   // 超过 32 字节
+		hdr("st1", "root/s/1"),                  // 前缀不符
+		hdr("st1", "st1x/s/1"),                  // 只是字符串前缀
+		hdr("st1", "st1/"),                      // 前缀之后为空
+		hdr("st1", "st1"),                       // 没有分隔符
+		{HeaderSubrun: "st1", HeaderCallID: ""}, // 缺 call id 仍为 missing_call_id（下面单独断言）
+	}
+	for i, h := range bad[:len(bad)-1] {
+		if r := do(t, p, "POST", "/v1/search", strings.NewReader(`{}`), h); r.status != 400 || errCode(t, r) != CodeInvalidRequest {
+			t.Errorf("#%d %v: %d %s", i, h, r.status, r.body)
+		}
+	}
+	if r := do(t, p, "POST", "/v1/fetch", strings.NewReader(`{}`), bad[len(bad)-1]); r.status != 400 || errCode(t, r) != CodeMissingCallID {
+		t.Errorf("缺 call id: %d %s", r.status, r.body)
+	}
+	if invokes, _, _, _ := calls.snapshot(); len(invokes) != 0 {
+		t.Fatalf("被拒的请求不应调用 Invoke：%+v", invokes)
+	}
+	if r := do(t, p, "POST", "/v1/chat/completions", strings.NewReader(`{}`), hdr("st1", "st1/s/chat/1")); r.status != 200 {
+		t.Fatalf("合法 sub-run: %d %s", r.status, r.body)
+	}
+	if r := do(t, p, "POST", "/v1/search", strings.NewReader(`{}`), callHdr("root/s/1")); r.status != 200 {
+		t.Fatalf("root: %d %s", r.status, r.body)
+	}
+	invokes, _, _, _ := calls.snapshot()
+	if len(invokes) != 2 || invokes[0].SubrunID != "st1" || invokes[0].CallID != "st1/s/chat/1" || invokes[1].SubrunID != "" {
+		t.Fatalf("Invoke = %+v", invokes)
+	}
+	for _, c := range []struct {
+		status int
+		code   string
+	}{{409, "subrun_closed"}, {402, "subrun_budget_exhausted"}} {
+		mu.Lock()
+		next = call.Result{Status: c.status, Code: c.code}
+		mu.Unlock()
+		if r := do(t, p, "POST", "/v1/fetch", strings.NewReader(`{}`), hdr("st1", "st1/f/1")); r.status != c.status || errCode(t, r) != c.code {
+			t.Errorf("%s: %d %s", c.code, r.status, r.body)
+		}
+	}
+}
+
+// 只读端点：/v1/budget 与 /blobs/{sha} 带 X-Agentbox-Subrun 时不要求 call id（SDK 的 sub-run 视图在这两个端点
+// 也带该头），sub-run 进入 CheckAccess；/v1/budget 附加 sub-run 层（无上限时 cap 与 available 为 null）；不带头时
+// 响应与旧版逐字节一致；非法 ID → 400；访问被拒（409 subrun_closed）原样返回。
+func TestSubrunHeaderOnReadOnly(t *testing.T) {
+	capMicro := int64(400)
+	calls := &fakeCalls{
+		budget:    call.Budget{LimitMicro: 1000, ReservedMicro: 100, SpentMicro: 200, UnknownMicro: 50},
+		subBudget: call.SubrunBudget{CapMicro: &capMicro, ReservedMicro: 100, SpentMicro: 50, UnknownMicro: 25},
+		open: func(_, sha string) (io.ReadCloser, error) {
+			return io.NopCloser(strings.NewReader("blob")), nil
+		},
+	}
+	e := newEdge(t, Config{}, calls)
+	p := bind(t, e, "a1", "e1")
+	sub := map[string]string{HeaderSubrun: "st1"}
+
+	r := do(t, p, "GET", "/v1/budget", nil, nil)
+	const old = `{"limit_micro":1000,"reserved_micro":100,"spent_micro":200,"unknown_micro":50,"available_micro":650,"tool_calls_used":0,"tool_call_limit":null}`
+	if r.status != 200 || string(r.body) != old {
+		t.Errorf("不带头的 /v1/budget 应与旧响应一致：%d %s", r.status, r.body)
+	}
+	r = do(t, p, "GET", "/v1/budget", nil, sub)
+	want := `{"limit_micro":1000,"reserved_micro":100,"spent_micro":200,"unknown_micro":50,"available_micro":650,"tool_calls_used":0,"tool_call_limit":null,` +
+		`"subrun":{"cap_micro":400,"reserved_micro":100,"spent_micro":50,"unknown_micro":25,"available_micro":225}}`
+	if r.status != 200 || string(r.body) != want {
+		t.Errorf("带头的 /v1/budget：%d %s", r.status, r.body)
+	}
+	calls.mu.Lock()
+	calls.subBudget = call.SubrunBudget{SpentMicro: 10}
+	calls.mu.Unlock()
+	r = do(t, p, "GET", "/v1/budget", nil, sub)
+	if !strings.HasSuffix(string(r.body), `"subrun":{"cap_micro":null,"reserved_micro":0,"spent_micro":10,"unknown_micro":0,"available_micro":null}}`) {
+		t.Errorf("无上限的 sub-run 层：%s", r.body)
+	}
+	if r := do(t, p, "GET", "/blobs/"+testSHA, nil, sub); r.status != 200 || string(r.body) != "blob" {
+		t.Errorf("带头的 blob：%d %s", r.status, r.body)
+	}
+	for _, path := range []string{"/v1/budget", "/blobs/" + testSHA} {
+		if r := do(t, p, "GET", path, nil, map[string]string{HeaderSubrun: "root"}); r.status != 400 || errCode(t, r) != CodeInvalidRequest {
+			t.Errorf("%s 非法 sub-run：%d %s", path, r.status, r.body)
+		}
+	}
+	calls.mu.Lock()
+	calls.access = call.Result{Status: 409, Code: "subrun_closed"}
+	calls.mu.Unlock()
+	for _, path := range []string{"/v1/budget", "/blobs/" + testSHA} {
+		if r := do(t, p, "GET", path, nil, sub); r.status != 409 || errCode(t, r) != "subrun_closed" {
+			t.Errorf("%s 已关闭的 sub-run：%d %s", path, r.status, r.body)
+		}
+	}
+	calls.mu.Lock()
+	defer calls.mu.Unlock()
+	if fmt.Sprint(calls.subChecks) != "[ st1 st1 st1 st1 st1]" {
+		t.Errorf("CheckAccess 的 sub-run = %q", calls.subChecks)
+	}
+	if fmt.Sprint(calls.subBudgets) != "[st1 st1]" {
+		t.Errorf("SubrunBudget 调用 = %q（访问被拒与不带头时不读 sub-run 层）", calls.subBudgets)
 	}
 }

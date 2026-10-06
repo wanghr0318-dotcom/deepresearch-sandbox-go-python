@@ -29,13 +29,17 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/blob"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/subrun"
 )
 
 // Calls 是 edge 使用的 call 协调器子集（*call.Coordinator 满足它）。
 type Calls interface {
 	Invoke(ctx context.Context, in call.Invoke) (call.Result, error)
-	CheckAccess(ctx context.Context, taskID, attemptID string) (call.Result, error)
+	// CheckAccess 的 subrunID 来自 X-Agentbox-Subrun（空为 root）：非空时另查该 sub-run 是否可用（409 subrun_closed）。
+	CheckAccess(ctx context.Context, taskID, attemptID, subrunID string) (call.Result, error)
 	Budget(ctx context.Context, taskID string) (call.Budget, error)
+	// SubrunBudget 返回 sub-run 层账本（/v1/budget 带 X-Agentbox-Subrun 时附加）。
+	SubrunBudget(ctx context.Context, taskID, subrunID string) (call.SubrunBudget, error)
 	OpenBlob(ctx context.Context, taskID, sha string) (io.ReadCloser, error)
 	CancelAttempt(attemptID, reason string)
 }
@@ -66,7 +70,6 @@ const (
 // edge 自身产生的错误码（其余原样来自 call.Result.Code）。
 const (
 	CodeMissingCallID      = "missing_call_id"
-	CodeSubrunUnsupported  = "subrun_unsupported"
 	CodeNotImplemented     = "not_implemented"
 	CodeTooManyRequests    = "too_many_requests"
 	CodeRequestTooLarge    = "request_too_large"
@@ -547,8 +550,12 @@ func (t *target) serveHTTP(w http.ResponseWriter, r *http.Request, tc *trackedCo
 	}
 	defer t.exit()
 
-	if r.Header.Get(HeaderSubrun) != "" {
-		t.writeError(w, http.StatusBadRequest, CodeSubrunUnsupported, "本版本不支持 sub-run 调用")
+	// X-Agentbox-Subrun（§9.2、§9.3）：非空时须满足 sub-run ID 规则；归属（属于本任务、绑定本 attempt、started）
+	// 由 Calls 在访问检查中判定。计费端点另要求 call id 以 <subrun_id>/ 开头（invoke）；只读端点（/v1/budget、
+	// /blobs）不要求 call id。
+	subrunID := r.Header.Get(HeaderSubrun)
+	if subrunID != "" && !subrun.ValidID(subrunID) {
+		t.writeError(w, http.StatusBadRequest, CodeInvalidRequest, "X-Agentbox-Subrun 不是合法的 sub-run ID")
 		return
 	}
 	path := r.URL.Path
@@ -560,28 +567,32 @@ func (t *target) serveHTTP(w http.ResponseWriter, r *http.Request, tc *trackedCo
 			t.methodNotAllowed(w, http.MethodPost)
 			return
 		}
-		t.invoke(w, r, tc, billable[path])
+		t.invoke(w, r, tc, billable[path], subrunID)
 	case path == "/v1/budget":
 		if r.Method != http.MethodGet {
 			t.methodNotAllowed(w, http.MethodGet)
 			return
 		}
-		t.budget(w, r)
+		t.budget(w, r, subrunID)
 	case strings.HasPrefix(path, "/blobs/"):
 		if r.Method != http.MethodGet {
 			t.methodNotAllowed(w, http.MethodGet)
 			return
 		}
-		t.blob(w, r, strings.TrimPrefix(path, "/blobs/"))
+		t.blob(w, r, strings.TrimPrefix(path, "/blobs/"), subrunID)
 	default:
 		t.writeError(w, http.StatusNotFound, CodeNotFound, "未知端点")
 	}
 }
 
-func (t *target) invoke(w http.ResponseWriter, r *http.Request, tc *trackedConn, kind upstream.Kind) {
+func (t *target) invoke(w http.ResponseWriter, r *http.Request, tc *trackedConn, kind upstream.Kind, subrunID string) {
 	callID := r.Header.Get(HeaderCallID)
 	if callID == "" || len(callID) > MaxCallIDBytes {
 		t.writeError(w, http.StatusBadRequest, CodeMissingCallID, "计费调用须携带 1–256 字节的 X-Agentbox-Call-Id")
+		return
+	}
+	if prefix := subrunID + "/"; subrunID != "" && (!strings.HasPrefix(callID, prefix) || len(callID) == len(prefix)) {
+		t.writeError(w, http.StatusBadRequest, CodeInvalidRequest, "带 X-Agentbox-Subrun 时 X-Agentbox-Call-Id 须以 <subrun_id>/ 开头")
 		return
 	}
 	// 不按 Content-Length 提前拒绝：未读请求体时立即响应会让仍在写入的客户端得到 broken pipe 而非 413。
@@ -612,6 +623,7 @@ func (t *target) invoke(w http.ResponseWriter, r *http.Request, tc *trackedConn,
 		Supersedes:      r.Header.Get(HeaderSupersedes),
 		SupersedeReason: r.Header.Get(HeaderSupersedeReason),
 		NoCache:         noCache,
+		SubrunID:        subrunID,
 	}
 	// Worker 在响应前断开（net/http 读到 EOF 后取消 r.Context()）：立即关闭服务端连接、释放连接名额，
 	// Invoke 不受影响，响应写入失败即丢弃。处理函数返回前 stop，正常结束不会触发。
@@ -651,8 +663,8 @@ func (t *target) invoke(w http.ResponseWriter, r *http.Request, tc *trackedConn,
 }
 
 // access 做 §9.2 访问检查（经 Calls.CheckAccess）；拒绝时写出错误并返回 false。
-func (t *target) access(w http.ResponseWriter, r *http.Request) bool {
-	res, err := t.e.calls.CheckAccess(r.Context(), t.taskID, t.attemptID)
+func (t *target) access(w http.ResponseWriter, r *http.Request, subrunID string) bool {
+	res, err := t.e.calls.CheckAccess(r.Context(), t.taskID, t.attemptID, subrunID)
 	if err != nil {
 		t.internalError(w, "check_access", err)
 		return false
@@ -674,10 +686,22 @@ type budgetBody struct {
 	ToolCallsUsed  int64 `json:"tool_calls_used"`
 	// ToolCallLimit 是每 turn 的工具调用上限；不限时为 null。
 	ToolCallLimit *int64 `json:"tool_call_limit"`
+	// Subrun 只在请求带 X-Agentbox-Subrun 时出现（不带头时响应与之前逐字节相同）。
+	Subrun *subrunBudgetBody `json:"subrun,omitempty"`
 }
 
-func (t *target) budget(w http.ResponseWriter, r *http.Request) {
-	if !t.access(w, r) {
+// subrunBudgetBody 是 sub-run 层账本（§9.6）。CapMicro 为 null 表示只做归属、不设上限，此时 AvailableMicro
+// 也为 null（没有上限就没有可用额度的概念；不输出超出 JSON 安全整数的哨兵值）。
+type subrunBudgetBody struct {
+	CapMicro       *int64 `json:"cap_micro"`
+	ReservedMicro  int64  `json:"reserved_micro"`
+	SpentMicro     int64  `json:"spent_micro"`
+	UnknownMicro   int64  `json:"unknown_micro"`
+	AvailableMicro *int64 `json:"available_micro"`
+}
+
+func (t *target) budget(w http.ResponseWriter, r *http.Request, subrunID string) {
+	if !t.access(w, r, subrunID) {
 		return
 	}
 	bg, err := t.e.calls.Budget(r.Context(), t.taskID)
@@ -685,19 +709,34 @@ func (t *target) budget(w http.ResponseWriter, r *http.Request) {
 		t.internalError(w, "budget", err)
 		return
 	}
-	t.writeJSON(w, http.StatusOK, budgetBody{
+	body := budgetBody{
 		LimitMicro: bg.LimitMicro, ReservedMicro: bg.ReservedMicro, SpentMicro: bg.SpentMicro,
 		UnknownMicro: bg.UnknownMicro, AvailableMicro: bg.Available(),
 		ToolCallsUsed: bg.ToolCallsUsed, ToolCallLimit: bg.ToolCallLimit,
-	})
+	}
+	if subrunID != "" {
+		sb, err := t.e.calls.SubrunBudget(r.Context(), t.taskID, subrunID)
+		if err != nil {
+			t.internalError(w, "subrun_budget", err, "subrun_id", subrunID)
+			return
+		}
+		sub := &subrunBudgetBody{CapMicro: sb.CapMicro, ReservedMicro: sb.ReservedMicro, SpentMicro: sb.SpentMicro,
+			UnknownMicro: sb.UnknownMicro}
+		if sb.CapMicro != nil {
+			avail := sb.Available()
+			sub.AvailableMicro = &avail
+		}
+		body.Subrun = sub
+	}
+	t.writeJSON(w, http.StatusOK, body)
 }
 
-func (t *target) blob(w http.ResponseWriter, r *http.Request, sha string) {
+func (t *target) blob(w http.ResponseWriter, r *http.Request, sha, subrunID string) {
 	if !shaPattern.MatchString(sha) {
 		t.writeError(w, http.StatusNotFound, CodeNotFound, "blob 不存在")
 		return
 	}
-	if !t.access(w, r) {
+	if !t.access(w, r, subrunID) {
 		return
 	}
 	rc, err := t.e.calls.OpenBlob(r.Context(), t.taskID, sha)

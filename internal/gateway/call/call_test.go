@@ -45,12 +45,16 @@ type fakeStore struct {
 	settled    chan string      // 每次 SettleTry 改变账本后发送 call_id
 	reserveErr error            // 下一次 ReserveTry 返回的存储故障（一次性）
 	scoped     map[callKey]bool // (task_id, sha256) → 以其他来源登记到 scope_blobs(task)
+	// sub-run（Plan 14 Task 5）：键为 (task_id, subrun_id)；默认 open、层账本不设上限。
+	subClosed    map[callKey]bool
+	subExhausted map[callKey]bool // ReserveTry 返回 subrun_budget_exhausted
+	subBudgets   map[callKey]SubrunBudget
 }
 
 func newFakeStore(t *testing.T) *fakeStore {
 	return &fakeStore{t: t, revoked: map[string]bool{}, desired: map[string]string{}, budgets: map[string]*Budget{},
 		calls: map[callKey]*CallRecord{}, tries: map[callKey][]*fakeTry{}, begun: make(chan string, 64), settled: make(chan string, 64),
-		scoped: map[callKey]bool{}}
+		scoped: map[callKey]bool{}, subClosed: map[callKey]bool{}, subExhausted: map[callKey]bool{}, subBudgets: map[callKey]SubrunBudget{}}
 }
 
 func (s *fakeStore) budget(taskID string) *Budget {
@@ -98,35 +102,50 @@ func (s *fakeStore) checkI3() {
 
 func rejected(code string) error { return &persistence.RejectedError{Code: code, Detail: "fake"} }
 
-func (s *fakeStore) facts(taskID, attemptID string) AccessFacts {
+func (s *fakeStore) facts(taskID, attemptID, subrunID string) AccessFacts {
 	d := s.desired[taskID]
 	if d == "" {
 		d = "run"
 	}
-	return AccessFacts{TaskID: taskID, AttemptID: attemptID, Active: !s.revoked[attemptID], Current: true, Desired: d}
+	return AccessFacts{TaskID: taskID, AttemptID: attemptID, Active: !s.revoked[attemptID], Current: true, Desired: d,
+		SubrunID: subrunID, SubrunOpen: subrunID != "" && !s.subClosed[callKey{taskID, subrunID}]}
 }
 
 func (s *fakeStore) CheckAccess(_ context.Context, taskID, attemptID, subrunID string) (AccessFacts, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	f := s.facts(taskID, attemptID)
-	f.SubrunID, f.SubrunOpen = subrunID, subrunID != "" // fake 不建模 sub-run 生命周期（Plan 14 Task 5 扩展）
-	return f, nil
+	return s.facts(taskID, attemptID, subrunID), nil
 }
 
-// LoadSubrunBudget：fake 不建模 sub-run 层账本（真实语义见 postgres 测试）。
-func (s *fakeStore) LoadSubrunBudget(context.Context, string, string) (SubrunBudget, error) {
-	return SubrunBudget{}, persistence.ErrNotFound
+// closeSubrun 模拟宿主把 sub-run 置为 cancel_requested（之后的访问复查为 subrun_closed）。
+func (s *fakeStore) closeSubrun(taskID, subrunID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.subClosed[callKey{taskID, subrunID}] = true
+}
+
+// LoadSubrunBudget：fake 只返回测试登记的 sub-run 层账本（两层记账的真实语义见 postgres 测试）。
+func (s *fakeStore) LoadSubrunBudget(_ context.Context, taskID, subrunID string) (SubrunBudget, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.subBudgets[callKey{taskID, subrunID}]
+	if !ok {
+		return SubrunBudget{}, persistence.ErrNotFound
+	}
+	return b, nil
 }
 
 func (s *fakeStore) BeginCall(_ context.Context, r BeginCallRequest) (BeginCallResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if code := admit(s.facts(r.TaskID, r.AttemptID)); code != "" {
+	if code := admit(s.facts(r.TaskID, r.AttemptID, r.SubrunID)); code != "" {
 		return BeginCallResult{}, rejected(code)
 	}
 	k := callKey{r.TaskID, r.CallID}
 	rec := s.calls[k]
+	if rec != nil && rec.SubrunID != r.SubrunID { // 与 postgres 相同：归属不同的同 ID 调用是指纹分歧
+		return BeginCallResult{}, rejected(persistence.CodeFingerprintMismatch)
+	}
 	now := time.Now()
 	b := s.budget(r.TaskID)
 	tool := r.Endpoint == "/v1/search" || r.Endpoint == "/v1/fetch"
@@ -146,7 +165,7 @@ func (s *fakeStore) BeginCall(_ context.Context, r BeginCallRequest) (BeginCallR
 		rec = &CallRecord{TaskID: r.TaskID, CallID: r.CallID, Fingerprint: r.Fingerprint, Endpoint: r.Endpoint,
 			State: StateResolving, Source: "upstream", CreatedAt: now, DeadlineAt: now.Add(r.Deadline),
 			FirstAttemptID: r.AttemptID, SupersedesCallID: r.SupersedesCallID, SupersedeReason: r.SupersedeReason,
-			ResolvingSince: &now, Model: r.Model}
+			ResolvingSince: &now, Model: r.Model, SubrunID: r.SubrunID}
 		s.calls[k] = rec
 		select {
 		case s.begun <- r.CallID:
@@ -191,11 +210,15 @@ func (s *fakeStore) ReserveTry(_ context.Context, r ReserveTryRequest) (Try, err
 			return Try{}, rejected(persistence.CodeCallInProgress)
 		}
 	}
-	if code := admit(s.facts(r.TaskID, r.AttemptID)); code != "" {
+	if code := admit(s.facts(r.TaskID, r.AttemptID, r.SubrunID)); code != "" {
 		return Try{}, rejected(code)
 	}
 	b := s.budget(r.TaskID)
 	switch {
+	case rec.SubrunID != r.SubrunID:
+		return Try{}, rejected(persistence.CodeFingerprintMismatch)
+	case r.SubrunID != "" && s.subExhausted[callKey{r.TaskID, r.SubrunID}]:
+		return Try{}, rejected(persistence.CodeSubrunBudgetExhausted)
 	case rec.State == StateCompleted:
 		return Try{}, persistence.ErrConflict
 	case !time.Now().Before(rec.DeadlineAt):
@@ -273,8 +296,11 @@ func (s *fakeStore) CompleteFromCache(_ context.Context, r CacheCompletion) (Cal
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	defer s.checkI3()
-	if code := admit(s.facts(r.TaskID, r.AttemptID)); code != "" {
+	if code := admit(s.facts(r.TaskID, r.AttemptID, r.SubrunID)); code != "" {
 		return CallRecord{}, rejected(code)
+	}
+	if rec := s.calls[callKey{r.TaskID, r.CallID}]; rec != nil && rec.SubrunID != r.SubrunID {
+		return CallRecord{}, rejected(persistence.CodeFingerprintMismatch)
 	}
 	src := r.Source
 	if src == "" {
@@ -1897,5 +1923,250 @@ func TestToolBudgetExhaustedIs429(t *testing.T) {
 		Body: []byte(searchBody)})
 	if unlimited.Status != 200 || unlimited.ToolBudget != nil {
 		t.Fatalf("不限的任务不带额度：%+v", unlimited)
+	}
+}
+
+// ==== M4 Plan 14 Task 5：sub-run 的在途上限、合并与取消（规格 §9.7、§11.4、§13.4） ====
+
+// subInv 是 sub-run sr 中的一次调用（call id 以 <sr>/ 开头，与 edge 的校验一致）。
+func subInv(base Invoke, sr, id string) Invoke {
+	base.SubrunID, base.CallID = sr, sr+"/"+id
+	return base
+}
+
+// holdSteps 返回 n 个忽略 ctx、只在 gate 关闭时返回的 try。
+func holdSteps(n int, gate chan struct{}) []step {
+	s := make([]step, n)
+	for i := range s {
+		s[i] = step{gate: gate, hold: true}
+	}
+	return s
+}
+
+// noMoreEntered 断言在一个短窗口内没有新的上游 try 开始（反向检查：槽位阻塞）。
+func noMoreEntered(t *testing.T, a *fakeAdapter, why string) {
+	t.Helper()
+	select {
+	case <-a.entered:
+		t.Fatal(why)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// 每 sub-run 在途 ≤ 2：同一 sub-run 的 5 个不同调用并发，上游同时在途峰值 = 2；等待 sub-run 槽位的调用不预留。
+func TestPerSubrunInflight(t *testing.T) {
+	gate := make(chan struct{})
+	ad := newAdapter("p", holdSteps(5, gate)...)
+	h := newHarness(t, testLimits(), ad)
+	var outs []<-chan invokeOutcome
+	for i := 0; i < 5; i++ {
+		outs = append(outs, h.start(context.Background(), subInv(inv("", chatBody), "st1", fmt.Sprintf("c%d", i))))
+	}
+	waitEntered(t, ad)
+	waitEntered(t, ad)
+	noMoreEntered(t, ad, "同一 sub-run 第三个 try 没有等待 sub-run 槽位")
+	if b := h.budget(t, "t1"); b.ReservedMicro != 200 {
+		t.Fatalf("等待槽位的调用不应预留：账本 %+v", b)
+	}
+	close(gate)
+	for i, ch := range outs {
+		if r := await(t, ch); r.Status != 200 {
+			t.Fatalf("c%d：%+v", i, r)
+		}
+	}
+	if calls, maxIn, _ := ad.stats(); calls != 5 || maxIn != 2 {
+		t.Fatalf("上游 %d 次、峰值 %d，期望 5 与 2", calls, maxIn)
+	}
+	if rec, _ := h.call(t, "t1", "st1/c0"); rec.SubrunID != "st1" {
+		t.Fatalf("调用应登记归属 st1：%+v", rec)
+	}
+	if _, ok := h.c.subSem[subrunSemKey("t1", "st1")]; ok {
+		t.Fatal("全部调用结束后 sub-run 槽位应被回收")
+	}
+}
+
+// 两个 sub-run 各 3 个调用：峰值 = 4（task 上限），sub-run 槽位不跨 sub-run 共享；root 调用不受 sub-run 槽位限制。
+func TestPerSubrunInflightTwoSubruns(t *testing.T) {
+	gate := make(chan struct{})
+	ad := newAdapter("p", holdSteps(6, gate)...)
+	h := newHarness(t, testLimits(), ad)
+	var outs []<-chan invokeOutcome
+	for _, sr := range []string{"st1", "st2"} {
+		for i := 0; i < 3; i++ {
+			outs = append(outs, h.start(context.Background(), subInv(inv("", chatBody), sr, fmt.Sprintf("c%d", i))))
+		}
+	}
+	for i := 0; i < 4; i++ {
+		waitEntered(t, ad)
+	}
+	noMoreEntered(t, ad, "第五个 try 越过了 task 上限")
+	close(gate)
+	for i, ch := range outs {
+		if r := await(t, ch); r.Status != 200 {
+			t.Fatalf("#%d：%+v", i, r)
+		}
+	}
+	if calls, maxIn, _ := ad.stats(); calls != 6 || maxIn != 4 {
+		t.Fatalf("上游 %d 次、峰值 %d，期望 6 与 4", calls, maxIn)
+	}
+
+	gate2 := make(chan struct{})
+	root := newHarness(t, testLimits(), newAdapter("p", holdSteps(3, gate2)...))
+	var routs []<-chan invokeOutcome
+	for i := 0; i < 3; i++ {
+		routs = append(routs, root.start(context.Background(), inv(fmt.Sprintf("root/c%d", i), chatBody)))
+	}
+	for i := 0; i < 3; i++ {
+		waitEntered(t, root.ad)
+	}
+	close(gate2)
+	for _, ch := range routs {
+		if r := await(t, ch); r.Status != 200 {
+			t.Fatalf("root：%+v", r)
+		}
+	}
+}
+
+// E24：同一 sub-run 内 10 个相同抓取（不同 call_id、同 cache_key）→ 上游 1 次、9 个 coalesced（follower 不占槽位）；
+// 另一 sub-run 的同一抓取不合并 → 上游共 2 次。
+func TestSubrunCoalesceE24(t *testing.T) {
+	gate := make(chan struct{})
+	h, fc := newCoalesceHarness(t, upstream.KindFetch, step{gate: gate, body: `{"page":"st1"}`}, step{gate: gate, body: `{"page":"st2"}`})
+	ctx := context.Background()
+	outs := []<-chan invokeOutcome{h.start(ctx, subInv(fetchInv(""), "st1", "f0"))}
+	waitEntered(t, h.ad)
+	for i := 1; i < 10; i++ {
+		outs = append(outs, h.start(ctx, subInv(fetchInv(""), "st1", fmt.Sprintf("f%d", i))))
+	}
+	waitJoined(t, fc, 9)
+	other := h.start(ctx, subInv(fetchInv(""), "st2", "f0"))
+	waitEntered(t, h.ad)
+	close(gate)
+	for i, ch := range outs {
+		if r := await(t, ch); r.Status != 200 || string(r.Body) != `{"page":"st1"}` {
+			t.Fatalf("st1/f%d：%+v", i, r)
+		}
+	}
+	if r := await(t, other); r.Status != 200 || string(r.Body) != `{"page":"st2"}` {
+		t.Fatalf("st2：%+v", r)
+	}
+	if calls, _, _ := h.ad.stats(); calls != 2 || fc.coalesced() != 9 {
+		t.Fatalf("上游 %d 次、coalesced %d，期望 2 与 9", calls, fc.coalesced())
+	}
+	for i := 1; i < 10; i++ {
+		if rec, _ := h.call(t, "t1", fmt.Sprintf("st1/f%d", i)); rec.Source != SourceCoalesced || rec.SubrunID != "st1" {
+			t.Fatalf("follower %d：%+v", i, rec)
+		}
+	}
+}
+
+// CancelSubrun(st1)：取消 st1 的在途 try（已发出 → unknown；未发出 → 释放）、st1 的共享请求（follower 以同因失败）
+// 与等待 sub-run 槽位的调用，Worker 均得到 409 subrun_closed；st2 的同时在途调用继续完成；幂等。
+func TestCancelSubrun(t *testing.T) {
+	gate := make(chan struct{})
+	h, fc := newCoalesceHarness(t, upstream.KindFetch,
+		step{hang: true, sent: true},             // st1 leader（url a）
+		step{hang: true, sent: false},            // st1 第二个调用（url b）
+		step{gate: gate, body: `{"page":"st2"}`}) // st2（url a，不与 st1 合并）
+	ctx := context.Background()
+	urlInv := func(sr, id, u string) Invoke {
+		in := subInv(fetchInv(""), sr, id)
+		in.Body = []byte(`{"url":"https://example.com/` + u + `"}`)
+		return in
+	}
+	leader := h.start(ctx, urlInv("st1", "a0", "a"))
+	waitEntered(t, h.ad)
+	follower := h.start(ctx, urlInv("st1", "a1", "a"))
+	waitJoined(t, fc, 1)
+	second := h.start(ctx, urlInv("st1", "b0", "b"))
+	waitEntered(t, h.ad)
+	waiting := h.start(ctx, urlInv("st1", "c0", "c"))
+	waitBegun(t, h.store, "st1/c0")
+	st2 := h.start(ctx, urlInv("st2", "a0", "a"))
+	waitEntered(t, h.ad)
+
+	h.c.CancelSubrun("t1", "a1", "st2x") // 不存在的 sub-run：无影响
+	h.c.CancelSubrun("t1", "a2", "st1")  // 其他 attempt：无影响
+	h.store.closeSubrun("t1", "st1")
+	h.c.CancelSubrun("t1", "a1", "st1")
+	h.c.CancelSubrun("t1", "a1", "st1") // 幂等
+	for name, ch := range map[string]<-chan invokeOutcome{"leader": leader, "follower": follower, "second": second, "waiting": waiting} {
+		if r := await(t, ch); r.Status != 409 || r.Code != persistence.CodeSubrunClosed {
+			t.Fatalf("%s：%+v", name, r)
+		}
+	}
+	select {
+	case o := <-st2:
+		t.Fatalf("st2 的调用被取消：%+v", o)
+	default:
+	}
+	close(gate)
+	if r := await(t, st2); r.Status != 200 || string(r.Body) != `{"page":"st2"}` {
+		t.Fatalf("st2：%+v", r)
+	}
+	if rec, _ := h.call(t, "t1", "st1/a0"); rec.State != StateUnknown {
+		t.Fatalf("已发出的 leader 应为 unknown：%+v", rec)
+	}
+	for _, id := range []string{"st1/a1", "st1/b0", "st1/c0"} {
+		if rec, _ := h.call(t, "t1", id); rec.State != StateFailed || rec.FailReason != persistence.CodeSubrunClosed {
+			t.Fatalf("%s：%+v", id, rec)
+		}
+	}
+	if _, tries := h.call(t, "t1", "st1/c0"); len(tries) != 0 {
+		t.Fatalf("等待槽位的调用不应有 try：%+v", tries)
+	}
+	if b := h.budget(t, "t1"); b.ReservedMicro != 0 || b.UnknownMicro != 100 || b.SpentMicro != 100 {
+		t.Fatalf("账本 %+v：期望 unknown 100（st1 leader）、spent 100（st2）", b)
+	}
+	if retryableReason(persistence.CodeSubrunClosed) {
+		t.Fatal("subrun_closed 不可重试")
+	}
+	if _, ok := h.c.bySubrun[subrunKey{"t1", "a1", "st1"}]; ok {
+		t.Fatal("结束的 job 应从 bySubrun 移除")
+	}
+}
+
+// sub-run 的错误码映射：subrun_budget_exhausted → 402（Invoke 经 ReserveTry 被拒），subrun_closed → 409
+// （CheckAccess 带 sub-run）；SubrunBudget 透传 sub-run 层账本。
+func TestSubrunCodesAndAccess(t *testing.T) {
+	h := newHarness(t, testLimits(), newAdapter("p"))
+	h.store.mu.Lock()
+	h.store.subExhausted[callKey{"t1", "st1"}] = true
+	h.store.mu.Unlock()
+	if r := h.invoke(t, subInv(inv("", chatBody), "st1", "c1")); r.Status != 402 || r.Code != persistence.CodeSubrunBudgetExhausted {
+		t.Fatalf("sub-run 预算耗尽：%+v", r)
+	}
+	if r := h.invoke(t, subInv(inv("", chatBody), "st2", "c1")); r.Status != 200 {
+		t.Fatalf("其他 sub-run 不受影响：%+v", r)
+	}
+	if calls, _, _ := h.ad.stats(); calls != 1 {
+		t.Fatalf("被拒的调用不应到达上游：%d", calls)
+	}
+	ctx := context.Background()
+	if r, err := h.c.CheckAccess(ctx, "t1", "a1", "st1"); err != nil || r.Code != "" {
+		t.Fatalf("open 的 sub-run：%+v / %v", r, err)
+	}
+	h.store.closeSubrun("t1", "st1")
+	if r, err := h.c.CheckAccess(ctx, "t1", "a1", "st1"); err != nil || r.Status != 409 || r.Code != persistence.CodeSubrunClosed {
+		t.Fatalf("closed 的 sub-run：%+v / %v", r, err)
+	}
+	if r, err := h.c.CheckAccess(ctx, "t1", "a1", ""); err != nil || r.Code != "" {
+		t.Fatalf("root：%+v / %v", r, err)
+	}
+	if r := h.invoke(t, subInv(inv("", chatBody), "st1", "c2")); r.Status != 409 || r.Code != persistence.CodeSubrunClosed {
+		t.Fatalf("closed 的 sub-run 的新调用：%+v", r)
+	}
+	capMicro := int64(500)
+	h.store.mu.Lock()
+	h.store.subBudgets[callKey{"t1", "st2"}] = SubrunBudget{CapMicro: &capMicro, SpentMicro: 100}
+	h.store.mu.Unlock()
+	if b, err := h.c.SubrunBudget(ctx, "t1", "st2"); err != nil || b.CapMicro == nil || *b.CapMicro != 500 || b.Available() != 400 {
+		t.Fatalf("SubrunBudget：%+v / %v", b, err)
+	}
+	if _, err := h.c.SubrunBudget(ctx, "t1", "nope"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("不存在的 sub-run 账本：%v", err)
+	}
+	if Limits.withDefaults(Limits{}).PerSubrunInflight != 2 {
+		t.Fatal("PerSubrunInflight 默认应为 2")
 	}
 }
