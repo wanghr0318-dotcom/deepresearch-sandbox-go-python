@@ -15,7 +15,8 @@ import (
 
 // 本文件实现 init 的挂载建立（规格 §4.5、§4.6 init 段；Plan 1B 实验记录 §4 的 B2 结论）。
 // 全部挂载只存在于沙箱自己的 mount namespace：宿主不可见，init 消失即随命名空间释放，
-// 不需要宿主侧清理，也没有崩溃后的残留。
+// 不需要宿主侧清理，也没有崩溃后的残留。唯一的宿主侧对象是 exec 环境 /out 的 tmpfs（InitSpec.Out）：
+// 它由 provider 在宿主上挂载与卸载，init 只把它 bind 进来。
 //
 // 新根是 init 在 stagingDir 上挂载的 tmpfs：其中只有模板项的上级目录、重建的符号链接与
 // init 自己的挂载点；模板各项以只读 bind 挂到同一路径，随后根本身 remount 为只读。
@@ -320,7 +321,7 @@ func setupMounts(s *InitSpec, check func(string) error, logf func(string, ...any
 		}
 		tmpl = append(tmpl, src)
 	}
-	in, ws, gw := source{fd: -1}, source{fd: -1}, source{fd: -1}
+	in, out, ws, gw := source{fd: -1}, source{fd: -1}, source{fd: -1}, source{fd: -1}
 	var err error
 	if s.In != "" {
 		if in, err = pin(stepMountIn, s.In); err != nil {
@@ -328,6 +329,14 @@ func setupMounts(s *InitSpec, check func(string) error, logf func(string, ...any
 		}
 		if !in.dir {
 			return &stepErr{stepMountIn, fmt.Errorf("%s 不是目录", s.In)}
+		}
+	}
+	if s.Out != "" {
+		if out, err = pin(stepMountOut, s.Out); err != nil {
+			return err
+		}
+		if !out.dir {
+			return &stepErr{stepMountOut, fmt.Errorf("%s 不是目录", s.Out)}
 		}
 	}
 	if s.Workspace != "" {
@@ -405,19 +414,26 @@ func setupMounts(s *InitSpec, check func(string) error, logf func(string, ...any
 			return &stepErr{stepMountIn, err}
 		}
 	}
+	// /out：宿主侧 tmpfs（Plan 15 D1）可写 bind，nosuid、nodev（bind 在两条路径上都设置这两个属性，
+	// 回退路径以 MS_BIND|MS_REMOUNT|MS_NOSUID|MS_NODEV 补设）。size、nr_inodes 与属主由宿主挂载决定。
+	if out.fd >= 0 {
+		if err := check(stepMountOut); err != nil {
+			return err
+		}
+		if err := m.bind(out.fd, root("/out"), false); err != nil {
+			return &stepErr{stepMountOut, err}
+		}
+	}
 	if err := syscall.Mount("", stagingDir, "", syscall.MS_BIND|syscall.MS_REMOUNT|syscall.MS_RDONLY|syscall.MS_NOSUID|syscall.MS_NODEV, ""); err != nil {
 		return &stepErr{stepMountRootfs, fmt.Errorf("新根 remount 只读: %w", err)}
 	}
 
-	// tmpfs：/tmp；编排环境 /run（限额）；exec 环境 /out（size、nr_inodes 即配额，属主为 workload）。
+	// tmpfs：/tmp；编排环境 /run（限额）。exec 环境的 /out 不在此建立：它是上面 bind 的宿主侧 tmpfs。
 	if err := check(stepMountTmpfs); err != nil {
 		return err
 	}
 	tmpfs := []struct{ dst, data string }{{"/tmp", fmt.Sprintf("mode=1777,size=%d", s.TmpBytes)}}
-	if s.Kind == KindExec {
-		tmpfs = append(tmpfs, struct{ dst, data string }{"/out",
-			fmt.Sprintf("mode=755,size=%d,nr_inodes=1024,uid=%d,gid=%d", s.OutBytes, workloadID, workloadID)})
-	} else {
+	if s.Kind != KindExec {
 		tmpfs = append(tmpfs, struct{ dst, data string }{"/run", fmt.Sprintf("mode=1777,size=%d", s.TmpBytes)})
 	}
 	for _, t := range tmpfs {

@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -240,7 +241,7 @@ var seccompTestNrs = map[Arch]map[string]uint32{
 		"setns": 308, "process_vm_readv": 310, "process_vm_writev": 311,
 		"finit_module": 313, "kexec_file_load": 320, "bpf": 321, "userfaultfd": 323,
 		"io_uring_setup": 425, "io_uring_enter": 426, "io_uring_register": 427,
-		"clone3": 435,
+		"clone3": 435, "personality": 135, "name_to_handle_at": 303,
 	},
 	ArchARM64: {
 		"read": 63, "getpid": 172, "socket": 198, "clone": 220, "ptrace": 117,
@@ -250,7 +251,7 @@ var seccompTestNrs = map[Arch]map[string]uint32{
 		"setns": 268, "process_vm_readv": 270, "process_vm_writev": 271,
 		"finit_module": 273, "kexec_file_load": 294, "bpf": 280, "userfaultfd": 282,
 		"io_uring_setup": 425, "io_uring_enter": 426, "io_uring_register": 427,
-		"clone3": 435,
+		"clone3": 435, "personality": 92, "name_to_handle_at": 264,
 	},
 }
 
@@ -261,7 +262,16 @@ var seccompDeniedEPERM = []string{
 	"userfaultfd", "io_uring_setup", "io_uring_enter", "io_uring_register",
 	"keyctl", "add_key", "request_key", "open_by_handle_at", "init_module",
 	"finit_module", "delete_module", "kexec_load", "kexec_file_load",
+	"name_to_handle_at",
 }
+
+// personality 的 persona 取值（include/uapi/linux/personality.h）：PER_LINUX 0、UNAME26 0x0020000、
+// ADDR_NO_RANDOMIZE 0x0040000、READ_IMPLIES_EXEC 0x0400000、ADDR_COMPAT_LAYOUT 0x0200000、PER_LINUX32 0x0008；
+// 0xffffffff 是查询（不修改）。
+var (
+	tPersonalityAllowed = []uint64{0x0, 0x8, 0x20000, 0x20008, 0xffffffff}
+	tPersonalityDenied  = []uint64{0x0400000, 0x0040000, 0x0200000, 0x0400008, 0x1, 0xfffffffe}
+)
 
 // 测试侧独立写出的内核常量（include/uapi/linux/audit.h、seccomp.h、
 // sched.h、socket.h、asm-generic/errno-base.h、errno.h）。
@@ -436,6 +446,17 @@ func TestSeccompFilterRules(t *testing.T) {
 				// clone3 → ENOSYS（让 glibc 回退到 clone）。
 				expect("clone3", call("clone3", 0, 88), tRetErrnoENOSYS)
 
+				// personality：只允许 PER_LINUX、PER_LINUX32、UNAME26 及其组合与查询，其余（READ_IMPLIES_EXEC、
+				// ADDR_NO_RANDOMIZE 等）EPERM。内核只取 persona 的低 32 位（unsigned int）。
+				for _, p := range tPersonalityAllowed {
+					expect(fmt.Sprintf("personality %#x", p), call("personality", p), tRetAllow)
+				}
+				for _, p := range tPersonalityDenied {
+					expect(fmt.Sprintf("personality %#x", p), call("personality", p), tRetErrnoEPERM)
+				}
+				expect("personality READ_IMPLIES_EXEC+高位", call("personality", 0xFFFFFFFF00000000|0x0400000), tRetErrnoEPERM)
+				expect("personality 查询+高位", call("personality", 0xFFFFFFFF00000000|0xffffffff), tRetAllow)
+
 				// 非原生 ABI → KILL_PROCESS，无论调用号是什么（包括本会被允许的 read）。
 				for _, foreign := range a.foreignABI {
 					for _, name := range []string{"read", "socket", "clone3"} {
@@ -490,8 +511,10 @@ func TestSeccompSyscallNumbersMatchStdlib(t *testing.T) {
 		"delete_module": syscall.SYS_DELETE_MODULE, "kexec_load": syscall.SYS_KEXEC_LOAD,
 		"add_key": syscall.SYS_ADD_KEY, "request_key": syscall.SYS_REQUEST_KEY,
 		"keyctl": syscall.SYS_KEYCTL, "unshare": syscall.SYS_UNSHARE,
-		"perf_event_open": syscall.SYS_PERF_EVENT_OPEN,
+		"perf_event_open": syscall.SYS_PERF_EVENT_OPEN, "personality": syscall.SYS_PERSONALITY,
 	}
+	// name_to_handle_at：amd64 的标准库表（冻结于较早的内核）没有 SYS_NAME_TO_HANDLE_AT，无法在此核对；
+	// 本机调用号由 seccomp 子进程用例的拒绝探针在真实内核上核对（对照 EINVAL、过滤后 EPERM）。
 	for name, want := range std {
 		if got := seccompTestNrs[native][name]; uintptr(got) != want {
 			t.Errorf("%s: 测试表 %d, 标准库 %d", name, got, want)
@@ -584,6 +607,17 @@ func runSeccompChild() int {
 	if _, _, e := syscall.RawSyscall(sysClone3, 0, 0, 0); e != syscall.ENOSYS {
 		return fail("clone3 errno = %v, want ENOSYS", e)
 	}
+	// personality：查询与 PER_LINUX 允许（本进程的 persona 本就是 PER_LINUX，设置它不改变任何东西）；
+	// READ_IMPLIES_EXEC 被拒绝。只在过滤器安装之后调用：未过滤时它会真的改变本进程的 persona。
+	if _, _, e := syscall.RawSyscall(syscall.SYS_PERSONALITY, 0xffffffff, 0, 0); e != 0 {
+		return fail("personality(查询) errno = %v, want 成功", e)
+	}
+	if _, _, e := syscall.RawSyscall(syscall.SYS_PERSONALITY, 0, 0, 0); e != 0 {
+		return fail("personality(PER_LINUX) errno = %v, want 成功", e)
+	}
+	if _, _, e := syscall.RawSyscall(syscall.SYS_PERSONALITY, 0x0400000, 0, 0); e != syscall.EPERM {
+		return fail("personality(READ_IMPLIES_EXEC) errno = %v, want EPERM", e)
+	}
 
 	// 拒绝列表逐项：过滤后必须是 EPERM；对照必须不是 EPERM（证明 EPERM 来自
 	// 过滤器而不是权限不足），也不能是 ENOSYS（ENOSYS 说明调用号不存在或该功能
@@ -617,7 +651,7 @@ func runSeccompChild() int {
 	if failed > 0 {
 		return fail("%d 个拒绝列表探针未通过", failed)
 	}
-	fmt.Printf("seccomp child: ok (root=%v; getpid ok, unshare EPERM, socket(AF_INET) EPERM, socket(AF_UNIX) ok, clone3 ENOSYS, %d deny probes)\n", isRoot, len(probes))
+	fmt.Printf("seccomp child: ok (root=%v; getpid ok, unshare EPERM, socket(AF_INET) EPERM, socket(AF_UNIX) ok, clone3 ENOSYS, personality filtered, %d deny probes)\n", isRoot, len(probes))
 	return 0
 }
 
@@ -704,7 +738,8 @@ func seccompDenyProbes(arch Arch) []seccompProbe {
 		mk("finit_module", "finit_module", true, bad, 0, 0),                         // 先查 CAP_SYS_MODULE；root 下 fd=-1
 		mk("delete_module", "delete_module", true, 0, 0),                            // 先查 CAP_SYS_MODULE；root 下 NULL 名字 → EFAULT
 		kexecLoad,
-		mk("kexec_file_load", "kexec_file_load", true, bad, bad, 0, 0, 0xFFFFFFFF), // 先查 CAP_SYS_BOOT；root 下未知 flags → EINVAL
+		mk("kexec_file_load", "kexec_file_load", true, bad, bad, 0, 0, 0xFFFFFFFF),    // 先查 CAP_SYS_BOOT；root 下未知 flags → EINVAL
+		mk("name_to_handle_at", "name_to_handle_at", false, bad, 0, 0, 0, 0xFFFFFFFF), // 未知 flags → EINVAL（先于路径查找）
 	}
 	// clone：每个 CLONE_NEW* 搭配 CLONE_THREAD 而不带 CLONE_SIGHAND，内核
 	// 在创建任何东西之前就返回 EINVAL，未过滤时也不会真的 fork。
@@ -2166,7 +2201,7 @@ func hostTestTemplate(t *testing.T) rootfs.Template {
 }
 
 // initTestSpec 返回给定环境类型的启动规格：task 带 workspace（属主为映射 uid 1000，内有标记文件）与
-// Gateway socket（属主映射 uid 1000、0600）；exec 带 /in（内有标记文件）与 /out。
+// Gateway socket（属主映射 uid 1000、0600）；exec 带 /in（内有标记文件）与 /out（宿主侧 tmpfs，见 hostOutTmpfs）。
 func initTestSpec(t *testing.T, kind string, classic bool) LaunchSpec {
 	t.Helper()
 	dir := initTestDir(t)
@@ -2176,6 +2211,7 @@ func initTestSpec(t *testing.T, kind string, classic bool) LaunchSpec {
 	case KindExec:
 		is.In = filepath.Join(dir, "in")
 		is.OutBytes = 1 << 20
+		is.Out = hostOutTmpfs(t, dir, is.OutBytes)
 		if err := os.Mkdir(is.In, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -2203,6 +2239,28 @@ func initTestSpec(t *testing.T, kind string, classic bool) LaunchSpec {
 		spec.Env = append(spec.Env, envTestInitClassic+"=1")
 	}
 	return spec
+}
+
+// hostOutTmpfs 按 Plan 15 D1 的参数（provider 在启动 init 前所做的）在 dir/out 挂载宿主侧 tmpfs：
+// size、nr_inodes=1024、mode=0700、属主为映射 uid/gid 1000、nosuid、nodev。测试结束时卸载
+// （先于 initTestDir 的删除执行：t.Cleanup 后注册先运行）。
+func hostOutTmpfs(t *testing.T, dir string, size int64) string {
+	t.Helper()
+	out := filepath.Join(dir, "out")
+	if err := os.Mkdir(out, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	id := initTestIDBase + workloadID
+	data := fmt.Sprintf("size=%d,nr_inodes=1024,mode=0700,uid=%d,gid=%d", size, id, id)
+	if err := syscall.Mount("tmpfs", out, "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, data); err != nil {
+		t.Fatalf("挂载宿主 /out tmpfs: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := syscall.Unmount(out, syscall.MNT_DETACH); err != nil {
+			t.Errorf("卸载宿主 /out tmpfs %s: %v", out, err)
+		}
+	})
+	return out
 }
 
 // gatewayTestSocket 在 dir 下建一个监听中的 unix socket，属主设为 uid（宿主视角），权限 0600。
@@ -2436,12 +2494,16 @@ func checkInitEnvironment(t *testing.T, kind string, classic bool) {
 	}
 	hostWorkload := uint32(initTestIDBase + workloadID)
 	if kind == KindExec {
-		if m := find("/out"); m == nil || m.fstype != "tmpfs" || !hasAll(m.super, fmt.Sprintf("size=%dk", is.OutBytes>>10), "nr_inodes=1024") {
-			t.Errorf("/out 挂载 = %+v，期望 tmpfs size=%dk,nr_inodes=1024", m, is.OutBytes>>10)
+		if m := find("/out"); m == nil || m.fstype != "tmpfs" || !hasAll(m.super, fmt.Sprintf("size=%dk", is.OutBytes>>10), "nr_inodes=1024") ||
+			!hasAll(m.opts, "rw", "nosuid", "nodev") {
+			t.Errorf("/out 挂载 = %+v，期望 rw,nosuid,nodev 的 tmpfs size=%dk,nr_inodes=1024", m, is.OutBytes>>10)
 		}
-		var st syscall.Stat_t
+		var st, hst syscall.Stat_t
 		if err := syscall.Stat(rootDir+"/out", &st); err != nil || st.Uid != hostWorkload {
 			t.Errorf("/out 属主 = %d（%v），期望映射 uid 1000（宿主 %d）", st.Uid, err, hostWorkload)
+		}
+		if err := syscall.Stat(is.Out, &hst); err != nil || hst.Dev != st.Dev || hst.Ino != st.Ino {
+			t.Errorf("/out (dev %d ino %d) 不是宿主 %s (dev %d ino %d，%v) 的 bind", st.Dev, st.Ino, is.Out, hst.Dev, hst.Ino, err)
 		}
 		if b, err := os.ReadFile(rootDir + "/in/marker"); err != nil || string(b) != "in" {
 			t.Errorf("/in/marker = %q, %v", b, err)
@@ -2619,7 +2681,7 @@ func TestInitSpecValidate(t *testing.T) {
 			Workspace: "/w", GatewaySocket: "/g.sock"}
 	}
 	execSpec := func() InitSpec {
-		return InitSpec{Kind: KindExec, Template: rootfs.Template{Paths: []string{"/usr"}}, TmpBytes: 1 << 20, In: "/i", OutBytes: 1 << 20}
+		return InitSpec{Kind: KindExec, Template: rootfs.Template{Paths: []string{"/usr"}}, TmpBytes: 1 << 20, In: "/i", Out: "/o", OutBytes: 1 << 20}
 	}
 	for _, ok := range []InitSpec{base(), execSpec(), {Kind: KindSession, Template: rootfs.Template{Paths: []string{"/usr"}}, TmpBytes: 1}} {
 		if err := ok.validate(); err != nil {
@@ -2639,6 +2701,10 @@ func TestInitSpecValidate(t *testing.T) {
 	add("exec 带 Gateway", execSpec(), func(s *InitSpec) { s.GatewaySocket = "/g" })
 	add("exec 的 out_bytes 为 0", execSpec(), func(s *InitSpec) { s.OutBytes = 0 })
 	add("exec 的 in 不规范", execSpec(), func(s *InitSpec) { s.In = "/i/../j" })
+	add("编排环境带宿主 out", base(), func(s *InitSpec) { s.Out = "/o" })
+	add("exec 缺少宿主 out", execSpec(), func(s *InitSpec) { s.Out = "" })
+	add("exec 的 out 相对路径", execSpec(), func(s *InitSpec) { s.Out = "o" })
+	add("exec 的 out 不规范", execSpec(), func(s *InitSpec) { s.Out = "/o/" })
 	for name, s := range bad {
 		if err := s.validate(); err == nil {
 			t.Errorf("%s: validate 通过，期望拒绝", name)
@@ -4233,5 +4299,158 @@ func TestIsolationAcceptance16_2(t *testing.T) {
 			t.Fatalf("server 各线程凭据由 %q 变为 %q", credsBefore, after)
 		}
 		t.Logf("全部启动（5 个检查器环境与条目 09 的环境）前后 server 各线程凭据相同：%q", after)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Plan 15 Task 1：能力边界与 ptrace 禁用回归锁；exec 环境 /out 宿主侧 tmpfs bind（D1）
+// ---------------------------------------------------------------------------
+
+// TestInitCapsBoundaryIsFinal：init 能力集是决策说明定案的边界（permitted = effective = {KILL}，
+// bounding = {KILL, SETUID, SETGID, SETPCAP}）。任何扩展都必须先改决策说明，而不是改这里。
+func TestInitCapsBoundaryIsFinal(t *testing.T) {
+	want := capSets{
+		Bounding:  1<<capKill | 1<<capSetuid | 1<<capSetgid | 1<<capSetpcap,
+		Permitted: 1 << capKill,
+		Effective: 1 << capKill,
+	}
+	if initCaps != want {
+		t.Fatalf("initCaps = %+v，决策说明要求 %+v", initCaps, want)
+	}
+}
+
+// TestNoPtraceStartDetection：启动判据只用 exec-status 管道 + reaper wait（决策说明 §5）。
+// sandbox 的非测试源码不得出现 ptrace 跟踪相关调用；seccomp 拒绝列表中的 "ptrace" 名称除外。
+func TestNoPtraceStartDetection(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) == 0 {
+		t.Fatal("未找到 sandbox 源文件")
+	}
+	banned := regexp.MustCompile(`SYS_PTRACE|PtraceAttach|PtraceSeize|PTRACE_(SEIZE|ATTACH|TRACEME|O_|EVENT_)|PtraceSetOptions`)
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loc := banned.FindIndex(b); loc != nil {
+			t.Errorf("%s 出现 ptrace 跟踪调用 %q：启动检测不得使用 ptrace（决策说明）", f, b[loc[0]:loc[1]])
+		}
+	}
+}
+
+// outHostScript 是 TestInitExecOutHostMount 的 workload（uid 1000，经生产 Launcher）：写 /out/a/b.txt；
+// 超过 size 的写入得到 ENOSPC；然后逐个创建空文件直到 nr_inodes 耗尽（ENOSPC），输出已创建的个数。
+// 创建文件用 true 而不是 :（特殊内建命令的重定向失败会让非交互 shell 直接退出）。
+const outHostScript = `exec 2>&1
+set -e
+mkdir -p /out/a
+printf hello > /out/a/b.txt
+if head -c 2097152 /dev/zero > /out/big 2>/tmp/big.err; then echo "big: 写入成功"; exit 11; fi
+grep -q 'No space left' /tmp/big.err || { cat /tmp/big.err; exit 12; }
+rm -f /out/big
+i=0
+while [ $i -lt 1100 ]; do
+  if ! { true > /out/f$i; } 2>/tmp/ino.err; then break; fi
+  i=$((i+1))
+done
+grep -q 'No space left' /tmp/ino.err || { echo "files=$i"; cat /tmp/ino.err; exit 13; }
+echo "files=$i"`
+
+// TestInitExecOutHostMount（Plan 15 D1）：exec 环境的 /out 是宿主侧 tmpfs（provider 在启动 init 前挂载）的可写 bind，
+// 新挂载 API 与 mount(2) 回退路径各一次：
+//   - workload 写 /out/a/b.txt 成功；超过 size 的写入 ENOSPC；nr_inodes=1024 限制文件数（约第 1024 个 → ENOSPC）；
+//   - init 视图中 /out 为 rw,nosuid,nodev，且与宿主挂载点是同一对象；
+//   - 执行树终止、init 退出后，宿主仍从 <Out>/a/b.txt 读到内容，属主为映射 uid 1000；
+//   - Out 指向不存在的路径：init/mount_out 失败，init 未进入 Serve（workload 未运行）。
+func TestInitExecOutHostMount(t *testing.T) {
+	testutil.RequireLinuxRoot(t)
+	hostWorkload := uint32(initTestIDBase + workloadID)
+	for _, classic := range []bool{false, true} {
+		name := "new-mount-api"
+		if classic {
+			name = "mount2-fallback"
+		}
+		t.Run(name, func(t *testing.T) {
+			spec := initTestSpec(t, KindExec, classic)
+			out := spec.Init.Out
+			s := startSandboxInit(t, spec)
+			if s.ready != nil {
+				t.Fatalf("init 未就绪: %v\n%s", s.ready, s.output())
+			}
+			if fell := strings.Contains(s.output(), "mount(2) 回退路径"); fell != classic {
+				t.Fatalf("回退路径使用 = %v，期望 %v；输出:\n%s", fell, classic, s.output())
+			}
+			var m *mountinfoEntry
+			mounts := readMountinfo(t, s.pid)
+			for i := range mounts {
+				if mounts[i].point == "/out" {
+					m = &mounts[i]
+				}
+			}
+			if m == nil || m.fstype != "tmpfs" || !hasAll(m.opts, "rw", "nosuid", "nodev") || !hasAll(m.super, "nr_inodes=1024") {
+				t.Fatalf("/out 挂载 = %+v，期望 rw,nosuid,nodev 的 tmpfs（nr_inodes=1024）", m)
+			}
+			var st, hst syscall.Stat_t
+			if err := syscall.Stat(inSandbox(s, "/out"), &st); err != nil {
+				t.Fatal(err)
+			}
+			if err := syscall.Stat(out, &hst); err != nil || st.Dev != hst.Dev || st.Ino != hst.Ino {
+				t.Fatalf("沙箱 /out (dev %d ino %d) 不是宿主 %s (dev %d ino %d，%v)", st.Dev, st.Ino, out, hst.Dev, hst.Ino, err)
+			}
+
+			ch := pumpMessages(s.conn)
+			outR, outW, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer outR.Close()
+			sendStart(t, s, "w", outW, "/bin/sh", "-c", outHostScript)
+			outc := make(chan []byte, 1)
+			go func() {
+				b, _ := io.ReadAll(outR)
+				outc <- b
+			}()
+			_, ex := expectAckExit(t, s, ch, "w")
+			var stdout []byte
+			select {
+			case stdout = <-outc:
+			case <-time.After(msgDeadline):
+				t.Fatal("workload 输出未结束")
+			}
+			if ex.Code != 0 || ex.Signal != 0 {
+				t.Fatalf("workload 退出 = %+v，输出 %q\n%s", ex, stdout, s.output())
+			}
+			var files int
+			if _, err := fmt.Sscanf(strings.TrimSpace(string(stdout)), "files=%d", &files); err != nil || files < 1000 || files >= 1024 {
+				t.Fatalf("创建空文件 %d 个（输出 %q，%v），期望在 nr_inodes=1024 附近 ENOSPC", files, stdout, err)
+			}
+			closeAndDrain(t, s, ch) // init 退出：执行树（pid namespace）已整体终止
+
+			b, err := os.ReadFile(filepath.Join(out, "a", "b.txt"))
+			if err != nil || string(b) != "hello" {
+				t.Fatalf("执行树终止后宿主读 %s/a/b.txt = %q, %v", out, b, err)
+			}
+			var fst syscall.Stat_t
+			if err := syscall.Stat(filepath.Join(out, "a", "b.txt"), &fst); err != nil || fst.Uid != hostWorkload || fst.Gid != hostWorkload {
+				t.Fatalf("b.txt 属主 = %d:%d（%v），期望映射 uid/gid 1000（宿主 %d）", fst.Uid, fst.Gid, err, hostWorkload)
+			}
+			t.Logf("workload 创建空文件 %d 个后 ENOSPC；宿主读回 b.txt，属主 %d", files, fst.Uid)
+		})
+	}
+
+	t.Run("Out 不存在", func(t *testing.T) {
+		spec := initTestSpec(t, KindExec, false)
+		spec.Init.Out = filepath.Join(filepath.Dir(spec.Init.Out), "missing")
+		s := startSandboxInit(t, spec)
+		if s.ready == nil || !strings.HasPrefix(s.ready.Error(), "init/"+stepMountOut+": ") {
+			t.Fatalf("就绪结果 = %v，期望 init/%s 失败\n%s", s.ready, stepMountOut, s.output())
+		}
+		assertInitGone(t, s)
 	})
 }
