@@ -57,3 +57,10 @@
 - 恢复（新服务器）：安装 PostgreSQL/Redis/agentbox 后，建空库，`sudo AGENTBOX_BACKUP_PASSPHRASE_FILE=… AGENTBOX_RESTORE_DATA_DIR=/var/lib/agentbox AGENTBOX_RESTORE_DATABASE_URL=… bash scripts/restore.sh <归档>`；再提供 `api.token`、`/etc/agentbox/agentbox.env`（Key 与连接串）、TLS 证书与私钥，启动服务。
 - 口令（`.backup-passphrase`）只在维护者本机与服务器 root 0600 文件中；须另存到密码管理器。
 - 恢复出的安装与原安装 install_id 相同，**不要在同一宿主上与原服务同时运行**。
+
+## 升级（M4 Plan 13，2026-10-06 已执行，见[验收记录](../evidence/2026-10-06-m4-chat-acceptance.md)）
+
+1. 本机 `git bundle create <文件> <分支>` → scp → 服务器 `git clone`/`git pull <bundle> <分支>`（服务器上没有 GitHub 凭据）；`. /etc/profile.d/go.sh`（GOPROXY goproxy.cn）后 `CGO_ENABLED=0 go build -o bin/agentbox ./cmd/agentbox`，`sudo bin/agentbox doctor`。
+2. 迁移前备份（见上节），复制到本机 `backups/`；保留回滚副本 `/usr/local/bin/agentbox.m3-bak`、`/opt/agentbox.m3-bak`、`/opt/agentbox-web.m3-bak`、`/root/agentbox-demo.service.m3-bak`。
+3. `sudo bash scripts/dev/install-worker.sh /opt/agentbox`；web 在本机构建，`dist` 打包后装到 `/opt/agentbox-web`；停服务 → 换二进制与 unit（`deploy/systemd/agentbox-demo.service`）→ `daemon-reload` → 启动（新迁移在启动时应用；重启使全部会话转为驱逐，下一条消息冷恢复）。
+4. 回滚：停服务，换回 `.m3-bak` 副本；数据库已迁移时先按上节从迁移前的备份恢复。
