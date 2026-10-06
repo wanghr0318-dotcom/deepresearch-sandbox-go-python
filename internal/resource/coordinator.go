@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/rand/v2"
 	"sync"
@@ -26,6 +27,9 @@ type Provider interface {
 	Freeze(ctx context.Context, envID string) error
 	Thaw(ctx context.Context, envID string) error
 	Procs(ctx context.Context, envID string) ([]int, error)
+	// UID 范围归还前的文件回收与核查（M4 Plan 15 Task 5；cleanup.go）。
+	ReclaimUIDFiles(ctx context.Context, base, size uint32) (int, error)
+	UIDFiles(ctx context.Context, base, size uint32, limit int) ([]string, error)
 }
 
 // EnvRequest 描述要创建的环境。environments 行由调用方（task/session actor、gateway）先行创建；
@@ -77,6 +81,9 @@ type Options struct {
 	CleanupInterval time.Duration
 	// CleanupBatch 是每轮最多处理的环境数；默认 16。
 	CleanupBatch int
+	// Alert 发出一条隔离报警（规格 §16.3 I8 的报警出口：结构化错误日志）；之后 coordinator 调用
+	// Store.MarkQuarantineAlerted。默认以 slog.Default() 记录 error 日志（字段与启动恢复的报警相同）。
+	Alert func(q Quarantine)
 }
 
 // ErrEnvStopped 表示环境已确认停止（stopped_at 已记录或待提交），不能再创建：停止之后到达的
@@ -105,6 +112,7 @@ type Coordinator struct {
 	locks        map[string]*envLock
 	pendingStop  map[string]time.Time // 已确认停止、stopped_at 尚未提交
 	pendingFree  map[string]struct{}  // 清理已完成、UID 范围尚未归还
+	pendingAlert map[string]struct{}  // 已隔离并报警、MarkQuarantineAlerted 尚未成功的路径
 	seeded       bool
 	kick         chan struct{}      // 唤醒 cleanup loop（容量 1，合并多次唤醒）
 	freed        chan struct{}      // 有 UID 范围归还时关闭并替换（广播给等待中的 CreateEnv）
@@ -135,13 +143,20 @@ func NewCoordinator(store Store, p Provider, opt Options) *Coordinator {
 	if opt.CleanupBatch <= 0 {
 		opt.CleanupBatch = 16
 	}
+	if opt.Alert == nil {
+		opt.Alert = func(q Quarantine) {
+			slog.Error("隔离资源报警", "alert", "quarantine", "layer", q.Layer, "path", q.Path,
+				"observed_owner", q.ObservedOwner, "reason", q.Reason)
+		}
+	}
 	return &Coordinator{
 		store: store, p: p, opt: opt,
-		locks:       make(map[string]*envLock),
-		pendingStop: make(map[string]time.Time),
-		pendingFree: make(map[string]struct{}),
-		kick:        make(chan struct{}, 1),
-		freed:       make(chan struct{}),
+		locks:        make(map[string]*envLock),
+		pendingStop:  make(map[string]time.Time),
+		pendingFree:  make(map[string]struct{}),
+		pendingAlert: make(map[string]struct{}),
+		kick:         make(chan struct{}, 1),
+		freed:        make(chan struct{}),
 	}
 }
 

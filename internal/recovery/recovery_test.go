@@ -281,6 +281,11 @@ func (w *world) RecordQuarantine(_ context.Context, q resource.Quarantine) error
 
 func (w *world) MarkQuarantineAlerted(context.Context, string) error { return nil }
 
+// QuarantineUIDRange 由 coordinator 的 cleanup 使用（M4 Plan 15 Task 5），启动恢复不调用。
+func (w *world) QuarantineUIDRange(context.Context, string, string, string) error {
+	return errors.New("未使用")
+}
+
 // ---- Coordinator ----
 
 func (w *world) StopEnv(_ context.Context, envID string) (resource.StopResult, error) {

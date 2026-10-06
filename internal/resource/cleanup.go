@@ -3,16 +3,21 @@ package resource
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
+	"strings"
 	"time"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/faultinject"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
 )
 
 // RunCleanup 运行 cleanup loop，直到 ctx 结束（返回 ctx 的错误）或失去数据库所有权。
 //
 // 每轮只处理 ListCleanupCandidates 返回的环境（已停止、所属 attempt 已有判决、退避已到）：
-// Destroy → 结束 intent → UpdateCleanup(done) → ReleaseUIDRange；Destroy 失败 →
+// Destroy → 结束 intent → UpdateCleanup(done) → ReclaimUIDFiles → UIDFiles → ReleaseUIDRange（有残留文件则
+// QuarantineUIDRange 并报警，不归还；M4 Plan 15 D13）；Destroy 失败 →
 // UpdateCleanup(pending, error, next_retry_at = 退避)。只写清理列、intent 与 UID 范围，
 // 不写生命周期字段（规格 §3.2）。Store 故障不终止循环，下一轮重做（各操作幂等）。
 func (c *Coordinator) RunCleanup(ctx context.Context) error {
@@ -41,6 +46,9 @@ func (c *Coordinator) RunCleanup(ctx context.Context) error {
 // cleanupPass 执行一轮清理，返回第一个错误（仅用于判断是否失去所有权）。
 func (c *Coordinator) cleanupPass(ctx context.Context) error {
 	first := c.retryReleases(ctx)
+	if err := c.retryAlerts(ctx); err != nil && first == nil {
+		first = err
+	}
 	envs, err := c.store.ListCleanupCandidates(ctx, c.opt.Now(), c.opt.CleanupBatch)
 	if err != nil {
 		return err
@@ -114,8 +122,21 @@ func (c *Coordinator) finishIntent(ctx context.Context, envID string) error {
 	return err
 }
 
-// releaseUIDRange 归还环境的 UID 范围（规格 §4.5：环境已停止且清理完成；文件与挂载由 Destroy
-// 的逐层核对保证）。成功、没有范围或冲突（分配已变化，重试无意义，交给启动核对）时移出待归还集合。
+// uidFilesReportLimit 是归还前核查残留文件时最多列出的路径数；隔离原因中写出其中前 uidFilesReasonPaths 个。
+const (
+	uidFilesReportLimit = 16
+	uidFilesReasonPaths = 4
+)
+
+// releaseUIDRange 归还环境的 UID 范围（规格 §4.5：环境已停止且清理完成、范围拥有的文件已不存在、无残留挂载；
+// 挂载与环境目录由 Destroy 的逐层核对保证）。归还前（M4 Plan 15 D13、E39）：
+//
+//  1. ReclaimUIDFiles：<data>/workspaces 下仍归该范围的文件改回 root 属主（任务 workspace 在任务结束后仍归
+//     最后一个 attempt 的范围；下个 attempt 启动时会重新 chown，无损）；
+//  2. UIDFiles：数据目录其他位置仍有归该范围的文件 → QuarantineUIDRange 并报警（I8 路径），不归还。
+//
+// 回收或核查出错时本轮不归还，留在待归还集合中由下一轮重试。成功归还、已隔离、没有范围或冲突（分配已变化，
+// 重试无意义，交给启动核对）时移出待归还集合。
 func (c *Coordinator) releaseUIDRange(ctx context.Context, envID string) error {
 	ur, err := c.store.GetUIDRange(ctx, envID)
 	if err == nil && isOwnerRange(ur) {
@@ -125,8 +146,9 @@ func (c *Coordinator) releaseUIDRange(ctx context.Context, envID string) error {
 		c.mu.Unlock()
 		return nil
 	}
+	released := false
 	if err == nil {
-		_, err = c.store.ReleaseUIDRange(ctx, ur.UIDRangeID, ur.AllocationID)
+		released, err = c.checkAndRelease(ctx, ur)
 	}
 	if errors.Is(err, persistence.ErrNotFound) {
 		err = nil
@@ -137,10 +159,75 @@ func (c *Coordinator) releaseUIDRange(ctx context.Context, envID string) error {
 	c.mu.Lock()
 	delete(c.pendingFree, envID)
 	c.mu.Unlock()
-	if err == nil {
+	if released {
 		c.notifyFreed()
 	}
 	return err
+}
+
+// checkAndRelease 回收 workspace 属主、核查残留文件，然后归还（released 为真）或隔离该范围。
+func (c *Coordinator) checkAndRelease(ctx context.Context, ur UIDRange) (released bool, err error) {
+	if ur.Base < 0 || ur.Size <= 0 || ur.Base+ur.Size-1 > math.MaxUint32 {
+		return false, fmt.Errorf("resource: UID 范围 %s [%d, +%d) 超出 uint32", ur.UIDRangeID, ur.Base, ur.Size)
+	}
+	base, size := uint32(ur.Base), uint32(ur.Size)
+	if _, err := c.p.ReclaimUIDFiles(ctx, base, size); err != nil {
+		return false, fmt.Errorf("resource: 回收 UID 范围 %s 的 workspace 文件: %w", ur.UIDRangeID, err)
+	}
+	left, err := c.p.UIDFiles(ctx, base, size, uidFilesReportLimit)
+	if err != nil {
+		return false, fmt.Errorf("resource: 核查 UID 范围 %s 的残留文件: %w", ur.UIDRangeID, err)
+	}
+	if len(left) == 0 {
+		_, err = c.store.ReleaseUIDRange(ctx, ur.UIDRangeID, ur.AllocationID)
+		return err == nil, err
+	}
+	count := fmt.Sprint(len(left))
+	if len(left) >= uidFilesReportLimit {
+		count = "至少 " + count
+	}
+	reason := fmt.Sprintf("归还前数据目录中仍有 %s 个条目归该范围所有：%s", count,
+		strings.Join(left[:min(len(left), uidFilesReasonPaths)], ", "))
+	if err := c.persist(ctx, func(ctx context.Context) error {
+		return c.store.QuarantineUIDRange(ctx, ur.UIDRangeID, ur.AllocationID, reason)
+	}); err != nil {
+		return false, fmt.Errorf("resource: 隔离 UID 范围 %s: %w", ur.UIDRangeID, err)
+	}
+	q := Quarantine{Layer: provider.LayerUIDFiles, Path: UIDRangeQuarantinePath(ur.UIDRangeID), ObservedOwner: ur.OwnerID, Reason: reason}
+	c.opt.Alert(q)
+	c.mu.Lock()
+	c.pendingAlert[q.Path] = struct{}{}
+	c.mu.Unlock()
+	return false, c.markAlerted(ctx, q.Path)
+}
+
+// markAlerted 记录报警已发出（I8）；失败时保留在待标记集合中，由后续轮次重试。
+func (c *Coordinator) markAlerted(ctx context.Context, path string) error {
+	err := c.persist(ctx, func(ctx context.Context) error { return c.store.MarkQuarantineAlerted(ctx, path) })
+	if err != nil && !errors.Is(err, persistence.ErrNotFound) {
+		return err
+	}
+	c.mu.Lock()
+	delete(c.pendingAlert, path)
+	c.mu.Unlock()
+	return nil
+}
+
+// retryAlerts 补做此前失败的报警标记。
+func (c *Coordinator) retryAlerts(ctx context.Context) error {
+	c.mu.Lock()
+	paths := make([]string, 0, len(c.pendingAlert))
+	for p := range c.pendingAlert {
+		paths = append(paths, p)
+	}
+	c.mu.Unlock()
+	var first error
+	for _, p := range paths {
+		if err := c.markAlerted(ctx, p); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 // retryReleases 补做此前失败的 UID 范围归还（规格 §14.5 在线补偿）。

@@ -21,7 +21,8 @@ import (
 
 // 本文件实现独立原始扫描（契约第 3 节 Scan 行、规格 §14.1 第 5 步）与挂载表解析。
 // Scan 不依赖本进程的内存状态来发现资源：逐层读取磁盘、挂载表与 cgroup 文件系统，
-// 只在分类"完整"时参考 init 是否就绪。UID 范围文件属主一层在 Plan 1B 引入 UID 映射后补充。
+// 只在分类"完整"时参考 init 是否就绪。UID 范围文件属主一层（uid_files）需要已归还范围的集合，Scan 不知道它，
+// 由 UIDFiles 与 provider.ScanUIDFiles 提供（M4 Plan 15 Task 5）。
 
 // Scan 逐层报告：
 //   - env_dir：<data>/envs/* 的每一项（含无或损坏 owner.json 的），EnvID 一律取目录名；
@@ -218,4 +219,137 @@ func unmountUnder(dir string) error {
 			}
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// UID 范围文件属主（M4 Plan 15 Task 5；规格 §4.5 回收条件、I11、E39；计划 D13）
+
+// 数据目录下的固定子目录：任务 workspace 的父目录与 BlobStore（内容寻址，只由宿主写入，不扫描）。
+const (
+	workspacesDirName = "workspaces"
+	blobsDirName      = "blobs"
+)
+
+// oPath 是 O_PATH（asm-generic/fcntl.h 的 010000000；标准库 syscall 在 amd64 上未导出）。
+const oPath = 0x200000
+
+// atEmptyPath 是 AT_EMPTY_PATH（include/uapi/linux/fcntl.h；标准库 syscall 未导出）：fchownat 作用于 fd 本身。
+const atEmptyPath = 0x1000
+
+// ReclaimUIDFiles 实现 provider.Provider：<data>/workspaces 下属主落在范围内的条目改回 0:0（计划 D13）。
+// workspaces 不存在时为 0。
+func (p *Provider) ReclaimUIDFiles(ctx context.Context, base, size uint32) (int, error) {
+	n := 0
+	err := walkUIDs(ctx, filepath.Join(p.dataDir, workspacesDirName), "", base, size, func(fd int, rel string) (bool, error) {
+		if err := syscall.Fchownat(fd, "", 0, 0, atEmptyPath); err != nil {
+			return false, fmt.Errorf("local: 回收 workspaces/%s 的属主: %w", rel, err)
+		}
+		n++
+		return true, nil
+	})
+	return n, err
+}
+
+// UIDFiles 实现 provider.Provider：数据目录（跳过 blobs）中属主落在范围内的条目，至多 limit 个宿主路径。
+func (p *Provider) UIDFiles(ctx context.Context, base, size uint32, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("local: UIDFiles 的上限 %d 必须为正", limit)
+	}
+	var out []string
+	err := walkUIDs(ctx, p.dataDir, blobsDirName, base, size, func(_ int, rel string) (bool, error) {
+		out = append(out, filepath.Join(p.dataDir, rel))
+		return len(out) < limit, nil
+	})
+	return out, err
+}
+
+// walkUIDs 遍历 root 之下的全部条目（不含 root 本身；顶层名为 skipTop 的条目整体跳过），对属主 uid 或 gid
+// 落在 [base, base+size) 的条目调用 fn(fd, rel)：fd 是以 O_PATH|O_NOFOLLOW 打开的该条目本身（符号链接即链接
+// 本身），fn 返回 false 时停止遍历。root 不存在时什么也不做。
+//
+// 每一级都相对已打开的目录 fd 解析单个名字，不跟随符号链接：遍历期间并发替换路径分量（存活环境可以改写自己的
+// workspace）不能把操作引到 root 之外。子目录只在与 root 同一文件系统（st_dev 相同）时进入：挂载点本身按属主
+// 检查，但不遍历其中的其他文件系统。目录并发消失（ENOENT）时跳过。
+func walkUIDs(ctx context.Context, root, skipTop string, base, size uint32, fn func(fd int, rel string) (bool, error)) error {
+	rfd, err := syscall.Open(root, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if errors.Is(err, syscall.ENOENT) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("local: 打开 %s: %w", root, err)
+	}
+	defer syscall.Close(rfd)
+	var st syscall.Stat_t
+	if err := syscall.Fstat(rfd, &st); err != nil {
+		return fmt.Errorf("local: fstat %s: %w", root, err)
+	}
+	w := uidWalk{ctx: ctx, root: root, skipTop: skipTop, lo: uint64(base), hi: uint64(base) + uint64(size), dev: st.Dev, fn: fn}
+	_, err = w.dir(rfd, "")
+	return err
+}
+
+type uidWalk struct {
+	ctx     context.Context
+	root    string
+	skipTop string
+	lo, hi  uint64 // [lo, hi)
+	dev     uint64
+	fn      func(fd int, rel string) (bool, error)
+}
+
+func (w *uidWalk) owned(st *syscall.Stat_t) bool {
+	in := func(id uint32) bool { return uint64(id) >= w.lo && uint64(id) < w.hi }
+	return in(st.Uid) || in(st.Gid)
+}
+
+// dir 遍历已打开的目录 dirfd（相对 root 为 rel）；返回 true 表示 fn 要求停止。
+func (w *uidWalk) dir(dirfd int, rel string) (bool, error) {
+	ents, err := readDirents(dirfd)
+	if err != nil {
+		return false, fmt.Errorf("local: 读取 %s: %w", filepath.Join(w.root, rel), err)
+	}
+	for _, e := range ents {
+		if err := w.ctx.Err(); err != nil {
+			return false, err
+		}
+		if rel == "" && e.rel == w.skipTop {
+			continue
+		}
+		child := filepath.Join(rel, e.rel)
+		stop, err := w.entry(dirfd, e.rel, child)
+		if stop || err != nil {
+			return stop, err
+		}
+	}
+	return false, nil
+}
+
+// entry 检查 dirfd 下的单个名字 name（相对 root 为 rel），是同一文件系统的目录时递归进入。
+func (w *uidWalk) entry(dirfd int, name, rel string) (bool, error) {
+	fd, err := syscall.Openat(dirfd, name, oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if errors.Is(err, syscall.ENOENT) {
+		return false, nil // 并发删除
+	} else if err != nil {
+		return false, fmt.Errorf("local: 打开 %s: %w", filepath.Join(w.root, rel), err)
+	}
+	defer syscall.Close(fd)
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return false, fmt.Errorf("local: fstat %s: %w", filepath.Join(w.root, rel), err)
+	}
+	if w.owned(&st) {
+		if more, err := w.fn(fd, rel); err != nil || !more {
+			return !more, err
+		}
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR || st.Dev != w.dev {
+		return false, nil
+	}
+	sub, err := syscall.Openat(fd, ".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if errors.Is(err, syscall.ENOENT) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("local: 打开目录 %s: %w", filepath.Join(w.root, rel), err)
+	}
+	defer syscall.Close(sub)
+	return w.dir(sub, rel)
 }

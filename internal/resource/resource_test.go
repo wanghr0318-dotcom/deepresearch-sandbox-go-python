@@ -58,6 +58,7 @@ type memStore struct {
 	ranges     []*UIDRange
 	quarantine map[string]Quarantine
 	envRange   map[string]string   // env_id → 使用的 UID 范围（environments.uid_range_id；owner 范围也记录）
+	alerted    map[string]bool     // MarkQuarantineAlerted 已标记的路径
 	fail       map[string]int      // 方法名 → 接下来失败的次数（ErrUnavailable）
 	onFail     func(method string) // 每次注入失败后调用（锁外）
 }
@@ -371,10 +372,42 @@ func (s *memStore) RecordQuarantine(_ context.Context, q Quarantine) error {
 }
 
 func (s *memStore) MarkQuarantineAlerted(_ context.Context, path string) error {
+	if err := s.enter("MarkQuarantineAlerted"); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rec.add("MarkQuarantineAlerted")
+	if s.alerted == nil {
+		s.alerted = map[string]bool{}
+	}
+	s.alerted[path] = true
 	return nil
+}
+
+// QuarantineUIDRange 实现 Store：分配代次匹配时置为 quarantined 并记录隔离（layer = uid_files）。
+func (s *memStore) QuarantineUIDRange(_ context.Context, id, alloc, reason string) error {
+	if err := s.enter("QuarantineUIDRange"); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rec.add("QuarantineUIDRange")
+	for _, r := range s.ranges {
+		if r.UIDRangeID != id {
+			continue
+		}
+		if r.AllocationID != alloc {
+			return persistence.ErrConflict
+		}
+		r.State = "quarantined"
+		path := UIDRangeQuarantinePath(id)
+		if _, ok := s.quarantine[path]; !ok {
+			s.quarantine[path] = Quarantine{Layer: provider.LayerUIDFiles, Path: path, ObservedOwner: r.OwnerID, Reason: reason}
+		}
+		return nil
+	}
+	return persistence.ErrNotFound
 }
 
 // tprov 包装 fake provider：记录调用与结果，并提供 Create 的阻塞钩子与 Destroy 的故障注入。
@@ -451,6 +484,18 @@ func (p *tprov) Destroy(ctx context.Context, envID string) error {
 	err := p.Provider.Destroy(ctx, envID)
 	p.rec.add("Destroy:" + errName(err))
 	return err
+}
+
+func (p *tprov) ReclaimUIDFiles(ctx context.Context, base, size uint32) (int, error) {
+	n, err := p.Provider.ReclaimUIDFiles(ctx, base, size)
+	p.rec.add("ReclaimUIDFiles:" + errName(err))
+	return n, err
+}
+
+func (p *tprov) UIDFiles(ctx context.Context, base, size uint32, limit int) ([]string, error) {
+	paths, err := p.Provider.UIDFiles(ctx, base, size, limit)
+	p.rec.add(fmt.Sprintf("UIDFiles:%d", len(paths)))
+	return paths, err
 }
 
 // clock 是可推进的测试时钟。
@@ -791,7 +836,7 @@ func TestCleanupReleasesUIDRange(t *testing.T) {
 	if err := f.c.cleanupPass(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	assertLog(t, f.rec, "Destroy:ok", "ResolveIntent:released", "UpdateCleanup:done", "ReleaseUIDRange")
+	assertLog(t, f.rec, "Destroy:ok", "ResolveIntent:released", "UpdateCleanup:done", "ReclaimUIDFiles:ok", "UIDFiles:0", "ReleaseUIDRange")
 	if r := f.store.rangeOf(fmt.Sprintf("uid-%d", testUIDBase)); r.State != "free" {
 		t.Fatalf("UID 范围 = %+v", r)
 	}
@@ -1137,5 +1182,133 @@ func TestFreezeEnvSerializedAndReported(t *testing.T) {
 	}
 	if _, err := f.c.EnvProcs(ctx, "nope"); !errors.Is(err, provider.ErrNotFound) {
 		t.Fatalf("不存在的环境 EnvProcs = %v，期望 ErrNotFound", err)
+	}
+}
+
+// ---- M4 Plan 15 Task 5：UID 范围归还前的文件回收与核查（E39、I11；计划 D13） ----
+
+// TestCleanupReclaimsWorkspaceThenReleases：清理完成后先回收 workspace 属主、再核查残留、最后归还；
+// workspace 中归该范围的文件改回 0，其他范围的文件不变。
+func TestCleanupReclaimsWorkspaceThenReleases(t *testing.T) {
+	f := newFixture(t, true)
+	f.createStopped(t, "e1", true)
+	const ws, other = "/data/workspaces/t1/a", "/data/workspaces/t2/b"
+	f.prov.PlantUIDFile(ws, testUIDBase+1000, true)
+	f.prov.PlantUIDFile(other, testUIDBase+testUIDSize+1000, true)
+	if err := f.c.cleanupPass(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertLog(t, f.rec, "Destroy:ok", "ResolveIntent:released", "UpdateCleanup:done", "ReclaimUIDFiles:ok", "UIDFiles:0", "ReleaseUIDRange")
+	if uid, _ := f.prov.UIDFileOwner(ws); uid != 0 {
+		t.Fatalf("workspace 文件属主 = %d，期望回收为 0", uid)
+	}
+	if uid, _ := f.prov.UIDFileOwner(other); uid != testUIDBase+testUIDSize+1000 {
+		t.Fatalf("其他范围的 workspace 文件属主被改为 %d", uid)
+	}
+	if r := f.store.rangeOf(fmt.Sprintf("uid-%d", testUIDBase)); r.State != "free" {
+		t.Fatalf("UID 范围 = %+v，期望归还", r)
+	}
+}
+
+// TestCleanupQuarantinesRangeWithResidue：数据目录其他位置仍有归该范围的文件 → 范围 quarantined、不归还、
+// 记录隔离（uid_files）并报警（I8：Alert 后 MarkQuarantineAlerted）；之后的轮次不再处理，新环境分到其他范围。
+func TestCleanupQuarantinesRangeWithResidue(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	var alerts []Quarantine
+	f.c.opt.Alert = func(q Quarantine) { alerts = append(alerts, q) }
+	f.createStopped(t, "e1", true)
+	const ws, stray = "/data/workspaces/t1/a", "/data/stray/x"
+	f.prov.PlantUIDFile(ws, testUIDBase+1000, true)
+	f.prov.PlantUIDFile(stray, testUIDBase+1000, false)
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertLog(t, f.rec, "Destroy:ok", "ResolveIntent:released", "UpdateCleanup:done", "ReclaimUIDFiles:ok", "UIDFiles:1",
+		"QuarantineUIDRange", "MarkQuarantineAlerted")
+	id := fmt.Sprintf("uid-%d", testUIDBase)
+	if r := f.store.rangeOf(id); r.State != "quarantined" {
+		t.Fatalf("UID 范围 = %+v，期望 quarantined", r)
+	}
+	path := UIDRangeQuarantinePath(id)
+	q, ok := f.store.quarantine[path]
+	if !ok || q.Layer != provider.LayerUIDFiles || q.ObservedOwner != "e1" || !strings.Contains(q.Reason, stray) {
+		t.Fatalf("隔离记录 = %+v（%v）", q, ok)
+	}
+	if len(alerts) != 1 || alerts[0].Path != path || !f.store.alerted[path] {
+		t.Fatalf("报警 = %+v，已标记 = %v", alerts, f.store.alerted)
+	}
+	if uid, _ := f.prov.UIDFileOwner(stray); uid != testUIDBase+1000 {
+		t.Fatalf("workspaces 之外的文件被改动（属主 %d）", uid)
+	}
+
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.rec.count("QuarantineUIDRange") + f.rec.count("ReleaseUIDRange"); n != 1 {
+		t.Fatalf("隔离之后又处理了该范围（%v）", f.rec.snapshot())
+	}
+	f.store.addEnv("e2", false)
+	if _, err := f.c.CreateEnv(ctx, req("e2")); err != nil {
+		t.Fatal(err)
+	}
+	if s := f.prov.specs[len(f.prov.specs)-1]; s.UIDBase == testUIDBase {
+		t.Fatalf("隔离的范围被重新分配给 e2：%+v", s)
+	}
+}
+
+// TestCleanupReclaimFailureRetriesNextPass：ReclaimUIDFiles 出错 → 本轮不归还（也不核查、不隔离），
+// 环境清理已完成；下一轮重试回收并归还。
+func TestCleanupReclaimFailureRetriesNextPass(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	f.createStopped(t, "e1", true)
+	f.prov.FailReclaim(errors.New("EIO"))
+	if err := f.c.cleanupPass(ctx); err == nil || !strings.Contains(err.Error(), "EIO") {
+		t.Fatalf("cleanupPass = %v，期望回收错误", err)
+	}
+	id := fmt.Sprintf("uid-%d", testUIDBase)
+	if r := f.store.rangeOf(id); r.State != "assigned" {
+		t.Fatalf("回收失败后 UID 范围 = %+v，期望仍为 assigned", r)
+	}
+	if e := f.store.env("e1"); e.CleanupState != CleanupDone {
+		t.Fatalf("env = %+v", e)
+	}
+	if n := f.rec.count("UIDFiles:0") + f.rec.count("ReleaseUIDRange") + f.rec.count("QuarantineUIDRange"); n != 0 {
+		t.Fatalf("回收失败后仍继续核查或归还：%v", f.rec.snapshot())
+	}
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.store.rangeOf(id); r.State != "free" {
+		t.Fatalf("下一轮未归还：%+v", r)
+	}
+	if n := f.rec.count("ReclaimUIDFiles:ok"); n != 1 {
+		t.Fatalf("ReclaimUIDFiles 成功 %d 次，期望重试一次", n)
+	}
+}
+
+// TestSessionRangeNotReclaimedOnEnvCleanup：会话环境的清理不归还 owner 范围，也不回收或核查其文件
+// （会话 workspace 在会话存续期间保持会话范围属主）。
+func TestSessionRangeNotReclaimedOnEnvCleanup(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	f.store.addEnv("s1-a", true)
+	if _, err := f.c.CreateEnv(ctx, sessionReq("s1-a", "session:s1")); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := f.c.StopEnv(ctx, "s1-a"); err != nil || !res.Recorded {
+		t.Fatalf("StopEnv = %+v, %v", res, err)
+	}
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if e := f.store.env("s1-a"); e.CleanupState != CleanupDone {
+		t.Fatalf("env = %+v", e)
+	}
+	for _, s := range f.rec.snapshot() {
+		if strings.HasPrefix(s, "ReclaimUIDFiles") || strings.HasPrefix(s, "UIDFiles") {
+			t.Fatalf("会话环境清理回收或核查了 owner 范围的文件：%v", f.rec.snapshot())
+		}
 	}
 }

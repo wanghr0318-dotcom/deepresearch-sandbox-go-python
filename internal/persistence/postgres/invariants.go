@@ -91,6 +91,12 @@ var invariantQueries = []struct {
 		FROM api_requests r WHERE r.resource_id = '' OR CASE WHEN r.kind IN ('create_session', 'wake_session')
 			THEN NOT EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = r.resource_id)
 			ELSE NOT EXISTS (SELECT 1 FROM tasks t WHERE t.task_id = r.resource_id) END`},
+	// I11 [A]：存活环境（stopped_at 未记录）的 UID 范围互不相同。environments.uid_range_id 由按环境与按 owner 的分配
+	// 写入；同一会话的环境共用 owner 范围，但旧环境确认停止之后才建新环境。[Q] 部分（已归还范围不拥有文件）见
+	// invariants.Verify 的独立扫描。
+	{"I11", "A", `SELECT uid_range_id, format('%s 个存活环境使用同一 UID 范围：%s', count(*), string_agg(env_id, ', ' ORDER BY env_id))
+		FROM environments WHERE stopped_at IS NULL AND uid_range_id IS NOT NULL
+		GROUP BY uid_range_id HAVING count(*) > 1`},
 }
 
 // DBViolations 运行只依赖数据库的不变量检查（实现 invariants.Store）。
@@ -127,6 +133,24 @@ func (s *Store) CleanedEnvIDs(ctx context.Context) ([]string, error) {
 			return err
 		}
 		out, err = pgx.CollectRows(rows, pgx.RowTo[string])
+		return err
+	})
+	return out, err
+}
+
+// FreeUIDRanges 返回未分配（state = free）的 UID 范围（实现 invariants.Store；I11 [Q]）。
+func (s *Store) FreeUIDRanges(ctx context.Context) ([]invariants.UIDRange, error) {
+	var out []invariants.UIDRange
+	err := s.read(ctx, "FreeUIDRanges", func(ctx context.Context, q queryer) error {
+		rows, err := q.Query(ctx, "SELECT uid_range_id, base, size FROM uid_ranges WHERE state = 'free' ORDER BY base")
+		if err != nil {
+			return err
+		}
+		out, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (invariants.UIDRange, error) {
+			var u invariants.UIDRange
+			err := r.Scan(&u.ID, &u.Base, &u.Size)
+			return u, err
+		})
 		return err
 	})
 	return out, err

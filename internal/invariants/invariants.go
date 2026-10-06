@@ -1,9 +1,10 @@
 // Package invariants 实现 `agentbox verify-invariants` 的检查（规格 §16.3，M1 范围：I1、I2、I4–I8、I16；
 // M2 Gateway：I3 的 task 层账本、I14 的 journal 部分——已完成调用的结果不变且在 blobs 与 scope_blobs(task) 中；
 // M3 缓存：I14 的缓存部分——source = cache|coalesced 的调用同样登记并授权到 scope_blobs(task)、结果是 Tx2 记录的
-// blob 且没有 try；I15——恢复完成后不存在没有活跃 attempt 的进行中 resolving 调用）。
+// blob 且没有 try；I15——恢复完成后不存在没有活跃 attempt 的进行中 resolving 调用；M4 Plan 15：I11——存活环境的
+// UID 范围互不相同 [A]、已归还范围不拥有任何文件 [Q]）。
 //
-// 资源类检查独立扫描实际资源（provider.Scan）与 BlobStore 内容，不只从数据库推导。每条违反带类别：
+// 资源类检查独立扫描实际资源（provider.Scan、UID 范围文件属主）与 BlobStore 内容，不只从数据库推导。每条违反带类别：
 // [A] 始终成立、[B] 期限内成立、[Q] 静止时成立；Q 类只在 quiescent 为真时检查。
 package invariants
 
@@ -13,6 +14,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"strings"
 
@@ -43,12 +45,24 @@ type Store interface {
 	// ReferencedBlobs 返回已登记产物、已提交 checkpoint 引用与已完成调用结果的 blob（I5、I6、I14 的内容部分；
 	// Origin 分别以 "artifact"、"checkpoint"、"call" 开头）。
 	ReferencedBlobs(ctx context.Context) ([]BlobRef, error)
+	// FreeUIDRanges 返回未分配（free）的 UID 范围（I11 [Q]）。
+	FreeUIDRanges(ctx context.Context) ([]UIDRange, error)
 }
 
-// Scanner 是 provider 的独立原始扫描。
+// UIDRange 是 uid_ranges 中的一段 [Base, Base+Size)。
+type UIDRange struct {
+	ID         string
+	Base, Size int64
+}
+
+// Scanner 是 provider 的独立原始扫描：各层资源（Scan）与 UID 范围文件属主（UIDFiles，I11）。
 type Scanner interface {
 	Scan(ctx context.Context) (provider.ScanReport, error)
+	UIDFiles(ctx context.Context, base, size uint32, limit int) ([]string, error)
 }
+
+// uidFilesLimit 是 I11 [Q] 每段范围最多报告的残留路径数。
+const uidFilesLimit = 16
 
 // Blobs 读取 BlobStore 的内容。
 type Blobs interface {
@@ -78,6 +92,11 @@ func Verify(ctx context.Context, s Store, scan Scanner, blobs Blobs, quiescent b
 	}
 	if quiescent {
 		vs, err := cleanedEnvsHaveNoResources(ctx, s, scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, vs...)
+		vs, err = freeRangesOwnNoFiles(ctx, s, scan)
 		if err != nil {
 			return nil, err
 		}
@@ -113,6 +132,30 @@ func checkBlob(blobs Blobs, r BlobRef) *Violation {
 		return &Violation{ID: id, Class: "A", Detail: fmt.Sprintf("%s 引用的 blob %s 大小为 %d，登记为 %d", r.Origin, r.SHA256, n, r.Size)}
 	}
 	return nil
+}
+
+// freeRangesOwnNoFiles：I11 [Q]——已归还（free）的 UID 范围不拥有数据目录中的任何文件（独立扫描
+// provider.ScanUIDFiles，即 Scan 的 uid_files 层；残留挂载点本身的属主也在扫描之内）。
+func freeRangesOwnNoFiles(ctx context.Context, s Store, scan Scanner) ([]Violation, error) {
+	ranges, err := s.FreeUIDRanges(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("invariants: 读取未分配的 UID 范围: %w", err)
+	}
+	var out []Violation
+	for _, r := range ranges {
+		if r.Base < 0 || r.Size <= 0 || r.Base+r.Size-1 > math.MaxUint32 {
+			return nil, fmt.Errorf("invariants: UID 范围 %s [%d, +%d) 超出 uint32", r.ID, r.Base, r.Size)
+		}
+		items, err := provider.ScanUIDFiles(ctx, scan, []provider.UIDSpan{{ID: r.ID, Base: uint32(r.Base), Size: uint32(r.Size)}}, uidFilesLimit)
+		if err != nil {
+			return nil, fmt.Errorf("invariants: %w", err)
+		}
+		for _, it := range items {
+			out = append(out, Violation{ID: "I11", Class: "Q",
+				Detail: fmt.Sprintf("UID 范围 %s 已归还，但仍拥有 %s", r.ID, it.Path)})
+		}
+	}
+	return out, nil
 }
 
 // cleanedEnvsHaveNoResources：I1——cleanup_state = done 的环境不存在任何实际挂载、cgroup、listener 或目录。

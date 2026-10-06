@@ -777,6 +777,13 @@ func (p *Provider) Procs(_ context.Context, envID string) ([]int, error) {
 	return p.live(dir)
 }
 
+// ReclaimUIDFiles 实现 provider.Provider。procprov 不做 UID 映射（进程以宿主用户运行），没有任何文件归 UID 范围
+// 所有，因此什么也不改。
+func (p *Provider) ReclaimUIDFiles(context.Context, uint32, uint32) (int, error) { return 0, nil }
+
+// UIDFiles 实现 provider.Provider：理由同 ReclaimUIDFiles，总是为空。
+func (p *Provider) UIDFiles(context.Context, uint32, uint32, int) ([]string, error) { return nil, nil }
+
 // ownedDir 返回属于本安装的环境目录；否则 ErrNotFound。
 func (p *Provider) ownedDir(envID string) (string, error) {
 	if err := checkName(envID); err != nil {

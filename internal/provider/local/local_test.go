@@ -1940,3 +1940,208 @@ func TestSessionEnvFreezeThawRestore(t *testing.T) {
 		t.Fatalf("Destroy 后 Freeze = %v，期望 ErrNotFound", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Plan 15 Task 5：UID 范围文件回收与核查（E39、I11；计划 D13）。
+
+// uidFileSet 以集合比较 UIDFiles 的结果（遍历顺序是目录项顺序，不排序）。
+func uidFileSet(t *testing.T, p *Provider, base, size uint32, limit int) map[string]bool {
+	t.Helper()
+	paths, err := p.UIDFiles(context.Background(), base, size, limit)
+	if err != nil {
+		t.Fatalf("UIDFiles: %v", err)
+	}
+	out := make(map[string]bool, len(paths))
+	for _, x := range paths {
+		out[x] = true
+	}
+	return out
+}
+
+func sameSet(got map[string]bool, want ...string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for _, w := range want {
+		if !got[w] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestUIDFilesWalk（不需要 root）：以本进程的 uid 为"范围"，UIDFiles 报告数据目录中属主落在范围内的全部条目
+// （符号链接报告链接本身、不跟随到数据目录之外；blobs 整体跳过），并遵守 limit。
+func TestUIDFilesWalk(t *testing.T) {
+	data := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("o"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(Options{DataDir: data, CgroupRoot: "/sys/fs/cgroup", InstallID: "walk", Starter: testStarter{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{"workspaces/t1/d", "blobs/sha256", "stray"} {
+		if err := os.MkdirAll(filepath.Join(p.dataDir, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{"workspaces/t1/d/f", "blobs/sha256/x", "stray/g"} {
+		if err := os.WriteFile(filepath.Join(p.dataDir, f), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(outside, filepath.Join(p.dataDir, "workspaces/t1/ln")); err != nil {
+		t.Fatal(err)
+	}
+	uid := uint32(os.Getuid())
+	var want []string
+	for _, rel := range []string{"envs", "workspaces", "workspaces/t1", "workspaces/t1/d", "workspaces/t1/d/f", "workspaces/t1/ln", "stray", "stray/g"} {
+		want = append(want, filepath.Join(p.dataDir, rel))
+	}
+	if got := uidFileSet(t, p, uid, 1, 100); !sameSet(got, want...) {
+		t.Fatalf("UIDFiles = %v\n期望 %v", got, want)
+	}
+	if got := uidFileSet(t, p, uid, 1, 3); len(got) != 3 {
+		t.Fatalf("limit 3 时 UIDFiles 返回 %d 个", len(got))
+	}
+	if got := uidFileSet(t, p, uid+1, 4096, 100); len(got) != 0 {
+		t.Fatalf("范围外的 UIDFiles = %v，期望为空", got)
+	}
+	if _, err := p.UIDFiles(context.Background(), uid, 1, 0); err == nil {
+		t.Fatal("limit 0 应被拒绝")
+	}
+}
+
+// TestE39UIDRangeReuse（root，E39）：范围 R 的 task 环境在 workspace 与 /tmp 写文件 → 清理（Destroy）后 workspace
+// 文件回到 0:0、/tmp 随 tmpfs 消失，UIDFiles(R) 为空；范围 R 分配给新环境 B，B 的 uid 1000（与旧环境同一宿主 uid）
+// 在其可见视图中找不到任何旧文件。另一轮：在数据目录其他位置植入属主 R+1000 的文件 → UIDFiles 报告该路径
+// （resource 层据此隔离，见 resource_test）；blobs 中的与挂载点之内的不报告（挂载点本身报告），ReclaimUIDFiles
+// 不改动 workspaces 之外的文件。
+func TestE39UIDRangeReuse(t *testing.T) {
+	requireRoot(t)
+	st, err := NewProcessStarter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.initEnv = []string{envRealInit + "=1"}
+	install := "u" + randHex(4)
+	p := newProviderWith(t, install, st)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	const base, size = 600000, 4096
+	const hostUID = base + workloadID
+
+	wsParent := filepath.Join(p.dataDir, "workspaces")
+	if err := os.Mkdir(wsParent, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	newTask := func(envID, task string) string {
+		t.Helper()
+		ws := filepath.Join(wsParent, task)
+		if err := os.Mkdir(ws, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		spec := testEnvSpec(install, envID)
+		spec.UIDBase, spec.UIDSize = base, size
+		spec.Mounts = provider.Mounts{Workspace: ws}
+		if info, err := p.Create(ctx, spec); err != nil || !info.Complete {
+			t.Fatalf("Create %s = %+v, %v", envID, info, err)
+		}
+		return ws
+	}
+	teardown := func(envID string) {
+		t.Helper()
+		if err := p.Stop(ctx, envID); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.Destroy(ctx, envID); err != nil {
+			t.Fatal(err)
+		}
+		layersGone(t, p, envID)
+	}
+
+	// 环境 A：workspace 与 /tmp 中留下文件。
+	wsA := newTask("env-a", "t-a")
+	if got := runSh(ctx, t, p, "env-a", "id -u; echo s > /workspace/a.txt; mkdir /workspace/d; echo s > /workspace/d/b; "+
+		"ln -s /etc/passwd /workspace/ln; echo s > /tmp/secret; ls /tmp"); got != "1000\nsecret\n" {
+		t.Fatalf("环境 A 输出 %q", got)
+	}
+	teardown("env-a")
+	oldFiles := []string{wsA, filepath.Join(wsA, "a.txt"), filepath.Join(wsA, "d"), filepath.Join(wsA, "d", "b"), filepath.Join(wsA, "ln")}
+	if got := uidFileSet(t, p, base, size, 16); !sameSet(got, oldFiles...) {
+		t.Fatalf("回收前 UIDFiles = %v，期望恰为 A 的 workspace（/tmp 随 tmpfs 消失）%v", got, oldFiles)
+	}
+	n, err := p.ReclaimUIDFiles(ctx, base, size)
+	if err != nil || n != len(oldFiles) {
+		t.Fatalf("ReclaimUIDFiles = %d, %v，期望 %d", n, err, len(oldFiles))
+	}
+	for _, f := range oldFiles {
+		var s syscall.Stat_t
+		if err := syscall.Lstat(f, &s); err != nil || s.Uid != 0 || s.Gid != 0 {
+			t.Fatalf("%s 回收后属主 %d:%d（%v），期望 0:0", f, s.Uid, s.Gid, err)
+		}
+	}
+	var target syscall.Stat_t
+	if err := syscall.Stat("/etc/passwd", &target); err != nil || target.Uid != 0 {
+		t.Fatalf("符号链接目标的属主被改动（%d，%v）", target.Uid, err)
+	}
+	if got := uidFileSet(t, p, base, size, 16); len(got) != 0 {
+		t.Fatalf("回收后 UIDFiles = %v，期望为空", got)
+	}
+
+	// 环境 B 复用范围 R：同一宿主 uid，看不到 A 的任何文件。
+	newTask("env-b", "t-b")
+	got := runSh(ctx, t, p, "env-b", "id -u; for f in /tmp/secret /workspace/a.txt /workspace/d /workspace/ln; do "+
+		"if [ -e \"$f\" ] || [ -L \"$f\" ]; then echo present \"$f\"; fi; done; "+
+		"find / \\( -path /proc -o -path /sys \\) -prune -o -user 1000 -print 2>/dev/null; true")
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	if lines[0] != "1000" {
+		t.Fatalf("环境 B 的 uid = %q", lines[0])
+	}
+	for _, l := range lines[1:] {
+		if strings.HasPrefix(l, "present") || strings.Contains(l, "a.txt") || strings.Contains(l, "secret") || strings.HasPrefix(l, "/workspace/") {
+			t.Fatalf("环境 B 看到了旧文件：%q（全部输出 %q）", l, got)
+		}
+	}
+	teardown("env-b")
+	if _, err := p.ReclaimUIDFiles(ctx, base, size); err != nil {
+		t.Fatal(err)
+	}
+
+	// 植入残留：数据目录其他位置、blobs 中、另一文件系统的挂载点（挂载点本身属主 R+1000，其中的文件不遍历）。
+	stray := filepath.Join(p.dataDir, "stray", "x")
+	blobFile := filepath.Join(p.dataDir, blobsDirName, "y")
+	mnt := filepath.Join(p.dataDir, "mnt")
+	for _, d := range []string{filepath.Dir(stray), filepath.Dir(blobFile), mnt} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := syscall.Mount("tmpfs", mnt, "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, fmt.Sprintf("size=1m,uid=%d,gid=%d", hostUID, hostUID)); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = syscall.Unmount(mnt, syscall.MNT_DETACH) }()
+	for _, f := range []string{stray, blobFile, filepath.Join(mnt, "inner")} {
+		if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Lchown(f, hostUID, hostUID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := uidFileSet(t, p, base, size, 16); !sameSet(got, stray, mnt) {
+		t.Fatalf("植入残留后 UIDFiles = %v，期望 %s 与挂载点 %s", got, stray, mnt)
+	}
+	if n, err := p.ReclaimUIDFiles(ctx, base, size); err != nil || n != 0 {
+		t.Fatalf("ReclaimUIDFiles = %d, %v：workspaces 之外不应改动", n, err)
+	}
+	var s syscall.Stat_t
+	if err := syscall.Lstat(stray, &s); err != nil || s.Uid != hostUID {
+		t.Fatalf("%s 属主 %d（%v），期望不变", stray, s.Uid, err)
+	}
+	if got := uidFileSet(t, p, base+size, size, 16); len(got) != 0 {
+		t.Fatalf("相邻范围的 UIDFiles = %v，期望为空", got)
+	}
+}

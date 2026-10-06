@@ -165,6 +165,46 @@ type Provider interface {
 	Thaw(ctx context.Context, envID string) error
 	// Procs 返回环境 cgroup.procs 中的宿主 pid（释放核验的进程基线比较，规格 §12.4）。环境 cgroup 不存在 → ErrNotFound。
 	Procs(ctx context.Context, envID string) ([]int, error)
+	// ReclaimUIDFiles 把 <data>/workspaces 下属主（uid 或 gid）落在 [base, base+size) 的条目（不跟随符号链接）
+	// 改回 0:0，返回改动数量。只处理 workspaces；其他位置不改动（M4 Plan 15 D13：UID 范围归还前的回收，
+	// 下个 attempt 启动时会重新 chown 到它的范围）。
+	ReclaimUIDFiles(ctx context.Context, base, size uint32) (int, error)
+	// UIDFiles 扫描数据目录（跳过 blobs 目录；不进入其他文件系统的挂载点，挂载点本身仍按属主检查，因此
+	// /proc 类伪文件系统与残留 tmpfs 都不会被遍历）中属主（uid 或 gid）落在 [base, base+size) 的条目，
+	// 至多返回 limit 个宿主路径（规格 §4.5 UID 范围回收条件、I11）。
+	UIDFiles(ctx context.Context, base, size uint32, limit int) ([]string, error)
+}
+
+// LayerUIDFiles 是 UID 范围文件属主一层的扫描层名（ScanItem.Layer、隔离记录的 kind）。
+const LayerUIDFiles = "uid_files"
+
+// UIDSpan 是一段 UID 范围 [Base, Base+Size)。
+type UIDSpan struct {
+	ID   string // uid_ranges.uid_range_id（仅用于报告）
+	Base uint32
+	Size uint32
+}
+
+// UIDFileScanner 是 ScanUIDFiles 需要的 provider 子集。
+type UIDFileScanner interface {
+	UIDFiles(ctx context.Context, base, size uint32, limit int) ([]string, error)
+}
+
+// ScanUIDFiles 是 Scan 的 uid_files 层（规格 §14.1 第 5 步"UID 范围文件属主"）：Scan 不知道哪些范围已归还，
+// 因此由调用方（启动核对、verify-invariants）传入未分配的范围集合；每段至多报告 limit 个仍归它所有的路径。
+// 报告项的 EnvID 为空、归属为 Unknown（文件不属于任何存活环境）。
+func ScanUIDFiles(ctx context.Context, s UIDFileScanner, spans []UIDSpan, limit int) ([]ScanItem, error) {
+	var out []ScanItem
+	for _, sp := range spans {
+		paths, err := s.UIDFiles(ctx, sp.Base, sp.Size, limit)
+		if err != nil {
+			return nil, fmt.Errorf("provider: 扫描 UID 范围 %s [%d, +%d) 的文件: %w", sp.ID, sp.Base, sp.Size, err)
+		}
+		for _, p := range paths {
+			out = append(out, ScanItem{Layer: LayerUIDFiles, Path: p, Owner: Unknown})
+		}
+	}
+	return out, nil
 }
 
 // 错误（契约第 4 节）。ErrNotFound 只说明本次操作需要的那一层资源不存在，不说明其他层是否已清理。

@@ -41,7 +41,14 @@ type Store interface {
 	RecordQuarantine(ctx context.Context, q Quarantine) error
 	// MarkQuarantineAlerted 记录隔离资源已报警（规格 §16.3 I8）；M1 的报警为结构化错误日志，发出后调用。
 	MarkQuarantineAlerted(ctx context.Context, path string) error
+	// QuarantineUIDRange 把范围置为 quarantined（只在分配代次匹配时，否则为 persistence.ErrConflict；范围不存在为
+	// ErrNotFound），同一事务 RecordQuarantine(layer = uid_files, path = UIDRangeQuarantinePath(id))。已隔离时幂等。
+	// 规格 §4.5"存疑则隔离该范围"、E39；隔离的范围不再分配，也不由启动核对归还。
+	QuarantineUIDRange(ctx context.Context, uidRangeID, allocationID, reason string) error
 }
+
+// UIDRangeQuarantinePath 是被隔离 UID 范围在 quarantined_resources 中的路径（resource_path）。
+func UIDRangeQuarantinePath(uidRangeID string) string { return "uid_range/" + uidRangeID }
 
 // Quarantine 是一个归属不明或冲突的资源：不自动销毁，报警并计入占用。
 type Quarantine struct {

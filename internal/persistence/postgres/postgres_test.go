@@ -5086,3 +5086,93 @@ func TestToolBudget(t *testing.T) {
 }
 
 // ==== M4 Plan 12 Task 4 段结束 ====
+// ==== M4 Plan 15 Task 5：UID 范围隔离与 I11 [A]（E39；计划 D13） ====
+
+// TestQuarantineUIDRange：分配代次匹配时范围置为 quarantined 并在同一事务记录隔离（kind = uid_files，observed_owner
+// 为原 owner）；重复调用幂等、不覆盖原因；代次不匹配为冲突、未知范围为 ErrNotFound；隔离的范围不再分配，也不在
+// 启动核对的未归还范围中，GetUIDRange 不再返回它。
+func TestQuarantineUIDRange(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	fixture(t, s, "t2")
+	if err := s.SeedUIDRanges(ctx, 100000, 4096, 2); err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.AssignUIDRange(ctx, "env-t1", "env-uid:env-t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.QuarantineUIDRange(ctx, r.UIDRangeID, "env-uid:other", "残留"); !errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("代次不匹配 = %v，期望 ErrConflict", err)
+	}
+	if err := s.QuarantineUIDRange(ctx, "uid-missing", "x", "残留"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("未知范围 = %v，期望 ErrNotFound", err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM quarantined_resources"); n != 0 {
+		t.Fatalf("被拒绝的隔离写入了 %d 条记录", n)
+	}
+	stopAndClean(t, s, "env-t1")
+	for _, reason := range []string{"仍有 /data/stray/x", "第二次"} {
+		if err := s.QuarantineUIDRange(ctx, r.UIDRangeID, "env-uid:env-t1", reason); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := resource.UIDRangeQuarantinePath(r.UIDRangeID)
+	if n := count(t, s, `SELECT count(*) FROM quarantined_resources WHERE resource_path = $1 AND kind = 'uid_files'
+		AND observed_owner = 'env-t1' AND reason = '仍有 /data/stray/x' AND NOT alerted`, path); n != 1 {
+		t.Fatalf("隔离记录不符（%d）", n)
+	}
+	if n := count(t, s, "SELECT count(*) FROM uid_ranges WHERE uid_range_id = $1 AND state = 'quarantined'", r.UIDRangeID); n != 1 {
+		t.Fatal("范围应为 quarantined")
+	}
+	if _, err := s.GetUIDRange(ctx, "env-t1"); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("隔离后 GetUIDRange = %v，期望 ErrNotFound", err)
+	}
+	f, err := s.LoadRecoveryFacts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range f.UnreleasedRanges {
+		if u.UIDRangeID == r.UIDRangeID {
+			t.Fatalf("隔离的范围出现在未归还范围中：%+v", u)
+		}
+	}
+	r2, err := s.AssignUIDRange(ctx, "env-t2", "env-uid:env-t2")
+	if err != nil || r2.UIDRangeID == r.UIDRangeID {
+		t.Fatalf("新分配 = %+v, %v，不应复用隔离的 %s", r2, err, r.UIDRangeID)
+	}
+	if err := s.MarkQuarantineAlerted(ctx, path); err != nil {
+		t.Fatal(err)
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestInvariantI11LiveRanges：I11 [A]——两个存活环境（stopped_at 未记录）使用同一 UID 范围即违例；其中一个确认停止
+// 后（会话的新环境沿用 owner 范围的情形）不再违例。
+func TestInvariantI11LiveRanges(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	fixture(t, s, "t1")
+	fixture(t, s, "t2")
+	if err := s.SeedUIDRanges(ctx, 100000, 4096, 2); err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.AssignUIDRange(ctx, "env-t1", "env-uid:env-t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectNoDBViolations(t, s)
+	if _, err := s.pool.Exec(ctx, "UPDATE environments SET uid_range_id = $1 WHERE env_id = 'env-t2'", r.UIDRangeID); err != nil {
+		t.Fatal(err)
+	}
+	vs, err := s.DBViolations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vs) != 1 || vs[0].ID != "I11" || vs[0].Class != "A" || !strings.Contains(vs[0].Detail, "env-t1, env-t2") {
+		t.Fatalf("违例 = %+v，期望一条 I11/A 列出 env-t1, env-t2", vs)
+	}
+	stopEnv(t, s, "env-t1")
+	expectNoDBViolations(t, s)
+}

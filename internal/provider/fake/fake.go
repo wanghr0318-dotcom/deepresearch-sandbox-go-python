@@ -27,8 +27,10 @@ type Program func(ctx context.Context, spec provider.ExecSpec, stdin io.Reader, 
 type Provider struct {
 	prog Program
 
-	mu   sync.Mutex
-	envs map[string]*env
+	mu         sync.Mutex
+	envs       map[string]*env
+	files      map[string]uidFile // PlantUIDFile 植入的文件属主（UID 范围回收与核查，M4 Plan 15 Task 5）
+	reclaimErr error              // FailReclaim 注入，一次性
 }
 
 type env struct {
@@ -55,7 +57,7 @@ type startBlock struct {
 
 // New 返回以 prog 执行 workload 的 fake provider。
 func New(prog Program) *Provider {
-	return &Provider{prog: prog, envs: make(map[string]*env)}
+	return &Provider{prog: prog, envs: make(map[string]*env), files: make(map[string]uidFile)}
 }
 
 // Create 实现契约第 3 节的 Create。
@@ -381,7 +383,78 @@ func (p *Provider) Frozen(envID string) bool {
 	return ok && e.frozen
 }
 
+// uidFile 是 PlantUIDFile 植入的一个文件属主事实。
+type uidFile struct {
+	uid       uint32
+	workspace bool // 位于 <data>/workspaces 之下（ReclaimUIDFiles 只改这些）
+}
+
+// ReclaimUIDFiles 把属主落在范围内的 workspace 文件改回 0（模拟 chown 0:0），返回改动数量；FailReclaim 注入的
+// 错误只返回一次。
+func (p *Provider) ReclaimUIDFiles(_ context.Context, base, size uint32) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.reclaimErr; err != nil {
+		p.reclaimErr = nil
+		return 0, err
+	}
+	n := 0
+	for path, f := range p.files {
+		if f.workspace && inSpan(f.uid, base, size) {
+			p.files[path] = uidFile{uid: 0, workspace: true}
+			n++
+		}
+	}
+	return n, nil
+}
+
+// UIDFiles 返回属主落在范围内的植入文件（按路径排序，至多 limit 个）。
+func (p *Provider) UIDFiles(_ context.Context, base, size uint32, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("fake: UIDFiles 的上限 %d 必须为正", limit)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []string
+	for path, f := range p.files {
+		if inSpan(f.uid, base, size) {
+			out = append(out, path)
+		}
+	}
+	sort.Strings(out)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func inSpan(uid, base, size uint32) bool {
+	return uint64(uid) >= uint64(base) && uint64(uid) < uint64(base)+uint64(size)
+}
+
+// PlantUIDFile 植入一个属主为 uid 的文件（workspace 为真表示位于 <data>/workspaces 之下）。
+func (p *Provider) PlantUIDFile(path string, uid uint32, workspace bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.files[path] = uidFile{uid: uid, workspace: workspace}
+}
+
+// UIDFileOwner 返回植入文件当前的属主。
+func (p *Provider) UIDFileOwner(path string) (uint32, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	f, ok := p.files[path]
+	return f.uid, ok
+}
+
 // ---- 故障注入 ----
+
+// FailReclaim 使下一次 ReclaimUIDFiles 返回 err。
+func (p *Provider) FailReclaim(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reclaimErr = err
+}
 
 // FailFreeze 使 envID 上的 Freeze 返回 err（例如包装 provider.ErrFreezeUnconfirmed）；nil 取消注入。
 func (p *Provider) FailFreeze(envID string, err error) {
