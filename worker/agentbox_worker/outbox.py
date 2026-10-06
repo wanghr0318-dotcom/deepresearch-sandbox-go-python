@@ -7,7 +7,13 @@ from datetime import UTC, datetime
 from typing import Any
 
 from agentbox_worker.errors import TransportBroken
-from agentbox_worker.protocol import BOOTSTRAP_VERSION, VERSION, WORKER, encode_line
+from agentbox_worker.protocol import (
+    BOOTSTRAP_VERSION,
+    VERSION,
+    WORKER,
+    encode_line,
+    encode_session_line,
+)
 from agentbox_worker.transport import Transport
 
 
@@ -21,10 +27,12 @@ class Outbox:
     seq 的提交点是"校验通过、开始发送"：此后无论发送成功、失败还是被取消，该 seq 都已用掉。
     发送失败或在途被取消时结果不确定，Outbox 进入失效状态，此后的发送一律抛出
     TransportBroken，绝不以同一 seq 重发。校验失败抛出 ProtocolError，且不占用 seq。
+    session=True 时按 session 模式校验（seq 每 incarnation 从 1 起，跨 task 不重置）。
     """
 
-    def __init__(self, transport: Transport) -> None:
+    def __init__(self, transport: Transport, *, session: bool = False) -> None:
         self._transport = transport
+        self._encode = encode_session_line if session else encode_line
         self._seq = 0
         self._lock = asyncio.Lock()
         self._broken: str | None = None
@@ -37,7 +45,7 @@ class Outbox:
         async with self._lock:
             self._check_usable()
             message = {**body, "v": VERSION, "seq": self._seq + 1, "ts": _now()}
-            line = encode_line(WORKER, message)
+            line = self._encode(WORKER, message)
             self._seq += 1
             await self._send(line, f"seq={self._seq}")
 

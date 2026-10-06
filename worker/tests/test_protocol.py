@@ -277,3 +277,165 @@ def test_schema_accepts_valid(item):
 )
 def test_schema_rejects_invalid(case):
     assert not validator_for(case["direction"], case["message"]).is_valid(case["message"])
+
+
+# ---- session 扩展：与 Go 共用的 fixtures（M4 Plan 12/13）----
+
+from protocol_fixtures import load_session_messages, load_session_scenarios
+
+from agentbox_worker.protocol import decode_session_line, encode_session_line
+from agentbox_worker.stream import SessionStreamChecker
+
+SESSION_MESSAGES = load_session_messages()
+SESSION_SCENARIOS = load_session_scenarios()
+assert SESSION_MESSAGES["valid"] and SESSION_MESSAGES["invalid"] and SESSION_SCENARIOS
+
+
+@pytest.mark.parametrize("case", SESSION_MESSAGES["valid"], ids=lambda c: c["name"])
+def test_session_valid_message_round_trips(case):
+    msg = decode_session_line(case["direction"], line_bytes(case))
+    encoded = encode_session_line(case["direction"], msg)
+    assert json.loads(encoded) == json.loads(line_bytes(case))
+
+
+@pytest.mark.parametrize("case", SESSION_MESSAGES["invalid"], ids=lambda c: c["name"])
+def test_session_invalid_message_has_expected_code(case):
+    with pytest.raises(ProtocolError) as exc:
+        decode_session_line(case["direction"], line_bytes(case))
+    assert exc.value.code == case["code"]
+
+
+def replay_session(scenario: dict) -> tuple[int, str, SessionStreamChecker]:
+    """与 Go 侧 replaySession 相同：宿主消息送入 host_sent，Worker 事件送入 observe。"""
+    checker = SessionStreamChecker()
+    for index, line in enumerate(scenario["lines"]):
+        try:
+            msg = decode_session_line(line["from"], line_bytes(line))
+            if line["from"] == HOST:
+                checker.host_sent(msg)
+            else:
+                checker.observe(msg)
+        except ProtocolError as exc:
+            return index, exc.code, checker
+    return -1, "", checker
+
+
+@pytest.mark.parametrize("scenario", SESSION_SCENARIOS, ids=lambda s: s["name"])
+def test_session_scenario_stream(scenario):
+    expect = scenario["expect"]
+    at, code, checker = replay_session(scenario)
+    if expect["stream"] == "ok":
+        assert (at, code) == (-1, "")
+        assert checker.phase == expect["phase"]
+    else:
+        assert (at, code) == (expect["at"], expect["violation"])
+
+
+@pytest.mark.parametrize(
+    ("decode", "direction", "line", "code"),
+    [
+        pytest.param(
+            decode_line,
+            WORKER,
+            b'{"type":"task_accepted","v":1,"seq":2,"attempt_id":"a-1"}',
+            "unknown_type",
+            id="task_mode_rejects_task_accepted",
+        ),
+        pytest.param(
+            decode_line,
+            HOST,
+            b'{"type":"task_start","v":1,"task_id":"t","attempt_id":"a","attempt_no":1,"out_dir":"/o"}',
+            "unknown_type",
+            id="task_mode_rejects_task_start",
+        ),
+        pytest.param(
+            decode_session_line,
+            HOST,
+            b'{"type":"task_start","v":1,"task_id":"t","attempt_id":"a","attempt_no":1,'
+            b'"out_dir":"/o","config":"' + b"a" * (100 << 10) + b'"}',
+            None,
+            id="task_start_limit_is_1mib",
+        ),
+        pytest.param(
+            decode_session_line,
+            HOST,
+            b'{"type":"task_start","v":1,"task_id":"t","attempt_id":"a","attempt_no":1,'
+            b'"out_dir":"/o","config":"' + b"a" * MAX_INIT_BYTES + b'"}',
+            "message_too_large",
+            id="task_start_over_1mib",
+        ),
+        pytest.param(
+            decode_session_line,
+            HOST,
+            b'{"type":"task_outcome","v":1,"attempt_id":"a","verdict":"failed","pad":"'
+            + b"a" * MAX_CONTROL_BYTES
+            + b'"}',
+            "message_too_large",
+            id="task_outcome_is_a_control_message",
+        ),
+        pytest.param(
+            decode_session_line,
+            HOST,
+            b'{"type":"init","bootstrap":1,"protocol_versions":[1],"mode":"session",'
+            b'"session_id":"s","incarnation_id":"i","session_resume":{"checkpoint_id":"sc",'
+            b'"state":{},"Staged_State_Path":"x"}}',
+            "invalid_field",
+            id="session_resume_key_case",
+        ),
+    ],
+)
+def test_session_codec_boundaries(decode, direction, line, code):
+    if code is None:
+        decode(direction, line)
+        return
+    with pytest.raises(ProtocolError) as exc:
+        decode(direction, line)
+    assert exc.value.code == code
+
+
+def test_session_encode_applies_session_rules():
+    cr = {"type": "checkpoint_result", "v": 1, "checkpoint_id": "c", "scope": "task"}
+    cr["status"] = "committed"
+    with pytest.raises(ProtocolError) as exc:
+        encode_session_line(HOST, cr)
+    assert exc.value.code == "missing_field"
+    encode_line(HOST, cr)  # task 模式下 attempt_id 可省略
+
+
+SESSION_SCHEMA = json.loads(
+    (FIXTURES.parents[1] / "v1" / "session.schema.json").read_text(encoding="utf-8")
+)
+
+
+def session_validator(direction: str) -> Draft202012Validator:
+    side = "host" if direction == HOST else "worker"
+    schema = {k: v for k, v in SESSION_SCHEMA.items() if k != "oneOf"}  # 顶层接受二者之一
+    return Draft202012Validator({**schema, "$ref": f"#/$defs/{side}"})
+
+
+def session_valid_items() -> list[tuple[str, str, dict[str, Any]]]:
+    items = [(c["name"], c["direction"], c["message"]) for c in SESSION_MESSAGES["valid"]]
+    for scenario in SESSION_SCENARIOS:
+        bad = scenario["expect"].get("at")
+        for index, line in enumerate(scenario["lines"]):
+            if index != bad and "message" in line:
+                items.append((f"{scenario['name']}[{index}]", line["from"], line["message"]))
+    return items
+
+
+def test_session_schema_is_valid_draft_2020_12():
+    Draft202012Validator.check_schema(SESSION_SCHEMA)
+
+
+@pytest.mark.parametrize("item", session_valid_items(), ids=lambda i: i[0])
+def test_session_schema_accepts_valid(item):
+    _, direction, msg = item
+    errors = list(session_validator(direction).iter_errors(msg))
+    assert not errors, [e.message for e in errors]
+
+
+@pytest.mark.parametrize(
+    "case", [c for c in SESSION_MESSAGES["invalid"] if "message" in c], ids=lambda c: c["name"]
+)
+def test_session_schema_rejects_invalid(case):
+    assert not session_validator(case["direction"]).is_valid(case["message"])

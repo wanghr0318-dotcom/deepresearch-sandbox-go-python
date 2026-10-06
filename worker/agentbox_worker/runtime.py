@@ -15,7 +15,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from agentbox_worker.errors import (
     ArtifactRejected,
@@ -29,6 +29,8 @@ from agentbox_worker.outbox import Outbox, Waiters
 from agentbox_worker.protocol import (
     BOOTSTRAP_VERSION,
     HOST,
+    MODE_SESSION,
+    MODE_TASK,
     VERSION,
     ProtocolError,
     decode_line,
@@ -36,6 +38,9 @@ from agentbox_worker.protocol import (
     valid_artifact_path,
 )
 from agentbox_worker.transport import StdioTransport, Transport
+
+if TYPE_CHECKING:
+    from agentbox_worker.session import SessionInfo
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
@@ -53,17 +58,24 @@ MAX_ERROR_MESSAGE_BYTES = 8 << 10
 GATEWAY_SOCKET_ENV = "AGENTBOX_GATEWAY_SOCKET"
 # checkpoint state 中由 SDK 保留的键：{"_agentbox": {"call_ids": {...}}}，应用看不到也不能写
 RESERVED_STATE_KEY = "_agentbox"
+# result.session_state 的上限（紧凑 JSON 的 UTF-8 字节）：低于协议的 256 KiB，留出余量
+MAX_SESSION_STATE_BYTES = 192 << 10
 
 
 @dataclass(frozen=True)
 class Result:
     summary: str
     outputs: list[str] = field(default_factory=list)
+    # 新的会话状态提议（规格 §12.3）；仅 session 模式写入 result，task 模式忽略。None = 不提议
+    session_state: Any = None
 
 
 @dataclass(frozen=True)
 class Paused:
     checkpoint_id: str
+    # {"question_id": str}：等待用户回答（协调者裁定 A），以 awaiting_input 终态提议发出；
+    # 仅 session 模式可用，task 模式下给出时任务以 invalid_field 失败
+    awaiting_input: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -161,11 +173,34 @@ def _hash_file(path: Path) -> tuple[str, int]:
 
 
 class TaskContext:
-    """应用看到的任务上下文。"""
+    """应用看到的任务上下文。
+
+    task 模式由 init 构造；session 模式由 task_start 构造并带 session（该 attempt 开始时
+    已提交的会话状态）。session 模式下 directive、carryover、restored_from_task_id、
+    base_session_checkpoint_id 原样取自 task_start（缺省为 None），发出的 task 相关事件
+    自动带 attempt_id；task 模式下这些字段均为 None。
+    """
 
     def __init__(
-        self, init: dict[str, Any], outbox: Outbox, timing: Timing, new_id: Callable[[], str]
+        self,
+        init: dict[str, Any],
+        outbox: Outbox,
+        timing: Timing,
+        new_id: Callable[[], str],
+        *,
+        session: SessionInfo | None = None,
     ) -> None:
+        self.session = session
+        start = init if session is not None else {}
+        # {"kind": "finish_now"} | {"kind": "answer", "question_id", "answers"}；None = 开始或继续
+        self.directive: dict[str, Any] | None = start.get("directive")
+        # {"task_id", "checkpoint_ref"}：被取代 turn 最新 task checkpoint 的 blob（协调者裁定 D）
+        self.carryover: dict[str, Any] | None = start.get("carryover")
+        # 仅用于展示：恢复即从 resume（宿主复制的种子 checkpoint）继续（协调者裁定 C）
+        self.restored_from_task_id: str | None = start.get("restored_from_task_id") or None
+        self.base_session_checkpoint_id: str | None = (
+            start.get("base_session_checkpoint_id") or None
+        )
         self.task_id: str = init["task_id"]
         self.attempt_id: str = init["attempt_id"]
         self.attempt_no: int = init["attempt_no"]
@@ -195,6 +230,12 @@ class TaskContext:
             path = os.environ.get(GATEWAY_SOCKET_ENV) or DEFAULT_SOCKET_PATH
             self._gateway = GatewayClient(path, call_ids=self._call_ids)
         return self._gateway
+
+    @property
+    def call_ids(self) -> CallIds:
+        """本 attempt 的 call id 计数器（resume 时已从快照续号）；Gateway 客户端与 checkpoint
+        共用它，测试中注入的替身 Gateway 也应使用它。"""
+        return self._call_ids
 
     def should_pause(self) -> bool:
         """宿主是否请求了暂停。应用在提交边界检查它（规格 §5.9）。"""
@@ -318,15 +359,27 @@ class TaskContext:
             return ArtifactRef(artifact_id, result["version"], result["sha256"])
         raise ArtifactRejected(f"artifact {artifact_id}: rejected ({result.get('code', '')})")
 
+    def _tag(self, body: dict[str, Any]) -> dict[str, Any]:
+        """session 模式下为 task 相关事件补上 attempt_id。"""
+        return body if self.session is None else {**body, "attempt_id": self.attempt_id}
+
     async def _emit(self, body: dict[str, Any]) -> None:
         try:
-            await self._outbox.emit(body)
+            await self._outbox.emit(self._tag(body))
         except ProtocolError as exc:
             raise WorkerFailure(exc.code, exc.detail) from exc
 
     def _handle_control(self, msg: dict[str, Any]) -> bool:
-        """处理一条宿主控制消息；返回 False 表示收到 cancel，控制循环结束。"""
+        """处理一条宿主控制消息；返回 False 表示收到 cancel，控制循环结束。
+
+        session 模式下控制消息的 attempt_id 必须是本 attempt，否则为 control_protocol_error。
+        """
         typ = msg["type"]
+        if self.session is not None and msg.get("attempt_id") != self.attempt_id:
+            raise ProtocolError(
+                "control_protocol_error",
+                f"收到 attempt_id={msg.get('attempt_id')!r} 的 {typ}，当前为 {self.attempt_id}",
+            )
         if typ == "checkpoint_result":
             self._checkpoint_results.deliver(msg["checkpoint_id"], msg)
         elif typ == "artifact_result":
@@ -355,8 +408,34 @@ def _supports_protocol(line: bytes) -> bool:
     return not isinstance(versions, list) or VERSION in versions
 
 
-async def _read_init(transport: Transport, outbox: Outbox) -> dict[str, Any] | int:
-    """读取并校验 init；无法开始时返回退出码。"""
+def _peek_mode(line: bytes) -> Any:
+    try:
+        envelope = parse_json(line)
+    except ProtocolError:
+        return None
+    return envelope.get("mode") if isinstance(envelope, dict) else None
+
+
+async def _unsupported_mode(outbox: Outbox, mode: Any) -> int:
+    await outbox.emit(
+        {
+            "type": "error",
+            "code": "unsupported_mode",
+            "message": f"不支持的模式：{mode}",
+            "retryable": False,
+        }
+    )
+    return EXIT_FAILURE
+
+
+async def _read_init(
+    transport: Transport, outbox: Outbox, mode: str = MODE_TASK
+) -> dict[str, Any] | int:
+    """读取并校验 init；无法开始时返回退出码。
+
+    init 按 task 模式编解码器校验（它同样校验 session 分支）；mode 不是本 Worker 的模式时
+    发出 unsupported_mode——即使另一模式的字段不完整，也先报告模式不受支持。
+    """
     try:
         line = await transport.receive()
     except ProtocolError as exc:  # 例如输入帧超长
@@ -371,21 +450,16 @@ async def _read_init(transport: Transport, outbox: Outbox) -> dict[str, Any] | i
     try:
         init = decode_line(HOST, line)
     except ProtocolError as exc:
+        peeked = _peek_mode(line)
+        if peeked in (MODE_TASK, MODE_SESSION) and peeked != mode:
+            return await _unsupported_mode(outbox, peeked)
         _log(f"init 不合法：{exc}")
         return EXIT_FAILURE
     if init["type"] != "init":
         _log(f"第一条消息必须是 init，收到 {init['type']}")
         return EXIT_FAILURE
-    if init["mode"] != "task":
-        await outbox.emit(
-            {
-                "type": "error",
-                "code": "unsupported_mode",
-                "message": f"不支持的模式：{init['mode']}",
-                "retryable": False,
-            }
-        )
-        return EXIT_FAILURE
+    if init["mode"] != mode:
+        return await _unsupported_mode(outbox, init["mode"])
     return init
 
 
@@ -465,40 +539,88 @@ async def _run_task(app: App, ctx: TaskContext, transport: Transport) -> int:
     app_task = asyncio.create_task(app(ctx))
     control_task = asyncio.create_task(_control_loop(ctx, transport, app_task))
     try:
+        kind, value = await _await_app(ctx, app_task)
+    finally:
+        control_task.cancel()
+    if kind == "cancelled":
+        return EXIT_OK  # 宿主取消：不发终态提议，由宿主按其意图裁决（规格 §5.8）
+    if kind == "failure":
+        return await _emit_failure(ctx, value)
+    return await _emit_outcome(ctx, value)
+
+
+async def _await_app(ctx: TaskContext, app_task: asyncio.Task[Any]) -> tuple[str, Any]:
+    """等待应用结束并归类（task 与 session 模式共用）：
+
+    ("outcome", 应用返回值) | ("failure", WorkerFailure) | ("cancelled", None)（宿主取消）。
+    控制协议错误（含发生在应用最后一次发送期间的）归为 control_protocol_error 失败；
+    不是由宿主取消或控制错误引起的取消原样向上传播。
+    """
+    try:
         outcome = await app_task
     except asyncio.CancelledError:
         if ctx.control_error is not None:
-            failure = WorkerFailure("control_protocol_error", str(ctx.control_error))
-            return await _emit_failure(ctx, failure)
+            return "failure", WorkerFailure("control_protocol_error", str(ctx.control_error))
         if ctx.cancel_reason is None:
             raise
-        return EXIT_OK  # 宿主取消：不发终态提议，由宿主按其意图裁决（规格 §5.8）
+        return "cancelled", None
     except WorkerFailure as exc:
-        return await _emit_failure(ctx, exc)
+        return "failure", exc
     except Exception as exc:
         failure = WorkerFailure("internal_error", f"{type(exc).__name__}: {exc}", retryable=True)
-        return await _emit_failure(ctx, failure)
-    finally:
-        control_task.cancel()
+        return "failure", failure
     if ctx.control_error is not None:  # 控制错误发生在应用最后一次发送期间：同样以错误结束
-        failure = WorkerFailure("control_protocol_error", str(ctx.control_error))
-        return await _emit_failure(ctx, failure)
-    return await _emit_outcome(ctx, outcome)
+        return "failure", WorkerFailure("control_protocol_error", str(ctx.control_error))
+    return "outcome", outcome
+
+
+def _session_state_snapshot(state: Any) -> Any:
+    snap = _snapshot(state)
+    size = len(json.dumps(snap, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    if size > MAX_SESSION_STATE_BYTES:
+        raise WorkerFailure(
+            "state_too_large", f"session_state {size} 字节，上限 {MAX_SESSION_STATE_BYTES}"
+        )
+    return snap
+
+
+def _outcome_body(ctx: TaskContext, outcome: Any) -> dict[str, Any]:
+    """把应用返回值转换为终态提议的事件体；不合法时抛出 WorkerFailure。
+
+    session 模式下 Result.session_state 归一化为快照并以新的 checkpoint_id 提议；
+    Paused.awaiting_input 发出 awaiting_input 提议（协调者裁定 A）。
+    """
+    if isinstance(outcome, Paused):
+        if outcome.awaiting_input is None:
+            return {"type": "paused", "checkpoint_id": outcome.checkpoint_id}
+        if ctx.session is None:
+            raise WorkerFailure("invalid_field", "awaiting_input 只能用于 session 模式")
+        ask = outcome.awaiting_input
+        question_id = ask.get("question_id") if isinstance(ask, dict) else None
+        if not isinstance(question_id, str) or not question_id:
+            raise WorkerFailure("invalid_field", "awaiting_input.question_id 必须是非空字符串")
+        return {
+            "type": "awaiting_input",
+            "checkpoint_id": outcome.checkpoint_id,
+            "question_id": question_id,
+        }
+    if isinstance(outcome, Result):
+        body = {"type": "result", "summary": outcome.summary, "outputs": list(outcome.outputs)}
+        if ctx.session is not None and outcome.session_state is not None:
+            body["session_state"] = {
+                "checkpoint_id": ctx._new_id(),
+                "state": _session_state_snapshot(outcome.session_state),
+            }
+        return body
+    raise WorkerFailure("internal_error", f"应用返回了未知结果：{outcome!r}", retryable=True)
 
 
 async def _emit_outcome(ctx: TaskContext, outcome: Any) -> int:
     try:
-        if isinstance(outcome, Paused):
-            await ctx._emit({"type": "paused", "checkpoint_id": outcome.checkpoint_id})
-            return EXIT_OK
-        if isinstance(outcome, Result):
-            body = {"type": "result", "summary": outcome.summary, "outputs": list(outcome.outputs)}
-            await ctx._emit(body)
-            return EXIT_OK
+        await ctx._emit(_outcome_body(ctx, outcome))
     except WorkerFailure as exc:
         return await _emit_failure(ctx, exc)
-    failure = WorkerFailure("internal_error", f"应用返回了未知结果：{outcome!r}", retryable=True)
-    return await _emit_failure(ctx, failure)
+    return EXIT_OK
 
 
 def _safe_text(value: object, limit: int) -> str:
@@ -508,15 +630,17 @@ def _safe_text(value: object, limit: int) -> str:
 
 async def _emit_failure(ctx: TaskContext, failure: WorkerFailure) -> int:
     # 应用可能传入非字符串的 code/message 或非布尔的 retryable：一律规范化后再发送
-    await ctx._outbox.emit(
-        {
-            "type": "error",
-            "code": _safe_text(failure.code, MAX_ERROR_CODE_BYTES),
-            "message": _safe_text(failure.message, MAX_ERROR_MESSAGE_BYTES),
-            "retryable": bool(failure.retryable),
-        }
-    )
+    await ctx._outbox.emit(ctx._tag(_error_body(failure)))
     return EXIT_FAILURE
+
+
+def _error_body(failure: WorkerFailure) -> dict[str, Any]:
+    return {
+        "type": "error",
+        "code": _safe_text(failure.code, MAX_ERROR_CODE_BYTES),
+        "message": _safe_text(failure.message, MAX_ERROR_MESSAGE_BYTES),
+        "retryable": bool(failure.retryable),
+    }
 
 
 def _shutdown_timeout() -> float:
@@ -543,14 +667,21 @@ def main(app: App, *, name: str, version: str, capabilities: Iterable[str] = ())
     收尾，不是整个 Worker 的退出期限：asyncio.run 返回前会等待线程池中的线程（例如
     register_artifact 的哈希线程），这段等待不受该期限约束。最终强制终止由宿主负责。
     """
+    _run_main(
+        lambda transport: run_worker(
+            app, transport, name=name, version=version, capabilities=capabilities
+        )
+    )
+
+
+def _run_main(start: Callable[[Transport], Awaitable[int]]) -> NoReturn:
+    """main 与 session.main_session 共用的进程入口（退出策略见 main 的说明）。"""
     protocol_out = sys.stdout.buffer
     sys.stdout = sys.stderr
     transport = StdioTransport(sys.stdin.buffer, protocol_out)
     code = EXIT_FAILURE
     try:
-        code = asyncio.run(
-            run_worker(app, transport, name=name, version=version, capabilities=capabilities)
-        )
+        code = asyncio.run(start(transport))
     except BaseException:  # noqa: B036  进程入口：任何异常都必须走有界退出
         traceback.print_exc()
     finally:
