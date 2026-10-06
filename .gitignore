@@ -44,3 +44,9 @@ __pycache__/
 # 前端（web/）
 web/node_modules/
 web/dist/
+
+# backup.sh 的产物与本地口令文件不进 Git（加密归档放私有 Release asset 或对象存储）
+*.tar.zst.gpg
+*.tar.zst.gpg.sha256
+/backups/
+.backup-passphrase

@@ -49,3 +49,11 @@
 | SSH 密钥 | 腾讯云控制台重新绑定密钥对；私钥只在维护者本机 |
 
 本地开发与 CI 的 `agentbox/agentbox` 是只监听本机的开发默认值，不用于服务器。Redis 无口令、只监听 127.0.0.1，缓存条目带 HMAC 签名（篡改即未命中）。释放服务器前删除 `~/.agentbox.env`。
+
+## 备份与恢复（2026-10-06 已实际执行，见[验证记录](../evidence/2026-10-06-backup-restore.md)）
+
+- 备份（服务在线）：`sudo AGENTBOX_BACKUP_PASSPHRASE_FILE=/root/.agentbox-backup-pass bash scripts/backup.sh` → `/var/backups/agentbox/agentbox-backup-<UTC>.tar.zst.gpg` 与 `.sha256`。
+- 异地：复制到维护者本机 `backups/`（git 忽略）并上传为私有仓库的**草稿** release（`gh release create <名称> --draft <归档> <归档>.sha256`）。
+- 恢复（新服务器）：安装 PostgreSQL/Redis/agentbox 后，建空库，`sudo AGENTBOX_BACKUP_PASSPHRASE_FILE=… AGENTBOX_RESTORE_DATA_DIR=/var/lib/agentbox AGENTBOX_RESTORE_DATABASE_URL=… bash scripts/restore.sh <归档>`；再提供 `api.token`、`/etc/agentbox/agentbox.env`（Key 与连接串）、TLS 证书与私钥，启动服务。
+- 口令（`.backup-passphrase`）只在维护者本机与服务器 root 0600 文件中；须另存到密码管理器。
+- 恢复出的安装与原安装 install_id 相同，**不要在同一宿主上与原服务同时运行**。
