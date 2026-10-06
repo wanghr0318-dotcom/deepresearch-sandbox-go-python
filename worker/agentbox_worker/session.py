@@ -30,10 +30,12 @@ from agentbox_worker.protocol import (
     HOST,
     MODE_SESSION,
     SESSION_EXT_VERSION,
+    SUBRUNS_EXT_VERSION,
     VERSION,
     ProtocolError,
     decode_session_line,
     parse_json,
+    requests_subruns,
 )
 from agentbox_worker.runtime import (
     EXIT_FAILURE,
@@ -133,7 +135,9 @@ class _Session:
         timing: Timing,
         new_id: Callable[[], str],
         info: SessionInfo,
+        subruns: bool = False,
     ) -> None:
+        self.subruns = subruns  # 会话 init 是否协商了 sub-run 扩展（对每个 turn 生效）
         self.app = app
         self.outbox = outbox
         self.inbox = inbox
@@ -182,7 +186,7 @@ class _Session:
         )
         try:
             ctx: TaskContext | None = TaskContext(
-                start, self.outbox, self.timing, self.new_id, session=session
+                start, self.outbox, self.timing, self.new_id, session=session, subruns=self.subruns
             )
             failure = None
         except WorkerFailure as exc:  # resume 中的 SDK 保留状态损坏：无法续号，不能安全开始
@@ -209,6 +213,14 @@ class _Session:
                 app_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await app_task
+        # 取消引起的 subrun_end{cancelled} 须先于终态提议发出；宿主已裁决或取消时直接放弃
+        abandon = (
+            control.stop is not None
+            or control.outcome is not None
+            or ctx.control_error is not None
+            or kind == "cancelled"
+        )
+        await ctx.subruns.settle(abandon=abandon)
         if control.stop == "close":
             return await self._close()
         if control.stop == "eof":
@@ -266,6 +278,8 @@ class _Session:
             typ = item["type"]
             if typ == "session_close":
                 return await self._close()
+            if typ in ("subrun_started", "subrun_cancel_requested"):
+                continue  # 迟到的 sub-run 控制消息（不带 attempt_id）：attempt 已提议终态，忽略
             if item.get("attempt_id") != attempt_id:
                 return _violation(f"等待 {attempt_id} 的裁决时收到 {typ}")
             if typ == "task_outcome":
@@ -319,7 +333,14 @@ class _TurnControl:
         elif typ == "task_outcome" and item["attempt_id"] == ctx.attempt_id:
             self.outcome = item
             self._stop(None)
-        elif typ in ("checkpoint_result", "artifact_result", "pause", "cancel"):
+        elif typ in (
+            "checkpoint_result",
+            "artifact_result",
+            "pause",
+            "cancel",
+            "subrun_started",
+            "subrun_cancel_requested",
+        ):
             try:
                 keep_going = ctx._handle_control(item)
             except ProtocolError as exc:
@@ -412,19 +433,21 @@ async def _run_session(
     except WorkerFailure as exc:  # 启动失败：不属于任何 attempt
         await outbox.emit(_error_body(exc))
         return EXIT_FAILURE
-    await outbox.emit(
-        {
-            "type": "ready",
-            "protocol_version": VERSION,
-            "mode": MODE_SESSION,
-            "worker": {"name": name, "version": version},
-            "capabilities": list(capabilities),
-            "session_ext": SESSION_EXT_VERSION,
-        }
-    )
+    subruns = requests_subruns(init.get("extensions"))
+    ready: dict[str, Any] = {
+        "type": "ready",
+        "protocol_version": VERSION,
+        "mode": MODE_SESSION,
+        "worker": {"name": name, "version": version},
+        "capabilities": list(capabilities),
+        "session_ext": SESSION_EXT_VERSION,
+    }
+    if subruns:
+        ready["subruns"] = SUBRUNS_EXT_VERSION  # 扩展确认：当且仅当宿主请求（规格 §5.2）
+    await outbox.emit(ready)
     inbox = _Inbox(transport)
     try:
-        return await _Session(app, outbox, inbox, timing, new_id, info).run()
+        return await _Session(app, outbox, inbox, timing, new_id, info, subruns).run()
     finally:
         await inbox.close()
 

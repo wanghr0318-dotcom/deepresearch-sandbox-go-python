@@ -29,6 +29,7 @@ from agentbox_worker.errors import (
     GatewayError,
     ToolBudgetExhausted,
 )
+from agentbox_worker.protocol import valid_subrun_id
 
 DEFAULT_SOCKET_PATH = "/run/agentbox/gateway.sock"
 MAX_CALL_ID_BYTES = 256
@@ -207,6 +208,12 @@ class GatewayClient:
         self.call_ids = call_ids
         self.timeout_s = default_timeout_s() if timeout_s is None else timeout_s
 
+    # 调用归属：None = root（task 本身）；SubrunGateway 设为其 sub-run ID
+    subrun_id: str | None = None
+
+    def _next_id(self, step_id: str, kind: str) -> str:
+        return self.call_ids.next(step_id, kind, self.subrun_id)
+
     # ---- 计费调用 ----
 
     def chat(
@@ -231,7 +238,7 @@ class GatewayClient:
             tools=tools,
             tool_choice=tool_choice,
         )
-        return self._call("chat", self.call_ids.next(step_id, "chat"), body, {})
+        return self._call("chat", self._next_id(step_id, "chat"), body, {})
 
     @staticmethod
     def chat_body(
@@ -266,13 +273,13 @@ class GatewayClient:
         该指令计入调用指纹（规格 §11.4），恢复后重发同一调用须给出同一取值。"""
         body = {"query": query, "max_results": max_results}
         return self._call(
-            "search", self.call_ids.next(step_id, "search"), body, _cache_headers(no_cache)
+            "search", self._next_id(step_id, "search"), body, _cache_headers(no_cache)
         )
 
     def fetch(self, step_id: str, url: str, *, no_cache: bool = False) -> GatewayResult:
         """no_cache 的含义同 search。"""
         return self._call(
-            "fetch", self.call_ids.next(step_id, "fetch"), {"url": url}, _cache_headers(no_cache)
+            "fetch", self._next_id(step_id, "fetch"), {"url": url}, _cache_headers(no_cache)
         )
 
     def retry(
@@ -289,7 +296,7 @@ class GatewayClient:
     ) -> GatewayResult:
         """以新 call id 显式取代旧调用（CallDivergence 之后由编排层发起，规格 §9.4）。"""
         headers = {"X-Agentbox-Supersedes": old_call_id, "X-Agentbox-Supersede-Reason": reason}
-        return self._call(kind, self.call_ids.next(step_id, kind), body, headers)
+        return self._call(kind, self._next_id(step_id, kind), body, headers)
 
     # ---- 只读端点 ----
 
@@ -370,3 +377,85 @@ class GatewayClient:
             raise GatewayError(0, "connection_lost", f"{type(exc).__name__}: {exc}") from exc
         finally:
             conn.close()
+
+
+# sub-run 归属头（规格 §9.2）与每 sub-run 的上游在途上限（规格 §9.7）
+SUBRUN_HEADER = "X-Agentbox-Subrun"
+MAX_SUBRUN_IN_FLIGHT = 2
+
+
+class SubrunGateway(GatewayClient):
+    """GatewayClient 的 sub-run 视图（规格 §9.2、§9.7、§13）。
+
+    - 每个请求（含 /v1/budget 与 /blobs）带 X-Agentbox-Subrun: <subrun_id>；计费调用的
+      call id 前缀为 <subrun_id>/。与 root 共用同一个 CallIds（键按前缀区分），因此随
+      checkpoint 一起保存、恢复后续号。
+    - 同一视图的计费调用在途至多 MAX_SUBRUN_IN_FLIGHT 个（与 Gateway 的上限一致）；
+      多出的调用在其线程中等待槽位，不发出请求。
+    - 不提供创建 sub-run 的能力：sub-run 不能递归（规格 §13.2），of() 拒绝从视图再派生。
+    - close() 之后的新请求在本地以 GatewayError(0, "subrun_closed") 失败、不发出。已经在途的
+      同步请求（经 asyncio.to_thread 发出）不能被协程取消终止：宿主取消该 sub-run 后它们会很快
+      以 409 subrun_closed 返回，结果由调用方丢弃。SDK 不宣称能停止这些线程。
+    """
+
+    def __init__(
+        self,
+        socket_path: str = DEFAULT_SOCKET_PATH,
+        *,
+        call_ids: CallIds,
+        subrun_id: str,
+        timeout_s: float | None = None,
+    ) -> None:
+        if not valid_subrun_id(subrun_id):
+            raise ValueError(f"sub-run ID 不合法：{subrun_id!r}")
+        super().__init__(socket_path, call_ids=call_ids, timeout_s=timeout_s)
+        self.subrun_id = subrun_id
+        self._slots = threading.BoundedSemaphore(MAX_SUBRUN_IN_FLIGHT)
+        self._closed = threading.Event()
+
+    @classmethod
+    def of(cls, client: GatewayClient, subrun_id: str) -> SubrunGateway:
+        """由 root 客户端派生 sub-run 视图：同一 socket、超时、退避参数与 CallIds。"""
+        if isinstance(client, SubrunGateway):
+            raise TypeError("sub-run 视图不能再派生 sub-run（不允许递归）")
+        view = cls(
+            client.socket_path,
+            call_ids=client.call_ids,
+            subrun_id=subrun_id,
+            timeout_s=client.timeout_s,
+        )
+        view.in_progress_wait_s = client.in_progress_wait_s
+        view.in_progress_backoff_s = client.in_progress_backoff_s
+        view.in_progress_backoff_max_s = client.in_progress_backoff_max_s
+        return view
+
+    @property
+    def closed(self) -> bool:
+        return self._closed.is_set()
+
+    def close(self) -> None:
+        """sub-run 已结束或被取消：此后的请求在本地失败。"""
+        self._closed.set()
+
+    def retry(
+        self, step_id: str, kind: str, call_id: str, body: dict, *, no_cache: bool = False
+    ) -> GatewayResult:
+        if not call_id.startswith(f"{self.subrun_id}/"):
+            raise ValueError(f"call id {call_id!r} 不属于 sub-run {self.subrun_id}")
+        return super().retry(step_id, kind, call_id, body, no_cache=no_cache)
+
+    def _call(self, kind: str, call_id: str, body: dict, extra: dict[str, str]) -> GatewayResult:
+        self._check_open()
+        with self._slots:
+            return super()._call(kind, call_id, body, extra)
+
+    def _send(
+        self, method: str, path: str, payload: bytes | None, headers: dict[str, str]
+    ) -> _Response:
+        self._check_open()
+        assert self.subrun_id is not None
+        return super()._send(method, path, payload, {**headers, SUBRUN_HEADER: self.subrun_id})
+
+    def _check_open(self) -> None:
+        if self._closed.is_set():
+            raise GatewayError(0, "subrun_closed", f"sub-run {self.subrun_id} 已结束或被取消")

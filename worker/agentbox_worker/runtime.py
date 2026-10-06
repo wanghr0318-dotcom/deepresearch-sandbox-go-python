@@ -24,19 +24,22 @@ from agentbox_worker.errors import (
     TransportBroken,
     WorkerFailure,
 )
-from agentbox_worker.gateway import DEFAULT_SOCKET_PATH, CallIds, GatewayClient
+from agentbox_worker.gateway import DEFAULT_SOCKET_PATH, CallIds, GatewayClient, SubrunGateway
 from agentbox_worker.outbox import Outbox, Waiters
 from agentbox_worker.protocol import (
     BOOTSTRAP_VERSION,
     HOST,
     MODE_SESSION,
     MODE_TASK,
+    SUBRUNS_EXT_VERSION,
     VERSION,
     ProtocolError,
     decode_line,
     parse_json,
+    requests_subruns,
     valid_artifact_path,
 )
+from agentbox_worker.subruns import SubrunManager, parse_resumed
 from agentbox_worker.transport import StdioTransport, Transport
 
 if TYPE_CHECKING:
@@ -189,7 +192,10 @@ class TaskContext:
         new_id: Callable[[], str],
         *,
         session: SessionInfo | None = None,
+        subruns: bool | None = None,
     ) -> None:
+        """subruns：是否已协商 sub-run 扩展；None 时取 init.extensions（task 模式）。
+        session 模式由会话 init 决定，经此参数传入（task_start 不携带 extensions）。"""
         self.session = session
         start = init if session is not None else {}
         # {"kind": "finish_now"} | {"kind": "answer", "question_id", "answers"}；None = 开始或继续
@@ -219,6 +225,18 @@ class TaskContext:
         self._artifact_results = Waiters()
         self._checkpoint_lock = asyncio.Lock()
         self._pause_requested = False
+        negotiated = requests_subruns(init.get("extensions")) if subruns is None else subruns
+        # 本 attempt（session 模式下即本 turn）的 sub-run 状态所有者
+        self.subruns = SubrunManager(
+            negotiated=negotiated,
+            resumed=parse_resumed((init.get("resume") or {}).get("subruns")),
+            emit=self._emit,
+            cancel_task=outbox.cancel_when_idle,
+            gateway_factory=lambda subrun_id: SubrunGateway.of(self.gateway, subrun_id),
+            ack_timeout=timing.ack_timeout,
+            max_ack_attempts=timing.max_ack_attempts,
+            retry_backoff=timing.retry_backoff,
+        )
 
     @property
     def gateway(self) -> GatewayClient:
@@ -270,6 +288,8 @@ class TaskContext:
 
         已发起过 Gateway 调用时，SDK 把 call id 计数器并入 state 的保留键 _agentbox.call_ids
         （state 须为对象，不能用 state_ref），恢复时取出并续号；应用的 resume.state 不含该键。
+
+        存在 sub-run 时自动附加 subruns=self.subruns.snapshot()（与 state 同一时刻生成）。
         """
         async with self._checkpoint_lock:
             checkpoint_id = self._new_id()
@@ -290,6 +310,9 @@ class TaskContext:
             else:
                 body["state_ref"] = state_ref
             body["refs"] = list(refs)
+            subruns = self.subruns.snapshot()
+            if subruns:
+                body["subruns"] = subruns
             status, code = await self._submit_checkpoint(checkpoint_id, body)
         if status == "committed":
             return checkpoint_id
@@ -375,6 +398,10 @@ class TaskContext:
         session 模式下控制消息的 attempt_id 必须是本 attempt，否则为 control_protocol_error。
         """
         typ = msg["type"]
+        if typ in ("subrun_started", "subrun_cancel_requested"):
+            # 不带 attempt_id：针对本 attempt 中已 subrun_start 的 sub-run
+            self.subruns.handle_control(msg)
+            return True
         if self.session is not None and msg.get("attempt_id") != self.attempt_id:
             raise ProtocolError(
                 "control_protocol_error",
@@ -504,15 +531,16 @@ async def _run_worker(
             {"type": "error", "code": exc.code, "message": exc.message, "retryable": False}
         )
         return EXIT_FAILURE
-    await outbox.emit(
-        {
-            "type": "ready",
-            "protocol_version": VERSION,
-            "mode": "task",
-            "worker": {"name": name, "version": version},
-            "capabilities": list(capabilities),
-        }
-    )
+    ready: dict[str, Any] = {
+        "type": "ready",
+        "protocol_version": VERSION,
+        "mode": "task",
+        "worker": {"name": name, "version": version},
+        "capabilities": list(capabilities),
+    }
+    if requests_subruns(init.get("extensions")):
+        ready["subruns"] = SUBRUNS_EXT_VERSION  # 扩展确认：当且仅当宿主请求（规格 §5.2）
+    await outbox.emit(ready)
     return await _run_task(app, ctx, transport)
 
 
@@ -540,6 +568,8 @@ async def _run_task(app: App, ctx: TaskContext, transport: Transport) -> int:
     control_task = asyncio.create_task(_control_loop(ctx, transport, app_task))
     try:
         kind, value = await _await_app(ctx, app_task)
+        # 取消引起的 subrun_end{cancelled} 须先于终态提议发出；控制循环此时仍在运行
+        await ctx.subruns.settle(abandon=kind == "cancelled" or ctx.control_error is not None)
     finally:
         control_task.cancel()
     if kind == "cancelled":
@@ -606,6 +636,9 @@ def _outcome_body(ctx: TaskContext, outcome: Any) -> dict[str, Any]:
         }
     if isinstance(outcome, Result):
         body = {"type": "result", "summary": outcome.summary, "outputs": list(outcome.outputs)}
+        subruns = ctx.subruns.result_entries()
+        if subruns:
+            body["subruns"] = subruns
         if ctx.session is not None and outcome.session_state is not None:
             body["session_state"] = {
                 "checkpoint_id": ctx._new_id(),
