@@ -485,7 +485,7 @@ func (a *SessionAPI) CreateTurn(ctx context.Context, req api.CreateTurnRequest) 
 		if err != nil { // 会话关闭中或已关闭（重放不受影响）
 			return err
 		}
-		if owner != req.OwnerUserID {
+		if !req.Operator && owner != req.OwnerUserID { // 运维路径（POST /tasks 带 session_id）：turn 归会话所有者
 			return notFoundf("会话 %s 不属于用户 %d", req.SessionID, req.OwnerUserID)
 		}
 		if owner > 0 {

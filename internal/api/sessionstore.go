@@ -39,6 +39,10 @@ type CreateTurnRequest struct {
 	ConfigVersion                string
 	MaxFaultRetries              int64
 	RestoredFromTaskID           string // 非空 = POST /turns/{id}/restore
+	// Operator 为运维路径（POST /tasks 带 session_id）：不比较 OwnerUserID 与会话所有者，turn 归会话所有者；
+	// Research 覆盖服务端生成的 spec.research（只在 api 层合并进 Spec）。
+	Operator bool
+	Research json.RawMessage
 }
 
 // CreateTurnResult 是 CreateTurn 的结果（OpenAPI MessageResult）。

@@ -221,6 +221,14 @@ paths:
     post:
       operationId: createTask
       summary: Create a task (idempotent by request_id)
+      description: >-
+        Operator only. With `session_id` the task is a turn of that session (spec §15.1; the operator path used by the
+        serial-vs-parallel research comparison). It goes through the same transaction as a user message and belongs to
+        the session's owner. `spec` may then contain only `text`, `deep_research` and `research`; the server builds the
+        turn spec (models, limits) exactly as for a user message and overlays the keys of `research` onto
+        `spec.research` (for example `scheduling` and `fixed_plan`, validated by the worker). `limits` must be omitted.
+        Errors are those of `POST /sessions/{id}/messages` (404 `session_not_found`, 409 `turn_in_progress`,
+        `user_task_running` or `session_closed`, 503 `sessions_unavailable`).
       requestBody:
         required: true
         content:
@@ -235,6 +243,7 @@ paths:
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/Conflict'}
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/Unavailable'}
@@ -1062,6 +1071,7 @@ components:
       required: [request_id, spec]
       properties:
         request_id: {type: string, minLength: 1, maxLength: 128}
+        session_id: {type: string, minLength: 1, description: 'Create the task as a turn of this session (operator path; see createTask)'}
         spec: {type: object, description: Task specification passed to the worker}
         limits: {type: object, description: Resource limits for the task}
     CreateTaskResult:

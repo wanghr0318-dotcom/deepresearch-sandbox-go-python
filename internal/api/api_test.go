@@ -2594,7 +2594,7 @@ func (f *fakeSessions) CreateTurn(_ context.Context, req CreateTurnRequest) (Cre
 	if err != nil {
 		return CreateTurnResult{}, err
 	}
-	if s.OwnerUserID != req.OwnerUserID {
+	if !req.Operator && s.OwnerUserID != req.OwnerUserID {
 		return CreateTurnResult{}, persistence.ErrNotFound
 	}
 	var res CreateTurnResult
@@ -3476,3 +3476,80 @@ func flowList(block []string, prefix string) []string {
 }
 
 // ==== M4 Plan 14 Task 10 段结束 ====
+
+// ==== M4 Plan 14 Task 12 段：运维在会话中创建 turn（POST /tasks 带 session_id，C12-7） ====
+
+// TestOperatorCreateTurnInSession：运维 POST /tasks 带 session_id → 201 {task_id}，turn 归会话所有者（不比较调用者），
+// spec 由服务端生成（模型、limits 不变），research 的键覆盖到 spec.research；重放返回同一 task_id；spec 只接受
+// text、deep_research、research，limits 不可指定；不存在的会话 404；用户调用 POST /tasks 仍 403；未启用会话 503。
+func TestOperatorCreateTurnInSession(t *testing.T) {
+	ts, acc, fs := newSessionServer(t, nil)
+	_, ca := acc.seedUser(t, "anna")
+	st, b, _ := ts.do("POST", "/sessions", `{"request_id":"c1"}`, session(ca))
+	expect(t, st, b, 201, "")
+
+	body := `{"request_id":"op1","session_id":"s1","spec":{"text":" 固态电池 ","deep_research":true,` +
+		`"research":{"scheduling":"serial","fixed_plan":[{"id":"1","title":"t","budget":5}]}}}`
+	st, b, _ = ts.do("POST", "/tasks", body, adminAuth)
+	expect(t, st, b, 201, "")
+	var first CreateTaskResult
+	decodeJSONBody(t, b, &first)
+	fs.mu.Lock()
+	req := fs.lastTurn
+	fs.mu.Unlock()
+	var spec map[string]any
+	if err := json.Unmarshal(req.Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+	research, _ := spec["research"].(map[string]any)
+	if first.TaskID == "" || req.TaskID != first.TaskID || !req.Operator || req.SessionID != "s1" || req.Text != "固态电池" ||
+		!req.DeepResearch || spec["orchestrator_model"] != "kimi-k3" || spec["text"] != "固态电池" ||
+		research["scheduling"] != "serial" || research["fixed_plan"] == nil || string(req.Limits) != `{"max_tool_calls":30}` {
+		t.Fatalf("CreateTurn 请求 = %+v (spec %s, limits %s)", req, req.Spec, req.Limits)
+	}
+	st, b, _ = ts.do("POST", "/tasks", body, adminAuth)
+	expect(t, st, b, 201, "")
+	var again CreateTaskResult
+	decodeJSONBody(t, b, &again)
+	if again.TaskID != first.TaskID {
+		t.Fatalf("重放 = %s，首次 %+v", b, first)
+	}
+
+	for _, bad := range []string{
+		`{"request_id":"op2","session_id":"s1","spec":{"text":"x","deep_research":true,"orchestrator_model":"gpt"}}`,
+		`{"request_id":"op2","session_id":"s1","spec":{"text":"x"}}`,
+		`{"request_id":"op2","session_id":"s1","spec":{"text":"x","deep_research":true},"limits":{"max_tool_calls":99}}`,
+		`{"request_id":"op2","session_id":"s1","spec":{"text":"x","deep_research":true,"research":[1]}}`,
+	} {
+		st, b, _ = ts.do("POST", "/tasks", bad, adminAuth)
+		expect(t, st, b, 400, "invalid_request")
+	}
+	st, b, _ = ts.do("POST", "/tasks", `{"request_id":"op2","session_id":"s1","spec":{"text":" ","deep_research":true}}`, adminAuth)
+	expect(t, st, b, 400, "invalid_text")
+	st, b, _ = ts.do("POST", "/tasks", `{"request_id":"op3","session_id":"nope","spec":{"text":"x","deep_research":false}}`, adminAuth)
+	expect(t, st, b, 404, "session_not_found")
+	st, b, _ = ts.do("POST", "/tasks", `{"request_id":"op4","session_id":"s1","spec":{"text":"x","deep_research":false}}`, session(ca))
+	expect(t, st, b, 403, "forbidden")
+
+	plain, _ := newAccountServer(t, nil)
+	st, b, _ = plain.do("POST", "/tasks", `{"request_id":"op5","session_id":"s1","spec":{"text":"x","deep_research":false}}`, adminAuth)
+	expect(t, st, b, 503, "sessions_unavailable")
+}
+
+// TestOverlayResearch：运维的 research 键覆盖服务端的同名键，其余服务端键保留；spec 无 research 时新建。
+func TestOverlayResearch(t *testing.T) {
+	got, err := overlayResearch(json.RawMessage(`{"kind":"turn","research":{"worker_output_micro_per_mtok":8,"scheduling":"parallel"}}`),
+		json.RawMessage(`{"scheduling":"serial"}`))
+	if err != nil || string(got) != `{"kind":"turn","research":{"scheduling":"serial","worker_output_micro_per_mtok":8}}` {
+		t.Fatalf("overlay = %s, %v", got, err)
+	}
+	got, err = overlayResearch(json.RawMessage(`{"kind":"turn"}`), json.RawMessage(`{"scheduling":"serial"}`))
+	if err != nil || string(got) != `{"kind":"turn","research":{"scheduling":"serial"}}` {
+		t.Fatalf("overlay（无 research）= %s, %v", got, err)
+	}
+	if got, err = overlayResearch(json.RawMessage(`{"a":1}`), nil); err != nil || string(got) != `{"a":1}` {
+		t.Fatalf("overlay（nil）= %s, %v", got, err)
+	}
+}
+
+// ==== M4 Plan 14 Task 12 段结束 ====

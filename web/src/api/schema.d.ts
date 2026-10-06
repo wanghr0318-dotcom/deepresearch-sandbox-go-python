@@ -121,7 +121,10 @@ export interface paths {
         /** List tasks, newest first (keyset pagination) */
         get: operations["listTasks"];
         put?: never;
-        /** Create a task (idempotent by request_id) */
+        /**
+         * Create a task (idempotent by request_id)
+         * @description Operator only. With `session_id` the task is a turn of that session (spec §15.1; the operator path used by the serial-vs-parallel research comparison). It goes through the same transaction as a user message and belongs to the session's owner. `spec` may then contain only `text`, `deep_research` and `research`; the server builds the turn spec (models, limits) exactly as for a user message and overlays the keys of `research` onto `spec.research` (for example `scheduling` and `fixed_plan`, validated by the worker). `limits` must be omitted. Errors are those of `POST /sessions/{id}/messages` (404 `session_not_found`, 409 `turn_in_progress`, `user_task_running` or `session_closed`, 503 `sessions_unavailable`).
+         */
         post: operations["createTask"];
         delete?: never;
         options?: never;
@@ -682,6 +685,8 @@ export interface components {
         };
         CreateTaskRequest: {
             request_id: string;
+            /** @description Create the task as a turn of this session (operator path; see createTask) */
+            session_id?: string;
             /** @description Task specification passed to the worker */
             spec: Record<string, unknown>;
             /** @description Resource limits for the task */
@@ -1902,6 +1907,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             500: components["responses"]["Internal"];
             503: components["responses"]["Unavailable"];

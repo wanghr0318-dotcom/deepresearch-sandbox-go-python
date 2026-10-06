@@ -151,7 +151,7 @@ var (
 var routes = []route{
 	{"GET", "/status", accessDiagnostic, audienceAnyone, []int{200, 401, 403}, (*Handler).getStatus},
 	{"GET", "/tasks", accessRead, audienceList, []int{200, 400, 401, 403, 500, 503}, (*Handler).listTasks},
-	{"POST", "/tasks", accessWrite, audienceAdmin, []int{201, 400, 401, 403, 409, 500, 503}, (*Handler).createTask},
+	{"POST", "/tasks", accessWrite, audienceAdmin, []int{201, 400, 401, 403, 404, 409, 500, 503}, (*Handler).createTask},
 	{"GET", "/tasks/{id}", accessRead, audienceTask, readStatuses, (*Handler).getTask},
 	{"POST", "/tasks/{id}/cancel", accessWrite, audienceTask, controlStatuses, control("cancel")},
 	{"POST", "/tasks/{id}/pause", accessWrite, audienceAdmin, controlStatuses, control("pause")},
@@ -651,6 +651,7 @@ func (h *Handler) listTasks(w http.ResponseWriter, r *http.Request) {
 
 type createTaskBody struct {
 	RequestID string          `json:"request_id"`
+	SessionID string          `json:"session_id,omitempty"`
 	Spec      json.RawMessage `json:"spec"`
 	Limits    json.RawMessage `json:"limits,omitempty"`
 }
@@ -662,6 +663,10 @@ func (h *Handler) createTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if !isJSONObject(body.Spec) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "spec 必填且须为 JSON 对象")
+		return
+	}
+	if body.SessionID != "" {
+		h.createOperatorTurn(w, r, body)
 		return
 	}
 	if string(bytes.TrimSpace(body.Limits)) == "null" {

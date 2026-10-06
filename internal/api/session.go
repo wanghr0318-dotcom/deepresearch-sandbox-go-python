@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -423,11 +424,96 @@ func (h *Handler) sendMessage(w http.ResponseWriter, r *http.Request) {
 		Text: text, DeepResearch: *body.DeepResearch}, "session_not_found", msgSessionNotFound)
 }
 
-// createTurn 生成 spec 与 limits 并创建 turn（消息与恢复共用）；成功回答 202 MessageResult。
+// operatorTurnSpec 是运维在会话中创建 turn 时 spec 允许的字段（POST /tasks 带 session_id）。模型、额度与其余
+// 配置仍由服务端生成（与用户消息相同）；research 的键覆盖服务端生成的 config.research（串并行对比用其设置
+// scheduling 与 fixed_plan，由 Worker 校验）。
+type operatorTurnSpec struct {
+	Text         string          `json:"text"`
+	DeepResearch *bool           `json:"deep_research"`
+	Research     json.RawMessage `json:"research,omitempty"`
+}
+
+// createOperatorTurn 是 POST /tasks 带 session_id（规格 §15.1；Plan 14 的运维路径 C12-7）：在指定会话中创建
+// 一个 turn，与用户发消息走同一事务（会话所有者为 turn 的所有者，不检查调用者是否为所有者）；成功回答 201
+// CreateTaskResult（task_id 即 turn_id）。limits 由服务端决定，不接受请求中的 limits。
+func (h *Handler) createOperatorTurn(w http.ResponseWriter, r *http.Request, body createTaskBody) {
+	if h.cfg.Sessions == nil {
+		writeError(w, http.StatusServiceUnavailable, "sessions_unavailable", "服务端未启用会话")
+		return
+	}
+	if len(body.Limits) > 0 && string(bytes.TrimSpace(body.Limits)) != "null" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "带 session_id 时 limits 由服务端决定，不能指定")
+		return
+	}
+	body.Limits = nil
+	var in operatorTurnSpec
+	dec := json.NewDecoder(bytes.NewReader(body.Spec))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "带 session_id 时 spec 只能含 text、deep_research、research")
+		return
+	}
+	if in.DeepResearch == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "spec.deep_research 必填")
+		return
+	}
+	text := strings.TrimSpace(in.Text)
+	if n := utf8.RuneCountInString(text); n < 1 || n > maxTextRunes {
+		writeError(w, http.StatusBadRequest, "invalid_text", "spec.text 须为 1–4000 个字符")
+		return
+	}
+	if len(in.Research) > 0 && string(bytes.TrimSpace(in.Research)) != "null" && !isJSONObject(in.Research) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "spec.research 须为 JSON 对象")
+		return
+	}
+	hash, ok := hashSessionRequest(w, sessionHashInput{Body: body, Op: "operator_turn", SessionID: body.SessionID})
+	if !ok {
+		return
+	}
+	h.createTurn(w, r, CreateTurnRequest{RequestID: body.RequestID, SessionID: body.SessionID, BodyHash: hash,
+		Text: text, DeepResearch: *in.DeepResearch, Operator: true, Research: in.Research},
+		"session_not_found", msgSessionNotFound)
+}
+
+// overlayResearch 把运维给出的 research 键覆盖到服务端生成的 spec.research 上（其余字段不变）。
+func overlayResearch(spec, research json.RawMessage) (json.RawMessage, error) {
+	if len(research) == 0 || string(bytes.TrimSpace(research)) == "null" {
+		return spec, nil
+	}
+	var s map[string]json.RawMessage
+	if err := json.Unmarshal(spec, &s); err != nil {
+		return nil, err
+	}
+	base := map[string]json.RawMessage{}
+	if raw, ok := s["research"]; ok && string(bytes.TrimSpace(raw)) != "null" {
+		if err := json.Unmarshal(raw, &base); err != nil {
+			return nil, err
+		}
+	}
+	var over map[string]json.RawMessage
+	if err := json.Unmarshal(research, &over); err != nil {
+		return nil, err
+	}
+	for k, v := range over {
+		base[k] = v
+	}
+	merged, err := json.Marshal(base)
+	if err != nil {
+		return nil, err
+	}
+	s["research"] = merged
+	return json.Marshal(s)
+}
+
+// createTurn 生成 spec 与 limits 并创建 turn（消息与恢复共用）；成功回答 202 MessageResult（运维路径 201
+// CreateTaskResult）。
 func (h *Handler) createTurn(w http.ResponseWriter, r *http.Request, req CreateTurnRequest, notFoundCode, notFoundMsg string) {
 	spec, limits, err := h.cfg.TurnSpec(req.Text, req.DeepResearch)
 	if err == nil && (!isJSONObject(spec) || (len(limits) > 0 && !isJSONObject(limits))) {
 		err = errors.New("TurnSpec 返回的 spec 或 limits 不是 JSON 对象")
+	}
+	if err == nil && req.Research != nil {
+		spec, err = overlayResearch(spec, req.Research)
 	}
 	if err != nil {
 		h.logError("生成 turn spec", err)
@@ -451,6 +537,10 @@ func (h *Handler) createTurn(w http.ResponseWriter, r *http.Request, req CreateT
 	}
 	if err != nil {
 		writeSessionError(w, err, notFoundCode, notFoundMsg)
+		return
+	}
+	if req.Operator {
+		writeJSON(w, http.StatusCreated, CreateTaskResult{TaskID: res.TurnID})
 		return
 	}
 	writeJSON(w, http.StatusAccepted, res) // 重放时返回首次结果，状态码相同

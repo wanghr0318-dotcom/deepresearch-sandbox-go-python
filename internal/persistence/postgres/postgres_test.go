@@ -7225,3 +7225,35 @@ func TestSubrunDeadlineSuspendedWhilePaused(t *testing.T) {
 }
 
 // ==== M4 真实验收修复段结束 ====
+
+// ==== M4 Plan 14 Task 12 段：运维路径在会话中创建 turn ====
+
+// TestOperatorCreateTurn：Operator = true 的 CreateTurn（POST /tasks 带 session_id）不比较调用者与会话所有者，turn 的
+// owner_user_id 为会话所有者；仍受"每用户同时 1 个运行中"约束；不带 Operator 的同一调用者仍为 not found。
+func TestOperatorCreateTurn(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	a := s.SessionAPI()
+	alice := mustUser(t, s, "alice")
+	newSession(t, s, "s1", alice)
+	newSession(t, s, "s2", alice)
+
+	if _, err := a.CreateTurn(ctx, turnReq("s1", "tx", 0)); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("非运维调用者应为 not found，得到 %v", err)
+	}
+	op := turnReq("s1", "ta", 0)
+	op.Operator = true
+	if r := mustTurn(t, s, op); r.TurnID != "ta" || r.TurnIndex != 0 {
+		t.Fatalf("运维 turn = %+v", r)
+	}
+	if n := count(t, s, `SELECT count(*) FROM tasks WHERE task_id = 'ta' AND session_id = 's1' AND owner_user_id = $1`, alice); n != 1 {
+		t.Fatal("运维创建的 turn 应归会话所有者")
+	}
+	op2 := turnReq("s2", "tb", 0)
+	op2.Operator = true
+	if _, err := a.CreateTurn(ctx, op2); !errors.Is(err, api.ErrUserTaskRunning) {
+		t.Fatalf("所有者已有进行中的 turn 时应 user_task_running，得到 %v", err)
+	}
+}
+
+// ==== M4 Plan 14 Task 12 段结束 ====

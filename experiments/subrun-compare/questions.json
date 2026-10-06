@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "note": "固定研究问题与固定拆分（research.fixed_plan）：两组（serial / parallel）共用同一份清单；每题 3 个子主题，各 8 次工具份额（task 级共 30 次）。拆分由维护者按 deep-research skill 的格式事先写定（见 README 的“偏差”）。",
+  "questions": [
+    {
+      "id": "q01",
+      "lang": "zh",
+      "text": "比较钠离子电池与磷酸铁锂电池在电网储能中的现状：成本、循环寿命与安全性，以及 2024–2025 年的量产进展。",
+      "fixed_plan": [
+        {"id": "1", "title": "成本与材料", "budget": 8, "brief": "两种电池的电芯与系统成本（元/Wh 或 USD/kWh）及其材料来源差异，引用 2024–2025 年的公开数据。"},
+        {"id": "2", "title": "循环寿命与安全性", "budget": 8, "brief": "循环寿命、低温性能与热失控风险的对比，优先厂商规格书与测试报告。"},
+        {"id": "3", "title": "量产与项目进展", "budget": 8, "brief": "2024–2025 年钠离子电池的量产线与已投运的储能项目（宁德时代、中科海钠等）。"}
+      ]
+    },
+    {
+      "id": "q02",
+      "lang": "en",
+      "text": "How do the EU AI Act's obligations for general-purpose AI models work, when do they apply, and how are providers preparing to comply?",
+      "fixed_plan": [
+        {"id": "1", "title": "GPAI obligations", "budget": 8, "brief": "What the AI Act requires of general-purpose AI model providers, including the systemic-risk tier (Articles 53 and 55)."},
+        {"id": "2", "title": "Timeline and enforcement", "budget": 8, "brief": "Application dates, the AI Office's role, penalties, and grandfathering for models already on the market."},
+        {"id": "3", "title": "Code of practice and industry response", "budget": 8, "brief": "The GPAI code of practice and which major providers have signed or criticised it."}
+      ]
+    },
+    {
+      "id": "q03",
+      "lang": "zh",
+      "text": "数据中心液冷技术（冷板式与浸没式）的能效、成本与 2024–2025 年在中国的部署情况如何？",
+      "fixed_plan": [
+        {"id": "1", "title": "技术路线与能效", "budget": 8, "brief": "冷板式与单相/两相浸没式的原理、PUE 与适用功率密度。"},
+        {"id": "2", "title": "成本与改造难度", "budget": 8, "brief": "初投资、运维成本与对既有机房改造的要求，引用厂商或研究机构数据。"},
+        {"id": "3", "title": "中国部署案例", "budget": 8, "brief": "2024–2025 年国内运营商与互联网公司的液冷部署规模和政策要求。"}
+      ]
+    },
+    {
+      "id": "q04",
+      "lang": "en",
+      "text": "What is the state of small modular reactors (SMRs) in 2025: leading designs, licensing status, and the main cost and schedule risks?",
+      "fixed_plan": [
+        {"id": "1", "title": "Leading SMR designs", "budget": 8, "brief": "The most advanced designs (e.g. NuScale, BWRX-300, Rolls-Royce SMR, ACP100) and their key parameters."},
+        {"id": "2", "title": "Licensing and first projects", "budget": 8, "brief": "Regulatory approvals and first-of-a-kind projects in the US, Canada, UK and China as of 2025."},
+        {"id": "3", "title": "Cost and schedule risks", "budget": 8, "brief": "Evidence on cost overruns and cancellations (e.g. the UAMPS cancellation) and estimated levelised costs."}
+      ]
+    },
+    {
+      "id": "q05",
+      "lang": "zh",
+      "text": "开源大模型的主要许可证（Llama 社区许可、Apache 2.0、Qwen 许可等）在商用限制上有哪些差异？",
+      "fixed_plan": [
+        {"id": "1", "title": "Llama 社区许可", "budget": 8, "brief": "月活阈值、可接受使用政策与衍生模型命名要求。"},
+        {"id": "2", "title": "Apache 2.0 与 MIT 类模型", "budget": 8, "brief": "以 Apache 2.0 或 MIT 发布的主流模型（Mistral、DeepSeek 等）及其权利与义务。"},
+        {"id": "3", "title": "Qwen 与其他自定义许可", "budget": 8, "brief": "Qwen、Gemma 等自定义许可的商用条件与限制条款。"}
+      ]
+    },
+    {
+      "id": "q06",
+      "lang": "en",
+      "text": "How effective are GLP-1 receptor agonists such as semaglutide and tirzepatide for weight loss, what are their main side effects, and how has access and pricing changed?",
+      "fixed_plan": [
+        {"id": "1", "title": "Efficacy in trials", "budget": 8, "brief": "Average weight loss in the key phase 3 trials (STEP, SURMOUNT) and head-to-head results."},
+        {"id": "2", "title": "Side effects and safety", "budget": 8, "brief": "Common gastrointestinal effects, discontinuation rates, and safety signals under investigation."},
+        {"id": "3", "title": "Access, supply and pricing", "budget": 8, "brief": "List prices, shortages, compounded versions and insurance coverage changes in 2024–2025."}
+      ]
+    },
+    {
+      "id": "q07",
+      "lang": "zh",
+      "text": "欧洲主要国家（德国、法国、英国）的住宅热泵补贴政策在 2025 年有何不同？",
+      "fixed_plan": [
+        {"id": "1", "title": "德国", "budget": 8, "brief": "BEG 补贴的比例、上限与收入加成，以及 2024 年供暖法修订的影响。"},
+        {"id": "2", "title": "法国", "budget": 8, "brief": "MaPrimeRénov' 对热泵的补贴额度与 2025 年调整。"},
+        {"id": "3", "title": "英国", "budget": 8, "brief": "Boiler Upgrade Scheme 的补贴金额、申请量与 2025 年变化。"}
+      ]
+    },
+    {
+      "id": "q08",
+      "lang": "en",
+      "text": "What are the main approaches to post-quantum cryptography migration, which NIST standards were finalised, and what deadlines do governments set?",
+      "fixed_plan": [
+        {"id": "1", "title": "NIST PQC standards", "budget": 8, "brief": "FIPS 203, 204 and 205: algorithms, parameters and intended uses."},
+        {"id": "2", "title": "Migration approaches", "budget": 8, "brief": "Hybrid key exchange in TLS, crypto-agility and inventory practices, with deployment examples."},
+        {"id": "3", "title": "Government deadlines", "budget": 8, "brief": "Timelines from the US (NSM-10, CNSA 2.0), the UK NCSC and the EU."}
+      ]
+    },
+    {
+      "id": "q09",
+      "lang": "zh",
+      "text": "固态电池的产业化进展如何？请比较硫化物、氧化物与聚合物路线以及主要企业的量产时间表。",
+      "fixed_plan": [
+        {"id": "1", "title": "技术路线对比", "budget": 8, "brief": "硫化物、氧化物、聚合物电解质的离子电导率、界面问题与成本。"},
+        {"id": "2", "title": "主要企业与时间表", "budget": 8, "brief": "丰田、宁德时代、QuantumScape、卫蓝新能源等的量产计划与样品进展。"},
+        {"id": "3", "title": "半固态电池装车情况", "budget": 8, "brief": "2024–2025 年半固态电池在量产车型上的应用与能量密度。"}
+      ]
+    },
+    {
+      "id": "q10",
+      "lang": "en",
+      "text": "How are major cloud providers pricing and supplying AI accelerators in 2025 (Nvidia H100/H200/B200, TPU, Trainium), and what constrains supply?",
+      "fixed_plan": [
+        {"id": "1", "title": "Cloud GPU pricing", "budget": 8, "brief": "On-demand and reserved hourly prices for H100/H200/B200 instances on AWS, Azure and Google Cloud."},
+        {"id": "2", "title": "Custom accelerators", "budget": 8, "brief": "Google TPU and AWS Trainium generations, availability and claimed price-performance."},
+        {"id": "3", "title": "Supply constraints", "budget": 8, "brief": "CoWoS packaging capacity, HBM supply and export controls affecting availability."}
+      ]
+    }
+  ]
+}
