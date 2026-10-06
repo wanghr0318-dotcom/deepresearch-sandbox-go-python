@@ -356,7 +356,7 @@ func retryableReason(reason string) bool {
 	return false
 }
 
-// admit 是规格 §9.2 的访问判定，顺序与持久化层一致：访问撤销 → 非当前 attempt → 已请求取消。
+// admit 是规格 §9.2 的访问判定，顺序与持久化层一致：访问撤销 → 非当前 attempt → 已请求取消 → sub-run 不可用。
 func admit(f AccessFacts) string {
 	switch {
 	case !f.Active:
@@ -365,6 +365,8 @@ func admit(f AccessFacts) string {
 		return persistence.CodeNotCurrentAttempt
 	case f.Desired == "cancel":
 		return persistence.CodeCancelRequested
+	case f.SubrunID != "" && !f.SubrunOpen:
+		return persistence.CodeSubrunClosed
 	}
 	return ""
 }
@@ -385,7 +387,7 @@ func (c *Coordinator) opCtx() (context.Context, context.CancelFunc) {
 
 // CheckAccess 在一致快照中做 §9.2 访问检查（供 /v1/budget 与 blob 读取使用）。零值 Result 表示允许。
 func (c *Coordinator) CheckAccess(ctx context.Context, taskID, attemptID string) (Result, error) {
-	f, err := c.store.CheckAccess(ctx, taskID, attemptID)
+	f, err := c.store.CheckAccess(ctx, taskID, attemptID, "") // sub-run 归属由 Plan 14 Task 5 从 edge 传入
 	if err != nil {
 		return Result{}, err
 	}

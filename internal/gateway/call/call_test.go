@@ -106,10 +106,17 @@ func (s *fakeStore) facts(taskID, attemptID string) AccessFacts {
 	return AccessFacts{TaskID: taskID, AttemptID: attemptID, Active: !s.revoked[attemptID], Current: true, Desired: d}
 }
 
-func (s *fakeStore) CheckAccess(_ context.Context, taskID, attemptID string) (AccessFacts, error) {
+func (s *fakeStore) CheckAccess(_ context.Context, taskID, attemptID, subrunID string) (AccessFacts, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.facts(taskID, attemptID), nil
+	f := s.facts(taskID, attemptID)
+	f.SubrunID, f.SubrunOpen = subrunID, subrunID != "" // fake 不建模 sub-run 生命周期（Plan 14 Task 5 扩展）
+	return f, nil
+}
+
+// LoadSubrunBudget：fake 不建模 sub-run 层账本（真实语义见 postgres 测试）。
+func (s *fakeStore) LoadSubrunBudget(context.Context, string, string) (SubrunBudget, error) {
+	return SubrunBudget{}, persistence.ErrNotFound
 }
 
 func (s *fakeStore) BeginCall(_ context.Context, r BeginCallRequest) (BeginCallResult, error) {

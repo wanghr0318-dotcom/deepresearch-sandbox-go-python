@@ -2641,12 +2641,12 @@ func TestReserveTryAccessRejections(t *testing.T) {
 			s := newStore(t, Options{})
 			gwFixture(t, s, "t1", 1000)
 			beginCall(t, s, "t1", "c1")
-			f, err := s.CheckAccess(ctx, "t1", "att-t1")
+			f, err := s.CheckAccess(ctx, "t1", "att-t1", "")
 			if err != nil || f != (call.AccessFacts{TaskID: "t1", AttemptID: "att-t1", Active: true, Current: true, Desired: "run"}) {
 				t.Fatalf("初始访问事实不对：%+v / %v", f, err)
 			}
 			c.after(t, s)
-			if f, err := s.CheckAccess(ctx, "t1", "att-t1"); err != nil || f != c.facts {
+			if f, err := s.CheckAccess(ctx, "t1", "att-t1", ""); err != nil || f != c.facts {
 				t.Fatalf("访问事实应为 %+v，得到 %+v / %v", c.facts, f, err)
 			}
 			_, err = reserve(s, "t1", "c1", 10)
@@ -2661,7 +2661,7 @@ func TestReserveTryAccessRejections(t *testing.T) {
 		})
 	}
 	s := newStore(t, Options{})
-	if _, err := s.CheckAccess(ctx, "missing", "a"); !errors.Is(err, persistence.ErrNotFound) {
+	if _, err := s.CheckAccess(ctx, "missing", "a", ""); !errors.Is(err, persistence.ErrNotFound) {
 		t.Fatalf("不存在的任务应为 ErrNotFound，得到 %v", err)
 	}
 }
@@ -5176,3 +5176,469 @@ func TestInvariantI11LiveRanges(t *testing.T) {
 	stopEnv(t, s, "env-t1")
 	expectNoDBViolations(t, s)
 }
+
+// ==== M4 Plan 14 Task 4：Gateway 两层账本与 sub-run 归属访问检查（规格 §9.2、§9.6；本段到此结束前不含其他任务的用例） ====
+
+// srFixture 建立预算为 budget 的任务 taskID（attempt att-<taskID>）并启动 sub-run：caps 的键为 sub-run ID，值为上限（nil 不设）。
+func srFixture(t *testing.T, s *Store, taskID string, budget int64, caps map[string]*int64) {
+	t.Helper()
+	gwFixture(t, s, taskID, budget)
+	for id, c := range caps {
+		if _, err := s.StartSubrun(context.Background(), taskID, "att-"+taskID, id, subrunDef("plan", c)); err != nil {
+			t.Fatalf("StartSubrun(%s): %v", id, err)
+		}
+	}
+}
+
+func srBeginReq(taskID, sub, callID, endpoint string) call.BeginCallRequest {
+	return call.BeginCallRequest{TaskID: taskID, CallID: callID, AttemptID: "att-" + taskID, Fingerprint: "fp-" + callID,
+		Endpoint: endpoint, Deadline: 120 * time.Second, SubrunID: sub}
+}
+
+func srBegin(t *testing.T, s *Store, taskID, sub, callID string) {
+	t.Helper()
+	res, err := s.BeginCall(context.Background(), srBeginReq(taskID, sub, callID, "chat"))
+	if err != nil || res.Existing {
+		t.Fatalf("BeginCall %s: %+v / %v", callID, res, err)
+	}
+	checkI3Layers(t, s)
+}
+
+func srReserve(s *Store, taskID, sub, callID string, est int64) (call.Try, error) {
+	return s.ReserveTry(context.Background(), call.ReserveTryRequest{TaskID: taskID, CallID: callID, AttemptID: "att-" + taskID,
+		EnvID: "env-" + taskID, EstimateMicro: est, MaxTries: 3, SubrunID: sub})
+}
+
+func srMustReserve(t *testing.T, s *Store, taskID, sub, callID string, est int64) call.Try {
+	t.Helper()
+	tr, err := srReserve(s, taskID, sub, callID, est)
+	if err != nil {
+		t.Fatalf("ReserveTry %s: %v", callID, err)
+	}
+	checkI3Layers(t, s)
+	return tr
+}
+
+func srSettle(t *testing.T, s *Store, tr call.Try, outcome string, actual int64) {
+	t.Helper()
+	st := call.Settlement{Try: tr, Outcome: outcome, ActualMicro: actual}
+	if outcome == "ok" {
+		st.ResultSHA256, st.ResultSize = srSHA(tr.CallID), 1
+	}
+	if _, err := s.SettleTry(context.Background(), st); err != nil {
+		t.Fatalf("SettleTry %+v: %v", st, err)
+	}
+	checkI3Layers(t, s)
+}
+
+// srSHA 把 s（≤ 32 字节）编码为一个 64 位小写十六进制的结果 sha，用作测试结果 blob。
+func srSHA(s string) string {
+	b := make([]byte, 32)
+	copy(b, s)
+	return hex.EncodeToString(b)
+}
+
+// checkI3Layers 断言两层的 I3：task 层见 checkI3；每个 sub-run 层 reserved = Σ 该 sub-run 的 held、unknown = Σ charged_unknown、
+// spent = Σ ok try 的实际费用；Σ sub-run reserved/spent/unknown 不超过 task 层对应的桶；reservation 的 subrun_id 与其调用一致。
+func checkI3Layers(t *testing.T, s *Store) {
+	t.Helper()
+	checkI3(t, s)
+	var bad *string
+	if err := s.pool.QueryRow(context.Background(), `SELECT string_agg(v, '; ') FROM (
+		SELECT format('sub-run %s/%s：reserved %s / held %s，unknown %s / charged_unknown %s，spent %s / ok %s', sb.task_id, sb.subrun_id,
+				sb.reserved_micro, h.held, sb.unknown_micro, h.unk, sb.spent_micro, h.ok) AS v
+			FROM subrun_budgets sb, LATERAL (SELECT
+				COALESCE((SELECT sum(amount) FROM reservations r WHERE r.task_id = sb.task_id AND r.subrun_id = sb.subrun_id AND r.state = 'held'), 0) AS held,
+				COALESCE((SELECT sum(amount) FROM reservations r WHERE r.task_id = sb.task_id AND r.subrun_id = sb.subrun_id AND r.state = 'charged_unknown'), 0) AS unk,
+				COALESCE((SELECT sum(c.cost_micro) FROM call_tries c JOIN reservations r USING (reservation_id)
+					WHERE r.task_id = sb.task_id AND r.subrun_id = sb.subrun_id AND c.outcome = 'ok'), 0) AS ok) h
+			WHERE sb.reserved_micro <> h.held OR sb.unknown_micro <> h.unk OR sb.spent_micro <> h.ok
+		UNION ALL
+		SELECT format('任务 %s：Σ sub-run reserved %s / spent %s / unknown %s 超过 task 层 %s / %s / %s', b.task_id,
+				x.r, x.s, x.u, b.reserved_micro, b.spent_micro, b.unknown_micro)
+			FROM budgets b JOIN (SELECT task_id, sum(reserved_micro) AS r, sum(spent_micro) AS s, sum(unknown_micro) AS u
+				FROM subrun_budgets GROUP BY task_id) x USING (task_id)
+			WHERE x.r > b.reserved_micro OR x.s > b.spent_micro OR x.u > b.unknown_micro
+		UNION ALL
+		SELECT format('reservation %s 的 subrun_id %s 与调用 %s 的 %s 不同', r.reservation_id, r.subrun_id, r.call_id, c.subrun_id)
+			FROM reservations r JOIN calls c USING (task_id, call_id) WHERE r.subrun_id IS DISTINCT FROM c.subrun_id
+		) x`).Scan(&bad); err != nil {
+		t.Fatal(err)
+	}
+	if bad != nil {
+		t.Fatalf("违反两层 I3：%s", *bad)
+	}
+}
+
+// expectLayers 断言 task 层与 sub-run 层的 reserved/spent/unknown。
+func expectLayers(t *testing.T, s *Store, taskID string, taskLayer [3]int64, sub string, subLayer [3]int64) {
+	t.Helper()
+	b, err := s.LoadBudget(context.Background(), taskID)
+	if err != nil || [3]int64{b.ReservedMicro, b.SpentMicro, b.UnknownMicro} != taskLayer {
+		t.Fatalf("task 层 reserved/spent/unknown 应为 %v，得到 %+v / %v", taskLayer, b, err)
+	}
+	sb, err := s.LoadSubrunBudget(context.Background(), taskID, sub)
+	if err != nil || [3]int64{sb.ReservedMicro, sb.SpentMicro, sb.UnknownMicro} != subLayer {
+		t.Fatalf("sub-run %s 层 reserved/spent/unknown 应为 %v，得到 %+v / %v", sub, subLayer, sb, err)
+	}
+}
+
+func callSubrun(t *testing.T, s *Store, taskID, callID string) string {
+	t.Helper()
+	var sub *string
+	if err := s.pool.QueryRow(context.Background(), "SELECT subrun_id FROM calls WHERE task_id = $1 AND call_id = $2", taskID, callID).
+		Scan(&sub); err != nil {
+		t.Fatal(err)
+	}
+	if sub == nil {
+		return ""
+	}
+	return *sub
+}
+
+// TestSubrunLedgerReserveSettle：带 sub-run 的预留两层同时增加；ok/retryable/fatal/unknown 结算两层同步（按 reservation 的
+// subrun_id）；sub-run 赤字允许；sub-run 层可用不足 → budget_insufficient_for_request（注明 sub-run 层）且两层不变；
+// 可用 ≤ 0 → subrun_budget_exhausted，同任务 root 与无上限 sub-run 仍可预留（E43 的账本部分）。
+func TestSubrunLedgerReserveSettle(t *testing.T) {
+	s := newStore(t, Options{})
+	srFixture(t, s, "t1", 10_000, map[string]*int64{"st1": capOf(400), "st2": nil, "st3": capOf(100)})
+
+	srBegin(t, s, "t1", "st1", "st1/c1")
+	if got := callSubrun(t, s, "t1", "st1/c1"); got != "st1" {
+		t.Fatalf("calls.subrun_id = %q", got)
+	}
+	tr := srMustReserve(t, s, "t1", "st1", "st1/c1", 150)
+	expectLayers(t, s, "t1", [3]int64{150, 0, 0}, "st1", [3]int64{150, 0, 0})
+	srSettle(t, s, tr, "ok", 300)
+	expectLayers(t, s, "t1", [3]int64{0, 300, 0}, "st1", [3]int64{0, 300, 0})
+
+	// sub-run 可用 100 < 估算 150：budget_insufficient_for_request，消息注明 sub-run 层，两层不变。
+	srBegin(t, s, "t1", "st1", "st1/c2")
+	_, err := srReserve(s, "t1", "st1", "st1/c2", 150)
+	expectRejected(t, err, persistence.CodeBudgetInsufficient)
+	if !strings.Contains(err.Error(), "sub-run") {
+		t.Fatalf("消息应注明 sub-run 层：%v", err)
+	}
+	expectLayers(t, s, "t1", [3]int64{0, 300, 0}, "st1", [3]int64{0, 300, 0})
+	checkI3Layers(t, s)
+
+	// 上限 100、估算 150：同样拒绝，两层不变。
+	srBegin(t, s, "t1", "st3", "st3/c1")
+	_, err = srReserve(s, "t1", "st3", "st3/c1", 150)
+	expectRejected(t, err, persistence.CodeBudgetInsufficient)
+	expectLayers(t, s, "t1", [3]int64{0, 300, 0}, "st3", [3]int64{0, 0, 0})
+
+	// 赤字：实际 250 超过剩余 100，sub-run spent 550 > cap 400，允许。
+	srSettle(t, s, srMustReserve(t, s, "t1", "st1", "st1/c2", 100), "ok", 250)
+	expectLayers(t, s, "t1", [3]int64{0, 550, 0}, "st1", [3]int64{0, 550, 0})
+
+	// sub-run 可用 ≤ 0：subrun_budget_exhausted；root 与无上限的 st2 不受影响（E43）。
+	srBegin(t, s, "t1", "st1", "st1/c3")
+	_, err = srReserve(s, "t1", "st1", "st1/c3", 1)
+	expectRejected(t, err, persistence.CodeSubrunBudgetExhausted)
+	beginCall(t, s, "t1", "r1")
+	mustReserve(t, s, "t1", "r1", 100)
+	srBegin(t, s, "t1", "st2", "st2/c1")
+	tr2 := srMustReserve(t, s, "t1", "st2", "st2/c1", 200)
+	expectLayers(t, s, "t1", [3]int64{300, 550, 0}, "st2", [3]int64{200, 0, 0})
+
+	// retryable 释放两层；再 try 后 fatal 释放；unknown 计入两层 unknown。
+	srSettle(t, s, tr2, "retryable", 0)
+	expectLayers(t, s, "t1", [3]int64{100, 550, 0}, "st2", [3]int64{0, 0, 0})
+	srSettle(t, s, srMustReserve(t, s, "t1", "st2", "st2/c1", 200), "fatal", 0)
+	expectLayers(t, s, "t1", [3]int64{100, 550, 0}, "st2", [3]int64{0, 0, 0})
+	srBegin(t, s, "t1", "st2", "st2/c2")
+	tr3 := srMustReserve(t, s, "t1", "st2", "st2/c2", 70)
+	srSettle(t, s, tr3, "unknown", 0)
+	expectLayers(t, s, "t1", [3]int64{100, 550, 70}, "st2", [3]int64{0, 0, 70})
+	// 重复结算幂等：两层不再变化。
+	srSettle(t, s, tr3, "unknown", 0)
+	expectLayers(t, s, "t1", [3]int64{100, 550, 70}, "st2", [3]int64{0, 0, 70})
+	if n := count(t, s, "SELECT count(*) FROM reservations WHERE subrun_id = 'st2'"); n != 3 {
+		t.Fatalf("st2 的 reservation 应为 3 笔，得到 %d", n)
+	}
+
+	// 预留请求的 sub-run 与调用登记的不同：fingerprint_mismatch，不预留。
+	_, err = srReserve(s, "t1", "st2", "st1/c3", 1)
+	expectRejected(t, err, persistence.CodeFingerprintMismatch)
+	_, err = srReserve(s, "t1", "", "st1/c3", 1)
+	expectRejected(t, err, persistence.CodeFingerprintMismatch)
+	checkI3Layers(t, s)
+}
+
+// TestSubrunLedgerConvert：unknown 结算与启动账本转换后两层同步：每层 reserved = Σ held（转换后为 0）、unknown = Σ
+// charged_unknown，Σ subrun_budgets.unknown ≤ budgets.unknown；再次转换为空操作。
+func TestSubrunLedgerConvert(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	srFixture(t, s, "t1", 10_000, map[string]*int64{"st1": capOf(1000), "st2": nil})
+	srBegin(t, s, "t1", "st1", "st1/c1")
+	srMustReserve(t, s, "t1", "st1", "st1/c1", 300)
+	srBegin(t, s, "t1", "st1", "st1/c2")
+	srSettle(t, s, srMustReserve(t, s, "t1", "st1", "st1/c2", 50), "unknown", 0)
+	srBegin(t, s, "t1", "st2", "st2/c1")
+	srMustReserve(t, s, "t1", "st2", "st2/c1", 200)
+	beginCall(t, s, "t1", "r1")
+	mustReserve(t, s, "t1", "r1", 100)
+
+	got, err := s.ConvertLedger(ctx)
+	if want := (recovery.LedgerConversion{Reservations: 3, Calls: 3, UnknownMicro: 600}); err != nil || got != want {
+		t.Fatalf("ConvertLedger = %+v / %v，期望 %+v", got, err, want)
+	}
+	checkI3Layers(t, s)
+	expectLayers(t, s, "t1", [3]int64{0, 0, 650}, "st1", [3]int64{0, 0, 350})
+	expectLayers(t, s, "t1", [3]int64{0, 0, 650}, "st2", [3]int64{0, 0, 200})
+	again, err := s.ConvertLedger(ctx)
+	if err != nil || again != (recovery.LedgerConversion{}) {
+		t.Fatalf("再次转换应为空操作：%+v / %v", again, err)
+	}
+	expectLayers(t, s, "t1", [3]int64{0, 0, 650}, "st1", [3]int64{0, 0, 350})
+	// sub-run 可用 = 1000 − 350 = 650：转换后的 unknown 计入 sub-run 层可用。
+	_, err = srReserve(s, "t1", "st1", "st1/c1", 700)
+	expectRejected(t, err, persistence.CodeBudgetInsufficient)
+	srMustReserve(t, s, "t1", "st1", "st1/c1", 650)
+}
+
+// TestSubrunGatewayAccess：带 sub-run 的访问检查（属于本任务、绑定当前 attempt、started，否则 subrun_closed），顺序
+// 访问撤销 → 非当前 attempt → 已请求取消 → subrun_closed；同 call_id 不同 sub-run → fingerprint_mismatch；
+// CompleteFromCache 带 sub-run 不动两层账本并写 calls.subrun_id。
+func TestSubrunGatewayAccess(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	srFixture(t, s, "t1", 10_000, map[string]*int64{"st1": capOf(1000), "st2": capOf(1000), "st3": nil})
+
+	f, err := s.CheckAccess(ctx, "t1", "att-t1", "st1")
+	if err != nil || f.SubrunID != "st1" || !f.SubrunOpen || !f.Active || !f.Current {
+		t.Fatalf("CheckAccess(st1) = %+v / %v", f, err)
+	}
+	if f, err := s.CheckAccess(ctx, "t1", "att-t1", ""); err != nil || f.SubrunID != "" || !f.Active || !f.Current {
+		t.Fatalf("CheckAccess(root) = %+v / %v", f, err)
+	}
+	if f, err := s.CheckAccess(ctx, "t1", "att-t1", "zz"); err != nil || f.SubrunOpen {
+		t.Fatalf("未知 sub-run 应不可用：%+v / %v", f, err)
+	}
+	if f, err := s.CheckAccess(ctx, "t1", "att-other", "st1"); err != nil || f.SubrunOpen {
+		t.Fatalf("未绑定调用方 attempt 的 sub-run 应不可用：%+v / %v", f, err)
+	}
+	expectRejected(t, admitAccess(call.AccessFacts{Active: true, Current: true, Desired: "run", SubrunID: "zz"}),
+		persistence.CodeSubrunClosed)
+	expectRejected(t, admitAccess(call.AccessFacts{Active: true, Current: true, Desired: "cancel", SubrunID: "zz"}),
+		persistence.CodeCancelRequested)
+	expectRejected(t, admitAccess(call.AccessFacts{Active: true, Current: false, Desired: "run", SubrunID: "zz"}),
+		persistence.CodeNotCurrentAttempt)
+
+	// 同 call_id 以不同 sub-run（或 root）再次 BeginCall：fingerprint_mismatch；同 sub-run 的重放返回已有记录。
+	srBegin(t, s, "t1", "st1", "st1/c1")
+	_, err = s.BeginCall(ctx, srBeginReq("t1", "st2", "st1/c1", "chat"))
+	expectRejected(t, err, persistence.CodeFingerprintMismatch)
+	_, err = s.BeginCall(ctx, srBeginReq("t1", "", "st1/c1", "chat"))
+	expectRejected(t, err, persistence.CodeFingerprintMismatch)
+	if res, err := s.BeginCall(ctx, srBeginReq("t1", "st1", "st1/c1", "chat")); err != nil || !res.Existing || res.Record.SubrunID != "st1" {
+		t.Fatalf("同 sub-run 的重放应返回已有记录：%+v / %v", res, err)
+	}
+	beginCall(t, s, "t1", "r1")
+	_, err = s.BeginCall(ctx, srBeginReq("t1", "st1", "r1", "chat"))
+	expectRejected(t, err, persistence.CodeFingerprintMismatch)
+
+	// 缓存完成带 sub-run：不动两层账本，calls.subrun_id 为该 sub-run；与登记不同的 sub-run 为 fingerprint_mismatch。
+	srBegin(t, s, "t1", "st3", "st3/c1")
+	_, err = s.CompleteFromCache(ctx, call.CacheCompletion{TaskID: "t1", CallID: "st3/c1", AttemptID: "att-t1",
+		ResultSHA256: srSHA("st3/c1"), ResultSize: 1, SubrunID: "st1"})
+	expectRejected(t, err, persistence.CodeFingerprintMismatch)
+	rec, err := s.CompleteFromCache(ctx, call.CacheCompletion{TaskID: "t1", CallID: "st3/c1", AttemptID: "att-t1",
+		ResultSHA256: srSHA("st3/c1"), ResultSize: 1, SubrunID: "st3"})
+	if err != nil || rec.State != call.StateCompleted || rec.SubrunID != "st3" {
+		t.Fatalf("CompleteFromCache = %+v / %v", rec, err)
+	}
+	if got := callSubrun(t, s, "t1", "st3/c1"); got != "st3" {
+		t.Fatalf("calls.subrun_id = %q", got)
+	}
+	expectLayers(t, s, "t1", [3]int64{0, 0, 0}, "st3", [3]int64{0, 0, 0})
+	checkI3Layers(t, s)
+
+	// st2 进入 cancel_requested：ReserveTry、CompleteFromCache 与 BeginCall 均 subrun_closed，两层不变，不登记调用。
+	srBegin(t, s, "t1", "st2", "st2/c1")
+	srBegin(t, s, "t1", "st2", "st2/c2")
+	if _, err := s.RequestSubrunCancel(ctx, "t1", "st2", subrun.ReasonDeadline); err != nil {
+		t.Fatal(err)
+	}
+	_, err = srReserve(s, "t1", "st2", "st2/c1", 10)
+	expectRejected(t, err, persistence.CodeSubrunClosed)
+	_, err = s.CompleteFromCache(ctx, call.CacheCompletion{TaskID: "t1", CallID: "st2/c2", AttemptID: "att-t1",
+		ResultSHA256: srSHA("st2/c2"), ResultSize: 1, SubrunID: "st2"})
+	expectRejected(t, err, persistence.CodeSubrunClosed)
+	_, err = s.BeginCall(ctx, srBeginReq("t1", "st2", "st2/c3", "chat"))
+	expectRejected(t, err, persistence.CodeSubrunClosed)
+	if f, err := s.CheckAccess(ctx, "t1", "att-t1", "st2"); err != nil || f.SubrunOpen {
+		t.Fatalf("cancel_requested 的 sub-run 应不可用：%+v / %v", f, err)
+	}
+	expectLayers(t, s, "t1", [3]int64{0, 0, 0}, "st2", [3]int64{0, 0, 0})
+	if n := count(t, s, "SELECT count(*) FROM calls WHERE call_id = 'st2/c3'"); n != 0 {
+		t.Fatal("被拒绝的请求不应登记调用")
+	}
+
+	// 访问撤销先于 subrun_closed。
+	if err := s.RevokeAttemptAccess(ctx, "att-t1", "stopping"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = srReserve(s, "t1", "st2", "st2/c1", 10)
+	expectRejected(t, err, persistence.CodeAccessRevoked)
+	checkI3Layers(t, s)
+}
+
+// TestSubrunClosedDoesNotCountTools：被 subrun_closed 拒绝的搜索与抓取不增加 Plan 12 的工具计数；开放 sub-run 的搜索计入
+// task 计数（不设 sub-run 级工具上限）。
+func TestSubrunClosedDoesNotCountTools(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	limit := int64(30)
+	toolTask(t, s, "t1", &limit)
+	for _, id := range []string{"st1", "st2"} {
+		if _, err := s.StartSubrun(ctx, "t1", "att-t1", id, subrunDef("plan", nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := s.BeginCall(ctx, srBeginReq("t1", "st1", "st1/s1", "/v1/search"))
+	if err != nil || res.ToolBudget == nil || res.ToolBudget.Used != 1 {
+		t.Fatalf("开放 sub-run 的搜索应计数：%+v / %v", res, err)
+	}
+	if _, err := s.RequestSubrunCancel(ctx, "t1", "st2", subrun.ReasonOrchestrator); err != nil {
+		t.Fatal(err)
+	}
+	for _, ep := range []string{"/v1/search", "/v1/fetch"} {
+		_, err := s.BeginCall(ctx, srBeginReq("t1", "st2", "st2/"+ep, ep))
+		expectRejected(t, err, persistence.CodeSubrunClosed)
+	}
+	_, err = s.BeginCall(ctx, srBeginReq("t1", "nope", "nope/s1", "/v1/search"))
+	expectRejected(t, err, persistence.CodeSubrunClosed)
+	if b, err := s.LoadBudget(ctx, "t1"); err != nil || b.ToolCallsUsed != 1 {
+		t.Fatalf("被 subrun_closed 拒绝的请求不应计数：%+v / %v", b, err)
+	}
+}
+
+// TestSubrunReserveCommitLostE11b：COMMIT 丢失后以同一 try_no 重试不重复预留（sub-run 层同样只加一次）。
+func TestSubrunReserveCommitLostE11b(t *testing.T) {
+	s := newStore(t, Options{})
+	srFixture(t, s, "t1", 1000, map[string]*int64{"st1": capOf(500)})
+	srBegin(t, s, "t1", "st1", "st1/c1")
+	var lost atomic.Bool
+	s.hooks.afterCommit = func(op string) error {
+		if op == "ReserveTry" && lost.CompareAndSwap(false, true) {
+			return errors.New("模拟：COMMIT 已执行但回复丢失")
+		}
+		return nil
+	}
+	tr, err := srReserve(s, "t1", "st1", "st1/c1", 300)
+	if err != nil || !lost.Load() || tr.TryNo != 1 {
+		t.Fatalf("应解析为原 try：%+v / %v（钩子触发 %v）", tr, err, lost.Load())
+	}
+	s.hooks.afterCommit = nil
+	again, err := srReserve(s, "t1", "st1", "st1/c1", 300)
+	if err != nil || again != tr {
+		t.Fatalf("同一身份重试应返回原 try：%+v / %v，原为 %+v", again, err, tr)
+	}
+	if n := count(t, s, "SELECT count(*) FROM reservations"); n != 1 {
+		t.Fatalf("应只有 1 笔预留，得到 %d", n)
+	}
+	expectLayers(t, s, "t1", [3]int64{300, 0, 0}, "st1", [3]int64{300, 0, 0})
+	checkI3Layers(t, s)
+}
+
+// TestSubrunReserveConcurrent：并发预留下两层上限都精确：sub-run 上限 1000、20 个估算 100 的调用并发 → 恰 10 个成功、
+// 10 个 subrun_budget_exhausted；同时 10 个 root 调用全部成功；另一 sub-run 在并发预留中被请求取消，每个请求要么在取消前
+// 预留成功、要么 subrun_closed；之后并发结算；每一步两层 I3 成立。
+func TestSubrunReserveConcurrent(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	srFixture(t, s, "t1", 1_000_000, map[string]*int64{"st1": capOf(1000), "st2": nil})
+	type job struct{ sub, id string }
+	var jobs []job
+	for i := 0; i < 20; i++ {
+		jobs = append(jobs, job{"st1", fmt.Sprintf("st1/c%d", i)})
+	}
+	for i := 0; i < 10; i++ {
+		jobs = append(jobs, job{"", fmt.Sprintf("r%d", i)}, job{"st2", fmt.Sprintf("st2/c%d", i)})
+	}
+	for _, j := range jobs {
+		res, err := s.BeginCall(ctx, srBeginReq("t1", j.sub, j.id, "chat"))
+		if err != nil || res.Existing {
+			t.Fatalf("BeginCall %s: %+v / %v", j.id, res, err)
+		}
+	}
+	results := make([]error, len(jobs))
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i, j := range jobs {
+		wg.Add(1)
+		go func(i int, j job) {
+			defer wg.Done()
+			<-start
+			_, results[i] = srReserve(s, "t1", j.sub, j.id, 100)
+		}(i, j)
+	}
+	var cancelErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, cancelErr = s.RequestSubrunCancel(ctx, "t1", "st2", subrun.ReasonOrchestrator)
+	}()
+	close(start)
+	wg.Wait()
+	if cancelErr != nil {
+		t.Fatal(cancelErr)
+	}
+	ok := map[string]int{}
+	for i, j := range jobs {
+		var rej *persistence.RejectedError
+		switch {
+		case results[i] == nil:
+			ok[j.sub]++
+		case j.sub == "st1" && errors.As(results[i], &rej) && rej.Code == persistence.CodeSubrunBudgetExhausted:
+		case j.sub == "st2" && errors.As(results[i], &rej) && rej.Code == persistence.CodeSubrunClosed:
+		default:
+			t.Fatalf("%s 的预留结果不应为 %v", j.id, results[i])
+		}
+	}
+	if ok["st1"] != 10 || ok[""] != 10 {
+		t.Fatalf("st1 应恰 10 个成功、root 10 个成功：%v", ok)
+	}
+	checkI3Layers(t, s)
+	n2 := int64(ok["st2"])
+	expectLayers(t, s, "t1", [3]int64{2000 + 100*n2, 0, 0}, "st1", [3]int64{1000, 0, 0})
+	expectLayers(t, s, "t1", [3]int64{2000 + 100*n2, 0, 0}, "st2", [3]int64{100 * n2, 0, 0})
+	// 取消之后的新预留一律 subrun_closed（已预留的 try 以同一身份重试仍返回原 try）。
+	for i := 0; i < 10; i++ {
+		if _, err := srReserve(s, "t1", "st2", fmt.Sprintf("st2/c%d", i), 99); err != nil {
+			expectRejected(t, err, persistence.CodeSubrunClosed)
+		} else {
+			t.Fatalf("取消后 st2/c%d 不应得到新预留", i)
+		}
+	}
+	// 并发结算（不复查访问）：两层同步释放。
+	var wg2 sync.WaitGroup
+	for _, j := range jobs {
+		wg2.Add(1)
+		go func(id string) {
+			defer wg2.Done()
+			_, tries, err := s.LoadCall(ctx, "t1", id)
+			if err != nil {
+				t.Errorf("LoadCall %s: %v", id, err)
+				return
+			}
+			if len(tries) == 0 {
+				return
+			}
+			tr := call.Try{TaskID: "t1", CallID: id, TryNo: tries[0].TryNo, ReservationID: tries[0].ReservationID}
+			if _, err := s.SettleTry(ctx, call.Settlement{Try: tr, Outcome: "retryable"}); err != nil {
+				t.Errorf("SettleTry %s: %v", id, err)
+			}
+		}(j.id)
+	}
+	wg2.Wait()
+	checkI3Layers(t, s)
+	expectLayers(t, s, "t1", [3]int64{0, 0, 0}, "st1", [3]int64{0, 0, 0})
+	expectLayers(t, s, "t1", [3]int64{0, 0, 0}, "st2", [3]int64{0, 0, 0})
+}
+
+// ==== M4 Plan 14 Task 4 段结束 ====
