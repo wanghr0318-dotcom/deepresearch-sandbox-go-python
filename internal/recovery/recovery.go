@@ -29,6 +29,10 @@ type Coordinator interface {
 	// ReclaimOrphan 回收属于本安装、无对应记录的环境资源（§14.1 扫描表）：在该环境的串行执行者内
 	// 停止并逐层销毁；幂等，资源已不存在时返回 nil。
 	ReclaimOrphan(ctx context.Context, envID string) error
+	// ReleaseCheckedUIDRange 归还清理已完成的环境的 UID 范围，归还前与 cleanup loop 相同地回收 workspace 属主并以
+	// provider.ScanUIDFiles 核查残留（M4 Plan 15 D13）：仍有归该范围的文件时隔离该范围并报警（released 为假、无错误）。
+	// 分配代次已变化为 persistence.ErrConflict。
+	ReleaseCheckedUIDRange(ctx context.Context, ur resource.UIDRange) (released bool, err error)
 }
 
 var _ Coordinator = (*resource.Coordinator)(nil)
@@ -94,6 +98,8 @@ type Report struct {
 	Steps    []StepResult
 	// Ledger 是本次执行的账本转换结果（§14.1 第 4 步；重跑时已转换的记录不再计入）。
 	Ledger LedgerConversion
+	// EvictedSessions 是重启驱逐（§12.6、§14.1 第 7 步）的结果：被驱逐的会话与被结束的 incarnation（重跑时为空）。
+	EvictedSessions []EvictedSession
 }
 
 const (
@@ -153,6 +159,14 @@ func Execute(ctx context.Context, plan reconcile.RecoveryPlan, d Deps) (Report, 
 			return x.r, fmt.Errorf("recovery: 步骤 %s: %w", s.ID, err)
 		}
 	}
+	// 第 7 步（规格 §12.6）：会话的环境（kind = session，含 frozen 的：provider.Stop 直接 kill 冻结的进程并等
+	// populated 0）已由计划的 StopEnv 停止；运行中 turn 的 attempt 已按 §14.2 提交 lost_on_restart（故障重试，下一次
+	// 授予走冷恢复）。此后单事务驱逐全部未关闭会话、结束遗留 incarnation，最新 session checkpoint 保留。
+	evicted, err := d.Store.EvictSessionsOnRestart(ctx)
+	if err != nil {
+		return x.r, fmt.Errorf("recovery: 重启驱逐会话: %w", err)
+	}
+	x.r.EvictedSessions = evicted
 	occupied, err := x.occupied(ctx)
 	if err != nil {
 		return x.r, fmt.Errorf("recovery: 计算占用: %w", err)
@@ -454,7 +468,8 @@ func (x *executor) resolveIntent(ctx context.Context, s reconcile.Step) error {
 	return nil
 }
 
-// releaseUIDRange：范围已不属于该环境或该分配代次（已归还或已被复用）则跳过。
+// releaseUIDRange：范围已不属于该环境或该分配代次（已归还、已隔离或已被复用）则跳过；否则经 coordinator 回收、
+// 核查并归还（M4 Plan 15 D13）：仍有归该范围的文件时该范围已被隔离并报警（不归还、不计入占用）。
 func (x *executor) releaseUIDRange(ctx context.Context, s reconcile.Step) error {
 	ur, err := x.d.Resources.GetUIDRange(ctx, s.EnvID)
 	switch {
@@ -467,13 +482,20 @@ func (x *executor) releaseUIDRange(ctx context.Context, s reconcile.Step) error 
 		x.result(s, StepSkipped, "UID 范围已归还")
 		return nil
 	}
-	_, err = x.d.Resources.ReleaseUIDRange(ctx, s.UIDRangeID, s.AllocationID)
-	if errors.Is(err, persistence.ErrConflict) {
+	released, err := x.d.Coordinator.ReleaseCheckedUIDRange(ctx, ur)
+	switch {
+	case errors.Is(err, persistence.ErrConflict):
 		x.result(s, StepSkipped, "UID 范围已被后来的分配复用")
 		return nil
-	}
-	if err != nil {
+	case err != nil:
 		return err
+	case !released:
+		path := resource.UIDRangeQuarantinePath(ur.UIDRangeID)
+		if x.once("q:" + path) {
+			x.r.Quarantined = append(x.r.Quarantined, path)
+		}
+		x.result(s, StepQuarantined, "UID 范围仍拥有数据目录中的文件，已隔离并报警")
+		return nil
 	}
 	x.result(s, StepDone, "")
 	return nil

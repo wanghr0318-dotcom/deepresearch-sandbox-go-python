@@ -54,6 +54,8 @@ type Provider struct {
 
 	// afterOwner 是测试钩子：Create 写完 owner.json 之后、建 cgroup 之前调用。
 	afterOwner func()
+	// eventsFile 是测试钩子：Freeze/Thaw 确认冻结状态所读的 cgroup 文件名，空为 cgroup.events（E31 以不存在的文件注入失败）。
+	eventsFile string
 
 	mu   sync.Mutex
 	envs map[string]*envState // 本进程创建的环境；进程重启后为空（不接管存活环境）
@@ -86,8 +88,14 @@ func New(opt Options) (*Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("local: 数据目录: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(data, "envs"), 0o700); err != nil {
+	// 环境目录根 0711：exec 环境的 init 以映射 root 运行，只有"其他人"的权限，须能经过它到达
+	// <envs>/<env_id>/in 与 out（Plan 15 D1、D2）。没有 r 位，不能列出其中的环境。
+	envs := filepath.Join(data, "envs")
+	if err := os.MkdirAll(envs, 0o711); err != nil {
 		return nil, fmt.Errorf("local: 创建环境目录根: %w", err)
+	}
+	if err := os.Chmod(envs, 0o711); err != nil { // 已存在的目录与 umask 都不影响结果
+		return nil, fmt.Errorf("local: 设置环境目录根权限: %w", err)
 	}
 	// 挂载表中的路径没有符号链接；解析后才能按前缀匹配数据目录下的挂载。
 	if data, err = filepath.EvalSymlinks(data); err != nil {
@@ -244,7 +252,8 @@ func syncDir(dir string) error {
 // 属于本安装但不完整 → ErrIncomplete；owner.json 缺失、损坏或属于其他安装 → ErrForeign。
 // ctx 结束时停止推进并返回 ctx 的错误，已建的部分留在原处。
 //
-// 挂载（rootfs、workspace、Gateway socket）由生产启动器在 Plan 1B 之后完成，必在 owner.json 之后。
+// 沙箱内的挂载（rootfs、workspace、Gateway socket、/in、/out 的 bind）由 init 在自己的 mount namespace 中建立；
+// 宿主侧唯一的挂载是 exec 环境 <envdir>/out 的 tmpfs（prepareExecDirs），在 owner.json 之后、启动 init 之前。
 func (p *Provider) Create(ctx context.Context, spec provider.EnvSpec) (provider.EnvInfo, error) {
 	if err := spec.Validate(); err != nil {
 		return provider.EnvInfo{}, err
@@ -261,10 +270,18 @@ func (p *Provider) Create(ctx context.Context, spec provider.EnvSpec) (provider.
 	hash := provider.SpecHash(spec)
 	dir := p.envDir(spec.EnvID)
 
-	if err := os.Mkdir(dir, 0o700); errors.Is(err, os.ErrExist) {
+	// exec 环境的目录 0711：init 须经过它到达 in/ 与 out/（D2）；其余环境 0700。
+	mode := os.FileMode(0o700)
+	if spec.Kind == provider.KindExec {
+		mode = 0o711
+	}
+	if err := os.Mkdir(dir, mode); errors.Is(err, os.ErrExist) {
 		return p.existing(spec, hash)
 	} else if err != nil {
 		return provider.EnvInfo{}, fmt.Errorf("local: 创建环境目录: %w", err)
+	}
+	if err := os.Chmod(dir, mode); err != nil { // 不受 umask 影响
+		return provider.EnvInfo{}, fmt.Errorf("local: 设置环境目录权限: %w", err)
 	}
 	if err := syncDir(p.envsDir); err != nil {
 		return provider.EnvInfo{}, err
@@ -277,6 +294,15 @@ func (p *Provider) Create(ctx context.Context, spec provider.EnvSpec) (provider.
 	}
 	if err := ctx.Err(); err != nil {
 		return provider.EnvInfo{}, err
+	}
+	if spec.Kind == provider.KindExec {
+		// 挂载在 owner.json 之后、启动 init 之前；失败即残留（ErrIncomplete），由 Stop、Destroy 清理。
+		if err := prepareExecDirs(spec, dir); err != nil {
+			return provider.EnvInfo{}, err
+		}
+		if err := ctx.Err(); err != nil {
+			return provider.EnvInfo{}, err
+		}
 	}
 
 	// 同名 cgroup 已存在说明有更早的残留（目录被外部删除）；不复用其中的进程与计数。
@@ -316,7 +342,47 @@ func (p *Provider) Create(ctx context.Context, spec provider.EnvSpec) (provider.
 	p.mu.Lock()
 	p.envs[spec.EnvID] = st
 	p.mu.Unlock()
-	return provider.EnvInfo{EnvID: spec.EnvID, Kind: spec.Kind, Complete: true, Running: true}, nil
+	return provider.EnvInfo{EnvID: spec.EnvID, Kind: spec.Kind, Complete: true, Running: true, InDir: inDir(spec, dir)}, nil
+}
+
+// exec 环境的宿主侧目录（Plan 15 D1、D2）：<envdir>/in 是输入暂存（调用方未提供 Mounts.In 时），
+// <envdir>/out 是宿主挂载的 tmpfs，init 把两者分别只读、可写地 bind 到沙箱内的 /in 与 /out。
+const (
+	execInName  = "in"
+	execOutName = "out"
+	outInodes   = 1024 // /out 的 nr_inodes（§19 补充）
+)
+
+// inDir 返回 exec 环境由 provider 建立的输入暂存目录；其他情况为空。
+func inDir(spec provider.EnvSpec, dir string) string {
+	if spec.Kind != provider.KindExec || spec.Mounts.In != "" {
+		return ""
+	}
+	return filepath.Join(dir, execInName)
+}
+
+// prepareExecDirs 建立 exec 环境的 in/（root 0755，需要时）与 out/，并在 out/ 上挂载 tmpfs：
+// size=OutBytes、nr_inodes=1024、mode=0700、属主为映射 uid/gid 1000（宿主 UIDBase+1000）、nosuid、nodev。
+// tmpfs 页面按写入者计入其 memory cgroup（即环境 cgroup）。卸载由 Destroy 的 unmountUnder 负责。
+func prepareExecDirs(spec provider.EnvSpec, dir string) error {
+	if in := inDir(spec, dir); in != "" {
+		if err := os.Mkdir(in, 0o755); err != nil {
+			return fmt.Errorf("local: 建立 exec 输入目录: %w", err)
+		}
+		if err := os.Chmod(in, 0o755); err != nil {
+			return fmt.Errorf("local: 设置 exec 输入目录权限: %w", err)
+		}
+	}
+	out := filepath.Join(dir, execOutName)
+	if err := os.Mkdir(out, 0o700); err != nil {
+		return fmt.Errorf("local: 建立 exec 输出挂载点: %w", err)
+	}
+	id := spec.UIDBase + workloadID
+	opts := fmt.Sprintf("size=%d,nr_inodes=%d,mode=0700,uid=%d,gid=%d", spec.Mounts.OutBytes, outInodes, id, id)
+	if err := syscall.Mount("tmpfs", out, "tmpfs", syscall.MS_NOSUID|syscall.MS_NODEV, opts); err != nil {
+		return fmt.Errorf("local: 挂载 exec /out tmpfs: %w", err)
+	}
+	return nil
 }
 
 // existing 分类已存在的环境目录（契约第 3 节 Create 的幂等列）。
@@ -339,7 +405,12 @@ func (p *Provider) existing(spec provider.EnvSpec, hash string) (provider.EnvInf
 	if !p.state(spec.EnvID).ready() {
 		return provider.EnvInfo{}, provider.ErrIncomplete
 	}
-	return p.info(spec.EnvID)
+	info, err := p.info(spec.EnvID)
+	if err != nil {
+		return provider.EnvInfo{}, err
+	}
+	info.InDir = inDir(spec, p.envDir(spec.EnvID))
+	return info, nil
 }
 
 // info 返回属于本安装的环境的 EnvInfo。
@@ -392,7 +463,8 @@ func (p *Provider) StartExec(ctx context.Context, envID string, spec provider.Ex
 
 // Stop 关闭执行闸门 → cgroup.kill → 等待 populated 0（契约第 3 节）。成功仅当权威检查成立：
 // 环境 cgroup 不存在，或存在且 populated 为 0。期限内未确认 → ErrStopUnconfirmed。
-// 不等待在途启动；不卸载、不删除。
+// 不等待在途启动；不卸载、不删除。已冻结的环境同样适用：冻结中的进程收到 cgroup.kill 的 SIGKILL 即退出，
+// 不需要先解冻（规格 §12.2"从 frozen 直接销毁"）。
 func (p *Provider) Stop(ctx context.Context, envID string) error {
 	if err := checkName("env_id", envID); err != nil {
 		return err
@@ -532,6 +604,118 @@ func (p *Provider) Destroy(ctx context.Context, envID string) error {
 	delete(p.envs, envID)
 	p.mu.Unlock()
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Freeze、Thaw、Procs（契约第 3 节修订，M4 Plan 12；规格 §12.2、§12.4）
+
+// defaultFreezeTimeout 是 ctx 没有期限时 Freeze/Thaw 等待确认的上限。
+const defaultFreezeTimeout = 10 * time.Second
+
+// Freeze 写 cgroup.freeze=1 并等待 cgroup.events 中 frozen 1（规格 §12.2"宿主写 cgroup.freeze = 1 并等到
+// frozen 1（有期限）后才记录 frozen"）。期限内未确认（或无法读取冻结状态）→ ErrFreezeUnconfirmed，返回前
+// 写 cgroup.freeze=0 尝试解冻（不等待确认；调用方随后驱逐，Stop 对冻结与否都成立）。
+func (p *Provider) Freeze(ctx context.Context, envID string) error {
+	g, err := p.existingGroup(envID)
+	if err != nil {
+		return err
+	}
+	if err := g.Freeze(); err != nil {
+		return fmt.Errorf("local: 冻结环境 %s: %w", envID, err)
+	}
+	if err := p.waitFrozen(ctx, g, true); err != nil {
+		if terr := g.Thaw(); terr != nil {
+			err = errors.Join(err, fmt.Errorf("尝试解冻: %w", terr))
+		}
+		return fmt.Errorf("%w: 环境 %s: %w", provider.ErrFreezeUnconfirmed, envID, err)
+	}
+	return nil
+}
+
+// Thaw 写 cgroup.freeze=0 并等待 frozen 0（期限同 Freeze）。
+func (p *Provider) Thaw(ctx context.Context, envID string) error {
+	g, err := p.existingGroup(envID)
+	if err != nil {
+		return err
+	}
+	if err := g.Thaw(); err != nil {
+		return fmt.Errorf("local: 解冻环境 %s: %w", envID, err)
+	}
+	if err := p.waitFrozen(ctx, g, false); err != nil {
+		return fmt.Errorf("local: 环境 %s 期限内未确认解冻: %w", envID, err)
+	}
+	return nil
+}
+
+// Procs 返回环境 cgroup.procs 中的宿主 pid（规格 §12.4 释放核验的进程基线比较）。
+func (p *Provider) Procs(ctx context.Context, envID string) ([]int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	g, err := p.existingGroup(envID)
+	if err != nil {
+		return nil, err
+	}
+	return g.Procs()
+}
+
+// existingGroup 返回已存在的环境 cgroup；不存在 → ErrNotFound。
+func (p *Provider) existingGroup(envID string) (*cgroup.Group, error) {
+	if err := checkName("env_id", envID); err != nil {
+		return nil, err
+	}
+	g, ok, err := p.group(envID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("%w: 环境 %q 的 cgroup", provider.ErrNotFound, envID)
+	}
+	return g, nil
+}
+
+// waitFrozen 轮询 cgroup.events 的 frozen 直到等于 want；ctx 结束（无期限时取 defaultFreezeTimeout）或读取失败时返回错误。
+func (p *Provider) waitFrozen(ctx context.Context, g *cgroup.Group, want bool) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultFreezeTimeout)
+		defer cancel()
+	}
+	name := p.eventsFile
+	if name == "" {
+		name = "cgroup.events"
+	}
+	path := filepath.Join(g.Path(), name)
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		frozen, err := readFrozen(path)
+		if err != nil {
+			return err
+		}
+		if frozen == want {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("frozen 仍为 %v: %w", frozen, ctx.Err())
+		case <-tick.C:
+		}
+	}
+}
+
+// readFrozen 读取 cgroup.events 中的 frozen 键。
+func readFrozen(path string) (bool, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false, fmt.Errorf("读取 %s: %w", path, err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "frozen "); ok {
+			return strings.TrimSpace(v) == "1", nil
+		}
+	}
+	return false, fmt.Errorf("%s 中没有 frozen", path)
 }
 
 // ---------------------------------------------------------------------------

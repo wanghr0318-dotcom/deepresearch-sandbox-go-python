@@ -5,7 +5,9 @@ import type { TaskEvent } from "../api/client";
 import ArtifactsPanel from "./ArtifactsPanel.vue";
 import CallsPanel from "./CallsPanel.vue";
 import ErrorBanner from "./ErrorBanner.vue";
+import EventTimeline from "./EventTimeline.vue";
 import SubmitTaskForm from "./SubmitTaskForm.vue";
+import SubrunsPanel from "./SubrunsPanel.vue";
 import TaskControls from "./TaskControls.vue";
 import { ev, fakeApi, flushAll, services, task } from "./testkit";
 
@@ -279,6 +281,7 @@ describe("CallsPanel", () => {
     const inspection = {
       task: task(),
       attempts: [],
+      subruns: [],
       checkpoints: [],
       calls: [
         {
@@ -327,5 +330,80 @@ describe("CallsPanel", () => {
     expect(w.get('[data-testid="budget-failure"]').text()).toContain("budget_exhausted");
     await c1.get("button.expander").trigger("click");
     expect(w.text()).toContain("upstream 502");
+  });
+});
+
+// M4 Plan 14 Task 10：运维工作台的 sub-run 表（状态、时间线条、两层费用、失败原因）与按 subrun_id 分泳道的事件时间线。
+describe("SubrunsPanel", () => {
+  const t0 = Date.parse("2026-10-06T08:00:00Z");
+  const iso = (sec: number) => new Date(t0 + sec * 1000).toISOString();
+  const inspection = {
+    task: task(),
+    attempts: [],
+    checkpoints: [],
+    calls: [],
+    budget: { limit_micro: 2_000_000, reserved_micro: 100, spent_micro: 1_500, unknown_micro: 5, tool_call_limit: 30, tool_calls_used: 7 },
+    subruns: [
+      { subrun_id: "st1", parent_step_id: "research", status: "started" as const, started_at: iso(0), deadline_at: iso(600),
+        cap_micro: 400_000, reserved_micro: 100, spent_micro: 1_000, unknown_micro: 5, calls: 4 },
+      { subrun_id: "st2", parent_step_id: "research", status: "timed_out" as const, started_at: iso(30), ended_at: iso(90),
+        deadline_at: iso(60), cancel_reason: "deadline", reserved_micro: 0, spent_micro: 200, unknown_micro: 0, calls: 1 },
+      { subrun_id: "st3", parent_step_id: "research", status: "failed" as const, started_at: iso(0), ended_at: iso(60),
+        deadline_at: iso(600), failure_reason: "model_unavailable", reserved_micro: 0, spent_micro: 0, unknown_micro: 0, calls: 0 },
+    ],
+  };
+
+  it("renders status, reasons, the two cost layers and timeline bars", () => {
+    const w = mount(SubrunsPanel, { props: { inspection, now: t0 + 120_000 } });
+    expect(w.get('[data-testid="task-total"]').text()).toContain("$0.001500");
+    expect(w.get('[data-testid="task-total"]').text()).toContain("$2.000000");
+    expect(w.get('[data-testid="subrun-total"]').text()).toContain("$0.001200");
+    expect(w.get('[data-testid="root-spent"]').text()).toContain("$0.000300");
+    expect(w.get('[data-testid="tool-calls"]').text()).toContain("7 / 30");
+
+    const st1 = w.get('tr[data-subrun="st1"]');
+    expect(st1.get(".badge").text()).toBe("started");
+    expect(st1.text()).toContain("$0.001000");
+    expect(st1.text()).toContain("$0.400000");
+    expect(st1.text()).toContain("4");
+    const st2 = w.get('tr[data-subrun="st2"]');
+    expect(st2.get(".badge").text()).toBe("timed_out");
+    expect(st2.text()).toContain("deadline");
+    expect(st2.text()).toContain("不设上限");
+    expect(w.get('tr[data-subrun="st3"]').text()).toContain("model_unavailable");
+
+    // 时间窗 [t0, now=t0+120s]：st2 从 30 s 到 90 s → left 25%、width 50%；进行中的 st1 延伸到 now。
+    const bar = (id: string) => w.get(`tr[data-subrun="${id}"] [data-testid="subrun-bar"]`).attributes("style") ?? "";
+    expect(bar("st2")).toContain("left: 25%");
+    expect(bar("st2")).toContain("width: 50%");
+    expect(bar("st1")).toContain("left: 0%");
+    expect(bar("st1")).toContain("width: 100%");
+  });
+
+  it("shows an empty state without sub-runs", () => {
+    const w = mount(SubrunsPanel, { props: { inspection: { ...inspection, subruns: [] } } });
+    expect(w.text()).toContain("没有 sub-run");
+    expect(w.find("tr[data-subrun]").exists()).toBe(false);
+  });
+});
+
+describe("EventTimeline lanes", () => {
+  it("groups interleaved events into one lane per subrun_id, root first", () => {
+    const events = [
+      ev(1, "task_created"),
+      ev(2, "subrun_start", { source: "worker", payload: { subrun_id: "st1" } }),
+      ev(3, "subrun_start", { source: "worker", payload: { subrun_id: "st2" } }),
+      ev(4, "progress", { source: "worker", payload: { subrun_id: "st2" } }),
+      ev(5, "progress", { source: "worker", payload: { subrun_id: "st1" } }),
+      ev(6, "checkpoint_committed"),
+      ev(7, "subrun_end", { source: "worker", payload: { subrun_id: "st1" } }),
+    ];
+    const w = mount(EventTimeline, { props: { events } });
+    const lanes = w.findAll("[data-lane]");
+    expect(lanes.map((l) => l.attributes("data-lane"))).toEqual(["root", "st1", "st2"]);
+    const seqs = (i: number) => lanes[i]!.findAll("[data-seq]").map((e) => e.attributes("data-seq"));
+    expect(seqs(0)).toEqual(["1", "6"]);
+    expect(seqs(1)).toEqual(["2", "5", "7"]);
+    expect(seqs(2)).toEqual(["3", "4"]);
   });
 });

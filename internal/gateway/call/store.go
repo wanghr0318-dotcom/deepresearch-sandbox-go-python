@@ -7,6 +7,8 @@ package call
 import (
 	"context"
 	"time"
+
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/subrun"
 )
 
 // AccessFacts 是规格 §9.2 访问检查所需的事实，在一致快照中读取。
@@ -15,10 +17,32 @@ type AccessFacts struct {
 	Active            bool   // attempt_access.state = active
 	Current           bool   // tasks.current_attempt_id = AttemptID
 	Desired           string // task_control.desired
+	SubrunID          string // 请求归属的 sub-run（X-Agentbox-Subrun）；空为 root
+	// SubrunOpen 只在 SubrunID 非空时有意义：该 sub-run 属于本任务、bound_attempt_id = AttemptID 且 status = started
+	// （否则 409 subrun_closed，规格 §9.2）。
+	SubrunOpen bool
 }
 
-// Budget 是 task 层账本（微美元）。
-type Budget struct{ LimitMicro, ReservedMicro, SpentMicro, UnknownMicro int64 }
+// SubrunBudget 是 sub-run 层账本（规格 §9.6；CapMicro 为 nil 表示只做归属、不设上限）；Available 同 subrun.Budget。
+type SubrunBudget = subrun.Budget
+
+// Budget 是 task 层账本（微美元）与每 turn 的工具调用额度。
+type Budget struct {
+	LimitMicro, ReservedMicro, SpentMicro, UnknownMicro int64
+	ToolCallLimit                                       *int64 // nil = 不限（独立任务）
+	ToolCallsUsed                                       int64
+}
+
+// ToolBudget 是搜索与抓取的工具调用额度（X-Agentbox-Tool-Budget: <Used>/<Limit>）；只在任务有上限时出现。
+type ToolBudget struct{ Used, Limit int64 }
+
+// ToolBudget 返回有上限时的工具调用额度，不限时为 nil。
+func (b Budget) ToolBudget() *ToolBudget {
+	if b.ToolCallLimit == nil {
+		return nil
+	}
+	return &ToolBudget{Used: b.ToolCallsUsed, Limit: *b.ToolCallLimit}
+}
 
 // Available 返回可用额度：limit − spent − reserved − unknown（规格 §9.6；可为负，即赤字）。
 func (b Budget) Available() int64 {
@@ -53,6 +77,7 @@ type CallRecord struct {
 	// 为空表示已由 ResetResolving 复位，下一次 BeginCall 会接管它（Existing=false），期限不变。
 	ResolvingSince *time.Time
 	Model          string // 解析后的模型（chat；搜索与抓取为空），只是审计元数据
+	SubrunID       string // 归属的 sub-run（calls.subrun_id；root 为空），登记后不变
 }
 
 // BeginCallRequest 是 Tx1 的输入。Model 只在新建记录时写入；已有记录保持首次写入的值。
@@ -61,12 +86,17 @@ type BeginCallRequest struct {
 	Deadline                                         time.Duration
 	SupersedesCallID, SupersedeReason                string
 	Model                                            string
+	// SubrunID 是请求归属的 sub-run（空为 root）：须可用（否则 subrun_closed，先于工具计数）；新建记录写入
+	// calls.subrun_id；已有记录的 subrun_id 不同 → ErrRejected(fingerprint_mismatch)。
+	SubrunID string
 }
 
-// BeginCallResult：Existing 表示已有同 ID 记录（调用方按 §9.4 表处理）。
+// BeginCallResult：Existing 表示已有同 ID 记录（调用方按 §9.4 表处理）。ToolBudget 只在搜索与抓取且任务有上限时
+// 返回：新登记后的计数，或已有记录（重放）时的当前值；拒绝为 tool_budget_exhausted 时与错误一同返回当前值。
 type BeginCallResult struct {
-	Record   CallRecord
-	Existing bool
+	Record     CallRecord
+	Existing   bool
+	ToolBudget *ToolBudget
 }
 
 // ReserveTryRequest 是 Tx2 的输入。
@@ -74,6 +104,9 @@ type ReserveTryRequest struct {
 	TaskID, CallID, AttemptID, EnvID string
 	EstimateMicro                    int64
 	MaxTries                         int
+	// SubrunID 须与调用登记的 sub-run 相同（否则 fingerprint_mismatch）；非空时另须 sub-run 可用（subrun_closed），
+	// 有上限时 sub-run 层可用 ≤ 0 → subrun_budget_exhausted、< 估算 → budget_insufficient_for_request。
+	SubrunID string
 }
 
 // Try 标识一次已预留的 try；身份为 (TaskID, CallID, TryNo)。
@@ -103,6 +136,7 @@ type CacheCompletion struct {
 	TaskID, CallID, AttemptID, ResultSHA256 string
 	ResultSize                              int64
 	Source                                  string
+	SubrunID                                string // 须与调用登记的 sub-run 相同；非空时另须 sub-run 可用（subrun_closed）
 }
 
 // calls.source 中不经上游 try 的来源。
@@ -113,9 +147,13 @@ const (
 
 // Store 是 call 对持久化层的窄接口。每个方法一个事务（规格 §7.1 锁顺序）。
 type Store interface {
-	// CheckAccess 在一致快照中读取 §9.2 的事实（attempt_access.state、tasks.current_attempt_id、task_control.desired）。
-	CheckAccess(ctx context.Context, taskID, attemptID string) (AccessFacts, error)
+	// CheckAccess 在一致快照中读取 §9.2 的事实（attempt_access.state、tasks.current_attempt_id、task_control.desired；
+	// subrunID 非空时另读该 sub-run 是否可用）。
+	CheckAccess(ctx context.Context, taskID, attemptID, subrunID string) (AccessFacts, error)
+	// LoadSubrunBudget 读取 sub-run 层账本（/v1/budget 带 X-Agentbox-Subrun）；不存在为 ErrNotFound。
+	LoadSubrunBudget(ctx context.Context, taskID, subrunID string) (SubrunBudget, error)
 	// BeginCall 是 Tx1：复查访问 → 无记录则登记 resolving（created_at、deadline_at = created_at + Deadline）；有记录则返回它（含指纹供比较）；
+	// 搜索与抓取新登记时在同一事务计入工具调用额度（已用完为 ErrRejected(tool_budget_exhausted)，不登记）；
 	// 已复位的 resolving（ResolvingSince 为空）由本次请求接管并按新登记返回（Existing=false），created_at、deadline_at 不变。
 	BeginCall(ctx context.Context, r BeginCallRequest) (BeginCallResult, error)
 	// ReserveTry 是 Tx2：复查访问与期限（db now() < deadline_at）、累计 tries_used < MaxTries、预算可用 ≥ 估算；
@@ -125,7 +163,8 @@ type Store interface {
 	// SettleTry 完成一次 try 的结算：ok → spent += actual（可赤字），reservation settled，calls completed + result_ref + scope_blobs(task)；
 	// retryable/fatal → 释放预留（released），calls 保持 in_flight（retryable，由调用方决定是否再 try）或 failed（fatal）；
 	// unknown → unknown += 估算（charged_unknown），calls.state = unknown（BeginCall 见到 unknown 可在上限内新建 try）。
-	// 每笔 reservation 只进入一个桶（互斥记账）；幂等：同 try 重复结算返回已有结果。
+	// 每笔 reservation 只进入一个桶（互斥记账）；幂等：同 try 重复结算返回已有结果。reservation 带 subrun_id 时
+	// sub-run 层在同一事务中同步调整（按 reservation 记录的归属，不取自调用方）。
 	SettleTry(ctx context.Context, s Settlement) (CallRecord, error)
 	// CompleteFromCache 是缓存命中的 Tx2（§11.2）：复查访问（含 desired ≠ cancel；取消先提交则拒绝，命中结果
 	// 不被授权，E23）与期限 → 结果 blob 写入 scope_blobs(task) → calls.completed（source = cache、result_ref）。
@@ -143,7 +182,7 @@ type Store interface {
 	LoadCall(ctx context.Context, taskID, callID string) (CallRecord, []TryRecord, error)
 	ListCalls(ctx context.Context, taskID string) ([]CallRecord, error)
 	// BlobAuthorized 报告 sha 是否在任务 scope 内（scope_blobs(task)：已完成调用的结果、产物与 checkpoint
-	// 引用等），供 GET /blobs/{sha} 授权（§9.3"按 scope 授权"）。
+	// 引用等；会话 turn 另含其会话 scope），供 GET /blobs/{sha} 授权（§9.3"按 scope 授权"）。
 	BlobAuthorized(ctx context.Context, taskID, sha string) (bool, error)
 }
 

@@ -38,6 +38,11 @@ func TestContract(t *testing.T) {
 		BlockStart: func(_ *testing.T, p provider.Provider, envID string) (<-chan struct{}, func()) {
 			return p.(*Provider).BlockStart(envID)
 		},
+		ExecSpec: func(envID string) provider.EnvSpec {
+			s := spec(envID)
+			s.Kind, s.Mounts = provider.KindExec, provider.Mounts{OutBytes: 1 << 20}
+			return s
+		},
 	})
 }
 

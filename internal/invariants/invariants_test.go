@@ -168,10 +168,24 @@ func (e *env) cacheFixture(callID, source string) blob.Ref {
 	return ref
 }
 
-type scanner provider.ScanReport
+// scanner 是独立扫描的替身：Items 是 Scan 的报告，owned 是数据目录中文件路径 → 属主 uid（UIDFiles）。
+type scanner struct {
+	Items []provider.ScanItem
+	owned map[string]uint32
+}
 
 func (s scanner) Scan(context.Context) (provider.ScanReport, error) {
-	return provider.ScanReport(s), nil
+	return provider.ScanReport{Items: s.Items}, nil
+}
+
+func (s scanner) UIDFiles(_ context.Context, base, size uint32, limit int) ([]string, error) {
+	var out []string
+	for p, uid := range s.owned {
+		if uid >= base && uid-base < size && len(out) < limit {
+			out = append(out, p)
+		}
+	}
+	return out, nil
 }
 
 func (e *env) verify(scan scanner, quiescent bool) []invariants.Violation {
@@ -311,6 +325,28 @@ func TestEachInvariantIsReported(t *testing.T) {
 				e.t.Fatalf("非静止时不应检查 I15：%+v", vs)
 			}
 		}, scanner{}, true},
+		// I11 [Q]（M4 Plan 15 Task 5）：已归还（free）的范围仍拥有文件即违例；已分配范围拥有的文件（存活环境的
+		// workspace）不是违例。只在静止时检查。
+		{"I11 已归还的 UID 范围仍拥有文件", "I11/Q", func(e *env, _ blob.Ref) {
+			ctx := context.Background()
+			if err := e.store.SeedUIDRanges(ctx, 100000, 4096, 2); err != nil {
+				e.t.Fatal(err)
+			}
+			if _, err := e.store.AssignUIDRange(ctx, "e1", "env-uid:e1"); err != nil { // e1 取得 uid-100000
+				e.t.Fatal(err)
+			}
+			if vs := e.verify(scanner{owned: map[string]uint32{"/data/stray/x": 105000}}, false); len(vs) != 0 {
+				e.t.Fatalf("非静止时不应检查 I11 [Q]：%+v", vs)
+			}
+		}, scanner{owned: map[string]uint32{
+			"/data/workspaces/t1/a": 101000, // uid-100000：已分配给 e1
+			"/data/stray/x":         105000, // uid-104096：free
+		}}, true},
+		// I12 [Q]（M4 Plan 15 Task 10）：清理完成的 exec 环境仍有挂载（宿主侧 /out 的 tmpfs）——与 I1 同一扫描，按 kind 报告为 I12。
+		{"I12 已清理的 exec 环境仍有挂载", "I12/Q", func(e *env, _ blob.Ref) {
+			e.exec(`INSERT INTO environments (env_id, kind, attempt_id, status, stopped_at, cleanup_state)
+				VALUES ('exec-x', 'exec', 'a1', 'creating', now(), 'done')`)
+		}, scanner{Items: []provider.ScanItem{{Layer: "mount", Path: "/data/envs/exec-x/out", EnvID: "exec-x", Owner: provider.OwnedPartial}}}, true},
 		{"I16 请求对应的资源不存在", "I16/A", func(e *env, _ blob.Ref) {
 			e.exec("INSERT INTO api_requests (request_id, kind, body_hash, resource_id, response) VALUES ('r9', 'create_task', 'x', 'missing', 'null')")
 		}, scanner{}, false},

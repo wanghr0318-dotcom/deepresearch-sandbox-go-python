@@ -3,8 +3,8 @@ info:
   title: agentbox API
   version: 0.2.0-m1
   description: |
-    The single contract for the agentbox HTTP API (design spec §15). M1 scope: tasks and status.
-    Sessions endpoints belong to M4 and are not part of this version.
+    The single contract for the agentbox HTTP API (design spec §15). M1 scope: tasks and status; M3 adds
+    user accounts; M4 adds chat sessions (`/sessions`, `/turns`, see "Sessions" below).
 
     Access (§15.3): the server binds 127.0.0.1 by default. Any other address requires the static
     Bearer token from `<data>/api.token` (0600) on every request. The `Host` header and, when present,
@@ -36,6 +36,18 @@ info:
     is configured, any `Authorization` header is 401 and credential-less requests are anonymous. Users
     get a redacted view of tasks and events (see `GET /tasks/{id}` and `GET /tasks/{id}/events`).
     Without accounts only the Bearer token applies, exactly as above.
+
+    Sessions (M4): a chat session belongs to the user who created it; each message starts a turn, and a
+    turn is a task (`turn_id` = `task_id`, so a turn's report downloads through
+    `/tasks/{turn_id}/artifacts/...`). A user may call every `/sessions` and `/turns` operation, and is
+    the only one who may write to their sessions. Another user's session, an unowned session, a missing
+    session and (for a user) a `closed` session all answer the same 404 `session_not_found`; turns
+    likewise answer 404 `turn_not_found`. The operator may read every session, turn and event stream
+    (`GET` operations, with `owner` and `internal_state` in the session view and the raw record in each
+    event's `internal`), but every write operation answers the operator with 403 `forbidden` (the
+    operator does not chat as a user). A user's `GET /tasks` does not list turns. When the server has no
+    session worker configured, every session operation answers 503 `sessions_unavailable`. All 4xx/5xx
+    bodies are `Error`; the session-specific codes are listed in `SessionErrorCode`.
 servers:
   - url: http://127.0.0.1:8080
 security:
@@ -209,6 +221,14 @@ paths:
     post:
       operationId: createTask
       summary: Create a task (idempotent by request_id)
+      description: >-
+        Operator only. With `session_id` the task is a turn of that session (spec §15.1; the operator path used by the
+        serial-vs-parallel research comparison). It goes through the same transaction as a user message and belongs to
+        the session's owner. `spec` may then contain only `text`, `deep_research` and `research`; the server builds the
+        turn spec (models, limits) exactly as for a user message and overlays the keys of `research` onto
+        `spec.research` (for example `scheduling` and `fixed_plan`, validated by the worker). `limits` must be omitted.
+        Errors are those of `POST /sessions/{id}/messages` (404 `session_not_found`, 409 `turn_in_progress`,
+        `user_task_running` or `session_closed`, 503 `sessions_unavailable`).
       requestBody:
         required: true
         content:
@@ -223,6 +243,7 @@ paths:
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/Conflict'}
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/Unavailable'}
@@ -422,7 +443,7 @@ paths:
       summary: Diagnostic timeline (§14.6); also served in diagnostic mode
       responses:
         '200':
-          description: Attempts with outcome, exit and OOM diagnosis, environment and cleanup state, checkpoints, and Gateway calls with their tries (task_id → attempt_id → call_id → try_no)
+          description: Attempts with outcome, exit and OOM diagnosis, environment and cleanup state, checkpoints, Gateway calls with their tries (task_id → attempt_id → call_id → try_no), the task-layer ledger and the sub-runs with their own ledger layer (§15.4)
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Inspection'}
@@ -431,6 +452,412 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/Unavailable'}
+  /sessions:
+    post:
+      operationId: createSession
+      summary: Create a chat session (owner only; idempotent by request_id)
+      description: |
+        The session starts with the given title, or empty until the first message sets it to the first
+        40 characters of that message. The same `request_id` with the same content returns the first
+        result (201 again); different content is 409 `request_conflict`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateSessionRequest'}
+      responses:
+        '201':
+          description: Session created, or the first result of the same request replayed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Session'}
+        '400':
+          description: '`invalid_request`; or `invalid_title`: the trimmed title is longer than 80 characters'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/SessionsUnavailable'}
+    get:
+      operationId: listSessions
+      summary: List sessions, most recently active first (keyset pagination)
+      description: |
+        Ordered by `last_active_at` descending (ties by `session_id`). A user sees only their own sessions
+        and never `closed` ones; the operator sees every session with `owner` and `internal_state`.
+      parameters:
+        - name: after
+          in: query
+          description: The `next` cursor of the previous page; omit for the first page.
+          schema: {type: string}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: One page of sessions
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SessionList'}
+        '400':
+          description: '`invalid_request` (bad limit); or `invalid_cursor`: `after` is malformed'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/SessionsUnavailable'}
+  /sessions/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/SessionID'}
+    get:
+      operationId: getSession
+      summary: Current view of a session
+      responses:
+        '200':
+          description: The session
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Session'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/SessionNotFound'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/SessionsUnavailable'}
+    patch:
+      operationId: renameSession
+      summary: Rename a session (owner only)
+      description: Sets the title (trimmed, 1–80 characters); an explicit title is never replaced by the automatic one.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RenameSessionRequest'}
+      responses:
+        '200':
+          description: The renamed session
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Session'}
+        '400':
+          description: '`invalid_request`; or `invalid_title`: the trimmed title is empty or longer than 80 characters'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/SessionNotFound'}
+        '409':
+          description: '`session_closed`: the session is being deleted'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/SessionsUnavailable'}
+    delete:
+      operationId: deleteSession
+      summary: Delete a session (owner only; idempotent)
+      description: |
+        Refuses new messages, cancels queued and paused turns, cancels and releases a running turn, stops
+        the environment and then deletes the workspace (`closing` → `closed`). Pinned reports stay in the
+        operator records and disappear from the user view. Repeating the call while the session is
+        `closing` returns 202 again; once it is `closed` the session is gone for the user (404).
+      responses:
+        '202':
+          description: Deletion accepted; `state = closing`
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Session'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/SessionNotFound'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/SessionsUnavailable'}
+  /sessions/{id}/wake:
+    parameters:
+      - {$ref: '#/components/parameters/SessionID'}
+    post:
+      operationId: wakeSession
+      summary: Wake a frozen or evicted session ahead of the next message (owner only; idempotent by request_id)
+      description: |
+        Asynchronous: progress is reported by `session_state` events (`restoring`, then `idle`; or `evicted`
+        with `user_message` when it cannot be restored). Waking an `idle` or `running` session is a no-op.
+        A new message wakes the session by itself; this call only hides the restore latency.
+      requestBody: {$ref: '#/components/requestBodies/SessionWrite'}
+      responses:
+        '202':
+          description: Wake requested (or nothing to do), or the first result of the same request replayed
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/SessionNotFound'}
+        '409':
+          description: '`session_closed`: the session is being deleted; or `request_conflict`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/SessionsUnavailable'}
+  /sessions/{id}/messages:
+    parameters:
+      - {$ref: '#/components/parameters/SessionID'}
+    post:
+      operationId: sendMessage
+      summary: Send a message, starting a new turn (owner only; idempotent by request_id)
+      description: |
+        Turns are not queued. If the session has a `queued`, `running` or `stopping` (cancelling) turn the
+        message is rejected with 409 `turn_in_progress` (stop the current research first). If it has a
+        `paused` or `awaiting_input` turn, or one that is stopping by pause, that turn is cancelled
+        (reason `superseded`; its content is kept and it stays restorable) and returned as
+        `superseded_turn_id`; its sources and finished subtopic summaries are given to the new turn as
+        context. A frozen or evicted session is woken. A user may have at most one `queued`, `running` or
+        `stopping` turn or research task across all sessions (409 `user_task_running`). The new turn gets
+        a fresh tool-call budget (`tool_call_limit`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MessageRequest'}
+      responses:
+        '202':
+          description: Turn created, or the first result of the same request replayed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MessageResult'}
+        '400':
+          description: '`invalid_request`; or `invalid_text`: the trimmed text is empty or longer than 4000 characters'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/SessionNotFound'}
+        '409':
+          description: '`session_closed`, `turn_in_progress`, `user_task_running`, or `request_conflict`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/SessionsUnavailable'}
+  /sessions/{id}/turns:
+    parameters:
+      - {$ref: '#/components/parameters/SessionID'}
+    get:
+      operationId: listTurns
+      summary: Turns of a session in `turn_index` order (history)
+      parameters:
+        - name: after_index
+          in: query
+          description: Return turns with `turn_index` greater than this; omit for the first page.
+          schema: {type: integer, format: int64, minimum: 0}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+      responses:
+        '200':
+          description: Up to `limit` turns, `turn_index` ascending; fewer than `limit` means the end
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TurnList'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/SessionNotFound'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/SessionsUnavailable'}
+  /sessions/{id}/events:
+    parameters:
+      - {$ref: '#/components/parameters/SessionID'}
+    get:
+      operationId: streamSessionEvents
+      summary: Server-sent event stream of a whole session (every turn and the session lifecycle)
+      description: |
+        Each event has `id` = `seq` (the session-wide sequence, monotonic and gap-free in storage),
+        `event` = the event type and `data` = a `SessionEvent` JSON object. Resume with `Last-Event-ID`;
+        events are kept for the life of the session. A heartbeat comment line (`: heartbeat`) is sent
+        every 15 s and takes no sequence number. The stream stays open across turns and closes after a
+        `session_state` event with `state = closed`; clients stop reconnecting once they receive it.
+
+        A user sees only the types in `SessionEventType` other than `internal`, and each `data` keeps
+        only the fields of its schema: costs, prices, usage, model names and internal IDs (call, attempt,
+        worker sequence, upstream request) are removed at any depth. Records the user cannot see (other
+        host and worker events, transitional session states) keep their `seq`, so ids increase with gaps,
+        and any existing `seq` (including a hidden one) is a valid `Last-Event-ID`. The operator sees
+        every record: mapped ones with `internal` attached, the rest as `type = internal`.
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          description: Resume after this seq. Must be a non-negative integer not beyond the latest event.
+          schema: {type: integer, format: int64, minimum: 0}
+      responses:
+        '200':
+          description: Event stream (`data` of each event is a `SessionEvent`)
+          content:
+            text/event-stream:
+              schema: {type: string}
+        '400':
+          description: Malformed request or `invalid_cursor` (malformed, or beyond the latest event)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/SessionNotFound'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/SessionsUnavailable'}
+  /turns/{id}/stop:
+    parameters:
+      - {$ref: '#/components/parameters/TurnID'}
+    post:
+      operationId: stopTurn
+      summary: Stop a queued or running turn (owner only; idempotent by request_id)
+      description: |
+        Requests a pause (`stopping` → `paused`); the turn keeps its last checkpoint and the worker reports
+        a `turn_stopped` card. Any other status is 409 `invalid_turn_state`.
+      requestBody: {$ref: '#/components/requestBodies/SessionWrite'}
+      responses:
+        '202': {$ref: '#/components/responses/TurnControlAccepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/TurnNotFound'}
+        '409': {$ref: '#/components/responses/TurnControlRejected'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/SessionsUnavailable'}
+  /turns/{id}/continue:
+    parameters:
+      - {$ref: '#/components/parameters/TurnID'}
+    post:
+      operationId: continueTurn
+      summary: Continue a stopped (`paused`) turn from where it stopped (owner only; idempotent by request_id)
+      description: Requires `status = paused` (not `awaiting_input`, which takes `/answer`); otherwise 409 `invalid_turn_state`.
+      requestBody: {$ref: '#/components/requestBodies/SessionWrite'}
+      responses:
+        '202': {$ref: '#/components/responses/TurnControlAccepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/TurnNotFound'}
+        '409': {$ref: '#/components/responses/TurnControlRejected'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/SessionsUnavailable'}
+  /turns/{id}/finish:
+    parameters:
+      - {$ref: '#/components/parameters/TurnID'}
+    post:
+      operationId: finishTurn
+      summary: Resume a stopped (`paused`) turn with "write the report now" (owner only; idempotent by request_id)
+      description: |
+        Requires `status = paused` (not `awaiting_input`); otherwise 409 `invalid_turn_state`. The remaining
+        subtopics are skipped and the report is written from the material gathered so far
+        (`report_ready.partial = true`).
+      requestBody: {$ref: '#/components/requestBodies/SessionWrite'}
+      responses:
+        '202': {$ref: '#/components/responses/TurnControlAccepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/TurnNotFound'}
+        '409': {$ref: '#/components/responses/TurnControlRejected'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/SessionsUnavailable'}
+  /turns/{id}/answer:
+    parameters:
+      - {$ref: '#/components/parameters/TurnID'}
+    post:
+      operationId: answerTurn
+      summary: Answer the questions of an `awaiting_input` turn and resume it (owner only; idempotent by request_id)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AnswerRequest'}
+      responses:
+        '202': {$ref: '#/components/responses/TurnControlAccepted'}
+        '400':
+          description: '`invalid_request`; or `invalid_answers`: not 1–3 answers, an empty `question_id`, or not exactly one of `choice` and `other`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/TurnNotFound'}
+        '409': {$ref: '#/components/responses/TurnControlRejected'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/SessionsUnavailable'}
+  /turns/{id}/restore:
+    parameters:
+      - {$ref: '#/components/parameters/TurnID'}
+    post:
+      operationId: restoreTurn
+      summary: Start a new turn that continues a cancelled turn from its last checkpoint (owner only; idempotent by request_id)
+      description: |
+        The new turn (same session, same text, `deep_research = true`, `restored_from_turn_id` = this turn)
+        continues from the source turn's last checkpoint with a fresh tool-call budget. The same rules as
+        `POST /sessions/{id}/messages` apply to other turns of the session (`turn_in_progress`; a paused
+        turn is superseded).
+      requestBody: {$ref: '#/components/requestBodies/SessionWrite'}
+      responses:
+        '202':
+          description: The new turn, or the first result of the same request replayed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MessageResult'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/TurnNotFound'}
+        '409':
+          description: '`not_restorable` (the turn is not cancelled or has no checkpoint), `session_closed`, `turn_in_progress`, `user_task_running`, or `request_conflict`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/SessionsUnavailable'}
+  /turns/{id}/raw/{sha256}:
+    parameters:
+      - {$ref: '#/components/parameters/TurnID'}
+      - name: sha256
+        in: path
+        required: true
+        description: The `raw.response_ref` of a `thinking`, `tool_call` or `tool_result` event (64 lowercase hex digits)
+        schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+    get:
+      operationId: getTurnRaw
+      summary: Download a raw model or tool response of a turn (⟨/⟩), redacted for users
+      description: |
+        Only blobs authorized to the turn are served. A user gets the content with internal fields removed
+        at any depth (costs, prices, usage, model, call and attempt IDs, upstream request id, system
+        fingerprint) and the top-level `id`; the operator gets it unchanged. Non-JSON content is sent
+        unchanged as `application/octet-stream`. An unauthorized blob, a malformed hash, another user's
+        turn and a missing one all answer the same 404 `not_found`.
+      responses:
+        '200':
+          description: The (redacted) content
+          headers:
+            Content-Disposition:
+              description: Always `attachment`
+              schema: {type: string}
+            X-Content-Type-Options:
+              description: Always `nosniff`
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {}
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404':
+          description: '`not_found`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/BlobUnavailable'}
+        '503': {$ref: '#/components/responses/SessionsUnavailable'}
 components:
   securitySchemes:
     bearerAuth:
@@ -453,13 +880,60 @@ components:
       in: path
       required: true
       schema: {type: string}
+    SessionID:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    TurnID:
+      name: id
+      in: path
+      required: true
+      description: The turn id (= task id)
+      schema: {type: string}
   requestBodies:
     Control:
       required: true
       content:
         application/json:
           schema: {$ref: '#/components/schemas/ControlRequest'}
+    SessionWrite:
+      required: true
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/SessionWriteRequest'}
   responses:
+    SessionNotFound:
+      description: '`session_not_found` (also another user''s session, an unowned one, and for a user a `closed` one)'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    TurnNotFound:
+      description: '`turn_not_found` (also a turn of another user''s session, and a task that is not a turn)'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    SessionsUnavailable:
+      description: |
+        `sessions_unavailable` (the server has no session worker configured); or, as for every operation,
+        `diagnostic_mode`, `ownership_lost`, `store_unavailable`, `contention`, or `commit_unknown`
+        (retry with the same request_id)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    TurnControlAccepted:
+      description: Control accepted, or the first result of the same request replayed
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/TurnControlResult'}
+    TurnControlRejected:
+      description: |
+        `invalid_turn_state` (stop needs `queued` or `running`; continue and finish need `paused`; answer
+        needs `awaiting_input`), `session_closed`, `user_task_running` (resuming would exceed one active
+        turn or research per user), or `request_conflict`
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
     ControlAccepted:
       description: Control intent accepted, or the first result of the same request replayed
       content:
@@ -597,6 +1071,7 @@ components:
       required: [request_id, spec]
       properties:
         request_id: {type: string, minLength: 1, maxLength: 128}
+        session_id: {type: string, minLength: 1, description: 'Create the task as a turn of this session (operator path; see createTask)'}
         spec: {type: object, description: Task specification passed to the worker}
         limits: {type: object, description: Resource limits for the task}
     CreateTaskResult:
@@ -688,6 +1163,10 @@ components:
         latency_ms: {type: integer, format: int64}
         cost_micro: {type: integer, format: int64, description: Settled cost in micro-USD (ok tries only)}
         error: {type: string}
+        queue_ms: {type: integer, format: int64, description: Exec tries only — time spent waiting for an exec slot}
+        wall_ms: {type: integer, format: int64, description: Exec tries only — wall time of the run}
+        cpu_usec: {type: integer, format: int64, description: Exec tries only — measured CPU (cpu.stat usage_usec); omitted when unknown (charged at the full reservation)}
+        exec_started_at: {type: string, format: date-time, description: Exec tries only — when the host marked the exec as starting; omitted if it never started}
     Call:
       type: object
       description: A Gateway logical call (journal entry). Metadata only — no request or response bodies, prompts or credentials.
@@ -696,6 +1175,7 @@ components:
         call_id: {type: string}
         endpoint: {type: string}
         model: {type: string, description: The resolved model the call used (from the journal). Omitted for non-chat calls.}
+        subrun_id: {type: string, description: The sub-run the call is attributed to (X-Agentbox-Subrun). Omitted for root calls.}
         state: {type: string, enum: [resolving, in_flight, completed, failed, unknown]}
         source: {type: string}
         first_attempt_id: {type: string}
@@ -728,9 +1208,41 @@ components:
         outputs:
           type: array
           items: {$ref: '#/components/schemas/PinnedOutput'}
+    TaskBudget:
+      type: object
+      description: The task-layer ledger (the total of the two-layer cost, spec §9.6). Amounts in micro-USD.
+      required: [limit_micro, reserved_micro, spent_micro, unknown_micro, tool_calls_used]
+      properties:
+        limit_micro: {type: integer, format: int64}
+        reserved_micro: {type: integer, format: int64}
+        spent_micro: {type: integer, format: int64}
+        unknown_micro: {type: integer, format: int64}
+        tool_call_limit: {type: integer, format: int64, description: Per-task web_search + web_fetch limit; omitted when unlimited}
+        tool_calls_used: {type: integer, format: int64}
+    Subrun:
+      type: object
+      description: |
+        One sub-run of the task (operator inspect only, spec §15.4): state machine status and timeline, failure or
+        cancel reason, and the sub-run-layer ledger (micro-USD). `cap_micro` is omitted when the sub-run layer only
+        attributes spend without a cap. `calls` counts the Gateway calls with this `subrun_id`.
+      required: [subrun_id, parent_step_id, status, started_at, deadline_at, reserved_micro, spent_micro, unknown_micro, calls]
+      properties:
+        subrun_id: {type: string}
+        parent_step_id: {type: string}
+        status: {type: string, enum: [started, end_proposed, cancel_requested, completed, cancelled, failed, timed_out]}
+        started_at: {type: string, format: date-time}
+        ended_at: {type: string, format: date-time, description: Set once the sub-run is terminal}
+        deadline_at: {type: string, format: date-time}
+        cancel_reason: {type: string, description: 'deadline, orchestrator, task_cancel or policy'}
+        failure_reason: {type: string, description: 'Worker reason (≤ 256 bytes), or task_cancel, not_completed_at_result, checkpoint_failed'}
+        cap_micro: {type: integer, format: int64}
+        reserved_micro: {type: integer, format: int64}
+        spent_micro: {type: integer, format: int64}
+        unknown_micro: {type: integer, format: int64}
+        calls: {type: integer}
     Inspection:
       type: object
-      required: [task, attempts, checkpoints, calls]
+      required: [task, attempts, checkpoints, calls, subruns]
       properties:
         task: {$ref: '#/components/schemas/Task'}
         attempts:
@@ -742,3 +1254,533 @@ components:
         calls:
           type: array
           items: {$ref: '#/components/schemas/Call'}
+        budget: {$ref: '#/components/schemas/TaskBudget'}
+        subruns:
+          type: array
+          description: Sub-runs ordered by start time, then ID; empty for tasks without sub-runs
+          items: {$ref: '#/components/schemas/Subrun'}
+    SessionErrorCode:
+      type: string
+      description: |
+        Error codes of the session operations (`Error.code`). Not-found: `session_not_found`,
+        `turn_not_found`, `not_found` (raw downloads). 409: `session_closed` (the session is being
+        deleted), `turn_in_progress` (a turn is queued, running or stopping; stop it first),
+        `invalid_turn_state` (the control does not fit the turn's status), `not_restorable`,
+        `user_task_running`, `request_conflict`. 400: `invalid_request`, `invalid_text`, `invalid_title`,
+        `invalid_answers`, `invalid_cursor`. 503: `sessions_unavailable`. Also `unauthorized` and
+        `forbidden` as for every operation.
+      enum: [session_not_found, turn_not_found, not_found, session_closed, turn_in_progress, invalid_turn_state, not_restorable, user_task_running, request_conflict, invalid_request, invalid_text, invalid_title, invalid_answers, invalid_cursor, sessions_unavailable, unauthorized, forbidden]
+    SessionWriteRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id]
+      properties:
+        request_id: {type: string, minLength: 1, maxLength: 128}
+    CreateSessionRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id]
+      properties:
+        request_id: {type: string, minLength: 1, maxLength: 128}
+        title: {type: string, maxLength: 80, description: 'Trimmed of surrounding whitespace; omitted or empty means the automatic title (the first 40 characters of the first message)'}
+    RenameSessionRequest:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title: {type: string, minLength: 1, maxLength: 80, description: Trimmed of surrounding whitespace before validation}
+    Session:
+      type: object
+      required: [session_id, title, state, last_active_at, created_at]
+      properties:
+        session_id: {type: string}
+        title: {type: string, description: Empty until the first message or a rename sets it}
+        state: {type: string, enum: [idle, running, frozen, evicted, restoring, closing, closed], description: 'User-facing state: the internal `creating` and `quiescing` show as `idle`, `evicting` as `frozen`. A message to a `frozen` or `evicted` session wakes it.'}
+        last_active_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+        owner: {type: string, description: Operator view only — the owner's username}
+        internal_state: {type: string, description: 'Operator view only — the stored lifecycle status (creating, idle, running, quiescing, frozen, evicting, evicted, restoring, closing, closed)'}
+    SessionList:
+      type: object
+      required: [sessions]
+      properties:
+        sessions:
+          type: array
+          items: {$ref: '#/components/schemas/Session'}
+        next: {type: string, description: Cursor for the next page; absent on the last page}
+    MessageRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id, text, deep_research]
+      properties:
+        request_id: {type: string, minLength: 1, maxLength: 128}
+        text: {type: string, minLength: 1, maxLength: 4000, description: Trimmed of surrounding whitespace before validation (1–4000 characters)}
+        deep_research: {type: boolean, description: Force the research path (otherwise the model decides between answering and researching)}
+    MessageResult:
+      type: object
+      required: [turn_id, turn_index]
+      properties:
+        turn_id: {type: string}
+        turn_index: {type: integer, format: int64}
+        superseded_turn_id: {type: string, description: The paused turn that this turn superseded (cancelled with reason `superseded`; restorable)}
+    Answer:
+      type: object
+      additionalProperties: false
+      required: [question_id]
+      description: Exactly one of `choice` (one of the question's options) and `other` (free text) is set.
+      properties:
+        question_id: {type: string, minLength: 1, description: 'The `questions[].id` of the `ask_user` event'}
+        choice: {type: string}
+        other: {type: string}
+    AnswerRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id, answers]
+      properties:
+        request_id: {type: string, minLength: 1, maxLength: 128}
+        answers:
+          type: array
+          minItems: 1
+          maxItems: 3
+          items: {$ref: '#/components/schemas/Answer'}
+    TurnControlResult:
+      type: object
+      required: [turn_id, control_version]
+      properties:
+        turn_id: {type: string}
+        control_version: {type: integer, format: int64}
+    ReportRef:
+      type: object
+      required: [artifact_id, version]
+      properties:
+        artifact_id: {type: string}
+        version: {type: integer, format: int64}
+    Turn:
+      type: object
+      required: [turn_id, turn_index, text, deep_research, status, restorable, tool_calls_used, tool_call_limit, created_at]
+      properties:
+        turn_id: {type: string, description: The turn's task id}
+        turn_index: {type: integer, format: int64}
+        text: {type: string, description: The user's message}
+        deep_research: {type: boolean}
+        status: {type: string, enum: [queued, running, stopping, paused, awaiting_input, succeeded, failed, cancelled], description: '`stopping` is the internal pausing or cancelling; `awaiting_input` is a pause waiting for `/answer`'}
+        status_reason: {type: string, description: 'For example `superseded` for a turn cancelled by a newer message'}
+        route: {type: string, enum: [answer, research], description: The path the turn took; absent until decided}
+        restored_from_turn_id: {type: string}
+        restorable: {type: boolean, description: 'True for a cancelled turn with a checkpoint (`POST /turns/{id}/restore`)'}
+        tool_calls_used: {type: integer, format: int64, description: web_search and web_fetch calls counted against the turn's budget}
+        tool_call_limit: {type: integer, format: int64}
+        summary: {type: string, description: The reply text of a succeeded turn}
+        report: {$ref: '#/components/schemas/ReportRef'}
+        user_message: {type: string, description: 'User-facing explanation of a failure ("模型服务暂时不可用，请重试")'}
+        created_at: {type: string, format: date-time}
+    TurnList:
+      type: object
+      required: [turns]
+      properties:
+        turns:
+          type: array
+          items: {$ref: '#/components/schemas/Turn'}
+    SessionEventType:
+      type: string
+      description: |
+        `session_state`, `turn_created`, `turn_status` and `turn_result` come from the host; the others are
+        worker progress kinds (`progress.kind` is the type and `progress.data` the data, filtered to the
+        schema's fields). `internal` is sent to the operator only.
+      enum: [session_state, turn_created, turn_status, route, skill_read, thinking, ask_user, todo_updated, subtopic, tool_call, tool_result, budget, assistant_delta, report_ready, turn_stopped, turn_result, internal]
+    SessionEventInternal:
+      type: object
+      description: Operator view only — the stored record the event was mapped from, unredacted.
+      required: [source, type, payload]
+      properties:
+        source: {type: string, enum: [host, worker, session]}
+        type: {type: string}
+        attempt_id: {type: string}
+        task_seq: {type: integer, format: int64}
+        payload: {type: object}
+    SessionEventBase:
+      type: object
+      required: [seq, ts]
+      properties:
+        seq: {type: integer, format: int64, description: Session-wide sequence (the SSE id)}
+        turn_id: {type: string, description: The turn the event belongs to; absent for session lifecycle events}
+        ts: {type: string, format: date-time}
+        internal: {$ref: '#/components/schemas/SessionEventInternal'}
+    SessionEvent:
+      description: One event of the session stream, discriminated by `type`.
+      oneOf:
+        - {$ref: '#/components/schemas/SessionStateEvent'}
+        - {$ref: '#/components/schemas/TurnCreatedEvent'}
+        - {$ref: '#/components/schemas/TurnStatusEvent'}
+        - {$ref: '#/components/schemas/RouteEvent'}
+        - {$ref: '#/components/schemas/SkillReadEvent'}
+        - {$ref: '#/components/schemas/ThinkingEvent'}
+        - {$ref: '#/components/schemas/AskUserEvent'}
+        - {$ref: '#/components/schemas/TodoUpdatedEvent'}
+        - {$ref: '#/components/schemas/SubtopicEvent'}
+        - {$ref: '#/components/schemas/ToolCallEvent'}
+        - {$ref: '#/components/schemas/ToolResultEvent'}
+        - {$ref: '#/components/schemas/BudgetEvent'}
+        - {$ref: '#/components/schemas/AssistantDeltaEvent'}
+        - {$ref: '#/components/schemas/ReportReadyEvent'}
+        - {$ref: '#/components/schemas/TurnStoppedEvent'}
+        - {$ref: '#/components/schemas/TurnResultEvent'}
+        - {$ref: '#/components/schemas/InternalEvent'}
+      discriminator:
+        propertyName: type
+        mapping:
+          session_state: '#/components/schemas/SessionStateEvent'
+          turn_created: '#/components/schemas/TurnCreatedEvent'
+          turn_status: '#/components/schemas/TurnStatusEvent'
+          route: '#/components/schemas/RouteEvent'
+          skill_read: '#/components/schemas/SkillReadEvent'
+          thinking: '#/components/schemas/ThinkingEvent'
+          ask_user: '#/components/schemas/AskUserEvent'
+          todo_updated: '#/components/schemas/TodoUpdatedEvent'
+          subtopic: '#/components/schemas/SubtopicEvent'
+          tool_call: '#/components/schemas/ToolCallEvent'
+          tool_result: '#/components/schemas/ToolResultEvent'
+          budget: '#/components/schemas/BudgetEvent'
+          assistant_delta: '#/components/schemas/AssistantDeltaEvent'
+          report_ready: '#/components/schemas/ReportReadyEvent'
+          turn_stopped: '#/components/schemas/TurnStoppedEvent'
+          turn_result: '#/components/schemas/TurnResultEvent'
+          internal: '#/components/schemas/InternalEvent'
+    SessionStateEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [session_state]}
+            data: {$ref: '#/components/schemas/SessionStateData'}
+    TurnCreatedEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [turn_created]}
+            data: {$ref: '#/components/schemas/TurnCreatedData'}
+    TurnStatusEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [turn_status]}
+            data: {$ref: '#/components/schemas/TurnStatusData'}
+    RouteEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [route]}
+            data: {$ref: '#/components/schemas/RouteData'}
+    SkillReadEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [skill_read]}
+            data: {$ref: '#/components/schemas/SkillReadData'}
+    ThinkingEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [thinking]}
+            data: {$ref: '#/components/schemas/ThinkingData'}
+    AskUserEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [ask_user]}
+            data: {$ref: '#/components/schemas/AskUserData'}
+    TodoUpdatedEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [todo_updated]}
+            data: {$ref: '#/components/schemas/TodoUpdatedData'}
+    SubtopicEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [subtopic]}
+            data: {$ref: '#/components/schemas/SubtopicData'}
+    ToolCallEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [tool_call]}
+            data: {$ref: '#/components/schemas/ToolCallData'}
+    ToolResultEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [tool_result]}
+            data: {$ref: '#/components/schemas/ToolResultData'}
+    BudgetEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [budget]}
+            data: {$ref: '#/components/schemas/BudgetData'}
+    AssistantDeltaEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [assistant_delta]}
+            data: {$ref: '#/components/schemas/AssistantDeltaData'}
+    ReportReadyEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [report_ready]}
+            data: {$ref: '#/components/schemas/ReportReadyData'}
+    TurnStoppedEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [turn_stopped]}
+            data: {$ref: '#/components/schemas/TurnStoppedData'}
+    TurnResultEvent:
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data]
+          properties:
+            type: {type: string, enum: [turn_result]}
+            data: {$ref: '#/components/schemas/TurnResultData'}
+    InternalEvent:
+      description: Operator view only — a stored record with no user-facing type; see `internal`.
+      allOf:
+        - {$ref: '#/components/schemas/SessionEventBase'}
+        - type: object
+          required: [type, data, internal]
+          properties:
+            type: {type: string, enum: [internal]}
+            data: {type: object, description: Always empty}
+    SessionStateData:
+      type: object
+      required: [state]
+      properties:
+        state: {type: string, enum: [idle, frozen, evicted, restoring, closed]}
+        user_message: {type: string, description: 'Set when a restore failed ("会话暂时无法恢复"); the history stays readable'}
+    TurnCreatedData:
+      type: object
+      required: [turn_index, text, deep_research]
+      properties:
+        turn_index: {type: integer, format: int64}
+        text: {type: string}
+        deep_research: {type: boolean}
+        restored_from_turn_id: {type: string}
+    TurnStatusData:
+      type: object
+      description: Sent when a control is applied, an attempt ends or the turn ends.
+      required: [status]
+      properties:
+        status: {type: string, enum: [queued, running, stopping, paused, awaiting_input, succeeded, failed, cancelled]}
+        reason: {type: string, description: 'The status reason, for example `superseded`; absent for `awaiting_input`'}
+        user_message: {type: string, description: 'Set for `failed` ("模型服务暂时不可用，请重试")'}
+    RouteData:
+      type: object
+      required: [route, forced]
+      properties:
+        route: {type: string, enum: [answer, research]}
+        forced: {type: boolean, description: True when the user forced research with `deep_research`}
+    SkillReadData:
+      type: object
+      required: [step_id, name]
+      properties:
+        step_id: {type: string}
+        name: {type: string, description: 'The skill name, for example `deep-research`'}
+        description: {type: string}
+        file: {type: string, description: A reference file of the skill that was read (absent for the skill body)}
+    ThinkingData:
+      type: object
+      required: [step_id, text]
+      properties:
+        step_id: {type: string}
+        text: {type: string, description: The model's reasoning shown to the user (≤ 600 characters)}
+        raw: {$ref: '#/components/schemas/RawRef'}
+    AskUserData:
+      type: object
+      required: [step_id, question_id, questions]
+      properties:
+        step_id: {type: string}
+        question_id: {type: string, description: Identifies this round of questions (the turn pauses as `awaiting_input` until `/answer`)}
+        questions:
+          type: array
+          minItems: 1
+          maxItems: 3
+          items: {$ref: '#/components/schemas/AskUserQuestion'}
+    AskUserQuestion:
+      type: object
+      required: [id, question, options, allow_other]
+      properties:
+        id: {type: string, description: The `question_id` of the matching `Answer`}
+        question: {type: string}
+        options:
+          type: array
+          items: {type: string}
+        allow_other: {type: boolean, description: Whether a free-text `other` answer is accepted}
+    TodoUpdatedData:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/TodoItem'}
+    TodoItem:
+      type: object
+      required: [id, title, status]
+      properties:
+        id: {type: string}
+        title: {type: string}
+        status: {type: string, enum: [pending, in_progress, done, skipped]}
+        budget_share: {type: integer, description: Tool calls planned for this item}
+    SubtopicData:
+      type: object
+      required: [id, title, status]
+      properties:
+        id: {type: string, description: The todo item id of the subtopic}
+        title: {type: string}
+        status: {type: string, enum: [running, done, skipped, failed]}
+        summary: {type: string, description: The subtopic summary (when done)}
+    ToolCallData:
+      type: object
+      required: [step_id, tool, input]
+      properties:
+        step_id: {type: string}
+        tool_call_id: {type: string, description: 'Pairs the call with its `tool_result`: a worker-assigned id `<step>:<n>` such as `orch:2` (a resumed attempt re-emits the same id), not the model''s tool-call id'}
+        tool: {type: string, description: 'web_search, web_fetch, read_source, read_skill, ask_user, todo_write, research_subtopic (later also run_python)'}
+        input: {type: object, description: The tool arguments}
+        subtopic_id: {type: string, description: The subtopic the call belongs to (absent for orchestrator calls)}
+        raw: {$ref: '#/components/schemas/RawRef'}
+    ToolResultData:
+      type: object
+      required: [step_id, tool, ok, preview]
+      properties:
+        step_id: {type: string}
+        tool_call_id: {type: string}
+        tool: {type: string}
+        ok: {type: boolean}
+        subtopic_id: {type: string}
+        preview: {$ref: '#/components/schemas/ToolPreview'}
+        error: {type: string, description: User-facing error of a failed call (the call still counts against the budget)}
+        raw: {$ref: '#/components/schemas/RawRef'}
+    ToolPreview:
+      type: object
+      description: |
+        What the step row shows. `web_search`: `{results: [{title, url, site, snippet}]}` (plus `query`);
+        `web_fetch`: `{title, url, excerpt}` (plus `n`, the source number, and `site`); other tools:
+        `{text}`. `kind` (search, fetch or text) may name the shape.
+      properties:
+        kind: {type: string, enum: [search, fetch, text]}
+        query: {type: string}
+        results:
+          type: array
+          items: {$ref: '#/components/schemas/SearchResultPreview'}
+        n: {type: integer, description: 'Source number used in citations `[n]`'}
+        title: {type: string}
+        url: {type: string}
+        site: {type: string}
+        excerpt: {type: string}
+        text: {type: string}
+    SearchResultPreview:
+      type: object
+      required: [title, url]
+      properties:
+        title: {type: string}
+        url: {type: string}
+        site: {type: string}
+        snippet: {type: string}
+    RawRef:
+      type: object
+      description: |
+        The raw request and response behind a step (⟨/⟩). `request` is the request the worker sent, inline
+        and redacted (no model, usage, costs or internal ids); it is cut to 32 KiB, in which case
+        `request_truncated` is true and `request` is the truncated JSON text (a string). `response_ref` is
+        the sha256 of the response blob, downloaded with `GET /turns/{turn_id}/raw/{response_ref}`.
+      properties:
+        request: {description: The request body (any JSON value; a string when truncated)}
+        request_truncated: {type: boolean}
+        response_ref: {type: string, pattern: '^[0-9a-f]{64}$'}
+    BudgetData:
+      type: object
+      description: The turn's tool-call budget (from the Gateway's `X-Agentbox-Tool-Budget`); only web_search and web_fetch count.
+      required: [used, limit]
+      properties:
+        used: {type: integer}
+        limit: {type: integer}
+    AssistantDeltaData:
+      type: object
+      description: A piece of the reply; concatenating the pieces with the same `message_id` in `seq` order gives the full text.
+      required: [message_id, text]
+      properties:
+        message_id: {type: string}
+        text: {type: string}
+        final: {type: boolean, description: True on the last piece of the message}
+    ReportReadyData:
+      type: object
+      description: The report was registered as an artifact (download with `GET /tasks/{turn_id}/artifacts/{artifact_id}?version=`).
+      required: [artifact_id, version, title, partial, tool_budget_reached]
+      properties:
+        artifact_id: {type: string}
+        version: {type: integer, format: int64}
+        title: {type: string}
+        partial: {type: boolean, description: True when written early ("write the report now") with subtopics skipped}
+        tool_budget_reached: {type: boolean, description: True when the tool-call budget ran out (shown as "已达工具额度")}
+        note: {type: string}
+    TurnStoppedData:
+      type: object
+      description: The stop summary card of a stopped turn (built from the checkpoint) and a short "findings so far".
+      required: [card, findings, can_finish]
+      properties:
+        card: {$ref: '#/components/schemas/StopCard'}
+        findings: {type: string, description: '2–3 sentences; "尚无发现，研究在规划阶段被停止" when nothing was found yet'}
+        can_finish: {type: boolean, description: True when at least one subtopic is done ("write the report now" is available)}
+    StopCard:
+      type: object
+      required: [subtopics_done, subtopics_total, sources, tool_calls_used, tool_call_limit]
+      properties:
+        subtopics_done: {type: integer}
+        subtopics_total: {type: integer}
+        sources: {type: integer}
+        tool_calls_used: {type: integer}
+        tool_call_limit: {type: integer}
+        todo:
+          type: array
+          items: {$ref: '#/components/schemas/TodoItem'}
+    TurnResultData:
+      type: object
+      required: [summary, outputs]
+      properties:
+        summary: {type: string, description: The reply text}
+        outputs:
+          type: array
+          description: Output artifact ids (`report` when a report was written)
+          items: {type: string}

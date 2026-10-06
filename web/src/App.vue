@@ -3,12 +3,16 @@
   <AdminApp v-if="isAdminRoute(route)" :route="route" />
 
   <!-- 用户页：DeepResearch 助手（cookie 会话） -->
-  <div v-else class="user-shell">
+  <div v-else class="user-shell" :class="{ fill: user && route.name === 'chat' }">
     <header v-if="user" class="topbar">
       <a class="topbar-brand" :href="homeHref()">
         <BrandMark />
         <span>DeepResearch 助手</span>
       </a>
+      <nav class="topbar-nav" aria-label="页面">
+        <a :href="homeHref()" :class="{ on: route.name === 'chat' }" data-testid="nav-chat">对话</a>
+        <a :href="legacyHref()" :class="{ on: route.name === 'legacy' || route.name === 'research' }" data-testid="nav-legacy">早期研究</a>
+      </nav>
       <span class="spacer"></span>
       <span class="topbar-user" data-testid="username">{{ user.username }}</span>
       <button class="btn small" type="button" data-action="logout" :disabled="signingOut" @click="logout">退出登录</button>
@@ -22,8 +26,9 @@
         <RegisterView v-else @signed-in="signedIn" />
       </template>
       <template v-else-if="user">
-        <ResearchDetailView v-if="route.name === 'research'" :id="route.id" :key="route.id" @unauthorized="signedOut" />
-        <AssistantView v-else @unauthorized="signedOut" />
+        <ChatView v-if="route.name === 'chat'" :session-id="route.id" @unauthorized="signedOut" />
+        <ResearchDetailView v-else-if="route.name === 'research'" :id="route.id" :key="route.id" @unauthorized="signedOut" />
+        <AssistantView v-else-if="route.name === 'legacy'" @unauthorized="signedOut" />
       </template>
     </main>
   </div>
@@ -35,9 +40,10 @@ import AdminApp from "./AdminApp.vue";
 import type { User } from "./api/client";
 import BrandMark from "./components/BrandMark.vue";
 import { userErrorMessage } from "./lib/research";
-import { homeHref, isAdminRoute, loginHref, navigate, needsSession, useHashRoute } from "./lib/router";
+import { homeHref, isAdminRoute, legacyHref, loginHref, navigate, needsSession, useHashRoute } from "./lib/router";
 import { useUserServices } from "./lib/userServices";
 import AssistantView from "./views/AssistantView.vue";
+import ChatView from "./views/ChatView.vue";
 import LoginView from "./views/LoginView.vue";
 import RegisterView from "./views/RegisterView.vue";
 import ResearchDetailView from "./views/ResearchDetailView.vue";
@@ -149,6 +155,51 @@ watch(
   color: #111827;
   text-decoration: none;
   letter-spacing: -0.01em;
+}
+.topbar-nav {
+  display: flex;
+  gap: 2px;
+  margin-left: 12px;
+}
+.topbar-nav a {
+  padding: 5px 11px;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #6b7280;
+  text-decoration: none;
+  transition: background 0.12s, color 0.12s;
+}
+.topbar-nav a:hover {
+  background: #f3f4f6;
+  color: #111827;
+}
+.topbar-nav a.on {
+  background: #f5f3ff;
+  color: #6d28d9;
+}
+@media (max-width: 600px) {
+  .topbar {
+    padding: 10px 12px;
+    gap: 8px;
+  }
+  .topbar-brand span,
+  .topbar-user {
+    display: none;
+  }
+  .topbar-nav {
+    margin-left: 0;
+  }
+}
+/* 对话页占满视口高度：页面本身不滚动，各栏各自滚动。 */
+.user-shell.fill {
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
+}
+.user-shell.fill .user-main {
+  min-height: 0;
 }
 .topbar-user {
   font-size: 0.85rem;

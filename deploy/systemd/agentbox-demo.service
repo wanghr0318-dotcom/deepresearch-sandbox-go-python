@@ -1,9 +1,12 @@
 # 演示服务器上的常驻 agentbox server（HTTPS 443，同源提供工作台）。
-# 安装：二进制 /usr/local/bin/agentbox；工作台 /opt/agentbox-web（web/dist）；worker 包 /opt/agentbox；
+# 安装：二进制 /usr/local/bin/agentbox；工作台 /opt/agentbox-web（web/dist）；worker 包 /opt/agentbox
+# （sudo bash scripts/dev/install-worker.sh /opt/agentbox：agentbox_worker、deepresearch、chatagent、skills）；
 # 机密只在 /etc/agentbox/agentbox.env（root 0600）：AGENTBOX_MODEL_API_KEY、AGENTBOX_SEARCH_API_KEY（serper 的 Key）、
 # AGENTBOX_DATABASE_URL；访问令牌 /var/lib/agentbox/api.token（0600）；自签证书 /etc/agentbox/tls.{crt,key}。
 # 4C8G 配置：任务环境内存池 4 GiB、最多 3 个并发任务；单任务预算默认 2 USD、上限 3 USD（按配置单价估算）。
 # 对外只在测试窗口经安全组放通 443；结束后删除规则并轮换 api.token。
+# M4：对话式助手（会话 Worker = python3 -m chatagent，每个 turn 30 次搜索/抓取额度，空闲 10 分钟冻结、1 小时驱逐）；
+# 独立 exec 沙箱只开 2 个 slot（exec 内存 = 2 × 1 GiB，不计入 4 GiB 任务池；对话 Agent 目前不调用 run_python）。
 [Unit]
 Description=go-agentbox server (demo, HTTPS)
 After=network-online.target postgresql.service redis-server.service
@@ -27,7 +30,10 @@ ExecStart=/usr/local/bin/agentbox server \
   --search-provider serper \
   --redis-addr 127.0.0.1:6379 \
   --memory-bytes 4294967296 --run-slots 3 \
-  --default-budget-micro 2000000 --budget-cap-micro 3000000
+  --default-budget-micro 2000000 --budget-cap-micro 3000000 \
+  --session-worker-argv python3,-m,chatagent \
+  --turn-tool-budget 30 --session-idle-freeze 10m --session-evict-after 1h \
+  --exec-slots 2 --exec-per-task 2 --exec-memory-max 1073741824
 Restart=on-failure
 RestartSec=5
 KillMode=mixed

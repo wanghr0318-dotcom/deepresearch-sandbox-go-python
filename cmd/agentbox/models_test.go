@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/account"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/app"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
@@ -352,5 +353,120 @@ func TestUserCommand(t *testing.T) {
 	t.Setenv("AGENTBOX_DATABASE_URL", "")
 	if code, _, errb := run("list"); code != 2 || !strings.Contains(errb, "--database-url") {
 		t.Fatalf("没有连接串时 user list = %d %q", code, errb)
+	}
+}
+
+// ---- M4 Plan 12 Task 9：会话标志 ----
+
+// 会话标志：--turn-tool-budget 为 1–1000（默认 30），--session-evict-after 须大于 --session-idle-freeze，
+// --session-worker-argv 需要用户账号；违反时 runServer 在取得锁与连接数据库之前以退出码 2 返回。
+func TestSessionFlags(t *testing.T) {
+	var cfg app.Config
+	cfg.Accounts = true
+	if err := sessionFlags(&cfg, 30, 10*time.Minute, time.Hour, "python3,-m,chatagent"); err != nil ||
+		cfg.TurnToolBudget != 30 || cfg.SessionIdleFreeze != 10*time.Minute || cfg.SessionEvictAfter != time.Hour ||
+		strings.Join(cfg.SessionWorkerArgv, " ") != "python3 -m chatagent" {
+		t.Fatalf("合法的会话标志 = %v，cfg = %+v", err, cfg)
+	}
+	for _, tc := range []struct {
+		budget        int
+		idle, evict   time.Duration
+		argv          string
+		accounts      bool
+		wantInMessage string
+	}{
+		{0, time.Minute, time.Hour, "", true, "--turn-tool-budget"},
+		{1001, time.Minute, time.Hour, "", true, "--turn-tool-budget"},
+		{30, 0, time.Hour, "", true, "--session-idle-freeze"},
+		{30, time.Hour, time.Hour, "", true, "--session-evict-after"},
+		{30, time.Minute, time.Hour, "w", false, "--model-base-url"},
+	} {
+		c := app.Config{Accounts: tc.accounts}
+		if err := sessionFlags(&c, tc.budget, tc.idle, tc.evict, tc.argv); err == nil || !strings.Contains(err.Error(), tc.wantInMessage) {
+			t.Errorf("%+v：%v，期望指出 %s", tc, err, tc.wantInMessage)
+		}
+	}
+	// sub-run 扩展的标志（M4 Plan 14）：T_subrun_cancel 须 > 0。
+	if err := subrunFlags(&cfg, true, 10*time.Second); err != nil || !cfg.WorkerSubruns || cfg.Runner.SubrunCancelTimeout != 10*time.Second {
+		t.Fatalf("合法的 sub-run 标志 = %v，cfg = %+v", err, cfg)
+	}
+	for _, d := range []time.Duration{0, -time.Second} {
+		if err := subrunFlags(&app.Config{}, true, d); err == nil || !strings.Contains(err.Error(), "--subrun-cancel-timeout") {
+			t.Errorf("--subrun-cancel-timeout %s：%v，期望拒绝", d, err)
+		}
+	}
+	if runtime.GOOS != "linux" {
+		t.Skip("runServer 只在 Linux 上可用")
+	}
+	var stderr strings.Builder
+	if code := runServer([]string{"-help"}, &stderr); code != 2 || !strings.Contains(stderr.String(), "-worker-subruns") ||
+		!strings.Contains(stderr.String(), "-subrun-cancel-timeout duration") || !strings.Contains(stderr.String(), "(default 10s)") ||
+		!strings.Contains(stderr.String(), "-turn-tool-budget int") ||
+		!strings.Contains(stderr.String(), "(default 30)") || !strings.Contains(stderr.String(), "(default 10m0s)") ||
+		!strings.Contains(stderr.String(), "(default 1h0m0s)") || !strings.Contains(stderr.String(), "-session-worker-argv string") {
+		t.Fatalf("-help 退出码 %d：%s", code, stderr.String())
+	}
+	base := []string{"--data-dir", t.TempDir(), "--database-url", "postgres://x"}
+	for _, extra := range [][]string{
+		{"--session-idle-freeze", "1h", "--session-evict-after", "1h"},
+		{"--turn-tool-budget", "0"},
+		{"--subrun-cancel-timeout", "0s"},
+	} {
+		stderr.Reset()
+		if code := runServer(append(append([]string{}, base...), extra...), &stderr); code != 2 {
+			t.Errorf("%v：退出码 %d（%s），期望 2", extra, code, stderr.String())
+		}
+	}
+}
+
+// exec 标志（M4 Plan 15，计划 D4）：默认值即计划的默认值；--exec-slots 0 关闭 exec（其余标志不检查）；其余标志须为正，
+// 每任务上限不超过全局 slots，默认值不超过上限；违反时 runServer 在取得锁与连接数据库之前以退出码 2 返回。
+func TestExecFlags(t *testing.T) {
+	def := app.ExecConfig{Slots: app.DefaultExecSlots, PerTask: app.DefaultExecPerTask, CountLimit: app.DefaultExecCountLimit,
+		CPUSeconds: app.DefaultExecCPUSeconds, WallLimit: app.DefaultExecWallLimit, WallDefault: app.DefaultExecWallDefault,
+		WallMax: app.DefaultExecWallMax, MemoryDefault: app.DefaultExecMemoryDefault, MemoryMax: app.DefaultExecMemoryMax,
+		QueueTimeout: app.DefaultExecQueueTimeout, PidsMax: app.DefaultExecPidsMax, CPUQuotaUs: app.DefaultExecCPUQuotaUs,
+		TmpBytes: app.DefaultExecTmpBytes, OutBytes: app.DefaultExecOutBytes}
+	if got, err := execFlags(def); err != nil || got != def || !got.Enabled() {
+		t.Fatalf("默认 exec 标志 = %+v, %v", got, err)
+	}
+	if def.Slots != 4 || def.PerTask != 2 || def.CountLimit != 50 || def.CPUSeconds != 600 || def.WallLimit != 1800*time.Second ||
+		def.WallDefault != time.Minute || def.WallMax != 5*time.Minute || def.MemoryDefault != 512<<20 || def.MemoryMax != 1<<30 ||
+		def.QueueTimeout != time.Minute || def.PidsMax != 128 || def.CPUQuotaUs != 100000 || def.OutBytes != 64<<20 {
+		t.Fatalf("exec 默认值与计划 D4 不符：%+v", def)
+	}
+	off := def
+	off.Slots, off.PerTask = 0, 0
+	if got, err := execFlags(off); err != nil || got.Enabled() {
+		t.Fatalf("--exec-slots 0 = %+v, %v，期望关闭且不检查其余标志", got, err)
+	}
+	for _, tc := range []struct {
+		mod  func(e *app.ExecConfig)
+		want string
+	}{
+		{func(e *app.ExecConfig) { e.Slots = -1 }, "--exec-slots"},
+		{func(e *app.ExecConfig) { e.PerTask = 5 }, "每任务上限"},
+		{func(e *app.ExecConfig) { e.WallDefault = 10 * time.Minute }, "wall 默认值"},
+		{func(e *app.ExecConfig) { e.MemoryDefault = 2 << 30 }, "内存默认值"},
+		{func(e *app.ExecConfig) { e.QueueTimeout = 0 }, "--exec-queue-timeout"},
+		{func(e *app.ExecConfig) { e.OutBytes = -1 }, "--exec-out-bytes"},
+	} {
+		e := def
+		tc.mod(&e)
+		if _, err := execFlags(e); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%+v：%v，期望指出 %s", e, err, tc.want)
+		}
+	}
+	if runtime.GOOS != "linux" {
+		t.Skip("runServer 只在 Linux 上可用")
+	}
+	var stderr strings.Builder
+	if code := runServer([]string{"-help"}, &stderr); code != 2 || !strings.Contains(stderr.String(), "-exec-slots int") ||
+		!strings.Contains(stderr.String(), "-exec-memory-max int") || !strings.Contains(stderr.String(), "(default 1073741824)") {
+		t.Fatalf("-help 退出码 %d：%s", code, stderr.String())
+	}
+	stderr.Reset()
+	if code := runServer([]string{"--data-dir", t.TempDir(), "--database-url", "postgres://x", "--exec-per-task", "9"}, &stderr); code != 2 {
+		t.Errorf("--exec-per-task 9：退出码 %d（%s），期望 2", code, stderr.String())
 	}
 }

@@ -725,6 +725,124 @@ func (p *Provider) ResourceDiag(_ context.Context, envID string) (provider.Resou
 	return provider.ResourceDiag{}, nil
 }
 
+// OpenOutputs：进程型 provider 不支持 exec 环境（没有宿主侧 /out），存在的环境一律报错。
+func (p *Provider) OpenOutputs(_ context.Context, envID string, _ int) ([]provider.OutputFile, []provider.SkippedOutput, error) {
+	if err := checkName(envID); err != nil {
+		return nil, nil, err
+	}
+	own, _, err := p.readOwner(envID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if own != dirOwned {
+		return nil, nil, provider.ErrNotFound
+	}
+	return nil, nil, errors.New("procprov: 不支持 exec 环境，没有 /out")
+}
+
+// ---- Freeze、Thaw、Procs（契约第 3 节修订，M4 Plan 12）----
+//
+// 进程型 provider 没有 cgroup freezer：冻结以 SIGSTOP 模拟，并等到每个存活进程的状态为 T（已停止）才确认；
+// 期限内未确认 → ErrFreezeUnconfirmed 并 SIGCONT 尝试解冻。解冻为 SIGCONT 并等到没有进程处于 T。
+// SIGKILL 对已停止的进程同样生效，因此 Stop 不需要先解冻。
+
+// Freeze 实现 provider.Provider。
+func (p *Provider) Freeze(ctx context.Context, envID string) error {
+	dir, err := p.ownedDir(envID)
+	if err != nil {
+		return err
+	}
+	if err := p.signalUntil(ctx, dir, syscall.SIGSTOP, true); err != nil {
+		_ = p.signalUntil(context.Background(), dir, syscall.SIGCONT, false) // 尽力解冻；冻结已报告失败
+		return fmt.Errorf("%w: %v", provider.ErrFreezeUnconfirmed, err)
+	}
+	return nil
+}
+
+// Thaw 实现 provider.Provider。
+func (p *Provider) Thaw(ctx context.Context, envID string) error {
+	dir, err := p.ownedDir(envID)
+	if err != nil {
+		return err
+	}
+	return p.signalUntil(ctx, dir, syscall.SIGCONT, false)
+}
+
+// Procs 实现 provider.Provider：环境的存活进程（记录的进程与带标记的进程）。
+func (p *Provider) Procs(_ context.Context, envID string) ([]int, error) {
+	dir, err := p.ownedDir(envID)
+	if err != nil {
+		return nil, err
+	}
+	return p.live(dir)
+}
+
+// ReclaimUIDFiles 实现 provider.Provider。procprov 不做 UID 映射（进程以宿主用户运行），没有任何文件归 UID 范围
+// 所有，因此什么也不改。
+func (p *Provider) ReclaimUIDFiles(context.Context, uint32, uint32) (int, error) { return 0, nil }
+
+// UIDFiles 实现 provider.Provider：理由同 ReclaimUIDFiles，总是为空。
+func (p *Provider) UIDFiles(context.Context, uint32, uint32, int) ([]string, error) { return nil, nil }
+
+// ownedDir 返回属于本安装的环境目录；否则 ErrNotFound。
+func (p *Provider) ownedDir(envID string) (string, error) {
+	if err := checkName(envID); err != nil {
+		return "", err
+	}
+	own, _, err := p.readOwner(envID)
+	if err != nil {
+		return "", err
+	}
+	if own != dirOwned {
+		return "", provider.ErrNotFound
+	}
+	return p.envDir(envID), nil
+}
+
+// signalUntil 向环境的全部存活进程发 sig，直到每个进程的"已停止"状态等于 stopped（ctx 无期限时取 StopTimeout）。
+func (p *Provider) signalUntil(ctx context.Context, dir string, sig syscall.Signal, stopped bool) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.opt.StopTimeout)
+		defer cancel()
+	}
+	for {
+		live, err := p.live(dir)
+		if err != nil {
+			return err
+		}
+		done := true
+		for _, pid := range live {
+			if procStopped(pid) != stopped {
+				done = false
+				_ = syscall.Kill(pid, sig) // 进程可能刚退出
+			}
+		}
+		if done {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("进程 %v 未达到目标状态: %w", live, ctx.Err())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// procStopped 报告进程是否处于作业控制停止状态（/proc/<pid>/stat 第 3 项为 T）。已退出的进程按"未停止"处理。
+func procStopped(pid int) bool {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return false
+	}
+	i := bytes.LastIndexByte(b, ')')
+	if i < 0 {
+		return false
+	}
+	f := strings.Fields(string(b[i+1:]))
+	return len(f) > 0 && f[0] == "T"
+}
+
 // ---- 测试注入 ----
 
 // BlockStart 使 envID 上的下一次 StartExec 在通过闸门之后、启动进程之前阻塞；blocked 在阻塞时关闭。

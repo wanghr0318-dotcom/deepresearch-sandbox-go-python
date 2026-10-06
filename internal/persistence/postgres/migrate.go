@@ -25,7 +25,9 @@ var agentboxTables = []string{
 	"installation", "api_requests", "tasks", "task_control", "task_progress", "task_event_seq",
 	"attempts", "attempt_access", "events", "environments", "uid_ranges", "resource_intents",
 	"quarantined_resources", "checkpoints", "blobs", "scope_blobs", "blob_provenance",
-	"artifact_heads", "artifacts", "budgets", "calls", "call_tries", "reservations", "users", "sessions",
+	"artifact_heads", "artifacts", "budgets", "calls", "call_tries", "reservations", "users", "sessions", "auth_sessions",
+	"session_control", "session_progress", "session_event_seq", "session_events", "incarnations", "subruns", "subrun_budgets",
+	"exec_quotas",
 }
 
 // inspectTablesSQL 在同一份目录中查三组表名是否存在：pg_catalog 限定 current_schema()。

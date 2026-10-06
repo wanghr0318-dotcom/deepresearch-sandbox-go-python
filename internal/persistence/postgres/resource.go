@@ -199,6 +199,37 @@ func (s *Store) ReleaseUIDRange(ctx context.Context, uidRangeID, allocationID st
 	return out, err
 }
 
+// QuarantineUIDRange 隔离 UID 范围（实现 resource.Store；规格 §4.5"存疑则隔离"、E39）：只在分配代次匹配时把范围
+// 置为 quarantined（保留 owner 以便诊断；quarantined 的范围不会被分配，也不在启动核对的未归还集合中），同一事务
+// 记录 quarantined_resources(kind = uid_files)。已隔离时幂等（隔离记录按路径幂等，不覆盖原因）。
+// 锁顺序：uid_ranges → quarantined_resources（不触碰 environments）。
+func (s *Store) QuarantineUIDRange(ctx context.Context, uidRangeID, allocationID, reason string) error {
+	if uidRangeID == "" || allocationID == "" || reason == "" {
+		return invalidf("QuarantineUIDRange 缺少 uid_range_id、allocation_id 或 reason")
+	}
+	return s.run(ctx, "QuarantineUIDRange", uidRangeID+"/"+allocationID, func(ctx context.Context, tx pgx.Tx) error {
+		cur, err := selectUIDRange(ctx, tx, "uid_range_id = $1", uidRangeID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("UID 范围 %s", uidRangeID)
+		}
+		if err != nil {
+			return err
+		}
+		if cur.AllocationID != allocationID {
+			return conflictf("UID 范围 %s 当前分配为 %q，不是 %q", uidRangeID, cur.AllocationID, allocationID)
+		}
+		if cur.State != "quarantined" {
+			if _, err := tx.Exec(ctx, "UPDATE uid_ranges SET state = 'quarantined' WHERE uid_range_id = $1", uidRangeID); err != nil {
+				return err
+			}
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO quarantined_resources (resource_path, kind, observed_owner, reason)
+			VALUES ($1, $2, $3, $4) ON CONFLICT (resource_path) DO NOTHING`,
+			resource.UIDRangeQuarantinePath(uidRangeID), "uid_files", cur.OwnerID, reason) // provider.LayerUIDFiles
+		return err
+	})
+}
+
 // GetUIDRange 读取分配给环境的 UID 范围（实现 resource.Store）。
 func (s *Store) GetUIDRange(ctx context.Context, envID string) (resource.UIDRange, error) {
 	var out resource.UIDRange

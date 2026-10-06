@@ -5,7 +5,19 @@ import { collectArtifacts } from "./artifacts";
 import { controlAvailability } from "./controls";
 import { describeError } from "./errors";
 import { downloadFilename, previewKindForDownload, previewKindOf } from "./media";
-import { homeHref, isAdminRoute, loginHref, needsSession, parseHash, registerHref, researchHref, taskHref, tasksHref } from "./router";
+import {
+  homeHref,
+  isAdminRoute,
+  legacyHref,
+  loginHref,
+  needsSession,
+  parseHash,
+  registerHref,
+  researchHref,
+  sessionHref,
+  taskHref,
+  tasksHref,
+} from "./router";
 import { canCancel, countEvidence, deriveProgress, formatCreated, reportFilename, researchTitle, reportTitle, statusLabel, userErrorMessage } from "./research";
 import { ROOT_LANE, lanes, mergeEvents } from "./timeline";
 
@@ -105,10 +117,26 @@ describe("hash router", () => {
     }
   });
 
+  it("parses #/, #/s/<id>, #/research and keeps #/admin", () => {
+    expect(parseHash("")).toEqual({ name: "chat" });
+    expect(parseHash("#/")).toEqual({ name: "chat" });
+    expect(parseHash("#/nope")).toEqual({ name: "chat" });
+    expect(homeHref()).toBe("#/");
+    expect(sessionHref("s/1 2")).toBe("#/s/s%2F1%202");
+    expect(parseHash(sessionHref("s/1 2"))).toEqual({ name: "chat", id: "s/1 2" });
+    expect(parseHash("#/s/abc/")).toEqual({ name: "chat", id: "abc" });
+    expect(parseHash("#/s/%E0%A4%A")).toEqual({ name: "chat" }); // 坏编码回到新对话
+    expect(parseHash("#/s/")).toEqual({ name: "chat" });
+    expect(legacyHref()).toBe("#/research");
+    expect(parseHash("#/research")).toEqual({ name: "legacy" });
+    expect(parseHash("#/research/")).toEqual({ name: "legacy" });
+    expect(parseHash("#/admin")).toEqual({ name: "tasks" });
+    expect(parseHash("#/admin/tasks/t-1")).toEqual({ name: "task", id: "t-1" });
+    for (const r of ["#/", "#/s/x", "#/research", "#/research/x"]) expect(needsSession(parseHash(r))).toBe(true);
+    expect(isAdminRoute(parseHash("#/s/x"))).toBe(false);
+  });
+
   it("routes the user pages", () => {
-    expect(parseHash("")).toEqual({ name: "home" });
-    expect(parseHash("#/")).toEqual({ name: "home" });
-    expect(parseHash("#/nope")).toEqual({ name: "home" });
     expect(parseHash("#/login")).toEqual({ name: "login" });
     expect(parseHash("#/register")).toEqual({ name: "register" });
     expect(researchHref("a/b")).toBe("#/research/a%2Fb");

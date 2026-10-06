@@ -679,6 +679,9 @@ func (h *harness) start(cfg app.Config) {
 		if len(cfg.WorkerEnv) == 0 {
 			cfg.WorkerEnv = []string{"PYTHONPATH=" + rootfs.WorkerDir}
 		}
+		if cfg.Exec.Enabled() {
+			d.ExecImageDigest = execImageDigest // 与 cmd/agentbox 的 prepareIsolation 相同
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
@@ -1900,6 +1903,9 @@ func TestMain(m *testing.M) {
 	}
 	if agentboxBinDir != "" {
 		_ = os.RemoveAll(agentboxBinDir)
+	}
+	if swDir != "" {
+		_ = os.RemoveAll(swDir)
 	}
 	if realCgRoot != "" {
 		killRemove(realCgRoot)
@@ -3657,13 +3663,16 @@ func freePort(t *testing.T) string {
 
 // startReal 以 `agentbox server` 启动 server 子进程（生产启动器、默认 rootfs 模板、本次运行的 cgroup 根），
 // 等待 API 进入 normal 模式。
-func (s *sysHarness) startReal() *serverProc {
+func (s *sysHarness) startReal(extra ...string) *serverProc {
 	s.t.Helper()
 	base := "http://127.0.0.1:" + freePort(s.t)
-	cmd := exec.Command(s.bin, "server", "--data-dir", s.dir, "--database-url", s.serverDSN,
-		"--listen", strings.TrimPrefix(base, "http://"), "--cgroup-root", realCgRoot)
+	cmd := exec.Command(s.bin, append([]string{"server", "--data-dir", s.dir, "--database-url", s.serverDSN,
+		"--listen", strings.TrimPrefix(base, "http://"), "--cgroup-root", realCgRoot}, extra...)...)
 	p := &serverProc{cmd: cmd, logs: &lockedBuffer{}, done: make(chan struct{}), base: base}
 	cmd.Stdout, cmd.Stderr = p.logs, p.logs
+	// server 被 SIGKILL 时，冻结的会话环境（E33）中的进程无法退出，仍持有继承的输出管道：Wait 在进程退出后至多
+	// 再等 WaitDelay 读取输出，然后关闭管道返回。
+	cmd.WaitDelay = 5 * time.Second
 	if err := cmd.Start(); err != nil {
 		s.t.Fatal(err)
 	}
@@ -3963,6 +3972,11 @@ type gwResp struct {
 
 // gwDo 在 attempt 的 socket 上以一条新连接发出一个请求（不复用连接）。
 func gwDo(sock, method, path, callID, body string) (gwResp, error) {
+	return gwDoSubrun(sock, "", method, path, callID, body)
+}
+
+// gwDoSubrun 同 gwDo；subrunID 非空时带 X-Agentbox-Subrun（归属该 sub-run，call id 须以 <subrunID>/ 开头）。
+func gwDoSubrun(sock, subrunID, method, path, callID, body string) (gwResp, error) {
 	tr := &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		var d net.Dialer
 		return d.DialContext(ctx, "unix", sock)
@@ -3974,6 +3988,9 @@ func gwDo(sock, method, path, callID, body string) (gwResp, error) {
 	}
 	if callID != "" {
 		req.Header.Set("X-Agentbox-Call-Id", callID)
+	}
+	if subrunID != "" {
+		req.Header.Set("X-Agentbox-Subrun", subrunID)
 	}
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
@@ -5199,8 +5216,9 @@ func task1Counts(fu *fakeupstream.Server) upstreamCounts {
 // Worker 是 sim_worker（fetch 操作的调用 ID 为 root/<step>/fetch/1）；E24 与收益测量直接连接 attempt 的 socket
 // 发请求。每条用例以静止时的不变量检查结束（含 I14 的缓存部分与 I15）。
 //
-// E24 的"两个 sub-run 的同一抓取不合并"在 call 层覆盖（internal/gateway/call 的 Task 4 用例：两个 sub-run 与另一
-// attempt → 3 次上游、coalesced = 0）：edge 在 M3 仍以 subrun_unsupported 拒绝 X-Agentbox-Subrun（sub-run 是 M4）。
+// TestE24CoalesceWithinAttempt 只覆盖 root 调用的合并。sub-run 的部分（同一 sub-run 内合并、两个 sub-run 的同一
+// 抓取不合并）见 M4 Plan 14 Task 11 段的 TestE24SubrunCoalesce：edge 自 M4（Plan 14 Task 5）接受 X-Agentbox-Subrun，
+// 合并键含 subrun_id（§11.4）。
 
 const redisEnv = "AGENTBOX_TEST_REDIS_ADDR"
 
@@ -6133,3 +6151,2181 @@ func benchReport(started time.Time, runs int, latency time.Duration, redisAddr s
 	}
 	return b.String()
 }
+
+// ---- M4 Plan 12 Task 9：会话（基本流、工具额度、D5 与恢复、awaiting_input、用户隔离；E28–E33） ----
+//
+// 会话 Worker 是脚本化的 Go 程序 tests/e2e/sessionworker（CGO_ENABLED=0），行为由每条消息正文中的 key=value 选项选择
+// （script=…、searches=N、sleep_ms=N、hold_ms=N、state=ref）。非 root 用例经 agentbox-e2e（procprov，不隔离）运行，
+// SIGKILL 与重启都是真实的；Worker 的观察记录写在会话 workspace 的 .sw/log.jsonl。TestRealE2x/E3x 以 root 在真实隔离
+// 环境中运行 cmd/agentbox（会话 Worker 复制到 rootfs.WorkerDir）。
+
+var (
+	swOnce sync.Once
+	swDir  string
+	swPath string
+	swErr  error
+)
+
+// sessionWorkerBinary 以 CGO_ENABLED=0 构建 tests/e2e/sessionworker（每次 go test 一次）。
+func sessionWorkerBinary(t *testing.T) string {
+	t.Helper()
+	swOnce.Do(func() {
+		if swDir, swErr = os.MkdirTemp("", "agentbox-sw-"); swErr != nil {
+			return
+		}
+		if swErr = os.Chmod(swDir, 0o755); swErr != nil {
+			return
+		}
+		swPath = filepath.Join(swDir, "sessionworker")
+		cmd := exec.Command(goBinary(), "build", "-o", swPath, "./sessionworker")
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			swErr = fmt.Errorf("构建 sessionworker: %v\n%s", err, out)
+		}
+	})
+	if swErr != nil {
+		t.Fatal(swErr)
+	}
+	return swPath
+}
+
+// sessSys 是启用会话的系统级装置：agentbox-e2e（或 root 时的 cmd/agentbox）+ fake upstream + 会话 Worker。
+type sessSys struct {
+	*sysHarness
+	flags []string
+	real  bool
+}
+
+// newSessionSys：非 root、procprov。extra 是额外的 server 标志（每次启动都使用）。
+func newSessionSys(t *testing.T, extra ...string) *sessSys {
+	t.Helper()
+	s := newSys(t)
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	ss := &sessSys{sysHarness: s,
+		flags: append([]string{"--fake-upstream", fu.URL(), "--session-worker", sessionWorkerBinary(t)}, extra...)}
+	t.Cleanup(ss.dumpOnFailure)
+	return ss
+}
+
+// dumpOnFailure 在失败时输出会话、incarnation、环境与 UID 范围的存储状态，以及各 server 除访问日志之外的日志
+// （轮询请求会挤掉 tail 中有用的部分）。
+func (s *sessSys) dumpOnFailure() {
+	if !s.t.Failed() {
+		return
+	}
+	ctx := context.Background()
+	if c, err := pgx.Connect(ctx, s.dsn); err == nil {
+		for _, q := range []string{
+			`SELECT session_id, status, COALESCE(last_error, ''), COALESCE(current_incarnation_id, ''), COALESCE(uid_range_id, ''),
+				COALESCE(current_task_id, ''), COALESCE(blocked_by_task_id, '') FROM sessions`,
+			`SELECT incarnation_id, session_id, env_id, status, COALESCE(end_reason, '') FROM incarnations ORDER BY started_at`,
+			`SELECT env_id, kind, COALESCE(attempt_id, ''), status, stopped_at IS NOT NULL, cleanup_state, COALESCE(uid_range_id, ''),
+				COALESCE(cleanup_error, '') FROM environments ORDER BY created_at`,
+			`SELECT uid_range_id, state, COALESCE(owner_id, ''), COALESCE(allocation_id, '') FROM uid_ranges WHERE state <> 'free'`,
+			`SELECT task_id, status, status_reason, COALESCE(session_id, '') FROM tasks ORDER BY created_at`,
+		} {
+			rows, err := c.Query(ctx, q)
+			if err != nil {
+				s.t.Logf("%s: %v", q, err)
+				continue
+			}
+			var lines []string
+			for rows.Next() {
+				vals, _ := rows.Values()
+				lines = append(lines, fmt.Sprint(vals...))
+			}
+			rows.Close()
+			s.t.Logf("%s\n  %s", strings.Fields(q)[1], strings.Join(lines, "\n  "))
+		}
+		_ = c.Close(ctx)
+	}
+	for i, p := range s.procs {
+		var keep []string
+		for _, line := range strings.Split(p.logs.tail(8<<20), "\n") {
+			if !strings.Contains(line, `"msg":"api request"`) {
+				keep = append(keep, line)
+			}
+		}
+		if len(keep) > 300 {
+			keep = keep[len(keep)-300:]
+		}
+		s.t.Logf("server #%d 日志（不含访问日志，末尾）：\n%s", i+1, strings.Join(keep, "\n"))
+	}
+}
+
+func (s *sessSys) startS() *serverProc {
+	s.t.Helper()
+	if s.real {
+		return s.startReal(s.flags...)
+	}
+	return s.start("", s.flags...)
+}
+
+// kill 以 SIGKILL 杀死当前 server，等待其数据库连接全部结束。
+func (s *sessSys) kill() {
+	s.t.Helper()
+	if err := s.srv.cmd.Process.Kill(); err != nil {
+		s.t.Fatal(err)
+	}
+	if ps := s.waitExit(s.srv); !killedBySIGKILL(ps) {
+		s.t.Fatalf("server 退出状态 %v，期望被 SIGKILL", ps)
+	}
+	s.waitConnsGone()
+}
+
+func (s *sessSys) end() {
+	s.t.Helper()
+	if s.real {
+		s.finishReal()
+		return
+	}
+	s.finish()
+}
+
+func (s *sessSys) row(sql string, args []any, dest ...any) {
+	s.t.Helper()
+	pgQueryRow(s.t, s.dsn, sql, args, dest...)
+}
+
+// swRec 是会话 Worker 的一条观察记录。
+type swRec map[string]any
+
+func (r swRec) str(k string) string { v, _ := r[k].(string); return v }
+
+func (r swRec) num(k string) int64 { v, _ := r[k].(float64); return int64(v) }
+
+// swLog 读取会话 workspace 中 Worker 的观察记录（.sw/log.jsonl）。
+func (s *sessSys) swLog(sessionID string) []swRec {
+	s.t.Helper()
+	b, err := os.ReadFile(filepath.Join(s.dir, "sessions", sessionID, "workspace", ".sw", "log.jsonl"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		s.t.Fatal(err)
+	}
+	var out []swRec
+	for _, line := range bytes.Split(b, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var r swRec
+		if err := json.Unmarshal(line, &r); err != nil {
+			s.t.Fatalf("Worker 记录 %q: %v", line, err)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// swFind 返回满足条件的记录。
+func swFind(recs []swRec, f func(swRec) bool) []swRec {
+	var out []swRec
+	for _, r := range recs {
+		if f(r) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func swEvent(event string, kv ...string) func(swRec) bool {
+	return func(r swRec) bool {
+		if r.str("event") != event {
+			return false
+		}
+		for i := 0; i+1 < len(kv); i += 2 {
+			if r.str(kv[i]) != kv[i+1] {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// sessUser 是一个已登录的用户（cookie 跨 server 重启有效）。
+type sessUser struct {
+	s      *sessSys
+	cookie string
+}
+
+func (s *sessSys) user(name string) *sessUser {
+	s.t.Helper()
+	resp, err := http.Post(s.srv.base+"/auth/register", "application/json",
+		strings.NewReader(`{"username":"`+name+`","password":"correct horse battery"}`))
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	u := &sessUser{s: s}
+	for _, c := range resp.Cookies() {
+		if c.Name == "agentbox_session" {
+			u.cookie = c.Name + "=" + c.Value
+		}
+	}
+	if resp.StatusCode != http.StatusCreated || u.cookie == "" {
+		s.t.Fatalf("注册 %s = %d", name, resp.StatusCode)
+	}
+	return u
+}
+
+func (u *sessUser) do(method, path, body string) (int, []byte) {
+	u.s.t.Helper()
+	req, err := http.NewRequest(method, u.s.srv.base+path, strings.NewReader(body))
+	if err != nil {
+		u.s.t.Fatal(err)
+	}
+	req.Header.Set("Cookie", u.cookie)
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		u.s.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		u.s.t.Fatal(err)
+	}
+	return resp.StatusCode, b
+}
+
+func (u *sessUser) createSession(requestID string) string {
+	u.s.t.Helper()
+	code, b := u.do("POST", "/sessions", `{"request_id":"`+requestID+`"}`)
+	var v api.SessionView
+	if code != http.StatusCreated || json.Unmarshal(b, &v) != nil || v.SessionID == "" {
+		u.s.t.Fatalf("POST /sessions = %d %s", code, b)
+	}
+	return v.SessionID
+}
+
+func (u *sessUser) message(sessionID, requestID, text string) api.CreateTurnResult {
+	u.s.t.Helper()
+	body, _ := json.Marshal(map[string]any{"request_id": requestID, "text": text, "deep_research": false})
+	code, b := u.do("POST", "/sessions/"+sessionID+"/messages", string(body))
+	var r api.CreateTurnResult
+	if code != http.StatusAccepted || json.Unmarshal(b, &r) != nil || r.TurnID == "" {
+		u.s.t.Fatalf("POST messages %q = %d %s", text, code, b)
+	}
+	return r
+}
+
+// control 发送 turn 控制（stop | continue | finish）。
+func (u *sessUser) control(turnID, action, requestID string) {
+	u.s.t.Helper()
+	if code, b := u.do("POST", "/turns/"+turnID+"/"+action, `{"request_id":"`+requestID+`"}`); code != http.StatusAccepted {
+		u.s.t.Fatalf("POST /turns/%s/%s = %d %s", turnID, action, code, b)
+	}
+}
+
+func (u *sessUser) turn(sessionID, turnID string) (api.TurnView, bool) {
+	u.s.t.Helper()
+	code, b := u.do("GET", "/sessions/"+sessionID+"/turns", "")
+	var r struct {
+		Turns []api.TurnView `json:"turns"`
+	}
+	if code != http.StatusOK || json.Unmarshal(b, &r) != nil {
+		u.s.t.Fatalf("GET turns = %d %s", code, b)
+	}
+	for _, v := range r.Turns {
+		if v.TurnID == turnID {
+			return v, true
+		}
+	}
+	return api.TurnView{}, false
+}
+
+func (u *sessUser) waitTurn(sessionID, turnID, what string, cond func(api.TurnView) bool) api.TurnView {
+	u.s.t.Helper()
+	var v api.TurnView
+	eventuallyWithin(u.s.t, "turn "+turnID+" "+what, waitLimit, 100*time.Millisecond, func() bool {
+		var ok bool
+		v, ok = u.turn(sessionID, turnID)
+		return ok && cond(v)
+	})
+	return v
+}
+
+func turnIs(status string) func(api.TurnView) bool {
+	return func(v api.TurnView) bool { return v.Status == status }
+}
+
+// closeSession 删除会话并等待它 closed（workspace 删除、UID 范围归还）。
+func (u *sessUser) closeSession(sessionID string) {
+	u.s.t.Helper()
+	if code, b := u.do("DELETE", "/sessions/"+sessionID, ""); code != http.StatusAccepted {
+		u.s.t.Fatalf("DELETE /sessions/%s = %d %s", sessionID, code, b)
+	}
+	u.s.waitSession(sessionID, "closed")
+}
+
+// waitSession 等待会话的存储状态（sessions.status）。
+func (s *sessSys) waitSession(sessionID, status string) {
+	s.t.Helper()
+	eventually(s.t, "会话 "+sessionID+" 进入 "+status, func() bool {
+		var st string
+		s.row("SELECT status FROM sessions WHERE session_id = $1", []any{sessionID}, &st)
+		return st == status
+	})
+}
+
+// sse 以该用户读取整个会话的事件流（Last-Event-ID = 0），直到 until 成立或期限到；返回每条事件的原始 JSON。
+func (u *sessUser) sse(sessionID string, until func([]json.RawMessage) bool) []json.RawMessage {
+	u.s.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), waitLimit)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", u.s.srv.base+"/sessions/"+sessionID+"/events", nil)
+	if err != nil {
+		u.s.t.Fatal(err)
+	}
+	req.Header.Set("Cookie", u.cookie)
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		u.s.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		u.s.t.Fatalf("GET events = %d", resp.StatusCode)
+	}
+	var out []json.RawMessage
+	br := bufio.NewReader(resp.Body)
+	for {
+		line, err := br.ReadString('\n')
+		if data, ok := strings.CutPrefix(strings.TrimRight(line, "\r\n"), "data: "); ok {
+			out = append(out, json.RawMessage(data))
+			if until(out) {
+				return out
+			}
+		}
+		if err != nil {
+			u.s.t.Fatalf("事件流在条件成立之前结束（%v），已读 %d 条", err, len(out))
+		}
+	}
+}
+
+func hasEventType(typ string) func([]json.RawMessage) bool {
+	return func(evs []json.RawMessage) bool {
+		for _, e := range evs {
+			var v struct {
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(e, &v) == nil && v.Type == typ {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// internalKeys 返回 JSON 中任意深度出现的内部字段名（用户视图不得出现）。
+func internalKeys(v any) []string {
+	var out []string
+	switch x := v.(type) {
+	case map[string]any:
+		for k, sub := range x {
+			switch k {
+			case "internal", "attempt_id", "call_id", "worker_seq", "usage", "model", "task_seq":
+				out = append(out, k)
+			}
+			if strings.HasPrefix(k, "cost") || strings.Contains(k, "price") {
+				out = append(out, k)
+			}
+			out = append(out, internalKeys(sub)...)
+		}
+	case []any:
+		for _, sub := range x {
+			out = append(out, internalKeys(sub)...)
+		}
+	}
+	return out
+}
+
+// assertSessionSeqContiguous：会话的 session_seq（task 事件与会话事件合计）从 1 起连续。
+func (s *sessSys) assertSessionSeqContiguous(sessionID string) {
+	s.t.Helper()
+	var n, lo, hi int64
+	s.row(`SELECT count(*), COALESCE(min(q), 0), COALESCE(max(q), 0) FROM (SELECT session_seq AS q FROM events WHERE session_id = $1
+		UNION ALL SELECT session_seq FROM session_events WHERE session_id = $1) x`, []any{sessionID}, &n, &lo, &hi)
+	if n == 0 || lo != 1 || hi != n {
+		s.t.Fatalf("会话 %s 的 session_seq 不连续：%d 条，范围 %d..%d", sessionID, n, lo, hi)
+	}
+}
+
+// TestSessionBasicFlow：创建会话 → 两条消息（第二条读到第一条提交的会话状态：base checkpoint、计数与 workspace 文件）
+// → 事件流 session_seq 连续、用户视图没有内部字段；另一用户读写该会话一律 404；删除会话后环境停止、workspace 删除、
+// UID 范围归还，不变量（含 I9、I10）成立。
+func TestSessionBasicFlow(t *testing.T) {
+	s := newSessionSys(t)
+	s.startS()
+	alice, bob := s.user("alice"), s.user("bob")
+	sid := alice.createSession("cs-1")
+	r1 := alice.message(sid, "m-1", "searches=2")
+	v1 := alice.waitTurn(sid, r1.TurnID, "成功", turnIs("succeeded"))
+	r2 := alice.message(sid, "m-2", "searches=1")
+	v2 := alice.waitTurn(sid, r2.TurnID, "成功", turnIs("succeeded"))
+	if v1.Summary != "count=1 task="+r1.TurnID || v2.Summary != "count=2 task="+r2.TurnID {
+		t.Fatalf("第二条消息应读到第一条提交的会话状态：%q / %q", v1.Summary, v2.Summary)
+	}
+	if v1.ToolCallsUsed != 2 || v1.ToolCallLimit != 30 || v2.ToolCallsUsed != 1 {
+		t.Errorf("工具额度 = %d/%d、%d", v1.ToolCallsUsed, v1.ToolCallLimit, v2.ToolCallsUsed)
+	}
+	logs := s.swLog(sid)
+	st1 := swFind(logs, swEvent("task_start", "task_id", r1.TurnID))
+	st2 := swFind(logs, swEvent("task_start", "task_id", r2.TurnID))
+	if len(st1) != 1 || len(st2) != 1 || st1[0].str("base_session_checkpoint_id") != "" ||
+		st2[0].str("base_session_checkpoint_id") != "sc-"+st1[0].str("attempt_id") || st1[0].num("pid") != st2[0].num("pid") {
+		t.Fatalf("task_start 记录：%v / %v（两轮应在同一 incarnation 中，第二轮以第一轮的会话 checkpoint 为 base）", st1, st2)
+	}
+	if note, err := os.ReadFile(filepath.Join(s.dir, "sessions", sid, "workspace", "session", "note.txt")); err != nil ||
+		string(note) != "count=2 task="+r2.TurnID {
+		t.Errorf("workspace 会话文件 = %q, %v", note, err)
+	}
+	// 用户隔离：另一用户读写该会话与其 turn 一律 404。
+	for _, req := range []struct{ method, path, body string }{
+		{"GET", "/sessions/" + sid, ""}, {"GET", "/sessions/" + sid + "/turns", ""}, {"GET", "/sessions/" + sid + "/events", ""},
+		{"POST", "/sessions/" + sid + "/messages", `{"request_id":"x","text":"hi","deep_research":false}`},
+		{"POST", "/turns/" + r1.TurnID + "/stop", `{"request_id":"y"}`}, {"DELETE", "/sessions/" + sid, ""},
+	} {
+		if code, b := bob.do(req.method, req.path, req.body); code != http.StatusNotFound {
+			t.Errorf("用户 B %s %s = %d %s，期望 404", req.method, req.path, code, b)
+		}
+	}
+	// 事件流：用户视图没有内部字段，seq 递增；存储的 session_seq 连续。
+	evs := alice.sse(sid, func(evs []json.RawMessage) bool {
+		n := 0
+		for _, e := range evs {
+			var v struct {
+				Type   string `json:"type"`
+				TurnID string `json:"turn_id"`
+			}
+			if json.Unmarshal(e, &v) == nil && v.Type == "turn_result" {
+				n++
+			}
+		}
+		return n == 2
+	})
+	last := int64(0)
+	for _, e := range evs {
+		var v map[string]any
+		if err := json.Unmarshal(e, &v); err != nil {
+			t.Fatal(err)
+		}
+		if keys := internalKeys(v); len(keys) > 0 {
+			t.Errorf("用户事件含内部字段 %v：%s", keys, e)
+		}
+		seq := int64(v["seq"].(float64))
+		if seq <= last {
+			t.Errorf("事件 seq 不递增：%d 之后 %d", last, seq)
+		}
+		last = seq
+	}
+	s.assertSessionSeqContiguous(sid)
+	alice.closeSession(sid)
+	if _, err := os.Stat(filepath.Join(s.dir, "sessions", sid)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("关闭后会话目录仍存在：%v", err)
+	}
+	s.end()
+}
+
+// TestToolBudgetAcrossRestart：Worker 调用 35 次搜索——第 31 次起 429 tool_budget_exhausted，turn 仍 succeeded，
+// tool_calls_used = 30；第 20 次调用之后 SIGKILL server 并重启：计数延续（调用以同一 call id 重放不计数），恢复后的
+// attempt 至多再新建 10 个调用。
+func TestToolBudgetAcrossRestart(t *testing.T) {
+	s := newSessionSys(t)
+	s.startS()
+	u := s.user("alice")
+	sid := u.createSession("cs-1")
+	r := u.message(sid, "m-1", "searches=35 sleep_ms=100")
+	var before int
+	eventually(t, "至少 20 次搜索调用已登记", func() bool {
+		s.row("SELECT count(*) FROM calls WHERE task_id = $1", []any{r.TurnID}, &before)
+		return before >= 20
+	})
+	s.kill()
+	s.row("SELECT count(*) FROM calls WHERE task_id = $1", []any{r.TurnID}, &before)
+	if before >= 30 {
+		t.Fatalf("SIGKILL 之前已登记 %d 个调用，测试前提不成立", before)
+	}
+	s.startS()
+	v := u.waitTurn(sid, r.TurnID, "成功", turnIs("succeeded"))
+	var calls, used int
+	s.row("SELECT count(*) FROM calls WHERE task_id = $1", []any{r.TurnID}, &calls)
+	s.row("SELECT tool_calls_used FROM budgets WHERE task_id = $1", []any{r.TurnID}, &used)
+	if v.ToolCallsUsed != 30 || used != 30 || calls != 30 || calls-before > 10 {
+		t.Fatalf("工具额度：Turn.tool_calls_used = %d，budgets = %d，调用 %d 个（重启前 %d 个）", v.ToolCallsUsed, used, calls, before)
+	}
+	searches := swFind(s.swLog(sid), swEvent("search", "task_id", r.TurnID))
+	attempts := map[string]bool{}
+	var exhausted int
+	for _, rec := range searches {
+		attempts[rec.str("attempt_id")] = true
+		if rec.str("error") != "" { // SIGKILL 时在途的请求：连接中断，没有状态码
+			continue
+		}
+		switch n := rec.num("n"); {
+		case n > 30 && rec.num("status") != http.StatusTooManyRequests:
+			t.Errorf("第 %d 次搜索 = %v，期望 429", n, rec["status"])
+		case n > 30:
+			exhausted++
+		case rec.num("status") != http.StatusOK:
+			t.Errorf("第 %d 次搜索 = %v，期望 200（新建或重放）", n, rec["status"])
+		}
+	}
+	if len(attempts) != 2 || exhausted != 5 {
+		t.Errorf("搜索记录：%d 个 attempt，%d 次 429（期望 2 个 attempt、最后一个 attempt 的第 31–35 次 429）", len(attempts), exhausted)
+	}
+	u.closeSession(sid)
+	s.end()
+}
+
+// TestSessionStopSupersedeRestore（D5 与恢复）：turn 1 运行中 stop → paused（turn_stopped 及其之前的事件可见）→ 新消息
+// → turn 1 cancelled/superseded、turn 2 运行并带 carryover；restore turn 1 → turn 3 的首个 task_start.resume 为种子
+// seed-…，额度重新为 30。
+func TestSessionStopSupersedeRestore(t *testing.T) {
+	s := newSessionSys(t)
+	s.startS()
+	u := s.user("alice")
+	sid := u.createSession("cs-1")
+	r1 := u.message(sid, "m-1", "searches=2 hold_ms=120000")
+	eventually(t, "turn 1 完成两次搜索", func() bool {
+		return len(swFind(s.swLog(sid), swEvent("search", "task_id", r1.TurnID))) == 2
+	})
+	u.control(r1.TurnID, "stop", "st-1")
+	v1 := u.waitTurn(sid, r1.TurnID, "暂停", turnIs("paused"))
+	if v1.ToolCallsUsed != 2 {
+		t.Errorf("暂停的 turn 1 tool_calls_used = %d", v1.ToolCallsUsed)
+	}
+	evs := u.sse(sid, hasEventType("turn_stopped"))
+	if !hasEventType("turn_created")(evs) {
+		t.Errorf("turn_stopped 之前的事件不可见：%s", evs)
+	}
+	r2 := u.message(sid, "m-2", "searches=1")
+	if r2.SupersededTurnID != r1.TurnID {
+		t.Fatalf("新消息应取代暂停的 turn 1：%+v", r2)
+	}
+	v1 = u.waitTurn(sid, r1.TurnID, "被取代", turnIs("cancelled"))
+	if v1.StatusReason != "superseded" || !v1.Restorable {
+		t.Errorf("turn 1 = %s/%s，restorable %v", v1.Status, v1.StatusReason, v1.Restorable)
+	}
+	u.waitTurn(sid, r2.TurnID, "成功", turnIs("succeeded"))
+	st2 := swFind(s.swLog(sid), swEvent("task_start", "task_id", r2.TurnID))
+	if len(st2) != 1 {
+		t.Fatalf("turn 2 的 task_start：%v", st2)
+	}
+	carry, _ := st2[0]["carryover"].(map[string]any)
+	if carry["task_id"] != r1.TurnID || len(fmt.Sprint(carry["checkpoint_ref"])) != 64 {
+		t.Errorf("turn 2 的 carryover = %v，期望指向 turn 1 的最新 checkpoint", st2[0]["carryover"])
+	}
+	code, b := u.do("POST", "/turns/"+r1.TurnID+"/restore", `{"request_id":"rs-1"}`)
+	var r3 api.CreateTurnResult
+	if code != http.StatusAccepted || json.Unmarshal(b, &r3) != nil || r3.TurnID == "" {
+		t.Fatalf("POST restore = %d %s", code, b)
+	}
+	v3 := u.waitTurn(sid, r3.TurnID, "成功", turnIs("succeeded"))
+	st3 := swFind(s.swLog(sid), swEvent("task_start", "task_id", r3.TurnID))
+	att1 := swFind(s.swLog(sid), swEvent("task_start", "task_id", r1.TurnID))
+	if len(st3) == 0 || len(att1) == 0 || st3[0].str("resume_checkpoint_id") != "seed-tc-"+att1[0].str("attempt_id") ||
+		st3[0].str("restored_from_task_id") != r1.TurnID {
+		t.Fatalf("turn 3 的首个 task_start = %v，期望从种子 seed-tc-%s 继续", st3, att1)
+	}
+	if v3.ToolCallLimit != 30 || v3.ToolCallsUsed != 2 || v3.RestoredFromTurnID != r1.TurnID { // 恢复的 turn 沿用源正文（2 次搜索），额度自 0 计
+		t.Errorf("turn 3 = %+v，期望新的 30 次额度", v3)
+	}
+	u.closeSession(sid)
+	s.end()
+}
+
+// TestSessionAwaitingInput：ask_user → turn awaiting_input，run slot 归还（--run-slots 1 下另一用户的 turn 照常完成）
+// → answer → 同一 turn 从原位置继续并成功，Worker 收到 directive.answer（带待答提问的 question_id）。
+func TestSessionAwaitingInput(t *testing.T) {
+	s := newSessionSys(t, "--run-slots", "1")
+	s.startS()
+	alice, bob := s.user("alice"), s.user("bob")
+	sa, sb := alice.createSession("cs-a"), bob.createSession("cs-b")
+	r := alice.message(sa, "m-1", "script=ask_user")
+	alice.waitTurn(sa, r.TurnID, "等待回答", turnIs("awaiting_input"))
+	rb := bob.message(sb, "m-b", "searches=1")
+	bob.waitTurn(sb, rb.TurnID, "成功（run slot 已归还）", turnIs("succeeded"))
+	if code, b := alice.do("POST", "/turns/"+r.TurnID+"/answer",
+		`{"request_id":"an-1","answers":[{"question_id":"1","choice":"A"}]}`); code != http.StatusAccepted {
+		t.Fatalf("POST answer = %d %s", code, b)
+	}
+	alice.waitTurn(sa, r.TurnID, "回答后成功", turnIs("succeeded"))
+	starts := swFind(s.swLog(sa), swEvent("task_start", "task_id", r.TurnID))
+	if len(starts) != 2 {
+		t.Fatalf("task_start 记录：%v", starts)
+	}
+	dir, _ := starts[1]["directive"].(map[string]any)
+	answers, _ := dir["answers"].([]any)
+	if dir["kind"] != "answer" || dir["question_id"] != "q-"+r.TurnID || len(answers) != 1 || starts[1].str("resume_checkpoint_id") != "tc-"+starts[0].str("attempt_id") {
+		t.Fatalf("回答后的 task_start = %v，期望 directive.answer{question_id = q-%s} 并从提问前的 checkpoint 继续", starts[1], r.TurnID)
+	}
+	alice.closeSession(sa)
+	bob.closeSession(sb)
+	s.end()
+}
+
+// ---- 会话：root、真实隔离（cmd/agentbox + provider/local；E28–E33） ----
+
+var (
+	swInstallOnce sync.Once
+	swInstallErr  error
+)
+
+// installSessionWorker 把 sessionworker 复制到 rootfs.WorkerDir（默认模板包含该目录），返回环境内的路径。
+func installSessionWorker(t *testing.T) string {
+	t.Helper()
+	src := sessionWorkerBinary(t)
+	dst := filepath.Join(rootfs.WorkerDir, "sessionworker")
+	swInstallOnce.Do(func() { // 写临时文件后改名：旧二进制仍在运行时（ETXTBSY）也能替换
+		b, err := os.ReadFile(src)
+		tmp := dst + ".tmp"
+		if err == nil {
+			err = os.WriteFile(tmp, b, 0o755)
+		}
+		if err == nil {
+			err = os.Chmod(tmp, 0o755)
+		}
+		if err == nil {
+			err = os.Rename(tmp, dst)
+		}
+		swInstallErr = err
+	})
+	if swInstallErr != nil {
+		t.Fatalf("安装 sessionworker 到 %s: %v", dst, swInstallErr)
+	}
+	return dst
+}
+
+// newRealSessionSys：root，cmd/agentbox 以生产启动器运行；模型与搜索指向 fake upstream（用户账号需要模型上游），
+// 会话 Worker 为复制进 rootfs.WorkerDir 的 sessionworker。
+func newRealSessionSys(t *testing.T, extra ...string) *sessSys {
+	t.Helper()
+	s := newRealSys(t)
+	worker := installSessionWorker(t)
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	u, err := url.Parse(fu.URL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ss := &sessSys{sysHarness: s, real: true, flags: append([]string{
+		"--model-base-url", fu.URL() + "/v1", "--model-name", fakeupstream.Model,
+		"--user-orchestrator-model", fakeupstream.Model, "--user-worker-model", fakeupstream.Model,
+		"--search-provider", upstream.SearchFake, "--search-base-url", fu.URL(), "--upstream-allow-private", u.Host,
+		"--session-worker-argv", worker,
+	}, extra...)}
+	t.Cleanup(ss.dumpOnFailure)
+	return ss
+}
+
+// incarnationOf 返回会话最近建立的 incarnation 与其环境。
+func (s *sessSys) incarnationOf(sessionID string) (incID, envID, status, endReason string) {
+	s.t.Helper()
+	s.row(`SELECT incarnation_id, env_id, status, COALESCE(end_reason, '') FROM incarnations WHERE session_id = $1
+		ORDER BY started_at DESC LIMIT 1`, []any{sessionID}, &incID, &envID, &status, &endReason)
+	return
+}
+
+func (s *sessSys) envCgroupDir(envID string) string {
+	return filepath.Join(s.installCgroup(), "env-"+envID)
+}
+
+// cgroupFrozen 读取环境 cgroup 的 cgroup.events 中的 frozen 值。
+func cgroupFrozen(dir string) (bool, error) {
+	b, err := os.ReadFile(filepath.Join(dir, "cgroup.events"))
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "frozen "); ok {
+			return strings.TrimSpace(v) == "1", nil
+		}
+	}
+	return false, errors.New("cgroup.events 没有 frozen 行")
+}
+
+// sessionStateEvents 返回会话的 session_state 事件中的状态序列（按 session_seq）。
+func (s *sessSys) sessionStateEvents(sessionID string) []string {
+	s.t.Helper()
+	ctx := context.Background()
+	c, err := pgx.Connect(ctx, s.dsn)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	defer func() { _ = c.Close(ctx) }()
+	rows, err := c.Query(ctx, `SELECT payload->>'state' FROM session_events WHERE session_id = $1 AND type = 'session_state'
+		ORDER BY session_seq`, sessionID)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	out, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	return out
+}
+
+// TestRealE28SessionColdRestore（E28）：会话 idle 时 Worker 死亡（exit_when_idle）→ evicted → 新消息 → restoring →
+// 冷恢复：同一 workspace（Worker 读到上次写入 /workspace/session 的文件）、新的 incarnation 与入口 socket、同一 UID
+// 范围。分别以 inline state 与 state_ref 的会话 checkpoint 各运行一次；state_ref 时 Worker 从
+// /run/agentbox/restore/<sha> 读取，ready 之后暂存目录被删除；恢复期间（ready 之前）连接 Gateway 被拒。
+func TestRealE28SessionColdRestore(t *testing.T) {
+	s := newRealSessionSys(t)
+	s.startS()
+	u := s.user("alice")
+	for _, mode := range []string{"inline", "ref"} {
+		sid := u.createSession("cs-" + mode)
+		r1 := u.message(sid, "m1-"+mode, "searches=1 state="+mode+" script=exit_when_idle")
+		u.waitTurn(sid, r1.TurnID, "成功", turnIs("succeeded"))
+		s.waitSession(sid, "evicted")
+		inc1, env1, st1, _ := s.incarnationOf(sid)
+		if st1 != "ended" {
+			t.Fatalf("%s：Worker 退出后 incarnation %s = %s", mode, inc1, st1)
+		}
+		r2 := u.message(sid, "m2-"+mode, "searches=1")
+		v2 := u.waitTurn(sid, r2.TurnID, "冷恢复后成功", turnIs("succeeded"))
+		if v2.Summary != "count=2 task="+r2.TurnID {
+			t.Errorf("%s：冷恢复后的会话状态 = %q", mode, v2.Summary)
+		}
+		inc2, env2, _, _ := s.incarnationOf(sid)
+		var range1, range2 string
+		s.row("SELECT uid_range_id FROM environments WHERE env_id = $1", []any{env1}, &range1)
+		s.row("SELECT uid_range_id FROM environments WHERE env_id = $1", []any{env2}, &range2)
+		if inc2 == inc1 || env2 == env1 || range1 != range2 || range1 == "" {
+			t.Errorf("%s：恢复应建立新的 incarnation（入口 inc-<id>.sock）并沿用同一 UID 范围：%s/%s → %s/%s，范围 %s → %s",
+				mode, inc1, env1, inc2, env2, range1, range2)
+		}
+		states := s.sessionStateEvents(sid)
+		if i := slices.Index(states, "evicted"); i < 0 || !slices.Contains(states[i:], "restoring") {
+			t.Errorf("%s：会话状态事件 = %v，期望 evicted 之后 restoring", mode, states)
+		}
+		starts := swFind(s.swLog(sid), func(r swRec) bool { return r.str("event") == "start" && r["resumed"] == true })
+		att1 := swFind(s.swLog(sid), swEvent("task_start", "task_id", r1.TurnID))
+		if len(starts) != 1 || len(att1) != 1 {
+			t.Fatalf("%s：恢复记录 %v，turn 1 记录 %v", mode, starts, att1)
+		}
+		rs := starts[0]
+		if rs.str("checkpoint_id") != "sc-"+att1[0].str("attempt_id") || rs.str("note") != "count=1 task="+r1.TurnID ||
+			rs["gateway_refused"] != true {
+			t.Errorf("%s：恢复记录 = %v（期望 checkpoint sc-%s、读到上次写入的会话文件、恢复期间 Gateway 被拒）",
+				mode, rs, att1[0].str("attempt_id"))
+		}
+		staged := rs.str("staged_state_path")
+		if (mode == "ref") != strings.HasPrefix(staged, protocol.StagedStateDir) {
+			t.Errorf("%s：staged_state_path = %q", mode, staged)
+		}
+		if _, err := os.Stat(filepath.Join(s.dir, "restore", env2)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s：ready 之后恢复暂存目录仍存在（%v）", mode, err)
+		}
+		u.closeSession(sid)
+	}
+	s.end()
+}
+
+// TestRealE29OutcomeLossAndReleaseTimeout（E29）：task_outcome 丢失一次 → Worker 以 task_outcome_query 查询后释放，
+// turn 终态不变、incarnation 继续服务下一轮；Worker 永不发 task_released → T_release 后 incarnation 销毁
+// （end_reason = release_timeout），turn 终态、会话指针与 fault_retries_used 不变，不重跑。
+func TestRealE29OutcomeLossAndReleaseTimeout(t *testing.T) {
+	s := newRealSessionSys(t)
+	s.startS()
+	u := s.user("alice")
+	sid := u.createSession("cs-1")
+	r1 := u.message(sid, "m-1", "searches=1 script=drop_outcome_once")
+	u.waitTurn(sid, r1.TurnID, "成功", turnIs("succeeded"))
+	eventually(t, "Worker 查询裁决后释放", func() bool {
+		return len(swFind(s.swLog(sid), swEvent("task_outcome"))) == 1
+	})
+	logs := s.swLog(sid)
+	if len(swFind(logs, swEvent("outcome_dropped"))) != 1 {
+		t.Fatalf("Worker 应丢弃第一次 task_outcome：%v", logs)
+	}
+	inc1, _, _, _ := s.incarnationOf(sid)
+	r2 := u.message(sid, "m-2", "searches=1 script=never_release")
+	u.waitTurn(sid, r2.TurnID, "成功", turnIs("succeeded"))
+	if inc, _, _, _ := s.incarnationOf(sid); inc != inc1 {
+		t.Fatalf("查询恢复之后 incarnation 应继续服务：%s → %s", inc1, inc)
+	}
+	eventuallyWithin(t, "T_release 后 incarnation 销毁", 2*waitLimit, 100*time.Millisecond, func() bool {
+		_, _, st, reason := s.incarnationOf(sid)
+		return st == "ended" && reason == "release_timeout"
+	})
+	starts := swFind(s.swLog(sid), swEvent("task_start", "task_id", r2.TurnID))
+	var status, pointer string
+	var faults int64
+	s.row("SELECT status, fault_retries_used FROM tasks WHERE task_id = $1", []any{r2.TurnID}, &status, &faults)
+	s.row("SELECT COALESCE(latest_checkpoint_id, '') FROM session_progress WHERE session_id = $1", []any{sid}, &pointer)
+	if len(starts) != 1 || status != "succeeded" || faults != 0 || pointer != "sc-"+starts[0].str("attempt_id") {
+		t.Fatalf("释放超时不改变裁决：task_start %d 次，状态 %s，fault_retries_used %d，会话指针 %s", len(starts), status, faults, pointer)
+	}
+	u.closeSession(sid)
+	s.end()
+}
+
+// TestRealE30LeakedChildFailsRelease（E30）：T1 释放前留下子进程 → 释放核验（进程表回到基线）失败 → incarnation
+// 销毁；T2 在新的 incarnation 中运行；calls 中没有 T1 的 attempt 在 T2 期间登记的调用。
+func TestRealE30LeakedChildFailsRelease(t *testing.T) {
+	s := newRealSessionSys(t)
+	s.startS()
+	u := s.user("alice")
+	sid := u.createSession("cs-1")
+	r1 := u.message(sid, "m-1", "searches=1 script=leak_child")
+	u.waitTurn(sid, r1.TurnID, "成功", turnIs("succeeded"))
+	inc1, env1, _, _ := s.incarnationOf(sid)
+	eventuallyWithin(t, "释放核验失败后 incarnation 销毁", 2*waitLimit, 100*time.Millisecond, func() bool {
+		var st, reason string
+		s.row("SELECT status, COALESCE(end_reason, '') FROM incarnations WHERE incarnation_id = $1", []any{inc1}, &st, &reason)
+		return st == "ended" && reason == "release_timeout"
+	})
+	if len(swFind(s.swLog(sid), swEvent("leaked_child"))) != 1 {
+		t.Fatal("Worker 没有留下子进程")
+	}
+	if pids := cgroupPids(s.envCgroupDir(env1)); len(pids) != 0 {
+		t.Errorf("销毁之后环境 %s 仍有进程 %v", env1, pids)
+	}
+	r2 := u.message(sid, "m-2", "searches=1")
+	u.waitTurn(sid, r2.TurnID, "在新 incarnation 中成功", turnIs("succeeded"))
+	if inc2, _, _, _ := s.incarnationOf(sid); inc2 == inc1 {
+		t.Fatalf("T2 应在新的 incarnation 中运行")
+	}
+	var late int
+	s.row(`SELECT count(*) FROM calls c JOIN tasks t2 ON t2.task_id = $2 WHERE c.task_id = $1 AND c.created_at >= t2.created_at`,
+		[]any{r1.TurnID, r2.TurnID}, &late)
+	if late != 0 {
+		t.Errorf("T1 在 T2 期间登记了 %d 个调用", late)
+	}
+	u.closeSession(sid)
+	s.end()
+}
+
+// TestRealE31FreezeAndFreezeFailure（E31）：--session-idle-freeze 2s → frozen（会话事件出现时 cgroup.events 已是
+// frozen 1）→ 新消息 thaw 并在同一 incarnation 中运行；冻结无法确认（cgroup.events 被替换为 frozen 0 的文件）→
+// 驱逐（evicted），不记录 frozen。
+func TestRealE31FreezeAndFreezeFailure(t *testing.T) {
+	s := newRealSessionSys(t, "--session-idle-freeze", "2s")
+	s.startS()
+	u := s.user("alice")
+
+	sid := u.createSession("cs-1")
+	r1 := u.message(sid, "m-1", "searches=1")
+	u.waitTurn(sid, r1.TurnID, "成功", turnIs("succeeded"))
+	inc1, env1, _, _ := s.incarnationOf(sid)
+	cg := s.envCgroupDir(env1)
+	eventually(t, "会话冻结（事件出现时 cgroup 已冻结）", func() bool {
+		if !slices.Contains(s.sessionStateEvents(sid), "frozen") {
+			return false
+		}
+		frozen, err := cgroupFrozen(cg)
+		if err != nil || !frozen {
+			t.Fatalf("session_state{frozen} 已出现，但 cgroup.events frozen = %v（%v）", frozen, err)
+		}
+		return true
+	})
+	r2 := u.message(sid, "m-2", "searches=1")
+	u.waitTurn(sid, r2.TurnID, "thaw 后成功", turnIs("succeeded"))
+	if inc, _, _, _ := s.incarnationOf(sid); inc != inc1 {
+		t.Fatalf("thaw 之后应在同一 incarnation 中运行：%s → %s", inc1, inc)
+	}
+	u.closeSession(sid)
+
+	sid2 := u.createSession("cs-2")
+	r3 := u.message(sid2, "m-3", "searches=1")
+	u.waitTurn(sid2, r3.TurnID, "成功", turnIs("succeeded"))
+	_, env2, _, _ := s.incarnationOf(sid2)
+	events := filepath.Join(s.envCgroupDir(env2), "cgroup.events")
+	fakeEvents := filepath.Join(t.TempDir(), "cgroup.events")
+	if err := os.WriteFile(fakeEvents, []byte("populated 1\nfrozen 0\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mount(fakeEvents, events, "", syscall.MS_BIND, ""); err != nil {
+		t.Fatalf("以 bind 替换 %s: %v", events, err)
+	}
+	mounted := true
+	unmount := func() {
+		if mounted {
+			_ = syscall.Unmount(events, syscall.MNT_DETACH)
+			mounted = false
+		}
+	}
+	defer unmount()
+	eventuallyWithin(t, "冻结无法确认 → 驱逐", 2*waitLimit, 50*time.Millisecond, func() bool {
+		var st string
+		s.row("SELECT status FROM sessions WHERE session_id = $1", []any{sid2}, &st)
+		if st == "evicting" || st == "evicted" {
+			unmount()
+		}
+		return st == "evicted"
+	})
+	if states := s.sessionStateEvents(sid2); slices.Contains(states, "frozen") {
+		t.Errorf("冻结未确认却记录了 frozen：%v", states)
+	}
+	var reason string
+	s.row("SELECT COALESCE(end_reason, '') FROM incarnations WHERE env_id = $1", []any{env2}, &reason)
+	if reason != "freeze_failed" {
+		t.Errorf("incarnation end_reason = %q，期望 freeze_failed", reason)
+	}
+	u.closeSession(sid2)
+	s.end()
+}
+
+// TestRealE32CloseStopsEnvBeforeDeletingWorkspace（E32）：turn 暂停后 DELETE /sessions/{id} → 暂停的 turn
+// cancelled → 环境的 stopped_at 早于 workspace 目录删除 → 会话 closed、UID 范围归还。
+func TestRealE32CloseStopsEnvBeforeDeletingWorkspace(t *testing.T) {
+	s := newRealSessionSys(t)
+	s.startS()
+	u := s.user("alice")
+	sid := u.createSession("cs-1")
+	r1 := u.message(sid, "m-1", "searches=1 hold_ms=120000")
+	eventually(t, "turn 1 完成搜索", func() bool {
+		return len(swFind(s.swLog(sid), swEvent("search", "task_id", r1.TurnID))) == 1
+	})
+	u.control(r1.TurnID, "stop", "st-1")
+	u.waitTurn(sid, r1.TurnID, "暂停", turnIs("paused"))
+	_, env, _, _ := s.incarnationOf(sid)
+	ws := filepath.Join(s.dir, "sessions", sid, "workspace")
+	if code, b := u.do("DELETE", "/sessions/"+sid, ""); code != http.StatusAccepted {
+		t.Fatalf("DELETE = %d %s", code, b)
+	}
+	var deletedAt time.Time
+	eventuallyWithin(t, "workspace 目录删除", waitLimit, 5*time.Millisecond, func() bool {
+		if _, err := os.Stat(ws); errors.Is(err, os.ErrNotExist) {
+			deletedAt = time.Now()
+			return true
+		}
+		return false
+	})
+	s.waitSession(sid, "closed")
+	var stoppedAt time.Time
+	var status, rangeState string
+	s.row("SELECT stopped_at FROM environments WHERE env_id = $1", []any{env}, &stoppedAt)
+	s.row("SELECT status FROM tasks WHERE task_id = $1", []any{r1.TurnID}, &status)
+	s.row(`SELECT COALESCE((SELECT state FROM uid_ranges WHERE owner_id = $1 AND state <> 'free'), 'free')`,
+		[]any{"session:" + sid}, &rangeState)
+	if status != "cancelled" || !stoppedAt.Before(deletedAt) || rangeState != "free" {
+		t.Fatalf("关闭：turn %s，环境停止于 %s、workspace 删除于 %s，UID 范围 %s", status, stoppedAt, deletedAt, rangeState)
+	}
+	s.end()
+}
+
+// TestRealE33RestartWithFrozenSession（E33）：存在 frozen 会话时 SIGKILL server 并重启 → 会话 evicted（incarnation
+// ended{lost_on_restart}）、冻结的旧环境被停止并回收 → 新消息冷恢复成功（读到冻结前提交的会话状态）。
+func TestRealE33RestartWithFrozenSession(t *testing.T) {
+	s := newRealSessionSys(t, "--session-idle-freeze", "2s")
+	s.startS()
+	u := s.user("alice")
+	sid := u.createSession("cs-1")
+	r1 := u.message(sid, "m-1", "searches=1")
+	u.waitTurn(sid, r1.TurnID, "成功", turnIs("succeeded"))
+	s.waitSession(sid, "frozen")
+	inc1, env1, _, _ := s.incarnationOf(sid)
+	if frozen, err := cgroupFrozen(s.envCgroupDir(env1)); err != nil || !frozen {
+		t.Fatalf("frozen 会话的 cgroup.events frozen = %v（%v）", frozen, err)
+	}
+	s.kill()
+	s.startS()
+	s.waitSession(sid, "evicted")
+	var st, reason string
+	s.row("SELECT status, COALESCE(end_reason, '') FROM incarnations WHERE incarnation_id = $1", []any{inc1}, &st, &reason)
+	if st != "ended" || reason != "lost_on_restart" {
+		t.Errorf("重启后旧 incarnation = %s/%s", st, reason)
+	}
+	eventually(t, "冻结的旧环境被停止并回收", func() bool {
+		var stopped bool
+		var cleanup string
+		s.row("SELECT stopped_at IS NOT NULL, cleanup_state FROM environments WHERE env_id = $1", []any{env1}, &stopped, &cleanup)
+		_, err := os.Stat(s.envCgroupDir(env1))
+		return stopped && cleanup == "done" && errors.Is(err, os.ErrNotExist)
+	})
+	r2 := u.message(sid, "m-2", "searches=1")
+	v2 := u.waitTurn(sid, r2.TurnID, "冷恢复后成功", turnIs("succeeded"))
+	if v2.Summary != "count=2 task="+r2.TurnID {
+		t.Errorf("冷恢复后的会话状态 = %q", v2.Summary)
+	}
+	u.closeSession(sid)
+	s.end()
+}
+
+// ==== M4 Plan 14 Task 11：sub-run 故障实验（规格 §13、§16.4 E24、E40–E45；本段到此结束前不含其他任务的用例） ====
+//
+// Worker 是 sim_worker 的 sub-run 操作（subrun_start、带 subrun 的 Gateway 步骤、subrun_end、subrun_cancel、
+// subrun_ignore_cancel、checkpoint 的 forge_completed；见 worker/sim_worker/app.py）。每个实验一对用例：进程内装置
+// （fake provider 的进程型 Program，非 root）与真实隔离（provider/local + 生产启动器，root；TestRealE…）。二者共用
+// testE…(t, h)，结束时都以 h.finish() 运行静止时的不变量检查（verify-invariants 的同一检查，含 I3 两层与 I13）。
+
+// subrunCfg 是开启 sub-run 扩展的 Gateway 配置（app.Config.WorkerSubruns 的零值为关闭；cmd/agentbox 默认开启）。
+func subrunCfg(fu *fakeupstream.Server) app.Config {
+	cfg := gatewayCfg(fu, gwSecret(), call.Limits{})
+	cfg.WorkerSubruns = true
+	return cfg
+}
+
+func srStartStep(id string, deadlineMs int) step {
+	return step{"op": "subrun_start", "subrun_id": id, "deadline_ms": deadlineMs}
+}
+
+func srFetchStep(sub, u string) step {
+	return step{"op": "fetch", "step_id": "f", "subrun": sub, "url": u}
+}
+
+func srEndStep(id string) step {
+	return step{"op": "subrun_end", "subrun_id": id, "summary": id + " 的摘要"}
+}
+
+// crashStep 只在第 1 个 attempt 以 SIGKILL 杀死 Worker 自身。
+func crashStep() step { return step{"op": "exit", "code": 137, "signal": 9, "attempt": 1} }
+
+// subrunRow 返回 sub-run 的 status|bound attempt_no|failure_reason|cancel_reason。
+func (h *harness) subrunRow(taskID, subrunID string) string {
+	h.t.Helper()
+	var out string
+	h.queryRow(`SELECT concat_ws('|', s.status, a.attempt_no, s.failure_reason, s.cancel_reason) FROM subruns s
+		JOIN attempts a ON a.attempt_id = s.bound_attempt_id WHERE s.task_id = $1 AND s.subrun_id = $2`,
+		[]any{taskID, subrunID}, &out)
+	return out
+}
+
+// resumeSubruns 是第 n 个 attempt 的 init.resume.subruns（subrun_id → status）。
+func (h *harness) resumeSubruns(taskID string, n int64) map[string]string {
+	h.t.Helper()
+	in, ok := h.rec(taskID).init(n)
+	if !ok || in.Resume == nil {
+		h.t.Fatalf("attempt %d 没有 init.resume：%+v", n, in)
+	}
+	out := map[string]string{}
+	for _, s := range in.Resume.Subruns {
+		out[s.SubrunID] = s.Status
+	}
+	return out
+}
+
+// subrunCalls 返回 call_id 以 prefix 开头的调用：call_id → state/source/首个 attempt_no。
+func (h *harness) subrunCalls(taskID, prefix string) map[string]string {
+	h.t.Helper()
+	var agg string
+	h.queryRow(`SELECT COALESCE(string_agg(c.call_id || '=' || concat_ws('/', c.state, c.source, a.attempt_no), ' ' ORDER BY c.call_id), '')
+		FROM calls c JOIN attempts a ON a.attempt_id = c.first_attempt_id WHERE c.task_id = $1 AND starts_with(c.call_id, $2)`,
+		[]any{taskID, prefix}, &agg)
+	out := map[string]string{}
+	for _, kv := range strings.Fields(agg) {
+		k, v, _ := strings.Cut(kv, "=")
+		out[k] = v
+	}
+	return out
+}
+
+func (h *harness) controlTask(taskID, action, requestID string) {
+	h.t.Helper()
+	st, b, err := httpDo("POST", h.base+"/tasks/"+taskID+"/"+action, `{"request_id":"`+requestID+`","reason":"e2e"}`)
+	if err != nil || st != http.StatusOK {
+		h.t.Fatalf("%s %s = %d %s %v", action, taskID, st, b, err)
+	}
+}
+
+// TestE24SubrunCoalesce：E24（sub-run 部分）——同一 sub-run 内 10 个相同抓取 → fake upstream 计数 1（1 个 upstream、
+// 9 个 coalesced）；另一个 sub-run 的同一抓取不合并（合并键含 subrun_id，§11.4）→ 计数 2。
+func TestE24SubrunCoalesce(t *testing.T) { testE24Subrun(t, newHarness(t)) }
+
+func TestRealE24SubrunCoalesce(t *testing.T) { testE24Subrun(t, newRealHarness(t)) }
+
+func testE24Subrun(t *testing.T, h *harness) {
+	addr := testRedisAddr(t)
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	u := cachePage(fu, "/e24s-"+randSuffix()+"/a", nil) // 没有新鲜度头：不写缓存，只看合并
+	fu.Inject(fakeupstream.Fetch, 1, fakeupstream.Action{Hang: true})
+	cfg := cacheCfg(fu, addr)
+	cfg.WorkerSubruns = true
+	h.start(cfg)
+	id := h.submit("e24s", spec(nil, "e24s", nil, srStartStep("st1", 600000), srStartStep("st2", 600000), sleepStep(600000)))
+	sock := h.waitAttemptSocket(id)
+	eventually(t, "两个 sub-run 已启动", func() bool {
+		var n int
+		h.queryRow("SELECT count(*) FROM subruns WHERE task_id = $1 AND status = 'started'", []any{id}, &n)
+		return n == 2
+	})
+	before := h.cacheMetrics()
+
+	const n = 10
+	body := `{"url":"` + u + `"}`
+	res := make([]gwResp, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res[i], errs[i] = gwDoSubrun(sock, "st1", http.MethodPost, "/v1/fetch", fmt.Sprintf("st1/e24/fetch/%d", i+1), body)
+		}()
+	}
+	eventually(t, "st1 的 leader 挂起在上游、9 个请求作为 follower 加入", func() bool {
+		return fu.Hanging() == 1 && metricsDelta(h.cacheMetrics(), before)["coalesced"] == n-1
+	})
+	// st2 的同一抓取不加入 st1 的共享请求：自行访问上游（第 2 次抓取不挂起）。
+	r2, err := gwDoSubrun(sock, "st2", http.MethodPost, "/v1/fetch", "st2/e24/fetch/1", body)
+	if err != nil || r2.Status != http.StatusOK || r2.Replayed || r2.Blob == "" {
+		t.Fatalf("st2 的抓取：%+v %v", r2, err)
+	}
+	fu.Release()
+	wg.Wait()
+	for i := range n {
+		if errs[i] != nil || res[i].Status != http.StatusOK || res[i].Blob == "" || res[i].Blob != res[0].Blob {
+			t.Fatalf("st1 请求 %d：%+v %v（请求 1：%+v）", i+1, res[i], errs[i], res[0])
+		}
+	}
+	st1 := h.subrunCalls(id, "st1/e24/")
+	var up, co int
+	for _, v := range st1 {
+		up += strings.Count(v, "/upstream/")
+		co += strings.Count(v, "/coalesced/")
+	}
+	if len(st1) != n || up != 1 || co != n-1 || fu.Count(fakeupstream.Fetch) != 2 {
+		t.Fatalf("st1 的调用 %v；上游抓取 %d 次", st1, fu.Count(fakeupstream.Fetch))
+	}
+	if st2 := h.subrunCalls(id, "st2/"); st2["st2/e24/fetch/1"] != "completed/upstream/1" {
+		t.Fatalf("st2 的调用 %v", st2)
+	}
+	if st, code := h.cancelTask(id, "e24s-cancel"); st != http.StatusOK {
+		t.Fatalf("取消 = %d %s", st, code)
+	}
+	if v := h.waitTerminal(id); v.Status != "cancelled" {
+		t.Fatalf("任务结束为 %s", v.Status)
+	}
+	for _, sub := range []string{"st1", "st2"} {
+		if g := h.subrunRow(id, sub); g != "cancelled|1|task_cancel|task_cancel" {
+			t.Fatalf("取消裁决后 %s = %s", sub, g)
+		}
+	}
+	t.Logf("E24（sub-run）：st1 内 10 个相同抓取 + st2 同一抓取 → 上游 %d 次", fu.Count(fakeupstream.Fetch))
+	h.finish()
+}
+
+// TestE40CancelThenCrash：E40——编排层取消 st2 后 SIGKILL Worker → 新 attempt 的 init.resume.subruns 中 st2 为
+// cancelled（不恢复执行），st2 没有新调用；st1 重新绑定并完成。
+func TestE40CancelThenCrash(t *testing.T) { testE40(t, newHarness(t)) }
+
+func TestRealE40CancelThenCrash(t *testing.T) { testE40(t, newRealHarness(t)) }
+
+func testE40(t *testing.T, h *harness) {
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	p := "/e40-" + randSuffix()
+	a, b, c, d := cachePage(fu, p+"/a", nil), cachePage(fu, p+"/b", nil), cachePage(fu, p+"/c", nil), cachePage(fu, p+"/d", nil)
+	h.start(subrunCfg(fu))
+	id := h.submit("e40", spec(nil, "e40", nil,
+		srStartStep("st1", 600000), srStartStep("st2", 600000),
+		srFetchStep("st1", a), srFetchStep("st2", b),
+		checkpointStep("c1"),
+		step{"op": "subrun_cancel", "subrun_id": "st2"},
+		crashStep(),
+		srFetchStep("st2", c), // 恢复后不得执行：st2 已 cancelled
+		srFetchStep("st1", d),
+		srEndStep("st1"),
+		checkpointStep("c2"),
+	))
+	if v := h.waitTerminal(id); v.Status != "succeeded" {
+		t.Fatalf("任务结束为 %+v", v)
+	}
+	in := h.inspect(id)
+	if a1, a2 := attemptByNo(in, 1), attemptByNo(in, 2); a1.OutcomeClass != runner.ClassCrashedSignal || a2.OutcomeClass != runner.ClassSucceeded {
+		t.Fatalf("attempts %+v / %+v", a1, a2)
+	}
+	if got := h.resumeSubruns(id, 2); got["st2"] != "cancelled" || got["st1"] != "started" {
+		t.Fatalf("attempt 2 的 resume.subruns = %v", got)
+	}
+	if g := h.subrunRow(id, "st2"); g != "cancelled|1||orchestrator" {
+		t.Fatalf("st2 = %s", g)
+	}
+	if g := h.subrunRow(id, "st1"); g != "completed|2||" {
+		t.Fatalf("st1 = %s", g)
+	}
+	st2 := h.subrunCalls(id, "st2/")
+	if len(st2) != 1 || st2["st2/f/fetch/1"] != "completed/upstream/1" || pathCount(t, fu, c) != 0 {
+		t.Fatalf("st2 的调用 %v；/c 上游抓取 %d 次", st2, pathCount(t, fu, c))
+	}
+	if pathCount(t, fu, a) != 1 || pathCount(t, fu, d) != 1 {
+		t.Fatalf("st1 的抓取：/a %d 次、/d %d 次", pathCount(t, fu, a), pathCount(t, fu, d))
+	}
+	h.finish()
+}
+
+// TestE41LateCheckpointCompleted：E41——已取消的 sub-run 被迟到的 checkpoint 列为 completed → checkpoint_result
+// rejected/invalid_transition，该 checkpoint 不写入、指针不变（之后的 checkpoint 的 commit_seq 连续）；st2 保持 cancelled。
+func TestE41LateCheckpointCompleted(t *testing.T) { testE41(t, newHarness(t)) }
+
+func TestRealE41LateCheckpointCompleted(t *testing.T) { testE41(t, newRealHarness(t)) }
+
+func testE41(t *testing.T, h *harness) {
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	h.start(subrunCfg(fu))
+	id := h.submit("e41", spec(nil, "e41", nil,
+		srStartStep("st1", 600000), srStartStep("st2", 600000),
+		checkpointStep("c1"),
+		step{"op": "subrun_cancel", "subrun_id": "st2"},
+		step{"op": "checkpoint", "step_id": "forged", "forge_completed": []string{"st2"}, "expect_rejected": "invalid_transition"},
+		srEndStep("st1"),
+		checkpointStep("c2"),
+	))
+	if v := h.waitTerminal(id); v.Status != "succeeded" {
+		t.Fatalf("任务结束为 %+v", v)
+	}
+	var rejected int
+	for _, l := range h.rec(id).hostLines() {
+		if l.Type == protocol.TypeCheckpointResult && l.Status == protocol.CheckpointRejected && l.Code == "invalid_transition" {
+			rejected++
+		}
+	}
+	in := h.inspect(id)
+	if rejected != 1 || len(in.Checkpoints) != 2 {
+		t.Fatalf("invalid_transition 拒绝 %d 次；已提交 checkpoint %+v", rejected, in.Checkpoints)
+	}
+	if c1, c2 := checkpointByStep(in, "c1"), checkpointByStep(in, "c2"); c1.CommitSeq != 1 || c2.CommitSeq != 2 {
+		t.Fatalf("commit_seq：c1 %d、c2 %d（被拒的 checkpoint 不应占用序号）", c1.CommitSeq, c2.CommitSeq)
+	}
+	if g := h.subrunRow(id, "st2"); g != "cancelled|1||orchestrator" {
+		t.Fatalf("st2 = %s", g)
+	}
+	if g := h.subrunRow(id, "st1"); g != "completed|1||" {
+		t.Fatalf("st1 = %s", g)
+	}
+	h.finish()
+}
+
+// TestE42EndThenCrash：E42——subrun_end{succeeded} 之后、checkpoint 之前崩溃 → end_proposed 不视为完成：恢复时 st1
+// 重新绑定（resume.subruns 中为 started）并重新执行。checkpoint 之后完成的调用以同一 call id 重放（上游不重复），新的
+// 调用以续号 call id 出现（st1/f/fetch/3，首个 attempt 为 2）；checkpoint 之前的调用不重做。
+func TestE42EndThenCrash(t *testing.T) { testE42(t, newHarness(t)) }
+
+func TestRealE42EndThenCrash(t *testing.T) { testE42(t, newRealHarness(t)) }
+
+func testE42(t *testing.T, h *harness) {
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	p := "/e42-" + randSuffix()
+	a, b, c := cachePage(fu, p+"/a", nil), cachePage(fu, p+"/b", nil), cachePage(fu, p+"/c", nil)
+	fetchC := srFetchStep("st1", c)
+	fetchC["attempt"] = 2
+	h.start(subrunCfg(fu))
+	id := h.submit("e42", spec(nil, "e42", nil,
+		srStartStep("st1", 600000),
+		srFetchStep("st1", a),
+		checkpointStep("c1"),
+		srFetchStep("st1", b),
+		fetchC,
+		srEndStep("st1"),
+		crashStep(),
+		checkpointStep("c2"),
+	))
+	if v := h.waitTerminal(id); v.Status != "succeeded" {
+		t.Fatalf("任务结束为 %+v", v)
+	}
+	in := h.inspect(id)
+	if a1 := attemptByNo(in, 1); a1.OutcomeClass != runner.ClassCrashedSignal {
+		t.Fatalf("attempt 1：%+v", a1)
+	}
+	if got := h.resumeSubruns(id, 2); got["st1"] != "started" {
+		t.Fatalf("attempt 2 的 resume.subruns = %v（end_proposed 未入 checkpoint 不视为完成）", got)
+	}
+	var subrunEnds int
+	for _, typ := range h.rec(id).workerTypes(1) {
+		if typ == "subrun_end" {
+			subrunEnds++
+		}
+	}
+	if subrunEnds != 1 {
+		t.Fatalf("attempt 1 应在崩溃前发出 subrun_end：%q", h.rec(id).workerTypes(1))
+	}
+	if g := h.subrunRow(id, "st1"); g != "completed|2||" {
+		t.Fatalf("st1 = %s", g)
+	}
+	want := map[string]string{"st1/f/fetch/1": "completed/upstream/1", "st1/f/fetch/2": "completed/upstream/1",
+		"st1/f/fetch/3": "completed/upstream/2"}
+	if got := h.subrunCalls(id, "st1/"); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("st1 的调用 %v，期望 %v", got, want)
+	}
+	if pathCount(t, fu, a) != 1 || pathCount(t, fu, b) != 1 || pathCount(t, fu, c) != 1 {
+		t.Fatalf("上游抓取：/a %d、/b %d、/c %d（重放不应再访问上游）", pathCount(t, fu, a), pathCount(t, fu, b), pathCount(t, fu, c))
+	}
+	h.finish()
+}
+
+// TestE43SubrunBudget：E43——sub-run 上限 0：付费调用（chat）被拒 402 subrun_budget_exhausted，不访问上游、两层账本不动；
+// 同 URL 的缓存命中（root 先抓取并写入共享缓存）仍返回；sub-run 以抽取式总结完成（预算耗尽不自动取消 sub-run）。
+func TestE43SubrunBudget(t *testing.T) { testE43(t, newHarness(t)) }
+
+func TestRealE43SubrunBudget(t *testing.T) { testE43(t, newRealHarness(t)) }
+
+func testE43(t *testing.T, h *harness) {
+	addr := testRedisAddr(t)
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	u := cachePage(fu, "/e43-"+randSuffix()+"/p", ccHeader("max-age=600"))
+	cfg := cacheCfg(fu, addr)
+	cfg.WorkerSubruns = true
+	h.start(cfg)
+	// 先由另一个任务的 root 抓取写入共享缓存（写入在响应之后完成：等到 Redis 中出现该键）。
+	h.runFetches("e43-warm", u)
+	r, key := testRedis(t, addr), fetchKey(t, u)
+	eventually(t, "抓取结果写入共享缓存", func() bool { _, ok := cacheEntry(t, r, key); return ok })
+	chat := chatStep("s")
+	chat["subrun"], chat["expect_error"] = "st1", "subrun_budget_exhausted"
+	id := h.submit("e43", spec(nil, "e43", nil,
+		step{"op": "subrun_start", "subrun_id": "st1", "deadline_ms": 600000, "budget_cap_micro": 0},
+		chat,
+		srFetchStep("st1", u),
+		srEndStep("st1"),
+		checkpointStep("c1"),
+	))
+	if v := h.waitTerminal(id); v.Status != "succeeded" {
+		t.Fatalf("任务结束为 %+v", v)
+	}
+	if g := h.subrunRow(id, "st1"); g != "completed|1||" {
+		t.Fatalf("st1 = %s", g)
+	}
+	calls := h.subrunCalls(id, "st1/")
+	if calls["st1/f/fetch/1"] != "completed/cache/1" || fu.Count(fakeupstream.Chat) != 0 || pathCount(t, fu, u) != 1 {
+		t.Fatalf("st1 的调用 %v；上游 chat %d 次、抓取 %d 次", calls, fu.Count(fakeupstream.Chat), pathCount(t, fu, u))
+	}
+	var tries int
+	var spent, reserved, unknown int64
+	h.queryRow(`SELECT (SELECT count(*) FROM call_tries WHERE task_id = $1 AND call_id LIKE 'st1/%'),
+			sb.spent_micro, sb.reserved_micro, sb.unknown_micro FROM subrun_budgets sb WHERE sb.task_id = $1 AND sb.subrun_id = 'st1'`,
+		[]any{id}, &tries, &spent, &reserved, &unknown)
+	if tries != 0 || spent != 0 || reserved != 0 || unknown != 0 {
+		t.Fatalf("sub-run 层：try %d 个，spent/reserved/unknown = %d/%d/%d", tries, spent, reserved, unknown)
+	}
+	h.finish()
+}
+
+// TestE44IgnoreCancel：E44——SDK 忽略 subrun_cancel_requested（deadline 触发）→ T_subrun_cancel 到期后 attempt 被终止
+// （outcome_class = subrun_cancel_timeout，故障重试）→ 新 attempt 从 checkpoint 恢复，st1 为 timed_out 且不再执行。
+func TestE44IgnoreCancel(t *testing.T) { testE44(t, newHarness(t)) }
+
+func TestRealE44IgnoreCancel(t *testing.T) { testE44(t, newRealHarness(t)) }
+
+func testE44(t *testing.T, h *harness) {
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	cfg := subrunCfg(fu)
+	cfg.Runner.SubrunCancelTimeout = time.Second
+	h.start(cfg)
+	id := h.submit("e44", spec(nil, "e44", nil,
+		step{"op": "subrun_ignore_cancel"},
+		srStartStep("st1", 1500),
+		checkpointStep("c1"),
+		step{"op": "sleep", "ms": 600000, "subrun": "st1"},
+		checkpointStep("c2"),
+	))
+	if v := h.waitTerminal(id); v.Status != "succeeded" {
+		t.Fatalf("任务结束为 %+v", v)
+	}
+	in := h.inspect(id)
+	a1, a2 := attemptByNo(in, 1), attemptByNo(in, 2)
+	if a1.OutcomeClass != runner.ClassSubrunCancelTimeout || a2.OutcomeClass != runner.ClassSucceeded {
+		t.Fatalf("attempts %+v / %+v", a1, a2)
+	}
+	init2, _ := h.rec(id).init(2)
+	if c1 := checkpointByStep(in, "c1"); init2.Resume == nil || init2.Resume.CheckpointID != c1.CheckpointID {
+		t.Fatalf("attempt 2 的 resume %+v，期望 c1（%s）", init2.Resume, c1.CheckpointID)
+	}
+	if got := h.resumeSubruns(id, 2); got["st1"] != "timed_out" {
+		t.Fatalf("attempt 2 的 resume.subruns = %v", got)
+	}
+	if g := h.subrunRow(id, "st1"); !strings.HasPrefix(g, "timed_out|1|") || !strings.HasSuffix(g, "|deadline") {
+		t.Fatalf("st1 = %s", g)
+	}
+	if got := h.rec(id).workerTypes(2); slices.Contains(got, "subrun_start") {
+		t.Fatalf("attempt 2 不应重发已终态 sub-run 的 subrun_start：%q", got)
+	}
+	h.finish()
+}
+
+// TestE45PausePastDeadline：E45（规格 §13.5 执行中修订，M4 验收 2026-10-06）——暂停期间 sub-run 的 deadline 不计时：
+// 暂停久于剩余时间（原 deadline_at 在暂停期间过去）后继续，新 attempt 的 init.resume.subruns 告知 st1 为 started，
+// deadline 按暂停时记录的剩余时间重新起算，st1 完成其余步骤；任务成功。暂停前已过期仍为 timed_out 见 internal/app 的
+// TestSubrunAttemptLifecycle 与 postgres 的 TestSubrunDeadlineSuspendedWhilePaused。
+func TestE45PausePastDeadline(t *testing.T) { testE45(t, newHarness(t)) }
+
+func TestRealE45PausePastDeadline(t *testing.T) { testE45(t, newRealHarness(t)) }
+
+func testE45(t *testing.T, h *harness) {
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	u := cachePage(fu, "/e45-"+randSuffix()+"/a", nil)
+	steps := []step{srStartStep("st1", 6000)}
+	for i := range 20 { // 每 100 ms 一个 checkpoint：暂停请求在下一个提交边界生效
+		steps = append(steps, step{"op": "sleep", "ms": 100, "subrun": "st1"}, checkpointStep(fmt.Sprintf("k%d", i)))
+	}
+	steps = append(steps, srFetchStep("st1", u), srEndStep("st1"), checkpointStep("done"))
+	h.start(subrunCfg(fu))
+	id := h.submit("e45", spec(nil, "e45", nil, steps...))
+	eventually(t, "st1 已启动", func() bool {
+		var n int
+		h.queryRow("SELECT count(*) FROM subruns WHERE task_id = $1", []any{id}, &n)
+		return n == 1
+	})
+	h.controlTask(id, "pause", "e45-pause")
+	eventually(t, "任务暂停", func() bool {
+		st, _, _ := h.httpTask(id)
+		return st == "paused"
+	})
+	if g := h.subrunRow(id, "st1"); g != "started|1||" {
+		t.Fatalf("暂停时 st1 = %s（应在 deadline 之前暂停）", g)
+	}
+	var remaining int64
+	h.queryRow("SELECT COALESCE(remaining_ms, -1) FROM subruns WHERE task_id = $1 AND subrun_id = 'st1'", []any{id}, &remaining)
+	if remaining <= 0 || remaining > 6000 {
+		t.Fatalf("暂停裁决应记录 st1 的剩余时间，得到 %d ms", remaining)
+	}
+	eventuallyWithin(t, "st1 的原 deadline 在暂停期间过去", 15*time.Second, 100*time.Millisecond, func() bool {
+		var past bool
+		h.queryRow("SELECT now() > deadline_at FROM subruns WHERE task_id = $1 AND subrun_id = 'st1'", []any{id}, &past)
+		return past
+	})
+	h.controlTask(id, "resume", "e45-resume")
+	if v := h.waitTerminal(id); v.Status != "succeeded" {
+		t.Fatalf("任务结束为 %+v", v)
+	}
+	if got := h.resumeSubruns(id, 2); got["st1"] != "started" {
+		t.Fatalf("attempt 2 的 resume.subruns = %v（暂停期间不计时，st1 应继续）", got)
+	}
+	if g := h.subrunRow(id, "st1"); !strings.HasPrefix(g, "completed|2") {
+		t.Fatalf("st1 = %s", g)
+	}
+	if pathCount(t, fu, u) != 1 {
+		t.Fatalf("继续后 st1 应完成抓取：/a 抓取 %d 次", pathCount(t, fu, u))
+	}
+	h.finish()
+}
+
+// ==== M4 Plan 14 Task 11 段结束 ====
+
+// ==== M4 Plan 15 Task 12：exec 真实链路与故障实验（规格 §10、§16 E35–E38；E34、E39 见段末说明） ====
+//
+// 全部为 root、真实隔离：Worker（sim_worker）在任务沙箱中经 /run/agentbox/gateway.sock 调 POST /v1/exec，
+// Gateway 为每次 exec 建立独立的 exec 环境（provider/local，exec 模板，无 Gateway socket、无 workspace、netns 仅 lo），
+// 在其中以 python3 -I -B /in/.agentbox/main.py 运行代码。进程内装置（newRealHarness）启用 exec 时取与
+// cmd/agentbox 相同的 exec 模板摘要；E37 用真实子进程 cmd/agentbox（exec 默认开启，--exec-slots 4）。
+//
+// E34（权限边界）按项目负责人的决定不另写提权/攻击探针：由已有的 seccomp 拒绝探针（mount/unshare/setns/pivot_root/
+// CLONE_NEW*、ptrace/process_vm_*、bpf/io_uring/keyctl/perf_event_open/userfaultfd、非 AF_UNIX socket）与能力集
+// {KILL}、无 ptrace 的回归锁覆盖——不是穷尽证明。E39（UID 范围复用）由 internal/provider/local 的
+// TestE39UIDRangeReuse（root）与 resource 的回收/隔离用例覆盖（Plan 15 Task 5 已合入）。
+
+// execImageDigest 与 cmd/agentbox 的 prepareIsolation 相同：确认 exec 模板可用（python3 可解析）并返回其摘要。
+func execImageDigest() (string, error) {
+	et := rootfs.ExecTemplate()
+	if err := et.EnsureExec(); err != nil {
+		return "", err
+	}
+	return rootfs.TemplateDigest(et)
+}
+
+// execCfg 是启用 exec 的进程内 Gateway 配置（其余 exec 策略取默认值：slots 4、每任务 2、wall 60 s、内存 512 MiB）。
+func execCfg(fu *fakeupstream.Server) app.Config {
+	cfg := gatewayCfg(fu, gwSecret(), call.Limits{})
+	cfg.Exec = app.ExecConfig{Slots: app.DefaultExecSlots}
+	return cfg
+}
+
+// execStep 是 sim_worker 的 exec 操作（期望结果状态 completed；inputs 为 [sha256, path]）。
+func execStep(stepID, code string, inputs ...[2]string) step {
+	s := step{"op": "exec", "step_id": stepID, "code": code, "expect_status": "completed", "wall_ms": 60000}
+	if len(inputs) > 0 {
+		s["inputs"] = inputs
+	}
+	return s
+}
+
+// execResult 是 /v1/exec 的结果 JSON（结果 blob 与 200 响应体）中测试关心的字段。
+type execResult struct {
+	Status string `json:"status"`
+	Exit   *struct {
+		Code   int `json:"code"`
+		Signal int `json:"signal"`
+	} `json:"exit"`
+	Diag *struct {
+		OOMKillDelta uint64 `json:"oom_kill_delta"`
+		OOMObserved  bool   `json:"oom_observed"`
+	} `json:"diag"`
+	Stdout          string `json:"stdout"`
+	StdoutTruncated bool   `json:"stdout_truncated"`
+	Stderr          string `json:"stderr"`
+	StderrTruncated bool   `json:"stderr_truncated"`
+	Outputs         []struct {
+		Path   string `json:"path"`
+		SHA256 string `json:"sha256"`
+		Size   int64  `json:"size"`
+	} `json:"outputs"`
+	SkippedOutputs []struct {
+		Reason string `json:"reason"`
+	} `json:"skipped_outputs"`
+	QueueMs int64 `json:"queue_ms"`
+	WallMs  int64 `json:"wall_ms"`
+	Limits  struct {
+		MemoryBytes int64 `json:"memory_bytes"`
+	} `json:"limits"`
+}
+
+func (r execResult) exitCode() (code, signal int) {
+	if r.Exit == nil {
+		return -1, -1
+	}
+	return r.Exit.Code, r.Exit.Signal
+}
+
+func (r execResult) output(path string) (sha string, size int64, ok bool) {
+	for _, o := range r.Outputs {
+		if o.Path == path {
+			return o.SHA256, o.Size, true
+		}
+	}
+	return "", 0, false
+}
+
+// execCall 返回任务中 callID 的调用（inspect）与其结果 blob 解析出的 exec 结果。
+func (h *harness) execCall(taskID, callID string) (api.CallView, execResult) {
+	h.t.Helper()
+	for _, c := range h.inspect(taskID).Calls {
+		if c.CallID != callID {
+			continue
+		}
+		if c.Endpoint != "/v1/exec" || c.ResultRef == "" {
+			h.t.Fatalf("调用 %s：%+v，期望有结果的 /v1/exec 调用", callID, c)
+		}
+		var r execResult
+		if err := json.Unmarshal(h.readBlob(c.ResultRef), &r); err != nil {
+			h.t.Fatalf("调用 %s 的结果 blob: %v", callID, err)
+		}
+		return c, r
+	}
+	h.t.Fatalf("任务 %s 没有调用 %s", taskID, callID)
+	return api.CallView{}, execResult{}
+}
+
+// gwRaw 在 attempt 的 socket 上以一条新连接发出一个请求，返回状态码与响应体（exec 结果、/blobs 内容）。
+func gwRaw(sock, method, path, callID, body string) (int, []byte, error) {
+	tr := &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", sock)
+	}}
+	defer tr.CloseIdleConnections()
+	req, err := http.NewRequest(method, "http://gateway"+path, strings.NewReader(body))
+	if err != nil {
+		return 0, nil, err
+	}
+	if callID != "" {
+		req.Header.Set("X-Agentbox-Call-Id", callID)
+	}
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := (&http.Client{Transport: tr}).Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, b, err
+}
+
+// execBody 是 /v1/exec 的请求体（memoryBytes 为 0 时不写内存限制）。
+func execBody(code string, wallMs, memoryBytes int64) string {
+	lim := map[string]int64{"wall_ms": wallMs}
+	if memoryBytes > 0 {
+		lim["memory_bytes"] = memoryBytes
+	}
+	b, err := json.Marshal(map[string]any{"language": "python3", "code": code, "limits": lim})
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+// heldTask 提交一个在第 1 个 checkpoint 处暂停的任务，等它到达暂停点，返回任务 ID 与其 attempt 的 Gateway socket。
+func (h *harness) heldTask(requestID string) (string, string) {
+	h.t.Helper()
+	id := h.submit(requestID, spec(&directives{Hold: &holdSpec{Type: protocol.TypeCheckpoint, Nth: 1}}, requestID, nil,
+		checkpointStep("c1"), progressStep("after hold")))
+	h.waitHeld(id)
+	in, ok := h.rec(id).init(1)
+	if !ok {
+		h.t.Fatalf("任务 %s 没有 attempt 1 的 init", id)
+	}
+	return id, h.gwSocket(in.AttemptID)
+}
+
+// waitEnvGone 等待环境的 cgroup 与环境目录都不存在（执行树已清空、/out 已卸载删除）。
+func (h *harness) waitEnvGone(envID string) {
+	h.t.Helper()
+	eventually(h.t, "环境 "+envID+" 的 cgroup 与目录已删除", func() bool {
+		_, cgErr := os.Stat(h.envCgroup(envID))
+		_, dirErr := os.Stat(filepath.Join(h.dir, "envs", envID))
+		return errors.Is(cgErr, os.ErrNotExist) && errors.Is(dirErr, os.ErrNotExist)
+	})
+}
+
+const (
+	execPage    = "x,y\n1,2\n3,4\n10,20\n"
+	execSumCode = `import csv, io, json
+page = json.load(open("/in/page.json"))
+rows = list(csv.reader(io.StringIO(page["content"])))
+with open("/out/result.csv", "w", newline="") as f:
+    w = csv.writer(f, lineterminator="\n")
+    w.writerow(["x", "y", "sum"])
+    for x, y in rows[1:]:
+        w.writerow([x, y, int(x) + int(y)])
+print("rows", len(rows) - 1)
+`
+	execSumCSV    = "x,y,sum\n1,2,3\n3,4,7\n10,20,30\n"
+	execTotalCode = `import csv
+rows = list(csv.DictReader(open("/in/data/result.csv")))
+total = sum(int(r["sum"]) for r in rows)
+open("total.txt", "w").write(f"{total}\n")
+print("total", total)
+`
+)
+
+// TestRealExecViaGateway：真实链路——沙箱中的 sim_worker 先 fetch（fake upstream）得到结果 blob，再 exec 以该 blob 为
+// /in/page.json、写 /out/result.csv；第二个 exec 以前者的输出为 /in/data/result.csv、写 total.txt（cwd 为 /out）。
+// 两次 exec 都 completed（退出码 0），输出经 attempt 的 Gateway GET /blobs/{sha} 读取到预期内容，exec_count_used = 2，
+// 每次 exec 在独立的 exec 环境中运行且已停止、清理；任务成功，静止时 I1–I16 成立。
+func TestRealExecViaGateway(t *testing.T) {
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	h := newRealHarness(t)
+	h.start(execCfg(fu))
+	const pagePath = "/data/points.csv"
+	fu.SetPage(pagePath, "text/csv", execPage)
+	pageURL := fu.URL() + pagePath
+	// fetch 的结果 blob 是 upstream.FetchResult 的 JSON（与 fetch adapter 的编码相同），sha 可预先算出。
+	fr, err := json.Marshal(upstream.FetchResult{URL: pageURL, FinalURL: pageURL, Status: 200, ContentType: "text/csv",
+		Encoding: "utf-8", Content: execPage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetchSHA, csvSHA, totalSHA := sha256Hex(fr), sha256Hex([]byte(execSumCSV)), sha256Hex([]byte("40\n"))
+	id := h.submit("exec-gw", spec(&directives{Hold: &holdSpec{Type: protocol.TypeCheckpoint, Nth: 1}}, "exec", nil,
+		step{"op": "fetch", "step_id": "f1", "url": pageURL},
+		execStep("x1", execSumCode, [2]string{fetchSHA, "page.json"}),
+		execStep("x2", execTotalCode, [2]string{csvSHA, "data/result.csv"}),
+		checkpointStep("c1"), progressStep("done")))
+	h.waitHeld(id)
+	in1, _ := h.rec(id).init(1)
+	sock := h.gwSocket(in1.AttemptID)
+	for sha, want := range map[string]string{csvSHA: execSumCSV, totalSHA: "40\n"} {
+		st, b, err := gwRaw(sock, http.MethodGet, "/blobs/"+sha, "", "")
+		if err != nil || st != http.StatusOK || string(b) != want {
+			t.Fatalf("GET /blobs/%s = %d %q %v；期望 %q", sha, st, b, err, want)
+		}
+	}
+	h.rec(id).releaseHold()
+	if v := h.waitTerminal(id); v.Status != "succeeded" {
+		t.Fatalf("任务 %+v", v)
+	}
+	refs := h.checkpointRefs(id, "c1")
+	for _, sha := range []string{fetchSHA, csvSHA, totalSHA} {
+		if !slices.Contains(refs, sha) {
+			t.Fatalf("checkpoint c1 的 refs %v 不含 %s", refs, sha)
+		}
+	}
+	attemptEnv := attemptByNo(h.inspect(id), 1).EnvID
+	envs := map[string]bool{}
+	for _, c := range []struct{ callID, stdout, out, sha string }{
+		{"root/x1/exec/1", "rows 3\n", "result.csv", csvSHA},
+		{"root/x2/exec/1", "total 40\n", "total.txt", totalSHA},
+	} {
+		cv, r := h.execCall(id, c.callID)
+		code, sig := r.exitCode()
+		sha, size, ok := r.output(c.out)
+		if cv.State != "completed" || cv.TriesUsed != 1 || len(cv.Tries) != 1 || cv.Tries[0].Outcome != "ok" ||
+			r.Status != "completed" || code != 0 || sig != 0 || r.Stdout != c.stdout || !ok || sha != c.sha ||
+			len(r.Outputs) != 1 || size != int64(len(h.readBlob(sha))) {
+			t.Fatalf("调用 %s：%+v；结果 %+v", c.callID, cv, r)
+		}
+		envID := cv.Tries[0].EnvID
+		if envID == "" || envID == attemptEnv || envs[envID] || cv.Tries[0].ExecStartedAt == nil || cv.Tries[0].CPUUsec == nil {
+			t.Fatalf("调用 %s 的 try %+v：期望独立的、已启动并结算 CPU 的 exec 环境（attempt 环境 %s）", c.callID, cv.Tries[0], attemptEnv)
+		}
+		envs[envID] = true
+		var kind, cleanup string
+		var stopped bool
+		h.queryRow("SELECT kind, stopped_at IS NOT NULL, cleanup_state FROM environments WHERE env_id = $1", []any{envID},
+			&kind, &stopped, &cleanup)
+		if kind != "exec" || !stopped {
+			t.Fatalf("exec 环境 %s：kind %s，已停止 %v", envID, kind, stopped)
+		}
+		h.waitEnvGone(envID)
+	}
+	var used int64
+	h.queryRow("SELECT exec_count_used FROM exec_quotas WHERE task_id = $1", []any{id}, &used)
+	if used != 2 {
+		t.Fatalf("exec_count_used = %d，期望 2", used)
+	}
+	t.Logf("exec 真实链路：fetch %s → exec x1 → %s（result.csv）→ exec x2 → %s（total.txt）；exec 环境 %v", fetchSHA[:12],
+		csvSHA[:12], totalSHA[:12], slices.Collect(maps.Keys(envs)))
+	h.finish()
+}
+
+// e35Code：主进程 fork 一个后台写入者后立即退出。写入者持续向 /out/log 追加整行 "<序号> <是否已成孤儿>"（O_APPEND 单次
+// 写入，不间断；写失败时退出），并继承了 stdout/stderr 管道（主进程退出时管道不会关闭）。主进程等写入者写满 50 行
+// 后才退出，此后写入者的 getppid 改变，行尾记为 1。
+const e35Code = `import os
+r, w = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(r)
+    parent = os.getppid()
+    fd = os.open("/out/log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    i = 0
+    while True:
+        try:
+            os.write(fd, f"{i} {int(os.getppid() != parent)}\n".encode())
+        except OSError:
+            os._exit(1)
+        i += 1
+        if i == 50:
+            os.write(w, b"x")
+            os.close(w)
+os.close(w)
+os.read(r, 1)
+print("main exits; writer", pid, flush=True)
+os._exit(0)
+`
+
+// TestRealE35BackgroundWriter：E35——主进程退出而后台写入者继续追加 /out/log。收集发生在执行树清空（populated 0）
+// 之后：结果中 log 的 size 与 sha 与 blob 一致（两次读取相同）、内容是从 0 开始连续的完整行，且包含主进程退出之后
+// 写入的行（写入者在主进程退出后仍在写，收集等它被停止）；调用不因写入者持有 stdout 管道而挂起；exec 环境的
+// cgroup 与目录随后删除（文件不再可能增长）。
+func TestRealE35BackgroundWriter(t *testing.T) {
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	h := newRealHarness(t)
+	h.start(execCfg(fu))
+	id := h.submit("e35", spec(nil, "e35", nil, execStep("bg", e35Code)))
+	if v := h.waitTerminal(id); v.Status != "succeeded" {
+		t.Fatalf("任务 %+v", v)
+	}
+	cv, r := h.execCall(id, "root/bg/exec/1")
+	code, sig := r.exitCode()
+	sha, size, ok := r.output("log")
+	if r.Status != "completed" || code != 0 || sig != 0 || !ok || !strings.HasPrefix(r.Stdout, "main exits; writer ") {
+		t.Fatalf("E35 结果 %+v", r)
+	}
+	first, second := h.readBlob(sha), h.readBlob(sha)
+	if !bytes.Equal(first, second) || int64(len(first)) != size || sha256Hex(first) != sha {
+		t.Fatalf("log 的两次读取不一致或与结果不符：size %d/%d/%d", size, len(first), len(second))
+	}
+	if !bytes.HasSuffix(first, []byte("\n")) {
+		t.Fatalf("log 以不完整的行结束：%q", first[max(0, len(first)-64):])
+	}
+	lines := strings.Split(strings.TrimSuffix(string(first), "\n"), "\n")
+	var orphan int
+	for i, l := range lines {
+		f := strings.Fields(l)
+		if len(f) != 2 || f[0] != strconv.Itoa(i) {
+			t.Fatalf("log 第 %d 行 %q 不是连续的完整行", i, l)
+		}
+		if f[1] == "1" {
+			orphan++
+		}
+	}
+	if len(lines) < 50 || orphan == 0 {
+		t.Fatalf("log 共 %d 行、主进程退出后写入 %d 行；期望写入者在主进程退出后仍在写", len(lines), orphan)
+	}
+	envID := cv.Tries[0].EnvID
+	h.waitEnvGone(envID)
+	t.Logf("E35：log %d 行（主进程退出后 %d 行），%d 字节，sha %s；exec 环境 %s 已删除；wall %d ms", len(lines), orphan,
+		size, sha[:12], envID, r.WallMs)
+	h.finish()
+}
+
+// TestRealE36StdoutFlood：E36——exec 向 stdout 写 100 MB：调用不挂起，stdout 只保留前 1 MiB 并置 stdout_truncated，
+// stderr 完整，任务按时完成。
+func TestRealE36StdoutFlood(t *testing.T) {
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	h := newRealHarness(t)
+	h.start(execCfg(fu))
+	const code = `import sys
+b = b"x" * (1 << 20)
+for _ in range(100):
+    sys.stdout.buffer.write(b)
+sys.stdout.buffer.flush()
+print("done", file=sys.stderr)
+`
+	start := time.Now()
+	id := h.submit("e36", spec(nil, "e36", nil, execStep("flood", code)))
+	if v := h.waitTerminal(id); v.Status != "succeeded" {
+		t.Fatalf("任务 %+v", v)
+	}
+	took := time.Since(start)
+	_, r := h.execCall(id, "root/flood/exec/1")
+	c, sig := r.exitCode()
+	if r.Status != "completed" || c != 0 || sig != 0 || !r.StdoutTruncated || len(r.Stdout) != 1<<20 ||
+		strings.Trim(r.Stdout, "x") != "" || r.Stderr != "done\n" || r.StderrTruncated {
+		t.Fatalf("E36 结果：status %s exit %d/%d stdout %d 字节 truncated=%v stderr %q", r.Status, c, sig, len(r.Stdout),
+			r.StdoutTruncated, r.Stderr)
+	}
+	if took > 60*time.Second {
+		t.Fatalf("100 MB stdout 的任务用时 %s", took)
+	}
+	t.Logf("E36：100 MB stdout → 保留 %d 字节、stdout_truncated；exec wall %d ms，任务用时 %s", len(r.Stdout), r.WallMs,
+		took.Round(time.Millisecond))
+	h.finish()
+}
+
+// e38FillCode：/out 写满（tmpfs 64 MiB；页面计入环境 cgroup 的内存），然后分配内存直到超过 memory.max。
+const e38FillCode = `import errno
+written = 0
+try:
+    with open("/out/fill", "wb", buffering=0) as f:
+        while True:
+            f.write(b"\0" * (1 << 20))
+            written += 1
+except OSError as e:
+    print("fill", errno.errorcode.get(e.errno), written, flush=True)
+hog = []
+for i in range(512):
+    hog.append(bytearray(1 << 20))
+print("survived", len(hog), flush=True)
+`
+
+// e38FilesCode：在 /out 中创建 2000 个文件（nr_inodes = 1024）。
+const e38FilesCode = `import errno
+n = 0
+try:
+    for i in range(2000):
+        open(f"/out/f{i:04d}", "w").close()
+        n += 1
+except OSError as e:
+    print("files", errno.errorcode.get(e.errno), n, flush=True)
+else:
+    print("files ok", n, flush=True)
+`
+
+// TestRealE38ExecPressure：E38——4 个暂停中的任务经各自 attempt 的 Gateway socket 同时发出 8 个 exec（每任务 2 个，
+// 全局 slots 4）：
+//   - ① /out 写满后分配内存超过 memory.max（96 MiB）：写满得到 ENOSPC/EFBIG，随后环境内 OOM，结果如实报告
+//     （signal 9、diag.oom_observed）；
+//   - ② 创建 2000 个文件：nr_inodes 用尽得到 ENOSPC，收集 256 个、其余报告 too_many；
+//   - ③ 其余 6 个各 sleep 3 s：同时存活的 exec 环境从不超过 4 个（第 5 个起排队，queue_ms 记录等待）；
+//   - 压力期间 GET /tasks/{id} 与 GET /status 每次都在 2 s 内响应；
+//   - 全部 exec 环境回收，任务成功，静止时 I1、I11、I12 等不变量成立。
+func TestRealE38ExecPressure(t *testing.T) {
+	fu := fakeupstream.New()
+	t.Cleanup(fu.Close)
+	h := newRealHarness(t)
+	h.start(execCfg(fu))
+	ids, socks := make([]string, 4), make([]string, 4)
+	for i := range ids {
+		ids[i], socks[i] = h.heldTask(fmt.Sprintf("e38-%d", i))
+	}
+
+	// 控制面响应：压力期间持续轮询，记录最大延迟与失败。
+	stopPoll := make(chan struct{})
+	var (
+		pollMu     sync.Mutex
+		maxLatency time.Duration
+		polls      int
+		pollErrs   []string
+	)
+	pollDone := make(chan struct{})
+	go func() {
+		defer close(pollDone)
+		for {
+			select {
+			case <-stopPoll:
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+			for _, p := range []string{"/status", "/tasks/" + ids[0]} {
+				t0 := time.Now()
+				st, _, err := httpDo("GET", h.base+p, "")
+				d := time.Since(t0)
+				pollMu.Lock()
+				polls++
+				maxLatency = max(maxLatency, d)
+				if err != nil || st != http.StatusOK || d > 2*time.Second {
+					pollErrs = append(pollErrs, fmt.Sprintf("GET %s = %d %v（%s）", p, st, err, d))
+				}
+				pollMu.Unlock()
+			}
+		}
+	}()
+	// 同时存活的 exec 环境数（stopped_at 未记录；slot 在 stopped_at 持久化之后才归还）。
+	var maxLive int
+	sampleDone := make(chan struct{})
+	go func() {
+		defer close(sampleDone)
+		ctx := context.Background()
+		c, err := pgx.Connect(ctx, h.dsn)
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.Close(ctx) }()
+		for {
+			select {
+			case <-stopPoll:
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+			var n int
+			if c.QueryRow(ctx, "SELECT count(*) FROM environments WHERE kind = 'exec' AND stopped_at IS NULL").Scan(&n) == nil {
+				pollMu.Lock()
+				maxLive = max(maxLive, n)
+				pollMu.Unlock()
+			}
+		}
+	}()
+
+	type job struct {
+		task   int
+		callID string
+		body   string
+	}
+	const sleepCode = "import time\ntime.sleep(3)\nprint('slept')\n"
+	jobs := []job{
+		{0, "e2e/fill/exec/1", execBody(e38FillCode, 60000, 96<<20)},
+		{0, "e2e/files/exec/1", execBody(e38FilesCode, 60000, 0)},
+	}
+	for i := 1; i < 4; i++ {
+		for k := 1; k <= 2; k++ {
+			jobs = append(jobs, job{i, fmt.Sprintf("e2e/sleep%d/exec/1", k), execBody(sleepCode, 60000, 0)})
+		}
+	}
+	type answer struct {
+		status int
+		res    execResult
+		raw    []byte
+		err    error
+	}
+	answers := make([]answer, len(jobs))
+	var wg sync.WaitGroup
+	for i, j := range jobs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			st, b, err := gwRaw(socks[j.task], http.MethodPost, "/v1/exec", j.callID, j.body)
+			a := answer{status: st, raw: b, err: err}
+			if err == nil && st == http.StatusOK {
+				a.err = json.Unmarshal(b, &a.res)
+			}
+			answers[i] = a
+		}()
+	}
+	wg.Wait()
+	close(stopPoll)
+	<-pollDone
+	<-sampleDone
+
+	for i, a := range answers {
+		if a.err != nil || a.status != http.StatusOK || a.res.Status != "completed" {
+			t.Fatalf("exec %s（任务 %d）= %d %v：%s", jobs[i].callID, jobs[i].task, a.status, a.err, a.raw)
+		}
+	}
+	fill, files := answers[0].res, answers[1].res
+	if _, sig := fill.exitCode(); !strings.HasPrefix(fill.Stdout, "fill ") || sig != 9 || fill.Diag == nil || !fill.Diag.OOMObserved ||
+		strings.Contains(fill.Stdout, "survived") || fill.Limits.MemoryBytes != 96<<20 {
+		t.Fatalf("① /out 写满 + 内存压力：stdout %q，exit %+v，diag %+v，limits %+v；期望写满报错后环境内 OOM（signal 9、oom_observed）",
+			fill.Stdout, fill.Exit, fill.Diag, fill.Limits)
+	}
+	if f := strings.Fields(fill.Stdout); len(f) < 2 || (f[1] != "ENOSPC" && f[1] != "EFBIG") {
+		t.Fatalf("① 写满 /out 的错误 %q，期望 ENOSPC（tmpfs 写满）或 EFBIG（RLIMIT_FSIZE）", fill.Stdout)
+	}
+	ff := strings.Fields(files.Stdout)
+	n := -1
+	if len(ff) == 3 {
+		n, _ = strconv.Atoi(ff[2]) // 非数字时为 0，由下方断言报告
+	}
+	var tooMany int
+	for _, s := range files.SkippedOutputs {
+		if s.Reason == "too_many" {
+			tooMany++
+		}
+	}
+	if len(ff) != 3 || ff[1] != "ENOSPC" || n >= 1024 || n < 256 || len(files.Outputs) != 256 || tooMany != n-256 {
+		t.Fatalf("② 2000 个文件：stdout %q，收集 %d 个，too_many %d；期望 nr_inodes 用尽得到 ENOSPC、收集 256 个",
+			files.Stdout, len(files.Outputs), tooMany)
+	}
+	var queued int
+	for _, a := range answers {
+		if a.res.QueueMs >= 100 {
+			queued++
+		}
+	}
+	pollMu.Lock()
+	ml, lat, np, perrs := maxLive, maxLatency, polls, pollErrs
+	pollMu.Unlock()
+	if ml > app.DefaultExecSlots || ml == 0 || queued < len(jobs)-app.DefaultExecSlots {
+		t.Fatalf("③ 同时存活的 exec 环境最多 %d 个（slots %d），排队 ≥ 100 ms 的 exec %d 个", ml, app.DefaultExecSlots, queued)
+	}
+	if len(perrs) != 0 || np == 0 {
+		t.Fatalf("压力期间控制面轮询 %d 次，最大延迟 %s，异常：%v", np, lat, perrs)
+	}
+	for _, id := range ids {
+		h.rec(id).releaseHold()
+	}
+	for _, id := range ids {
+		if v := h.waitTerminal(id); v.Status != "succeeded" {
+			t.Fatalf("任务 %+v", v)
+		}
+	}
+	var envs, cleaned int
+	h.queryRow("SELECT count(*), count(*) FILTER (WHERE cleanup_state = 'done') FROM environments WHERE kind = 'exec'", nil, &envs, &cleaned)
+	if envs != len(jobs) {
+		t.Fatalf("exec 环境 %d 个，期望 %d", envs, len(jobs))
+	}
+	t.Logf("E38：① %q exit %+v oom_kill_delta %d；② %q 收集 %d、too_many %d；③ 同时存活的 exec 环境最多 %d 个，排队 ≥ 100 ms 的 %d 个；"+
+		"控制面轮询 %d 次、最大延迟 %s", strings.TrimSpace(fill.Stdout), fill.Exit, fill.Diag.OOMKillDelta, strings.TrimSpace(files.Stdout),
+		len(files.Outputs), tooMany, ml, queued, np, lat.Round(time.Millisecond))
+	h.finish()
+}
+
+// ---- E37：exec 进行中 SIGKILL server（cmd/agentbox 真实子进程） ----
+
+const (
+	e37CallID = "root/e1/exec/1"
+	e37Code   = "import time\ntime.sleep(8)\nprint('done')\n"
+)
+
+// e37Try 是一次 exec try 与其环境。
+type e37Try struct {
+	TryNo     int
+	EnvID     string
+	Outcome   string
+	Error     string
+	StoppedAt *time.Time
+	CreatedAt time.Time
+}
+
+func (s *sysHarness) e37Tries(taskID string) []e37Try {
+	s.t.Helper()
+	ctx := context.Background()
+	c, err := pgx.Connect(ctx, s.dsn)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	defer func() { _ = c.Close(ctx) }()
+	rows, err := c.Query(ctx, `SELECT ct.try_no, ct.env_id, ct.outcome, ct.error, e.stopped_at, e.created_at FROM call_tries ct
+		JOIN environments e ON e.env_id = ct.env_id WHERE ct.task_id = $1 AND ct.call_id = $2 ORDER BY ct.try_no`, taskID, e37CallID)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	out, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (e37Try, error) {
+		var x e37Try
+		err := r.Scan(&x.TryNo, &x.EnvID, &x.Outcome, &x.Error, &x.StoppedAt, &x.CreatedAt)
+		return x, err
+	})
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	return out
+}
+
+// e37Started 提交 exec sleep 的任务，等 exec 主进程在 exec 环境中运行，返回任务 ID 与该 exec 环境。
+func (s *sysHarness) e37Started(requestID string) (string, string) {
+	s.t.Helper()
+	id := s.submit(requestID, spec(nil, requestID, nil, execStep("e1", e37Code)))
+	var envID string
+	eventually(s.t, "exec 主进程在 exec 环境中运行", func() bool {
+		var started int
+		pgQueryRow(s.t, s.dsn, `SELECT count(*) FROM call_tries WHERE task_id = $1 AND call_id = $2 AND exec_started_at IS NOT NULL`,
+			[]any{id, e37CallID}, &started)
+		if started == 0 {
+			return false
+		}
+		pgQueryRow(s.t, s.dsn, `SELECT env_id FROM call_tries WHERE task_id = $1 AND call_id = $2 AND try_no = 1`,
+			[]any{id, e37CallID}, &envID)
+		for _, pid := range cgroupPids(filepath.Join(s.installCgroup(), "env-"+envID)) {
+			if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil && bytes.Contains(b, []byte("/in/.agentbox/main.py")) {
+				return true
+			}
+		}
+		return false
+	})
+	return id, envID
+}
+
+// killServer 以 SIGKILL 杀死当前 server，等待其数据库连接全部结束。
+func (s *sysHarness) killServer() {
+	s.t.Helper()
+	p := s.srv
+	if err := p.cmd.Process.Kill(); err != nil {
+		s.t.Fatal(err)
+	}
+	if ps := s.waitExit(p); !killedBySIGKILL(ps) {
+		s.t.Fatalf("server 退出状态 %v", ps)
+	}
+	s.waitConnsGone()
+}
+
+// TestRealE37ServerKilledDuringExec：E37——exec（sleep 8 s）运行中 SIGKILL cmd/agentbox server 并重启：
+//   - 旧 exec 环境的 stopped_at 在新 try 的环境建立之前记录（重跑前确认此前的 exec 环境已停止），旧 try 为 unknown；
+//   - attempt 1 为 lost_on_restart，attempt 2 的 Worker 以同一 call id 重发，新 try 在新环境中完成，任务成功；
+//   - 另一例：先取消任务（202 已返回）再立即杀死 server → 恢复后旧环境已停止，任务 cancelled，没有新的 try。
+func TestRealE37ServerKilledDuringExec(t *testing.T) {
+	t.Run("rerun", func(t *testing.T) {
+		s := newRealSys(t)
+		s.startReal()
+		id, env1 := s.e37Started("e37")
+		s.killServer()
+		pre := s.e37Tries(id)
+		if len(pre) != 1 || pre[0].StoppedAt != nil {
+			t.Fatalf("server 被杀死时的 try：%+v；期望 1 个、环境未记录停止", pre)
+		}
+		s.startReal()
+		v := s.waitTerminal(id)
+		in := s.inspect(id)
+		tries := s.e37Tries(id)
+		if v.Status != "succeeded" || attemptByNo(in, 1).OutcomeClass != runner.ClassLostOnRestart || len(tries) != 2 {
+			t.Fatalf("恢复后任务 %s，attempts %s，tries %+v", v.Status, attemptClasses(in), tries)
+		}
+		old, cur := tries[0], tries[1]
+		if old.EnvID != env1 || old.Outcome != "unknown" || old.StoppedAt == nil || cur.EnvID == env1 || cur.Outcome != "ok" ||
+			!old.StoppedAt.Before(cur.CreatedAt) {
+			t.Fatalf("旧 try %+v，新 try %+v；期望旧环境先确认停止（stopped_at）再建立新 try 的环境", old, cur)
+		}
+		var res, state string
+		pgQueryRow(t, s.dsn, `SELECT state, COALESCE(result_ref, '') FROM calls WHERE task_id = $1 AND call_id = $2`,
+			[]any{id, e37CallID}, &state, &res)
+		rc, err := s.blobs.Open(res)
+		if err != nil {
+			t.Fatalf("调用 %s 的结果 blob %q: %v", state, res, err)
+		}
+		b, err := io.ReadAll(rc)
+		_ = rc.Close() // 只读句柄，关闭错误无关紧要
+		var r execResult
+		if err != nil || json.Unmarshal(b, &r) != nil || state != "completed" || r.Status != "completed" || r.Stdout != "done\n" {
+			t.Fatalf("调用 %s；结果 %s %v", state, b, err)
+		}
+		t.Logf("E37：旧 exec 环境 %s stopped_at %s（unknown）→ 新 try 环境 %s 建立于 %s（ok）；attempts %s", old.EnvID,
+			old.StoppedAt.Format(time.RFC3339Nano), cur.EnvID, cur.CreatedAt.Format(time.RFC3339Nano), attemptClasses(in))
+		s.finishReal()
+	})
+	t.Run("cancelled_not_rerun", func(t *testing.T) {
+		s := newRealSys(t)
+		s.startReal()
+		id, env1 := s.e37Started("e37-cancel")
+		st, b, err := httpDo("POST", s.srv.base+"/tasks/"+id+"/cancel", `{"request_id":"e37-cancel-req","reason":"e2e"}`)
+		if err != nil || (st != http.StatusAccepted && st != http.StatusOK) {
+			t.Fatalf("取消 = %d %s %v", st, b, err)
+		}
+		s.killServer()
+		s.startReal()
+		v := s.waitTerminal(id)
+		time.Sleep(time.Second) // 给任何（错误的）重跑留出时间
+		tries := s.e37Tries(id)
+		if v.Status != "cancelled" || len(tries) != 1 || tries[0].EnvID != env1 || tries[0].StoppedAt == nil {
+			t.Fatalf("取消后杀死 server：任务 %s，tries %+v；期望 cancelled、只有原来的 1 个 try 且其环境已停止", v.Status, tries)
+		}
+		t.Logf("E37（取消）：任务 %s，唯一 try %+v", v.Status, tries[0])
+		s.finishReal()
+	})
+}
+
+// ==== M4 Plan 15 Task 12 段结束 ====

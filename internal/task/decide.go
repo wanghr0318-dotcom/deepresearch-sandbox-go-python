@@ -20,6 +20,10 @@ const (
 	// DefaultControlGraceMs 是 State.ControlGraceMs 为 0 时 cancel/pause 的 grace_ms。规格未单列该值，
 	// 取与 exit_grace 相同的 10 s。
 	DefaultControlGraceMs = 10_000
+	// DefaultSessionPauseGraceMs 是会话 turn 的 pause（用户"停止"）在 ControlGraceMs 为 0 时的 grace_ms。停止时
+	// Worker 先等各子主题到达下一个工具边界（进行中的模型调用须返回），再用模型写 2–3 句"目前发现"并发出停止卡
+	// （设计 D2）；真实 Kimi 的这两段合计常超过 10 s，超时则宿主终止 incarnation（会话被驱逐、停止卡丢失）。
+	DefaultSessionPauseGraceMs = 60_000
 )
 
 // Decide 读取的 outcome_class（分类本身只由 runner.Classify 给出；Decide 只按类别裁决）。
@@ -29,7 +33,13 @@ const (
 	ClassDeadlineExceeded = "task_deadline_exceeded"  // 累计运行时限超限：任务级事实，新 attempt 不重置，不重试
 	ClassCancelled        = "cancelled"               // 宿主意图：执行尚未启动时由 Decide 直接给出
 	ClassPaused           = "paused"
+	// ClassAwaitingInput 是会话 turn 的 awaiting_input 提议（runner.ClassAwaitingInput，非故障）：desired = run 时裁决为
+	// paused + awaiting_input（契约 A），保留 checkpoint、归还 run slot。
+	ClassAwaitingInput = "awaiting_input"
 )
+
+// ReasonSessionUnavailable 是会话无法恢复或已关闭、turn 没有 attempt 即失败的 status_reason。
+const ReasonSessionUnavailable = "session_unavailable"
 
 // State 是 Decide 读取的任务事实。Attempt 是任务的当前 attempt（可能已 ended）；nil 表示从未创建。
 type State struct {
@@ -50,6 +60,13 @@ type State struct {
 	ControlGraceMs int64 // cancel/pause 的 grace_ms；0 取 DefaultControlGraceMs
 	SlotRequested  bool  // 已发出 RequestSlot，尚未收到 SlotGranted
 	SlotHeld       bool  // 持有 run slot：从授予到执行环境确认停止（§14.5）
+
+	// SessionID 非空：会话 turn（§12.1）。attempt 创建须经 session actor 授予：RequestSlot → RequestSessionGrant →
+	// CreateAttempt（带授予的 incarnation 与其环境）→ StartWorker（不创建任务环境）；停止改为交还 incarnation
+	// （StopEnvironment.Session）。
+	SessionID string
+	// SessionRequested：已发出 RequestSessionGrant，尚未收到 SessionGranted 或 SessionUnavailable（期间持有 run slot）。
+	SessionRequested bool
 }
 
 // AttemptState 是当前 attempt 的事实。Status 取值 starting | handshaking | active | finishing |
@@ -63,8 +80,9 @@ type AttemptState struct {
 	StopRequested            bool   // 已发出 RevokeAccess 与 StopEnvironment
 	StopFailures             int64  // 连续无法确认停止的次数（退避用）
 	StopRetryAt              *time.Time
-	Outcome                  *Outcome // finishing 及之后为 attempt 结果；stop_blocked 时为恢复给出的结果
-	Verdict                  *Verdict // finishing：待提交的判决（nil 表示需重算）；ended：已提交的判决
+	Outcome                  *Outcome        // finishing 及之后为 attempt 结果；stop_blocked 时为恢复给出的结果
+	Verdict                  *Verdict        // finishing：待提交的判决（nil 表示需重算）；ended：已提交的判决
+	Handoff                  *SessionHandoff // 会话 turn：已发出的交还（停止重试时原样重发）
 }
 
 // Outcome 是 Decide 使用的 attempt 结果（纯数据）；actor 把 runner.Outcome 转换为它，Decide 不导入 runner。
@@ -119,8 +137,19 @@ type AttemptFinished struct {
 	Outcome          Outcome
 }
 
-// VerdictCommitted 表示 FinalizeAttempt 已提交该判决。
-type VerdictCommitted struct{ Verdict Verdict }
+// VerdictCommitted 表示 FinalizeAttempt 已提交该判决。CommittedSessionCheckpointID 是会话 turn 裁决后的会话指针
+// （Attempt.CommittedSessionCheckpointID；交还时作为 task_outcome.committed_session_checkpoint_id）。
+type VerdictCommitted struct {
+	Verdict                      Verdict
+	CommittedSessionCheckpointID string
+}
+
+// SessionGranted 表示 session actor 授予了 incarnation（会话 turn）。
+type SessionGranted struct{ IncarnationID, EnvID string }
+
+// SessionUnavailable 表示授予失败：Err 为 ErrSessionUnavailable（会话已关闭或恢复两次失败）时 queued 的 turn 失败；
+// 其余错误（撤回、暂时失败）稍后重试。
+type SessionUnavailable struct{ Err error }
 
 // EnvStopped 表示环境已确认停止并记录 stopped_at。
 type EnvStopped struct{ AttemptID, EnvID string }
@@ -146,17 +175,19 @@ type StoreFailed struct {
 	Err            error
 }
 
-func (Tick) isEvent()             {}
-func (ControlChanged) isEvent()   {}
-func (SlotGranted) isEvent()      {}
-func (AttemptCreated) isEvent()   {}
-func (EnvCreated) isEvent()       {}
-func (WorkerStarted) isEvent()    {}
-func (AttemptFinished) isEvent()  {}
-func (VerdictCommitted) isEvent() {}
-func (EnvStopped) isEvent()       {}
-func (StopUnconfirmed) isEvent()  {}
-func (StoreFailed) isEvent()      {}
+func (Tick) isEvent()               {}
+func (ControlChanged) isEvent()     {}
+func (SlotGranted) isEvent()        {}
+func (AttemptCreated) isEvent()     {}
+func (EnvCreated) isEvent()         {}
+func (WorkerStarted) isEvent()      {}
+func (AttemptFinished) isEvent()    {}
+func (VerdictCommitted) isEvent()   {}
+func (EnvStopped) isEvent()         {}
+func (StopUnconfirmed) isEvent()    {}
+func (StoreFailed) isEvent()        {}
+func (SessionGranted) isEvent()     {}
+func (SessionUnavailable) isEvent() {}
 
 // Decision 是 Decide 的输出：新状态与按顺序执行的副作用。
 type Decision struct {
@@ -174,8 +205,22 @@ type RequestSlot struct{}
 type ReleaseSlot struct{}
 
 // CreateAttempt 以 actor 生成的 attempt_id、env_id 调用 Store.CreateAttempt；结果为 AttemptCreated 或
-// StoreFailed{OpCreateAttempt}。
-type CreateAttempt struct{ Retry RetryKind }
+// StoreFailed{OpCreateAttempt}。Session 非 nil（会话 turn）时 env_id 为授予的 incarnation 环境。
+type CreateAttempt struct {
+	Retry   RetryKind
+	Session *SessionGrant
+}
+
+// RequestSessionGrant 向 session actor 申请 incarnation（SessionGate.Grant）；结果为 SessionGranted 或
+// SessionUnavailable。
+type RequestSessionGrant struct{}
+
+// WithdrawSessionGrant 撤回在途的授予申请（控制或条件变化后不再需要）；结果仍以 SessionGranted/SessionUnavailable
+// 回到 Decide。
+type WithdrawSessionGrant struct{}
+
+// FailTurn 把没有 attempt 的 queued 会话 turn 裁决为 failed（TurnStore.FailQueuedTurn，同事务 host 事件）。
+type FailTurn struct{ Reason string }
 
 // CreateEnvironment 经 coordinator 创建任务环境；结果为 EnvCreated。
 type CreateEnvironment struct{ AttemptID, EnvID string }
@@ -189,8 +234,12 @@ type SendControl struct {
 	GraceMs         int64
 }
 
-// StopEnvironment 经 coordinator 停止环境；结果为 EnvStopped 或 StopUnconfirmed。
-type StopEnvironment struct{ AttemptID, EnvID string }
+// StopEnvironment 经 coordinator 停止环境；结果为 EnvStopped 或 StopUnconfirmed。Session 非 nil（会话 turn）时改为
+// 交还 incarnation（SessionGate.Handoff）：Recorded 即 EnvStopped。
+type StopEnvironment struct {
+	AttemptID, EnvID string
+	Session          *SessionHandoff
+}
 
 // RevokeAccess 撤销 attempt 的访问（Store 与 Gateway）；在停止之前执行。Reason 在 desired = cancel 时为
 // RevokeReasonCancel，否则为 attempt_stopping。
@@ -218,17 +267,20 @@ type WakeAt struct{ Time time.Time }
 // ApplyControl（定义于 store.go，也是 Store.ApplyControl 的输入）作为副作用：以 CAS 写入控制转换。
 func (ApplyControl) isEffect() {}
 
-func (RequestSlot) isEffect()       {}
-func (ReleaseSlot) isEffect()       {}
-func (CreateAttempt) isEffect()     {}
-func (CreateEnvironment) isEffect() {}
-func (StartWorker) isEffect()       {}
-func (SendControl) isEffect()       {}
-func (StopEnvironment) isEffect()   {}
-func (RevokeAccess) isEffect()      {}
-func (RevokeGateway) isEffect()     {}
-func (Finalize) isEffect()          {}
-func (WakeAt) isEffect()            {}
+func (RequestSlot) isEffect()          {}
+func (ReleaseSlot) isEffect()          {}
+func (RequestSessionGrant) isEffect()  {}
+func (WithdrawSessionGrant) isEffect() {}
+func (FailTurn) isEffect()             {}
+func (CreateAttempt) isEffect()        {}
+func (CreateEnvironment) isEffect()    {}
+func (StartWorker) isEffect()          {}
+func (SendControl) isEffect()          {}
+func (StopEnvironment) isEffect()      {}
+func (RevokeAccess) isEffect()         {}
+func (RevokeGateway) isEffect()        {}
+func (Finalize) isEffect()             {}
+func (WakeAt) isEffect()               {}
 
 // ErrInvalid 表示状态与事件的组合不合法（actor 的程序错误或事实不一致）。
 var ErrInvalid = errors.New("task: 不合法的状态或事件")
@@ -284,6 +336,10 @@ func (d *decider) dispatch(e Event) error {
 		return d.stopUnconfirmed(e)
 	case StoreFailed:
 		return d.storeFailed(e)
+	case SessionGranted:
+		return d.sessionGranted(e)
+	case SessionUnavailable:
+		return d.sessionUnavailable(e)
 	}
 	return invalid("未知事件 %T", e)
 }
@@ -297,7 +353,7 @@ func (d *decider) tick() error {
 			d.stop()
 		case a.StopRetryAt != nil && !d.s.Now.Before(*a.StopRetryAt):
 			a.StopRetryAt = nil
-			d.emit(StopEnvironment{AttemptID: a.AttemptID, EnvID: a.EnvID})
+			d.emit(StopEnvironment{AttemptID: a.AttemptID, EnvID: a.EnvID, Session: a.Handoff})
 		}
 	}
 	// 未应用的控制，以及被拒绝后需按最新控制重算的判决（finishing 且 Verdict 为 nil）。
@@ -327,10 +383,56 @@ func (d *decider) slotGranted() error {
 	}
 	d.s.SlotRequested, d.s.SlotHeld = false, true
 	if d.canStart() {
+		if d.s.SessionID != "" { // 会话 turn：attempt 创建须经 session actor 授予（§12.1）
+			d.s.SessionRequested = true
+			d.emit(RequestSessionGrant{})
+			return nil
+		}
 		d.emit(CreateAttempt{Retry: d.s.NextRetry})
 		return nil
 	}
 	d.releaseSlot() // 等待期间控制或时间条件已变化：归还授予（§3.2）
+	return nil
+}
+
+func (d *decider) sessionGranted(e SessionGranted) error {
+	if !d.s.SessionRequested || !d.s.SlotHeld {
+		return invalid("没有在途的会话授予申请时收到授予")
+	}
+	if e.IncarnationID == "" || e.EnvID == "" {
+		return invalid("会话授予缺少 incarnation_id 或 env_id")
+	}
+	d.s.SessionRequested = false
+	if d.canStart() {
+		d.emit(CreateAttempt{Retry: d.s.NextRetry, Session: &SessionGrant{IncarnationID: e.IncarnationID, EnvID: e.EnvID}})
+		return nil
+	}
+	d.releaseSlot() // 未使用的授予由 session actor 在期限后收回
+	d.maybeStart()
+	return nil
+}
+
+// sessionUnavailable：会话已关闭或恢复两次失败（ErrSessionUnavailable）时，仍可运行的 queued turn 没有 attempt 即
+// 失败（failed/session_unavailable）；撤回或暂时失败则退避后重新申请。
+func (d *decider) sessionUnavailable(e SessionUnavailable) error {
+	if !d.s.SessionRequested {
+		return invalid("没有在途的会话授予申请时收到授予失败")
+	}
+	d.s.SessionRequested = false
+	if d.s.SlotHeld {
+		d.releaseSlot()
+	}
+	if !d.startable() {
+		return nil
+	}
+	if errors.Is(e.Err, ErrSessionUnavailable) {
+		d.s.TaskStatus = "failed"
+		d.emit(FailTurn{Reason: ReasonSessionUnavailable})
+		return nil
+	}
+	at := d.s.Now.Add(RetryBackoff(0, d.s.Jitter))
+	d.s.NotBefore = &at
+	d.emit(WakeAt{Time: at})
 	return nil
 }
 
@@ -354,7 +456,12 @@ func (d *decider) attemptCreated(e AttemptCreated) error {
 	if err := d.reconcileControl(); err != nil {
 		return err
 	}
-	if d.s.Attempt.Status == "starting" {
+	if a := d.s.Attempt; a.Status == "starting" {
+		if d.s.SessionID != "" { // 会话 turn 在授予的 incarnation 中运行：不创建任务环境（视为 EnvCreated 成功）
+			a.Status = "handshaking"
+			d.emit(StartWorker{AttemptID: e.AttemptID, EnvID: e.EnvID})
+			return nil
+		}
 		d.emit(CreateEnvironment{AttemptID: e.AttemptID, EnvID: e.EnvID})
 	}
 	return nil
@@ -363,7 +470,7 @@ func (d *decider) attemptCreated(e AttemptCreated) error {
 func (d *decider) envCreated(e EnvCreated) error {
 	a := d.current(e.AttemptID)
 	if a == nil { // 过期：迟到的创建结果交给清理
-		d.emit(StopEnvironment{AttemptID: e.AttemptID, EnvID: e.EnvID})
+		d.staleStop(e.AttemptID, e.EnvID)
 		return nil
 	}
 	switch {
@@ -382,7 +489,7 @@ func (d *decider) envCreated(e EnvCreated) error {
 func (d *decider) workerStarted(e WorkerStarted) error {
 	a := d.current(e.AttemptID)
 	if a == nil {
-		d.emit(StopEnvironment{AttemptID: e.AttemptID, EnvID: e.EnvID})
+		d.staleStop(e.AttemptID, e.EnvID)
 		return nil
 	}
 	switch {
@@ -400,7 +507,7 @@ func (d *decider) workerStarted(e WorkerStarted) error {
 func (d *decider) attemptFinished(e AttemptFinished) error {
 	a := d.current(e.AttemptID)
 	if a == nil { // 过期：只做资源转交
-		d.emit(StopEnvironment{AttemptID: e.AttemptID, EnvID: e.EnvID})
+		d.staleStop(e.AttemptID, e.EnvID)
 		return nil
 	}
 	if a.Status != "handshaking" && a.Status != "active" {
@@ -432,6 +539,13 @@ func (d *decider) verdictCommitted(e VerdictCommitted) error {
 	d.s.NextRetry = RetryNone
 	if v.TaskStatus == "queued" {
 		d.s.NextRetry = a.Outcome.Retry
+	}
+	if d.s.SessionID != "" && !a.StopRequested && !a.EnvStopped {
+		// 会话 turn 的交还在裁决提交之后（§12.4：task_outcome 告知已提交的裁决与会话指针）。故障重试、取消与
+		// 非正常结束销毁 incarnation；其余经 Release 回到 idle。
+		destroy := v.TaskStatus == "queued" || d.sessionDestroy(*a.Outcome)
+		d.handoff(&SessionHandoff{TaskID: d.s.TaskID, AttemptID: a.AttemptID, EnvID: a.EnvID, Verdict: outcomeVerdict(v.TaskStatus),
+			CommittedSessionCheckpointID: e.CommittedSessionCheckpointID, Destroy: destroy})
 	}
 	if err := d.reconcileControl(); err != nil {
 		return err
@@ -524,6 +638,9 @@ func (d *decider) reconcileControl() error {
 	if next != prev && (next == "pausing" || next == "cancelling") && live(a) {
 		d.interrupt()
 	}
+	if d.s.SessionRequested && !d.startable() { // 不再需要的会话授予：撤回（结果仍会回到 Decide）
+		d.emit(WithdrawSessionGrant{})
+	}
 	d.maybeStart()
 	return nil
 }
@@ -545,6 +662,9 @@ func (d *decider) interrupt() {
 			grace := d.s.ControlGraceMs
 			if grace == 0 {
 				grace = DefaultControlGraceMs
+				if d.s.SessionID != "" && d.s.Desired == "pause" {
+					grace = DefaultSessionPauseGraceMs
+				}
 			}
 			// 取消生效时立即撤销 Gateway 入口（§9.1；attempt_access 留到停止时，见 RevokeGateway）；暂停不撤销。
 			if d.s.Desired == "cancel" {
@@ -556,11 +676,59 @@ func (d *decider) interrupt() {
 }
 
 // finish 记录 attempt 结果、撤销访问并停止环境，提交判决（§8.2：active 之前的失败也总是发起停止）。
+//
+// 会话 turn：需要销毁 incarnation 的结果（sessionDestroy）立即交还销毁；其余在裁决提交之后经 Release 交还（见
+// verdictCommitted），incarnation 在此之前保持 busy。
 func (d *decider) finish(o Outcome) {
 	a := d.s.Attempt
 	a.Status, a.Outcome, a.Verdict = "finishing", &o, nil
-	d.stop()
+	if d.s.SessionID == "" || d.sessionDestroy(o) {
+		d.stop()
+	}
 	d.finalize()
+}
+
+// sessionDestroy：会话 turn 的执行结果要求销毁 incarnation——取消生效，或 Worker 没有正常给出终态提议（崩溃、
+// 超时、协议违规、累计时限等故障类结果）。结果、业务错误、暂停与 awaiting_input 提议经 Release 交还。
+func (d *decider) sessionDestroy(o Outcome) bool {
+	if d.s.Desired == "cancel" || o.ProposalKind == "" {
+		return true
+	}
+	switch o.Class {
+	case ClassSucceeded, ClassOOMObserved, ClassPaused, ClassAwaitingInput, "worker_error":
+		return false
+	}
+	return true
+}
+
+// outcomeVerdict 是 task_outcome.verdict（succeeded|failed|cancelled|paused）：故障重试（queued）的 incarnation 总是
+// 被销毁，按 failed 告知。
+func outcomeVerdict(taskStatus string) string {
+	switch taskStatus {
+	case "succeeded", "cancelled", "paused":
+		return taskStatus
+	}
+	return "failed"
+}
+
+// handoff 撤销访问并交还会话 incarnation（StopEnvironment.Session）。
+func (d *decider) handoff(h *SessionHandoff) {
+	a := d.s.Attempt
+	a.StopRequested, a.Handoff = true, h
+	reason := "attempt_stopping"
+	if d.s.Desired == "cancel" {
+		reason = RevokeReasonCancel
+	}
+	d.emit(RevokeAccess{AttemptID: a.AttemptID, Reason: reason},
+		StopEnvironment{AttemptID: a.AttemptID, EnvID: a.EnvID, Session: h})
+}
+
+// staleStop 是过期结果的资源转交：独立任务停止该环境；会话 turn 的环境是 incarnation 的环境，由 session actor
+// 管理（该 attempt 的交还已经发生或将以当前 attempt 的身份发生），不在此停止。
+func (d *decider) staleStop(attemptID, envID string) {
+	if d.s.SessionID == "" {
+		d.emit(StopEnvironment{AttemptID: attemptID, EnvID: envID})
+	}
 }
 
 func (d *decider) failBeforeActive(err error, o *Outcome) error {
@@ -577,6 +745,10 @@ func (d *decider) failBeforeActive(err error, o *Outcome) error {
 func (d *decider) stop() {
 	a := d.s.Attempt
 	if a.StopRequested || a.EnvStopped {
+		return
+	}
+	if d.s.SessionID != "" { // 会话 turn 在裁决之前停止执行：销毁 incarnation（§12.4 释放只在裁决之后）
+		d.handoff(&SessionHandoff{TaskID: d.s.TaskID, AttemptID: a.AttemptID, EnvID: a.EnvID, Verdict: "failed", Destroy: true})
 		return
 	}
 	a.StopRequested = true
@@ -612,8 +784,16 @@ func (d *decider) verdict(o Outcome) Verdict {
 		if valid {
 			v.TaskStatusReason, v.Result = "completed_during_pause", o.Result
 		}
+	case o.Class == ClassAwaitingInput: // 一种不经暂停请求的暂停（契约 A；VerdictAllowedReason）
+		v.TaskStatus, v.TaskStatusReason = "paused", ReasonAwaitingInput
+	case valid && d.s.SessionID != "" && resultSessionState(o.Result) == nil:
+		// 会话 turn 的成功裁决须提交 session_state（§12.3）：缺失或不完整的 result 不是有效结果
+		v.OutcomeClass, v.TaskStatus, v.TaskStatusReason = "protocol_violation", "failed", "protocol_violation"
 	case valid:
 		v.TaskStatus, v.TaskStatusReason, v.Result = "succeeded", o.Class, o.Result
+		if d.s.SessionID != "" {
+			v.SessionState = resultSessionState(o.Result)
+		}
 	case d.retryAllowed(o):
 		at := d.s.Now.Add(RetryBackoff(d.s.FaultRetriesUsed+d.s.OOMRetriesUsed, d.s.Jitter))
 		v.TaskStatus, v.TaskStatusReason, v.NotBefore = "queued", o.Class, &at
@@ -636,6 +816,32 @@ type verdictEvent struct {
 	StatusReason     string `json:"status_reason"`
 	PlatformKilled   bool   `json:"platform_killed"`
 	OutputIncomplete bool   `json:"output_incomplete"`
+}
+
+// resultSessionState 取出 result 内容（runner 记录的 {summary, outputs, session_state}）中的 session_state，作为成功
+// 裁决提交的新 session checkpoint（§12.3）；缺失或不完整（无 checkpoint_id，或 state 与 state_ref 不是恰有一个）时为 nil。
+func resultSessionState(result json.RawMessage) *SessionState {
+	var c struct {
+		SessionState *struct {
+			CheckpointID string          `json:"checkpoint_id"`
+			State        json.RawMessage `json:"state"`
+			StateRef     string          `json:"state_ref"`
+			Refs         []string        `json:"refs"`
+		} `json:"session_state"`
+	}
+	if json.Unmarshal(result, &c) != nil || c.SessionState == nil {
+		return nil
+	}
+	ss := c.SessionState
+	hasState := len(ss.State) > 0 && string(ss.State) != "null"
+	if ss.CheckpointID == "" || hasState == (ss.StateRef != "") {
+		return nil
+	}
+	out := &SessionState{CheckpointID: ss.CheckpointID, StateRef: ss.StateRef, Refs: ss.Refs}
+	if hasState {
+		out.State = ss.State
+	}
+	return out
 }
 
 // validResult：Worker 的 result 已被接受为有效结果（分类为成功）。
@@ -683,9 +889,10 @@ func (d *decider) canStart() bool {
 }
 
 // creating：已持有槽位且没有阻止执行的 attempt，即 CreateAttempt 已发出、结果未到。
+// 会话 turn 等待授予期间（SessionRequested）不算创建中：控制照常应用，不再需要的申请被撤回。
 func (d *decider) creating() bool {
 	a := d.s.Attempt
-	return d.s.TaskStatus == "queued" && d.s.SlotHeld && (a == nil || (a.Status == "ended" && a.EnvStopped))
+	return d.s.TaskStatus == "queued" && d.s.SlotHeld && !d.s.SessionRequested && (a == nil || (a.Status == "ended" && a.EnvStopped))
 }
 
 func (d *decider) releaseSlot() {
@@ -749,6 +956,9 @@ func validateState(s State) error {
 	executing := s.TaskStatus == "running" || s.TaskStatus == "pausing" || s.TaskStatus == "cancelling"
 	if executing != live(a) {
 		return invalid("任务状态 %s 与当前 attempt 不一致", s.TaskStatus)
+	}
+	if s.SessionRequested && (s.SessionID == "" || !s.SlotHeld) {
+		return invalid("会话授予申请须属于会话 turn 且持有 run slot")
 	}
 	return nil
 }

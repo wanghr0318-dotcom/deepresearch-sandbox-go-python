@@ -40,6 +40,14 @@ type InitSpec struct {
 	// exec 环境：/in 只读输入目录（可为空）；/out tmpfs 的大小（必须为正，nr_inodes=1024）。
 	In       string `json:"in,omitempty"`
 	OutBytes int64  `json:"out_bytes,omitempty"`
+	// Out 是 exec 环境 /out 的宿主侧 tmpfs 挂载点，exec 环境必填：init 不再自建 /out tmpfs（Plan 15 D1）。
+	// provider 在启动 init 前挂载（size=OutBytes、nr_inodes=1024、mode=0700、uid=gid=映射 1000、nosuid、nodev）。
+	// init 以 O_PATH 固定后 open_tree(OPEN_TREE_CLONE) 克隆，mount_setattr 设 NOSUID|NODEV（不设 RDONLY）后
+	// move_mount 到 /out；回退路径 mount(2) MS_BIND。执行树停止后挂载仍在宿主上，供收集输出。
+	Out string `json:"out,omitempty"`
+	// Restore 仅 session 环境（可为空）：冷恢复暂存的宿主目录，只读 bind 到 /run/agentbox/restore（规格 §12.2，
+	// M4 Plan 12）。bind 的是目录：宿主删除其中的文件后沙箱内随即不可见。
+	Restore string `json:"restore,omitempty"`
 	// NoFile 是 workload 的 RLIMIT_NOFILE（软、硬限相同），0 由 validate 填为 workloadNoFile；FSize 是 exec 环境 workload 的 RLIMIT_FSIZE，
 	// 0 表示由 init 取可写 tmpfs（/tmp、/out）中最大者。二者来自 provider.Limits（规格 §4.5）。
 	NoFile uint64 `json:"nofile"`
@@ -62,12 +70,18 @@ func (s *InitSpec) validate() error {
 		}
 		return nil
 	}
+	if s.Restore != "" && s.Kind != KindSession {
+		return fmt.Errorf("%s 环境不能有恢复暂存目录（restore）", s.Kind)
+	}
 	switch s.Kind {
 	case KindTask, KindSession:
-		if s.In != "" || s.OutBytes != 0 {
+		if s.In != "" || s.OutBytes != 0 || s.Out != "" {
 			return fmt.Errorf("%s 环境不能有 /in 或 /out", s.Kind)
 		}
 		if err := abs("workspace", s.Workspace); err != nil {
+			return err
+		}
+		if err := abs("restore", s.Restore); err != nil {
 			return err
 		}
 		return abs("gateway_socket", s.GatewaySocket)
@@ -77,6 +91,12 @@ func (s *InitSpec) validate() error {
 		}
 		if s.OutBytes <= 0 {
 			return fmt.Errorf("exec 环境的 out_bytes 必须为正（实际 %d）", s.OutBytes)
+		}
+		if s.Out == "" {
+			return errors.New("exec 环境缺少宿主侧 /out 挂载点（out）")
+		}
+		if err := abs("out", s.Out); err != nil {
+			return err
 		}
 		return abs("in", s.In)
 	default:
@@ -92,10 +112,12 @@ const (
 	stepMountPrivate   = "mount_private"
 	stepMountRootfs    = "mount_rootfs"
 	stepMountIn        = "mount_in"
+	stepMountOut       = "mount_out"
 	stepMountTmpfs     = "mount_tmpfs"
 	stepMountDev       = "mount_dev"
 	stepMountGateway   = "mount_gateway"
 	stepMountWorkspace = "mount_workspace"
+	stepMountRestore   = "mount_restore"
 	stepMountProc      = "mount_proc"
 	stepMaskProc       = "mask_proc"
 	stepOpenSelf       = "open_self"

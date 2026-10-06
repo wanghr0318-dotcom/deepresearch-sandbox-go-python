@@ -48,6 +48,19 @@ func VerdictAllowed(desired, taskStatus string) bool {
 	}
 }
 
+// ReasonAwaitingInput 是会话 turn 等待用户回答时的 status_reason（契约 A：paused + awaiting_input）。
+const ReasonAwaitingInput = "awaiting_input"
+
+// VerdictAllowedReason 是 VerdictAllowed 的会话扩展：desired = run 时另允许 (paused, awaiting_input)——Worker 的
+// awaiting_input 提议是一种不经暂停请求的暂停（保留 checkpoint、释放 run slot）。其余组合与 VerdictAllowed 相同；
+// desired = pause 时 paused 可带任意原因。Store 用它校验；VerdictAllowed 保留给尚未迁移的调用方。
+func VerdictAllowedReason(desired, taskStatus, statusReason string) bool {
+	if desired == "run" && taskStatus == "paused" {
+		return statusReason == ReasonAwaitingInput
+	}
+	return VerdictAllowed(desired, taskStatus)
+}
+
 // IsTerminal 报告任务状态是否为终态。
 func IsTerminal(status string) bool {
 	return status == "succeeded" || status == "failed" || status == "cancelled"

@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import json
 import re
-from html.parser import HTMLParser
 from typing import Any
 
 from agentbox_worker import (
@@ -31,6 +30,13 @@ from agentbox_worker import (
     GatewayClient,
     GatewayError,
     GatewayResult,
+)
+from agentbox_worker.tools.text import (
+    page_text,
+    renumber_citations,
+    search_hits,
+    strip_thinking,
+    truncate_utf8,
 )
 from deepresearch import prompts
 from deepresearch.models import Evidence, ResearchState, ResearchTask
@@ -48,10 +54,7 @@ NO_INFO = "暂无可用信息"  # 只表示"没有证据"，从不用来掩盖�
 FALLBACK_TITLE = "基础背景梳理"
 FALLBACK_INTENT = "收集主题的核心背景与最新动态"
 
-_HTML_PARSE_MAX_CHARS = 512 * 1024
-_THINK = re.compile(r"<think>.*?</think>|【思考】.*?【/思考】", re.DOTALL | re.IGNORECASE)
 _FENCE = re.compile(r"```(?:json|JSON)?\s*\n?(.*?)```", re.DOTALL)
-_CITE = re.compile(r"\[(\d+(?:\s*[,，、]\s*\d+)*)\]")
 _EVIDENCE_HEADING = re.compile(r"^#{1,6}\s*(?:证据|参考来源)(?:列表)?\s*$", re.MULTILINE)
 
 
@@ -194,7 +197,7 @@ def search_and_fetch(
     seen_urls: set[str] = set()
     seen_shas: set[str] = set()
     last_error: GatewayError | None = None
-    for hit in _search_hits(res.body)[:max_results]:
+    for hit in search_hits(res.body)[:max_results]:
         if len(seen_urls) >= max_fetch:
             break
         if hit["url"] in seen_urls:
@@ -213,7 +216,7 @@ def search_and_fetch(
         if sha is None or sha in seen_shas:
             continue
         seen_shas.add(sha)
-        parts = [p for p in (hit["snippet"], _page_text(fetched.body)) if p]
+        parts = [p for p in (hit["snippet"], page_text(fetched.body)) if p]
         evidence.append(
             Evidence(
                 sha256=sha,
@@ -233,63 +236,6 @@ def _fatal(exc: GatewayError) -> bool:
     if isinstance(exc, BudgetExhausted | AccessRevoked | CallDivergence):
         return True
     return exc.status == 0 and not isinstance(exc, CallDeadlineExceeded)
-
-
-def _search_hits(body: dict) -> list[dict[str, str]]:
-    """搜索响应 {"results": [{url, title, snippet|content|description}]}；跳过非 http(s) 条目。"""
-    results = body.get("results")
-    if not isinstance(results, list):
-        return []
-    hits = []
-    for item in results:
-        if not isinstance(item, dict):
-            continue
-        url = _text(item.get("url"))
-        if not url.lower().startswith(("http://", "https://")):
-            continue
-        snippet = next(
-            (s for k in ("snippet", "content", "description") if (s := _text(item.get(k)))), ""
-        )
-        # 网页 <title> 原文可能含制表符与换行：折叠为单个空格，证据列表才能一行一条。
-        title = " ".join(_text(item.get("title")).split())
-        hits.append({"url": url, "title": title or url, "snippet": snippet})
-    return hits
-
-
-def _page_text(body: dict) -> str:
-    """抓取响应中的正文（text|content|body），HTML 转为纯文本并压缩空白。"""
-    raw = next((v for k in ("text", "content", "body") if isinstance(v := body.get(k), str)), "")
-    content_type = body.get("content_type")
-    is_html = (isinstance(content_type, str) and "html" in content_type.lower()) or raw.lstrip()[
-        :1
-    ] == "<"
-    if is_html:
-        parser = _TextExtractor()
-        parser.feed(raw[:_HTML_PARSE_MAX_CHARS])
-        parser.close()
-        raw = " ".join(parser.chunks)
-    return " ".join(raw.split())
-
-
-class _TextExtractor(HTMLParser):
-    _SKIP = frozenset({"script", "style", "noscript", "template", "svg", "head"})
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.chunks: list[str] = []
-        self._skip_depth = 0
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in self._SKIP:
-            self._skip_depth += 1
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in self._SKIP and self._skip_depth:
-            self._skip_depth -= 1
-
-    def handle_data(self, data: str) -> None:
-        if not self._skip_depth and data.strip():
-            self.chunks.append(data)
 
 
 # ---- 总结 ----
@@ -364,7 +310,7 @@ def write_report(
     task_blocks = []
     for task in state.tasks:
         local = {i: numbers[sha] for i, sha in enumerate(task.evidence, start=1) if sha in numbers}
-        summary = _renumber(task.summary or NO_INFO, local)
+        summary = renumber_citations(task.summary or NO_INFO, local)
         task_blocks.append(
             prompts.REPORT_TASK.format(
                 id=task.id,
@@ -391,7 +337,7 @@ def write_report(
     if heading:
         body = body[: heading.start()]
     body = (
-        _renumber(body, {n: n for n in numbers.values()}).strip()
+        renumber_citations(body, {n: n for n in numbers.values()}).strip()
         or "报告生成失败：模型未返回内容。"
     )
     lines = [f"# {state.topic}" if state.topic else "# 研究报告", "", body, "", "## 证据", ""]
@@ -414,32 +360,10 @@ def _global_numbers(state: ResearchState) -> dict[str, int]:
     return numbers
 
 
-def _renumber(text: str, mapping: dict[int, int]) -> str:
-    """把 [n]、[n, m] 形式的引用按 mapping 改写为 [a][b]；不在 mapping 中的编号删除。"""
-
-    def repl(m: re.Match[str]) -> str:
-        nums = [int(x) for x in re.split(r"\s*[,，、]\s*", m.group(1))]
-        return "".join(f"[{mapping[n]}]" for n in nums if n in mapping)
-
-    return _CITE.sub(repl, text)
-
-
 # ---- 公共工具 ----
 
-
-def strip_thinking(text: str) -> str:
-    """去掉推理模型输出中的 <think>…</think> / 【思考】…【/思考】 段。"""
-    return _THINK.sub("", text)
-
-
-def truncate_utf8(text: str, limit: int) -> str:
-    """截断到 UTF-8 编码 ≤ limit 字节（不切开字符）；被截断时以 … 结尾且总长仍 ≤ limit。"""
-    data = text.encode("utf-8")
-    if len(data) <= limit:
-        return text
-    ellipsis = "…"
-    cut = data[: limit - len(ellipsis.encode("utf-8"))]
-    return cut.decode("utf-8", "ignore") + ellipsis
+# 文本辅助已移至 agentbox_worker.tools.text；_renumber 是 app.py 使用的原名。
+_renumber = renumber_citations
 
 
 def _chat_text(res: GatewayResult) -> str:

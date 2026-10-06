@@ -78,6 +78,18 @@ func checkShell(dir string) error {
 // 模板路径不能位于 init 自己建立的挂载点（ReservedPaths）之上或之下。
 type Template struct {
 	Paths []string `json:"paths"`
+
+	// hostRoot 只供本包测试：非空时沙箱路径 p 对应宿主路径 hostRoot+p（在临时目录中构造模板）。
+	// 生产模板为空，沙箱路径即宿主路径。不编码进 JSON，init 看不到它。
+	hostRoot string
+}
+
+// host 返回沙箱路径 p 在宿主上的路径。
+func (t Template) host(p string) string {
+	if t.hostRoot == "" {
+		return p
+	}
+	return filepath.Join(t.hostRoot, p)
 }
 
 // WorkerDir 是 worker 包目录，M1 默认模板包含它。
@@ -111,10 +123,30 @@ func DefaultTemplate() Template {
 	return Template{Paths: paths}
 }
 
-// ResolveTemplate 把模板标识解析为模板。M1 只有默认模板。
+// ExecTemplateName 是 exec 环境的模板标识（Plan 15 D5）。
+const ExecTemplateName = "exec"
+
+// execPython 是 exec 环境的解释器在沙箱内的路径（规格 §10.1，v0.2 只有 python3）。
+const execPython = "/usr/bin/python3"
+
+// ExecTemplate 返回 exec 环境的模板：默认模板去掉 WorkerDir 与 /etc/ssl（exec 无网络、不运行 Worker、不需要 SDK）。
+func ExecTemplate() Template {
+	var paths []string
+	for _, p := range DefaultTemplate().Paths {
+		if p != WorkerDir && p != "/etc/ssl" {
+			paths = append(paths, p)
+		}
+	}
+	return Template{Paths: paths}
+}
+
+// ResolveTemplate 把模板标识解析为模板：默认模板与 exec 模板。
 func ResolveTemplate(name string) (Template, error) {
-	if name == DefaultTemplateName {
+	switch name {
+	case DefaultTemplateName:
 		return DefaultTemplate(), nil
+	case ExecTemplateName:
+		return ExecTemplate(), nil
 	}
 	return Template{}, fmt.Errorf("未知的 rootfs 模板 %q", name)
 }
@@ -150,22 +182,49 @@ func (t Template) Ensure() error {
 		return err
 	}
 	for _, p := range t.Paths {
-		if _, err := os.Lstat(p); err != nil {
+		if _, err := os.Lstat(t.host(p)); err != nil {
 			return fmt.Errorf("模板路径 %s: %w", p, err)
 		}
 	}
-	sh, err := t.resolve("/bin/sh")
-	if err != nil {
-		return fmt.Errorf("模板内的 /bin/sh: %w", err)
+	_, err := t.resolveFile("/bin/sh")
+	return err
+}
+
+// EnsureExec 在 Ensure 之外要求沙箱内的 execPython（/usr/bin/python3）可解析为模板中的普通文件。
+func (t Template) EnsureExec() error {
+	_, err := t.ensureExec()
+	return err
+}
+
+// ensureExec 返回 python3 在沙箱视图中解析出的路径（hostRoot 为空时即宿主真实路径）。
+func (t Template) ensureExec() (string, error) {
+	if err := t.Ensure(); err != nil {
+		return "", err
 	}
-	fi, err := os.Stat(sh)
+	py, err := t.resolveFile(execPython)
 	if err != nil {
-		return fmt.Errorf("模板内的 /bin/sh（%s）: %w", sh, err)
+		return "", err
+	}
+	if fi, err := os.Stat(t.host(py)); err != nil || !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("模板内的 %s（%s）不是普通文件（%v）", execPython, py, err)
+	}
+	return py, nil
+}
+
+// resolveFile 按沙箱视图解析 p，要求结果存在且不是目录；返回解析出的沙箱路径。
+func (t Template) resolveFile(p string) (string, error) {
+	r, err := t.resolve(p)
+	if err != nil {
+		return "", fmt.Errorf("模板内的 %s: %w", p, err)
+	}
+	fi, err := os.Stat(t.host(r))
+	if err != nil {
+		return "", fmt.Errorf("模板内的 %s（%s）: %w", p, r, err)
 	}
 	if fi.IsDir() {
-		return fmt.Errorf("模板内的 /bin/sh（%s）是目录", sh)
+		return "", fmt.Errorf("模板内的 %s（%s）是目录", p, r)
 	}
-	return nil
+	return r, nil
 }
 
 // overlaps 报告 a、b 是否相同或一个位于另一个之下。
@@ -208,7 +267,7 @@ func (t Template) resolve(p string) (string, error) {
 				}
 				return "", fmt.Errorf("%s 不在模板内", next)
 			}
-			fi, err := os.Lstat(next)
+			fi, err := os.Lstat(t.host(next))
 			if err != nil {
 				return "", err
 			}
@@ -216,7 +275,7 @@ func (t Template) resolve(p string) (string, error) {
 				cur = next
 				continue
 			}
-			target, err := os.Readlink(next)
+			target, err := os.Readlink(t.host(next))
 			if err != nil {
 				return "", err
 			}

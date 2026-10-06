@@ -1200,3 +1200,1131 @@ def test_sim_worker_gateway_error_fails_task(fake_gateway, tmp_path, monkeypatch
     code, events = run(sim_app, tmp_path, init={"config": {"steps": steps}})
     assert code == 1
     assert events[-1]["type"] == "error" and events[-1]["code"] == "budget_exhausted"
+
+
+# ---- sub-run：SubrunManager 与 sub-run Gateway 视图（Plan 14 Task 8） ----
+# 宿主由 responder 脚本化：checkpoint 一律 committed，subrun_start 按用例作答；
+# 取消经 subrun_cancel_requested 注入。Worker 事件流再按协商了 subruns 的流规则回放一遍。
+
+from agentfakes import SessionHost
+
+from agentbox_worker import (
+    SubrunCancelled,
+    SubrunGateway,
+    SubrunInfo,
+    SubrunRejected,
+)
+from agentbox_worker.gateway import _Response
+from agentbox_worker.stream import SessionStreamChecker
+
+SUBRUN_INIT = {"extensions": ["subruns"]}
+REF1 = "1" * 64
+REF2 = "2" * 64
+START_ARGS = {"parent_step_id": "plan", "deadline_ms": 600_000}
+
+
+def subrun_host(
+    *,
+    started: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+    on: Responder | None = None,
+) -> Responder:
+    """checkpoint → committed；subrun_start → started(msg) 的答复（None 不答复），缺省 started；
+    on(msg, transport) 在自动作答之后调用，用于注入 subrun_cancel_requested。"""
+
+    def respond(msg: dict[str, Any], transport: MemoryTransport) -> None:
+        checkpoint_reply("committed")(msg, transport)
+        if msg["type"] == "subrun_start":
+            answer = {"status": "started"} if started is None else started(msg)
+            if answer is not None:
+                reply(
+                    transport,
+                    {"type": "subrun_started", "subrun_id": msg["subrun_id"], **answer},
+                )
+        if on is not None:
+            on(msg, transport)
+
+    return respond
+
+
+def cancel_requested(transport: MemoryTransport, subrun_id: str, reason: str = "deadline") -> None:
+    reply(
+        transport,
+        {"type": "subrun_cancel_requested", "subrun_id": subrun_id, "reason": reason},
+    )
+
+
+def check_stream(events: list[dict[str, Any]]) -> None:
+    checker = StreamChecker()
+    checker.negotiate(["subruns"])
+    for event in events:
+        checker.observe(event)
+
+
+def of_type(events: list[dict[str, Any]], typ: str) -> list[dict[str, Any]]:
+    return [e for e in events if e["type"] == typ]
+
+
+def first_of(events: list[dict[str, Any]], typ: str) -> dict[str, Any]:
+    return next(e for e in events if e["type"] == typ)
+
+
+def strip(event: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in event.items() if k not in ("v", "seq", "ts")}
+
+
+async def sleeps_in_subrun(handle) -> str:
+    await asyncio.sleep(10)
+    return "never"
+
+
+@pytest.mark.parametrize(
+    ("extensions", "expected"),
+    [
+        pytest.param(["subruns"], 1, id="requested"),
+        pytest.param(None, None, id="absent"),
+        pytest.param(["other"], None, id="other_extension"),
+    ],
+)
+def test_ready_acknowledges_subruns_only_when_requested(tmp_path, extensions, expected):
+    init = {} if extensions is None else {"extensions": extensions}
+    code, events = run(returns_ok, tmp_path, init=init)
+    assert code == 0
+    assert events[0]["type"] == "ready" and events[0].get("subruns") == expected
+
+
+@pytest.mark.parametrize("requested", [True, False])
+def test_session_ready_acknowledges_subruns_only_when_requested(requested):
+    host = SessionHost()
+    if requested:
+        host.init["extensions"] = ["subruns"]
+    host.close_when_idle()
+    code, events = host.run(returns_ok)
+    assert code == 0
+    assert events[0]["type"] == "ready"
+    assert events[0].get("subruns") == (1 if requested else None)
+
+
+def test_start_sends_subrun_start_and_blocks_until_started(tmp_path):
+    holder: dict[str, Any] = {}
+    seen: dict[str, Any] = {}
+
+    def on(msg, transport):
+        holder["transport"] = transport
+
+    async def app(ctx):
+        task = asyncio.create_task(ctx.subruns.start("st1", **START_ARGS, budget_cap_micro=5000))
+        await asyncio.sleep(0.02)  # 短于 ack_timeout：宿主尚未答复
+        seen["blocked"] = not task.done()
+        started = {"type": "subrun_started", "subrun_id": "st1", "status": "started"}
+        reply(holder["transport"], started)
+        handle = await task
+        seen["id"] = handle.subrun_id
+        seen["cancelled"] = handle.cancelled()
+        return Result("ok")
+
+    responder = subrun_host(started=lambda m: None, on=on)
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=responder)
+    assert code == 0, events
+    assert seen == {"blocked": True, "id": "st1", "cancelled": False}
+    assert strip(of_type(events, "subrun_start")[0]) == {
+        "type": "subrun_start",
+        "subrun_id": "st1",
+        "parent_step_id": "plan",
+        "deadline_ms": 600_000,
+        "budget_cap_micro": 5000,
+    }
+    check_stream(events)
+
+
+def test_start_without_cap_omits_budget_cap(tmp_path):
+    async def app(ctx):
+        await ctx.subruns.start("st1", **START_ARGS)
+        return Result("ok")
+
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=subrun_host())
+    assert code == 0
+    assert "budget_cap_micro" not in of_type(events, "subrun_start")[0]
+
+
+@pytest.mark.parametrize(
+    "reject_code", ["subrun_limit", "conflict", "subrun_closed", "invalid_field"]
+)
+def test_rejected_start_raises_subrun_rejected(tmp_path, reject_code):
+    async def app(ctx):
+        try:
+            await ctx.subruns.start("st1", **START_ARGS)
+        except SubrunRejected as exc:
+            assert isinstance(exc, WorkerFailure)
+            return Result(f"rejected:{exc.code}")
+        return Result("started")
+
+    responder = subrun_host(started=lambda m: {"status": "rejected", "code": reject_code})
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=responder)
+    assert code == 0
+    assert events[-1]["summary"] == f"rejected:{reject_code}"
+    assert len(of_type(events, "subrun_start")) == 1
+
+
+def test_retryable_rejection_resends_same_definition(tmp_path):
+    answers = [{"status": "rejected", "code": "retryable_error"}, {"status": "started"}]
+
+    async def app(ctx):
+        await ctx.subruns.start("st1", **START_ARGS)
+        return Result("ok")
+
+    responder = subrun_host(started=lambda m: answers.pop(0))
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=responder)
+    assert code == 0, events
+    starts = [strip(e) for e in of_type(events, "subrun_start")]
+    assert len(starts) == 2 and starts[0] == starts[1]
+
+
+def test_unanswered_start_is_resent_then_unresolved(tmp_path):
+    async def app(ctx):
+        await ctx.subruns.start("st1", **START_ARGS)
+        return Result("ok")
+
+    responder = subrun_host(started=lambda m: None)
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=responder)
+    assert code == 1
+    starts = of_type(events, "subrun_start")
+    assert len(starts) == FAST.max_ack_attempts + 1
+    assert len({json.dumps(strip(s), sort_keys=True) for s in starts}) == 1
+    assert events[-1]["type"] == "error" and events[-1]["code"] == "subrun_unresolved"
+    assert events[-1]["retryable"] is True
+
+
+def test_start_without_negotiation_fails_locally(tmp_path):
+    async def app(ctx):
+        await ctx.subruns.start("st1", **START_ARGS)
+        return Result("ok")
+
+    code, events = run(app, tmp_path, responder=subrun_host())
+    assert code == 1
+    assert types(events) == ["ready", "error"]
+    assert events[-1]["code"] == "subruns_not_negotiated"
+
+
+@pytest.mark.parametrize(
+    ("subrun_id", "args"),
+    [
+        pytest.param("root", START_ARGS, id="root_id"),
+        pytest.param("ST1", START_ARGS, id="bad_id"),
+        pytest.param("st1", {"parent_step_id": "", "deadline_ms": 1}, id="empty_parent"),
+        pytest.param("st1", {"parent_step_id": "p" * 257, "deadline_ms": 1}, id="long_parent"),
+        pytest.param("st1", {"parent_step_id": "p", "deadline_ms": 0}, id="zero_deadline"),
+        pytest.param("st1", {"parent_step_id": "p", "deadline_ms": 3_600_001}, id="long_deadline"),
+        pytest.param("st1", {**START_ARGS, "budget_cap_micro": -1}, id="negative_cap"),
+    ],
+)
+def test_invalid_start_is_rejected_locally(tmp_path, subrun_id, args):
+    async def app(ctx):
+        try:
+            await ctx.subruns.start(subrun_id, **args)
+        except SubrunRejected as exc:
+            return Result(exc.code)
+        return Result("started")
+
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=subrun_host())
+    assert code == 0
+    assert events[-1]["summary"] == "invalid_field"
+    assert of_type(events, "subrun_start") == []
+
+
+def test_fifth_logical_subrun_is_rejected_locally(tmp_path):
+    async def app(ctx):
+        for n in range(1, 5):
+            await ctx.subruns.start(f"st{n}", **START_ARGS)
+        try:
+            await ctx.subruns.start("st5", **START_ARGS)
+        except SubrunRejected as exc:
+            return Result(exc.code)
+        return Result("started")
+
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=subrun_host())
+    assert code == 0
+    assert events[-1]["summary"] == "subrun_limit"
+    assert [e["subrun_id"] for e in of_type(events, "subrun_start")] == ["st1", "st2", "st3", "st4"]
+
+
+def recording_send(recorded: list[tuple[str, dict[str, str]]]):
+    def _send(self, method, path, payload, headers, **_):  # exec 另传 timeout_s
+        recorded.append((path, dict(headers)))
+        return _Response(200, {}, b"{}")
+
+    return _send
+
+
+def test_subrun_gateway_tags_requests_and_continues_call_ids(tmp_path, monkeypatch):
+    recorded: list[tuple[str, dict[str, str]]] = []
+    monkeypatch.setattr(GatewayClient, "_send", recording_send(recorded))
+    monkeypatch.setenv(GATEWAY_SOCKET_ENV, "/tmp/x.sock")
+    resume = {
+        "checkpoint_id": "cp-0",
+        "step_id": "s0",
+        "state": {"_agentbox": {"call_ids": {"st1/s1/search": 2}}},
+        "refs": [],
+        "subruns": [{"subrun_id": "st1", "status": "started"}],
+    }
+    seen: dict[str, Any] = {}
+
+    async def app(ctx):
+        st1 = await ctx.subruns.start("st1", **START_ARGS)
+        st2 = await ctx.subruns.start("st2", **START_ARGS)
+        for gateway in (st1.gateway, st2.gateway, st1.gateway, ctx.gateway):
+            await asyncio.to_thread(gateway.search, "s1", "q")
+        await asyncio.to_thread(st1.gateway.budget)
+        seen["no_recursion"] = not any(
+            hasattr(st1.gateway, name) for name in ("start_subrun", "for_subrun", "subruns")
+        )
+        try:
+            st1.gateway.retry("s1", "search", "st2/s1/search/1", {})
+        except ValueError:
+            seen["foreign_retry"] = "refused"
+        await ctx.checkpoint("s2", state={})
+        return Result("ok")
+
+    init = {**SUBRUN_INIT, "resume": resume}
+    code, events = run(app, tmp_path, init=init, responder=subrun_host())
+    assert code == 0, events
+    assert seen == {"no_recursion": True, "foreign_retry": "refused"}
+    calls = [(h.get("X-Agentbox-Call-Id"), h.get("X-Agentbox-Subrun")) for _, h in recorded]
+    assert calls == [
+        ("st1/s1/search/3", "st1"),  # 随 checkpoint 恢复续号
+        ("st2/s1/search/1", "st2"),  # 两个 sub-run 的计数相互独立
+        ("st1/s1/search/4", "st1"),
+        ("root/s1/search/1", None),  # root 请求不带 sub-run 头
+        (None, "st1"),  # 只读端点同样带归属头
+    ]
+    checkpoint = of_type(events, "checkpoint")[0]
+    assert checkpoint["state"]["_agentbox"]["call_ids"] == {
+        "st1/s1/search": 4,
+        "st2/s1/search": 1,
+        "root/s1/search": 1,
+    }
+    assert checkpoint["subruns"] == [
+        {"subrun_id": "st1", "status": "started"},
+        {"subrun_id": "st2", "status": "started"},
+    ]
+    check_stream(events)
+
+
+def test_subrun_gateway_limits_in_flight_calls_to_two(monkeypatch):
+    lock = threading.Lock()
+    state = {"now": 0, "max": 0}
+    release = threading.Event()
+
+    def _send(self, method, path, payload, headers):
+        with lock:
+            state["now"] += 1
+            state["max"] = max(state["max"], state["now"])
+        release.wait(5)
+        with lock:
+            state["now"] -= 1
+        return _Response(200, {}, b"{}")
+
+    monkeypatch.setattr(GatewayClient, "_send", _send)
+    gateway = SubrunGateway("/x.sock", call_ids=CallIds(), subrun_id="st1", timeout_s=5)
+    threads = [threading.Thread(target=gateway.search, args=("s", f"q{i}")) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + 2
+    while state["now"] < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.1)  # 若没有上限，第三、四个请求会在这段时间内进入
+    assert state["now"] == 2
+    release.set()
+    for thread in threads:
+        thread.join(5)
+    assert state["max"] == 2
+
+
+def test_subrun_gateway_rejects_invalid_id():
+    for bad in ("root", "", "A", "x" * 33):
+        with pytest.raises(ValueError):
+            SubrunGateway("/x.sock", call_ids=CallIds(), subrun_id=bad, timeout_s=5)
+
+
+def test_cancel_requested_cancels_body_and_ends_cancelled(tmp_path, monkeypatch):
+    recorded: list[tuple[str, dict[str, str]]] = []
+    monkeypatch.setattr(GatewayClient, "_send", recording_send(recorded))
+    seen: dict[str, Any] = {}
+
+    def on(msg, transport):
+        if msg["type"] == "progress" and msg.get("subrun_id") == "st1":
+            cancel_requested(transport, "st1", "deadline")
+
+    async def body(handle):
+        await handle.progress("tool_call", "searching")
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            seen["body_cancelled"] = True
+            raise
+
+    async def app(ctx):
+        handle = await ctx.subruns.start("st1", **START_ARGS)
+        try:
+            await ctx.subruns.run(handle, body)
+        except SubrunCancelled as exc:
+            seen["reason"] = (exc.subrun_id, exc.reason)
+        seen["cancelled"] = handle.cancelled()
+        try:
+            handle.gateway.search("s1", "late")
+        except GatewayError as exc:
+            seen["late_call"] = exc.code
+        await ctx.checkpoint("after", state={})
+        return Result("ok")
+
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=subrun_host(on=on))
+    assert code == 0, events
+    assert seen == {
+        "body_cancelled": True,
+        "reason": ("st1", "deadline"),
+        "cancelled": True,
+        "late_call": "subrun_closed",
+    }
+    assert recorded == []  # 已关闭的视图不再发出请求
+    progress = of_type(events, "progress")[0]
+    assert progress["subrun_id"] == "st1" and progress["kind"] == "tool_call"
+    (end,) = of_type(events, "subrun_end")
+    assert end["subrun_id"] == "st1" and end["status"] == "cancelled"
+    assert of_type(events, "checkpoint")[0]["subruns"] == [
+        {"subrun_id": "st1", "status": "cancelled"}
+    ]
+    result = events[-1]
+    assert result["type"] == "result"
+    assert [(e["id"], e["status"]) for e in result["subruns"]] == [("st1", "timed_out")]
+    check_stream(events)
+
+
+def test_cancel_requested_racing_completion_still_ends_cancelled(tmp_path):
+    def on(msg, transport):
+        if msg["type"] == "subrun_end" and msg["status"] == "succeeded":
+            cancel_requested(transport, "st1", "deadline")  # 宿主已置 cancel_requested
+
+    async def app(ctx):
+        handle = await ctx.subruns.start("st1", **START_ARGS)
+        value = await ctx.subruns.run(handle, lambda h: asyncio.sleep(0, result="found"))
+        await ctx.subruns.complete(handle, summary=value, result_ref=REF1)
+        await asyncio.sleep(0.05)  # 让控制循环处理 subrun_cancel_requested
+        await ctx.checkpoint("after", state={})
+        return Result("ok")
+
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=subrun_host(on=on))
+    assert code == 0, events
+    assert [e["status"] for e in of_type(events, "subrun_end")] == ["succeeded", "cancelled"]
+    assert of_type(events, "checkpoint")[0]["subruns"] == [
+        {"subrun_id": "st1", "status": "cancelled"}
+    ]  # 不再宣称 completed（否则 E41 invalid_transition）
+    assert [(e["id"], e["status"]) for e in events[-1]["subruns"]] == [("st1", "timed_out")]
+    check_stream(events)
+
+
+def test_cancel_requested_between_run_and_complete(tmp_path):
+    def on(msg, transport):
+        if msg["type"] == "progress" and msg["kind"] == "between":
+            cancel_requested(transport, "st1", "deadline")
+
+    async def app(ctx):
+        handle = await ctx.subruns.start("st1", **START_ARGS)
+        await ctx.subruns.run(handle, lambda h: asyncio.sleep(0, result="x"))
+        await ctx.progress("between", "body finished")
+        await asyncio.sleep(0.05)
+        try:
+            await ctx.subruns.complete(handle, summary="x", result_ref=REF1)
+        except SubrunCancelled:
+            return Result("cancelled-before-complete")
+        return Result("completed")
+
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=subrun_host(on=on))
+    assert code == 0, events
+    assert events[-1]["summary"] == "cancelled-before-complete"
+    assert [e["status"] for e in of_type(events, "subrun_end")] == ["cancelled"]
+    check_stream(events)
+
+
+def test_cancel_requested_without_running_body_ends_before_result(tmp_path):
+    def on(msg, transport):
+        if msg["type"] == "progress" and msg["kind"] == "idle":
+            cancel_requested(transport, "st1", "deadline")
+
+    async def app(ctx):
+        await ctx.subruns.start("st1", **START_ARGS)
+        await ctx.progress("idle", "not running any body")
+        await asyncio.sleep(0.05)
+        return Result("ok")  # 结束前 SDK 仍须先发 subrun_end{cancelled}
+
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=subrun_host(on=on))
+    assert code == 0, events
+    assert types(events)[-2:] == ["subrun_end", "result"]
+    assert events[-2]["status"] == "cancelled"
+    check_stream(events)
+
+
+def test_orchestrator_cancel_sends_cancel_then_end(tmp_path):
+    async def app(ctx):
+        handle = await ctx.subruns.start("st1", **START_ARGS)
+        task = asyncio.create_task(ctx.subruns.run(handle, sleeps_in_subrun))
+        await asyncio.sleep(0.01)
+        await ctx.subruns.cancel(handle, reason="enough_evidence")
+        try:
+            await task
+        except SubrunCancelled as exc:
+            return Result(f"cancelled:{exc.reason}")
+        return Result("not cancelled")
+
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=subrun_host())
+    assert code == 0, events
+    assert events[-1]["summary"] == "cancelled:enough_evidence"
+    assert [strip(e) for e in events if e["type"] in ("subrun_cancel", "subrun_end")] == [
+        {"type": "subrun_cancel", "subrun_id": "st1", "reason": "enough_evidence"},
+        {
+            "type": "subrun_end",
+            "subrun_id": "st1",
+            "status": "cancelled",
+            "summary": "cancelled: enough_evidence",
+        },
+    ]
+    assert [(e["id"], e["status"]) for e in events[-1]["subruns"]] == [("st1", "cancelled")]
+    check_stream(events)
+
+
+def test_concurrent_completions_are_both_in_next_checkpoint(tmp_path):
+    async def app(ctx):
+        handles = [await ctx.subruns.start(sid, **START_ARGS) for sid in ("st1", "st2")]
+
+        async def one(handle, ref):
+            value = await ctx.subruns.run(handle, lambda h: asyncio.sleep(0, result=h.subrun_id))
+            await ctx.subruns.complete(handle, summary=f"{value} done", result_ref=ref)
+
+        await asyncio.gather(one(handles[0], REF1), one(handles[1], REF2))
+        await ctx.checkpoint("merge", state={"n": 1})
+        return Result("ok")
+
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=subrun_host())
+    assert code == 0, events
+    assert of_type(events, "checkpoint")[0]["subruns"] == [
+        {"subrun_id": "st1", "status": "completed", "result_ref": REF1},
+        {"subrun_id": "st2", "status": "completed", "result_ref": REF2},
+    ]
+    assert events[-1]["subruns"] == [
+        {"id": "st1", "status": "completed", "summary": "st1 done"},
+        {"id": "st2", "status": "completed", "summary": "st2 done"},
+    ]
+    assert [e["status"] for e in of_type(events, "subrun_end")] == ["succeeded", "succeeded"]
+    check_stream(events)
+
+
+def test_queued_checkpoint_snapshots_subruns_and_call_ids_with_its_state(tmp_path):
+    """§5.5 规则 4：subruns[] 与 call id 计数器须与 state 同一时刻生成。另一个提交在途时排队的
+    checkpoint，其 state 在调用时已定；排队期间 sub-run 完成、发起新调用，都不得进入它——否则
+    恢复时宿主说 completed 而 state 里该 sub-run 仍在进行（结果被当作不可读），或计数器越过了
+    state 里没有的调用（恢复后以新 id 重发）。"""
+    held: dict[str, Any] = {}
+    sent = asyncio.Event()
+    respond_subruns = subrun_host()
+
+    def respond(msg, transport):
+        if msg["type"] in ("checkpoint", "checkpoint_query") and msg["checkpoint_id"] == "cp-1":
+            held["transport"] = transport  # 第一个提交保持在途，直到应用放行
+            sent.set()
+            return
+        respond_subruns(msg, transport)
+
+    async def app(ctx):
+        handle = await ctx.subruns.start("st1", **START_ARGS)
+        first = asyncio.create_task(ctx.checkpoint("a", state={"n": 1}))
+        await sent.wait()
+        queued = asyncio.create_task(ctx.checkpoint("b", state={"n": 2}))
+        await asyncio.sleep(0)  # queued 已调用 checkpoint 并在等待在途提交
+        ctx.gateway.call_ids.next("s1", "chat")
+        await ctx.subruns.run(handle, lambda h: asyncio.sleep(0))
+        await ctx.subruns.complete(handle, summary="done", result_ref=REF1)
+        release = {"type": "checkpoint", "checkpoint_id": "cp-1"}
+        checkpoint_reply("committed")(release, held["transport"])
+        await first
+        await queued
+        await ctx.checkpoint("c", state={"n": 3})
+        return Result("ok")
+
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=respond)
+    assert code == 0, events
+    cps = {e["step_id"]: e for e in of_type(events, "checkpoint")}
+    assert cps["b"]["state"] == {"n": 2}  # 计数器在调用时尚无调用
+    assert cps["b"]["subruns"] == [{"subrun_id": "st1", "status": "started"}]
+    assert cps["c"]["state"] == {"n": 3, "_agentbox": {"call_ids": {"root/s1/chat": 1}}}
+    assert cps["c"]["subruns"] == [{"subrun_id": "st1", "status": "completed", "result_ref": REF1}]
+    check_stream(events)
+
+
+def test_failed_subrun_cannot_restart_in_same_turn(tmp_path):
+    async def app(ctx):
+        handle = await ctx.subruns.start("st1", **START_ARGS)
+        await ctx.subruns.fail(handle, summary="搜索全部失败")
+        try:
+            await ctx.subruns.start("st1", **START_ARGS)
+        except SubrunRejected as exc:
+            return Result(exc.code)
+        return Result("restarted")
+
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=subrun_host())
+    assert code == 0
+    assert events[-1]["summary"] == "subrun_closed"
+    assert len(of_type(events, "subrun_start")) == 1
+    (end,) = of_type(events, "subrun_end")
+    assert (end["status"], end["summary"]) == ("failed", "搜索全部失败")
+    assert events[-1]["subruns"] == [{"id": "st1", "status": "failed", "summary": "搜索全部失败"}]
+
+
+def test_resumed_subruns_are_visible_and_terminal_ones_closed(tmp_path):
+    resume = {
+        "checkpoint_id": "cp-0",
+        "step_id": "s0",
+        "state": {},
+        "refs": [],
+        "subruns": [
+            {"subrun_id": "st1", "status": "completed", "result_ref": REF1},
+            {"subrun_id": "st2", "status": "started"},
+            {"subrun_id": "st3", "status": "timed_out"},
+        ],
+    }
+    seen: dict[str, Any] = {}
+
+    async def app(ctx):
+        seen["resumed"] = ctx.subruns.resumed()
+        for sid in ("st1", "st3"):
+            try:
+                await ctx.subruns.start(sid, **START_ARGS)
+            except SubrunRejected as exc:
+                seen[sid] = exc.code
+        await ctx.subruns.start("st2", **START_ARGS)  # 恢复后须重发 subrun_start
+        await ctx.checkpoint("s1", state={})
+        return Result("ok")
+
+    init = {**SUBRUN_INIT, "resume": resume}
+    code, events = run(app, tmp_path, init=init, responder=subrun_host())
+    assert code == 0, events
+    assert seen == {
+        "resumed": {
+            "st1": SubrunInfo("st1", "completed", REF1),
+            "st2": SubrunInfo("st2", "started", None),
+            "st3": SubrunInfo("st3", "timed_out", None),
+        },
+        "st1": "subrun_closed",
+        "st3": "subrun_closed",
+    }
+    assert [e["subrun_id"] for e in of_type(events, "subrun_start")] == ["st2"]
+    assert of_type(events, "checkpoint")[0]["subruns"] == [
+        {"subrun_id": "st1", "status": "completed", "result_ref": REF1},
+        {"subrun_id": "st2", "status": "started"},
+        {"subrun_id": "st3", "status": "cancelled"},  # checkpoint 无 timed_out；宿主保持 timed_out
+    ]
+    assert [(e["id"], e["status"]) for e in events[-1]["subruns"]] == [
+        ("st1", "completed"),
+        ("st2", "started"),
+        ("st3", "timed_out"),
+    ]
+    check_stream(events)
+
+
+def test_checkpoint_and_result_omit_subruns_when_none(tmp_path):
+    async def app(ctx):
+        await ctx.checkpoint("s1", state={})
+        return Result("ok")
+
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=subrun_host())
+    assert code == 0
+    assert "subruns" not in of_type(events, "checkpoint")[0]
+    assert "subruns" not in events[-1]
+
+
+@pytest.mark.parametrize(
+    ("init", "message"),
+    [
+        pytest.param(
+            {},
+            {"type": "subrun_started", "subrun_id": "st1", "status": "started"},
+            id="not_negotiated",
+        ),
+        pytest.param(
+            SUBRUN_INIT,
+            {"type": "subrun_cancel_requested", "subrun_id": "st9", "reason": "deadline"},
+            id="unknown_subrun",
+        ),
+    ],
+)
+def test_unexpected_subrun_control_is_protocol_error(tmp_path, init, message):
+    line = json.dumps({"v": 1, **message}).encode()
+    code, events = run(sleeps, tmp_path, init=init, host_lines=[line])
+    assert code == 1
+    assert events[-1]["type"] == "error" and events[-1]["code"] == "control_protocol_error"
+
+
+def test_session_mode_subrun_flow():
+    def on_event(event, host):
+        if event["type"] == "subrun_start":
+            started = {"subrun_id": event["subrun_id"], "status": "started"}
+            host.send({"type": "subrun_started", "v": 1, **started})
+        if event["type"] == "progress" and event.get("subrun_id") == "st2":
+            cancel = {"subrun_id": "st2", "reason": "deadline"}
+            host.send({"type": "subrun_cancel_requested", "v": 1, **cancel})
+
+    host = SessionHost(on_event=on_event)
+    host.init["extensions"] = ["subruns"]
+    host.start_task("t-1", "a-1")
+    host.close_when_idle()
+
+    async def body(handle):
+        await handle.progress("tool_call", "working")
+        await asyncio.sleep(10)
+
+    async def app(ctx):
+        st1 = await ctx.subruns.start("st1", **START_ARGS)
+        st2 = await ctx.subruns.start("st2", **START_ARGS)
+        await ctx.subruns.run(st1, lambda h: asyncio.sleep(0))
+        await ctx.subruns.complete(st1, summary="done", result_ref=REF1)
+        try:
+            await ctx.subruns.run(st2, body)
+        except SubrunCancelled:
+            pass
+        await ctx.checkpoint("merge", state={})
+        return Result("ok")
+
+    code, events = host.run(app)
+    assert code == 0, events
+    subrun_events = [e for e in events if e["type"].startswith("subrun_")]
+    assert all(e["attempt_id"] == "a-1" for e in subrun_events)
+    assert [(e["type"], e["subrun_id"], e.get("status")) for e in subrun_events] == [
+        ("subrun_start", "st1", None),
+        ("subrun_start", "st2", None),
+        ("subrun_end", "st1", "succeeded"),
+        ("subrun_end", "st2", "cancelled"),
+    ]
+    assert first_of(events, "checkpoint")["subruns"] == [
+        {"subrun_id": "st1", "status": "completed", "result_ref": REF1},
+        {"subrun_id": "st2", "status": "cancelled"},
+    ]
+    assert [(e["id"], e["status"]) for e in first_of(events, "result")["subruns"]] == [
+        ("st1", "completed"),
+        ("st2", "timed_out"),
+    ]
+    checker = SessionStreamChecker()
+    for side, msg in host.transcript:
+        if side == "host":
+            checker.host_sent(msg)
+        else:
+            checker.observe(msg)
+
+
+def test_subrun_gateway_over_unix_socket(fake_gateway, tmp_path, monkeypatch):
+    monkeypatch.setenv(GATEWAY_SOCKET_ENV, fake_gateway.socket_path)
+    messages = [{"role": "user", "content": "hi"}]
+
+    async def app(ctx):
+        handle = await ctx.subruns.start("st1", **START_ARGS)
+        await asyncio.to_thread(handle.gateway.chat, "s1", messages)
+        await asyncio.to_thread(ctx.gateway.chat, "s1", messages)
+        return Result("ok")
+
+    code, events = run(app, tmp_path, init=SUBRUN_INIT, responder=subrun_host())
+    assert code == 0, events
+    sub, root = fake_gateway.requests
+    assert sub.headers["x-agentbox-subrun"] == "st1"
+    assert sub.headers["x-agentbox-call-id"] == "st1/s1/chat/1"
+    assert "x-agentbox-subrun" not in root.headers
+    assert root.headers["x-agentbox-call-id"] == "root/s1/chat/1"
+
+
+# ---- exec：GatewayClient.exec() → POST /v1/exec（规格 §10；Plan 15 Task 9） ----
+
+from agentbox_worker.gateway import (
+    EXEC_DEFAULT_WALL_MS,
+    EXEC_QUEUE_TIMEOUT_S,
+    exec_timeout_s,
+)
+
+EXEC_RESULT = {"status": "completed", "exit_code": 0, "stdout": "1\n", "stderr": ""}
+
+
+def exec_gateway(gw: FakeGateway) -> None:
+    """fake Gateway 的 /v1/exec：返回固定结果与结果 blob（同一 call id 再次到达时带重放头）。"""
+    seen: set[str] = set()
+    sha = gw.put_blob(json.dumps(EXEC_RESULT).encode())
+
+    def intercept(req):
+        if req.path != "/v1/exec":
+            return None
+        call_id = req.headers.get("x-agentbox-call-id", "")
+        headers = {"X-Agentbox-Blob": sha}
+        if call_id in seen:
+            headers["X-Agentbox-Replayed"] = "true"
+        seen.add(call_id)
+        return Reply(200, EXEC_RESULT, headers)
+
+    gw.interceptor = intercept
+
+
+def test_exec_sends_body_headers_and_call_ids(fake_gateway):
+    exec_gateway(fake_gateway)
+    gw = client(fake_gateway)
+    first = gw.exec("analyze", "print(1)")
+    inputs = [("a" * 64, "data/a.csv"), ("b" * 64, "b.txt")]
+    second = gw.exec("analyze", "print(2)", inputs=inputs, wall_ms=1500, memory_bytes=1 << 20)
+    third = gw.exec("analyze", "print(1)", retry=True)
+    got = [
+        (r.method, r.path, r.headers.get("x-agentbox-call-id"), r.json())
+        for r in fake_gateway.requests
+    ]
+    assert got == [
+        ("POST", "/v1/exec", "root/analyze/exec/1", {"language": "python3", "code": "print(1)"}),
+        (
+            "POST",
+            "/v1/exec",
+            "root/analyze/exec/2",
+            {
+                "language": "python3",
+                "code": "print(2)",
+                "inputs": [
+                    {"sha256": "a" * 64, "path": "data/a.csv"},
+                    {"sha256": "b" * 64, "path": "b.txt"},
+                ],
+                "limits": {"wall_ms": 1500, "memory_bytes": 1 << 20},
+            },
+        ),
+        ("POST", "/v1/exec", "root/analyze/exec/3", {"language": "python3", "code": "print(1)"}),
+    ]
+    retry_headers = [r.headers.get("x-agentbox-retry") for r in fake_gateway.requests]
+    assert retry_headers == [None, None, "true"]
+    for r in fake_gateway.requests:
+        assert r.headers["content-type"] == "application/json"
+        assert not {"x-agentbox-cache", "x-agentbox-supersedes", "x-agentbox-subrun"} & set(
+            r.headers
+        )
+    assert first.body == EXEC_RESULT and first.status == 200 and first.replayed is False
+    assert first.blob_sha256 == second.blob_sha256 and first.call_id == "root/analyze/exec/1"
+    assert third.call_id == "root/analyze/exec/3"
+
+
+def test_exec_call_ids_continue_after_checkpoint_restore(fake_gateway):
+    exec_gateway(fake_gateway)
+    ids = CallIds()
+    gw = client(fake_gateway, ids)
+    gw.exec("s1", "x = 1")
+    gw.exec("s1", "x = 2")
+    snap = json.loads(json.dumps(ids.snapshot()))  # 如同经 checkpoint 往返
+    assert snap == {"root/s1/exec": 2}
+    resumed = client(fake_gateway, CallIds.restore(snap))
+    assert resumed.exec("s1", "x = 3").call_id == "root/s1/exec/3"
+    # 恢复后重做同一步（快照早于该步）得到同一 call id；retry=True 允许重跑已取消的 exec
+    replay = client(fake_gateway, CallIds.restore({"root/s1/exec": 1}))
+    res = replay.exec("s1", "x = 2", retry=True)
+    assert res.call_id == "root/s1/exec/2" and res.replayed is True
+    assert fake_gateway.requests[-1].headers["x-agentbox-retry"] == "true"
+
+
+@pytest.mark.parametrize(
+    ("reply", "exc_type"),
+    [
+        (error_reply(402, "exec_quota_exhausted"), BudgetExhausted),
+        (error_reply(402, "exec_cpu_exhausted"), BudgetExhausted),
+        (error_reply(402, "exec_blocked"), BudgetExhausted),
+        # 输入未授权是请求参数问题，不是访问撤销：不得映射为 AccessRevoked（应用据它终止）
+        (error_reply(403, "input_not_authorized"), GatewayError),
+        (error_reply(403, "access_revoked"), AccessRevoked),
+        (error_reply(409, "exec_cancelled"), GatewayError),
+        (error_reply(409, "fingerprint_mismatch"), CallDivergence),
+        (error_reply(502, "exec_start_failed"), GatewayError),
+        (error_reply(502, "exec_unknown"), GatewayError),
+        (error_reply(503, "exec_env_unavailable"), GatewayError),
+        (error_reply(504, "exec_queue_timeout"), CallDeadlineExceeded),
+        (error_reply(504, "call_deadline_exceeded"), CallDeadlineExceeded),
+        (error_reply(400, "unsupported_field"), GatewayError),
+    ],
+    ids=lambda v: v.body["error"]["code"] if isinstance(v, Reply) else None,
+)
+def test_exec_errors_map_to_typed_exceptions(fake_gateway, reply, exc_type):
+    fake_gateway.replies.append(reply)
+    with pytest.raises(GatewayError) as caught:
+        client(fake_gateway).exec("s1", "print(1)")
+    assert type(caught.value) is exc_type
+    assert (caught.value.status, caught.value.code) == (reply.status, reply.body["error"]["code"])
+    assert len(fake_gateway.requests) == 1
+
+
+def test_exec_call_in_progress_is_retried_with_same_id(fake_gateway):
+    exec_gateway(fake_gateway)
+    fake_gateway.replies += [error_reply(409, "call_in_progress")] * 2
+    res = client(fake_gateway).exec("s1", "print(1)")
+    assert res.body == EXEC_RESULT
+    assert [r.headers["x-agentbox-call-id"] for r in fake_gateway.requests] == [
+        "root/s1/exec/1"
+    ] * 3
+
+
+def test_exec_timeout_covers_queue_wall_and_grace(monkeypatch):
+    # 调用期限 = 排队上限 + 生效 wall + 30 s（§9.7）；客户端再加余量，且不短于普通调用的超时
+    assert exec_timeout_s(None) == exec_timeout_s(EXEC_DEFAULT_WALL_MS)
+    assert exec_timeout_s(300_000) > EXEC_QUEUE_TIMEOUT_S + 300 + 30
+    seen: list[float | None] = []
+
+    def _send(self, method, path, payload, headers, *, timeout_s=None):
+        seen.append(timeout_s)
+        return _Response(200, {}, b"{}")
+
+    monkeypatch.setattr(GatewayClient, "_send", _send)
+    gw = GatewayClient("/x.sock", call_ids=CallIds(), timeout_s=5)
+    gw.exec("s", "pass", wall_ms=300_000)
+    gw.exec("s", "pass")
+    big = GatewayClient("/x.sock", call_ids=CallIds(), timeout_s=10_000)
+    big.exec("s", "pass")
+    assert seen == [exec_timeout_s(300_000), exec_timeout_s(None), 10_000]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"code": b"print(1)"},
+        {"inputs": [("a" * 64,)]},
+        {"inputs": [("a" * 64, 1)]},
+        {"wall_ms": 0},
+        {"memory_bytes": True},
+    ],
+)
+def test_exec_rejects_malformed_arguments_locally(kwargs):
+    gw = GatewayClient("/x.sock", call_ids=CallIds(), timeout_s=5)
+    args = {"code": "print(1)", **kwargs}
+    with pytest.raises((TypeError, ValueError)):
+        gw.exec("s", args.pop("code"), **args)
+    assert gw.call_ids.snapshot() == {}  # 本地拒绝不占号
+
+
+def test_subrun_gateway_exec_is_tagged(monkeypatch):
+    recorded: list[tuple[str, dict[str, str]]] = []
+    monkeypatch.setattr(GatewayClient, "_send", recording_send(recorded))
+    gw = SubrunGateway("/x.sock", call_ids=CallIds(), subrun_id="st1", timeout_s=5)
+    gw.exec("s1", "print(1)")
+    ((path, headers),) = recorded
+    assert path == "/v1/exec"
+    assert headers["X-Agentbox-Call-Id"] == "st1/s1/exec/1"
+    assert headers["X-Agentbox-Subrun"] == "st1"
+
+
+# ---- sim-worker 的 exec 操作（Plan 15 Task 11；e2e 用） ----
+
+
+def sim_exec_gateway(gw: FakeGateway, status: str) -> tuple[str, str]:
+    """/v1/exec 返回带一个输出文件的结果；返回 (结果 blob sha, 输出 sha)。"""
+    out_sha = gw.put_blob(b"1,2,3\n")
+    result = {
+        "status": status,
+        "exit": {"code": 0, "signal": 0},
+        "stdout": "",
+        "stderr": "",
+        "outputs": [{"path": "r.csv", "sha256": out_sha, "size": 6}],
+        "skipped_outputs": [],
+    }
+    sha = gw.put_blob(json.dumps(result).encode())
+
+    def intercept(req):
+        if req.path != "/v1/exec":
+            return None
+        return Reply(200, result, {"X-Agentbox-Blob": sha})
+
+    gw.interceptor = intercept
+    return sha, out_sha
+
+
+def test_sim_worker_exec_op_sends_request_and_puts_result_and_outputs_into_refs(
+    fake_gateway, tmp_path, monkeypatch
+):
+    monkeypatch.setenv(GATEWAY_SOCKET_ENV, fake_gateway.socket_path)
+    result_sha, out_sha = sim_exec_gateway(fake_gateway, "completed")
+    in_sha = "c" * 64
+    steps = [
+        {
+            "op": "exec",
+            "step_id": "s1",
+            "code": "print(1)",
+            "inputs": [[in_sha, "data/in.csv"]],
+            "wall_ms": 2000,
+            "expect_status": "completed",
+        },
+        {"op": "checkpoint", "step_id": "s1"},
+        {"op": "exec", "step_id": "s1", "code": "print(2)"},  # 无 expect_status：不检查
+        {"op": "checkpoint", "step_id": "s2"},
+    ]
+    code, events = run(
+        sim_app,
+        tmp_path,
+        init={"config": {"steps": steps}},
+        responder=checkpoint_reply("committed"),
+    )
+    assert code == 0 and events[-1]["type"] == "result", events
+    first, second = fake_gateway.requests
+    assert first.path == "/v1/exec" and first.headers["x-agentbox-call-id"] == "root/s1/exec/1"
+    assert first.json() == {
+        "language": "python3",
+        "code": "print(1)",
+        "inputs": [{"sha256": in_sha, "path": "data/in.csv"}],
+        "limits": {"wall_ms": 2000},
+    }
+    assert second.json() == {"language": "python3", "code": "print(2)"}
+    cp1, cp2 = [e for e in events if e["type"] == "checkpoint"]
+    assert cp1["refs"] == [result_sha, out_sha] and cp2["refs"] == [result_sha, out_sha]
+
+
+@pytest.mark.parametrize(
+    ("reply_status", "error_code"),
+    [("timed_out", "sim_exec_status_mismatch"), (None, "exec_quota_exhausted")],
+)
+def test_sim_worker_exec_op_fails_task_on_status_mismatch_or_gateway_error(
+    fake_gateway, tmp_path, monkeypatch, reply_status, error_code
+):
+    monkeypatch.setenv(GATEWAY_SOCKET_ENV, fake_gateway.socket_path)
+    if reply_status is None:
+        fake_gateway.replies.append(error_reply(402, "exec_quota_exhausted"))
+    else:
+        sim_exec_gateway(fake_gateway, reply_status)
+    steps = [{"op": "exec", "step_id": "s1", "code": "x", "expect_status": "completed"}]
+    code, events = run(sim_app, tmp_path, init={"config": {"steps": steps}})
+    assert code == 1
+    assert events[-1]["type"] == "error" and events[-1]["code"] == error_code
+
+
+# ---- sim-worker 的 sub-run 操作（M4 Plan 14 Task 11）----
+
+
+def sim_subrun_host(closed: frozenset[str] = frozenset()) -> Responder:
+    """最小宿主：subrun_start → started（closed 中的 ID → rejected/subrun_closed）；
+    产物 → saved；checkpoint 把已取消的 sub-run 列为 completed 时 rejected/invalid_transition
+    （E41），否则 committed。"""
+    cancelled: set[str] = set()
+
+    def respond(msg: dict[str, Any], transport: MemoryTransport) -> None:
+        typ = msg["type"]
+        if typ == "subrun_start":
+            sid = msg["subrun_id"]
+            answer = {"type": "subrun_started", "subrun_id": sid, "status": "started"}
+            if sid in closed:
+                answer = {**answer, "status": "rejected", "code": "subrun_closed"}
+            reply(transport, answer)
+        elif typ == "subrun_end" and msg["status"] == "cancelled":
+            cancelled.add(msg["subrun_id"])
+        elif typ == "artifact":
+            saved = {"artifact_id": msg["artifact_id"], "status": "saved", "version": 1}
+            reply(
+                transport,
+                {"type": "artifact_result", **saved, "sha256": msg["declared_sha256"]},
+            )
+        elif typ == "checkpoint":
+            bad = any(
+                e["subrun_id"] in cancelled and e["status"] == "completed"
+                for e in msg.get("subruns", [])
+            )
+            result = {"type": "checkpoint_result", "checkpoint_id": msg["checkpoint_id"]}
+            result |= {"scope": "task", "status": "committed"}
+            if bad:
+                result |= {"status": "rejected", "code": "invalid_transition"}
+            reply(transport, result)
+
+    return respond
+
+
+SUBRUN_STEPS: list[dict[str, Any]] = [
+    {"op": "subrun_start", "subrun_id": "st1", "deadline_ms": 60000},
+    {"op": "subrun_start", "subrun_id": "st2", "deadline_ms": 60000, "budget_cap_micro": 0},
+    {"op": "checkpoint", "step_id": "c1"},
+    {"op": "subrun_cancel", "subrun_id": "st2"},
+    {"op": "subrun_end", "subrun_id": "st1", "summary": "st1 摘要"},
+    {
+        "op": "checkpoint",
+        "step_id": "forged",
+        "forge_completed": ["st2"],
+        "expect_rejected": "invalid_transition",
+    },
+    {"op": "sleep", "ms": 1, "subrun": "st2"},
+    {"op": "fail", "code": "sim_attempt2", "attempt": 2},
+    {"op": "checkpoint", "step_id": "c2"},
+]
+
+
+def test_sim_worker_subrun_ops(tmp_path):
+    # 启动、取消、完成（登记 internal 结果产物为 result_ref）、伪造 completed 被拒
+    # （之后的 checkpoint 列出真实状态）；引用已关闭 sub-run 的步骤与其他 attempt 的步骤跳过。
+    init = {"extensions": ["subruns"], "config": {"steps": SUBRUN_STEPS}}
+    code, events = run(sim_app, tmp_path, init=init, responder=sim_subrun_host())
+    assert code == 0 and events[-1]["type"] == "result"
+    assert events[0]["subruns"] == 1  # ready 确认扩展
+    assert [e["subrun_id"] for e in events if e["type"] == "subrun_start"] == ["st1", "st2"]
+    ends = [(e["subrun_id"], e["status"]) for e in events if e["type"] == "subrun_end"]
+    assert ends == [("st2", "cancelled"), ("st1", "succeeded")]
+    artifacts = [e for e in events if e["type"] == "artifact" and e["artifact_id"] == "subrun-st1"]
+    assert artifacts[0]["path"] == "subruns/st1.json"
+    assert artifacts[0]["visibility"] == "internal"
+    content = json.loads((tmp_path / "subruns" / "st1.json").read_text(encoding="utf-8"))
+    assert content == {"summary": "st1 摘要", "sources": [], "partial": False}
+    c1, forged, c2 = [e for e in events if e["type"] == "checkpoint"]
+    assert c1["subruns"] == [
+        {"subrun_id": "st1", "status": "started"},
+        {"subrun_id": "st2", "status": "started"},
+    ]
+    assert forged["subruns"][1]["status"] == "completed"
+    assert c2["subruns"] == [
+        {"subrun_id": "st1", "status": "completed", "result_ref": artifacts[0]["declared_sha256"]},
+        {"subrun_id": "st2", "status": "cancelled"},
+    ]
+
+
+def test_sim_worker_subrun_resume_restarts_open_and_skips_closed(tmp_path):
+    # 恢复：next_index 之前的 subrun_start 以同一定义重发——st1 重新绑定，st2（resume.subruns
+    # 中 cancelled）在本地拒绝、不发消息；之后引用 st2 的步骤跳过；只在 attempt 2 执行的 fail 生效。
+    resume = {
+        "checkpoint_id": "cp-1",
+        "step_id": "c1",
+        "state": {"next_index": 6},
+        "subruns": [
+            {"subrun_id": "st1", "status": "started"},
+            {"subrun_id": "st2", "status": "cancelled"},
+        ],
+    }
+    init = {
+        "attempt_no": 2,
+        "extensions": ["subruns"],
+        "resume": resume,
+        "config": {"steps": SUBRUN_STEPS},
+    }
+    code, events = run(sim_app, tmp_path, init=init, responder=sim_subrun_host())
+    assert code == 1 and events[-1]["code"] == "sim_attempt2"
+    assert [e["subrun_id"] for e in events if e["type"] == "subrun_start"] == ["st1"]
+    assert [e for e in events if e["type"] in ("subrun_end", "subrun_cancel")] == []
+
+
+def test_sim_worker_subrun_gateway_and_expect_error(fake_gateway, tmp_path, monkeypatch):
+    # Gateway 操作经 sub-run 视图（归属头、call id 前缀）；expect_error 命中时继续、未命中时失败；
+    # 宿主答复 subrun_closed 的 sub-run 记为已关闭，其步骤跳过。
+    monkeypatch.setenv(GATEWAY_SOCKET_ENV, fake_gateway.socket_path)
+    fake_gateway.replies.append(error_reply(402, "subrun_budget_exhausted"))
+    chat = {"op": "chat", "step_id": "s", "subrun": "st1", "messages": [{"role": "user"}]}
+    steps = [
+        {"op": "subrun_start", "subrun_id": "st1"},
+        {"op": "subrun_start", "subrun_id": "st9"},
+        {**chat, "expect_error": "subrun_budget_exhausted"},
+        {"op": "fetch", "step_id": "s", "subrun": "st1", "url": "https://example.com/a"},
+        {"op": "fetch", "step_id": "s", "subrun": "st9", "url": "https://example.com/b"},
+        {"op": "subrun_end", "subrun_id": "st1"},
+    ]
+    init = {"extensions": ["subruns"], "config": {"steps": steps}}
+    host = sim_subrun_host(closed=frozenset({"st9"}))
+    code, events = run(sim_app, tmp_path, init=init, responder=host)
+    assert code == 0 and events[-1]["type"] == "result"
+    sent = [
+        (r.headers["x-agentbox-call-id"], r.headers["x-agentbox-subrun"])
+        for r in fake_gateway.requests
+    ]
+    assert sent == [("st1/s/chat/1", "st1"), ("st1/s/fetch/1", "st1")]
+
+    steps[2] = {**chat, "expect_error": "budget_exhausted"}
+    fake_gateway.replies.append(error_reply(402, "subrun_budget_exhausted"))
+    code, events = run(sim_app, tmp_path, init=init, responder=sim_subrun_host())
+    assert code == 1 and events[-1]["code"] == "subrun_budget_exhausted"

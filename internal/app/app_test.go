@@ -7,6 +7,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -47,6 +48,8 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider/fake"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/recovery"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/session"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
 )
 
@@ -204,6 +207,11 @@ type harness struct {
 	cancel     context.CancelFunc
 	result     chan error
 	resultSeen bool
+
+	// exec（M4 Plan 15 Task 10）。
+	execDigest      func() (string, error) // Deps.ExecImageDigest
+	crashed         atomic.Bool            // 模拟崩溃：provider.Stop 不停止（ErrStopUnconfirmed），SettleExec 失败
+	failExecDestroy atomic.Int32           // 接下来这么多次 exec 环境的 Destroy 失败
 }
 
 func newHarness(t *testing.T) *harness {
@@ -279,9 +287,10 @@ func (h *harness) deps(clock task.Clock) Deps {
 			}
 			return recStore{Store: s, h: h}, nil
 		},
-		NewProvider: func(string) (provider.Provider, error) { return recProvider{Provider: h.prov, h: h}, nil },
-		Clock:       clock,
-		Logger:      slog.New(slog.NewJSONHandler(lockedWriter{h}, nil)),
+		NewProvider:     func(string) (provider.Provider, error) { return recProvider{Provider: h.prov, h: h}, nil },
+		ExecImageDigest: h.execDigest,
+		Clock:           clock,
+		Logger:          slog.New(slog.NewJSONHandler(lockedWriter{h}, nil)),
 		Hooks: Hooks{
 			Step: func(name string) { h.record("step:" + name) },
 			Mode: func(m api.Mode) {
@@ -437,6 +446,14 @@ func (s recStore) MarkQuarantineAlerted(ctx context.Context, path string) error 
 	return s.Store.MarkQuarantineAlerted(ctx, path)
 }
 
+// SettleExec 在模拟崩溃时失败：exec 的预留保持 held、调用保持 in_flight（与 SIGKILL 留下的状态相同）。
+func (s recStore) SettleExec(ctx context.Context, x call.ExecSettlement) (call.CallRecord, error) {
+	if s.h.crashed.Load() {
+		return call.CallRecord{}, fmt.Errorf("%w: 模拟崩溃", persistence.ErrUnavailable)
+	}
+	return s.Store.SettleExec(ctx, x)
+}
+
 func (s recStore) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Attempt, error) {
 	if p := s.h.panicTask.Load().(string); p == "*" || p == a.TaskID {
 		panic("注入的 actor panic")
@@ -479,10 +496,21 @@ func (p recProvider) Stop(ctx context.Context, envID string) error {
 		p.h.stopFails[envID]--
 	}
 	p.h.mu.Unlock()
-	if fail {
+	if fail || p.h.crashed.Load() {
 		return provider.ErrStopUnconfirmed
 	}
+	if isExecEnv(envID) {
+		p.h.record("provider.Stop:" + envID)
+	}
 	return p.Provider.Stop(ctx, envID)
+}
+
+// Destroy：failExecDestroy 次数内 exec 环境的 Destroy 失败（模拟 /out 仍被占用）。
+func (p recProvider) Destroy(ctx context.Context, envID string) error {
+	if isExecEnv(envID) && p.h.failExecDestroy.Add(-1) >= 0 {
+		return errors.New("注入：EBUSY")
+	}
+	return p.Provider.Destroy(ctx, envID)
 }
 
 func (h *harness) stops(envID string) int {
@@ -1545,5 +1573,905 @@ func TestAccountsWiring(t *testing.T) {
 	h.cancel()
 	if err := h.wait(); err != nil {
 		t.Fatalf("Run 返回 %v", err)
+	}
+}
+
+// ---- M4 Plan 12 Task 9：会话装配 ----
+
+// userSession 注册用户并返回带会话 cookie 的请求函数。
+func userSession(t *testing.T, base, name string) func(method, path, body string) (int, []byte) {
+	t.Helper()
+	resp, err := http.Post(base+"/auth/register", "application/json", strings.NewReader(`{"username":"`+name+`","password":"correct horse"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	var cookie string
+	for _, c := range resp.Cookies() {
+		if c.Name == "agentbox_session" {
+			cookie = c.Name + "=" + c.Value
+		}
+	}
+	if resp.StatusCode != http.StatusCreated || cookie == "" {
+		t.Fatalf("注册 %s = %d", name, resp.StatusCode)
+	}
+	return func(method, path, body string) (int, []byte) {
+		t.Helper()
+		req, err := http.NewRequest(method, base+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Cookie", cookie)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode, b
+	}
+}
+
+// 会话标志与装配：额度 1–1000、evict 须大于 idle-freeze、会话需要账号（Run 拒绝启动）；未配置会话 Worker 时会话端点
+// 503 sessions_unavailable；配置后 turn 的 spec 由 server 固定模型，limits 为 server 默认值加 max_tool_calls = 30，
+// budgets.tool_call_limit = 30。
+func TestSessionsWiring(t *testing.T) {
+	model := ModelConfig{BaseURL: "https://m.example/v1", Name: "kimi-k2.6", Models: []string{"kimi-k2.6", "kimi-k3"},
+		PricingByModel: map[string]upstream.Pricing{"kimi-k3": {InputMicroPerMTok: 1, OutputMicroPerMTok: 7_000_000}}}
+	model.Pricing.OutputMicroPerMTok = 2_000_000
+	accounts := func(c Config) Config {
+		c.Model, c.Accounts, c.UserOrchestratorModel, c.UserWorkerModel = model, true, "kimi-k3", "kimi-k2.6"
+		return c
+	}
+	for _, tc := range []struct {
+		mut  func(*Config)
+		want string
+	}{
+		{func(c *Config) { c.TurnToolBudget = -1 }, "--turn-tool-budget"},
+		{func(c *Config) { c.TurnToolBudget = 1001 }, "--turn-tool-budget"},
+		{func(c *Config) { c.SessionIdleFreeze, c.SessionEvictAfter = time.Hour, time.Hour }, "--session-evict-after"},
+		{func(c *Config) { c.SessionIdleFreeze = -time.Second }, "--session-idle-freeze"},
+		{func(c *Config) { c.Accounts, c.Model = false, ModelConfig{}; c.SessionWorkerArgv = []string{"w"} }, "需要用户账号"},
+	} {
+		c := accounts(testConfig())
+		tc.mut(&c)
+		if err := Run(context.Background(), c, Deps{}); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("Run = %v，期望配置错误（%s）", err, tc.want)
+		}
+	}
+	c := accounts(testConfig()).withDefaults()
+	spec, limits, err := c.turnSpec("你好", true)
+	if err != nil || string(spec) != `{"kind":"turn","text":"你好","deep_research":true,"orchestrator_model":"kimi-k3","worker_model":"kimi-k2.6",`+
+		`"research":{"orchestrator_output_micro_per_mtok":7000000,"worker_output_micro_per_mtok":2000000}}` {
+		t.Fatalf("TurnSpec spec = %s, %v", spec, err)
+	}
+	var l map[string]int64
+	if err := json.Unmarshal(limits, &l); err != nil || l["max_tool_calls"] != 30 || l["budget_micro"] != c.DefaultBudgetMicro || l["max_run_time_ms"] <= 0 {
+		t.Fatalf("TurnSpec limits = %s, %v", limits, err)
+	}
+	for in, ok := range map[string]bool{`{"max_tool_calls":1}`: true, `{"max_tool_calls":1000}`: true, `{"max_tool_calls":0}`: false,
+		`{"max_tool_calls":1001}`: false, `{"max_tool_calls":-3}`: false} {
+		if _, err := c.effectiveLimits(json.RawMessage(in)); (err == nil) != ok {
+			t.Errorf("effectiveLimits(%s) = %v，期望接受 = %v", in, err, ok)
+		}
+	}
+
+	// 未配置会话 Worker：会话端点 503 sessions_unavailable。
+	h := newHarness(t)
+	h.start(accounts(testConfig()), task.SystemClock())
+	do := userSession(t, h.waitAddr(), "alice")
+	if code, b := do("POST", "/sessions", `{"request_id":"s-1"}`); code != http.StatusServiceUnavailable || errorCode(t, b) != "sessions_unavailable" {
+		t.Fatalf("未启用会话时 POST /sessions = %d %s", code, b)
+	}
+	h.cancel()
+	if err := h.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
+
+	// 配置会话 Worker：turn 的 spec 与 limits 由 server 生成，工具额度写入 budgets。
+	h = newHarness(t)
+	cfg := accounts(testConfig())
+	cfg.SessionWorkerArgv = []string{"session-worker"}
+	h.start(cfg, task.SystemClock())
+	do = userSession(t, h.waitAddr(), "bob")
+	code, b := do("POST", "/sessions", `{"request_id":"s-1"}`)
+	var sess struct {
+		SessionID string `json:"session_id"`
+	}
+	if code != http.StatusCreated || json.Unmarshal(b, &sess) != nil || sess.SessionID == "" {
+		t.Fatalf("POST /sessions = %d %s", code, b)
+	}
+	code, b = do("POST", "/sessions/"+sess.SessionID+"/messages", `{"request_id":"m-1","text":"第一条消息","deep_research":false}`)
+	var turn struct {
+		TurnID string `json:"turn_id"`
+	}
+	if code != http.StatusAccepted || json.Unmarshal(b, &turn) != nil || turn.TurnID == "" {
+		t.Fatalf("POST messages = %d %s", code, b)
+	}
+	var gotSpec, gotLimits []byte
+	var toolLimit int64
+	h.queryRow(`SELECT t.spec_json::text, t.limits_json::text, b.tool_call_limit FROM tasks t JOIN budgets b ON b.task_id = t.task_id
+		WHERE t.task_id = $1`, []any{turn.TurnID}, &gotSpec, &gotLimits, &toolLimit)
+	if err := json.Unmarshal(gotLimits, &l); err != nil || l["max_tool_calls"] != 30 || toolLimit != 30 ||
+		!strings.Contains(string(gotSpec), `"worker_model": "kimi-k2.6"`) {
+		t.Fatalf("turn spec = %s，limits = %s，tool_call_limit = %d", gotSpec, gotLimits, toolLimit)
+	}
+	h.cancel()
+	if err := h.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
+}
+
+// ==== M4 Plan 15 Task 10：exec 装配、启动恢复（E37）、清理与 inspect ====
+
+const execCallID = "root/s1/exec/1"
+
+// execWorld 驱动 exec 装配测试：task Worker 经本 attempt 的 socket POST /v1/exec（同一调用 ID；attempt 2 起带
+// X-Agentbox-Retry），把响应交给 replies，然后等待 release（nil 表示不等待）再发出 result；收到 attempt 1 的响应后
+// 若 holdFirst 则一直等到被终止（模拟崩溃前未完成的 attempt）。exec 程序（Dir = /out）第 blockRuns 次之前的执行
+// 一直运行到被终止，并在开始时关闭 running；其余执行写 /out/result.txt、输出 hello 并以 0 退出。
+type execWorld struct {
+	h         *harness
+	replies   chan string
+	release   chan struct{}
+	running   chan struct{}
+	holdFirst bool
+	blockRuns int32
+	runs      atomic.Int32
+	once      sync.Once
+}
+
+func newExecWorld(h *harness) *execWorld {
+	w := &execWorld{h: h, replies: make(chan string, 8), running: make(chan struct{})}
+	h.prov = fake.New(w.program)
+	h.execDigest = func() (string, error) { return "digest-exec-test", nil }
+	return w
+}
+
+func (w *execWorld) program(ctx context.Context, spec provider.ExecSpec, stdin io.Reader, stdout, _ io.Writer) provider.ExitStatus {
+	if spec.Dir == "/out" {
+		if w.runs.Add(1) <= w.blockRuns {
+			w.once.Do(func() { close(w.running) })
+			<-ctx.Done()
+			return provider.ExitStatus{Signal: syscall.SIGKILL}
+		}
+		if err := os.WriteFile(filepath.Join(w.h.prov.OutDir(spec.ExecID), "result.txt"), []byte("42\n"), 0o644); err != nil {
+			return provider.ExitStatus{Code: 3}
+		}
+		_, _ = io.WriteString(stdout, "hello\n")
+		return provider.ExitStatus{Code: 0}
+	}
+	line, err := bufio.NewReader(stdin).ReadBytes('\n')
+	if err != nil {
+		return provider.ExitStatus{Code: 2}
+	}
+	var in protocol.Init
+	if err := json.Unmarshal(line, &in); err != nil {
+		return provider.ExitStatus{Code: 2}
+	}
+	emit := func(m map[string]any) {
+		b, _ := json.Marshal(m)
+		_, _ = stdout.Write(append(b, '\n'))
+	}
+	emit(map[string]any{"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "task",
+		"worker": map[string]any{"name": "app-exec-test", "version": "0"}, "capabilities": []string{}})
+	sock := filepath.Join(gatewayDir(w.h.dir), in.AttemptID+".sock")
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", sock)
+	}}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://gateway/v1/exec",
+		strings.NewReader(`{"language":"python3","code":"print('hello')"}`))
+	if err != nil {
+		return provider.ExitStatus{Code: 2}
+	}
+	req.Header.Set("X-Agentbox-Call-Id", execCallID)
+	if in.AttemptNo > 1 {
+		req.Header.Set("X-Agentbox-Retry", "true")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		w.replies <- fmt.Sprintf("attempt %d error: %v", in.AttemptNo, err)
+	} else {
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		w.replies <- fmt.Sprintf("attempt %d %d %s", in.AttemptNo, resp.StatusCode, b)
+	}
+	if w.holdFirst && in.AttemptNo == 1 {
+		<-ctx.Done()
+		return provider.ExitStatus{Signal: syscall.SIGKILL}
+	}
+	if w.release != nil {
+		select {
+		case <-w.release:
+		case <-ctx.Done():
+			return provider.ExitStatus{Signal: syscall.SIGKILL}
+		}
+	}
+	emit(map[string]any{"type": "result", "v": 1, "seq": 2, "summary": "done", "outputs": []string{}})
+	return provider.ExitStatus{Code: 0}
+}
+
+func (w *execWorld) reply(t *testing.T) string {
+	t.Helper()
+	select {
+	case r := <-w.replies:
+		return r
+	case <-time.After(60 * time.Second):
+		t.Fatal("Worker 未完成 /v1/exec 调用")
+	}
+	return ""
+}
+
+func execTestConfig() Config {
+	cfg := testConfig()
+	cfg.Exec = ExecConfig{Slots: 2}
+	cfg.RetryBackoff = func(int) time.Duration { return 0 }
+	return cfg
+}
+
+// TestExecWiring：启用 exec 后经 edge 完成一次 exec（fake provider 的 exec 程序）；同步清理失败时 cleanup loop 在 attempt
+// 尚无判决时即回收 exec 环境（D8）；inspect 的 exec try 带 env_id、queue_ms、wall_ms、cpu_usec、exec_started_at 与结局。
+func TestExecWiring(t *testing.T) {
+	h := newHarness(t)
+	w := newExecWorld(h)
+	w.release = make(chan struct{})
+	h.failExecDestroy.Store(1)
+	h.start(execTestConfig(), task.SystemClock())
+	base := h.waitAddr()
+	id := submit(t, base, "ex-1", `{}`)
+
+	r := w.reply(t)
+	if !strings.HasPrefix(r, "attempt 1 200 ") || !strings.Contains(r, `"stdout":"hello\n"`) || !strings.Contains(r, "result.txt") {
+		t.Fatalf("/v1/exec = %s", r)
+	}
+	var envID string
+	h.queryRow("SELECT env_id FROM call_tries WHERE task_id = $1 AND call_id = $2", []any{id, execCallID}, &envID)
+	if !isExecEnv(envID) {
+		t.Fatalf("exec try 的环境 %q", envID)
+	}
+	// 同步清理的 Destroy 失败 → cleanup loop 接手；此时 attempt 仍在运行（Worker 等待 release），没有判决。
+	eventually(t, "cleanup loop 回收 exec 环境", nil, func() bool {
+		var state string
+		var tries int64
+		h.queryRow("SELECT cleanup_state, cleanup_tries FROM environments WHERE env_id = $1", []any{envID}, &state, &tries)
+		return state == "done" && tries >= 1
+	})
+	var verdict bool
+	h.queryRow(`SELECT a.verdict_hash IS NOT NULL FROM attempts a JOIN environments e ON e.attempt_id = a.attempt_id
+		WHERE e.env_id = $1`, []any{envID}, &verdict)
+	if verdict {
+		t.Fatal("exec 环境回收时所属 attempt 已有判决：本测试应在判决之前完成回收")
+	}
+	if l := h.liveEnvs(); slices.Contains(l, envID) {
+		t.Fatalf("exec 环境仍在 provider 中：%v", l)
+	}
+	close(w.release)
+	eventually(t, "任务完成", nil, func() bool { s, _ := h.taskStatus(id); return s == "succeeded" })
+
+	st, body := httpDo(t, "GET", base+"/tasks/"+id+"/inspect", "")
+	var in struct {
+		Calls []struct {
+			CallID   string `json:"call_id"`
+			Endpoint string `json:"endpoint"`
+			State    string `json:"state"`
+			Tries    []struct {
+				EnvID         string     `json:"env_id"`
+				Outcome       string     `json:"outcome"`
+				QueueMs       *int64     `json:"queue_ms"`
+				WallMs        *int64     `json:"wall_ms"`
+				CPUUsec       *int64     `json:"cpu_usec"`
+				ExecStartedAt *time.Time `json:"exec_started_at"`
+			} `json:"tries"`
+		} `json:"calls"`
+	}
+	if st != http.StatusOK || json.Unmarshal(body, &in) != nil || len(in.Calls) != 1 || len(in.Calls[0].Tries) != 1 {
+		t.Fatalf("inspect = %d %s", st, body)
+	}
+	c, tr := in.Calls[0], in.Calls[0].Tries[0]
+	if c.CallID != execCallID || c.Endpoint != "/v1/exec" || c.State != "completed" || tr.EnvID != envID || tr.Outcome != "ok" ||
+		tr.QueueMs == nil || tr.WallMs == nil || tr.CPUUsec == nil || tr.ExecStartedAt == nil {
+		t.Fatalf("inspect 的 exec 调用 = %s", body)
+	}
+	h.cancel()
+	if err := h.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
+}
+
+// TestExecDisabledAndTemplate：--exec-slots 0（Config.Exec 零值）→ /v1/exec 为 404 endpoint_not_configured；启用 exec
+// 而 exec 模板不可用（缺 python3）→ Run 在取得任何锁之前返回错误。
+func TestExecDisabledAndTemplate(t *testing.T) {
+	h := newHarness(t)
+	w := newExecWorld(h)
+	h.start(testConfig(), task.SystemClock())
+	base := h.waitAddr()
+	id := submit(t, base, "ex-off", `{}`)
+	if r := w.reply(t); !strings.HasPrefix(r, "attempt 1 404 ") || !strings.Contains(r, "endpoint_not_configured") {
+		t.Fatalf("exec 关闭时 /v1/exec = %s", r)
+	}
+	eventually(t, "任务完成", nil, func() bool { s, _ := h.taskStatus(id); return task.IsTerminal(s) })
+	h.cancel()
+	if err := h.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
+
+	h2 := newHarness(t)
+	h2.execDigest = func() (string, error) {
+		return "", errors.New("rootfs: exec 模板中 /usr/bin/python3 不存在")
+	}
+	h2.start(execTestConfig(), task.SystemClock())
+	err := h2.wait()
+	if !errors.Is(err, errExecImage) || !strings.Contains(err.Error(), "python3") {
+		t.Fatalf("exec 模板缺 python3 时 Run = %v", err)
+	}
+	if ev := h2.events(); slices.Contains(ev, "step:flock") || slices.Contains(ev, "acquire_ownership") {
+		t.Fatalf("exec 模板检查失败后仍取得了锁：%q", ev)
+	}
+}
+
+// crashDuringExec 启动 app，让 attempt 1 的 exec 运行起来，然后模拟 SIGKILL：provider 不再停止任何环境、exec 结算
+// 失败（预留保持 held、调用保持 in_flight、环境未记录 stopped_at，exec 程序仍在运行），再让 Run 返回。返回任务与
+// exec 环境。
+func crashDuringExec(t *testing.T, h *harness, w *execWorld) (taskID, envID string) {
+	t.Helper()
+	w.blockRuns, w.holdFirst = 1, true
+	h.start(execTestConfig(), task.SystemClock())
+	h.waitRecovered()
+	base := h.waitAddr()
+	taskID = submit(t, base, "e37", `{}`)
+	select {
+	case <-w.running:
+	case <-time.After(60 * time.Second):
+		t.Fatal("exec 未开始运行")
+	}
+	h.queryRow("SELECT env_id FROM call_tries WHERE task_id = $1 AND call_id = $2", []any{taskID, execCallID}, &envID)
+	h.crashed.Store(true)
+	h.cancel()
+	if err := h.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
+	w.reply(t) // attempt 1 收到的响应（Gateway 关闭）不影响结论
+	var callState, rsv string
+	var stopped bool
+	h.queryRow(`SELECT c.state, r.state, e.stopped_at IS NOT NULL FROM calls c
+		JOIN call_tries ct ON ct.task_id = c.task_id AND ct.call_id = c.call_id
+		JOIN reservations r ON r.reservation_id = ct.reservation_id
+		JOIN environments e ON e.env_id = ct.env_id
+		WHERE c.task_id = $1 AND c.call_id = $2`, []any{taskID, execCallID}, &callState, &rsv, &stopped)
+	if callState != "in_flight" || rsv != "held" || stopped {
+		t.Fatalf("崩溃后的状态：调用 %s、预留 %s、stopped_at 已记录 %v；期望 in_flight、held、未记录", callState, rsv, stopped)
+	}
+	if !slices.Contains(h.liveEnvs(), envID) {
+		t.Fatalf("崩溃后 exec 环境 %s 应仍存活：%v", envID, h.liveEnvs())
+	}
+	h.crashed.Store(false)
+	h.mu.Lock()
+	h.log = nil
+	h.mu.Unlock()
+	return taskID, envID
+}
+
+// TestE37ExecCrashRecovery（确定性版本）：exec 运行中 server 崩溃 → 重启的恢复阶段先停止旧 exec 环境并记录 stopped_at，
+// 之后 API 才开始监听（Gateway 入口只在 actor 启动后建立）；旧 try 为 unknown，cpu_unknown 增加；新 attempt 以同一调用
+// 重发（Retry）→ 新 try 在新环境中运行完成。
+func TestE37ExecCrashRecovery(t *testing.T) {
+	h := newHarness(t)
+	w := newExecWorld(h)
+	taskID, oldEnv := crashDuringExec(t, h, w)
+
+	h.start(execTestConfig(), task.SystemClock())
+	h.waitRecovered()
+	h.waitAddr()
+	ev := h.events()
+	stopAt, apiAt := slices.Index(ev, "provider.Stop:"+oldEnv), slices.Index(ev, "step:api")
+	if stopAt < 0 || apiAt < 0 || stopAt > apiAt || slices.Index(ev, "step:recovery_execute") < stopAt {
+		t.Fatalf("恢复应先停止旧 exec 环境再启动 API：%q", ev)
+	}
+	var stopped bool
+	var oldOutcome string
+	var cpuUnknown int64
+	h.queryRow(`SELECT e.stopped_at IS NOT NULL, ct.outcome, q.cpu_unknown_usec FROM call_tries ct
+		JOIN environments e ON e.env_id = ct.env_id JOIN exec_quotas q ON q.task_id = ct.task_id
+		WHERE ct.task_id = $1 AND ct.call_id = $2 AND ct.try_no = 1`, []any{taskID, execCallID}, &stopped, &oldOutcome, &cpuUnknown)
+	if !stopped || oldOutcome != "unknown" || cpuUnknown <= 0 {
+		t.Fatalf("旧 try：stopped_at 已记录 %v，结局 %q，cpu_unknown_usec %d", stopped, oldOutcome, cpuUnknown)
+	}
+	if r := w.reply(t); !strings.HasPrefix(r, "attempt 2 200 ") || !strings.Contains(r, `"stdout":"hello\n"`) {
+		t.Fatalf("重跑的 /v1/exec = %s", r)
+	}
+	eventually(t, "任务完成", nil, func() bool { s, _ := h.taskStatus(taskID); return s == "succeeded" })
+	var tries int64
+	var newEnv, newOutcome, callState string
+	h.queryRow(`SELECT c.tries_used, c.state, ct.env_id, ct.outcome FROM calls c JOIN call_tries ct
+		ON ct.task_id = c.task_id AND ct.call_id = c.call_id AND ct.try_no = 2 WHERE c.task_id = $1 AND c.call_id = $2`,
+		[]any{taskID, execCallID}, &tries, &callState, &newEnv, &newOutcome)
+	if tries != 2 || callState != "completed" || newEnv == oldEnv || newOutcome != "ok" {
+		t.Fatalf("重跑：tries_used %d、调用 %s、新环境 %s（旧 %s）、结局 %s", tries, callState, newEnv, oldEnv, newOutcome)
+	}
+	h.cancel()
+	if err := h.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
+}
+
+// TestE37CancelledTaskNotRerun：崩溃前用户的取消已提交 → 重启后旧 exec 环境被停止，任务 cancelled，该调用不再出现新 try。
+func TestE37CancelledTaskNotRerun(t *testing.T) {
+	h := newHarness(t)
+	w := newExecWorld(h)
+	taskID, oldEnv := crashDuringExec(t, h, w)
+	ctx := context.Background()
+	st, err := postgres.Open(ctx, postgres.Options{DSN: h.dsn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AcceptControl(ctx, api.ControlRequest{RequestID: "cancel-e37", BodyHash: []byte{1}, TaskID: taskID,
+		Desired: "cancel", Reason: "user"}); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	h.start(execTestConfig(), task.SystemClock())
+	h.waitRecovered()
+	h.waitAddr()
+	if ev := h.events(); !slices.Contains(ev, "provider.Stop:"+oldEnv) {
+		t.Fatalf("恢复未停止旧 exec 环境：%q", ev)
+	}
+	eventually(t, "任务取消", nil, func() bool { s, _ := h.taskStatus(taskID); return s == "cancelled" })
+	time.Sleep(200 * time.Millisecond) // 给任何（错误的）重跑留出时间
+	var tries int64
+	var stopped bool
+	h.queryRow(`SELECT count(*), bool_and(e.stopped_at IS NOT NULL) FROM call_tries ct JOIN environments e ON e.env_id = ct.env_id
+		WHERE ct.task_id = $1`, []any{taskID}, &tries, &stopped)
+	if tries != 1 || !stopped {
+		t.Fatalf("取消的任务：try 数 %d、环境已停止 %v；期望只有原来的 1 个且已停止", tries, stopped)
+	}
+	select {
+	case r := <-w.replies:
+		t.Fatalf("取消的任务不应再有 Worker 调用 exec：%s", r)
+	default:
+	}
+	h.cancel()
+	if err := h.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
+}
+
+// ==== M4 Plan 14 Task 7：sub-run 扩展协商、恢复时重新绑定与裁决收尾 ====
+
+// subrunPeer 是脚本化 Worker 的协议对端：逐行读取宿主消息，按类型等待答复。
+type subrunPeer struct {
+	ctx   context.Context
+	lines chan []byte
+	out   io.Writer
+	seq   int64
+}
+
+func newSubrunPeer(ctx context.Context, stdin io.Reader, stdout io.Writer) *subrunPeer {
+	p := &subrunPeer{ctx: ctx, lines: make(chan []byte, 16), out: stdout}
+	go func() {
+		defer close(p.lines)
+		r := bufio.NewReader(stdin)
+		for {
+			b, err := r.ReadBytes('\n')
+			if len(bytes.TrimSpace(b)) > 0 {
+				select {
+				case p.lines <- b:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return p
+}
+
+// emit 发出一条 Worker 事件（补上 v 与递增的 seq）。
+func (p *subrunPeer) emit(m map[string]any) {
+	p.seq++
+	m["v"], m["seq"] = 1, p.seq
+	b, _ := json.Marshal(m)
+	_, _ = p.out.Write(append(b, '\n'))
+}
+
+// await 读到类型为 typ 的宿主消息为止（其他消息跳过）；stdin 结束或 ctx 结束时 ok = false。
+func (p *subrunPeer) await(typ string) (raw []byte, msg map[string]any, ok bool) {
+	for {
+		select {
+		case b, open := <-p.lines:
+			if !open {
+				return nil, nil, false
+			}
+			var m map[string]any
+			if json.Unmarshal(b, &m) == nil && m["type"] == typ {
+				return b, m, true
+			}
+		case <-p.ctx.Done():
+			return nil, nil, false
+		}
+	}
+}
+
+// subrunRec 记录每个 attempt 的原始 init（task → attempt_no → 行）、Worker 等待控制的信号与脚本内的意外。
+type subrunRec struct {
+	mu      sync.Mutex
+	inits   map[string]map[int64]string
+	waiting chan string // Worker 已到达等待 pause/cancel 的位置：task_id
+	fail    chan string
+}
+
+func newSubrunRec() *subrunRec {
+	return &subrunRec{inits: map[string]map[int64]string{}, waiting: make(chan string, 8), fail: make(chan string, 8)}
+}
+
+func (r *subrunRec) init(taskID string, no int64) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.inits[taskID][no]
+	return s, ok
+}
+
+// subrunScenario 是 protocol/fixtures/v1/scenarios 中的一个场景（只取行）。
+type subrunScenario struct {
+	Lines []struct {
+		From    string          `json:"from"`
+		Message json.RawMessage `json:"message"`
+	} `json:"lines"`
+}
+
+// subrunWorker 按 config.script 与 attempt_no 执行脚本；ready 回 subruns: 1 当且仅当 init 请求了扩展。
+func subrunWorker(dataDir string, rec *subrunRec, fixture subrunScenario) fake.Program {
+	return func(ctx context.Context, _ provider.ExecSpec, stdin io.Reader, stdout, _ io.Writer) provider.ExitStatus {
+		killed := provider.ExitStatus{Signal: syscall.SIGKILL}
+		p := newSubrunPeer(ctx, stdin, stdout)
+		raw, _, ok := p.await("init")
+		if !ok {
+			return killed
+		}
+		var in protocol.Init
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return provider.ExitStatus{Code: 2}
+		}
+		rec.mu.Lock()
+		if rec.inits[in.TaskID] == nil {
+			rec.inits[in.TaskID] = map[int64]string{}
+		}
+		rec.inits[in.TaskID][in.AttemptNo] = string(raw)
+		rec.mu.Unlock()
+		var cfg struct {
+			Script string `json:"script"`
+		}
+		_ = json.Unmarshal(in.Config, &cfg) // 没有 script 时按 plain 处理
+		failf := func(format string, args ...any) provider.ExitStatus {
+			rec.fail <- fmt.Sprintf("%s/%d: ", cfg.Script, in.AttemptNo) + fmt.Sprintf(format, args...)
+			return provider.ExitStatus{Code: 3}
+		}
+		if cfg.Script == "fixture" { // 原样重放 fixture 的 Worker 行；宿主行只等待同类型的答复
+			for _, l := range fixture.Lines[1:] {
+				var head struct {
+					Type string `json:"type"`
+				}
+				if err := json.Unmarshal(l.Message, &head); err != nil {
+					return failf("fixture: %v", err)
+				}
+				if l.From == "host" {
+					if _, _, ok := p.await(head.Type); !ok {
+						return killed
+					}
+					continue
+				}
+				_, _ = stdout.Write(append(bytes.Clone(l.Message), '\n'))
+			}
+			return provider.ExitStatus{Code: 0}
+		}
+		ready := map[string]any{"type": "ready", "protocol_version": 1, "mode": "task",
+			"worker": map[string]any{"name": "app-subrun-test", "version": "0"}, "capabilities": []string{}}
+		if slices.Contains(in.Extensions, protocol.ExtensionSubruns) {
+			ready["subruns"] = 1
+		}
+		p.emit(ready)
+		start := func(id string) bool {
+			p.emit(map[string]any{"type": "subrun_start", "subrun_id": id, "parent_step_id": "research", "deadline_ms": 600000})
+			_, m, ok := p.await("subrun_started")
+			return ok && m["subrun_id"] == id && m["status"] == "started"
+		}
+		checkpoint := func(id string, subs []map[string]any) bool {
+			m := map[string]any{"type": "checkpoint", "checkpoint_id": id, "scope": "task", "step_id": "research",
+				"state": map[string]any{"cp": id}}
+			if subs != nil {
+				m["subruns"] = subs
+			}
+			p.emit(m)
+			_, r, ok := p.await("checkpoint_result")
+			return ok && r["status"] == "committed"
+		}
+		waitControl := func(typ string) provider.ExitStatus {
+			rec.waiting <- in.TaskID
+			if _, _, ok := p.await(typ); !ok {
+				return killed
+			}
+			return provider.ExitStatus{Code: 0} // 收到控制即退出：裁决按 desired（paused / cancelled）
+		}
+		if in.AttemptNo == 1 {
+			switch cfg.Script {
+			case "rebind":
+				for _, id := range []string{"st1", "st2", "st3"} {
+					if !start(id) {
+						return failf("subrun_start %s 未被接受", id)
+					}
+				}
+				p.emit(map[string]any{"type": "subrun_end", "subrun_id": "st1", "status": "succeeded", "summary": "s1"})
+				body := []byte(`{"summary":"s1","sources":[],"partial":false}`)
+				dir := filepath.Join(workspaceDir(dataDir, in.TaskID), "out", in.AttemptID, "subruns")
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					return failf("%v", err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "st1.json"), body, 0o644); err != nil {
+					return failf("%v", err)
+				}
+				sum := sha256.Sum256(body)
+				sha := hex.EncodeToString(sum[:])
+				p.emit(map[string]any{"type": "artifact", "artifact_id": "subrun-st1", "path": "subruns/st1.json", "declared_sha256": sha,
+					"declared_size": len(body), "media_type": "application/json", "visibility": "internal"})
+				if _, m, ok := p.await("artifact_result"); !ok || m["status"] != "saved" {
+					return failf("artifact_result = %v", m)
+				}
+				if !checkpoint("cp-1", []map[string]any{{"subrun_id": "st1", "status": "completed", "result_ref": sha}}) {
+					return failf("cp-1 未提交")
+				}
+				// E42：st3 的 end{succeeded} 之后没有 checkpoint 列出它；E40：st4 取消后崩溃。
+				p.emit(map[string]any{"type": "subrun_end", "subrun_id": "st3", "status": "succeeded", "summary": "s3"})
+				if !start("st4") {
+					return failf("subrun_start st4 未被接受")
+				}
+				p.emit(map[string]any{"type": "subrun_cancel", "subrun_id": "st4", "reason": "abandon"})
+				if !checkpoint("cp-2", nil) { // 同步：之前的事件都已处理
+					return failf("cp-2 未提交")
+				}
+				return killed // 被杀死（crashed_signal）：故障重试
+			case "pause":
+				if !start("st1") || !checkpoint("cp-1", nil) {
+					return failf("st1 或 cp-1 失败")
+				}
+				return waitControl("pause")
+			case "cancel":
+				if !start("st1") || !start("st2") {
+					return failf("subrun_start 未被接受")
+				}
+				p.emit(map[string]any{"type": "subrun_end", "subrun_id": "st2", "status": "succeeded", "summary": "s2"})
+				if !checkpoint("cp-1", nil) {
+					return failf("cp-1 未提交")
+				}
+				return waitControl("cancel")
+			}
+		}
+		// 恢复后的 attempt（与 plain）直接给出结果：成功裁决收尾仍未终态的 sub-run。
+		p.emit(map[string]any{"type": "result", "summary": "done", "outputs": []string{}})
+		return provider.ExitStatus{Code: 0}
+	}
+}
+
+// TestSubrunAttemptLifecycle（M4 Plan 14 Task 7）：真实库 + 脚本化 Worker。
+//   - 协商：init.extensions = ["subruns"]，ready 回 subruns: 1；--worker-subruns=false 时 init 无 extensions。
+//   - 重新绑定：第 1 个 attempt 启动 st1–st3，checkpoint 列出 st1 completed，st3 end{succeeded} 之后未入 checkpoint（E42），
+//     st4 取消后崩溃（E40）；新 attempt 的 init.resume.subruns = [st1 completed+result_ref, st2 started, st3 started,
+//     st4 cancelled]，st2、st3 绑定到新 attempt，st4 不重新绑定；成功裁决把仍未终态的 st2、st3 置为
+//     failed{not_completed_at_result}。
+//   - E45（§13.5 执行中修订）：deadline 在暂停之前已过 → 暂停裁决记录剩余 0，恢复 → timed_out，并在
+//     init.resume.subruns 中告知。
+//   - task 取消裁决：全部非终态（started、end_proposed）→ cancelled{task_cancel}。
+//   - fixture subrun_end_without_checkpoint：st1 由成功裁决事务置为 failed。
+func TestSubrunAttemptLifecycle(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "protocol", "fixtures", "v1", "scenarios", "subrun_end_without_checkpoint.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture subrunScenario
+	if err := json.Unmarshal(b, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t)
+	rec := newSubrunRec()
+	h.prov = fake.New(subrunWorker(h.dir, rec, fixture))
+	cfg := testConfig()
+	cfg.WorkerSubruns = true
+	h.start(cfg, task.SystemClock())
+	base := h.waitAddr()
+
+	ids := map[string]string{}
+	for _, s := range []string{"rebind", "pause", "cancel", "fixture"} {
+		ids[s] = submit(t, base, "sr-"+s, `{"script":"`+s+`"}`)
+	}
+	checkFail := func() {
+		select {
+		case f := <-rec.fail:
+			t.Fatalf("Worker 脚本：%s", f)
+		default:
+		}
+	}
+	waitStatus := func(h *harness, id, want string) {
+		t.Helper()
+		eventually(t, "任务 "+id+" 到达 "+want, checkFail, func() bool {
+			st, _ := h.taskStatus(id)
+			return st == want || task.IsTerminal(st)
+		})
+		if st, _ := h.taskStatus(id); st != want {
+			var events string
+			h.queryRow("SELECT COALESCE(string_agg(type || ' ' || payload::text, E'\n' ORDER BY task_seq), '') FROM events WHERE task_id = $1",
+				[]any{id}, &events)
+			t.Fatalf("任务 %s 为 %s，期望 %s；事件：\n%s", id, st, want, events)
+		}
+	}
+	control := func(id, action string) {
+		t.Helper()
+		st, b := httpDo(t, "POST", base+"/tasks/"+id+"/"+action, `{"request_id":"`+action+"-"+id+`","reason":"test"}`)
+		if st != http.StatusAccepted && st != http.StatusOK {
+			t.Fatalf("POST %s = %d %s", action, st, b)
+		}
+	}
+	// row 返回 status|绑定 attempt 的序号|result_ref|failure_reason|cancel_reason。
+	row := func(id, subrunID string) string {
+		var out string
+		h.queryRow(`SELECT concat_ws('|', s.status, COALESCE(a.attempt_no::text, '?'), COALESCE(s.result_ref, '-'),
+				COALESCE(s.failure_reason, ''), COALESCE(s.cancel_reason, ''))
+			FROM subruns s LEFT JOIN attempts a ON a.attempt_id = s.bound_attempt_id WHERE s.task_id = $1 AND s.subrun_id = $2`,
+			[]any{id, subrunID}, &out)
+		return out
+	}
+	initOf := func(rec *subrunRec, id string, no int64) protocol.Init {
+		t.Helper()
+		raw, ok := rec.init(id, no)
+		var in protocol.Init
+		if !ok || json.Unmarshal([]byte(raw), &in) != nil {
+			t.Fatalf("任务 %s 没有第 %d 个 attempt 的 init", id, no)
+		}
+		return in
+	}
+
+	// 暂停与取消：等 Worker 到达等待控制的位置。
+	for range 2 {
+		var id string
+		select {
+		case id = <-rec.waiting:
+		case f := <-rec.fail:
+			t.Fatalf("Worker 脚本：%s", f)
+		case <-time.After(60 * time.Second):
+			t.Fatal("Worker 未到达等待控制的位置")
+		}
+		switch id {
+		case ids["pause"]:
+			// deadline 在暂停之前已过（宿主计时器按原期限，尚未触发）：暂停裁决记录剩余 0，继续时 timed_out。
+			// 暂停期间才过期的情形不再超时（暂停期间不计时，见 postgres 的 TestSubrunDeadlineSuspendedWhilePaused 与 e2e E45）。
+			h.exec("UPDATE subruns SET deadline_at = now() - interval '1 second' WHERE task_id = $1", id)
+			control(id, "pause")
+			waitStatus(h, id, "paused")
+			control(id, "resume")
+		case ids["cancel"]:
+			control(id, "cancel")
+		}
+	}
+
+	// 重新绑定（E40、E42）与成功裁决收尾。
+	id := ids["rebind"]
+	waitStatus(h, id, "succeeded")
+	first := initOf(rec, id, 1)
+	if !slices.Equal(first.Extensions, []string{protocol.ExtensionSubruns}) || first.Resume != nil {
+		t.Fatalf("第 1 个 attempt 的 init：extensions = %v，resume = %+v", first.Extensions, first.Resume)
+	}
+	st1 := row(id, "st1")
+	sha := strings.Split(st1, "|")[2]
+	want := fmt.Sprint([]protocol.ResumeSubrun{{SubrunID: "st1", Status: "completed", ResultRef: sha},
+		{SubrunID: "st2", Status: "started"}, {SubrunID: "st3", Status: "started"}, {SubrunID: "st4", Status: "cancelled"}})
+	if r := initOf(rec, id, 2).Resume; r == nil || r.CheckpointID != "cp-2" || fmt.Sprint(r.Subruns) != want || len(sha) != 64 {
+		t.Fatalf("第 2 个 attempt 的 init.resume = %+v，期望 cp-2 与 %s", r, want)
+	}
+	for subrunID, w := range map[string]string{
+		"st1": "completed|1|" + sha + "||",
+		"st2": "failed|2|-|not_completed_at_result|",
+		"st3": "failed|2|-|not_completed_at_result|",
+		"st4": "cancelled|1|-||orchestrator",
+	} {
+		if g := row(id, subrunID); g != w {
+			t.Errorf("rebind %s = %s，期望 %s", subrunID, g, w)
+		}
+	}
+
+	// E45：暂停期间过期 → 恢复时 timed_out，并告知 Worker。
+	id = ids["pause"]
+	waitStatus(h, id, "succeeded")
+	if r := initOf(rec, id, 2).Resume; r == nil ||
+		fmt.Sprint(r.Subruns) != fmt.Sprint([]protocol.ResumeSubrun{{SubrunID: "st1", Status: "timed_out"}}) {
+		t.Fatalf("E45 的 init.resume = %+v", r)
+	}
+	if g := row(id, "st1"); g != "timed_out|1|-||deadline" {
+		t.Errorf("E45 st1 = %s", g)
+	}
+
+	// task 取消裁决：started 与 end_proposed 都收尾为 cancelled。
+	id = ids["cancel"]
+	waitStatus(h, id, "cancelled")
+	for _, subrunID := range []string{"st1", "st2"} {
+		if g := row(id, subrunID); g != "cancelled|1|-|task_cancel|task_cancel" {
+			t.Errorf("取消裁决 %s = %s", subrunID, g)
+		}
+	}
+
+	// fixture：subrun_end{succeeded} 未入 checkpoint 即 result → 成功裁决把 st1 置为 failed。
+	id = ids["fixture"]
+	waitStatus(h, id, "succeeded")
+	if g := row(id, "st1"); g != "failed|1|-|not_completed_at_result|" {
+		t.Errorf("fixture st1 = %s", g)
+	}
+	h.cancel()
+	if err := h.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
+
+	// --worker-subruns=false：init 不请求扩展（无 extensions 字段）。
+	off := newHarness(t)
+	offRec := newSubrunRec()
+	off.prov = fake.New(subrunWorker(off.dir, offRec, fixture))
+	off.start(testConfig(), task.SystemClock())
+	id = submit(t, off.waitAddr(), "sr-off", `{"script":"plain"}`)
+	waitStatus(off, id, "succeeded")
+	if raw, ok := offRec.init(id, 1); !ok || strings.Contains(raw, `"extensions"`) {
+		t.Fatalf("--worker-subruns=false 的 init = %s", raw)
+	}
+	off.cancel()
+	if err := off.wait(); err != nil {
+		t.Fatalf("Run 返回 %v", err)
+	}
+}
+
+// startCapture 记录 StartIncarnation 收到的 spec，并以错误返回（不启动 Worker）。
+type startCapture struct{ spec runner.IncarnationSpec }
+
+func (s *startCapture) StartIncarnation(_ context.Context, spec runner.IncarnationSpec) (*runner.Incarnation, error) {
+	s.spec = spec
+	return nil, errors.New("test: 不启动")
+}
+
+// TestSessionSubrunWiring（M4 Plan 14 Task 7）：会话 init 按 --worker-subruns 请求扩展；task_start.resume 与 task 模式的
+// init.resume 由同一函数组装（含 resume.subruns），没有 checkpoint 时不下发 resume。
+func TestSessionSubrunWiring(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		c := &startCapture{}
+		cfg := testConfig()
+		cfg.WorkerSubruns = on
+		w := sessionWorkers{r: c, cfg: cfg, dataDir: t.TempDir()}
+		if _, err := w.Start(context.Background(), session.WorkerStart{SessionID: "s1", IncarnationID: "i1", EnvID: "e1"}); err == nil {
+			t.Fatal("StartIncarnation 的错误应原样返回")
+		}
+		if got := c.spec.Extensions; on != slices.Equal(got, []string{protocol.ExtensionSubruns}) || (!on && got != nil) {
+			t.Errorf("--worker-subruns=%v：会话 init.extensions = %v", on, got)
+		}
+	}
+	ts := task.TaskState{Subruns: []task.SubrunState{{SubrunID: "st1", Status: "completed", ResultRef: strings.Repeat("a", 64)},
+		{SubrunID: "st2", Status: "timed_out"}}}
+	if r := taskResume(ts); r != nil {
+		t.Fatalf("没有 checkpoint 时 resume = %+v", r)
+	}
+	ts.Latest = &task.LatestCheckpoint{CheckpointID: "cp-1", StepID: "research", State: json.RawMessage(`{}`), Refs: []string{}}
+	r := taskResume(ts)
+	want := fmt.Sprint([]protocol.ResumeSubrun{{SubrunID: "st1", Status: "completed", ResultRef: strings.Repeat("a", 64)},
+		{SubrunID: "st2", Status: "timed_out"}})
+	if r == nil || r.CheckpointID != "cp-1" || fmt.Sprint(r.Subruns) != want {
+		t.Fatalf("resume = %+v", r)
+	}
+	in := protocol.Init{Type: protocol.TypeInit, Bootstrap: protocol.BootstrapVersion, ProtocolVersions: []int64{protocol.Version},
+		Mode: protocol.ModeTask, TaskID: "t", AttemptID: "a", AttemptNo: 2, OutDir: "/workspace/out/a", Resume: r,
+		Extensions: Config{WorkerSubruns: true}.workerExtensions()}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := protocol.DecodeLine(protocol.HostToWorker, b); err != nil {
+		t.Fatalf("组装的 init 未通过协议校验：%v（%s）", err, b)
 	}
 }

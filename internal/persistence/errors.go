@@ -44,6 +44,17 @@ const (
 	CodeRefNotAuthorized   = "ref_not_authorized"   // 引用的 blob 不存在或未授权到当前 scope
 )
 
+// 会话 turn 的原因码（规格 §8.1、§12.3；M4 Plan 12）。
+const (
+	// CodeSessionBlocked：会话被另一个 turn 阻塞（blocked_by_task_id），或已有另一个运行中的 turn，或会话不在
+	// idle/running——会话 turn 的 attempt 创建须等待。
+	CodeSessionBlocked = "session_blocked"
+	// CodeIncarnationNotIdle：授予的 incarnation 不是会话的当前 incarnation，或不处于 idle（上一 turn 尚未释放）。
+	CodeIncarnationNotIdle = "incarnation_not_idle"
+	// CodeSessionBaseMismatch：turn 的 base_session_checkpoint_id 不等于会话当前指针（§12.3），成功裁决不能提交。
+	CodeSessionBaseMismatch = "session_base_mismatch"
+)
+
 // Gateway 事务用例（gateway/call 的 Store）的原因码（规格 §9.2、§9.4–§9.7）。
 const (
 	CodeAccessRevoked        = "access_revoked"                  // attempt_access.state ≠ active
@@ -55,6 +66,17 @@ const (
 	CodeCallDeadlineExceeded = "call_deadline_exceeded"          // 数据库时间已到 deadline_at
 	CodeFingerprintMismatch  = "fingerprint_mismatch"            // 同一 call_id 的指纹不同
 	CodeCallInProgress       = "call_in_progress"                // 该调用已有执行中的 try 或仍在解析
+	CodeToolBudgetExhausted  = "tool_budget_exhausted"           // 搜索/抓取的每 turn 工具调用额度已用完（429，不可重试）
+)
+
+// sub-run 用例的原因码（规格 §8.4、§9.2、§9.6、§13；M4 Plan 14）。值与协议 subrun_started.code 及 Gateway 的
+// 错误码一致；invalid_transition 与 session.CodeInvalidTransition 同值。
+const (
+	CodeConflict              = "conflict"                // 同一 sub-run ID 的定义不同
+	CodeSubrunClosed          = "subrun_closed"           // sub-run 已终态，或不是 started / 未绑定当前 attempt
+	CodeSubrunBudgetExhausted = "subrun_budget_exhausted" // sub-run 层可用 ≤ 0
+	CodeSubrunLimit           = "subrun_limit"            // 该任务已有 4 个逻辑 sub-run
+	CodeInvalidTransition     = "invalid_transition"      // 状态机不允许的转换（含 checkpoint 列出未知 sub-run）
 )
 
 // RejectedError 携带前置条件不满足的原因。

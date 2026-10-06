@@ -48,11 +48,12 @@ func principalFrom(ctx context.Context) (principal, bool) {
 type audience int
 
 const (
-	audienceAdmin  audience = iota // 只限运维；用户 403 forbidden
-	audienceAnyone                 // 匿名可访问（不读会话 cookie）
-	audienceTask                   // 运维，或任务的 owner；他人与无主任务 404 task_not_found
-	audienceList                   // 运维看全部；用户只看自己的
-	audienceUser                   // 只限用户会话；运维 403 forbidden
+	audienceAdmin   audience = iota // 只限运维；用户 403 forbidden
+	audienceAnyone                  // 匿名可访问（不读会话 cookie）
+	audienceTask                    // 运维，或任务的 owner；他人与无主任务 404 task_not_found
+	audienceList                    // 运维看全部；用户只看自己的
+	audienceUser                    // 只限用户会话；运维 403 forbidden
+	audienceSession                 // 运维，或会话的所有者（由会话处理器判定；他人 404 session_not_found）
 )
 
 // accountRoutes 只在 Config.Accounts 非 nil 时注册。
@@ -66,7 +67,7 @@ var accountRoutes = []route{
 
 // allRoutes 是全部可能注册的操作（openapi.yaml 描述的全集）。
 func allRoutes() []route {
-	return append(append([]route{}, routes...), accountRoutes...)
+	return append(append(append([]route{}, routes...), accountRoutes...), sessionRoutes...)
 }
 
 func (h *Handler) now() time.Time {

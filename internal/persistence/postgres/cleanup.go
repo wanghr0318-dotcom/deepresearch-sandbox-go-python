@@ -10,7 +10,9 @@ import (
 )
 
 // ListCleanupCandidates 返回待清理的环境（实现 resource.Store）：stopped_at 已记录、清理未完成、
-// 所属 attempt 已有判决、next_retry_at 已到或为空；按停止时间排序。
+// 所属 attempt 已有判决（会话环境 kind = session 没有 attempt：使用它的 incarnation 已 ended，M4 Plan 12 Task 9）、
+// next_retry_at 已到或为空；按停止时间排序。exec 环境（kind = exec，M4 Plan 15 D8）只要求 stopped_at 已记录：exec 在
+// 收集之后即结束，同步清理失败时由 cleanup loop 接手，不等待所属 attempt 的判决。
 func (s *Store) ListCleanupCandidates(ctx context.Context, now time.Time, limit int) ([]resource.Environment, error) {
 	if limit < 1 {
 		return nil, invalidf("ListCleanupCandidates 的 limit 必须为正")
@@ -19,8 +21,10 @@ func (s *Store) ListCleanupCandidates(ctx context.Context, now time.Time, limit 
 	err := s.read(ctx, "ListCleanupCandidates", func(ctx context.Context, q queryer) error {
 		rows, err := q.Query(ctx, `SELECT e.env_id, e.kind, COALESCE(e.attempt_id, ''), e.status, e.stopped_at, e.cleanup_state,
 				e.cleanup_tries, e.cleanup_error, e.next_retry_at
-			FROM environments e JOIN attempts a ON a.attempt_id = e.attempt_id
-			WHERE e.stopped_at IS NOT NULL AND e.cleanup_state <> 'done' AND a.verdict_hash IS NOT NULL
+			FROM environments e LEFT JOIN attempts a ON a.attempt_id = e.attempt_id
+			WHERE e.stopped_at IS NOT NULL AND e.cleanup_state <> 'done'
+				AND (a.verdict_hash IS NOT NULL OR e.kind = 'exec' OR (e.kind = 'session' AND e.attempt_id IS NULL
+					AND NOT EXISTS (SELECT 1 FROM incarnations i WHERE i.env_id = e.env_id AND i.status <> 'ended')))
 				AND (e.next_retry_at IS NULL OR e.next_retry_at <= $1)
 			ORDER BY e.stopped_at, e.env_id LIMIT $2`, now, limit)
 		if err != nil {

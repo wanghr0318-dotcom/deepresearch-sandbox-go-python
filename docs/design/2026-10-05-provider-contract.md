@@ -166,3 +166,30 @@ ResourceDiag(ctx, envID string) (ResourceDiag, error)
 1. `Create` 只把完整且 init 就绪的环境作为成功返回；同名残留为 `ErrIncomplete`，由 coordinator 清理后重建；无 owner.json 的目录不认领，进入扫描与隔离流程（第 3 节）。
 2. 删除"`ErrNotFound` 视为已停止/已清理"；停止与清理完成只由 `Stop` 的权威检查与 `Destroy` 的逐层核对确认（第 3、4 节）。
 3. 固定执行与停止的并发边界：provider 内的执行闸门、仲裁顺序、停止后无迟到进程、未确认停止不能清理或归还，以及确定性的"start 在途时 stop"测试（第 5 节）。
+
+## 9. 执行中修订（Plan 15）
+
+Plan 15（独立 exec 沙箱，规格 §10）对 exec 环境补充以下契约，决定见计划的 D1、D2、D5：
+
+- **`EnvSpec.Validate`**：exec 环境须给出 `Mounts.OutBytes > 0`；`Mounts.In` 可以为空（由 provider 建立输入暂存目录）。
+- **`EnvInfo.InDir`**：只对 exec 环境且 `Mounts.In` 为空时非空，是 provider 建立的输入暂存目录 `<data>/envs/<env_id>/in` 的宿主路径（root 属主、0755）。调用方在 `StartExec` 之前写入（文件 0444、目录 0755），沙箱内只读可见于 `/in`。幂等 `Create`（完整且 spec 一致）返回同一路径；目录随环境目录由 `Destroy` 删除。
+- **环境目录权限**：`<data>/envs` 为 0711；exec 环境的目录为 0711（init 在 user namespace 中以映射 root 运行，只有"其他人"的权限，须能经过它们到达 `in/` 与 `out/`；数据目录本身由装配以 0711 建立），`owner.json` 仍 0600；编排环境的目录仍 0700。
+- **宿主侧 `/out`**：`Create` 在写 owner.json 之后、启动 init 之前建立 `<envdir>/out` 并挂载 tmpfs（`size=OutBytes,nr_inodes=1024,mode=0700,uid=gid=UIDBase+1000`，`nosuid,nodev`），init 把它可写 bind 到沙箱内的 `/out`。页面按写入者计入环境 cgroup（与匿名内存合计受 `memory.max` 约束）。挂载之后的任何失败都使环境成为残留（`ErrIncomplete`），由 `Stop` → `Destroy` 清理。执行树停止后挂载仍在，`/out` 的内容可供收集。`Scan` 把它作为该环境的 `mount` 层报告，不新增层。
+- **`OpenOutputs(ctx, envID, max) ([]OutputFile, []SkippedOutput, error)`**：前置条件是 `Stop` 的权威检查成立（否则 `ErrNotStopped`）；环境目录不存在 → `ErrNotFound`；归属无法证明 → `ErrForeign`；编排环境（没有 `/out`）→ 错误。从 `<envdir>/out` 的目录 FD 起逐级以 `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_XDEV)` 解析：子目录 `O_DIRECTORY|O_NOFOLLOW`，文件 `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` 后 `fstat` 须为普通文件（规格 §5.6 的打开规则）。递归、按相对路径字典序；收集至多 `max` 个普通文件（`MaxOutputFiles = 256`），其余条目报告为跳过：`symlink`、`not_regular`（FIFO、设备、socket）、`too_many`（超过 `max` 的普通文件）、`open_failed`。返回的文件由调用方关闭；出错时不留下已打开的文件。
+- **`Destroy` 的卸载顺序**：不变——数据目录下的挂载（含 `<envdir>/out` 的 tmpfs，深者先卸）→ 环境 cgroup → 环境目录。`OpenOutputs` 返回的文件仍打开时 tmpfs 卸载失败（`EBUSY`），`Destroy` 返回该宿主错误且不触碰后续各层；**调用方须先关闭全部输出文件再 `Destroy`**，之后重做即可。
+- **一致性测试**：`providertest` 增加"`OpenOutputs` 对编排环境报错、未知环境为 `ErrNotFound`"，以及（`Harness.ExecSpec` 非空时）"exec 环境 `InDir` 幂等、`OpenOutputs` 要求先停止"。fake 以临时目录模拟 `InDir` 与 `/out`（`OutDir(envID)` 供测试写入输出）。
+- **UID 范围的文件回收与核查**（Task 5，D13、E39）：`ReclaimUIDFiles(ctx, base, size)` 只遍历 `<data>/workspaces`，把属主落在范围内的条目以 `fchownat(fd, "", 0, 0, AT_EMPTY_PATH)` 改回 root（不跟随符号链接）；`UIDFiles(ctx, base, size, limit)` 遍历数据目录（跳过顶层 `blobs`，不进入其他文件系统的挂载，但报告挂载点本身的属主），返回至多 `limit` 个仍归该范围的宿主路径。纯函数 `provider.ScanUIDFiles(ctx, s, spans, limit)` 是 `Scan` 的 `uid_files` 层（报告项 EnvID 为空、归属 Unknown）。**范围归还前的唯一判据**：coordinator 在 cleanup loop、启动核对（recovery 的 `ReleaseUIDRange` 步骤经 `Coordinator.ReleaseCheckedUIDRange`）与会话关闭（`ReleaseOwnerUIDRange`，且只在使用过该范围的环境全部"已停止且清理完成"之后）三处都先 `ReclaimUIDFiles`，再以 `ScanUIDFiles` 核查：仍有条目则隔离该范围（`quarantined_resources` 的 `uid_range/<id>`，`kind = uid_files`）并报警、不归还。
+- **exec 环境的生命周期（Task 10 装配）**：`resource.EnvRequest{Kind: exec, Template: "exec", Limits: {MemoryMax: 生效值, PidsMax, CPUQuotaUs, NoFile 256, FSize = OutBytes, TmpBytes}, Mounts: {OutBytes}}` 经 coordinator 创建（环境行由 Gateway 的 `ReserveExec` 先行写入）；`Stop` 经 coordinator（`stopped_at` 已记录才归还 exec slot）；`StartExec`、`ResourceDiag`、`OpenOutputs` 直达 provider；收集之后**关闭全部输出文件**，再以 `Coordinator.CleanupNow(envID)` 同步清理（Destroy → intent → `cleanup_state = done` → 回收、核查并归还 UID 范围）。同步清理失败（例如 `EBUSY`）按退避记入 cleanup 列，由 cleanup loop 接手：`kind = exec` 的环境只要 `stopped_at` 已记录即为候选，不等待所属 attempt 的判决。启动恢复与其他环境一样停止 exec 环境并记录 `stopped_at`；没有 actor 负责的 stop_blocked exec 环境以 `ExecGate.Occupy` 占用其任务的一个 exec slot（不占 run slot 与任务内存池），确认停止后归还。`verify-invariants` 以 I1 的同一扫描把清理完成的 exec 环境的残留报告为 I12 [Q]。
+
+## 10. 执行中修订（Plan 12：会话环境）
+
+Plan 12（规格 §12 会话：每会话一个长期 incarnation，冻结、驱逐、冷恢复）对 `kind = session` 的环境补充以下契约（Task 5 实现，Task 9 装配）：
+
+- **`Mounts.RestoreDir`**（仅 session；task 与 exec 设置它时 `Validate` 拒绝）：宿主目录，只读 bind 到沙箱内的 `/run/agentbox/restore`（`ro,nosuid,nodev`，在 workspace 之后挂载）。冷恢复时宿主把会话 checkpoint 的 `state_ref` 内容暂存为其中的文件 `<sha256>`，Worker 以 `init.session_resume.staged_state_path = /run/agentbox/restore/<sha256>` 读取。bind 的是目录：宿主删除其中的文件后沙箱内随即不可见（incarnation 进入 idle 后的"卸载"）。**目录由调用方建立与删除**（root 属主、0755，文件 0444，上级目录 o+x），provider 只挂载；它不能在环境目录内（`Create` 要求环境目录不存在）。装配取 `<data>/restore/<env_id>`，incarnation ready 之后删除，环境停止之后再次删除（幂等）。
+- **`Freeze(ctx, envID) error`**：写 `cgroup.freeze = 1`，轮询 `cgroup.events` 直到 `frozen 1`。期限为 ctx（没有期限时 10 s）；超时或无法读取冻结状态 → `ErrFreezeUnconfirmed`，返回前已写回 `cgroup.freeze = 0`（不等待解冻完成）。环境 cgroup 不存在 → `ErrNotFound`。**调用方只在 `Freeze` 成功返回之后记录 frozen**（E31：冻结未确认即驱逐）。
+- **`Thaw(ctx, envID) error`**：写 `cgroup.freeze = 0` 并等待 `frozen 0`；cgroup 不存在 → `ErrNotFound`。
+- **`Procs(ctx, envID) ([]int, error)`**：返回环境 cgroup 的 `cgroup.procs`（释放核验：每个 turn 释放后进程表须回到 incarnation ready 时的基线，§12.4、E30）；cgroup 不存在 → `ErrNotFound`。
+- **`Stop` 与冻结**：语义不变；`cgroup.kill` 直接终止冻结的进程，权威检查仍是 `populated 0`。因此重启恢复（§14.1 第 6 步）以普通的 `StopEnv` 停止 frozen 会话的环境，不需要先解冻（E33）。
+- **UID 范围按 owner 保留**：会话环境以 `resource.EnvRequest.UIDOwner = "session:<session_id>"` 创建，coordinator 经 `resource.OwnerUIDStore` 为 owner 分配一段范围并在该会话的各个环境之间复用（workspace 的属主因此跨 incarnation 不变）；环境清理时不归还，会话关闭时 `ReleaseOwnerUIDRange`（要求使用过它的环境全部停止且清理完成）。provider 接口不变：仍只经 `EnvSpec.UIDBase/UIDSize` 收到范围。
+- **清理候选**：会话环境没有 `attempt_id`；它在 `stopped_at` 已记录且使用它的 incarnation 已 `ended` 时成为 cleanup 候选（task 环境仍要求 attempt 已有判决）。
+- **一致性与 fake**：`provider/fake` 实现 `Freeze`/`Thaw`/`Procs`（`Frozen`、`FailFreeze`、`SetProcs` 供测试注入）；`tests/e2e/procprov` 以 SIGSTOP/SIGCONT 模拟冻结，`Procs` 返回存活进程。

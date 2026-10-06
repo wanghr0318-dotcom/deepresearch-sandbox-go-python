@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -23,6 +24,8 @@ type Report struct {
 	CgroupV2   bool
 	CgroupRoot string
 	Problems   []string
+	// Warnings 不阻止启动，由 doctor 与 server 启动日志输出（例如 aarch64 未经验证）。
+	Warnings []string
 	// Items 是逐项检查结果（名称、是否通过、原因），供 agentbox doctor 逐项输出。
 	Items []Item
 }
@@ -42,13 +45,23 @@ var probes = []struct {
 	{"新挂载 API（open_tree/mount_setattr）", probeNewMountAPI},
 	{"close_range", probeCloseRange},
 	{"user namespace 可创建", probeUserNS},
+	{"user namespace 数量上限", probeUserNSMax},
+	{"seccomp 动作（kill_process/errno/allow）", probeSeccompActions},
+	{"CLONE_INTO_CGROUP", probeCloneIntoCgroup},
+	{"pidfd（pidfd_open/pidfd_send_signal）", probePidfd},
 }
+
+// goarch 与 geteuid 是架构与 euid 的来源；测试中可替换。
+var (
+	goarch  = runtime.GOARCH
+	geteuid = os.Geteuid
+)
 
 // Check 对当前宿主机做一次自检。
 func Check() Report {
 	r := Report{
 		IsLinux:    runtime.GOOS == "linux",
-		IsRoot:     os.Geteuid() == 0,
+		IsRoot:     geteuid() == 0,
 		CgroupRoot: DefaultCgroupRoot,
 	}
 
@@ -57,7 +70,16 @@ func Check() Report {
 		return r
 	}
 	if !r.IsRoot {
-		r.Problems = append(r.Problems, "需要 root 权限（M1 未启用 user namespace）")
+		r.Problems = append(r.Problems, "需要 root 权限（特权 Runtime 以 user namespace 隔离 workload，服务本身不是 rootless，规格 §4.5）")
+	}
+
+	archItem, archProblem, archWarning := checkArch(goarch)
+	r.Items = append(r.Items, archItem)
+	if archProblem != "" {
+		r.Problems = append(r.Problems, archProblem)
+	}
+	if archWarning != "" {
+		r.Warnings = append(r.Warnings, archWarning)
 	}
 
 	release := "" // 读不到则留空，由 checkCgroup 报为无法确认 cgroup.kill
@@ -129,6 +151,63 @@ func kernelAtLeast(release string, major, minor int) bool {
 		return false
 	}
 	return a > major || (a == major && b >= minor)
+}
+
+// aarch64Warning 是 arm64 宿主上的警告：可以启动，但不构成支持主张。
+const aarch64Warning = "aarch64 未经单独验证，不构成支持主张（规格 §16.2）"
+
+// checkArch 声明架构支持范围：amd64 支持；arm64 可运行但只给警告；其余为问题。
+func checkArch(arch string) (item Item, problem, warning string) {
+	switch arch {
+	case "amd64":
+		return Item{"架构", true, "amd64（x86_64），受支持"}, "", ""
+	case "arm64":
+		return Item{"架构", true, "arm64：" + aarch64Warning}, "", aarch64Warning
+	}
+	detail := fmt.Sprintf("架构 %s 不受支持（仅支持 amd64；arm64 未经验证）", arch)
+	return Item{"架构", false, detail}, detail, ""
+}
+
+// checkUserNS 解析 /proc/sys/user/max_user_namespaces：必须是正整数。
+func checkUserNS(content string) (bool, string) {
+	s := strings.TrimSpace(content)
+	n, err := strconv.Atoi(s)
+	switch {
+	case err != nil:
+		return false, fmt.Sprintf("无法解析 max_user_namespaces %q", s)
+	case n <= 0:
+		return false, fmt.Sprintf("max_user_namespaces = %d，user namespace 被禁用", n)
+	}
+	return true, fmt.Sprintf("max_user_namespaces = %d", n)
+}
+
+// requiredSeccompActions 是 seccomp 配置用到的动作（规格 §4.5）。
+var requiredSeccompActions = []string{"kill_process", "errno", "allow"}
+
+// checkSeccompActions 检查 /proc/sys/kernel/seccomp/actions_avail 是否含所需动作。
+func checkSeccompActions(content string) (bool, string) {
+	have := map[string]bool{}
+	for _, a := range strings.Fields(content) {
+		have[a] = true
+	}
+	var missing []string
+	for _, a := range requiredSeccompActions {
+		if !have[a] {
+			missing = append(missing, a)
+		}
+	}
+	if len(missing) > 0 {
+		return false, "seccomp 缺少动作：" + strings.Join(missing, "、")
+	}
+	return true, "seccomp 动作 " + strings.Join(requiredSeccompActions, "、") + " 可用"
+}
+
+// checkCloneIntoCgroup 按内核版本判断 clone3 的 CLONE_INTO_CGROUP（≥ 5.7）。
+func checkCloneIntoCgroup(release string) (bool, string) {
+	if !kernelAtLeast(release, 5, 7) {
+		return false, fmt.Sprintf("内核 %q 不支持 CLONE_INTO_CGROUP（需要 ≥ 5.7）", release)
+	}
+	return true, "内核 " + release + " 支持 CLONE_INTO_CGROUP（≥ 5.7）"
 }
 
 // Err 在存在任何问题时返回一个汇总错误，否则返回 nil。

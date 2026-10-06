@@ -18,7 +18,10 @@ const (
 	WorkerToHost
 )
 
-var registry = map[Direction]map[string]func() Message{
+// messageRegistry 按方向把消息类型映射到其构造函数。
+type messageRegistry map[Direction]map[string]func() Message
+
+var registry = messageRegistry{
 	HostToWorker: {
 		TypeInit:             func() Message { return &Init{} },
 		TypeCheckpointResult: func() Message { return &CheckpointResult{} },
@@ -39,10 +42,14 @@ var registry = map[Direction]map[string]func() Message{
 	},
 }
 
-// DecodeLine 解析并校验一行消息（不含行尾换行符）。
+// DecodeLine 解析并校验一行 task 模式消息（不含行尾换行符）。
 // 判定顺序：行长 → UTF-8 → JSON 结构限制 → 消息类型 → 类型上限 → 版本 → 键名大小写 → 字段类型 → 语义规则。
-// 未知字段忽略；违规均返回 *Error。
+// 未知字段忽略；违规均返回 *Error。session 模式使用 DecodeSessionLine。
 func DecodeLine(dir Direction, line []byte) (Message, error) {
+	return decodeLine(registry, dir, line)
+}
+
+func decodeLine(reg messageRegistry, dir Direction, line []byte) (Message, error) {
 	if len(line) > maxLineBytes {
 		return nil, newError(CodeMessageTooLarge, "%d 字节，上限 %d", len(line), maxLineBytes)
 	}
@@ -63,7 +70,7 @@ func DecodeLine(dir Direction, line []byte) (Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	newMsg, ok := registry[dir][typ]
+	newMsg, ok := reg[dir][typ]
 	if !ok {
 		return nil, newError(CodeUnknownType, "%q", typ)
 	}
@@ -93,9 +100,14 @@ func DecodeLine(dir Direction, line []byte) (Message, error) {
 	return m, nil
 }
 
-// EncodeLine 校验并编码一条消息（不含行尾换行符）。m 的 type 字段必须与其类型一致。
+// EncodeLine 校验并编码一条 task 模式消息（不含行尾换行符）。m 的 type 字段必须与其类型一致。
+// session 模式使用 EncodeSessionLine。
 func EncodeLine(dir Direction, m Message) ([]byte, error) {
-	if _, ok := registry[dir][m.MessageType()]; !ok {
+	return encodeLine(registry, dir, m, false)
+}
+
+func encodeLine(reg messageRegistry, dir Direction, m Message, session bool) ([]byte, error) {
+	if _, ok := reg[dir][m.MessageType()]; !ok {
 		return nil, newError(CodeUnknownType, "%s 不属于该方向", m.MessageType())
 	}
 	if m.declaredType() != m.MessageType() {
@@ -103,6 +115,11 @@ func EncodeLine(dir Direction, m Message) ([]byte, error) {
 	}
 	if err := m.validate(); err != nil {
 		return nil, err
+	}
+	if session {
+		if err := validateSessionMode(m); err != nil {
+			return nil, err
+		}
 	}
 	b, err := json.Marshal(m)
 	if err != nil {
@@ -139,12 +156,12 @@ func checkVersionField(raw json.RawMessage) error {
 	return checkVersion(v)
 }
 
-// checkSize 按方向与类型检查上限：Worker 事件 MaxEventBytes，init MaxInitBytes，
-// 其他宿主控制消息 MaxControlBytes。
+// checkSize 按方向与类型检查上限：Worker 事件 MaxEventBytes，init 与 task_start
+// （携带 config 与 resume.state）MaxInitBytes，其他宿主控制消息 MaxControlBytes。
 func checkSize(dir Direction, typ string, n int) error {
 	limit := MaxEventBytes
 	switch {
-	case dir == HostToWorker && typ == TypeInit:
+	case dir == HostToWorker && (typ == TypeInit || typ == TypeTaskStart):
 		limit = MaxInitBytes
 	case dir == HostToWorker:
 		limit = MaxControlBytes

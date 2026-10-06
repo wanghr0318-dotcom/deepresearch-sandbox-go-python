@@ -69,7 +69,8 @@ const (
 // launchSpecFor 由 provider.EnvSpec 构造启动进程转交给 init 的 LaunchSpec（规格 §4.5 的隔离配置）：
 // GID 范围与 UID 范围相同；模板按名称解析（空为默认模板）；rlimit 与挂载来自 Limits/Mounts。
 // 只做形状校验（rootfs.Template.Validate）；宿主路径是否存在由装配在启动时 Ensure。
-func launchSpecFor(spec provider.EnvSpec) (sandbox.LaunchSpec, error) {
+// exec 环境的 /in 为 Mounts.In，未提供时为 provider 建立的 <dir>/in；/out 总是 <dir>/out 上的宿主 tmpfs（D1、D2）。
+func launchSpecFor(spec provider.EnvSpec, dir string) (sandbox.LaunchSpec, error) {
 	name := spec.Template
 	if name == "" {
 		name = rootfs.DefaultTemplateName
@@ -86,17 +87,41 @@ func launchSpecFor(spec provider.EnvSpec) (sandbox.LaunchSpec, error) {
 	if nofile == 0 {
 		nofile = defaultNoFile
 	}
+	in, out := spec.Mounts.In, ""
+	if spec.Kind == provider.KindExec {
+		if in == "" {
+			in = inDir(spec, dir)
+		}
+		out = filepath.Join(dir, execOutName)
+	}
 	return sandbox.LaunchSpec{
 		UIDBase: spec.UIDBase, UIDSize: spec.UIDSize,
 		GIDBase: spec.UIDBase, GIDSize: spec.UIDSize,
 		Hostname: envHostname,
 		Init: sandbox.InitSpec{
 			Kind: string(spec.Kind), Template: tpl, TmpBytes: tmp,
-			Workspace: spec.Mounts.Workspace, GatewaySocket: spec.Mounts.GatewaySocket,
-			In: spec.Mounts.In, OutBytes: spec.Mounts.OutBytes,
+			Workspace: spec.Mounts.Workspace, GatewaySocket: spec.Mounts.GatewaySocket, Restore: spec.Mounts.RestoreDir,
+			In: in, Out: out, OutBytes: spec.Mounts.OutBytes,
 			NoFile: nofile, FSize: spec.Limits.FSize,
 		},
 	}, nil
+}
+
+// checkReachable 确认 init 能够到达 p：init 在 user namespace 中以映射 root 运行，对宿主 root 所有的上级目录
+// 只有"其他人"的权限，因此 p 的每个上级目录都须有 o+x。
+func checkReachable(p string) error {
+	for d := filepath.Dir(p); ; d = filepath.Dir(d) {
+		fi, err := os.Stat(d)
+		if err != nil {
+			return fmt.Errorf("local: %s 的上级目录 %s: %w", p, d, err)
+		}
+		if fi.Mode().Perm()&0o001 == 0 {
+			return fmt.Errorf("local: 上级目录 %s 的权限 %v 缺少 o+x，沙箱 init 无法到达 %s", d, fi.Mode().Perm(), p)
+		}
+		if d == "/" || d == "." {
+			return nil
+		}
+	}
 }
 
 // workloadID 是沙箱内 workload 的映射 uid/gid（规格 §4.5；与 sandbox 中的取值相同）。
@@ -108,17 +133,8 @@ const workloadID = 1000
 // 因此每个上级目录都须有 o+x（数据目录与 workspaces 目录由装配以 0711 建立）。
 // 同一任务的后续 attempt 可能分到不同的 UID 范围，所以每次启动都重新 chown。
 func prepareWorkspace(ws string, id uint32) error {
-	for d := filepath.Dir(ws); ; d = filepath.Dir(d) {
-		fi, err := os.Stat(d)
-		if err != nil {
-			return fmt.Errorf("local: workspace 上级目录 %s: %w", d, err)
-		}
-		if fi.Mode().Perm()&0o001 == 0 {
-			return fmt.Errorf("local: workspace 上级目录 %s 的权限 %v 缺少 o+x，沙箱 init 无法到达 %s", d, fi.Mode().Perm(), ws)
-		}
-		if d == "/" || d == "." {
-			break
-		}
+	if err := checkReachable(ws); err != nil {
+		return err
 	}
 	err := filepath.WalkDir(ws, func(p string, _ fs.DirEntry, err error) error {
 		if err != nil {
@@ -155,15 +171,23 @@ func isSubreaper() bool {
 	return e == 0 && v != 0
 }
 
-// StartInit 实现 EnvStarter。dir 目前不使用（挂载在 init 中建立，Plan 2 Task 10）。
-func (s *ProcessStarter) StartInit(ctx context.Context, spec provider.EnvSpec, _ string, cg *cgroup.Group) (*sandbox.Conn, int, error) {
+// StartInit 实现 EnvStarter。dir 是环境目录：exec 环境的 /in 暂存与 /out 挂载点在其下（Create 已建立）。
+func (s *ProcessStarter) StartInit(ctx context.Context, spec provider.EnvSpec, dir string, cg *cgroup.Group) (*sandbox.Conn, int, error) {
 	if !isSubreaper() {
 		// 否则 init 会被收养到 server 之外，starter 无法收割它。
 		return nil, 0, errors.New("local: 本进程不是 child subreaper（须经 NewProcessStarter 构造启动器）")
 	}
-	ls, err := launchSpecFor(spec)
+	ls, err := launchSpecFor(spec, dir)
 	if err != nil {
 		return nil, 0, err
+	}
+	for _, p := range []string{ls.Init.In, ls.Init.Out, ls.Init.Restore} {
+		if p == "" {
+			continue
+		}
+		if err := checkReachable(p); err != nil {
+			return nil, 0, err
+		}
 	}
 	ls.Env, ls.FailAt = s.initEnv, s.failAt
 	if spec.Mounts.Workspace != "" {

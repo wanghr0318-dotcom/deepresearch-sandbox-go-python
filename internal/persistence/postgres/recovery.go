@@ -3,6 +3,8 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -10,6 +12,7 @@ import (
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/recovery"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/resource"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/session"
 )
 
 var _ recovery.Store = (*Store)(nil)
@@ -104,12 +107,79 @@ func loadUnreleasedRanges(ctx context.Context, tx pgx.Tx) ([]resource.UIDRange, 
 	})
 }
 
+// EvictSessionsOnRestart 是重启时的会话驱逐（实现 recovery.Store；规格 §12.6、§14.1 第 7 步），单事务：未关闭会话的
+// 非 ended incarnation 置为 ended{lost_on_restart}（当前的清空 current_incarnation_id）；status ∉ {creating, evicted,
+// closing, closed} 的会话置为 evicted 并追加 session_state{evicted}。启动恢复在 actor 与 API 启动之前运行。
+// 锁顺序：sessions（按 session_id）→ incarnations → session_event_seq。
+func (s *Store) EvictSessionsOnRestart(ctx context.Context) ([]recovery.EvictedSession, error) {
+	var out []recovery.EvictedSession
+	err := s.run(ctx, "EvictSessionsOnRestart", "", func(ctx context.Context, tx pgx.Tx) error {
+		out = nil
+		rows, err := tx.Query(ctx, `SELECT session_id, status, row_version FROM sessions WHERE status <> 'closed'
+			ORDER BY session_id FOR UPDATE`)
+		if err != nil {
+			return err
+		}
+		type row struct {
+			id, status string
+			rv         int64
+		}
+		open, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (row, error) {
+			var x row
+			err := r.Scan(&x.id, &x.status, &x.rv)
+			return x, err
+		})
+		if err != nil {
+			return err
+		}
+		for _, x := range open {
+			rows, err := tx.Query(ctx, `UPDATE incarnations SET status = 'ended', ended_at = now(), end_reason = $2
+				WHERE session_id = $1 AND status <> 'ended' RETURNING incarnation_id, env_id`, x.id, session.EndLostOnRestart)
+			if err != nil {
+				return err
+			}
+			ended, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (recovery.EvictedSession, error) {
+				e := recovery.EvictedSession{SessionID: x.id}
+				err := r.Scan(&e.IncarnationID, &e.EnvID)
+				return e, err
+			})
+			if err != nil {
+				return err
+			}
+			evict := !slices.Contains([]string{session.StatusCreating, session.StatusEvicted, session.StatusClosing}, x.status)
+			if !evict {
+				if len(ended) > 0 {
+					if _, err := tx.Exec(ctx, "UPDATE sessions SET current_incarnation_id = NULL WHERE session_id = $1", x.id); err != nil {
+						return err
+					}
+				}
+				out = append(out, ended...)
+				continue
+			}
+			if _, err := tx.Exec(ctx, `UPDATE sessions SET status = 'evicted', row_version = row_version + 1, current_incarnation_id = NULL,
+				idle_since = NULL, frozen_since = NULL WHERE session_id = $1`, x.id); err != nil {
+				return err
+			}
+			if _, err := appendSessionEvent(ctx, tx, x.id, fmt.Sprintf("%s:%d", session.StatusEvicted, x.rv+1),
+				statePayload(session.StatusEvicted)); err != nil {
+				return err
+			}
+			if len(ended) == 0 {
+				ended = []recovery.EvictedSession{{SessionID: x.id}}
+			}
+			out = append(out, ended...)
+		}
+		return nil
+	})
+	return out, err
+}
+
 // RevokeAllActive 在单个事务中撤销全部 active 的 attempt 访问（实现 recovery.Store；规格 §14.1 第 3 步）。
 // 重跑时已撤销的行不再计入，结果仍是"全部已撤销"。
 func (s *Store) RevokeAllActive(ctx context.Context, reason string) (int, error) {
 	var n int
 	err := s.run(ctx, "RevokeAllActive", "", func(ctx context.Context, tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `UPDATE attempt_access SET state = 'revoked', revoked_at = now(), reason = $1
+		tag, err := tx.Exec(ctx, `UPDATE attempt_access SET state = 'revoked', revoked_at = clock_timestamp(), reason = $1
 			WHERE state = 'active'`, reason)
 		n = int(tag.RowsAffected())
 		return err

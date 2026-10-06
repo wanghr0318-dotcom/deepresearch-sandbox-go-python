@@ -3,7 +3,8 @@
 // - 维护游标（最后交付的 task_seq），重连时以 Last-Event-ID 续传；按事件 ID 去重；
 // - 断线后指数退避重连（上限 30 s）；连接有进展后退避计数归零；
 // - 服务端每 15 s 发一次注释心跳；超过 idleTimeoutMs 没收到任何字节视为连接僵死，主动断开重连；
-// - 收到 task_terminal 后关闭，不再发起任何请求；
+// - 收到终止帧（任务流为 task_terminal；会话流为 session_state closed）后关闭，不再发起任何请求；
+// - watchEvents 是通用实现，watchTaskEvents 只是它的任务流包装（行为不变）；
 // - 400 invalid_cursor（以及其他不可重试的 4xx）时停止并报告。
 
 import { authHeaders } from "./auth";
@@ -159,13 +160,44 @@ export interface EventStream {
   readonly done: Promise<StreamOutcome>;
 }
 
+/** 通用事件流选项：任务流与会话流共用同一套续传、去重、退避与空闲检测。 */
+export interface StreamOptions<E> {
+  /** 事件流路径，例如 /tasks/<id>/events、/sessions/<id>/events（调用方负责转义路径段）。 */
+  path: string;
+  baseUrl?: string;
+  getToken?: () => string;
+  fetch?: FetchLike;
+  /** 已交付的最后一个序号（SSE id）；0 表示从头开始。 */
+  cursor?: number;
+  /** 收到这一帧后关闭且不再重连；缺省永不终止（会话流跨越多轮一直打开）。 */
+  isTerminal?: (frameType: string, ev: E) => boolean;
+  onEvent: (ev: E, frameType: string) => void;
+  onHeartbeat?: () => void;
+  onState?: (state: StreamState, info: { attempt: number; delayMs?: number; error?: unknown }) => void;
+  backoffBaseMs?: number;
+  backoffCapMs?: number;
+  /** 超过这么久没有收到任何字节（含心跳）则断开重连；默认 45 s = 3 个心跳周期。 */
+  idleTimeoutMs?: number;
+}
+
+/** 任务事件流：/tasks/<id>/events，收到 task_terminal 后关闭。 */
 export function watchTaskEvents(opts: WatchOptions): EventStream {
+  const { taskId, ...rest } = opts;
+  return watchEvents<TaskEvent>({
+    ...rest,
+    path: `/tasks/${pathSeg(taskId)}/events`,
+    isTerminal: (frameType, ev) => frameType === TERMINAL_EVENT || ev.type === TERMINAL_EVENT,
+  });
+}
+
+export function watchEvents<E>(opts: StreamOptions<E>): EventStream {
   const fetchFn: FetchLike = opts.fetch ?? ((input, init) => globalThis.fetch(input, init));
   const getToken = opts.getToken ?? (() => "");
   const baseMs = opts.backoffBaseMs ?? 1000;
   const capMs = opts.backoffCapMs ?? 30_000;
   const idleMs = opts.idleTimeoutMs ?? 45_000;
-  const url = `${(opts.baseUrl ?? "").replace(/\/+$/, "")}/tasks/${pathSeg(opts.taskId)}/events`;
+  const isTerminal = opts.isTerminal ?? (() => false);
+  const url = `${(opts.baseUrl ?? "").replace(/\/+$/, "")}${opts.path}`;
   const stopper = new AbortController();
   let cursor = Math.max(0, Math.trunc(opts.cursor ?? 0));
   const state = (s: StreamState, info: { attempt: number; delayMs?: number; error?: unknown }) =>
@@ -214,16 +246,16 @@ export function watchTaskEvents(opts: WatchOptions): EventStream {
             return;
           }
           if (seq <= cursor) return; // 重连后服务端重放的旧事件：按 ID 去重
-          let ev: TaskEvent;
+          let ev: E;
           try {
-            ev = JSON.parse(f.data) as TaskEvent;
+            ev = JSON.parse(f.data) as E;
           } catch {
             fatal = new ProtocolError(`事件 ${seq} 的 data 不是 JSON`);
             return;
           }
           cursor = seq;
           out.progressed = true;
-          if (f.event === TERMINAL_EVENT || ev.type === TERMINAL_EVENT) out.terminal = true;
+          if (isTerminal(f.event, ev)) out.terminal = true;
           opts.onEvent(ev, f.event);
         },
         () => opts.onHeartbeat?.(),

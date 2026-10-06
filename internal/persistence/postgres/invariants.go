@@ -14,39 +14,140 @@ var _ invariants.Store = (*Store)(nil)
 // quarantineAlertDeadline 是 I8（[B] 类）的期限：隔离资源须在此时间内报警。与启动恢复期限一致（规格 §19）。
 const quarantineAlertDeadline = "60 seconds"
 
+// execStopDeadline 是 I12 [B] 的期限：已结束 attempt 的 exec 环境须在此时间内确认停止（--exec-stop-deadline 的默认值，
+// 同启动恢复期限，规格 §19）。
+const execStopDeadline = "60 seconds"
+
 // invariantQueries 每条返回 (subject text, detail text) 行；有行即违反。
 var invariantQueries = []struct {
 	id, class, sql string
 }{
-	{"I2", "A", `SELECT a.task_id, count(*)::text || ' 个 attempt 的环境未确认停止'
+	// I2：同一任务至多一个 attempt 有未确认停止的环境。按 attempt 计数：一个存活 attempt 的任务环境与其 exec 环境
+	// 并存不是违例（旧 attempt 未停止的 exec 环境与新 attempt 并存仍是违例，CreateAttempt 的准入同样把它算作旧环境）。
+	{"I2", "A", `SELECT a.task_id, count(DISTINCT a.attempt_id)::text || ' 个 attempt 的环境未确认停止'
 		FROM attempts a JOIN environments e ON e.attempt_id = a.attempt_id
-		WHERE e.stopped_at IS NULL GROUP BY a.task_id HAVING count(*) > 1`},
-	// I3（task 层）：reserved = Σ held、unknown = Σ charged_unknown、spent = Σ settled try 的实际费用。
-	{"I3", "A", `SELECT b.task_id, format('reserved=%s（held 之和 %s），unknown=%s（charged_unknown 之和 %s），spent=%s（settled 之和 %s）',
+		WHERE e.stopped_at IS NULL GROUP BY a.task_id HAVING count(DISTINCT a.attempt_id) > 1`},
+	// I3 分 kind 两组同形核对（D10）。money（budgets，微美元）：reserved = Σ held、unknown = Σ charged_unknown、
+	// spent = Σ settled try 的实际费用。
+	{"I3", "A", `SELECT b.task_id, format('money：reserved=%s（held 之和 %s），unknown=%s（charged_unknown 之和 %s），spent=%s（settled 之和 %s）',
 			b.reserved_micro, COALESCE(r.held, 0), b.unknown_micro, COALESCE(r.unk, 0), b.spent_micro, COALESCE(s.spent, 0))
 		FROM budgets b
 		LEFT JOIN (SELECT task_id, sum(amount) FILTER (WHERE state = 'held') AS held,
 				sum(amount) FILTER (WHERE state = 'charged_unknown') AS unk
-			FROM reservations GROUP BY task_id) r ON r.task_id = b.task_id
+			FROM reservations WHERE kind = 'money' GROUP BY task_id) r ON r.task_id = b.task_id
 		LEFT JOIN (SELECT t.task_id, sum(t.cost_micro) AS spent FROM call_tries t
-				JOIN reservations x ON x.reservation_id = t.reservation_id WHERE x.state = 'settled' GROUP BY t.task_id) s
+				JOIN reservations x ON x.reservation_id = t.reservation_id WHERE x.state = 'settled' AND x.kind = 'money' GROUP BY t.task_id) s
 			ON s.task_id = b.task_id
 		WHERE b.reserved_micro <> COALESCE(r.held, 0) OR b.unknown_micro <> COALESCE(r.unk, 0) OR b.spent_micro <> COALESCE(s.spent, 0)`},
-	// I3：每笔 reservation 恰在一个桶中，且与其 try 的结算一致（held ↔ 在途；settled ↔ ok；released ↔ retryable/fatal；
+	// I3 money：每笔 reservation 恰在一个桶中，且与其 try 的结算一致（held ↔ 在途；settled ↔ ok；released ↔ retryable/fatal；
 	// charged_unknown ↔ unknown）。
-	{"I3", "A", `SELECT r.task_id, format('reservation %s（%s#%s）为 %s，try 为 %s/%s', r.reservation_id, r.call_id, r.try_no,
+	{"I3", "A", `SELECT r.task_id, format('money reservation %s（%s#%s）为 %s，try 为 %s/%s', r.reservation_id, r.call_id, r.try_no,
 			r.state, COALESCE(t.state, '∅'), COALESCE(NULLIF(t.outcome, ''), '∅'))
 		FROM reservations r LEFT JOIN call_tries t ON t.reservation_id = r.reservation_id
-		WHERE t.reservation_id IS NULL OR NOT ((r.state = 'held' AND t.state = 'in_flight')
+		WHERE r.kind = 'money' AND (t.reservation_id IS NULL OR NOT ((r.state = 'held' AND t.state = 'in_flight')
 			OR (r.state = 'settled' AND t.outcome = 'ok') OR (r.state = 'released' AND t.outcome IN ('retryable', 'fatal'))
-			OR (r.state = 'charged_unknown' AND t.outcome = 'unknown'))`},
+			OR (r.state = 'charged_unknown' AND t.outcome = 'unknown')))`},
+	// I3 cpu（exec_quotas，usec）：cpu_reserved = Σ held、cpu_unknown = Σ charged_unknown、cpu_spent = Σ settled try 的
+	// 计入量（实测 cpu_usec；读取失败为 NULL，按全额预留计入）。有 cpu 预留而没有配额行的任务同样报告。
+	{"I3", "A", `SELECT COALESCE(q.task_id, r.task_id), format('cpu：cpu_reserved=%s（held 之和 %s），cpu_unknown=%s（charged_unknown 之和 %s），cpu_spent=%s（settled 之和 %s）',
+			COALESCE(q.cpu_reserved_usec::text, '∅'), COALESCE(r.held, 0), COALESCE(q.cpu_unknown_usec::text, '∅'), COALESCE(r.unk, 0),
+			COALESCE(q.cpu_spent_usec::text, '∅'), COALESCE(r.spent, 0))
+		FROM exec_quotas q
+		FULL JOIN (SELECT x.task_id, sum(x.amount) FILTER (WHERE x.state = 'held') AS held,
+				sum(x.amount) FILTER (WHERE x.state = 'charged_unknown') AS unk,
+				sum(COALESCE(t.cpu_usec, x.amount)) FILTER (WHERE x.state = 'settled') AS spent
+			FROM reservations x LEFT JOIN call_tries t ON t.reservation_id = x.reservation_id
+			WHERE x.kind = 'cpu' GROUP BY x.task_id) r ON r.task_id = q.task_id
+		WHERE q.task_id IS NULL OR q.cpu_reserved_usec <> COALESCE(r.held, 0) OR q.cpu_unknown_usec <> COALESCE(r.unk, 0)
+			OR q.cpu_spent_usec <> COALESCE(r.spent, 0)`},
+	// I3 cpu：每笔 reservation 恰在一个桶中，且与其 try 的结算一致（held ↔ 在途；settled ↔ ok（completed/timed_out）、
+	// retryable（cancelled）、fatal（start_failed）；charged_unknown ↔ unknown；exec 没有 released）。
+	{"I3", "A", `SELECT r.task_id, format('cpu reservation %s（%s#%s）为 %s，try 为 %s/%s', r.reservation_id, r.call_id, r.try_no,
+			r.state, COALESCE(t.state, '∅'), COALESCE(NULLIF(t.outcome, ''), '∅'))
+		FROM reservations r LEFT JOIN call_tries t ON t.reservation_id = r.reservation_id
+		WHERE r.kind = 'cpu' AND (t.reservation_id IS NULL OR NOT ((r.state = 'held' AND t.state = 'in_flight')
+			OR (r.state = 'settled' AND t.outcome IN ('ok', 'retryable', 'fatal'))
+			OR (r.state = 'charged_unknown' AND t.outcome = 'unknown')))`},
+	// I3 sub-run 层（两层账本，规格 §9.6；只有 money 预留归属 sub-run，exec 的 cpu 预留 subrun_id 为 NULL）：每个 sub-run
+	// reserved = Σ 该 sub-run 的 held、unknown = Σ charged_unknown、spent = Σ settled try 的实际费用。task 层见上。
+	{"I3", "A", `SELECT sb.task_id, format('sub-run %s：reserved=%s（held 之和 %s），unknown=%s（charged_unknown 之和 %s），spent=%s（settled 之和 %s）',
+			sb.subrun_id, sb.reserved_micro, COALESCE(r.held, 0), sb.unknown_micro, COALESCE(r.unk, 0), sb.spent_micro, COALESCE(s.spent, 0))
+		FROM subrun_budgets sb
+		LEFT JOIN (SELECT task_id, subrun_id, sum(amount) FILTER (WHERE state = 'held') AS held,
+				sum(amount) FILTER (WHERE state = 'charged_unknown') AS unk
+			FROM reservations WHERE kind = 'money' AND subrun_id IS NOT NULL GROUP BY task_id, subrun_id) r
+			ON r.task_id = sb.task_id AND r.subrun_id = sb.subrun_id
+		LEFT JOIN (SELECT x.task_id, x.subrun_id, sum(t.cost_micro) AS spent FROM call_tries t
+				JOIN reservations x ON x.reservation_id = t.reservation_id
+				WHERE x.state = 'settled' AND x.kind = 'money' AND x.subrun_id IS NOT NULL GROUP BY x.task_id, x.subrun_id) s
+			ON s.task_id = sb.task_id AND s.subrun_id = sb.subrun_id
+		WHERE sb.reserved_micro <> COALESCE(r.held, 0) OR sb.unknown_micro <> COALESCE(r.unk, 0) OR sb.spent_micro <> COALESCE(s.spent, 0)`},
+	// I3 归属：money reservation 记在其调用所属的层（reservations.subrun_id 与 calls.subrun_id 相同；root 为 NULL）。
+	{"I3", "A", `SELECT r.task_id, format('money reservation %s 记在 %s 层，调用 %s 属于 %s', r.reservation_id,
+			COALESCE(r.subrun_id, 'root'), r.call_id, COALESCE(c.subrun_id, 'root'))
+		FROM reservations r JOIN calls c ON c.task_id = r.task_id AND c.call_id = r.call_id
+		WHERE r.kind = 'money' AND r.subrun_id IS DISTINCT FROM c.subrun_id`},
+	// I13：各 sub-run 账本之和每桶（reserved、spent、unknown 分别比较）不超过 task 账本。
+	{"I13", "A", `SELECT b.task_id, format('Σ sub-run reserved=%s / spent=%s / unknown=%s 超过 task 层 %s / %s / %s',
+			x.r, x.s, x.u, b.reserved_micro, b.spent_micro, b.unknown_micro)
+		FROM budgets b JOIN (SELECT task_id, sum(reserved_micro) AS r, sum(spent_micro) AS s, sum(unknown_micro) AS u
+			FROM subrun_budgets GROUP BY task_id) x ON x.task_id = b.task_id
+		WHERE x.r > b.reserved_micro OR x.s > b.spent_micro OR x.u > b.unknown_micro`},
+	// I13：completed 的 sub-run 出现在该任务某个已提交 checkpoint 的 subruns[] 中（completed 且 result_ref 相同，§13.5）。
+	{"I13", "A", `SELECT s.task_id, format('sub-run %s 为 completed（result_ref %s），没有已提交的 checkpoint 以同一 result_ref 列出它',
+			s.subrun_id, COALESCE(s.result_ref, '∅'))
+		FROM subruns s WHERE s.status = 'completed' AND NOT EXISTS (SELECT 1 FROM checkpoints c, jsonb_array_elements(c.subruns_json) e
+			WHERE c.scope_kind = 'task' AND c.scope_id = s.task_id AND e->>'subrun_id' = s.subrun_id
+				AND e->>'status' = 'completed' AND e->>'result_ref' = s.result_ref)`},
+	// I13：状态不回退。终态的 ended_at 非空；已提交 checkpoint 列出的终态（completed、cancelled、failed）与该 sub-run 的
+	// 最终状态一致（cancelled 对应 cancelled|timed_out，completed 的 result_ref 相同）；列为终态之后（commit_seq 更大）
+	// 不再被列为 started。sub-run 的状态转换没有单独的宿主事件，提交顺序以 checkpoint 的 commit_seq 为准。
+	{"I13", "A", `SELECT s.task_id, format('sub-run %s 为 %s，但终态未记录 ended_at', s.subrun_id, s.status)
+		FROM subruns s WHERE s.status IN ('completed', 'cancelled', 'failed', 'timed_out') AND s.ended_at IS NULL`},
+	{"I13", "A", `WITH l AS (SELECT c.scope_id AS task_id, c.checkpoint_id, c.commit_seq, e->>'subrun_id' AS subrun_id,
+				e->>'status' AS st, e->>'result_ref' AS ref
+			FROM checkpoints c, jsonb_array_elements(c.subruns_json) e
+			WHERE c.scope_kind = 'task' AND c.checkpoint_id NOT LIKE 'seed-%')
+		SELECT s.task_id, format('sub-run %s 最终为 %s，checkpoint %s（commit_seq %s）列为 %s', s.subrun_id, s.status,
+				l.checkpoint_id, l.commit_seq, l.st)
+			FROM subruns s JOIN l ON l.task_id = s.task_id AND l.subrun_id = s.subrun_id
+			WHERE l.st <> 'started' AND NOT ((l.st = 'completed' AND s.status = 'completed' AND l.ref = s.result_ref)
+				OR (l.st = 'cancelled' AND s.status IN ('cancelled', 'timed_out')) OR (l.st = 'failed' AND s.status = 'failed'))
+		UNION ALL
+		SELECT t.task_id, format('sub-run %s 在 checkpoint %s（commit_seq %s）列为 %s 之后，checkpoint %s（commit_seq %s）又列为 started',
+				t.subrun_id, t.checkpoint_id, t.commit_seq, t.st, l.checkpoint_id, l.commit_seq)
+			FROM l t JOIN l ON l.task_id = t.task_id AND l.subrun_id = t.subrun_id AND l.commit_seq > t.commit_seq
+			WHERE t.st <> 'started' AND l.st = 'started'`},
+	// I13：终态任务没有未终态的 sub-run（裁决事务、无 attempt 的取消与失败在同一事务中收尾，§8.4）。
+	{"I13", "A", `SELECT s.task_id, format('任务已 %s，sub-run %s 仍为 %s', t.status, s.subrun_id, s.status)
+		FROM subruns s JOIN tasks t ON t.task_id = s.task_id
+		WHERE t.status IN ('succeeded', 'failed', 'cancelled') AND s.status IN ('started', 'end_proposed', 'cancel_requested')`},
+	// I12 [A]：已结束（访问已撤销）的 attempt 不启动新 exec——exec_started_at 不晚于所属 attempt 的 revoked_at。
+	// MarkExecStarting 与撤销在 attempt_access 上串行，先提交的启动标记早于撤销。
+	{"I12", "A", `SELECT t.task_id, format('调用 %s 的 exec try %s 于 %s 标记启动，晚于 attempt %s 的访问撤销（%s）',
+			t.call_id, t.try_no, t.exec_started_at, t.attempt_id, a.revoked_at)
+		FROM call_tries t JOIN attempt_access a ON a.attempt_id = t.attempt_id
+		WHERE t.exec_started_at IS NOT NULL AND a.revoked_at IS NOT NULL AND t.exec_started_at > a.revoked_at`},
+	// I12 [B]：已结束 attempt（attempts.status = ended 或访问已撤销）的 exec 环境须在停止期限内记录 stopped_at，
+	// 否则须已记隔离（隔离记录的路径含 env_id）。期限自访问撤销起算；没有撤销记录的已结束 attempt 自环境创建起算。
+	{"I12", "B", `SELECT e.env_id, format('attempt %s 已结束（%s），exec 环境自 %s 起超过停止期限仍未确认停止且未隔离',
+			e.attempt_id, a.status, COALESCE(x.revoked_at, e.created_at))
+		FROM environments e JOIN attempts a ON a.attempt_id = e.attempt_id
+		LEFT JOIN attempt_access x ON x.attempt_id = e.attempt_id
+		WHERE e.kind = 'exec' AND e.stopped_at IS NULL AND (a.status = 'ended' OR x.state = 'revoked')
+			AND COALESCE(x.revoked_at, e.created_at) < now() - interval '` + execStopDeadline + `'
+			AND NOT EXISTS (SELECT 1 FROM quarantined_resources q WHERE strpos(q.resource_path, e.env_id) > 0)`},
 	{"I4", "A", `SELECT task_id, format('事件 %s 条，task_seq 范围 %s..%s', count(*), min(task_seq), max(task_seq))
 		FROM events GROUP BY task_id HAVING count(*) <> max(task_seq) OR min(task_seq) <> 1`},
+	// I6：checkpoint 的引用授权到其 scope（session checkpoint 到会话 scope）、提交它的 attempt，或（task checkpoint）
+	// 任务所属会话的 scope（§5.5 第 2 条 attempt → task → session 推导）。
 	{"I6", "A", `SELECT c.scope_id, format('checkpoint %s 引用的 %s 未授权到当前 scope', c.checkpoint_id, refs.r)
 		FROM checkpoints c,
 			LATERAL (SELECT jsonb_array_elements_text(c.refs_json) AS r UNION ALL SELECT c.state_ref WHERE c.state_ref IS NOT NULL) refs
 		WHERE NOT EXISTS (SELECT 1 FROM scope_blobs sb WHERE sb.sha256 = refs.r AND
-			((sb.scope_kind = 'task' AND sb.scope_id = c.scope_id) OR (sb.scope_kind = 'attempt' AND sb.scope_id = c.attempt_id)))`},
+			((sb.scope_kind = c.scope_kind AND sb.scope_id = c.scope_id) OR (sb.scope_kind = 'attempt' AND sb.scope_id = c.attempt_id)
+				OR (c.scope_kind = 'task' AND sb.scope_kind = 'session'
+					AND sb.scope_id = (SELECT t.session_id FROM tasks t WHERE t.task_id = c.scope_id))))`},
 	{"I6", "A", `SELECT p.task_id, format('指针为 %s@%s，最新已提交为 commit_seq %s', COALESCE(p.latest_checkpoint_id, '∅'), p.latest_commit_seq, COALESCE(m.max_seq, 0))
 		FROM task_progress p
 		LEFT JOIN (SELECT scope_id, max(commit_seq) AS max_seq FROM checkpoints WHERE scope_kind = 'task' GROUP BY scope_id) m
@@ -54,6 +155,36 @@ var invariantQueries = []struct {
 		WHERE COALESCE(m.max_seq, 0) <> p.latest_commit_seq
 			OR (p.latest_checkpoint_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM checkpoints x WHERE x.scope_kind = 'task'
 				AND x.scope_id = p.task_id AND x.checkpoint_id = p.latest_checkpoint_id AND x.commit_seq = p.latest_commit_seq))`},
+	// I6：task checkpoint 由该任务的 attempt 提交。恢复种子（checkpoint_id 以 seed- 开头，Plan 12 Task 3）是宿主从源
+	// turn 复制的，attempt_id 沿用源 attempt，豁免这一关联（其引用授权由上面第一条检查）。
+	{"I6", "A", `SELECT c.scope_id, format('checkpoint %s 的 attempt %s 不属于该任务', c.checkpoint_id, c.attempt_id)
+		FROM checkpoints c WHERE c.scope_kind = 'task' AND c.checkpoint_id NOT LIKE 'seed-%'
+			AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.attempt_id = c.attempt_id AND a.task_id = c.scope_id)`},
+	// I9：每个会话至多一个非 ended 的 incarnation。
+	{"I9", "A", `SELECT session_id, count(*)::text || ' 个非 ended 的 incarnation：' || string_agg(incarnation_id, ', ' ORDER BY incarnation_id)
+		FROM incarnations WHERE status <> 'ended' GROUP BY session_id HAVING count(*) > 1`},
+	// I9：frozen 会话最近一次 quiesced 报告的 checkpoint（随 session_state{frozen} 事件的 payload 持久化）等于
+	// session_progress.latest_checkpoint_id（空串 = 会话尚无 checkpoint）。
+	{"I9", "A", `SELECT s.session_id, format('frozen 会话最近一次 quiesced 报告 %s，会话指针为 %s',
+			COALESCE(ev.qid, '∅'), COALESCE(p.latest_checkpoint_id, '∅'))
+		FROM sessions s JOIN session_progress p ON p.session_id = s.session_id
+		LEFT JOIN LATERAL (SELECT e.payload->>'quiesced_checkpoint_id' AS qid FROM session_events e
+			WHERE e.session_id = s.session_id AND e.type = 'session_state' AND e.payload->>'state' = 'frozen'
+			ORDER BY e.session_seq DESC LIMIT 1) ev ON true
+		WHERE s.status = 'frozen' AND ev.qid IS DISTINCT FROM COALESCE(p.latest_checkpoint_id, '')`},
+	// I10：每个 session checkpoint 由该会话中一个 succeeded 的 turn 的 attempt 提交（只有成功裁决推进会话指针）。
+	{"I10", "A", `SELECT c.scope_id, format('session checkpoint %s 的 attempt %s 不属于该会话 succeeded 的 turn', c.checkpoint_id, c.attempt_id)
+		FROM checkpoints c WHERE c.scope_kind = 'session' AND NOT EXISTS (SELECT 1 FROM attempts a JOIN tasks t ON t.task_id = a.task_id
+			WHERE a.attempt_id = c.attempt_id AND t.session_id = c.scope_id AND t.status = 'succeeded')`},
+	// I10：session checkpoint 的 commit_seq 在会话内互不相同（单调分配），指针指向 commit_seq 最大者。
+	{"I10", "A", `SELECT p.session_id, format('指针为 %s@%s，最新已提交为 commit_seq %s（%s 个 checkpoint，%s 个不同 commit_seq）',
+			COALESCE(p.latest_checkpoint_id, '∅'), p.latest_commit_seq, COALESCE(m.max_seq, 0), COALESCE(m.n, 0), COALESCE(m.d, 0))
+		FROM session_progress p
+		LEFT JOIN (SELECT scope_id, max(commit_seq) AS max_seq, count(*) AS n, count(DISTINCT commit_seq) AS d
+			FROM checkpoints WHERE scope_kind = 'session' GROUP BY scope_id) m ON m.scope_id = p.session_id
+		WHERE COALESCE(m.max_seq, 0) <> p.latest_commit_seq OR COALESCE(m.n, 0) <> COALESCE(m.d, 0)
+			OR (p.latest_checkpoint_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM checkpoints x WHERE x.scope_kind = 'session'
+				AND x.scope_id = p.session_id AND x.checkpoint_id = p.latest_checkpoint_id AND x.commit_seq = p.latest_commit_seq))`},
 	{"I7", "A", `SELECT task_id, count(*)::text || ' 个 active 访问身份'
 		FROM attempt_access WHERE state = 'active' GROUP BY task_id HAVING count(*) > 1`},
 	{"I8", "B", `SELECT resource_path, format('%s 自 %s 起隔离，超过期限仍未报警', kind, detected_at)
@@ -82,8 +213,17 @@ var invariantQueries = []struct {
 	{"I15", "Q", `SELECT c.task_id, format('调用 %s 自 %s 起处于 resolving，任务没有 active 的 attempt', c.call_id, c.resolving_since)
 		FROM calls c WHERE c.state = 'resolving' AND c.resolving_since IS NOT NULL
 			AND NOT EXISTS (SELECT 1 FROM attempt_access a WHERE a.task_id = c.task_id AND a.state = 'active')`},
+	// I16：已提交的请求都指向存在的资源——会话请求（create_session、wake_session）指向会话，其余指向任务。
 	{"I16", "A", `SELECT r.request_id, format('%s 请求对应的资源 %L 不存在', r.kind, r.resource_id)
-		FROM api_requests r WHERE r.resource_id = '' OR NOT EXISTS (SELECT 1 FROM tasks t WHERE t.task_id = r.resource_id)`},
+		FROM api_requests r WHERE r.resource_id = '' OR CASE WHEN r.kind IN ('create_session', 'wake_session')
+			THEN NOT EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = r.resource_id)
+			ELSE NOT EXISTS (SELECT 1 FROM tasks t WHERE t.task_id = r.resource_id) END`},
+	// I11 [A]：存活环境（stopped_at 未记录）的 UID 范围互不相同。environments.uid_range_id 由按环境与按 owner 的分配
+	// 写入；同一会话的环境共用 owner 范围，但旧环境确认停止之后才建新环境。[Q] 部分（已归还范围不拥有文件）见
+	// invariants.Verify 的独立扫描。
+	{"I11", "A", `SELECT uid_range_id, format('%s 个存活环境使用同一 UID 范围：%s', count(*), string_agg(env_id, ', ' ORDER BY env_id))
+		FROM environments WHERE stopped_at IS NULL AND uid_range_id IS NOT NULL
+		GROUP BY uid_range_id HAVING count(*) > 1`},
 }
 
 // DBViolations 运行只依赖数据库的不变量检查（实现 invariants.Store）。
@@ -111,15 +251,37 @@ func (s *Store) DBViolations(ctx context.Context) ([]invariants.Violation, error
 	return out, err
 }
 
-// CleanedEnvIDs 返回 cleanup_state = done 的环境（实现 invariants.Store）。
-func (s *Store) CleanedEnvIDs(ctx context.Context) ([]string, error) {
-	var out []string
-	err := s.read(ctx, "CleanedEnvIDs", func(ctx context.Context, q queryer) error {
-		rows, err := q.Query(ctx, "SELECT env_id FROM environments WHERE cleanup_state = 'done' ORDER BY env_id")
+// CleanedEnvs 返回 cleanup_state = done 的环境及其 kind（实现 invariants.Store；I1，exec 环境为 I12 [Q]）。
+func (s *Store) CleanedEnvs(ctx context.Context) ([]invariants.CleanedEnv, error) {
+	var out []invariants.CleanedEnv
+	err := s.read(ctx, "CleanedEnvs", func(ctx context.Context, q queryer) error {
+		rows, err := q.Query(ctx, "SELECT env_id, kind FROM environments WHERE cleanup_state = 'done' ORDER BY env_id")
 		if err != nil {
 			return err
 		}
-		out, err = pgx.CollectRows(rows, pgx.RowTo[string])
+		out, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (invariants.CleanedEnv, error) {
+			var e invariants.CleanedEnv
+			err := r.Scan(&e.EnvID, &e.Kind)
+			return e, err
+		})
+		return err
+	})
+	return out, err
+}
+
+// FreeUIDRanges 返回未分配（state = free）的 UID 范围（实现 invariants.Store；I11 [Q]）。
+func (s *Store) FreeUIDRanges(ctx context.Context) ([]invariants.UIDRange, error) {
+	var out []invariants.UIDRange
+	err := s.read(ctx, "FreeUIDRanges", func(ctx context.Context, q queryer) error {
+		rows, err := q.Query(ctx, "SELECT uid_range_id, base, size FROM uid_ranges WHERE state = 'free' ORDER BY base")
+		if err != nil {
+			return err
+		}
+		out, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (invariants.UIDRange, error) {
+			var u invariants.UIDRange
+			err := r.Scan(&u.ID, &u.Base, &u.Size)
+			return u, err
+		})
 		return err
 	})
 	return out, err

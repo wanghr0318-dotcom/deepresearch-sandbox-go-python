@@ -77,7 +77,7 @@ func (s *Store) CreateSession(ctx context.Context, idHash []byte, userID int64, 
 		return invalidf("CreateSession 缺少会话哈希或用户")
 	}
 	return s.run(ctx, "CreateSession", "", func(ctx context.Context, tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `INSERT INTO sessions (id_hash, user_id, expires_at) VALUES ($1, $2, $3)
+		_, err := tx.Exec(ctx, `INSERT INTO auth_sessions (id_hash, user_id, expires_at) VALUES ($1, $2, $3)
 			ON CONFLICT (id_hash) DO NOTHING`, idHash, userID, expiresAt)
 		return err
 	})
@@ -88,7 +88,7 @@ func (s *Store) SessionUser(ctx context.Context, idHash []byte) (api.User, error
 	var u api.User
 	err := s.read(ctx, "SessionUser", func(ctx context.Context, q queryer) error {
 		var err error
-		u, err = scanUser(q.QueryRow(ctx, "SELECT "+userColumns+` FROM sessions s JOIN users u ON u.id = s.user_id
+		u, err = scanUser(q.QueryRow(ctx, "SELECT "+userColumns+` FROM auth_sessions s JOIN users u ON u.id = s.user_id
 			WHERE s.id_hash = $1 AND s.expires_at > now() AND NOT u.disabled`, idHash))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return notFoundf("会话")
@@ -104,7 +104,7 @@ func (s *Store) SessionUser(ctx context.Context, idHash []byte) (api.User, error
 // DeleteSession 删除会话（实现 api.Accounts）；会话不存在时为空操作。
 func (s *Store) DeleteSession(ctx context.Context, idHash []byte) error {
 	return s.run(ctx, "DeleteSession", "", func(ctx context.Context, tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, "DELETE FROM sessions WHERE id_hash = $1", idHash)
+		_, err := tx.Exec(ctx, "DELETE FROM auth_sessions WHERE id_hash = $1", idHash)
 		return err
 	})
 }
@@ -120,7 +120,7 @@ func (s *Store) SetDisabled(ctx context.Context, key string, disabled bool) erro
 		if err != nil || !disabled {
 			return err
 		}
-		_, err = tx.Exec(ctx, "DELETE FROM sessions WHERE user_id = $1", id)
+		_, err = tx.Exec(ctx, "DELETE FROM auth_sessions WHERE user_id = $1", id)
 		return err
 	})
 }
@@ -183,7 +183,7 @@ func (s *Store) CreateResearch(ctx context.Context, userID int64, req api.Create
 		if err := admitResearch(ctx, tx, userID); err != nil {
 			return err
 		}
-		if err := createTaskTx(ctx, tx, req, budget, userID); err != nil {
+		if err := createTaskTx(ctx, tx, req, budget, userID, nil); err != nil {
 			return err
 		}
 		res.TaskID = req.TaskID

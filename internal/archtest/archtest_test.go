@@ -32,7 +32,7 @@ func deps(t *testing.T, pkg string) []string {
 func TestConsumersDoNotDependOnPostgres(t *testing.T) {
 	forbidden := []string{module + "/internal/persistence/postgres", "github.com/jackc/pgx"}
 	for _, pkg := range []string{
-		"internal/api", "internal/task", "internal/runner", "internal/resource",
+		"internal/api", "internal/task", "internal/session", "internal/runner", "internal/resource",
 		"internal/ownership", "internal/persistence", "internal/datadir", "internal/blob",
 		"internal/gateway/call", "internal/gateway/edge", "internal/gateway/upstream", "internal/gateway/cache",
 	} {
@@ -49,6 +49,8 @@ func TestConsumersDoNotDependOnPostgres(t *testing.T) {
 //   - gateway/cache 是共享优化，不记账、不授权（Plan 9）：不导入 net/http（它经 upstream.Kind 间接依赖
 //     net/http，只能按直接导入检查）、persistence 与 gateway/call；传递上也不依赖 persistence 与 call
 //     （call 只经 CacheSource 窄接口使用 cache，不能反向）。
+//   - exec 调度（Plan 15）：gateway/call 只导入 internal/provider 的纯类型，环境、slot 与 exec 事务经窄接口
+//     ExecEnvs、ExecSlots、ExecStore 使用，不直接导入 provider/local、resource、admission、persistence/postgres。
 func TestGatewayLayering(t *testing.T) {
 	forbidDirect(t, "internal/gateway/cache", []string{
 		"net/http", module + "/internal/persistence", module + "/internal/gateway/call",
@@ -56,7 +58,8 @@ func TestGatewayLayering(t *testing.T) {
 	forbid(t, "internal/gateway/cache", []string{
 		module + "/internal/persistence", module + "/internal/gateway/call", module + "/internal/gateway/edge",
 	})
-	forbidDirect(t, "internal/gateway/call", []string{"net/http"})
+	forbidDirect(t, "internal/gateway/call", []string{"net/http", module + "/internal/provider/local", module + "/internal/resource",
+		module + "/internal/admission", module + "/internal/persistence/postgres"})
 	for _, d := range deps(t, "internal/gateway/call") {
 		if first, _, _ := strings.Cut(d, "/"); strings.Contains(first, ".") && !strings.HasPrefix(d, module+"/") {
 			t.Errorf("internal/gateway/call 依赖了标准库与本模块之外的包 %s", d)
@@ -106,11 +109,31 @@ func TestDecisionCodeHasNoSideEffectDeps(t *testing.T) {
 	forbid(t, "internal/task", []string{"net/http", "os/exec", "github.com/jackc/pgx", "github.com/redis"})
 }
 
+// TestSessionDecisionCodeDeps：规则 2 用于 session（M4 Plan 12）——session 的决策代码（Decide）与 actor 同包，
+// 只经窄接口（session.Store、provider 契约等）产生副作用：不依赖 HTTP、Redis、PostgreSQL 驱动与进程，也不依赖
+// 低层实现（provider/local、sandbox、cgroup、rootfs）。session actor（Plan 12 Task 7）经窄接口使用 runner 与 Gateway
+// 入口，同样不得导入 internal/runner 与 internal/gateway/*（装配在 internal/app）。
+func TestSessionDecisionCodeDeps(t *testing.T) {
+	forbid(t, "internal/session", []string{
+		"net/http", "os/exec", "github.com/jackc/pgx", "github.com/redis",
+		module + "/internal/provider/local", module + "/internal/sandbox", module + "/internal/cgroup", module + "/internal/rootfs",
+		module + "/internal/runner", module + "/internal/gateway",
+	})
+}
+
 // TestAccountIsPureLogic：account 是账号的纯逻辑（哈希、规则、会话 ID、限速），不导入 persistence、net/http 与 api
 // （Plan 11 Task 1）；存储与 HTTP 由调用方负责。
 func TestAccountIsPureLogic(t *testing.T) {
 	forbidDirect(t, "internal/account", []string{
 		module + "/internal/persistence", "net/http", module + "/internal/api",
+	})
+}
+
+// TestSubrunIsPureLogic：subrun 是 sub-run 的纯逻辑（状态机、定义哈希、恢复判定），传递依赖中不得有
+// persistence、net/http、gateway 与 runner（Plan 14 Task 2）；存储与协议处理由调用方负责。
+func TestSubrunIsPureLogic(t *testing.T) {
+	forbid(t, "internal/subrun", []string{
+		module + "/internal/persistence", "net/http", module + "/internal/gateway", module + "/internal/runner",
 	})
 }
 

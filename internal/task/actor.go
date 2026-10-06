@@ -33,10 +33,42 @@ const revokeTimeout = 5 * time.Second
 
 // ---- 窄接口 ----
 
-// SlotRequest 是 run slot 的申请；适配器据 Limits 计算内存（admission.Request）。
+// SlotRequest 是 run slot 的申请；适配器据 Limits 计算内存（admission.Request）。SessionID 非空（会话 turn）时
+// 适配器申请 MemoryBytes = 0：incarnation 的内存由 session actor 以 MemoryOnly 授予持有。
 type SlotRequest struct {
-	TaskID string
-	Limits json.RawMessage
+	TaskID    string
+	Limits    json.RawMessage
+	SessionID string
+}
+
+// SessionGate 是 session actor 的授予与交还（session.Scheduler 的适配，Task 9 装配）。
+//
+//   - Grant 阻塞直到会话把 incarnation 授予该 turn；会话已关闭或恢复两次失败时返回 ErrSessionUnavailable（适配器把
+//     session.ErrUnavailable 包装为它），ctx 结束时撤回。
+//   - Handoff 在裁决提交之后交还 incarnation（Destroy=false → Release），或要求销毁（Destroy=true）。返回的
+//     StopReport.Recorded 为真表示该 attempt 的执行已确认结束（释放成功，或环境 stopped_at 已记录）。
+type SessionGate interface {
+	Grant(ctx context.Context, sessionID, taskID string) (SessionGrant, error)
+	Handoff(ctx context.Context, sessionID string, h SessionHandoff) (StopReport, error)
+}
+
+// SessionGrant 是授予给会话 turn 的 incarnation 与其环境。
+type SessionGrant struct{ IncarnationID, EnvID string }
+
+// SessionHandoff 是会话 turn 交还 incarnation（session.Handoff 的对应）。
+type SessionHandoff struct {
+	TaskID, AttemptID, EnvID, Verdict, CommittedSessionCheckpointID string
+	Destroy                                                         bool
+}
+
+// ErrSessionUnavailable 表示会话已关闭或暂时无法恢复：queued 的 turn 失败（status_reason = session_unavailable）。
+var ErrSessionUnavailable = errors.New("task: 会话不可用")
+
+// TurnStore 是会话 turn 额外需要的 Store 用例（*postgres.Store 实现；独立任务不需要，故不并入 Store）。
+type TurnStore interface {
+	// FailQueuedTurn 把没有活动 attempt 的 queued 会话 turn 裁决为 failed（status_reason = reason），同事务清除它对会话的
+	// 占用与阻塞并追加 host 事件 task_terminal。已是同一结果时成功（重跑）；不是 queued 为 ErrRejected。
+	FailQueuedTurn(ctx context.Context, taskID, reason string) error
 }
 
 // SlotGrant 是一份已授予的容量（与 admission.Grant 对应，按 ID 归还）。
@@ -134,6 +166,8 @@ type Deps struct {
 	IDs       func() string
 	Jitter    func() float64
 	OnFatal   func(taskID string, err error)
+	// Session 是会话 turn 的授予与交还；只有会话 turn 使用（为 nil 时会话 turn 的 actor 致命停止）。
+	Session SessionGate
 
 	// RunTimeLimit 可选：任务的累计运行时限（§14.4），0 表示不限。装配代码取任务 limits 的
 	// max_run_time_ms，没有时取服务配置的默认值。限额按任务计（已持久化的 run_time_ms 加当前区间），
@@ -255,6 +289,8 @@ type Actor struct {
 	runCancel map[string]context.CancelCauseFunc
 	// accountAttempt 是恢复交来、尚待 OnStopRecorded 计入运行时间的 attempt。
 	accountAttempt string
+	// grantCancel 撤回在途的会话授予申请（WithdrawSessionGrant）。
+	grantCancel context.CancelFunc
 }
 
 // runTime 是累计运行时间（§14.4）：base 是已结束区间的累计（毫秒），openAt 非 nil 时当前 attempt 的
@@ -369,7 +405,7 @@ func (a *Actor) load() bool {
 	a.s = State{TaskID: a.taskID, TaskStatus: ts.Status, Desired: ts.Desired, ControlVersion: ts.ControlVersion,
 		AppliedControlVersion: ts.AppliedControlVersion, FaultRetriesUsed: ts.FaultRetriesUsed,
 		MaxFaultRetries: ts.MaxFaultRetries, OOMRetriesUsed: ts.OOMRetriesUsed,
-		NextRetry: RetryAfter(ts.Status, ts.StatusReason), NotBefore: ts.NotBefore}
+		NextRetry: RetryAfter(ts.Status, ts.StatusReason), NotBefore: ts.NotBefore, SessionID: ts.SessionID}
 	if g := a.opt.stopBlocked; g != nil {
 		att, err := readRetry(a.ctx, a.d, func(ctx context.Context) (Attempt, error) {
 			return a.d.Store.GetAttempt(ctx, ts.CurrentAttemptID)
@@ -519,7 +555,7 @@ func (a *Actor) exec(eff Effect) {
 	case RequestSlot:
 		// 已达累计运行时限的 queued 任务（重启记账或调低配置之后）同样走正常路径：startWorker 以已取消
 		// 的 ctx 启动执行，runner 分类为 task_deadline_exceeded，经现有判决路径结束（代价是创建一次环境）。
-		req := SlotRequest{TaskID: a.taskID, Limits: a.limits}
+		req := SlotRequest{TaskID: a.taskID, Limits: a.limits, SessionID: a.s.SessionID}
 		a.async(func(ctx context.Context) any {
 			g, err := a.d.Admission.Acquire(ctx, req)
 			return grantResult{g: g, err: err}
@@ -527,8 +563,21 @@ func (a *Actor) exec(eff Effect) {
 	case ReleaseSlot:
 		a.d.Admission.Release(a.grant)
 		a.grant = SlotGrant{}
+	case RequestSessionGrant:
+		a.requestSessionGrant()
+	case WithdrawSessionGrant:
+		if a.grantCancel != nil {
+			a.grantCancel()
+		}
+	case FailTurn:
+		a.enqueue(&storeOp{kind: opFailTurn, reason: f.Reason})
 	case CreateAttempt:
-		na := NewAttempt{TaskID: a.taskID, AttemptID: a.d.IDs(), AttemptNo: a.attemptsTotal + 1, EnvID: a.d.IDs(), Retry: f.Retry}
+		na := NewAttempt{TaskID: a.taskID, AttemptID: a.d.IDs(), AttemptNo: a.attemptsTotal + 1, Retry: f.Retry}
+		if g := f.Session; g != nil { // 会话 turn：attempt 在授予的 incarnation 环境中运行
+			na.EnvID, na.SessionID, na.IncarnationID = g.EnvID, a.s.SessionID, g.IncarnationID
+		} else {
+			na.EnvID = a.d.IDs()
+		}
 		a.enqueue(&storeOp{kind: opCreateAttempt, attempt: na})
 	case CreateEnvironment:
 		spec := EnvSpec{TaskID: a.taskID, AttemptID: f.AttemptID, EnvID: f.EnvID, Spec: a.spec, Limits: a.limits}
@@ -612,9 +661,17 @@ func (a *Actor) stopRunForLimit(attemptID string) {
 // 检查才是执行点"）：Store.RevokeAttemptAccess 提交（或被确定拒绝）之后才 Access.Revoke；Store 暂时失败时
 // 不关闭入口（它在 Store 中仍是 active），由 Store 队列补提交后再关闭（见 opRevoke），物理停止不等待它。
 // 原因由 Decide 给出（desired = cancel 时为 RevokeReasonCancel，Gateway 据此取消该 attempt 的在途上游 try）。
+//
+// 会话 turn（f.Session 非 nil）以 SessionGate.Handoff 代替 StopEnv：撤销顺序相同，Recorded 即该 attempt 的执行已确认
+// 结束（释放成功或 incarnation 环境已停止）。
 func (a *Actor) stopEnv(f StopEnvironment) {
 	reason, revoke := a.revoking[f.AttemptID]
 	delete(a.revoking, f.AttemptID)
+	if f.Session != nil && a.d.Session == nil {
+		a.die(fmt.Errorf("task: 会话 turn %s 没有 SessionGate", a.taskID))
+		return
+	}
+	sessionID := a.s.SessionID
 	a.async(func(ctx context.Context) any {
 		r := stopDone{attemptID: f.AttemptID, envID: f.EnvID, reason: reason}
 		if revoke {
@@ -625,8 +682,34 @@ func (a *Actor) stopEnv(f StopEnvironment) {
 				r.accessErr = a.d.Access.Revoke(ctx, f.AttemptID, reason)
 			}
 		}
+		if f.Session != nil {
+			r.report, r.err = a.d.Session.Handoff(ctx, sessionID, *f.Session)
+			if r.report.Stopped && r.report.At.IsZero() {
+				r.report.At = a.d.Clock.Now()
+			}
+			return r
+		}
 		r.report, r.err = a.d.Env.StopEnv(ctx, f.EnvID)
 		return r
+	})
+}
+
+// requestSessionGrant 向 session actor 申请 incarnation（可由 WithdrawSessionGrant 撤回）。
+func (a *Actor) requestSessionGrant() {
+	if a.d.Session == nil {
+		a.die(fmt.Errorf("task: 会话 turn %s 没有 SessionGate", a.taskID))
+		return
+	}
+	gctx, cancel := context.WithCancel(a.ctx)
+	a.grantCancel = cancel
+	sessionID, taskID := a.s.SessionID, a.taskID
+	a.async(func(context.Context) any {
+		defer cancel()
+		g, err := a.d.Session.Grant(gctx, sessionID, taskID)
+		if err != nil {
+			return SessionUnavailable{Err: err}
+		}
+		return SessionGranted(g)
 	})
 }
 
@@ -724,6 +807,14 @@ func (a *Actor) handleResult(v any) {
 			a.controlAgain = false
 			a.readControl()
 		}
+	case SessionGranted:
+		a.grantCancel = nil
+		a.apply(r)
+	case SessionUnavailable:
+		a.grantCancel = nil
+		if a.ctx.Err() == nil {
+			a.apply(r)
+		}
 	case stopDone:
 		a.handleStop(r)
 	case storeDone:
@@ -788,6 +879,7 @@ const (
 	opRevoke
 	opAccountRunTime // 恢复交来的 attempt：Deps.OnStopRecorded
 	opRevokeGateway  // 只关闭 Gateway 入口（Access.Revoke），不写 Store；排在之前的 Store 写入之后
+	opFailTurn       // 会话 turn 没有 attempt 即失败（TurnStore.FailQueuedTurn）
 )
 
 // storeOp 是一个待提交的事实。队列按产生顺序串行提交：暂时失败（Store 不可用、提交结果未知、锁争用）
@@ -831,8 +923,15 @@ func (a *Actor) pumpStore() {
 			faultinject.Point(faultinject.AttemptCreateAfter)
 		case opFinalize:
 			faultinject.Point(faultinject.VerdictBefore)
-			_, r.err = a.d.Store.FinalizeAttempt(ctx, cp.verdict)
+			r.attempt, r.err = a.d.Store.FinalizeAttempt(ctx, cp.verdict)
 			faultinject.Point(faultinject.VerdictAfter)
+		case opFailTurn:
+			ts, ok := a.d.Store.(TurnStore)
+			if !ok {
+				r.err = fmt.Errorf("%w: Store 没有实现 TurnStore", persistence.ErrInvalid)
+				break
+			}
+			r.err = ts.FailQueuedTurn(ctx, taskID, cp.reason)
 		case opApplyControl:
 			_, r.err = a.d.Store.ApplyControl(ctx, cp.control)
 		case opPersistRunTime:
@@ -889,7 +988,7 @@ func (a *Actor) committed(op *storeOp, r storeDone) {
 		a.attemptNo[na.AttemptID] = na.AttemptNo
 		a.apply(AttemptCreated{AttemptID: na.AttemptID, EnvID: na.EnvID, Status: r.attempt.Status})
 	case opFinalize:
-		a.apply(VerdictCommitted{Verdict: op.verdict})
+		a.apply(VerdictCommitted{Verdict: op.verdict, CommittedSessionCheckpointID: r.attempt.CommittedSessionCheckpointID})
 	case opAccountRunTime:
 		if r.runTimeMs != nil && a.rt.openAt == nil {
 			a.rt.base = max(a.rt.base, *r.runTimeMs)
@@ -909,6 +1008,8 @@ func (a *Actor) rejected(op *storeOp, err error) {
 		a.readControl()
 	case opApplyControl:
 		a.readControl()
+	case opFailTurn: // 只有 actor 改变 queued 的 turn：被拒说明事实不一致
+		a.die(fmt.Errorf("task: 会话 turn %s 的失败裁决被拒绝: %w", a.taskID, err))
 	} // 运行时间（stale_attempt）与访问撤销被拒：事实已不适用
 }
 

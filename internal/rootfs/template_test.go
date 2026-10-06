@@ -5,6 +5,8 @@ package rootfs
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -143,5 +145,96 @@ func TestResolveTemplate(t *testing.T) {
 	}
 	if _, err := ResolveTemplate("nope"); err == nil {
 		t.Fatal("未知模板标识应当报错")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Plan 15 Task 2：exec 模板与模板摘要（D5）。
+
+// TestExecTemplate：exec 模板不含 worker 包目录与 /etc/ssl，语法合法，可按标识解析。
+func TestExecTemplate(t *testing.T) {
+	tm := ExecTemplate()
+	if err := tm.Validate(); err != nil {
+		t.Fatalf("exec 模板语法不合法: %v", err)
+	}
+	for _, p := range tm.Paths {
+		if p == WorkerDir || p == "/etc/ssl" {
+			t.Fatalf("exec 模板 %v 不应包含 %s", tm.Paths, p)
+		}
+	}
+	if r, err := ResolveTemplate(ExecTemplateName); err != nil || !reflect.DeepEqual(r.Paths, tm.Paths) {
+		t.Fatalf("ResolveTemplate(%q) = %v, %v", ExecTemplateName, r.Paths, err)
+	}
+}
+
+// fakeExecRoot 在临时目录中构造 merged-usr 形态的最小模板根：/bin → usr/bin、/usr/bin/sh；withPython 时
+// 另有 /usr/bin/python3 → python3.99（相对链接）与解释器文件。返回模板与解释器的宿主路径。
+func fakeExecRoot(t *testing.T, withPython bool) (Template, string) {
+	t.Helper()
+	root := t.TempDir()
+	bin := filepath.Join(root, "usr", "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "sh"), []byte("sh"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("usr/bin", filepath.Join(root, "bin")); err != nil {
+		t.Fatal(err)
+	}
+	py := filepath.Join(bin, "python3.99")
+	if withPython {
+		if err := os.WriteFile(py, []byte("interpreter v1"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("python3.99", filepath.Join(bin, "python3")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return Template{Paths: []string{"/usr", "/bin"}, hostRoot: root}, py
+}
+
+// TestEnsureExecRequiresPython：沙箱视图中缺 /usr/bin/python3 时 EnsureExec 报告该路径（Ensure 仍通过）。
+func TestEnsureExecRequiresPython(t *testing.T) {
+	tm, _ := fakeExecRoot(t, false)
+	if err := tm.Ensure(); err != nil {
+		t.Fatalf("Ensure 不要求 python3: %v", err)
+	}
+	if err := tm.EnsureExec(); err == nil || !strings.Contains(err.Error(), "/usr/bin/python3") {
+		t.Fatalf("缺 python3 时 EnsureExec = %v，期望指出 /usr/bin/python3", err)
+	}
+	tm, _ = fakeExecRoot(t, true)
+	if err := tm.EnsureExec(); err != nil {
+		t.Fatalf("有 python3 时 EnsureExec: %v", err)
+	}
+}
+
+// TestTemplateDigest：同一输入摘要稳定且与路径顺序无关；解释器内容或路径集合变化时摘要改变。
+func TestTemplateDigest(t *testing.T) {
+	tm, py := fakeExecRoot(t, true)
+	d1, err := TemplateDigest(tm)
+	if err != nil || len(d1) != 64 {
+		t.Fatalf("TemplateDigest = %q, %v", d1, err)
+	}
+	reordered := Template{Paths: []string{"/bin", "/usr"}, hostRoot: tm.hostRoot}
+	if d, err := TemplateDigest(reordered); err != nil || d != d1 {
+		t.Fatalf("路径顺序不同时摘要应相同：%q vs %q（%v）", d, d1, err)
+	}
+	if err := os.WriteFile(py, []byte("interpreter v2"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	d2, err := TemplateDigest(tm)
+	if err != nil || d2 == d1 {
+		t.Fatalf("解释器内容变化后摘要应改变：%q（%v）", d2, err)
+	}
+	if err := os.WriteFile(filepath.Join(tm.hostRoot, "extra"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	more := Template{Paths: []string{"/usr", "/bin", "/extra"}, hostRoot: tm.hostRoot}
+	if d, err := TemplateDigest(more); err != nil || d == d2 {
+		t.Fatalf("路径集合变化后摘要应改变：%q（%v）", d, err)
+	}
+	if _, err := TemplateDigest(Template{Paths: []string{"/usr", "/bin"}, hostRoot: t.TempDir()}); err == nil {
+		t.Fatal("模板不可用时 TemplateDigest 应报错")
 	}
 }

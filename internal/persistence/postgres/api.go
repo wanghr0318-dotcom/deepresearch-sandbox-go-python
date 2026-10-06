@@ -66,7 +66,7 @@ func (s *Store) CreateTask(ctx context.Context, req api.CreateTaskRequest) (api.
 			res.Replayed = true
 			return json.Unmarshal(stored, &res)
 		}
-		if err := createTaskTx(ctx, tx, req, budget, 0); err != nil {
+		if err := createTaskTx(ctx, tx, req, budget, 0, nil); err != nil {
 			return err
 		}
 		res.TaskID = req.TaskID
@@ -83,9 +83,22 @@ func createTaskBudget(op string, req api.CreateTaskRequest) (int64, error) {
 	return budgetLimit(req.Limits)
 }
 
+// turnRow 是会话 turn（会话 task）的附加列；独立任务为 nil。
+type turnRow struct {
+	sessionID    string
+	turnIndex    int64
+	restoredFrom string // restored_from_task_id；空为 NULL
+	created      []byte // task_created 事件的 payload
+}
+
 // createTaskTx 是创建任务的事务体（request 已认领且不是重放）：任务行（owner 为 0 时 owner_user_id 为空）、
-// 控制行、进度行、事件序号行、预算行与 task_created 事件。CreateTask 与 CreateResearch 共用。
-func createTaskTx(ctx context.Context, tx pgx.Tx, req api.CreateTaskRequest, budget, owner int64) error {
+// 控制行、进度行、事件序号行、预算行（tool_call_limit = limits.max_tool_calls，缺省为 NULL 即不限）与
+// task_created 事件。CreateTask、CreateResearch 与 CreateTurn（turn 非 nil）共用。
+func createTaskTx(ctx context.Context, tx pgx.Tx, req api.CreateTaskRequest, budget, owner int64, turn *turnRow) error {
+	toolLimit, err := toolCallLimit(req.Limits)
+	if err != nil {
+		return err
+	}
 	var exists bool // 否则 INSERT 的 23505 会被当作可重试错误一直重试到期限
 	if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM tasks WHERE task_id = $1)", req.TaskID).Scan(&exists); err != nil {
 		return err
@@ -93,9 +106,17 @@ func createTaskTx(ctx context.Context, tx pgx.Tx, req api.CreateTaskRequest, bud
 	if exists {
 		return conflictf("任务 %s 已存在", req.TaskID)
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO tasks (task_id, spec_json, config_version, limits_json, status, max_fault_retries, owner_user_id)
-		VALUES ($1, $2, $3, $4, 'queued', $5, NULLIF($6::bigint, 0))`,
-		req.TaskID, []byte(req.Spec), req.ConfigVersion, nullJSON(req.Limits), req.MaxFaultRetries, owner); err != nil {
+	var sessionID, restoredFrom string
+	var turnIndex any
+	var created []byte
+	if turn != nil {
+		sessionID, restoredFrom, turnIndex, created = turn.sessionID, turn.restoredFrom, turn.turnIndex, turn.created
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO tasks (task_id, spec_json, config_version, limits_json, status, max_fault_retries, owner_user_id,
+			session_id, turn_index, restored_from_task_id)
+		VALUES ($1, $2, $3, $4, 'queued', $5, NULLIF($6::bigint, 0), NULLIF($7, ''), $8, NULLIF($9, ''))`,
+		req.TaskID, []byte(req.Spec), req.ConfigVersion, nullJSON(req.Limits), req.MaxFaultRetries, owner,
+		sessionID, turnIndex, restoredFrom); err != nil {
 		return err
 	}
 	for _, q := range []string{
@@ -107,14 +128,36 @@ func createTaskTx(ctx context.Context, tx pgx.Tx, req api.CreateTaskRequest, bud
 			return err
 		}
 	}
-	if _, err := tx.Exec(ctx, "INSERT INTO budgets (task_id, limit_micro) VALUES ($1, $2)", req.TaskID, budget); err != nil {
+	if _, err := tx.Exec(ctx, "INSERT INTO budgets (task_id, limit_micro, tool_call_limit) VALUES ($1, $2, $3)",
+		req.TaskID, budget, toolLimit); err != nil {
 		return err
 	}
 	if err := lockEventSeq(ctx, tx, req.TaskID); err != nil {
 		return err
 	}
-	_, err := appendHostEvent(ctx, tx, hostEvent{taskID: req.TaskID, key: "task_created", typ: "task_created"})
+	_, err = appendHostEvent(ctx, tx, hostEvent{taskID: req.TaskID, key: "task_created", typ: "task_created", payload: created})
 	return err
+}
+
+// toolCallLimit 取 limits.max_tool_calls 作为每 turn 的工具调用额度（budgets.tool_call_limit）。缺省为 nil（不限，
+// 独立任务）；负数或非整数为 ErrInvalid。
+func toolCallLimit(limits json.RawMessage) (*int64, error) {
+	if len(limits) == 0 || string(limits) == "null" {
+		return nil, nil
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(limits, &m); err != nil {
+		return nil, invalidf("limits 不是 JSON 对象: %v", err)
+	}
+	raw, ok := m["max_tool_calls"]
+	if !ok || string(raw) == "null" {
+		return nil, nil
+	}
+	n, err := strconv.ParseInt(string(raw), 10, 64)
+	if err != nil || n < 0 {
+		return nil, invalidf("limits.max_tool_calls 必须是非负整数，得到 %s", raw)
+	}
+	return &n, nil
 }
 
 // budgetLimit 取任务 limits.budget_micro 作为 task 层预算上限（微美元）。缺省时为 0（失败关闭：所有
@@ -165,36 +208,50 @@ func (s *Store) AcceptControl(ctx context.Context, req api.ControlRequest) (api.
 			res.Replayed = true
 			return nil
 		}
-		var status, desired string
-		err = tx.QueryRow(ctx, "SELECT status FROM tasks WHERE task_id = $1 FOR UPDATE", req.TaskID).Scan(&status)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return notFoundf("任务 %s", req.TaskID)
-		}
+		res.ControlVersion, err = writeControl(ctx, tx, req.TaskID, req.Desired, req.Reason,
+			func(status, _, current string) error { return admitControl(req.TaskID, status, current, req.Desired) })
 		if err != nil {
-			return err
-		}
-		if err := tx.QueryRow(ctx, "SELECT desired FROM task_control WHERE task_id = $1 FOR UPDATE", req.TaskID).Scan(&desired); err != nil {
-			return err
-		}
-		if err := admitControl(req.TaskID, status, desired, req.Desired); err != nil {
-			return err
-		}
-		if err := tx.QueryRow(ctx, `UPDATE task_control SET control_version = control_version + 1, desired = $2, reason = $3
-			WHERE task_id = $1 RETURNING control_version`, req.TaskID, req.Desired, req.Reason).Scan(&res.ControlVersion); err != nil {
-			return err
-		}
-		if err := lockEventSeq(ctx, tx, req.TaskID); err != nil {
-			return err
-		}
-		payload, _ := json.Marshal(map[string]any{"desired": req.Desired, "reason": req.Reason, "control_version": res.ControlVersion})
-		if _, err := appendHostEvent(ctx, tx, hostEvent{taskID: req.TaskID, key: fmt.Sprintf("control_accepted:%d", res.ControlVersion),
-			typ: "control_accepted", payload: payload}); err != nil {
 			return err
 		}
 		res.TaskID = req.TaskID
 		return finishRequest(ctx, tx, req.RequestID, req.TaskID, res)
 	})
 	return res, err
+}
+
+// writeControl 是控制写入的事务体（AcceptControl、TurnControl、D5 取代与关闭会话共用）：锁 tasks、task_control
+// （FOR UPDATE），以 admit(status, status_reason, 当前 desired) 检查准入，递增 control_version 并写 desired 与
+// reason，追加 control_accepted 事件。返回新的 control_version。锁顺序：tasks → task_control → task_event_seq
+// （→ session_event_seq）。
+func writeControl(ctx context.Context, tx pgx.Tx, taskID, desired, reason string, admit func(status, statusReason, current string) error) (int64, error) {
+	var status, statusReason, current string
+	err := tx.QueryRow(ctx, "SELECT status, status_reason FROM tasks WHERE task_id = $1 FOR UPDATE", taskID).Scan(&status, &statusReason)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, notFoundf("任务 %s", taskID)
+	}
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.QueryRow(ctx, "SELECT desired FROM task_control WHERE task_id = $1 FOR UPDATE", taskID).Scan(&current); err != nil {
+		return 0, err
+	}
+	if err := admit(status, statusReason, current); err != nil {
+		return 0, err
+	}
+	var version int64
+	if err := tx.QueryRow(ctx, `UPDATE task_control SET control_version = control_version + 1, desired = $2, reason = $3
+		WHERE task_id = $1 RETURNING control_version`, taskID, desired, reason).Scan(&version); err != nil {
+		return 0, err
+	}
+	if err := lockEventSeq(ctx, tx, taskID); err != nil {
+		return 0, err
+	}
+	payload, _ := json.Marshal(map[string]any{"desired": desired, "reason": reason, "control_version": version})
+	if _, err := appendHostEvent(ctx, tx, hostEvent{taskID: taskID, key: fmt.Sprintf("control_accepted:%d", version),
+		typ: "control_accepted", payload: payload}); err != nil {
+		return 0, err
+	}
+	return version, nil
 }
 
 // admitControl 是规格 §8.1 的控制写入规则：终态任务不再接受控制；已接受的 cancel 不可被

@@ -11,7 +11,9 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/subrun"
 )
 
 var _ runner.Store = (*Store)(nil)
@@ -41,6 +43,65 @@ func (s *Store) AppendWorkerEvents(ctx context.Context, attemptID string, events
 	return out, err
 }
 
+// AppendSessionWorkerEvents 原子追加一批 session 模式的 Worker 事件（实现 runner.Store）：worker_seq 是 incarnation
+// 序号，批内与同一 attempt 内严格递增、不要求连续。已存在的序号逐条校验内容；新序号须大于该 attempt 已提交的最大
+// 序号（不回填空隙）。
+func (s *Store) AppendSessionWorkerEvents(ctx context.Context, attemptID string, events []runner.WorkerEvent) (runner.Watermark, error) {
+	if len(events) == 0 {
+		return runner.Watermark{}, invalidf("Worker 事件批次为空")
+	}
+	for i, e := range events {
+		if e.Seq < 1 || (i > 0 && e.Seq <= events[i-1].Seq) {
+			return runner.Watermark{}, invalidf("session Worker 事件序号必须为正且严格递增，第 %d 条为 %d", i, e.Seq)
+		}
+		if e.Type == "" || len(e.Payload) == 0 {
+			return runner.Watermark{}, invalidf("Worker 事件 %d 缺少类型或载荷", e.Seq)
+		}
+	}
+	out := runner.Watermark{AttemptID: attemptID}
+	identity := fmt.Sprintf("%s:%d-%d", attemptID, events[0].Seq, events[len(events)-1].Seq)
+	err := s.run(ctx, "AppendSessionWorkerEvents", identity, func(ctx context.Context, tx pgx.Tx) error {
+		var taskID string
+		err := tx.QueryRow(ctx, "SELECT task_id FROM attempts WHERE attempt_id = $1", attemptID).Scan(&taskID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("attempt %s", attemptID)
+		}
+		if err != nil {
+			return err
+		}
+		if err := lockEventSeq(ctx, tx, taskID); err != nil {
+			return err
+		}
+		var watermark int64
+		if err := tx.QueryRow(ctx, "SELECT COALESCE(max(worker_seq), 0) FROM events WHERE attempt_id = $1 AND worker_seq IS NOT NULL",
+			attemptID).Scan(&watermark); err != nil {
+			return err
+		}
+		existing, err := existingWorkerHashes(ctx, tx, attemptID, events[0].Seq, min(events[len(events)-1].Seq, watermark))
+		if err != nil {
+			return err
+		}
+		for _, e := range events {
+			if e.Seq > watermark {
+				if err := insertWorkerEvent(ctx, tx, taskID, attemptID, e); err != nil {
+					return err
+				}
+				continue
+			}
+			h, ok := existing[e.Seq]
+			if !ok {
+				return conflictf("attempt %s 的 Worker 事件 %d 不大于已提交的 %d 且不存在", attemptID, e.Seq, watermark)
+			}
+			if !bytes.Equal(h, workerEventHash(e)) {
+				return conflictf("attempt %s 的 Worker 事件 %d 已存在且内容不同", attemptID, e.Seq)
+			}
+		}
+		out.WorkerSeq = max(watermark, events[len(events)-1].Seq)
+		return nil
+	})
+	return out, err
+}
+
 // WorkerEventWatermark 返回已提交的最大 worker_seq（实现 runner.Store）。
 func (s *Store) WorkerEventWatermark(ctx context.Context, attemptID string) (runner.Watermark, error) {
 	out := runner.Watermark{AttemptID: attemptID}
@@ -51,15 +112,33 @@ func (s *Store) WorkerEventWatermark(ctx context.Context, attemptID string) (run
 	return out, err
 }
 
+// 带 subruns[] 时其 JSON 作为第 6 段参与哈希；没有时公式与 M4 之前相同（已有 checkpoint 的重放仍是同一内容）。
 func checkpointHash(c runner.Checkpoint) []byte {
-	return contentHash([]byte(c.AttemptID), []byte(c.StepID), c.State, []byte(c.StateRef), []byte(strings.Join(c.Refs, "\n")))
+	parts := [][]byte{[]byte(c.AttemptID), []byte(c.StepID), c.State, []byte(c.StateRef), []byte(strings.Join(c.Refs, "\n"))}
+	if len(c.Subruns) > 0 {
+		parts = append(parts, subrunsJSON(c.Subruns))
+	}
+	return contentHash(parts...)
+}
+
+// subrunsJSON 是 checkpoints.subruns_json 的内容（没有时为 []）。
+func subrunsJSON(s []protocol.CheckpointSubrun) []byte {
+	if s == nil {
+		s = []protocol.CheckpointSubrun{}
+	}
+	b, err := json.Marshal(s)
+	if err != nil { // 只含字符串
+		panic(fmt.Sprintf("postgres: 编码 subruns: %v", err))
+	}
+	return b
 }
 
 // CommitCheckpoint 以 (scope, checkpoint_id) 为身份提交 checkpoint（实现 runner.Store）。
 // 已存在的 ID 只比较内容并返回原结果（规格 §5.5 第 3 条）；新 checkpoint 在同一事务内检查
 // fencing（提交者是当前 attempt 且访问有效）与引用授权（refs、state_ref 已保存并授权到当前 scope），
 // 不通过时指针与事件都不改变。commit_seq 来自 task_progress 的行锁（规格 §7.2）。
-// 锁顺序：tasks → task_progress → task_event_seq → attempt_access。
+// subruns[] 在同一事务中按状态机转换（applyCheckpointSubrunsTx），不允许时整体回滚为 invalid_transition。
+// 锁顺序：tasks → task_progress → task_event_seq → subruns → attempt_access。
 func (s *Store) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runner.CommittedCheckpoint, error) {
 	if c.Scope.Kind != "task" || c.Scope.ID == "" {
 		return runner.CommittedCheckpoint{}, invalidf("M1 只支持 task 范围的 checkpoint，得到 %+v", c.Scope)
@@ -95,9 +174,10 @@ func (s *Store) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runn
 		}
 		refs, _ := json.Marshal(nonNil(c.Refs))
 		if _, err := tx.Exec(ctx, `INSERT INTO checkpoints (scope_kind, scope_id, checkpoint_id, commit_seq, attempt_id, step_id,
-				content_hash, state_inline, state_ref, refs_json)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10)`,
-			c.Scope.Kind, c.Scope.ID, c.CheckpointID, latest+1, c.AttemptID, c.StepID, hash, nullJSON(c.State), c.StateRef, refs); err != nil {
+				content_hash, state_inline, state_ref, refs_json, subruns_json)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10, $11)`,
+			c.Scope.Kind, c.Scope.ID, c.CheckpointID, latest+1, c.AttemptID, c.StepID, hash, nullJSON(c.State), c.StateRef, refs,
+			subrunsJSON(c.Subruns)); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, "UPDATE task_progress SET latest_checkpoint_id = $2, latest_commit_seq = $3 WHERE task_id = $1",
@@ -105,6 +185,10 @@ func (s *Store) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runn
 			return err
 		}
 		if err := lockEventSeq(ctx, tx, c.Scope.ID); err != nil {
+			return err
+		}
+		// subruns[] 与 checkpoint 同一事务（锁顺序 task_event_seq → subruns）：非法转换回滚整个 checkpoint（E41）
+		if err := applyCheckpointSubrunsTx(ctx, tx, c.Scope.ID, c.Subruns); err != nil {
 			return err
 		}
 		payload, _ := json.Marshal(map[string]any{"checkpoint_id": c.CheckpointID, "commit_seq": latest + 1, "step_id": c.StepID})
@@ -143,18 +227,25 @@ func fenceAttempt(ctx context.Context, tx pgx.Tx, taskID, attemptID string) erro
 }
 
 // authorizeRefs 要求 checkpoint 引用的每个 sha256 都已保存并授权到当前 scope（规格 §5.5 第 2 条）：
-// scope 由宿主按 attempt → task 推导（session 在 M4 加入），不接受其他任务的 blob。
+// scope 由宿主按 attempt → task → session 推导（会话 turn 另接受其会话 scope，例如 D5 carryover 与恢复种子的引用），
+// 不接受其他任务或会话的 blob。
 func authorizeRefs(ctx context.Context, tx pgx.Tx, c runner.Checkpoint) error {
 	refs := append([]string(nil), c.Refs...)
 	if c.StateRef != "" {
 		refs = append(refs, c.StateRef)
+	}
+	for _, e := range c.Subruns { // subruns[].result_ref 与 refs 同一授权规则（规格 §5.5 第 2 条）
+		if e.ResultRef != "" {
+			refs = append(refs, e.ResultRef)
+		}
 	}
 	if len(refs) == 0 {
 		return nil
 	}
 	rows, err := tx.Query(ctx, `SELECT r FROM unnest($1::text[]) AS r WHERE NOT EXISTS (
 		SELECT 1 FROM scope_blobs sb WHERE sb.sha256 = r AND
-			((sb.scope_kind = 'attempt' AND sb.scope_id = $2) OR (sb.scope_kind = 'task' AND sb.scope_id = $3)))`,
+			((sb.scope_kind = 'attempt' AND sb.scope_id = $2) OR (sb.scope_kind = 'task' AND sb.scope_id = $3)
+				OR (sb.scope_kind = 'session' AND sb.scope_id = (SELECT session_id FROM tasks WHERE task_id = $3))))`,
 		refs, c.AttemptID, c.Scope.ID)
 	if err != nil {
 		return err
@@ -247,7 +338,7 @@ func (s *Store) RegisterArtifact(ctx context.Context, a runner.Artifact) (runner
 	return out, err
 }
 
-// recordBlob 登记 blob 与其授权关联；同一 sha256 的大小不同为冲突。
+// recordBlob 登记 blob 与其授权关联（task 及其会话，规格 §5.6）；同一 sha256 的大小不同为冲突。
 func recordBlob(ctx context.Context, tx pgx.Tx, a runner.Artifact) error {
 	if _, err := tx.Exec(ctx, "INSERT INTO blobs (sha256, size) VALUES ($1, $2) ON CONFLICT DO NOTHING", a.SHA256, a.Size); err != nil {
 		return err
@@ -259,8 +350,16 @@ func recordBlob(ctx context.Context, tx pgx.Tx, a runner.Artifact) error {
 	if size != a.Size {
 		return conflictf("blob %s 已登记为 %d 字节，不是 %d", a.SHA256, size, a.Size)
 	}
-	_, err := tx.Exec(ctx, "INSERT INTO scope_blobs (scope_kind, scope_id, sha256) VALUES ('task', $1, $2) ON CONFLICT DO NOTHING",
-		a.TaskID, a.SHA256)
+	return authorizeTaskBlob(ctx, tx, a.TaskID, a.SHA256)
+}
+
+// authorizeTaskBlob 把 blob 授权到任务 scope，任务属于会话时同事务另授权到会话 scope（§5.5 第 2 条：attempt → task
+// → session 推导；会话 scope 使后续 turn 的 carryover、恢复与会话 checkpoint 可以引用它）。
+func authorizeTaskBlob(ctx context.Context, tx pgx.Tx, taskID, sha string) error {
+	_, err := tx.Exec(ctx, `INSERT INTO scope_blobs (scope_kind, scope_id, sha256)
+		SELECT 'task', $1::text, $2::text
+		UNION ALL SELECT 'session', session_id, $2::text FROM tasks WHERE task_id = $1::text AND session_id IS NOT NULL
+		ON CONFLICT DO NOTHING`, taskID, sha)
 	return err
 }
 
@@ -300,9 +399,9 @@ func proposalHash(p runner.TerminalProposal) []byte {
 // 不以 WHERE … IS NULL 静默忽略（设计 §2.4）。只写 attempts 的 terminal_proposal* 列。
 func (s *Store) RecordTerminalProposal(ctx context.Context, p runner.TerminalProposal) (runner.TerminalProposal, error) {
 	switch p.Kind {
-	case "result", "error", "paused":
+	case "result", "error", "paused", "awaiting_input":
 	default:
-		return runner.TerminalProposal{}, invalidf("终态提议必须是 result、error 或 paused，得到 %q", p.Kind)
+		return runner.TerminalProposal{}, invalidf("终态提议必须是 result、error、paused 或 awaiting_input，得到 %q", p.Kind)
 	}
 	hash := proposalHash(p)
 	var out runner.TerminalProposal
@@ -447,15 +546,29 @@ func insertWorkerEvent(ctx context.Context, tx pgx.Tx, taskID, attemptID string,
 	if err != nil {
 		return err
 	}
-	ts := e.TS
-	if ts.IsZero() {
-		_, err = tx.Exec(ctx, `INSERT INTO events (task_id, task_seq, event_key, attempt_id, worker_seq, source, type, payload, content_hash)
-			VALUES ($1, $2, $3, $4, $5, 'worker', $6, $7, $8)`,
-			taskID, seq, fmt.Sprintf("w:%s:%d", attemptID, e.Seq), attemptID, e.Seq, e.Type, []byte(e.Payload), workerEventHash(e))
+	sessionID, sessionSeq, err := appendSessionSeq(ctx, tx, taskID) // 会话 task：同事务分配 session_seq
+	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO events (task_id, task_seq, event_key, attempt_id, worker_seq, source, type, payload, content_hash, ts)
-		VALUES ($1, $2, $3, $4, $5, 'worker', $6, $7, $8, $9)`,
-		taskID, seq, fmt.Sprintf("w:%s:%d", attemptID, e.Seq), attemptID, e.Seq, e.Type, []byte(e.Payload), workerEventHash(e), ts)
+	var ts any // 零值时用数据库时间
+	if !e.TS.IsZero() {
+		ts = e.TS
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO events (task_id, task_seq, event_key, attempt_id, worker_seq, source, type, payload, content_hash,
+			ts, session_id, session_seq, subrun_id)
+		VALUES ($1, $2, $3, $4, $5, 'worker', $6, $7, $8, COALESCE($9::timestamptz, now()), NULLIF($10, ''), $11, NULLIF($12, ''))`,
+		taskID, seq, fmt.Sprintf("w:%s:%d", attemptID, e.Seq), attemptID, e.Seq, e.Type, []byte(e.Payload), workerEventHash(e),
+		ts, sessionID, nullSeq(sessionSeq), eventSubrunID(e.Payload))
 	return err
+}
+
+// eventSubrunID 是 Worker 事件载荷顶层的 subrun_id（subrun_* 与带 subrun_id 的 progress）；没有、无法解析或不合法时为空。
+func eventSubrunID(payload []byte) string {
+	var p struct {
+		SubrunID string `json:"subrun_id"`
+	}
+	if json.Unmarshal(payload, &p) != nil || !subrun.ValidID(p.SubrunID) {
+		return ""
+	}
+	return p.SubrunID
 }

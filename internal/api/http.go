@@ -98,6 +98,15 @@ type Config struct {
 	ResearchSpec  func(topic string) (json.RawMessage, error)
 	SecureCookies bool             // TLS 监听时为 true
 	Now           func() time.Time // 测试注入；nil 为 time.Now
+
+	// 会话端点（M4 Plan 12）只在启用账号时注册。Sessions 为 nil（server 未配置会话 Worker）时会话端点一律
+	// 503 sessions_unavailable。
+	Sessions Sessions
+	// TurnSpec 由消息生成 turn 的 spec 与 limits（server 固定模型；limits 含 max_tool_calls = --turn-tool-budget）。
+	// Sessions 非 nil 时必填。
+	TurnSpec func(text string, deepResearch bool) (spec, limits json.RawMessage, err error)
+	// NewSessionID 生成会话 ID（测试注入）；nil 时为 128 位随机十六进制。
+	NewSessionID func() string
 }
 
 // Handler 实现 api/openapi.yaml 描述的 REST 与 SSE 接口。
@@ -142,7 +151,7 @@ var (
 var routes = []route{
 	{"GET", "/status", accessDiagnostic, audienceAnyone, []int{200, 401, 403}, (*Handler).getStatus},
 	{"GET", "/tasks", accessRead, audienceList, []int{200, 400, 401, 403, 500, 503}, (*Handler).listTasks},
-	{"POST", "/tasks", accessWrite, audienceAdmin, []int{201, 400, 401, 403, 409, 500, 503}, (*Handler).createTask},
+	{"POST", "/tasks", accessWrite, audienceAdmin, []int{201, 400, 401, 403, 404, 409, 500, 503}, (*Handler).createTask},
 	{"GET", "/tasks/{id}", accessRead, audienceTask, readStatuses, (*Handler).getTask},
 	{"POST", "/tasks/{id}/cancel", accessWrite, audienceTask, controlStatuses, control("cancel")},
 	{"POST", "/tasks/{id}/pause", accessWrite, audienceAdmin, controlStatuses, control("pause")},
@@ -222,6 +231,12 @@ func New(cfg Config) (*Handler, error) {
 	}
 	if h.cfg.NewTaskID == nil {
 		h.cfg.NewTaskID = randomTaskID
+	}
+	if h.cfg.NewSessionID == nil {
+		h.cfg.NewSessionID = randomSessionID
+	}
+	if cfg.Sessions != nil && (cfg.Accounts == nil || cfg.TurnSpec == nil) {
+		return nil, errors.New("api: 会话（Sessions）需要启用账号（Accounts）与 TurnSpec")
 	}
 	active := routes
 	if cfg.Accounts != nil {
@@ -636,6 +651,7 @@ func (h *Handler) listTasks(w http.ResponseWriter, r *http.Request) {
 
 type createTaskBody struct {
 	RequestID string          `json:"request_id"`
+	SessionID string          `json:"session_id,omitempty"`
 	Spec      json.RawMessage `json:"spec"`
 	Limits    json.RawMessage `json:"limits,omitempty"`
 }
@@ -647,6 +663,10 @@ func (h *Handler) createTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if !isJSONObject(body.Spec) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "spec 必填且须为 JSON 对象")
+		return
+	}
+	if body.SessionID != "" {
+		h.createOperatorTurn(w, r, body)
 		return
 	}
 	if string(bytes.TrimSpace(body.Limits)) == "null" {
@@ -930,12 +950,18 @@ type tryJSON struct {
 	LatencyMs int64  `json:"latency_ms"`
 	CostMicro int64  `json:"cost_micro"`
 	Error     string `json:"error,omitempty"`
+	// exec try（/v1/exec）：排队与运行时间、CPU 实测（未测得时省略）、启动时间；其他端点省略。
+	QueueMs       *int64     `json:"queue_ms,omitempty"`
+	WallMs        *int64     `json:"wall_ms,omitempty"`
+	CPUUsec       *int64     `json:"cpu_usec,omitempty"`
+	ExecStartedAt *time.Time `json:"exec_started_at,omitempty"`
 }
 
 type callJSON struct {
 	CallID                    string    `json:"call_id"`
 	Endpoint                  string    `json:"endpoint"`
-	Model                     string    `json:"model,omitempty"` // chat 调用解析后的模型；其他端点省略
+	Model                     string    `json:"model,omitempty"`     // chat 调用解析后的模型；其他端点省略
+	SubrunID                  string    `json:"subrun_id,omitempty"` // 调用归属的 sub-run；root 调用省略
 	State                     string    `json:"state"`
 	Source                    string    `json:"source"`
 	FirstAttemptID            string    `json:"first_attempt_id"`
@@ -957,6 +983,8 @@ type inspectionJSON struct {
 	Attempts    []attemptJSON    `json:"attempts"`
 	Checkpoints []checkpointJSON `json:"checkpoints"`
 	Calls       []callJSON       `json:"calls"`
+	Budget      *BudgetView      `json:"budget,omitempty"` // task 层账本（两层费用的总额）
+	Subruns     []SubrunView     `json:"subruns"`          // 每项带 sub-run 层账本（规格 §15.4）
 }
 
 func (h *Handler) inspect(w http.ResponseWriter, r *http.Request) {
@@ -965,7 +993,8 @@ func (h *Handler) inspect(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	out := inspectionJSON{Task: toTaskJSON(in.Task), Attempts: []attemptJSON{}, Checkpoints: []checkpointJSON{}, Calls: []callJSON{}}
+	out := inspectionJSON{Task: toTaskJSON(in.Task), Attempts: []attemptJSON{}, Checkpoints: []checkpointJSON{}, Calls: []callJSON{},
+		Budget: in.Budget, Subruns: append([]SubrunView{}, in.Subruns...)}
 	for _, a := range in.Attempts {
 		out.Attempts = append(out.Attempts, attemptJSON{
 			AttemptID: a.AttemptID, AttemptNo: a.AttemptNo, Status: a.Status, OutcomeClass: a.OutcomeClass,
@@ -978,13 +1007,14 @@ func (h *Handler) inspect(w http.ResponseWriter, r *http.Request) {
 		out.Checkpoints = append(out.Checkpoints, checkpointJSON(c))
 	}
 	for _, c := range in.Calls {
-		cj := callJSON{CallID: c.CallID, Endpoint: c.Endpoint, Model: c.Model, State: c.State, Source: c.Source, FirstAttemptID: c.FirstAttemptID,
+		cj := callJSON{CallID: c.CallID, Endpoint: c.Endpoint, Model: c.Model, SubrunID: c.SubrunID, State: c.State, Source: c.Source, FirstAttemptID: c.FirstAttemptID,
 			TriesUsed: c.TriesUsed, CostChargedMicro: c.CostChargedMicro, UpstreamRequestID: c.UpstreamRequestID,
 			ResultRef: c.ResultRef, FailReason: c.FailReason, SupersedesCallID: c.SupersedesCallID, SupersedeReason: c.SupersedeReason,
 			PossibleExternalDuplicate: c.PossibleExternalDuplicate, CreatedAt: c.CreatedAt, DeadlineAt: c.DeadlineAt, Tries: []tryJSON{}}
 		for _, t := range c.Tries {
 			cj.Tries = append(cj.Tries, tryJSON{TryNo: t.TryNo, AttemptID: t.AttemptID, EnvID: t.EnvID, State: t.State,
-				Outcome: t.Outcome, LatencyMs: t.LatencyMs, CostMicro: t.CostMicro, Error: t.Error})
+				Outcome: t.Outcome, LatencyMs: t.LatencyMs, CostMicro: t.CostMicro, Error: t.Error,
+				QueueMs: t.QueueMs, WallMs: t.WallMs, CPUUsec: t.CPUUsec, ExecStartedAt: t.ExecStartedAt})
 		}
 		out.Calls = append(out.Calls, cj)
 	}

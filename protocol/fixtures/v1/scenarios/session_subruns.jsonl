@@ -1,0 +1,35 @@
+{"scenario": "subruns_happy_path", "description": "协商 subruns 扩展的会话：sub-run 事件带 attempt_id，宿主答复不带；release 后回到 idle", "expect": {"stream": "ok", "phase": "idle"}}
+{"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "session", "session_id": "s-1", "incarnation_id": "inc-1", "extensions": ["subruns"]}}
+{"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "session", "session_ext": 1, "subruns": 1, "worker": {"name": "research-worker", "version": "0.1.0"}, "capabilities": []}}
+{"from": "host", "message": {"type": "task_start", "v": 1, "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}}
+{"from": "worker", "message": {"type": "task_accepted", "v": 1, "seq": 2, "attempt_id": "a-1"}}
+{"from": "worker", "message": {"type": "subrun_start", "v": 1, "seq": 3, "attempt_id": "a-1", "subrun_id": "st1", "parent_step_id": "research", "deadline_ms": 600000}}
+{"from": "host", "message": {"type": "subrun_started", "v": 1, "subrun_id": "st1", "status": "started"}}
+{"from": "worker", "message": {"type": "progress", "v": 1, "seq": 4, "attempt_id": "a-1", "step_id": "research", "kind": "tool_call", "message": "web_search", "subrun_id": "st1"}}
+{"from": "worker", "message": {"type": "subrun_end", "v": 1, "seq": 5, "attempt_id": "a-1", "subrun_id": "st1", "status": "succeeded", "summary": "ok"}}
+{"from": "worker", "message": {"type": "checkpoint", "v": 1, "seq": 6, "attempt_id": "a-1", "checkpoint_id": "cp-1", "scope": "task", "step_id": "research", "state": {}, "refs": [], "subruns": [{"subrun_id": "st1", "status": "completed", "result_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}
+{"from": "host", "message": {"type": "checkpoint_result", "v": 1, "attempt_id": "a-1", "checkpoint_id": "cp-1", "scope": "task", "status": "committed"}}
+{"from": "worker", "message": {"type": "result", "v": 1, "seq": 7, "attempt_id": "a-1", "summary": "完成", "outputs": [], "subruns": [{"id": "st1", "status": "completed", "summary": "ok"}]}}
+{"from": "host", "message": {"type": "task_outcome", "v": 1, "attempt_id": "a-1", "verdict": "succeeded"}}
+{"from": "worker", "message": {"type": "task_released", "v": 1, "seq": 8, "attempt_id": "a-1"}}
+{"scenario": "subruns_ready_mismatch", "description": "init 请求了 subruns 而 ready 未确认 → extension_mismatch", "expect": {"stream": "violation", "violation": "extension_mismatch", "at": 1}}
+{"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "session", "session_id": "s-1", "incarnation_id": "inc-1", "extensions": ["subruns"]}}
+{"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "session", "session_ext": 1, "worker": {"name": "research-worker", "version": "0.1.0"}, "capabilities": []}}
+{"scenario": "subruns_not_negotiated", "description": "未协商 subruns 时的 subrun_start → extension_not_negotiated", "expect": {"stream": "violation", "violation": "extension_not_negotiated", "at": 4}}
+{"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "session", "session_id": "s-1", "incarnation_id": "inc-1"}}
+{"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "session", "session_ext": 1, "worker": {"name": "research-worker", "version": "0.1.0"}, "capabilities": []}}
+{"from": "host", "message": {"type": "task_start", "v": 1, "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}}
+{"from": "worker", "message": {"type": "task_accepted", "v": 1, "seq": 2, "attempt_id": "a-1"}}
+{"from": "worker", "message": {"type": "subrun_start", "v": 1, "seq": 3, "attempt_id": "a-1", "subrun_id": "st1", "parent_step_id": "research", "deadline_ms": 600000}}
+{"scenario": "subruns_known_per_attempt", "description": "已启动的 sub-run 只在本 attempt 内有效：下一个 attempt 未重发 subrun_start 就引用 st1 → subrun_unknown", "expect": {"stream": "violation", "violation": "subrun_unknown", "at": 10}}
+{"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "session", "session_id": "s-1", "incarnation_id": "inc-1", "extensions": ["subruns"]}}
+{"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "session", "session_ext": 1, "subruns": 1, "worker": {"name": "research-worker", "version": "0.1.0"}, "capabilities": []}}
+{"from": "host", "message": {"type": "task_start", "v": 1, "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1"}}
+{"from": "worker", "message": {"type": "task_accepted", "v": 1, "seq": 2, "attempt_id": "a-1"}}
+{"from": "worker", "message": {"type": "subrun_start", "v": 1, "seq": 3, "attempt_id": "a-1", "subrun_id": "st1", "parent_step_id": "research", "deadline_ms": 600000}}
+{"from": "host", "message": {"type": "cancel", "v": 1, "attempt_id": "a-1", "reason": "user", "grace_ms": 0}}
+{"from": "host", "message": {"type": "task_outcome", "v": 1, "attempt_id": "a-1", "verdict": "cancelled"}}
+{"from": "worker", "message": {"type": "task_released", "v": 1, "seq": 4, "attempt_id": "a-1"}}
+{"from": "host", "message": {"type": "task_start", "v": 1, "task_id": "t-2", "attempt_id": "a-2", "attempt_no": 1, "out_dir": "/workspace/out/a-2"}}
+{"from": "worker", "message": {"type": "task_accepted", "v": 1, "seq": 5, "attempt_id": "a-2"}}
+{"from": "worker", "message": {"type": "subrun_end", "v": 1, "seq": 6, "attempt_id": "a-2", "subrun_id": "st1", "status": "cancelled", "summary": ""}}

@@ -1,12 +1,19 @@
 // 极简 hash 路由：页面路由全部放在 # 之后，永远不会与 API 路径（/tasks、/status、/auth、/research…）冲突。
-// - 用户页：#/login、#/register、#/（DeepResearch 助手）、#/research/<id>（进度与报告）
+// - 用户页：#/login、#/register、#/（新对话）、#/s/<id>（对话会话）、
+//   #/research（早期的 DeepResearch 助手页）、#/research/<id>（早期研究的进度与报告）
 // - 运维工作台：#/admin、#/admin/tasks、#/admin/tasks/<id>（TokenGate 不变）
 import { onBeforeUnmount, ref } from "vue";
 import type { Ref } from "vue";
 
 export type AdminRoute = { name: "tasks" } | { name: "task"; id: string };
 
-export type Route = { name: "login" } | { name: "register" } | { name: "home" } | { name: "research"; id: string } | AdminRoute;
+export type Route =
+  | { name: "login" }
+  | { name: "register" }
+  | { name: "chat"; id?: string }
+  | { name: "legacy" }
+  | { name: "research"; id: string }
+  | AdminRoute;
 
 /** 运维工作台的路由（#/admin/...）。 */
 export function isAdminRoute(r: Route): r is AdminRoute {
@@ -15,7 +22,7 @@ export function isAdminRoute(r: Route): r is AdminRoute {
 
 /** 需要登录的用户页。 */
 export function needsSession(r: Route): boolean {
-  return r.name === "home" || r.name === "research";
+  return r.name === "chat" || r.name === "legacy" || r.name === "research";
 }
 
 function decodeId(raw: string): string | null {
@@ -31,10 +38,17 @@ export function parseHash(hash: string): Route {
   if (/^\/login\/?$/.test(path)) return { name: "login" };
   if (/^\/register\/?$/.test(path)) return { name: "register" };
 
+  const sess = /^\/s\/([^/?#]+)\/?$/.exec(path);
+  if (sess?.[1]) {
+    const id = decodeId(sess[1]);
+    return id ? { name: "chat", id } : { name: "chat" };
+  }
+
+  if (/^\/research\/?$/.test(path)) return { name: "legacy" };
   const research = /^\/research\/([^/?#]+)\/?$/.exec(path);
   if (research?.[1]) {
     const id = decodeId(research[1]);
-    return id ? { name: "research", id } : { name: "home" };
+    return id ? { name: "research", id } : { name: "legacy" };
   }
 
   // 工作台：#/admin/tasks/<id>；旧链接 #/tasks/<id> 同样指向工作台。
@@ -44,7 +58,7 @@ export function parseHash(hash: string): Route {
     return id ? { name: "task", id } : { name: "tasks" };
   }
   if (/^\/admin(?:\/.*)?$/.test(path) || /^\/tasks(?:\/.*)?$/.test(path)) return { name: "tasks" };
-  return { name: "home" };
+  return { name: "chat" };
 }
 
 export function loginHref(): string {
@@ -57,6 +71,15 @@ export function registerHref(): string {
 
 export function homeHref(): string {
   return "#/";
+}
+
+export function sessionHref(id: string): string {
+  return `#/s/${encodeURIComponent(id)}`;
+}
+
+/** 早期的 DeepResearch 助手页（研究列表与提交）。 */
+export function legacyHref(): string {
+  return "#/research";
 }
 
 export function researchHref(id: string): string {

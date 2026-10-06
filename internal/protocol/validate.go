@@ -13,11 +13,11 @@ func (m *Init) validate() error {
 	if len(m.ProtocolVersions) == 0 {
 		return newError(CodeMissingField, "protocol_versions 不能为空")
 	}
-	if err := oneOf("mode", m.Mode, ModeTask, ModeSession); err != nil {
+	if err := firstErr(oneOf("mode", m.Mode, ModeTask, ModeSession), checkExtensions(m.Extensions)); err != nil {
 		return err
 	}
-	if m.Mode != ModeTask {
-		return nil // session 扩展的字段由后续里程碑校验
+	if m.Mode == ModeSession {
+		return m.validateSessionInit()
 	}
 	if err := firstErr(required("task_id", m.TaskID), required("attempt_id", m.AttemptID), required("out_dir", m.OutDir)); err != nil {
 		return err
@@ -41,7 +41,10 @@ func (r *Resume) validate() error {
 	if err := checkState(r.State, r.StateRef); err != nil {
 		return err
 	}
-	return checkRefs("resume.refs", r.Refs, MaxRefsPerCheckpoint)
+	if err := checkRefs("resume.refs", r.Refs, MaxRefsPerCheckpoint); err != nil {
+		return err
+	}
+	return checkResumeSubruns(r.Subruns)
 }
 
 func (m *CheckpointResult) validate() error {
@@ -89,11 +92,11 @@ func (m *Ready) validate() error {
 	if m.ProtocolVersion != Version {
 		return newError(CodeVersionMismatch, "protocol_version=%d，期望 %d", m.ProtocolVersion, Version)
 	}
-	return firstErr(oneOf("mode", m.Mode, ModeTask, ModeSession), required("worker.name", m.Worker.Name))
+	return firstErr(oneOf("mode", m.Mode, ModeTask, ModeSession), required("worker.name", m.Worker.Name), checkReadySubruns(m.Subruns))
 }
 
 func (m *Progress) validate() error {
-	return firstErr(checkEvent(m.EventHeader), required("kind", m.Kind))
+	return firstErr(checkEvent(m.EventHeader), required("kind", m.Kind), checkProgressSubrun(m.SubrunID))
 }
 
 func (m *Artifact) validate() error {
@@ -124,7 +127,10 @@ func (m *Checkpoint) validate() error {
 	if err := checkState(m.State, m.StateRef); err != nil {
 		return err
 	}
-	return checkRefs("refs", m.Refs, MaxRefsPerCheckpoint)
+	if err := checkRefs("refs", m.Refs, MaxRefsPerCheckpoint); err != nil {
+		return err
+	}
+	return checkCheckpointSubruns(m.Subruns, len(m.Refs))
 }
 
 func (m *CheckpointQuery) validate() error {
@@ -144,7 +150,7 @@ func (m *Result) validate() error {
 			return newError(CodeInvalidField, "outputs 中不能有空的 artifact_id")
 		}
 	}
-	return nil
+	return checkResultSubruns(m.Subruns)
 }
 
 func (m *ErrorEvent) validate() error {
@@ -187,6 +193,11 @@ func checkState(state json.RawMessage, stateRef string) error {
 		}
 		return nil
 	}
+	return checkInlineState(state)
+}
+
+// checkInlineState 按紧凑 JSON 计算 inline state 的大小。
+func checkInlineState(state json.RawMessage) error {
 	var compact bytes.Buffer
 	if err := json.Compact(&compact, state); err != nil {
 		return newError(CodeMalformedJSON, "state: %v", err)

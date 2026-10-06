@@ -117,14 +117,20 @@ const cloneNewMask = 0x00020000 | 0x02000000 | 0x04000000 | 0x08000000 |
 // afUnix 是 AF_UNIX（include/linux/socket.h）。
 const afUnix = 1
 
+// personalityAllowed 是 personality(2) 允许的 persona（include/uapi/linux/personality.h）：PER_LINUX 0x0、
+// PER_LINUX32 0x8、UNAME26 0x0020000 及其组合，以及查询 0xffffffff（不修改）。其余（READ_IMPLIES_EXEC、
+// ADDR_NO_RANDOMIZE、ADDR_COMPAT_LAYOUT 等削弱内存布局保护的标志）→ EPERM。
+var personalityAllowed = []uint32{0x0, 0x8, 0x20000, 0x20008, 0xffffffff}
+
 // seccompSyscalls 是过滤器用到的系统调用号。
 type seccompSyscalls struct {
 	auditArch uint32
 	// deny 是无条件返回 EPERM 的调用号。
-	deny   []uint32
-	clone  uint32
-	socket uint32
-	clone3 uint32
+	deny        []uint32
+	clone       uint32
+	socket      uint32
+	clone3      uint32
+	personality uint32
 }
 
 // seccompDenyNames 是规格 §4.5 中无条件拒绝（EPERM）的系统调用，按此顺序生成。
@@ -136,6 +142,7 @@ var seccompDenyNames = []string{
 	"keyctl", "add_key", "request_key", "open_by_handle_at",
 	"init_module", "finit_module", "delete_module",
 	"kexec_load", "kexec_file_load",
+	"name_to_handle_at", // Plan 15 D15：与 open_by_handle_at 配对，不暴露文件句柄
 }
 
 // syscallNrAMD64 来自 arch/x86/entry/syscalls/syscall_64.tbl（common/64 条目）。
@@ -146,8 +153,8 @@ var syscallNrAMD64 = map[string]uint32{
 	"io_uring_setup": 425, "io_uring_enter": 426, "io_uring_register": 427,
 	"keyctl": 250, "add_key": 248, "request_key": 249, "open_by_handle_at": 304,
 	"init_module": 175, "finit_module": 313, "delete_module": 176,
-	"kexec_load": 246, "kexec_file_load": 320,
-	"clone": 56, "socket": 41, "clone3": 435,
+	"kexec_load": 246, "kexec_file_load": 320, "name_to_handle_at": 303,
+	"clone": 56, "socket": 41, "clone3": 435, "personality": 135,
 }
 
 // syscallNrARM64 来自 include/uapi/asm-generic/unistd.h（aarch64 使用通用表）。
@@ -158,8 +165,8 @@ var syscallNrARM64 = map[string]uint32{
 	"io_uring_setup": 425, "io_uring_enter": 426, "io_uring_register": 427,
 	"keyctl": 219, "add_key": 217, "request_key": 218, "open_by_handle_at": 265,
 	"init_module": 105, "finit_module": 273, "delete_module": 106,
-	"kexec_load": 104, "kexec_file_load": 294,
-	"clone": 220, "socket": 198, "clone3": 435,
+	"kexec_load": 104, "kexec_file_load": 294, "name_to_handle_at": 264,
+	"clone": 220, "socket": 198, "clone3": 435, "personality": 92,
 }
 
 func syscallsFor(arch Arch) (seccompSyscalls, error) {
@@ -197,6 +204,9 @@ func syscallsFor(arch Arch) (seccompSyscalls, error) {
 	if s.clone3, err = lookup("clone3"); err != nil {
 		return s, err
 	}
+	if s.personality, err = lookup("personality"); err != nil {
+		return s, err
+	}
 	return s, nil
 }
 
@@ -208,10 +218,12 @@ func syscallsFor(arch Arch) (seccompSyscalls, error) {
 //  3. clone 的 flags 带任一 CLONE_NEW* → ERRNO(EPERM)；
 //  4. socket 的 family 不是 AF_UNIX → ERRNO(EPERM)；
 //  5. clone3 → ERRNO(ENOSYS)（seccomp 无法解引用 clone_args，让 libc 回退到 clone）；
-//  6. 其余 → ALLOW。
+//  6. personality 的 persona 不在 personalityAllowed 中 → ERRNO(EPERM)；
+//  7. 其余 → ALLOW。
 //
 // 参数只比较低 32 位：clone 的 flags 在内核中按 lower_32_bits 截断，
-// socket 的 family 是 int，高 32 位不影响内核行为，也就无法用来绕过。
+// socket 的 family 是 int，personality 的 persona 是 unsigned int，
+// 高 32 位不影响内核行为，也就无法用来绕过。
 func BuildFilter(p SeccompProfile, arch Arch) ([]SockFilter, error) {
 	switch p {
 	case ProfileOrchestrator, ProfileExec:
@@ -237,6 +249,7 @@ func BuildFilter(p SeccompProfile, arch Arch) ([]SockFilter, error) {
 	b.jumpIf(bpfJEQ, sc.clone, "clone", "")
 	b.jumpIf(bpfJEQ, sc.socket, "socket", "")
 	b.jumpIf(bpfJEQ, sc.clone3, "enosys", "")
+	b.jumpIf(bpfJEQ, sc.personality, "personality", "")
 	b.ret(seccompRetAllow)
 
 	b.label("clone")
@@ -246,6 +259,13 @@ func BuildFilter(p SeccompProfile, arch Arch) ([]SockFilter, error) {
 	b.label("socket")
 	b.load(seccompDataArgs) // args[0] 低 32 位：family
 	b.jumpIf(bpfJEQ, afUnix, "allow", "eperm")
+
+	b.label("personality")
+	b.load(seccompDataArgs) // args[0] 低 32 位：persona
+	for _, p := range personalityAllowed {
+		b.jumpIf(bpfJEQ, p, "allow", "")
+	}
+	b.ret(seccompRetErrno | errnoEPERM)
 
 	b.label("allow")
 	b.ret(seccompRetAllow)

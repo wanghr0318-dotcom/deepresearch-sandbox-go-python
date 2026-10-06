@@ -33,6 +33,7 @@
           <th>call</th>
           <th>端点</th>
           <th>模型</th>
+          <th>sub-run</th>
           <th>状态</th>
           <th class="num">尝试</th>
           <th class="num">费用</th>
@@ -51,6 +52,7 @@
             </td>
             <td class="mono">{{ c.endpoint }}</td>
             <td class="mono">{{ modelOf(c) }}</td>
+            <td class="mono" :class="{ muted: !c.subrun_id }">{{ c.subrun_id || "root" }}</td>
             <td><span class="badge" :class="stateClass(c.state)">{{ c.state }}</span></td>
             <td class="num">{{ c.tries_used }}</td>
             <td class="num mono">{{ formatMicroUSD(c.cost_charged_micro) }}</td>
@@ -62,7 +64,7 @@
             </td>
           </tr>
           <tr v-if="open.has(c.call_id)" class="tries-row">
-            <td colspan="8">
+            <td colspan="9">
               <table class="data-table tries">
                 <thead>
                   <tr>

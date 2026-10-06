@@ -40,8 +40,9 @@ type capSets struct {
 // initCaps 是 init 的能力集合（规格 §4.6）：bounding = {KILL, SETUID, SETGID, SETPCAP}；
 // permitted = effective = {KILL}；inheritable、ambient 为空；不设 securebits。
 //
-// 这是唯一的定义处。Plan 2 的 permitted 扩展（{KILL, SETUID, SETGID, SETPCAP}，R3 判据所需）是有条件
-// 授权的增量：须经 Task 11 的有界实验验证后才采纳，届时只改这里。
+// 这是唯一的定义处。能力集已按 2026-10-05 决策说明（docs/design/2026-10-05-startup-success-decision.md）定案：
+// permitted = effective = {KILL}，不扩展；启动判据为 exec-status 管道 + reaper wait，ptrace 路径永久不采用。
+// TestInitCapsBoundaryIsFinal 锁定此值。
 var initCaps = capSets{
 	Bounding:  1<<capKill | 1<<capSetuid | 1<<capSetgid | 1<<capSetpcap,
 	Permitted: 1 << capKill,

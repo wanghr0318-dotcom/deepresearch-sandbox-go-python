@@ -1,0 +1,19 @@
+{
+  "name": "subrun_late_complete_after_cancel",
+  "description": "E41：deadline 触发 subrun_cancel_requested 之后，迟到的 checkpoint 把该 sub-run 列为 completed，宿主以 checkpoint_result rejected/invalid_transition 拒绝（事件流本身合法）；Worker 随后回 subrun_end{cancelled}，sub-run 终态为 timed_out（expect.subruns 是宿主侧期望的最终状态，供 runner 测试使用）",
+  "layers": ["protocol"],
+  "lines": [
+    {"from": "host", "message": {"type": "init", "bootstrap": 1, "protocol_versions": [1], "mode": "task", "task_id": "t-1", "attempt_id": "a-1", "attempt_no": 1, "out_dir": "/workspace/out/a-1", "extensions": ["subruns"]}},
+    {"from": "worker", "message": {"type": "ready", "v": 1, "seq": 1, "protocol_version": 1, "mode": "task", "worker": {"name": "research-worker", "version": "0.1.0"}, "capabilities": [], "subruns": 1}},
+    {"from": "worker", "message": {"type": "subrun_start", "v": 1, "seq": 2, "subrun_id": "st1", "parent_step_id": "research", "deadline_ms": 50}},
+    {"from": "host", "message": {"type": "subrun_started", "v": 1, "subrun_id": "st1", "status": "started"}},
+    {"from": "host", "message": {"type": "subrun_cancel_requested", "v": 1, "subrun_id": "st1", "reason": "deadline"}},
+    {"from": "worker", "message": {"type": "artifact", "v": 1, "seq": 3, "artifact_id": "subrun-st1", "path": "subruns/st1.json", "declared_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "declared_size": 64, "media_type": "application/json", "visibility": "internal"}},
+    {"from": "host", "message": {"type": "artifact_result", "v": 1, "artifact_id": "subrun-st1", "status": "saved", "version": 1, "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},
+    {"from": "worker", "message": {"type": "checkpoint", "v": 1, "seq": 4, "checkpoint_id": "cp-1", "scope": "task", "step_id": "research", "state": {"subtopics": {"st1": "done"}}, "refs": [], "subruns": [{"subrun_id": "st1", "status": "completed", "result_ref": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}]}},
+    {"from": "host", "message": {"type": "checkpoint_result", "v": 1, "checkpoint_id": "cp-1", "scope": "task", "status": "rejected", "code": "invalid_transition"}},
+    {"from": "worker", "message": {"type": "subrun_end", "v": 1, "seq": 5, "subrun_id": "st1", "status": "cancelled", "summary": "deadline"}},
+    {"from": "worker", "message": {"type": "result", "v": 1, "seq": 6, "summary": "部分完成", "outputs": [], "subruns": [{"id": "st1", "status": "timed_out", "summary": "deadline 到期，未纳入报告"}]}}
+  ],
+  "expect": {"stream": "ok", "subruns": {"st1": "timed_out"}}
+}

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"syscall"
 	"time"
 )
@@ -52,6 +53,10 @@ type Mounts struct {
 	GatewaySocket string // 宿主 socket 路径，挂到 /run/agentbox/gateway.sock；exec 为空
 	In            string // 仅 exec：只读输入目录
 	OutBytes      int64  // 仅 exec：/out tmpfs 大小
+	// RestoreDir 仅 session：宿主目录，只读 bind 到 /run/agentbox/restore（规格 §12.2 冷恢复暂存）。bind 的是目录，
+	// 宿主删除其中的暂存文件后沙箱内随即不可见（incarnation 进入 idle 后的"卸载"）。目录由调用方建立
+	// （root 属主、0755，文件 0444，上级目录须 o+x）与删除；provider 只挂载，不删除它。
+	RestoreDir string
 }
 
 // ExecSpec 描述环境内一次执行。workload 身份固定为映射 uid/gid 1000，seccomp 配置由环境类型决定，
@@ -91,7 +96,31 @@ type EnvInfo struct {
 	Kind     EnvKind
 	Complete bool // 各层齐全且 init 就绪；false 即 Create 会返回 ErrIncomplete 的残留
 	Running  bool // 环境 cgroup 存在且 populated 为 1
+	// InDir 只对 exec 环境且 Mounts.In 为空时非空：provider 建立的输入暂存目录（宿主路径，root 0755），
+	// 调用方在 StartExec 之前写入（文件 0444、目录 0755），沙箱内只读可见于 /in。幂等 Create 返回同一路径。
+	InDir string
 }
+
+// MaxOutputFiles 是 exec /out 收集的文件上限（规格 §10.2、§19）。
+const MaxOutputFiles = 256
+
+// OutputFile 是 /out 中一个已打开的普通文件（O_RDONLY|O_NOFOLLOW，按规格 §5.6 的规则打开）。调用方负责关闭。
+type OutputFile struct {
+	Path string // 相对 /out 的规范路径，例如 "a/b.txt"
+	Size int64  // 打开后 fstat 得到的大小
+	File *os.File
+}
+
+// SkippedOutput 是 /out 中未收集的条目。Reason 取值见 Skip* 常量。
+type SkippedOutput struct{ Path, Reason string }
+
+// SkippedOutput.Reason 的取值。
+const (
+	SkipSymlink    = "symlink"     // 符号链接（不跟随）
+	SkipNotRegular = "not_regular" // FIFO、设备、socket 等
+	SkipTooMany    = "too_many"    // 普通文件超过上限
+	SkipOpenFailed = "open_failed" // 打开或 fstat 失败（例如收集期间被替换）
+)
 
 // Owner 是扫描项的归属分类（规格 §14.1 扫描表）。
 type Owner int
@@ -125,19 +154,71 @@ type Provider interface {
 	List(ctx context.Context) ([]EnvInfo, error)
 	Scan(ctx context.Context) (ScanReport, error)
 	ResourceDiag(ctx context.Context, envID string) (ResourceDiag, error)
+	// OpenOutputs 打开 exec 环境 /out 下的普通文件（递归、按路径字典序、至多 max 个）。环境须已确认停止，
+	// 否则 ErrNotStopped；非 exec 环境返回错误；环境不存在为 ErrNotFound。出错时不留下已打开的文件。
+	OpenOutputs(ctx context.Context, envID string, max int) ([]OutputFile, []SkippedOutput, error)
+	// Freeze 冻结环境的执行树（规格 §12.2；契约第 3 节修订，M4 Plan 12）：写 cgroup.freeze=1 并等待 cgroup.events
+	// 中 frozen 1（ctx 为期限，无期限时取默认上限）。期限内未确认 → ErrFreezeUnconfirmed，并已尝试解冻。
+	// 冻结只停调度、不释放内存；冻结中的环境仍可 Stop。环境 cgroup 不存在 → ErrNotFound。
+	Freeze(ctx context.Context, envID string) error
+	// Thaw 写 cgroup.freeze=0 并等待 frozen 0（期限同 Freeze）。环境 cgroup 不存在 → ErrNotFound。
+	Thaw(ctx context.Context, envID string) error
+	// Procs 返回环境 cgroup.procs 中的宿主 pid（释放核验的进程基线比较，规格 §12.4）。环境 cgroup 不存在 → ErrNotFound。
+	Procs(ctx context.Context, envID string) ([]int, error)
+	// ReclaimUIDFiles 把 <data>/workspaces 下属主（uid 或 gid）落在 [base, base+size) 的条目（不跟随符号链接）
+	// 改回 0:0，返回改动数量。只处理 workspaces；其他位置不改动（M4 Plan 15 D13：UID 范围归还前的回收，
+	// 下个 attempt 启动时会重新 chown 到它的范围）。
+	ReclaimUIDFiles(ctx context.Context, base, size uint32) (int, error)
+	// UIDFiles 扫描数据目录（跳过 blobs 目录；不进入其他文件系统的挂载点，挂载点本身仍按属主检查，因此
+	// /proc 类伪文件系统与残留 tmpfs 都不会被遍历）中属主（uid 或 gid）落在 [base, base+size) 的条目，
+	// 至多返回 limit 个宿主路径（规格 §4.5 UID 范围回收条件、I11）。
+	UIDFiles(ctx context.Context, base, size uint32, limit int) ([]string, error)
+}
+
+// LayerUIDFiles 是 UID 范围文件属主一层的扫描层名（ScanItem.Layer、隔离记录的 kind）。
+const LayerUIDFiles = "uid_files"
+
+// UIDSpan 是一段 UID 范围 [Base, Base+Size)。
+type UIDSpan struct {
+	ID   string // uid_ranges.uid_range_id（仅用于报告）
+	Base uint32
+	Size uint32
+}
+
+// UIDFileScanner 是 ScanUIDFiles 需要的 provider 子集。
+type UIDFileScanner interface {
+	UIDFiles(ctx context.Context, base, size uint32, limit int) ([]string, error)
+}
+
+// ScanUIDFiles 是 Scan 的 uid_files 层（规格 §14.1 第 5 步"UID 范围文件属主"）：Scan 不知道哪些范围已归还，
+// 因此由调用方（启动核对、verify-invariants）传入未分配的范围集合；每段至多报告 limit 个仍归它所有的路径。
+// 报告项的 EnvID 为空、归属为 Unknown（文件不属于任何存活环境）。
+func ScanUIDFiles(ctx context.Context, s UIDFileScanner, spans []UIDSpan, limit int) ([]ScanItem, error) {
+	var out []ScanItem
+	for _, sp := range spans {
+		paths, err := s.UIDFiles(ctx, sp.Base, sp.Size, limit)
+		if err != nil {
+			return nil, fmt.Errorf("provider: 扫描 UID 范围 %s [%d, +%d) 的文件: %w", sp.ID, sp.Base, sp.Size, err)
+		}
+		for _, p := range paths {
+			out = append(out, ScanItem{Layer: LayerUIDFiles, Path: p, Owner: Unknown})
+		}
+	}
+	return out, nil
 }
 
 // 错误（契约第 4 节）。ErrNotFound 只说明本次操作需要的那一层资源不存在，不说明其他层是否已清理。
 var (
-	ErrNotFound        = errors.New("provider: 不存在")
-	ErrIncomplete      = errors.New("provider: 环境不完整")
-	ErrConflict        = errors.New("provider: 同一 env_id 已存在且 spec 不同")
-	ErrForeign         = errors.New("provider: 资源不属于本安装或归属无法判定")
-	ErrStopping        = errors.New("provider: 环境已停止接受新的执行")
-	ErrStartFailed     = errors.New("provider: 启动失败，workload 未运行")
-	ErrControlLost     = errors.New("provider: 控制连接断开") // ACK 前：启动结果未知；ACK 后（Wait）：退出状态未知
-	ErrStopUnconfirmed = errors.New("provider: 期限内未确认执行树清空")
-	ErrNotStopped      = errors.New("provider: 环境尚未确认停止")
+	ErrNotFound          = errors.New("provider: 不存在")
+	ErrIncomplete        = errors.New("provider: 环境不完整")
+	ErrConflict          = errors.New("provider: 同一 env_id 已存在且 spec 不同")
+	ErrForeign           = errors.New("provider: 资源不属于本安装或归属无法判定")
+	ErrStopping          = errors.New("provider: 环境已停止接受新的执行")
+	ErrStartFailed       = errors.New("provider: 启动失败，workload 未运行")
+	ErrControlLost       = errors.New("provider: 控制连接断开") // ACK 前：启动结果未知；ACK 后（Wait）：退出状态未知
+	ErrStopUnconfirmed   = errors.New("provider: 期限内未确认执行树清空")
+	ErrNotStopped        = errors.New("provider: 环境尚未确认停止") // Destroy、OpenOutputs 的前置条件不成立
+	ErrFreezeUnconfirmed = errors.New("provider: 期限内未确认冻结")
 )
 
 // StartError 是 init 回复的 start_err：启动序列某步失败，workload 未运行。Reason 的取值由
@@ -171,9 +252,15 @@ func (s EnvSpec) Validate() error {
 		if s.Mounts.In != "" || s.Mounts.OutBytes != 0 {
 			return fmt.Errorf("provider: %s 环境不能有 /in 或 /out", s.Kind)
 		}
+		if s.Mounts.RestoreDir != "" && s.Kind != KindSession {
+			return errors.New("provider: 只有 session 环境可以有恢复暂存目录（RestoreDir）")
+		}
 	case KindExec:
-		if s.Mounts.Workspace != "" || s.Mounts.GatewaySocket != "" {
-			return errors.New("provider: exec 环境不能有 workspace 或 Gateway socket")
+		if s.Mounts.Workspace != "" || s.Mounts.GatewaySocket != "" || s.Mounts.RestoreDir != "" {
+			return errors.New("provider: exec 环境不能有 workspace、Gateway socket 或恢复暂存目录")
+		}
+		if s.Mounts.OutBytes <= 0 {
+			return errors.New("provider: exec 环境须给出 /out 的大小（OutBytes）")
 		}
 	default:
 		return fmt.Errorf("provider: 未知的环境类型 %q", s.Kind)
