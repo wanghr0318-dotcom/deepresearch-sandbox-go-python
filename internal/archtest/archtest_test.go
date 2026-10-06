@@ -114,6 +114,14 @@ func TestAccountIsPureLogic(t *testing.T) {
 	})
 }
 
+// TestSubrunIsPureLogic：subrun 是 sub-run 的纯逻辑（状态机、定义哈希、恢复判定），传递依赖中不得有
+// persistence、net/http、gateway 与 runner（Plan 14 Task 2）；存储与协议处理由调用方负责。
+func TestSubrunIsPureLogic(t *testing.T) {
+	forbid(t, "internal/subrun", []string{
+		module + "/internal/persistence", "net/http", module + "/internal/gateway", module + "/internal/runner",
+	})
+}
+
 // TestProtocolIsStdlibOnly：规则 3——protocol 只依赖标准库。
 func TestProtocolIsStdlibOnly(t *testing.T) {
 	for _, d := range deps(t, "internal/protocol") {
