@@ -276,7 +276,7 @@ func (e *Edge) Attach(ctx context.Context, incarnationID, attemptID string) erro
 }
 
 // Detach 使 incarnation 入口不再接受属于 attemptID 的连接（之后的新连接被拒绝，直到下一次 Attach），
-// 结束面向 Worker 的请求上下文、关闭绑定到 attemptID 的全部连接，并等待其在途请求结束（ctx 为期限，
+// 关闭绑定到 attemptID 的全部连接、再结束面向 Worker 的请求上下文（Worker 不会收到离开之后写出的响应），并等待其在途请求结束（ctx 为期限，
 // 超时返回 ctx 的错误），最后把 reason 转交 Calls.CancelAttempt（只有 call.ReasonCancel 取消在途 try）。
 // 幂等：attemptID 不是当前 Attach 的 attempt（已 Detach、或 incarnation 已撤销）时只转交 reason。
 func (e *Edge) Detach(ctx context.Context, incarnationID, attemptID, reason string) error {
@@ -287,10 +287,12 @@ func (e *Edge) Detach(ctx context.Context, incarnationID, attemptID, reason stri
 	if b != nil {
 		if t, conns := b.ln.detach(attemptID); t != nil {
 			idle := t.detach()
-			t.cancel()
+			// 先关闭连接、再结束 Invoke 的上下文：反过来时，被取消的处理函数可能抢在连接关闭之前把错误响应
+			// 写给已离开的 attempt 的 Worker（-race 的调度下可观察到）。连接关闭之后，处理函数的写入只会失败。
 			for _, c := range conns {
 				_ = c.Close() // 撤销清理，连接可能已被对端关闭
 			}
+			t.cancel()
 			select {
 			case <-idle:
 			case <-ctx.Done():
