@@ -434,7 +434,7 @@ paths:
       summary: Diagnostic timeline (§14.6); also served in diagnostic mode
       responses:
         '200':
-          description: Attempts with outcome, exit and OOM diagnosis, environment and cleanup state, checkpoints, and Gateway calls with their tries (task_id → attempt_id → call_id → try_no)
+          description: Attempts with outcome, exit and OOM diagnosis, environment and cleanup state, checkpoints, Gateway calls with their tries (task_id → attempt_id → call_id → try_no), the task-layer ledger and the sub-runs with their own ledger layer (§15.4)
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Inspection'}
@@ -1161,6 +1161,7 @@ components:
         call_id: {type: string}
         endpoint: {type: string}
         model: {type: string, description: The resolved model the call used (from the journal). Omitted for non-chat calls.}
+        subrun_id: {type: string, description: The sub-run the call is attributed to (X-Agentbox-Subrun). Omitted for root calls.}
         state: {type: string, enum: [resolving, in_flight, completed, failed, unknown]}
         source: {type: string}
         first_attempt_id: {type: string}
@@ -1193,9 +1194,41 @@ components:
         outputs:
           type: array
           items: {$ref: '#/components/schemas/PinnedOutput'}
+    TaskBudget:
+      type: object
+      description: The task-layer ledger (the total of the two-layer cost, spec §9.6). Amounts in micro-USD.
+      required: [limit_micro, reserved_micro, spent_micro, unknown_micro, tool_calls_used]
+      properties:
+        limit_micro: {type: integer, format: int64}
+        reserved_micro: {type: integer, format: int64}
+        spent_micro: {type: integer, format: int64}
+        unknown_micro: {type: integer, format: int64}
+        tool_call_limit: {type: integer, format: int64, description: Per-task web_search + web_fetch limit; omitted when unlimited}
+        tool_calls_used: {type: integer, format: int64}
+    Subrun:
+      type: object
+      description: |
+        One sub-run of the task (operator inspect only, spec §15.4): state machine status and timeline, failure or
+        cancel reason, and the sub-run-layer ledger (micro-USD). `cap_micro` is omitted when the sub-run layer only
+        attributes spend without a cap. `calls` counts the Gateway calls with this `subrun_id`.
+      required: [subrun_id, parent_step_id, status, started_at, deadline_at, reserved_micro, spent_micro, unknown_micro, calls]
+      properties:
+        subrun_id: {type: string}
+        parent_step_id: {type: string}
+        status: {type: string, enum: [started, end_proposed, cancel_requested, completed, cancelled, failed, timed_out]}
+        started_at: {type: string, format: date-time}
+        ended_at: {type: string, format: date-time, description: Set once the sub-run is terminal}
+        deadline_at: {type: string, format: date-time}
+        cancel_reason: {type: string, description: 'deadline, orchestrator, task_cancel or policy'}
+        failure_reason: {type: string, description: 'Worker reason (≤ 256 bytes), or task_cancel, not_completed_at_result, checkpoint_failed'}
+        cap_micro: {type: integer, format: int64}
+        reserved_micro: {type: integer, format: int64}
+        spent_micro: {type: integer, format: int64}
+        unknown_micro: {type: integer, format: int64}
+        calls: {type: integer}
     Inspection:
       type: object
-      required: [task, attempts, checkpoints, calls]
+      required: [task, attempts, checkpoints, calls, subruns]
       properties:
         task: {$ref: '#/components/schemas/Task'}
         attempts:
@@ -1207,6 +1240,11 @@ components:
         calls:
           type: array
           items: {$ref: '#/components/schemas/Call'}
+        budget: {$ref: '#/components/schemas/TaskBudget'}
+        subruns:
+          type: array
+          description: Sub-runs ordered by start time, then ID; empty for tasks without sub-runs
+          items: {$ref: '#/components/schemas/Subrun'}
     SessionErrorCode:
       type: string
       description: |

@@ -20,11 +20,12 @@
     </div>
 
     <div v-if="turn.steps.length" class="steps">
-      <template v-for="(row, i) in turn.steps" :key="row.id">
-        <div v-if="row.subtopic && row.subtopic !== turn.steps[i - 1]?.subtopic" class="sub-heading" data-testid="subtopic-heading">
-          {{ row.subtopic }}
+      <template v-for="(block, bi) in blocks" :key="block.kind === 'row' ? block.row.id : `group-${bi}`">
+        <StepRow v-if="block.kind === 'row'" :row="block.row" :expanded="isExpanded(block.row)" @toggle="toggle(block.row)" @raw="openRaw" />
+        <div v-else class="sub-group" data-testid="subtopic-group">
+          <div class="sub-heading" data-testid="subtopic-heading">{{ block.title }}</div>
+          <StepRow v-for="row in block.rows" :key="row.id" :row="row" :expanded="isExpanded(row)" @toggle="toggle(row)" @raw="openRaw" />
         </div>
-        <StepRow :row="row" :expanded="isExpanded(row)" @toggle="toggle(row)" @raw="openRaw" />
       </template>
     </div>
 
@@ -104,6 +105,39 @@ function openRaw(r: RawRef): void {
   rawRef.value = r;
 }
 
+// 步骤行按子主题归组：并行的子主题（sub-run）事件交错到达，同一子主题的行仍放在一起，分组出现在该子主题
+// 第一行的位置。分组键是 subtopicId（缺省时用子主题标题）；research_subtopic 行本身不归组。分组标题只显示
+// 子主题名，不显示任何 ID。
+type Block = { kind: "row"; row: StepRowData } | { kind: "group"; key: string; title: string; rows: StepRowData[] };
+
+const blocks = computed<Block[]>(() => {
+  const t = props.turn;
+  const out: Block[] = [];
+  const groups = new Map<string, Extract<Block, { kind: "group" }>>();
+  for (const row of t.steps) {
+    const key = row.kind === "subtopic" ? undefined : (row.subtopicId ?? row.subtopic);
+    if (!key) {
+      out.push({ kind: "row", row });
+      continue;
+    }
+    let g = groups.get(key);
+    if (!g) {
+      g = { kind: "group", key, title: "", rows: [] };
+      groups.set(key, g);
+      out.push(g);
+    }
+    g.rows.push(row);
+  }
+  for (const g of groups.values()) {
+    g.title =
+      g.rows.find((r) => r.subtopic)?.subtopic ??
+      t.subtopics.find((s) => s.id === g.key)?.title ??
+      t.todo.find((x) => x.id === g.key)?.title ??
+      "子主题";
+  }
+  return out;
+});
+
 const statusText = computed(() => {
   const t = props.turn;
   switch (t.status) {
@@ -171,6 +205,11 @@ const statusText = computed(() => {
   border-radius: 14px;
 }
 .steps {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.sub-group {
   display: flex;
   flex-direction: column;
   gap: 1px;

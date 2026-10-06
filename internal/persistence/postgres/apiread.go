@@ -93,10 +93,50 @@ func (s *Store) Inspect(ctx context.Context, taskID string) (api.Inspection, err
 		if err != nil {
 			return err
 		}
-		in.Calls, err = inspectCalls(ctx, q, taskID)
+		if in.Calls, err = inspectCalls(ctx, q, taskID); err != nil {
+			return err
+		}
+		if in.Budget, err = inspectBudget(ctx, q, taskID); err != nil {
+			return err
+		}
+		in.Subruns, err = inspectSubruns(ctx, q, taskID)
 		return err
 	})
 	return in, err
+}
+
+// inspectBudget 读取 task 层账本（两层费用的总额）；没有账本行时为 nil。
+func inspectBudget(ctx context.Context, q queryer, taskID string) (*api.BudgetView, error) {
+	var b api.BudgetView
+	err := q.QueryRow(ctx, `SELECT limit_micro, reserved_micro, spent_micro, unknown_micro, tool_call_limit, tool_calls_used
+		FROM budgets WHERE task_id = $1`, taskID).
+		Scan(&b.LimitMicro, &b.ReservedMicro, &b.SpentMicro, &b.UnknownMicro, &b.ToolCallLimit, &b.ToolCallsUsed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
+// inspectSubruns 读取任务的 sub-run（按启动时间、ID 排序，同 ListSubruns）及其 sub-run 层账本与调用数（规格 §15.4）。
+func inspectSubruns(ctx context.Context, q queryer, taskID string) ([]api.SubrunView, error) {
+	rows, err := q.Query(ctx, `SELECT s.subrun_id, s.parent_step_id, s.status, s.started_at, s.ended_at, s.deadline_at,
+			s.cancel_reason, s.failure_reason, b.cap_micro, COALESCE(b.reserved_micro, 0), COALESCE(b.spent_micro, 0),
+			COALESCE(b.unknown_micro, 0),
+			(SELECT count(*) FROM calls c WHERE c.task_id = s.task_id AND c.subrun_id = s.subrun_id)
+		FROM subruns s LEFT JOIN subrun_budgets b ON b.task_id = s.task_id AND b.subrun_id = s.subrun_id
+		WHERE s.task_id = $1 ORDER BY s.started_at, s.subrun_id`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (api.SubrunView, error) {
+		var v api.SubrunView
+		err := r.Scan(&v.SubrunID, &v.ParentStepID, &v.Status, &v.StartedAt, &v.EndedAt, &v.DeadlineAt,
+			&v.CancelReason, &v.FailureReason, &v.CapMicro, &v.ReservedMicro, &v.SpentMicro, &v.UnknownMicro, &v.Calls)
+		return v, err
+	})
 }
 
 // TaskResult 读取任务状态与固定的结果 tasks.result_json（实现 api.Store；规格 §5.6）。
@@ -156,7 +196,7 @@ func (s *Store) PinnedArtifact(ctx context.Context, taskID, artifactID string, v
 func inspectCalls(ctx context.Context, q queryer, taskID string) ([]api.CallView, error) {
 	rows, err := q.Query(ctx, `SELECT call_id, endpoint, state, source, first_attempt_id, upstream_request_id,
 			COALESCE(result_ref, ''), fail_reason, COALESCE(supersedes_call_id, ''), COALESCE(supersede_reason, ''),
-			tries_used, cost_charged, possible_external_duplicate, created_at, deadline_at, model
+			tries_used, cost_charged, possible_external_duplicate, created_at, deadline_at, model, COALESCE(subrun_id, '')
 		FROM calls WHERE task_id = $1 ORDER BY created_at, call_id`, taskID)
 	if err != nil {
 		return nil, err
@@ -165,7 +205,7 @@ func inspectCalls(ctx context.Context, q queryer, taskID string) ([]api.CallView
 		var v api.CallView
 		err := r.Scan(&v.CallID, &v.Endpoint, &v.State, &v.Source, &v.FirstAttemptID, &v.UpstreamRequestID,
 			&v.ResultRef, &v.FailReason, &v.SupersedesCallID, &v.SupersedeReason,
-			&v.TriesUsed, &v.CostChargedMicro, &v.PossibleExternalDuplicate, &v.CreatedAt, &v.DeadlineAt, &v.Model)
+			&v.TriesUsed, &v.CostChargedMicro, &v.PossibleExternalDuplicate, &v.CreatedAt, &v.DeadlineAt, &v.Model, &v.SubrunID)
 		return v, err
 	})
 	if err != nil || len(calls) == 0 {

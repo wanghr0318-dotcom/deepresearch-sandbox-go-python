@@ -138,6 +138,7 @@ describe("TaskDetailView", () => {
       task: task(),
       attempts: [{ attempt_id: "a-1", status: "running" }],
       checkpoints: [],
+      subruns: [],
       calls: [],
     }));
     const w = mount(TaskDetailView, { props: { id: "t-1" }, global: services(fakeApi({ inspectTask }), fakeWatch().fn) });
@@ -162,6 +163,31 @@ describe("TaskDetailView", () => {
     const text = w.findAll(".error-banner").map((b) => b.text()).join("\n");
     expect(text).toContain("所有权");
     expect(text).toContain("事件游标无效");
+    w.unmount();
+  });
+});
+
+describe("TaskDetailView sub-runs (M4 Plan 14 Task 10)", () => {
+  it("the sub-run tab loads inspect and shows the sub-run table with failure reasons", async () => {
+    const inspectTask = vi.fn(async () => ({
+      task: task(),
+      attempts: [],
+      checkpoints: [],
+      calls: [{ call_id: "st1/1", subrun_id: "st1", endpoint: "/v1/search", state: "completed" as const, source: "worker",
+        first_attempt_id: "a-1", tries_used: 1, cost_charged_micro: 10, possible_external_duplicate: false,
+        created_at: "2026-10-06T08:00:00Z", deadline_at: "2026-10-06T08:01:00Z", tries: [] }],
+      subruns: [{ subrun_id: "st1", parent_step_id: "research", status: "failed" as const, started_at: "2026-10-06T08:00:00Z",
+        ended_at: "2026-10-06T08:00:30Z", deadline_at: "2026-10-06T08:10:00Z", failure_reason: "model_unavailable",
+        reserved_micro: 0, spent_micro: 10, unknown_micro: 0, calls: 1 }],
+    }));
+    const w = mount(TaskDetailView, { props: { id: "t-1" }, global: services(fakeApi({ inspectTask }), fakeWatch().fn) });
+    await flushAll();
+    await w.get('[data-tab="subruns"]').trigger("click");
+    await flushAll();
+    expect(inspectTask).toHaveBeenCalledWith("t-1");
+    expect(w.get('tr[data-subrun="st1"]').text()).toContain("model_unavailable");
+    await w.get('[data-tab="calls"]').trigger("click");
+    expect(w.get('tr[data-call="st1/1"]').text()).toContain("st1");
     w.unmount();
   });
 });

@@ -6468,3 +6468,78 @@ func TestWorkerEventSubrunID(t *testing.T) {
 }
 
 // ==== M4 Plan 14 Task 6 段结束 ====
+
+// ==== M4 Plan 14 Task 10：inspect 的 sub-run 时间线与两层费用（规格 §15.4；本段到此结束前不含其他任务的用例） ====
+
+// TestInspectSubruns：Inspect 返回 task 层账本与每个 sub-run 的状态、时间、原因、sub-run 层账本与调用数；
+// 调用带 subrun_id（root 调用为空）。没有 sub-run 的任务：Subruns 为空，task 层照常返回。
+func TestInspectSubruns(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	capA := int64(400)
+	srFixture(t, s, "t1", 10_000, map[string]*int64{"st1": &capA})
+	mustStartSubrun(t, s, "t1", "att-t1", "st2")
+
+	srBegin(t, s, "t1", "st1", "st1/c1")
+	srSettle(t, s, srMustReserve(t, s, "t1", "st1", "st1/c1", 150), "ok", 120)
+	srBegin(t, s, "t1", "", "c0")
+	srSettle(t, s, srMustReserve(t, s, "t1", "", "c0", 80), "ok", 50)
+	srBegin(t, s, "t1", "st1", "st1/c2")
+	srMustReserve(t, s, "t1", "st1", "st1/c2", 100) // 仍 held
+	if _, err := s.ProposeSubrunEnd(ctx, "t1", "att-t1", "st2", "failed", "上游全部失败"); err != nil {
+		t.Fatal(err)
+	}
+
+	in, err := s.Inspect(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := in.Budget; b == nil || b.LimitMicro != 10_000 || b.ReservedMicro != 100 || b.SpentMicro != 170 || b.UnknownMicro != 0 {
+		t.Fatalf("task 层 = %+v", in.Budget)
+	}
+	if len(in.Subruns) != 2 {
+		t.Fatalf("subruns = %+v", in.Subruns)
+	}
+	byID := map[string]api.SubrunView{}
+	for _, v := range in.Subruns {
+		byID[v.SubrunID] = v
+	}
+	st1, st2 := byID["st1"], byID["st2"]
+	if st1.Status != "started" || st1.ParentStepID != "plan" || st1.EndedAt != nil || st1.CapMicro == nil || *st1.CapMicro != 400 ||
+		st1.ReservedMicro != 100 || st1.SpentMicro != 120 || st1.UnknownMicro != 0 || st1.Calls != 2 ||
+		st1.StartedAt.IsZero() || st1.DeadlineAt.Sub(st1.StartedAt) != 60*time.Second {
+		t.Fatalf("st1 = %+v", st1)
+	}
+	if st2.Status != "failed" || st2.FailureReason != "上游全部失败" || st2.EndedAt == nil || st2.CapMicro != nil ||
+		st2.SpentMicro != 0 || st2.Calls != 0 {
+		t.Fatalf("st2 = %+v", st2)
+	}
+	subOf := map[string]string{}
+	for _, c := range in.Calls {
+		subOf[c.CallID] = c.SubrunID
+	}
+	if subOf["c0"] != "" || subOf["st1/c1"] != "st1" || subOf["st1/c2"] != "st1" {
+		t.Fatalf("calls.subrun_id = %v", subOf)
+	}
+
+	// 取消原因（deadline 取消后 Worker 确认 → timed_out）
+	if _, err := s.RequestSubrunCancel(ctx, "t1", "st1", subrun.ReasonDeadline); err != nil {
+		t.Fatal(err)
+	}
+	if in, err = s.Inspect(ctx, "t1"); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range in.Subruns {
+		if v.SubrunID == "st1" && (v.Status != "cancel_requested" || v.CancelReason != subrun.ReasonDeadline) {
+			t.Fatalf("st1 取消后 = %+v", v)
+		}
+	}
+
+	fixture(t, s, "t2")
+	in2, err := s.Inspect(ctx, "t2")
+	if err != nil || in2.Budget == nil || in2.Budget.SpentMicro != 0 || len(in2.Subruns) != 0 {
+		t.Fatalf("无 sub-run 的任务 = %+v / %v", in2, err)
+	}
+}
+
+// ==== M4 Plan 14 Task 10 段结束 ====

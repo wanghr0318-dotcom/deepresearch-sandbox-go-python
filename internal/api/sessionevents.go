@@ -10,7 +10,7 @@ import (
 // 会话事件的对外映射与原文脱敏（M4 Plan 12；契约见 api/openapi.yaml 的 SessionEvent）。
 //
 // 用户（会话所有者）看到的每种事件只保留 sessionEventDataFields 列出的 data 顶层字段，并在任意深度去掉内部键
-// （internalKey：费用、价格、用量、模型、调用与 attempt 等内部 ID）；raw 子对象只保留 request、
+// （internalKey：费用、价格、用量、模型、调用、attempt 与 sub-run 等内部 ID）；raw 子对象只保留 request、
 // request_truncated、response_ref。运维额外得到原始记录（Internal），映射不到对外类型的记录以 type = internal 返回。
 
 // failedTurnMessage 是 turn 失败时面向用户的固定文案（不暴露内部失败原因的细节）。
@@ -50,7 +50,7 @@ var sessionEventStates = []string{"idle", "frozen", "evicted", "restoring", "clo
 // internalKey 报告对象键是否为用户不可见的内部字段（任意深度）。
 func internalKey(k string) bool {
 	switch k {
-	case "usage", "model", "call_id", "attempt_id", "worker_seq", "upstream_request_id", "system_fingerprint":
+	case "usage", "model", "call_id", "attempt_id", "subrun_id", "worker_seq", "upstream_request_id", "system_fingerprint":
 		return true
 	}
 	return strings.HasPrefix(k, "cost") || strings.Contains(k, "price")

@@ -950,7 +950,8 @@ type tryJSON struct {
 type callJSON struct {
 	CallID                    string    `json:"call_id"`
 	Endpoint                  string    `json:"endpoint"`
-	Model                     string    `json:"model,omitempty"` // chat 调用解析后的模型；其他端点省略
+	Model                     string    `json:"model,omitempty"`     // chat 调用解析后的模型；其他端点省略
+	SubrunID                  string    `json:"subrun_id,omitempty"` // 调用归属的 sub-run；root 调用省略
 	State                     string    `json:"state"`
 	Source                    string    `json:"source"`
 	FirstAttemptID            string    `json:"first_attempt_id"`
@@ -972,6 +973,8 @@ type inspectionJSON struct {
 	Attempts    []attemptJSON    `json:"attempts"`
 	Checkpoints []checkpointJSON `json:"checkpoints"`
 	Calls       []callJSON       `json:"calls"`
+	Budget      *BudgetView      `json:"budget,omitempty"` // task 层账本（两层费用的总额）
+	Subruns     []SubrunView     `json:"subruns"`          // 每项带 sub-run 层账本（规格 §15.4）
 }
 
 func (h *Handler) inspect(w http.ResponseWriter, r *http.Request) {
@@ -980,7 +983,8 @@ func (h *Handler) inspect(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	out := inspectionJSON{Task: toTaskJSON(in.Task), Attempts: []attemptJSON{}, Checkpoints: []checkpointJSON{}, Calls: []callJSON{}}
+	out := inspectionJSON{Task: toTaskJSON(in.Task), Attempts: []attemptJSON{}, Checkpoints: []checkpointJSON{}, Calls: []callJSON{},
+		Budget: in.Budget, Subruns: append([]SubrunView{}, in.Subruns...)}
 	for _, a := range in.Attempts {
 		out.Attempts = append(out.Attempts, attemptJSON{
 			AttemptID: a.AttemptID, AttemptNo: a.AttemptNo, Status: a.Status, OutcomeClass: a.OutcomeClass,
@@ -993,7 +997,7 @@ func (h *Handler) inspect(w http.ResponseWriter, r *http.Request) {
 		out.Checkpoints = append(out.Checkpoints, checkpointJSON(c))
 	}
 	for _, c := range in.Calls {
-		cj := callJSON{CallID: c.CallID, Endpoint: c.Endpoint, Model: c.Model, State: c.State, Source: c.Source, FirstAttemptID: c.FirstAttemptID,
+		cj := callJSON{CallID: c.CallID, Endpoint: c.Endpoint, Model: c.Model, SubrunID: c.SubrunID, State: c.State, Source: c.Source, FirstAttemptID: c.FirstAttemptID,
 			TriesUsed: c.TriesUsed, CostChargedMicro: c.CostChargedMicro, UpstreamRequestID: c.UpstreamRequestID,
 			ResultRef: c.ResultRef, FailReason: c.FailReason, SupersedesCallID: c.SupersedesCallID, SupersedeReason: c.SupersedeReason,
 			PossibleExternalDuplicate: c.PossibleExternalDuplicate, CreatedAt: c.CreatedAt, DeadlineAt: c.DeadlineAt, Tries: []tryJSON{}}

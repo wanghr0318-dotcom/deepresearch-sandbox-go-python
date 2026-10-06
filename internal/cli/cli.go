@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 	"time"
 )
 
@@ -177,7 +178,7 @@ func (c *cmd) task(sub string, args []string) error {
 		return usageError{"未知子命令 task " + sub}
 	}
 	fs, f := c.flags("task " + sub)
-	var reason, reqID, outPath, artifact *string
+	var reason, reqID, outPath, artifact, format *string
 	var version *int64
 	switch sub {
 	case "cancel", "pause", "resume":
@@ -187,6 +188,8 @@ func (c *cmd) task(sub string, args []string) error {
 		outPath = fs.String("out", "", "写入文件（缺省写标准输出）")
 		artifact = fs.String("artifact", "", "下载该产物（缺省下载任务结果）")
 		version = fs.Int64("version", 0, "与 --artifact 一起使用：产物版本（缺省最新版本）")
+	case "inspect":
+		format = fs.String("format", "json", "输出格式：json（API 响应原样）或 text（摘要、账本与 sub-run 段）")
 	}
 	// 任务 ID 可在标志前或后。
 	var id string
@@ -204,6 +207,9 @@ func (c *cmd) task(sub string, args []string) error {
 	if id == "" {
 		return usageError{"缺少任务 ID"}
 	}
+	if sub == "inspect" && *format != "json" && *format != "text" {
+		return usageError{"--format 须为 json 或 text"}
+	}
 	if sub == "result" && (*version < 0 || (*version != 0 && *artifact == "")) {
 		return usageError{"--version 须为正整数且与 --artifact 一起使用"}
 	}
@@ -215,6 +221,9 @@ func (c *cmd) task(sub string, args []string) error {
 	case "watch":
 		return c.watch(base + "/events")
 	case "inspect":
+		if *format == "text" {
+			return c.inspectText(base + "/inspect")
+		}
 		return c.getJSON(base + "/inspect")
 	case "result":
 		if *artifact == "" {
@@ -401,6 +410,116 @@ func (c *cmd) getJSON(path string) error {
 		return err
 	}
 	return c.printJSON(b)
+}
+
+// inspectView 是 inspect 文本输出用到的字段（其余字段只在 JSON 输出中）。金额为 micro-USD。
+type inspectView struct {
+	Task struct {
+		TaskID        string `json:"task_id"`
+		Status        string `json:"status"`
+		StatusReason  string `json:"status_reason"`
+		AttemptsTotal int64  `json:"attempts_total"`
+	} `json:"task"`
+	Budget *struct {
+		LimitMicro    int64  `json:"limit_micro"`
+		ReservedMicro int64  `json:"reserved_micro"`
+		SpentMicro    int64  `json:"spent_micro"`
+		UnknownMicro  int64  `json:"unknown_micro"`
+		ToolCallLimit *int64 `json:"tool_call_limit"`
+		ToolCallsUsed int64  `json:"tool_calls_used"`
+	} `json:"budget"`
+	Subruns []struct {
+		SubrunID      string     `json:"subrun_id"`
+		Status        string     `json:"status"`
+		StartedAt     time.Time  `json:"started_at"`
+		EndedAt       *time.Time `json:"ended_at"`
+		DeadlineAt    time.Time  `json:"deadline_at"`
+		CancelReason  string     `json:"cancel_reason"`
+		FailureReason string     `json:"failure_reason"`
+		CapMicro      *int64     `json:"cap_micro"`
+		ReservedMicro int64      `json:"reserved_micro"`
+		SpentMicro    int64      `json:"spent_micro"`
+		UnknownMicro  int64      `json:"unknown_micro"`
+		Calls         int64      `json:"calls"`
+	} `json:"subruns"`
+	Calls []struct {
+		SubrunID string `json:"subrun_id"`
+	} `json:"calls"`
+}
+
+// inspectText 以文本输出 inspect 的摘要：任务、task 层账本（两层费用的总额）、sub-run 段（每个 sub-run 一行：
+// 状态、时间线、sub-run 层费用、调用数与失败/取消原因；规格 §15.4）与调用的归属统计。
+func (c *cmd) inspectText(path string) error {
+	b, _, err := c.doRetry(http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+	var in inspectView
+	if err := json.Unmarshal(b, &in); err != nil {
+		return fmt.Errorf("解析 inspect 响应: %w", err)
+	}
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "task %s  %s", in.Task.TaskID, in.Task.Status)
+	if in.Task.StatusReason != "" {
+		fmt.Fprintf(&buf, " (%s)", in.Task.StatusReason)
+	}
+	fmt.Fprintf(&buf, "  attempts %d\n", in.Task.AttemptsTotal)
+	if bg := in.Budget; bg != nil {
+		fmt.Fprintf(&buf, "budget  spent %s / limit %s  reserved %s  unknown %s  tool calls %d",
+			usd(bg.SpentMicro), usd(bg.LimitMicro), usd(bg.ReservedMicro), usd(bg.UnknownMicro), bg.ToolCallsUsed)
+		if bg.ToolCallLimit != nil {
+			fmt.Fprintf(&buf, "/%d", *bg.ToolCallLimit)
+		}
+		buf.WriteByte('\n')
+	}
+	if len(in.Subruns) == 0 {
+		buf.WriteString("sub-runs: none\n")
+	} else {
+		fmt.Fprintf(&buf, "sub-runs (%d)\n", len(in.Subruns))
+		tw := tabwriter.NewWriter(&buf, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "ID\tSTATUS\tSTARTED\tDURATION\tDEADLINE\tSPENT/CAP\tRESERVED\tUNKNOWN\tCALLS\tREASON")
+		for _, s := range in.Subruns {
+			dur := "running"
+			if s.EndedAt != nil {
+				dur = s.EndedAt.Sub(s.StartedAt).Round(time.Second).String()
+			}
+			capStr := "-"
+			if s.CapMicro != nil {
+				capStr = usd(*s.CapMicro)
+			}
+			var reasons []string
+			if s.FailureReason != "" {
+				reasons = append(reasons, "failure: "+s.FailureReason)
+			}
+			if s.CancelReason != "" && s.CancelReason != s.FailureReason {
+				reasons = append(reasons, "cancel: "+s.CancelReason)
+			}
+			reason := "-"
+			if len(reasons) > 0 {
+				reason = strings.Join(reasons, "; ")
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s/%s\t%s\t%s\t%d\t%s\n", s.SubrunID, s.Status,
+				s.StartedAt.UTC().Format(time.RFC3339), dur, s.DeadlineAt.UTC().Format(time.RFC3339),
+				usd(s.SpentMicro), capStr, usd(s.ReservedMicro), usd(s.UnknownMicro), s.Calls, reason)
+		}
+		if err := tw.Flush(); err != nil {
+			return err
+		}
+	}
+	root := 0
+	for _, cl := range in.Calls {
+		if cl.SubrunID == "" {
+			root++
+		}
+	}
+	fmt.Fprintf(&buf, "calls %d (root %d, sub-run %d)\n", len(in.Calls), root, len(in.Calls)-root)
+	_, err = c.out.Write(buf.Bytes())
+	return err
+}
+
+// usd 把 micro-USD 格式化为美元（6 位小数）。
+func usd(micro int64) string {
+	return fmt.Sprintf("$%.6f", float64(micro)/1e6)
 }
 
 func (c *cmd) postJSON(path string, body any) error {

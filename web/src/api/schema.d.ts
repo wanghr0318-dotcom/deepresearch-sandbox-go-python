@@ -791,6 +791,8 @@ export interface components {
             endpoint: string;
             /** @description The resolved model the call used (from the journal). Omitted for non-chat calls. */
             model?: string;
+            /** @description The sub-run the call is attributed to (X-Agentbox-Subrun). Omitted for root calls. */
+            subrun_id?: string;
             /** @enum {string} */
             state: "resolving" | "in_flight" | "completed" | "failed" | "unknown";
             source: string;
@@ -823,11 +825,65 @@ export interface components {
             summary: string;
             outputs: components["schemas"]["PinnedOutput"][];
         };
+        /** @description The task-layer ledger (the total of the two-layer cost, spec §9.6). Amounts in micro-USD. */
+        TaskBudget: {
+            /** Format: int64 */
+            limit_micro: number;
+            /** Format: int64 */
+            reserved_micro: number;
+            /** Format: int64 */
+            spent_micro: number;
+            /** Format: int64 */
+            unknown_micro: number;
+            /**
+             * Format: int64
+             * @description Per-task web_search + web_fetch limit; omitted when unlimited
+             */
+            tool_call_limit?: number;
+            /** Format: int64 */
+            tool_calls_used: number;
+        };
+        /**
+         * @description One sub-run of the task (operator inspect only, spec §15.4): state machine status and timeline, failure or
+         *     cancel reason, and the sub-run-layer ledger (micro-USD). `cap_micro` is omitted when the sub-run layer only
+         *     attributes spend without a cap. `calls` counts the Gateway calls with this `subrun_id`.
+         */
+        Subrun: {
+            subrun_id: string;
+            parent_step_id: string;
+            /** @enum {string} */
+            status: "started" | "end_proposed" | "cancel_requested" | "completed" | "cancelled" | "failed" | "timed_out";
+            /** Format: date-time */
+            started_at: string;
+            /**
+             * Format: date-time
+             * @description Set once the sub-run is terminal
+             */
+            ended_at?: string;
+            /** Format: date-time */
+            deadline_at: string;
+            /** @description deadline, orchestrator, task_cancel or policy */
+            cancel_reason?: string;
+            /** @description Worker reason (≤ 256 bytes), or task_cancel, not_completed_at_result, checkpoint_failed */
+            failure_reason?: string;
+            /** Format: int64 */
+            cap_micro?: number;
+            /** Format: int64 */
+            reserved_micro: number;
+            /** Format: int64 */
+            spent_micro: number;
+            /** Format: int64 */
+            unknown_micro: number;
+            calls: number;
+        };
         Inspection: {
             task: components["schemas"]["Task"];
             attempts: components["schemas"]["Attempt"][];
             checkpoints: components["schemas"]["Checkpoint"][];
             calls: components["schemas"]["Call"][];
+            budget?: components["schemas"]["TaskBudget"];
+            /** @description Sub-runs ordered by start time, then ID; empty for tasks without sub-runs */
+            subruns: components["schemas"]["Subrun"][];
         };
         /**
          * @description Error codes of the session operations (`Error.code`). Not-found: `session_not_found`,
@@ -2063,7 +2119,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Attempts with outcome, exit and OOM diagnosis, environment and cleanup state, checkpoints, and Gateway calls with their tries (task_id → attempt_id → call_id → try_no) */
+            /** @description Attempts with outcome, exit and OOM diagnosis, environment and cleanup state, checkpoints, Gateway calls with their tries (task_id → attempt_id → call_id → try_no), the task-layer ledger and the sub-runs with their own ledger layer (§15.4) */
             200: {
                 headers: {
                     [name: string]: unknown;

@@ -34,7 +34,7 @@ export function fakeApi(over: Partial<ApiLike> = {}): Mocked<ApiLike> {
     pauseTask: vi.fn(async (id: string) => ({ task_id: id, control_version: 1 })),
     resumeTask: vi.fn(async (id: string) => ({ task_id: id, control_version: 1 })),
     getResult: vi.fn(async () => ({ summary: "", outputs: [] })),
-    inspectTask: vi.fn(async (id: string) => ({ task: task({ task_id: id }), attempts: [], checkpoints: [], calls: [] })),
+    inspectTask: vi.fn(async (id: string) => ({ task: task({ task_id: id }), attempts: [], checkpoints: [], calls: [], subruns: [] })),
     downloadArtifact: vi.fn(async () => ({ blob: new Blob([""]), contentType: "text/plain", etag: "", contentDisposition: "" })),
   };
   for (const [k, fn] of Object.entries(over)) {

@@ -517,3 +517,68 @@ describe("user-facing views hide internals", () => {
     expect(htmls[0]).toContain("结果一");
   });
 });
+
+// M4 Plan 14 Task 10：并行 sub-run 的事件交错到达时，步骤行仍按子主题（subtopic_id）归组；用户侧不出现 sub-run ID 与费用。
+describe("TurnView groups interleaved sub-run steps by subtopic", () => {
+  it("keeps each subtopic's rows together and hides sub-run ids and costs", async () => {
+    const T = "turn-par";
+    const tc = (seq: number, id: string, sub: string, tool: string, input: Record<string, unknown>) =>
+      sev(seq, "tool_call", { tool, tool_call_id: id, input, subtopic_id: sub, subrun_id: sub, cost_micro: 3 }, T);
+    const tr = (seq: number, id: string, sub: string, tool: string, preview: Record<string, unknown>) =>
+      sev(seq, "tool_result", { tool, tool_call_id: id, ok: true, subtopic_id: sub, subrun_id: sub, cost_micro: 3, preview }, T);
+    const events = [
+      sev(1, "turn_status", { status: "running" }, T),
+      sev(2, "route", { route: "research", forced: true }, T),
+      sev(3, "todo_updated", { items: [
+        { id: "st1", title: "技术路线", status: "in_progress", budget_share: 10 },
+        { id: "st2", title: "成本与供应链", status: "in_progress", budget_share: 10 },
+      ] }, T),
+      sev(4, "tool_call", { tool: "research_subtopic", tool_call_id: "orch:3", input: { id: "st1" } }, T),
+      sev(5, "subtopic", { id: "st1", title: "技术路线", status: "running" }, T),
+      sev(6, "subtopic", { id: "st2", title: "成本与供应链", status: "running" }, T),
+      tc(7, "st1:1", "st1", "web_search", { query: "硫化物 电解质" }),
+      tc(8, "st2:1", "st2", "web_search", { query: "锂价 走势" }),
+      tr(9, "st1:1", "st1", "web_search", { kind: "search", query: "硫化物 电解质", results: [] }),
+      tc(10, "st2:2", "st2", "web_fetch", { url: "https://cost.example/a" }),
+      tc(11, "st1:2", "st1", "web_fetch", { url: "https://tech.example/b" }),
+      tr(12, "st2:1", "st2", "web_search", { kind: "search", query: "锂价 走势", results: [] }),
+      tr(13, "st1:2", "st1", "web_fetch", { kind: "fetch", url: "https://tech.example/b", n: 1, title: "技术来源", text: "摘录" }),
+      tr(14, "st2:2", "st2", "web_fetch", { kind: "fetch", url: "https://cost.example/a", n: 2, title: "成本来源", text: "摘录" }),
+    ];
+    let s = emptyChat();
+    for (const e of events) s = applyEvent(s, e);
+    const w = mount(TurnView, { props: { turn: s.turns[0]!, busy: false } });
+
+    expect(w.findAll("[data-testid=subtopic-heading]").map((h) => h.text())).toEqual(["技术路线", "成本与供应链"]);
+    const groups = w.findAll("[data-testid=subtopic-group]");
+    expect(groups).toHaveLength(2);
+    const rowsOf = (g: (typeof groups)[number]) => g.findAll("[data-testid=step-head]").map((h) => h.text());
+    expect(rowsOf(groups[0]!)).toHaveLength(2);
+    expect(rowsOf(groups[0]!).join("\n")).toContain("硫化物 电解质");
+    expect(rowsOf(groups[0]!).join("\n")).toContain("tech.example");
+    expect(rowsOf(groups[1]!)).toHaveLength(2);
+    expect(rowsOf(groups[1]!).join("\n")).toContain("锂价 走势");
+    expect(rowsOf(groups[1]!).join("\n")).toContain("cost.example");
+    // research_subtopic 行在分组之前单独显示，不并入第一个子主题
+    expect(w.findAll("[data-testid=step-head]")[0]!.text()).toContain("研究子主题");
+
+    for (const h of w.findAll("[data-testid=step-head]")) await h.trigger("click");
+    const html = w.html();
+    expect(html).not.toMatch(/subrun/i);
+    expect(html).not.toMatch(/st[12]:/);
+    expect(html).not.toMatch(/"st[12]"|>st[12]</);
+    expect(html).not.toMatch(/micro/i);
+    expect(html).not.toContain("$");
+  });
+
+  it("rows that only carry a subtopic title still group by that title", () => {
+    const steps: StepRowData[] = [
+      { id: "a", kind: "search", title: "搜索网页", status: "done", subtopic: "技术路线" },
+      { id: "b", kind: "search", title: "搜索网页", status: "done", subtopic: "成本" },
+      { id: "c", kind: "fetch", title: "阅读网页", status: "done", subtopic: "技术路线" },
+    ];
+    const w = mount(TurnView, { props: { turn: blankTurn({ steps }), busy: false } });
+    expect(w.findAll("[data-testid=subtopic-heading]").map((h) => h.text())).toEqual(["技术路线", "成本"]);
+    expect(w.findAll("[data-testid=subtopic-group]")[0]!.findAll("[data-testid=step-head]")).toHaveLength(2);
+  });
+});

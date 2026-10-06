@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"slices"
@@ -3316,3 +3317,162 @@ func TestSessionsUnavailable(t *testing.T) {
 		t.Fatal("会话需要 TurnSpec")
 	}
 }
+
+// ==== M4 Plan 14 Task 10：inspect 的 sub-run 时间线与两层费用（规格 §15.4） ====
+
+// TestInspectSubruns：inspect 返回 task 层账本（budget）与 sub-run 列表（状态、时间、原因、sub-run 层账本、调用数）；
+// sub-run 的调用带 subrun_id，root 调用省略；没有 sub-run 时 subruns 为 []；用户主体访问 inspect 仍 403。
+func TestInspectSubruns(t *testing.T) {
+	ts := newTestServer(t, nil)
+	t0 := time.Date(2026, 10, 6, 8, 0, 0, 0, time.UTC)
+	ended := t0.Add(90 * time.Second)
+	capMicro := int64(400)
+	toolLimit := int64(30)
+	ts.store.inspect["t1"] = Inspection{
+		Task:   TaskView{TaskID: "t1", Status: "running"},
+		Budget: &BudgetView{LimitMicro: 2000, ReservedMicro: 100, SpentMicro: 170, UnknownMicro: 5, ToolCallLimit: &toolLimit, ToolCallsUsed: 7},
+		Subruns: []SubrunView{
+			{SubrunID: "st1", ParentStepID: "research", Status: "started", StartedAt: t0, DeadlineAt: t0.Add(10 * time.Minute),
+				CapMicro: &capMicro, ReservedMicro: 100, SpentMicro: 120, UnknownMicro: 5, Calls: 2},
+			{SubrunID: "st2", ParentStepID: "research", Status: "timed_out", StartedAt: t0, EndedAt: &ended,
+				DeadlineAt: t0.Add(time.Minute), CancelReason: "deadline"},
+			{SubrunID: "st3", ParentStepID: "research", Status: "failed", StartedAt: t0, EndedAt: &ended,
+				DeadlineAt: t0.Add(time.Minute), FailureReason: "model_unavailable"},
+		},
+		Calls: []CallView{{CallID: "orch/1", Endpoint: "/v1/chat/completions", State: "completed"},
+			{CallID: "st1/1", Endpoint: "/v1/search", State: "completed", SubrunID: "st1"}},
+	}
+	ts.store.inspect["t2"] = Inspection{Task: TaskView{TaskID: "t2", Status: "queued"}}
+
+	st, b, _ := ts.do("GET", "/tasks/t1/inspect", "", nil)
+	expect(t, st, b, 200, "")
+	var out struct {
+		Budget  map[string]any   `json:"budget"`
+		Subruns []map[string]any `json:"subruns"`
+		Calls   []map[string]any `json:"calls"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Budget["limit_micro"] != 2000.0 || out.Budget["spent_micro"] != 170.0 || out.Budget["unknown_micro"] != 5.0 ||
+		out.Budget["tool_calls_used"] != 7.0 || out.Budget["tool_call_limit"] != 30.0 {
+		t.Fatalf("budget = %s", b)
+	}
+	if len(out.Subruns) != 3 {
+		t.Fatalf("subruns = %s", b)
+	}
+	s1, s2, s3 := out.Subruns[0], out.Subruns[1], out.Subruns[2]
+	if s1["subrun_id"] != "st1" || s1["status"] != "started" || s1["cap_micro"] != 400.0 || s1["spent_micro"] != 120.0 ||
+		s1["reserved_micro"] != 100.0 || s1["unknown_micro"] != 5.0 || s1["calls"] != 2.0 || s1["started_at"] != "2026-10-06T08:00:00Z" {
+		t.Fatalf("st1 = %v", s1)
+	}
+	for _, k := range []string{"ended_at", "cancel_reason", "failure_reason"} {
+		if _, has := s1[k]; has {
+			t.Errorf("进行中的 st1 不应有 %s：%v", k, s1)
+		}
+	}
+	if s2["status"] != "timed_out" || s2["cancel_reason"] != "deadline" || s2["ended_at"] != "2026-10-06T08:01:30Z" {
+		t.Fatalf("st2 = %v", s2)
+	}
+	if _, has := s2["cap_micro"]; has {
+		t.Errorf("没有上限的 sub-run 不应有 cap_micro：%v", s2)
+	}
+	if s3["failure_reason"] != "model_unavailable" || s3["spent_micro"] != 0.0 || s3["calls"] != 0.0 {
+		t.Fatalf("st3 = %v", s3)
+	}
+	if _, has := out.Calls[0]["subrun_id"]; has || out.Calls[1]["subrun_id"] != "st1" {
+		t.Fatalf("calls 的 subrun_id：%s", b)
+	}
+
+	st, b, _ = ts.do("GET", "/tasks/t2/inspect", "", nil)
+	expect(t, st, b, 200, "")
+	if !bytes.Contains(b, []byte(`"subruns":[]`)) || bytes.Contains(b, []byte(`"budget"`)) {
+		t.Fatalf("没有 sub-run 与账本时 = %s", b)
+	}
+
+	// 用户主体（含任务所有者）访问 inspect 仍 403：sub-run ID、费用与模型只对运维可见。
+	acc, a := newAccountServer(t, nil)
+	u, cookie := a.seedUser(t, "gus")
+	acc.store.addTask("t1", "running", "run")
+	a.own("t1", u.ID)
+	acc.store.inspect["t1"] = ts.store.inspect["t1"]
+	st, b, _ = acc.do("GET", "/tasks/t1/inspect", "", session(cookie))
+	expect(t, st, b, 403, "forbidden")
+	st, b, _ = acc.do("GET", "/tasks/t1/inspect", "", adminAuth)
+	expect(t, st, b, 200, "")
+}
+
+// TestOpenAPIInspectSubruns：openapi.yaml 的 Subrun、TaskBudget 字段与 Go 的 JSON 标签一致；Inspection 声明
+// subruns（必填）与 budget，Call 声明 subrun_id。
+func TestOpenAPIInspectSubruns(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+	for name, v := range map[string]any{"Subrun": SubrunView{}, "TaskBudget": BudgetView{}} {
+		if got, want := keysAt(openAPISchemaBlock(t, lines, name), "properties:", 6), jsonTagNames(v); !slices.Equal(got, want) {
+			t.Errorf("%s 字段 %v，Go JSON 标签 %v", name, got, want)
+		}
+	}
+	insp := openAPISchemaBlock(t, lines, "Inspection")
+	if got := keysAt(insp, "properties:", 6); !slices.Contains(got, "subruns") || !slices.Contains(got, "budget") {
+		t.Errorf("Inspection 字段 %v 缺少 subruns 或 budget", got)
+	}
+	if !slices.Contains(flowList(insp, "required: ["), "subruns") {
+		t.Error("Inspection.subruns 应为必填")
+	}
+	if got := keysAt(openAPISchemaBlock(t, lines, "Call"), "properties:", 6); !slices.Contains(got, "subrun_id") {
+		t.Errorf("Call 字段 %v 缺少 subrun_id", got)
+	}
+}
+
+// TestSessionEventHidesSubrunID：用户的会话事件只带子主题（subtopic_id），不带 sub-run ID（信封或 data 中任意深度）与费用。
+func TestSessionEventHidesSubrunID(t *testing.T) {
+	payload := `{"step_id":"st1","kind":"tool_call","subrun_id":"st1","data":{"tool_call_id":"st1:3","tool":"web_search",` +
+		`"subtopic_id":"st1","subrun_id":"st1","input":{"query":"q","subrun_id":"st1"},"cost_micro":9}}`
+	ev, ok := ToSessionEvent(sessionRec("worker", "progress", payload), false)
+	if !ok || ev.Type != SEvToolCall {
+		t.Fatalf("用户视图 = %+v, %v", ev, ok)
+	}
+	d := eventData(t, ev)
+	for _, k := range []string{"subrun_id", "cost_micro"} {
+		if hasKey(d, k) {
+			t.Errorf("用户 data 含 %q：%s", k, ev.Data)
+		}
+	}
+	if d["subtopic_id"] != "st1" || d["tool_call_id"] != "st1:3" {
+		t.Errorf("用户 data = %s", ev.Data)
+	}
+}
+
+// jsonTagNames 返回结构体字段的 JSON 名（排序）。
+func jsonTagNames(v any) []string {
+	var out []string
+	rt := reflect.TypeOf(v)
+	for i := 0; i < rt.NumField(); i++ {
+		name, _, _ := strings.Cut(rt.Field(i).Tag.Get("json"), ",")
+		if name != "" && name != "-" {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// flowList 返回块中第一处 "<prefix>a, b]" 的项。
+func flowList(block []string, prefix string) []string {
+	for _, l := range block {
+		if _, rest, ok := strings.Cut(l, prefix); ok {
+			items, _, _ := strings.Cut(rest, "]")
+			var out []string
+			for _, it := range strings.Split(items, ",") {
+				out = append(out, strings.TrimSpace(it))
+			}
+			return out
+		}
+	}
+	return nil
+}
+
+// ==== M4 Plan 14 Task 10 段结束 ====

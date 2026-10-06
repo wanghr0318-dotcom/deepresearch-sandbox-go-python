@@ -71,6 +71,17 @@
       <CallsPanel :inspection="inspection" />
     </section>
 
+    <section v-else-if="tab === 'subruns'" class="panel">
+      <div class="panel-tools">
+        <span class="muted small">来自 /inspect：sub-run 状态、时间线、两层费用与失败原因；事件按 sub-run 分泳道见"事件时间线"</span>
+        <span class="spacer"></span>
+        <button class="btn small" type="button" :disabled="inspectLoading" @click="loadInspect">刷新</button>
+      </div>
+      <ErrorBanner :error="inspectError" />
+      <SubrunsPanel v-if="inspection" :inspection="inspection" />
+      <div v-else class="empty">{{ inspectLoading ? "加载中…" : "暂无数据" }}</div>
+    </section>
+
     <section v-else class="panel">
       <div class="panel-tools">
         <span class="muted small">GET /tasks/{{ id }}/inspect 原始响应</span>
@@ -95,6 +106,7 @@ import CallsPanel from "../components/CallsPanel.vue";
 import ErrorBanner from "../components/ErrorBanner.vue";
 import EventTimeline from "../components/EventTimeline.vue";
 import StatusBadge from "../components/StatusBadge.vue";
+import SubrunsPanel from "../components/SubrunsPanel.vue";
 import TaskControls from "../components/TaskControls.vue";
 import { isTerminal } from "../lib/controls";
 import { shortId } from "../lib/format";
@@ -102,13 +114,16 @@ import { tasksHref } from "../lib/router";
 import { useServices } from "../lib/services";
 import { mergeEvents } from "../lib/timeline";
 
-type TabId = "timeline" | "artifacts" | "calls" | "inspect";
+type TabId = "timeline" | "artifacts" | "calls" | "subruns" | "inspect";
 const TABS: { id: TabId; label: string }[] = [
   { id: "timeline", label: "事件时间线" },
   { id: "artifacts", label: "产物与版本" },
   { id: "calls", label: "预算与调用" },
+  { id: "subruns", label: "Sub-runs" },
   { id: "inspect", label: "Inspect 原始" },
 ];
+/** 数据来自 /inspect 的标签：首次切换到其中之一时加载。 */
+const INSPECT_TABS: ReadonlySet<TabId> = new Set<TabId>(["calls", "subruns", "inspect"]);
 
 const props = defineProps<{ id: string }>();
 
@@ -201,7 +216,7 @@ async function loadInspect(): Promise<void> {
 
 function selectTab(id: TabId): void {
   tab.value = id;
-  if ((id === "calls" || id === "inspect") && !inspection.value && !inspectLoading.value) void loadInspect();
+  if (INSPECT_TABS.has(id) && !inspection.value && !inspectLoading.value) void loadInspect();
 }
 
 function flush(): void {
@@ -219,7 +234,7 @@ function onEvent(ev: TaskEvent): void {
   }
   if (ev.type === TERMINAL_EVENT) {
     void refreshTask(); // 任务为终态时由 refreshTask 拉取 /result
-    if (inspection.value || tab.value === "calls" || tab.value === "inspect") void loadInspect();
+    if (inspection.value || INSPECT_TABS.has(tab.value)) void loadInspect();
   } else {
     scheduleTaskRefresh();
   }
@@ -247,7 +262,7 @@ function start(): void {
   inspectError.value = null;
   streamState.value = "connecting";
   void refreshTask();
-  if (tab.value === "calls" || tab.value === "inspect") void loadInspect();
+  if (INSPECT_TABS.has(tab.value)) void loadInspect();
   const s = watchEvents({
     taskId: props.id,
     cursor: 0,

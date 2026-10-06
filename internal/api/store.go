@@ -99,14 +99,48 @@ type Inspection struct {
 	Attempts    []AttemptView
 	Checkpoints []CheckpointView
 	Calls       []CallView
+	// Budget 是 task 层账本（两层费用的总额；规格 §9.6）；任务没有账本行时为 nil。
+	Budget *BudgetView
+	// Subruns 是任务的 sub-run（按启动时间、ID 排序；规格 §15.4），每项带 sub-run 层账本。
+	Subruns []SubrunView
+}
+
+// BudgetView 是 task 层账本（budgets）：金额为 micro-USD；ToolCallLimit 为 nil 表示不限工具调用次数。
+type BudgetView struct {
+	LimitMicro    int64  `json:"limit_micro"`
+	ReservedMicro int64  `json:"reserved_micro"`
+	SpentMicro    int64  `json:"spent_micro"`
+	UnknownMicro  int64  `json:"unknown_micro"`
+	ToolCallLimit *int64 `json:"tool_call_limit,omitempty"`
+	ToolCallsUsed int64  `json:"tool_calls_used"`
+}
+
+// SubrunView 是一个 sub-run 的诊断视图（运维 inspect）：状态与时间线、失败/取消原因与 sub-run 层账本
+// （CapMicro 为 nil 表示该层不设上限、只做归属）。Calls 是 calls.subrun_id = 该 ID 的调用数。
+type SubrunView struct {
+	SubrunID      string     `json:"subrun_id"`
+	ParentStepID  string     `json:"parent_step_id"`
+	Status        string     `json:"status"`
+	StartedAt     time.Time  `json:"started_at"`
+	EndedAt       *time.Time `json:"ended_at,omitempty"`
+	DeadlineAt    time.Time  `json:"deadline_at"`
+	CancelReason  string     `json:"cancel_reason,omitempty"`
+	FailureReason string     `json:"failure_reason,omitempty"`
+	CapMicro      *int64     `json:"cap_micro,omitempty"`
+	ReservedMicro int64      `json:"reserved_micro"`
+	SpentMicro    int64      `json:"spent_micro"`
+	UnknownMicro  int64      `json:"unknown_micro"`
+	Calls         int        `json:"calls"`
 }
 
 // CallView 是一个 Gateway 逻辑调用的审计视图（§9.9）：只有元数据——端点、状态、费用、上游请求 ID 与
 // 每次 try 的 attempt、结果、延迟、费用；不含请求或响应正文、提示词与凭据。ResultRef 是结果 blob 的
 // sha256（只在 completed 时非空）。Model 是 journal 记录的解析后模型（chat 调用；其他端点为空）。
+// SubrunID 是调用归属的 sub-run（root 调用为空）。
 type CallView struct {
 	CallID, Endpoint, State, Source   string
 	Model                             string
+	SubrunID                          string
 	FirstAttemptID, UpstreamRequestID string
 	ResultRef, FailReason             string
 	SupersedesCallID, SupersedeReason string
