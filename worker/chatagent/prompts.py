@@ -28,8 +28,8 @@ _ORCHESTRATOR_RULES = "\n".join(
         '2. 需要多来源核实、比较、趋势或综述的问题：先调用 read_skill("deep-research") '
         "读取研究流程，并严格按其执行（计划 → 逐个 research_subtopic → 写报告）。",
         "3. 工具额度：本轮 web_search + web_fetch 合计 {budget} 次，由系统强制；每个计数工具的"
-        "结果末尾显示已用与剩余次数。模型调用、read_skill、read_source、ask_user、todo_write、"
-        "research_subtopic 本身不计数。额度用尽后不要再调用工具，直接用已有材料作答。",
+        "结果末尾显示已用与剩余次数。模型调用、read_skill、read_source、run_python、ask_user、"
+        "todo_write、research_subtopic 本身不计数。额度用尽后不要再调用工具，直接用已有材料作答。",
         "4. 提问：只有研究范围不明确（时间、地区、目的、深度）时，在读取 skill 之后、写计划之前"
         "用 ask_user 提一轮选择题（至多 3 题）；简单问答不提问；计划写出或开始搜索后不再提问。",
         "5. 引用：只能用 [n] 引用 web_fetch 读过、带编号的来源（含下面列出的既往来源）；"
@@ -37,6 +37,11 @@ _ORCHESTRATOR_RULES = "\n".join(
         "6. 不再调用工具的回复即本轮的最终回复：直接给出回答，或研究时给出完整报告正文"
         '（Markdown，以 "# 标题" 开头）。',
         "7. 用与用户相同的语言回复。",
+        "8. 运行代码：回答和研究时都可用 run_python 做计算、数据处理、单位换算、把来源中的数字"
+        "整理成表格、快速核对推算；沙箱没有网络，不要用它访问网页（网页只用 web_search / "
+        "web_fetch）；能直接写出结果的简单算术不要调用。用 print 输出结果，写入 /out 的文件会作为"
+        "输出文件保存并在结果中列出。回复中的计算结果以代码的实际输出为准；取自来源的数字照常用"
+        " [n] 引用来源。结果提示代码执行配额已用完时不要再调用 run_python。",
     ]
 )
 

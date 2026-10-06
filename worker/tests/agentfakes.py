@@ -33,7 +33,7 @@ BudgetScript = tuple[int, int] | Callable[[int], tuple[int, int] | None] | None
 
 @dataclass(frozen=True)
 class GatewayCall:
-    kind: str  # chat | search | fetch
+    kind: str  # chat | search | fetch | exec
     step_id: str
     call_id: str
     body: dict[str, Any]
@@ -43,8 +43,9 @@ class GatewayCall:
 class ScriptedGateway:
     """脚本化 Gateway。
 
-    - chat(step_id, body) / search(query, max_results) / fetch(url) 返回响应体（dict）或
-      GatewayResult，也可抛出 GatewayError 子类模拟失败；未给出脚本的端点调用时 AssertionError。
+    - chat(step_id, body) / search(query, max_results) / fetch(url) / exec(body) 返回响应体
+      （dict）或 GatewayResult，也可抛出 GatewayError 子类模拟失败；未给出脚本的端点调用时
+      AssertionError。
     - tool_budget：search/fetch 成功结果的 (used, limit)；可为常量、按第 k 次计数调用（从 1 起，
       含失败的调用）返回值的函数，或 None（模拟没有 X-Agentbox-Tool-Budget 头）。
     - calls 按发起顺序记录每次调用（含失败的）；blobs 为全部结果 blob；read_blob_error 不为 None 时
@@ -62,6 +63,7 @@ class ScriptedGateway:
         chat: Callable[[str, dict[str, Any]], Any] | None = None,
         search: Callable[[str, int], Any] | None = None,
         fetch: Callable[[str], Any] | None = None,
+        exec: Callable[[dict[str, Any]], Any] | None = None,
         tool_budget: BudgetScript = None,
         call_ids: CallIds | None = None,
         tool_limit: int | None = None,
@@ -73,6 +75,7 @@ class ScriptedGateway:
         self.chat_script = chat
         self.search_script = search
         self.fetch_script = fetch
+        self.exec_script = exec
         self.tool_budget = tool_budget
         self.call_ids = call_ids if call_ids is not None else CallIds()
         self.tool_limit = tool_limit
@@ -129,6 +132,23 @@ class ScriptedGateway:
     def fetch(self, step_id: str, url: str, *, no_cache: bool = False) -> GatewayResult:
         script = self.fetch_script
         return self._call("fetch", step_id, {"url": url}, lambda: _need(script, "fetch")(url))
+
+    def exec(
+        self,
+        step_id: str,
+        code: str,
+        *,
+        inputs: Any = (),
+        wall_ms: int | None = None,
+        memory_bytes: int | None = None,
+        retry: bool = False,
+    ) -> GatewayResult:
+        """POST /v1/exec：脚本收到请求体（GatewayClient.exec_body），返回结果体或抛出。"""
+        body = GatewayClient.exec_body(
+            code, inputs=inputs, wall_ms=wall_ms, memory_bytes=memory_bytes
+        )
+        script = self.exec_script
+        return self._call("exec", step_id, body, lambda: _need(script, "exec")(body))
 
     def read_blob(self, sha256: str) -> bytes:
         self.blob_reads.append(sha256)

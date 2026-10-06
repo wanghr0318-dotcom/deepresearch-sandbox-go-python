@@ -9,7 +9,7 @@ import { ApiError } from "../api/client";
 import type { SessionEvent, Turn } from "../api/chat";
 import { userErrorMessage } from "./research";
 
-export type StepKind = "skill" | "thinking" | "ask" | "todo" | "search" | "fetch" | "source" | "subtopic" | "tool";
+export type StepKind = "skill" | "thinking" | "ask" | "todo" | "search" | "fetch" | "source" | "subtopic" | "code" | "tool";
 
 export interface SearchItem {
   title: string;
@@ -299,6 +299,8 @@ function kindOfTool(tool: string): StepKind {
       return "todo";
     case "research_subtopic":
       return "subtopic";
+    case "run_python":
+      return "code";
     default:
       return "tool";
   }
@@ -334,9 +336,23 @@ function callTitle(t: TurnView, tool: string, input: Data): { title: string; det
       const id = str(input.id);
       return { title: `研究子主题：${subtopicTitle(t, id) ?? id}` };
     }
+    case "run_python":
+      // 完整代码在 ⟨/⟩ 的请求中；行内只给第一行非空代码作提示
+      return { title: "运行代码", detail: firstCodeLine(input.code) };
     default:
       return { title: `调用工具：${tool}` };
   }
+}
+
+const CODE_LINE_MAX = 80;
+
+function firstCodeLine(code: unknown): string | undefined {
+  const line = str(code)
+    .split("\n")
+    .map((x) => x.trim())
+    .find((x) => x !== "");
+  if (!line) return undefined;
+  return line.length > CODE_LINE_MAX ? `${line.slice(0, CODE_LINE_MAX - 1)}…` : line;
 }
 
 function previewText(p: Data): string | undefined {
@@ -432,7 +448,9 @@ function applyToolResult(t: TurnView, d: Data, seq: number): TurnView {
     const text = previewText(p);
     if (text) row.text = text;
   }
-  if (!ok) row.text = optStr(d.error) ?? row.text ?? "调用失败";
+  // run_python 失败（非零退出等）时预览含退出码与 stderr 末尾，比 error 的首段更完整
+  const codeText = kind === "code" ? previewText(p) : undefined;
+  if (!ok) row.text = codeText ?? optStr(d.error) ?? row.text ?? "调用失败";
   const raw = toRaw(d.raw);
   if (raw) row.raw = raw;
   if (i >= 0) steps[i] = row;

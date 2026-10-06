@@ -16,6 +16,7 @@ from agentbox_worker.errors import BudgetExhausted, WorkerFailure
 from agentbox_worker.runtime import Paused, TaskContext
 from agentbox_worker.tools import GatewayLike, ToolContext, ToolRegistry, ToolResult
 from agentbox_worker.tools.ask_user import AskUser
+from agentbox_worker.tools.run_python import RunPython
 from agentbox_worker.tools.skills import RESEARCH_SKILL, ReadSkill, SkillCatalog
 from agentbox_worker.tools.sources import ReadSource
 from agentbox_worker.tools.todo import TodoItem, TodoWrite
@@ -57,7 +58,8 @@ REPORT_POINTER = "完整报告见右侧「报告」"
 FORCED_READ_ID = "forced-read-skill"
 FIXED_PLAN_ID = "fixed-plan"
 FIXED_RESEARCH_ID = "fixed-research"
-_BASE_TOOLS = ("read_skill", "web_search", "web_fetch", "read_source")
+# run_python 在回答与研究两条路线都可用；子主题循环（sub_registry）只搜索与阅读
+_BASE_TOOLS = ("read_skill", "web_search", "web_fetch", "read_source", "run_python")
 
 
 @dataclass(frozen=True)
@@ -133,6 +135,7 @@ class Agent:
                 WebSearch(),
                 WebFetch(),
                 ReadSource(),
+                RunPython(),
                 AskUser(),
                 TodoWrite(),
                 ResearchSubtopic(state, parallel=self.subruns),

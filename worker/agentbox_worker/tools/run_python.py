@@ -19,6 +19,8 @@ STDOUT_HEAD_BYTES = 4096
 STDOUT_TAIL_BYTES = 1024
 STDERR_TAIL_BYTES = 2048
 GATEWAY_STREAM_CAP = "1 MiB"  # Gateway 对 stdout/stderr 各保留的上限（规格 §19 补充）
+PREVIEW_STDOUT_CHARS = 2000  # 步骤行预览（面向用户）中 stdout 的开头
+PREVIEW_STDERR_CHARS = 600
 
 # 402 exec 配额拒绝（与费用预算的 budget_exhausted 同一 HTTP 状态，靠 code 区分）
 _QUOTA_TEXT = {
@@ -135,10 +137,44 @@ def _result(res: GatewayResult) -> ToolResult:
     return ToolResult(
         content="\n".join(lines),
         ok=ok,
+        preview=_preview(body, status, exit_info, limits, outputs, ok),
         raw={"call_id": res.call_id},
         blobs=tuple(dict.fromkeys(blobs)),
         data=body,
     )
+
+
+def _preview(
+    body: dict[str, Any],
+    status: str,
+    exit_info: dict[str, Any],
+    limits: dict[str, Any],
+    outputs: list[dict[str, Any]],
+    ok: bool,
+) -> dict[str, Any]:
+    """步骤行的预览（kind text）：退出码或状态、stdout 开头、失败时 stderr 末尾、输出文件名。"""
+    if status == "completed" and not exit_info.get("signal"):
+        lines = [f"退出码 {exit_info.get('code')}"]
+    else:
+        lines = [_status_line(status, exit_info, limits).removeprefix("状态：")]
+    stdout = body.get("stdout") if isinstance(body.get("stdout"), str) else ""
+    if stdout:
+        lines.append(_head_chars(stdout.rstrip("\n"), PREVIEW_STDOUT_CHARS))
+    stderr = body.get("stderr") if isinstance(body.get("stderr"), str) else ""
+    if stderr and not ok:
+        text = stderr.rstrip("\n")
+        tail = text if len(text) <= PREVIEW_STDERR_CHARS else "…" + text[-PREVIEW_STDERR_CHARS:]
+        lines.append("stderr：\n" + tail)
+    names = [str(o.get("path")) for o in outputs]
+    if names:
+        lines.append("输出文件：" + "、".join(names))
+    return {"kind": "text", "text": "\n".join(lines)}
+
+
+def _head_chars(text: str, n: int) -> str:
+    if len(text) <= n:
+        return text
+    return text[:n] + f"\n…（共 {len(text)} 字符，已截断）"
 
 
 def _status_line(status: str, exit_info: dict[str, Any], limits: dict[str, Any]) -> str:

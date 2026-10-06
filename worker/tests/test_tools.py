@@ -522,6 +522,29 @@ def test_run_python_short_streams_untouched_and_timed_out_explained():
     )
     assert not r.ok and "timed_out" in r.content and "5000 ms" in r.content
     assert "信号 9" in r.content
+    assert r.preview == {
+        "kind": "text",
+        "text": "timed_out（运行超过时限 5000 ms 被终止，信号 9）\n42",
+    }
+
+
+def test_run_python_preview_for_step_row_is_bounded():
+    # 步骤行预览（面向用户）：退出码、stdout 开头（≤ 2000 字符）、失败时 stderr 末尾、输出文件名
+    body = exec_result(
+        exit={"code": 2, "signal": 0},
+        stdout="行\n" * 1500,
+        stderr="x" * 1000 + "Traceback END\n",
+        outputs=[{"path": "a.csv", "sha256": SHA_OUT, "size": 3}],
+    )
+    r = ToolRegistry([RunPython()]).dispatch(
+        "run_python", '{"code": "x"}', tool_ctx(ExecGateway(body))
+    )
+    assert r.preview is not None and r.preview["kind"] == "text"
+    text = r.preview["text"]
+    assert text.startswith("退出码 2\n行\n行")
+    assert "（共 2999 字符，已截断）" in text
+    assert text.count("x") == 600 - len("Traceback END") and text.endswith("输出文件：a.csv")
+    assert len(text) < 3000
 
 
 @pytest.mark.parametrize(

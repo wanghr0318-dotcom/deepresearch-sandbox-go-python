@@ -177,6 +177,39 @@ describe("StepRow", () => {
     expect(err.get("[data-testid=step-head]").attributes("data-status")).toBe("error");
     expect(err.text()).toContain("网页无法访问");
   });
+
+  it("运行代码 rows collapse, show exit code and the first 12 output lines, then reveal the rest", async () => {
+    const lines = Array.from({ length: 20 }, (_, i) => `<i>line ${i + 1}</i>`);
+    const row: StepRowData = {
+      id: "orch:1",
+      kind: "code",
+      title: "运行代码",
+      detail: "print(rows)",
+      status: "done",
+      text: ["退出码 0", ...lines].join("\n"),
+      raw: raw({ request: { language: "python3", code: "print(rows)" } }),
+    };
+    const w = mount(StepRow, { props: { row, expanded: false } });
+    expect(w.get("[data-testid=step-head]").text()).toContain("运行代码");
+    expect(w.find("[data-testid=code-output]").exists()).toBe(false);
+    await w.setProps({ expanded: true });
+    const out = w.get("[data-testid=code-output]");
+    expect(out.element.tagName).toBe("PRE");
+    expect(out.text().split("\n")).toEqual(["退出码 0", ...lines.slice(0, 11)]);
+    expect(w.find("i").exists()).toBe(false); // 输出按纯文本插值
+    expect(w.text()).toContain("print(rows)");
+    expect(w.get("[data-action=more-lines]").text()).toContain("还有 9 行");
+    await w.get("[data-action=more-lines]").trigger("click");
+    expect(w.get("[data-testid=code-output]").text().split("\n")).toHaveLength(21);
+    expect(w.find("[data-action=more-lines]").exists()).toBe(false);
+    await w.get("button.raw").trigger("click");
+    expect(w.emitted("raw")![0]).toEqual([row.raw]);
+
+    const short = mount(StepRow, { props: { row: { ...row, id: "orch:2", text: "退出码 1\nstderr：\nboom", status: "error" }, expanded: true } });
+    expect(short.find("[data-action=more-lines]").exists()).toBe(false);
+    expect(short.get("[data-testid=code-output]").text()).toBe("退出码 1\nstderr：\nboom");
+    expect(short.text()).toContain("失败");
+  });
 });
 
 describe("RawDialog", () => {

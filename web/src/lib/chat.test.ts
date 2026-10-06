@@ -82,7 +82,7 @@ describe("applyEvent", () => {
       sev(5, "tool_call", { step_id: "orch", tool_call_id: "k1", tool: "read_skill", input: { name: "deep-research" } }, "u1"),
       sev(6, "tool_result", { step_id: "orch", tool_call_id: "k1", tool: "read_skill", ok: true, preview: { kind: "text", text: "skill 正文" }, raw: { request: { name: "deep-research" } } }, "u1"),
       sev(7, "skill_read", { step_id: "orch", name: "deep-research", description: "深度研究" }, "u1"),
-      sev(8, "tool_call", { step_id: "orch", tool_call_id: "x1", tool: "run_python", input: {} }, "u1"),
+      sev(8, "tool_call", { step_id: "orch", tool_call_id: "x1", tool: "future_tool", input: {} }, "u1"),
     ]);
     const [fetch, failed, skill, other] = s.turns[0]!.steps;
     expect(fetch).toMatchObject({ kind: "fetch", title: "阅读网页 · news.example", status: "done", text: "摘录" });
@@ -91,9 +91,40 @@ describe("applyEvent", () => {
     // read_skill 的工具行与随后的 skill_read 合为一行；本地工具没有 ⟨/⟩
     expect(skill).toMatchObject({ kind: "skill", title: "读取 skill：deep-research", status: "done", text: "skill 正文" });
     expect(skill!.raw).toBeUndefined();
-    expect(other).toMatchObject({ kind: "tool", title: "调用工具：run_python", status: "running" });
+    expect(other).toMatchObject({ kind: "tool", title: "调用工具：future_tool", status: "running" });
     expect(s.turns[0]!.steps).toHaveLength(4);
     expect(s.turns[0]!.sources).toEqual([{ n: 1, title: "新闻", url: "https://www.news.example/p", site: "news.example" }]);
+  });
+
+  it("run_python becomes a 运行代码 row with exit code and stdout; failures keep the preview; ⟨/⟩ from the exec call", () => {
+    const code = "\n  rows = [(2023, 120), (2024, 150)]\nprint(150 / 120 - 1)";
+    const execReq = { language: "python3", code };
+    const s = run(started(), [
+      sev(1, "tool_call", { step_id: "orch", tool_call_id: "orch:1", tool: "run_python", input: { code } }, "u1"),
+      sev(2, "tool_result", {
+        step_id: "orch", tool_call_id: "orch:1", tool: "run_python", ok: true,
+        preview: { kind: "text", text: "退出码 0\n0.25\n输出文件：table.csv" },
+        raw: { request: execReq, response_ref: SHA },
+      }, "u1"),
+      sev(3, "tool_call", { step_id: "orch", tool_call_id: "orch:2", tool: "run_python", input: { code: "1/0" } }, "u1"),
+      sev(4, "tool_result", {
+        step_id: "orch", tool_call_id: "orch:2", tool: "run_python", ok: false,
+        preview: { kind: "text", text: "退出码 1\nstderr：\nZeroDivisionError: division by zero" },
+        error: "退出码 1", raw: { request: { language: "python3", code: "1/0" }, response_ref: SHA },
+      }, "u1"),
+      sev(5, "tool_call", { step_id: "orch", tool_call_id: "orch:3", tool: "run_python", input: { code: "print(1)" } }, "u1"),
+      sev(6, "tool_result", {
+        step_id: "orch", tool_call_id: "orch:3", tool: "run_python", ok: false,
+        preview: { kind: "text", text: "本任务的代码执行次数配额已用完（exec_quota_exhausted），不要再调用 run_python。" },
+        error: "本任务的代码执行次数配额已用完（exec_quota_exhausted），不要再调用 run_python。",
+      }, "u1"),
+    ]);
+    const [ok, failed, quota] = s.turns[0]!.steps;
+    expect(ok).toMatchObject({ kind: "code", title: "运行代码", detail: "rows = [(2023, 120), (2024, 150)]", status: "done", text: "退出码 0\n0.25\n输出文件：table.csv" });
+    expect(ok!.raw).toEqual({ request: execReq, requestTruncated: false, responseRef: SHA });
+    expect(failed).toMatchObject({ kind: "code", status: "error", text: "退出码 1\nstderr：\nZeroDivisionError: division by zero" });
+    expect(quota).toMatchObject({ kind: "code", status: "error" });
+    expect(quota!.raw).toBeUndefined(); // 配额拒绝没有结果 blob
   });
 
   it("gives skill_read without a preceding tool call its own row, and thinking a row of its own", () => {

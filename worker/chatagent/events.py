@@ -1,8 +1,9 @@
 """进度事件（共享契约裁定 L，字段以 api/openapi.yaml 的 <Type>Data 为准）。
 
 progress.kind 即会话事件 type，progress.data 即 data（宿主按字段允许列表过滤、去掉内部键）。
-message 为简短中文，供运维时间线阅读。只有经 Gateway 的调用（搜索、抓取、模型）带
-raw{request, response_ref}；本地工具（read_skill、todo_write、ask_user、read_source）不带 raw。
+message 为简短中文，供运维时间线阅读。只有经 Gateway 的调用（搜索、抓取、run_python 的 exec、
+模型）带 raw{request, response_ref}；本地工具（read_skill、todo_write、ask_user、read_source）
+不带 raw。
 单条事件 > 64 KiB 时依次截断 raw.request、preview 与 input。
 """
 
@@ -11,6 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from agentbox_worker.gateway import GatewayClient
 from agentbox_worker.runtime import ArtifactRef, TaskContext
 from agentbox_worker.tools import ToolResult
 from agentbox_worker.tools.budget import TurnBudget
@@ -23,7 +25,7 @@ REQUEST_MAX_BYTES = 32 * 1024
 THINKING_MAX_CHARS = 600
 PREVIEW_MAX_CHARS = 600
 DELTA_MAX_CHARS = 400
-_GATEWAY_TOOLS = frozenset({"web_search", "web_fetch"})
+_GATEWAY_TOOLS = frozenset({"web_search", "web_fetch", "run_python"})
 _TOOL_LABELS = {
     "web_search": "搜索",
     "web_fetch": "抓取",
@@ -32,6 +34,7 @@ _TOOL_LABELS = {
     "ask_user": "提问",
     "todo_write": "更新计划",
     "research_subtopic": "研究子主题",
+    "run_python": "运行代码",
 }
 
 
@@ -231,11 +234,25 @@ class Emitter:
 
 
 def _gateway_request(tool: str, args: Any) -> dict[str, Any]:
-    """搜索与抓取发给 Gateway 的请求体（与工具实现一致）。"""
+    """搜索、抓取与 exec 发给 Gateway 的请求体（与工具实现一致）。"""
     args = args if isinstance(args, dict) else {}
+    if tool == "run_python":
+        return _exec_request(args)
     if tool == "web_search":
         return {
             "query": str(args.get("query", "")).strip(),
             "max_results": args.get("max_results", 5),
         }
     return {"url": str(args.get("url", "")).strip()}
+
+
+def _exec_request(args: dict[str, Any]) -> dict[str, Any]:
+    """run_python 的 /v1/exec 请求体（RunPython.run 的参数映射 + GatewayClient.exec_body）。"""
+    items = args.get("inputs") if isinstance(args.get("inputs"), list) else []
+    inputs = [(i.get("sha256"), i.get("path")) for i in items if isinstance(i, dict)]
+    timeout_s = args.get("timeout_s")
+    wall_ms = timeout_s * 1000 if isinstance(timeout_s, int) and timeout_s > 0 else None
+    try:
+        return GatewayClient.exec_body(str(args.get("code", "")), inputs=inputs, wall_ms=wall_ms)
+    except (TypeError, ValueError):  # 只在调用已发生时生成：参数已通过工具的 schema 校验
+        return {"code": str(args.get("code", ""))}

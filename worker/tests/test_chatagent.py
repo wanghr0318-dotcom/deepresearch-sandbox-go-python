@@ -195,6 +195,7 @@ def test_simple_question_is_answered_directly_without_skill():
         "web_search",
         "web_fetch",
         "read_source",
+        "run_python",
     }
     assert "deep-research" in body["messages"][0]["content"]  # skill 目录在系统提示中
 
@@ -1600,3 +1601,161 @@ def test_fixed_plan_skips_planning_and_runs_given_subtopics():
     assert len(model.bodies("orch")) == 1  # 不经模型规划，直接执行固定的子主题
     assert sub_result(events) == {"st1": "completed", "st2": "completed", "st3": "completed"}
     assert "[5][6]" in artifact_text(events, "report")
+
+
+# ---- run_python（编排的回答与研究路线；子主题只搜索与阅读） ----
+
+
+def exec_ok(stdout: str = "42\n", **kw: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "status": "completed",
+        "exit": {"code": 0, "signal": 0},
+        "diag": {"oom_kill_delta": 0, "oom_observed": False},
+        "stdout": stdout,
+        "stderr": "",
+        "outputs": [],
+        "skipped_outputs": [],
+        "queue_ms": 2,
+        "wall_ms": 80,
+        "limits": {"wall_ms": 60000, "memory_bytes": 536870912},
+    }
+    return {**base, **kw}
+
+
+def tool_names_of(body: dict[str, Any]) -> set[str]:
+    return {s["function"]["name"] for s in body.get("tools") or []}
+
+
+def run_python_events(events: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+    return [e["data"] for e in progress(events, kind) if e["data"]["tool"] == "run_python"]
+
+
+def test_run_python_in_answer_route_events_and_result_to_model():
+    code_text = "rows = [(2023, 120), (2024, 150)]\nprint(150 / 120 - 1)"
+    model = ScriptedModel(orch=[call("run_python", code=code_text), reply("增长了 25%。")])
+    out = {"path": "table.csv", "size": 12, "sha256": "e" * 64}
+    gw = make_gateway(model)
+    gw.exec_script = lambda body: exec_ok("0.25\n", outputs=[out])
+    code, events, gw = run_turn(model, config={"text": "从 120 涨到 150 增长多少？"}, gw=gw)
+    assert code == 0
+    assert gw.counts() == {"chat": 2, "exec": 1}
+    exec_call = next(c for c in gw.calls if c.kind == "exec")
+    assert exec_call.step_id == "orch"
+    assert exec_call.body == {"language": "python3", "code": code_text}
+    assert "run_python" in tool_names_of(model.bodies("orch")[0])
+    # 事件（裁定 L）：tool 为字符串 run_python，input 带代码；预览为退出码与 stdout；
+    # ⟨/⟩ 只来自 Gateway 调用：请求为 exec 请求体，响应为结果 blob
+    (tc,) = run_python_events(events, "tool_call")
+    assert tc["input"] == {"code": code_text} and tc["step_id"] == "orch"
+    (tr,) = run_python_events(events, "tool_result")
+    assert tr["ok"] is True and tr["tool_call_id"] == tc["tool_call_id"]
+    assert tr["preview"] == {"kind": "text", "text": "退出码 0\n0.25\n输出文件：table.csv"}
+    assert tr["raw"]["request"] == exec_call.body
+    assert tr["raw"]["response_ref"] in gw.blobs
+    assert progress(events, "budget") == []  # 不计入 web 工具额度
+    assert progress(events, "route")[0]["data"]["route"] == "answer"
+    # 模型看到完整的结果文本；结果 blob 进入 checkpoint 的 refs
+    msgs = model.bodies("orch")[1]["messages"]
+    tool_msg = next(m for m in msgs if m.get("name") == "run_python")
+    assert "状态：completed（退出码 0）" in tool_msg["content"] and "0.25" in tool_msg["content"]
+    assert any(tr["raw"]["response_ref"] in c["refs"] for c in checkpoints(events))
+    assert result(events)["summary"] == "增长了 25%。"
+
+
+def test_run_python_failed_exit_shows_stderr_in_step_and_model_sees_failure():
+    model = ScriptedModel(orch=[call("run_python", code="1/0"), reply("代码出错了。")])
+    gw = make_gateway(model)
+    gw.exec_script = lambda body: exec_ok(
+        "", exit={"code": 1, "signal": 0}, stderr="ZeroDivisionError: division by zero\n"
+    )
+    code, events, gw = run_turn(model, gw=gw)
+    assert code == 0
+    (tr,) = run_python_events(events, "tool_result")
+    assert tr["ok"] is False and "raw" in tr
+    assert tr["preview"]["text"].startswith("退出码 1\nstderr：\nZeroDivisionError")
+    assert tr["error"].startswith("退出码 1")
+
+
+def test_run_python_exec_quota_exhausted_is_a_tool_failure_the_model_sees():
+    def exec_script(body: dict[str, Any]) -> Any:
+        raise BudgetExhausted(402, "exec_quota_exhausted", "exec 次数已用完")
+
+    model = ScriptedModel(
+        orch=[call("run_python", code="print(1)"), reply("无法运行代码，直接估算：约 1。")]
+    )
+    gw = make_gateway(model)
+    gw.exec_script = exec_script
+    code, events, gw = run_turn(model, gw=gw)
+    assert code == 0  # 不是费用预算耗尽：本轮照常完成
+    (tr,) = run_python_events(events, "tool_result")
+    assert tr["ok"] is False and "raw" not in tr  # 没有结果 blob：不显示 ⟨/⟩
+    assert "配额已用完" in tr["error"]
+    tool_msg = next(m for m in model.bodies("orch")[1]["messages"] if m.get("name") == "run_python")
+    assert "exec_quota_exhausted" in tool_msg["content"]
+    assert "不要再调用 run_python" in tool_msg["content"]
+    assert result(events)["summary"] == "无法运行代码，直接估算：约 1。"
+
+
+def test_run_python_in_research_report_step_and_not_offered_to_subtopics():
+    report = "# 储能成本\n\n## 摘要\n- 成本下降 [1]\n\n| 年份 | 成本 |\n|---|---|\n| 2024 | 0.8 |"
+    model = ScriptedModel(
+        orch=[
+            call("read_skill", name="deep-research"),
+            call("todo_write", items=[todo("1", "成本", 8), todo("2", "容量", 8)]),
+            call("research_subtopic", id="1"),
+            call("research_subtopic", id="2"),
+            call("run_python", code="print(round(0.8 / 1.0 - 1, 2))"),
+            reply(report),
+        ],
+        sub={
+            "1": [
+                call("web_fetch", url="https://a.example/1"),
+                call("run_python", code="print(1)"),  # 子主题没有该工具：未知工具失败
+                reply("成本 1.0 → 0.8 [1]"),
+            ],
+            "2": [call("web_fetch", url="https://b.example/1"), reply("容量 [1]")],
+        },
+    )
+    gw = make_gateway(model)
+    gw.exec_script = lambda body: exec_ok("-0.2\n")
+    code, events, gw = run_turn(model, config=RESEARCH_CONFIG, gw=gw)
+    assert code == 0
+    assert [c.step_id for c in gw.calls if c.kind == "exec"] == ["orch"]  # 只有编排调用了
+    for body in model.bodies("sub-1"):
+        assert "tools" not in body or "run_python" not in tool_names_of(body)
+    assert "run_python" not in model.bodies("sub-1")[0]["messages"][0]["content"]
+    sub_tr = [d for d in run_python_events(events, "tool_result") if d.get("subtopic_id") == "1"]
+    assert len(sub_tr) == 1 and sub_tr[0]["ok"] is False
+    orch_bodies = model.bodies("orch")
+    assert all("run_python" in tool_names_of(b) for b in orch_bodies[:-1])
+    assert "-0.2" in next(
+        m["content"] for m in orch_bodies[-1]["messages"] if m.get("name") == "run_python"
+    )
+    assert "| 2024 | 0.8 |" in artifact_text(events, "report")
+    assert result(events)["outputs"] == ["report"]
+
+
+def test_parallel_subruns_do_not_offer_run_python():
+    model = par_model()
+    code, events, gw, _ = par_run(model)
+    assert code == 0, of_type(events, "error")
+    for i in ("1", "2", "3"):
+        bodies = model.bodies(f"sub-{i}")
+        assert bodies and all("run_python" not in tool_names_of(b) for b in bodies)
+    assert "run_python" in tool_names_of(model.bodies("orch")[0])
+
+
+def test_orchestrator_prompt_lists_run_python_with_guidance():
+    model = ScriptedModel(orch=[reply("好的。")])
+    run_turn(model)
+    system = model.bodies("orch")[0]["messages"][0]["content"]
+    assert "- run_python：在隔离沙箱中运行一段 Python 3 代码" in system
+    for phrase in ("单位换算", "沙箱没有网络", "简单算术不要调用", "/out", "代码的实际输出", "[n]"):
+        assert phrase in system, phrase
+    assert "read_source、run_python、ask_user" in system  # 不计入 web 工具额度
+
+
+def test_research_skill_mentions_run_python_for_report_figures():
+    body = (SKILLS / "deep-research" / "SKILL.md").read_text(encoding="utf-8")
+    section = body.split("## 8. 写报告", 1)[1].split("\n## ", 1)[0]
+    assert "run_python" in section and "表" in section

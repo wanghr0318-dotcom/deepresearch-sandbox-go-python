@@ -36,14 +36,20 @@
           … 还有 {{ hidden }} 条（点击展开）
         </button>
       </template>
-      <div v-if="row.kind !== 'search' && row.detail" class="detail">{{ row.detail }}</div>
-      <div v-if="row.text" class="text">{{ row.text }}</div>
+      <div v-if="row.kind !== 'search' && row.detail" class="detail" :class="{ mono: row.kind === 'code' }">{{ row.detail }}</div>
+      <template v-if="row.kind === 'code' && row.text">
+        <pre class="text mono" data-testid="code-output">{{ shownOutput }}</pre>
+        <button v-if="hiddenLines > 0" class="more" type="button" data-action="more-lines" @click="showAll = true">
+          … 还有 {{ hiddenLines }} 行（点击展开）
+        </button>
+      </template>
+      <div v-else-if="row.text" class="text">{{ row.text }}</div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-// 一个 Agent 步骤（设计 §7）：默认折叠；搜索展开后逐行显示标题、站点、摘要；⟨/⟩ 只在有原始引用（经 Gateway 的调用）时出现。
+// 一个 Agent 步骤（设计 §7）：默认折叠；搜索展开后逐行显示标题、站点、摘要；运行代码展开后显示退出码与输出（前 12 行，可展开其余）；⟨/⟩ 只在有原始引用（经 Gateway 的调用）时出现。
 // 只渲染面向用户的字段：从不显示行 id、子主题 id、原始响应的 sha。所有文本经插值（不使用 v-html）。
 import { computed, ref, watch } from "vue";
 import type { RawRef, StepKind, StepRow } from "../../lib/chat";
@@ -60,10 +66,12 @@ const ICONS: Record<StepKind, string> = {
   fetch: "🌐",
   source: "📚",
   subtopic: "🧭",
+  code: "💻",
   tool: "🔧",
 };
 
 const FIRST_RESULTS = 5;
+const FIRST_LINES = 12; // 运行代码：输出默认显示前 12 行
 const showAll = ref(false);
 watch(
   () => props.expanded,
@@ -87,6 +95,10 @@ const shownResults = computed(() => {
   return showAll.value ? list : list.slice(0, FIRST_RESULTS);
 });
 const hidden = computed(() => (props.row.results?.length ?? 0) - shownResults.value.length);
+const outputLines = computed(() => (props.row.text ?? "").split("\n"));
+const shownLines = computed(() => (showAll.value ? outputLines.value : outputLines.value.slice(0, FIRST_LINES)));
+const shownOutput = computed(() => shownLines.value.join("\n"));
+const hiddenLines = computed(() => outputLines.value.length - shownLines.value.length);
 const hasBody = computed(() => {
   const r = props.row;
   return (r.results?.length ?? 0) > 0 || !!r.text || (r.kind !== "search" && !!r.detail);
@@ -250,6 +262,13 @@ a.r-title:hover {
 .detail {
   color: #656d76;
   word-break: break-all;
+}
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+}
+pre.text {
+  margin: 0;
 }
 .text {
   white-space: pre-wrap;
