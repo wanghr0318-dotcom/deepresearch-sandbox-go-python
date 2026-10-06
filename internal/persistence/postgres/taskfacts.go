@@ -128,7 +128,7 @@ func (s *Store) RevokeAttemptAccess(ctx context.Context, attemptID, reason strin
 		if !exists {
 			return notFoundf("attempt %s 的访问记录", attemptID)
 		}
-		_, err := tx.Exec(ctx, `UPDATE attempt_access SET state = 'revoked', revoked_at = now(), reason = $2
+		_, err := tx.Exec(ctx, `UPDATE attempt_access SET state = 'revoked', revoked_at = clock_timestamp(), reason = $2
 			WHERE attempt_id = $1 AND state = 'active'`, attemptID, reason)
 		return err
 	})

@@ -179,7 +179,7 @@ func (s *Store) EvictSessionsOnRestart(ctx context.Context) ([]recovery.EvictedS
 func (s *Store) RevokeAllActive(ctx context.Context, reason string) (int, error) {
 	var n int
 	err := s.run(ctx, "RevokeAllActive", "", func(ctx context.Context, tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `UPDATE attempt_access SET state = 'revoked', revoked_at = now(), reason = $1
+		tag, err := tx.Exec(ctx, `UPDATE attempt_access SET state = 'revoked', revoked_at = clock_timestamp(), reason = $1
 			WHERE state = 'active'`, reason)
 		n = int(tag.RowsAffected())
 		return err
