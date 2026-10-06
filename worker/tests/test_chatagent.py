@@ -1603,6 +1603,21 @@ def test_fixed_plan_skips_planning_and_runs_given_subtopics():
     assert "[5][6]" in artifact_text(events, "report")
 
 
+def test_subbudget_failure_uses_gateway_count_when_present():
+    import threading
+
+    from agentbox_worker.tools.budget import TurnBudget
+    from chatagent.research import SubBudget
+
+    turn = TurnBudget(limit=30, used=8)
+    sb = SubBudget(turn, threading.Lock(), share=6, spent=1)
+    sb.record_failure("1", (10, 30))  # 错误响应带头：以 Gateway 计数为准，不再本地加 1
+    assert turn.used == 10 and sb.spent == 2
+    assert sb.line() == "工具额度：已用 10/30，剩余 20（本子主题剩余 4）"
+    sb.record_failure("1")  # 没有头：本地计 1
+    assert turn.used == 11 and sb.spent == 3
+
+
 # ---- run_python（编排的回答与研究路线；子主题只搜索与阅读） ----
 
 

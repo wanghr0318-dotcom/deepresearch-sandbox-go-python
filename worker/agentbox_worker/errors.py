@@ -46,13 +46,22 @@ class TransportBroken(Exception):
 class GatewayError(Exception):
     """Gateway 返回错误或无法完成请求。status 为 HTTP 状态码（未得到响应时为 0），code 来自
     错误体 {"error":{"code","message"}}，客户端自身判定的失败使用 connection_lost、
-    connection_refused、client_timeout、invalid_response 等代码。"""
+    connection_refused、client_timeout、invalid_response 等代码。tool_budget 是错误响应所带的
+    X-Agentbox-Tool-Budget (used, limit)（搜索与抓取的失败也已计数）；没有头时为 None。"""
 
-    def __init__(self, status: int, code: str, message: str = "") -> None:
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        message: str = "",
+        *,
+        tool_budget: tuple[int, int] | None = None,
+    ) -> None:
         super().__init__(f"{status} {code}: {message}" if message else f"{status} {code}")
         self.status = status
         self.code = code
         self.message = message
+        self.tool_budget = tool_budget
 
 
 class BudgetExhausted(GatewayError):

@@ -39,10 +39,14 @@ class TurnBudget:
             self.limit = limit
         self._spend(subtopic_id)
 
-    def record_failure(self, subtopic_id: str | None) -> None:
-        """失败的调用也计 1 次（设计 §8：记录并继续）。"""
-        self.used += 1
-        self._spend(subtopic_id)
+    def record_failure(
+        self, subtopic_id: str | None, result_budget: tuple[int, int] | None = None
+    ) -> None:
+        """失败的调用也计 1 次（设计 §8：记录并继续）。
+
+        错误响应带计数头时以 Gateway 为准（同 record），否则本地计 1：并行子主题的在途调用
+        已计入先前的头，本地再加会多计。"""
+        self.record(result_budget, subtopic_id)
 
     def exhaust(self) -> None:
         """Gateway 返回 429 tool_budget_exhausted：本轮额度已用尽。"""

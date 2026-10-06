@@ -426,6 +426,7 @@ class GatewayClient:
             if 200 <= resp.status < 300:
                 return self._result(call_id, resp)
             err = _error_from(resp.status, resp.data)
+            err.tool_budget = _tool_budget(resp.headers.get(TOOL_BUDGET_HEADER))
             if not isinstance(err, CallInProgress) or time.monotonic() + delay > deadline:
                 raise err
             time.sleep(delay)

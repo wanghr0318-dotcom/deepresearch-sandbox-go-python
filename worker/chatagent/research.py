@@ -182,7 +182,12 @@ class SubBudget:
         self._seen = result_budget
         self.spent += 1
 
-    def record_failure(self, subtopic_id: str | None) -> None:
+    def record_failure(
+        self, subtopic_id: str | None, result_budget: tuple[int, int] | None = None
+    ) -> None:
+        if result_budget is not None:  # 错误响应带计数头：同成功，以 Gateway 计数为准
+            self.record(result_budget, subtopic_id)
+            return
         with self._lock:
             self._turn.used += 1
         self.spent += 1

@@ -210,6 +210,19 @@ def test_fetch_failure_is_recorded_and_counted_and_loop_continues():
     assert r.content.endswith("工具额度：已用 1/30，剩余 29")
 
 
+def test_failed_call_uses_gateway_count_from_error_response():
+    # 真实验收：并行子主题的在途抓取已计入先前响应的头（8/30），之后它们失败时本地再各加 1 会多计。
+    def fail(url: str) -> Any:
+        raise GatewayError(429, "tries_exhausted", "Too Many Requests", tool_budget=(10, 30))
+
+    gw = ScriptedGateway(fetch=fail)
+    ctx = tool_ctx(gw)
+    ctx.budget.used = 8
+    r = ToolRegistry([WebFetch()]).dispatch("web_fetch", '{"url":"https://a.example/x"}', ctx)
+    assert not r.ok and ctx.budget.used == 10
+    assert r.content.endswith("工具额度：已用 10/30，剩余 20")
+
+
 def test_fetch_of_http_error_page_is_not_a_source():
     gw = ScriptedGateway(
         fetch=lambda url: {"status": 404, "error": "http_status", "content": "nope"},
@@ -319,7 +332,13 @@ def test_gateway_client_parses_tool_budget_header_and_429(fake_gateway: FakeGate
     fake_gateway.replies.append(error_reply(429, "rate_limited"))
     with pytest.raises(GatewayError) as info:
         gw.fetch("orch", "https://a.example/")
-    assert not isinstance(info.value, ToolBudgetExhausted)
+    assert not isinstance(info.value, ToolBudgetExhausted) and info.value.tool_budget is None
+    fake_gateway.replies.append(
+        Reply(429, {"error": {"code": "tries_exhausted"}}, {"X-Agentbox-Tool-Budget": "10/30"})
+    )
+    with pytest.raises(GatewayError) as info:
+        gw.fetch("orch", "https://a.example/")
+    assert info.value.code == "tries_exhausted" and info.value.tool_budget == (10, 30)
     gw.chat("orch", [{"role": "user", "content": "x"}], tools=[{"type": "function"}])
     assert fake_gateway.requests[-1].json()["tools"] == [{"type": "function"}]
 

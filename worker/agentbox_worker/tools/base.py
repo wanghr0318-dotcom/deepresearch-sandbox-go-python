@@ -118,7 +118,7 @@ def counted_call(
     except GatewayError as exc:
         if is_fatal(exc):
             raise
-        ctx.budget.record_failure(ctx.subtopic_id)
+        ctx.budget.record_failure(ctx.subtopic_id, exc.tool_budget)
         reason = f"{exc.code}（{exc.message}）" if exc.message else exc.code
         return failed(ctx, f"{action}失败：{reason}")
     ctx.budget.record(res.tool_budget, ctx.subtopic_id)
