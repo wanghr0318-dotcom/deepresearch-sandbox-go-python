@@ -51,10 +51,6 @@ func with(s ActorState, f func(*ActorState)) ActorState {
 
 func status(st string) func(*ActorState) { return func(s *ActorState) { s.Session.Status = st } }
 
-func incStatus(st string) func(*ActorState) {
-	return func(s *ActorState) { s.Session.Incarnation.Status = st }
-}
-
 func noInc(s *ActorState) {
 	s.Session.Incarnation, s.Session.CurrentIncarnationID, s.HandleInc = nil, "", ""
 }

@@ -709,7 +709,7 @@ func (a *Actor) requestSessionGrant() {
 		if err != nil {
 			return SessionUnavailable{Err: err}
 		}
-		return SessionGranted{IncarnationID: g.IncarnationID, EnvID: g.EnvID}
+		return SessionGranted(g)
 	})
 }
 

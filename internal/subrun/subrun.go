@@ -110,7 +110,7 @@ type hashInput struct {
 
 // Hash 返回定义的 32 字节 sha256。nil 上限编码为 null，因此与上限 0 不同。
 func (d Definition) Hash() []byte {
-	canon, err := jcs.Canonical(hashInput{ParentStepID: d.ParentStepID, BudgetCapMicro: d.BudgetCapMicro, DeadlineMS: d.DeadlineMS})
+	canon, err := jcs.Canonical(hashInput(d))
 	if err != nil {
 		// 字符串、整数与 null 总能规范化（encoding/json 会替换非法 UTF-8），不可达。
 		panic(fmt.Sprintf("subrun: 定义无法规范化: %v", err))
