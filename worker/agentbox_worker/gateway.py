@@ -1,4 +1,4 @@
-"""Gateway 客户端：经 Unix socket 的 HTTP/1.1 访问模型、搜索、抓取与 blob（规格 §9.3、§9.4）。
+"""Gateway 客户端：经 Unix socket 的 HTTP/1.1 访问模型、搜索、抓取、exec 与 blob（规格 §9.3–§10）。
 
 只用标准库（http.client + socket.AF_UNIX），方法均为同步阻塞调用；在 asyncio 应用中应经
 asyncio.to_thread 调用，避免阻塞控制消息处理。每个请求使用一条新连接，不复用 keep-alive。
@@ -17,6 +17,7 @@ import re
 import socket
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,12 +43,39 @@ DEFAULT_TIMEOUT_S = 330.0
 GATEWAY_TIMEOUT_ENV = "AGENTBOX_GATEWAY_TIMEOUT_S"
 MAX_TIMEOUT_S = 86400.0  # 过大的值会使 socket 超时溢出
 
-# kind → 端点（M2 范围）
+# kind → 端点（M2 范围；exec 为 M4 Plan 15）
 ENDPOINTS: dict[str, str] = {
     "chat": "/v1/chat/completions",
     "search": "/v1/search",
     "fetch": "/v1/fetch",
+    "exec": "/v1/exec",
 }
+
+# exec（规格 §10、§19 补充）：服务端的调用期限 = 排队上限 + 生效 wall + 30 s（§9.7）。客户端超时按
+# server 默认值估算并加余量，且不短于普通调用的超时，让 Gateway 先给出 504 而不是客户端先放弃。
+EXEC_LANGUAGE = "python3"
+EXEC_QUEUE_TIMEOUT_S = 60.0
+EXEC_DEFAULT_WALL_MS = 60_000
+EXEC_DEADLINE_GRACE_S = 30.0
+EXEC_CLIENT_MARGIN_S = 15.0
+
+
+def exec_timeout_s(wall_ms: int | None) -> float:
+    """一次 exec 的客户端等待上限（秒）：排队上限 + wall + 30 s + 余量。
+
+    wall_ms 为 None 时按 server 默认值估算。"""
+    wall = EXEC_DEFAULT_WALL_MS if wall_ms is None else wall_ms
+    return EXEC_QUEUE_TIMEOUT_S + wall / 1000 + EXEC_DEADLINE_GRACE_S + EXEC_CLIENT_MARGIN_S
+
+
+def _positive_int(name: str, value: int | None) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} 须为整数，得到 {value!r}")
+    if value <= 0:
+        raise ValueError(f"{name} 须为正数，得到 {value}")
+
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 # 工具额度头（M4）：search/fetch 的每个成功响应带 "<used>/<limit>"
@@ -150,7 +178,8 @@ def _error_from(status: int, data: bytes) -> GatewayError:
         message = data[:512].decode("utf-8", "replace")
     if status == 402:
         return BudgetExhausted(status, code, message)
-    if status == 403:
+    # input_not_authorized（exec 的输入 blob 不在任务 scope 内）是请求参数问题，不是访问撤销
+    if status == 403 and code != "input_not_authorized":
         return AccessRevoked(status, code, message)
     if status == 504:
         return CallDeadlineExceeded(status, code, message)
@@ -282,6 +311,62 @@ class GatewayClient:
             "fetch", self._next_id(step_id, "fetch"), {"url": url}, _cache_headers(no_cache)
         )
 
+    def exec(
+        self,
+        step_id: str,
+        code: str,
+        *,
+        inputs: Sequence[tuple[str, str]] = (),
+        wall_ms: int | None = None,
+        memory_bytes: int | None = None,
+        retry: bool = False,
+    ) -> GatewayResult:
+        """POST /v1/exec（规格 §10）：在全新的 exec 环境中以 python3 执行 code；call id 为
+        <root|subrun>/<step_id>/exec/<n>。
+
+        inputs 是 (sha256, path)：已授权到本任务的 blob 放到 /in/<path>（只读）。wall_ms、
+        memory_bytes 为 None 时不写入（server 默认值）；超过 server 上限时被截断，生效值见结果。
+        请求内容进入调用指纹，恢复后重发同一调用须给出相同参数。retry=True 发送
+        X-Agentbox-Retry: true：以同一 call id 重跑此前可重试地失败的 exec（如 exec_cancelled）。
+        客户端超时 = 排队上限 + wall + 30 s + 余量（见 exec_timeout_s），不短于 timeout_s。
+        """
+        body = self.exec_body(code, inputs=inputs, wall_ms=wall_ms, memory_bytes=memory_bytes)
+        extra = {"X-Agentbox-Retry": "true"} if retry else {}
+        return self._call("exec", self._next_id(step_id, "exec"), body, extra)
+
+    @staticmethod
+    def exec_body(
+        code: str,
+        *,
+        inputs: Sequence[tuple[str, str]] = (),
+        wall_ms: int | None = None,
+        memory_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        """exec 的请求体：inputs 为空时不写 inputs，两个限制都为 None 时不写 limits。参数类型在本地
+        检查（不占 call id）；内容规则（路径、sha、大小）由 Gateway 校验（400）。"""
+        if not isinstance(code, str):
+            raise TypeError(f"code 须为 str，得到 {type(code).__name__}")
+        _positive_int("wall_ms", wall_ms)
+        _positive_int("memory_bytes", memory_bytes)
+        items = []
+        for item in inputs:
+            if (
+                not isinstance(item, tuple | list)
+                or len(item) != 2
+                or not all(isinstance(v, str) for v in item)
+            ):
+                raise ValueError(f"inputs 的每项须为 (sha256, path)，得到 {item!r}")
+            items.append({"sha256": item[0], "path": item[1]})
+        body: dict[str, Any] = {"language": EXEC_LANGUAGE, "code": code}
+        if items:
+            body["inputs"] = items
+        limits = {
+            k: v for k, v in (("wall_ms", wall_ms), ("memory_bytes", memory_bytes)) if v is not None
+        }
+        if limits:
+            body["limits"] = limits
+        return body
+
     def retry(
         self, step_id: str, kind: str, call_id: str, body: dict, *, no_cache: bool = False
     ) -> GatewayResult:
@@ -327,10 +412,17 @@ class GatewayClient:
             raise ValueError(f"call id 超过 {MAX_CALL_ID_BYTES} 字节")
         payload = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
         headers = {"Content-Type": "application/json", "X-Agentbox-Call-Id": call_id, **extra}
+        # exec（含 retry/supersede 发出的 exec）的等待上限随 wall 变化；其他调用用 timeout_s
+        send_kw: dict[str, float] = {}
+        if kind == "exec":
+            limits = body.get("limits")
+            wall = limits.get("wall_ms") if isinstance(limits, dict) else None
+            wall_ms = wall if isinstance(wall, int) and not isinstance(wall, bool) else None
+            send_kw["timeout_s"] = max(self.timeout_s, exec_timeout_s(wall_ms))
         deadline = time.monotonic() + self.in_progress_wait_s
         delay = self.in_progress_backoff_s
         while True:
-            resp = self._send("POST", path, payload, headers)
+            resp = self._send("POST", path, payload, headers, **send_kw)
             if 200 <= resp.status < 300:
                 return self._result(call_id, resp)
             err = _error_from(resp.status, resp.data)
@@ -358,9 +450,16 @@ class GatewayClient:
         return body
 
     def _send(
-        self, method: str, path: str, payload: bytes | None, headers: dict[str, str]
+        self,
+        method: str,
+        path: str,
+        payload: bytes | None,
+        headers: dict[str, str],
+        *,
+        timeout_s: float | None = None,
     ) -> _Response:
-        conn = _UnixHTTPConnection(self.socket_path, self.timeout_s)
+        timeout = self.timeout_s if timeout_s is None else timeout_s
+        conn = _UnixHTTPConnection(self.socket_path, timeout)
         try:
             try:
                 conn.connect()
@@ -372,7 +471,7 @@ class GatewayClient:
             data = resp.read()
             return _Response(resp.status, {k.lower(): v for k, v in resp.getheaders()}, data)
         except TimeoutError as exc:
-            raise CallDeadlineExceeded(0, "client_timeout", f"{self.timeout_s} s 内无响应") from exc
+            raise CallDeadlineExceeded(0, "client_timeout", f"{timeout} s 内无响应") from exc
         except (OSError, http.client.HTTPException) as exc:
             raise GatewayError(0, "connection_lost", f"{type(exc).__name__}: {exc}") from exc
         finally:
@@ -450,11 +549,21 @@ class SubrunGateway(GatewayClient):
             return super()._call(kind, call_id, body, extra)
 
     def _send(
-        self, method: str, path: str, payload: bytes | None, headers: dict[str, str]
+        self,
+        method: str,
+        path: str,
+        payload: bytes | None,
+        headers: dict[str, str],
+        *,
+        timeout_s: float | None = None,
     ) -> _Response:
         self._check_open()
         assert self.subrun_id is not None
-        return super()._send(method, path, payload, {**headers, SUBRUN_HEADER: self.subrun_id})
+        # 只在给出时转交 timeout_s（与 GatewayClient._call 一致：只有 exec 传它）
+        kw = {} if timeout_s is None else {"timeout_s": timeout_s}
+        return super()._send(
+            method, path, payload, {**headers, SUBRUN_HEADER: self.subrun_id}, **kw
+        )
 
     def _check_open(self) -> None:
         if self._closed.is_set():

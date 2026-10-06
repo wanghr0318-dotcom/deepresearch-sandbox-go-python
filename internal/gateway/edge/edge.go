@@ -42,6 +42,11 @@ type Calls interface {
 	SubrunBudget(ctx context.Context, taskID, subrunID string) (call.SubrunBudget, error)
 	OpenBlob(ctx context.Context, taskID, sha string) (io.ReadCloser, error)
 	CancelAttempt(attemptID, reason string)
+	// Exec 处理 POST /v1/exec（§10）；拒绝与失败以 Result 的 Status/Code 返回。
+	Exec(ctx context.Context, in call.ExecInvoke) (call.Result, error)
+	// ExecQuota 返回任务的 exec 配额（bool 为是否已有配额行；没有时为策略值、用量 0）；未配置 exec 时为
+	// call.ErrExecNotConfigured，/v1/budget 此时不输出 exec。
+	ExecQuota(ctx context.Context, taskID string) (call.ExecQuota, bool, error)
 }
 
 // Attempts 把 attempt 映射到它所属的任务与环境（由 Task 5 以 task.Store.LookupAttempt 实现）。
@@ -560,8 +565,12 @@ func (t *target) serveHTTP(w http.ResponseWriter, r *http.Request, tc *trackedCo
 	}
 	path := r.URL.Path
 	switch {
-	case path == "/v1/exec":
-		t.writeError(w, http.StatusNotImplemented, CodeNotImplemented, "exec 尚未实现")
+	case path == call.ExecEndpoint:
+		if r.Method != http.MethodPost {
+			t.methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		t.exec(w, r, tc, subrunID)
 	case billable[path] != "":
 		if r.Method != http.MethodPost {
 			t.methodNotAllowed(w, http.MethodPost)
@@ -585,15 +594,17 @@ func (t *target) serveHTTP(w http.ResponseWriter, r *http.Request, tc *trackedCo
 	}
 }
 
-func (t *target) invoke(w http.ResponseWriter, r *http.Request, tc *trackedConn, kind upstream.Kind, subrunID string) {
-	callID := r.Header.Get(HeaderCallID)
+// callRequest 读取计费调用与 exec 共用的部分：call id（1–256 字节；带 X-Agentbox-Subrun 时须以 <subrun_id>/
+// 开头）与请求体（≤ MaxBody）。失败时已写出错误，ok 为 false。
+func (t *target) callRequest(w http.ResponseWriter, r *http.Request, subrunID string) (callID string, body []byte, ok bool) {
+	callID = r.Header.Get(HeaderCallID)
 	if callID == "" || len(callID) > MaxCallIDBytes {
 		t.writeError(w, http.StatusBadRequest, CodeMissingCallID, "计费调用须携带 1–256 字节的 X-Agentbox-Call-Id")
-		return
+		return "", nil, false
 	}
 	if prefix := subrunID + "/"; subrunID != "" && (!strings.HasPrefix(callID, prefix) || len(callID) == len(prefix)) {
 		t.writeError(w, http.StatusBadRequest, CodeInvalidRequest, "带 X-Agentbox-Subrun 时 X-Agentbox-Call-Id 须以 <subrun_id>/ 开头")
-		return
+		return "", nil, false
 	}
 	// 不按 Content-Length 提前拒绝：未读请求体时立即响应会让仍在写入的客户端得到 broken pipe 而非 413。
 	// MaxBytesReader 至多读入 MaxBody 字节，超限时响应后关闭连接。
@@ -602,9 +613,53 @@ func (t *target) invoke(w http.ResponseWriter, r *http.Request, tc *trackedConn,
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			t.writeError(w, http.StatusRequestEntityTooLarge, CodeRequestTooLarge, "请求体超过上限")
-			return
+			return "", nil, false
 		}
 		t.writeError(w, http.StatusBadRequest, CodeInvalidRequest, "读取请求体失败")
+		return "", nil, false
+	}
+	return callID, body, true
+}
+
+// detached 在 Worker 于响应前断开时立即关闭服务端连接、释放连接名额（net/http 读到 EOF 后取消 r.Context()）；
+// 调用本身以 target 的上下文进行、不受影响，响应写入失败即丢弃。返回的 stop 须在处理函数返回前调用，
+// 正常结束不会触发。
+func detached(r *http.Request, tc *trackedConn) (stop func() bool) {
+	return context.AfterFunc(r.Context(), func() {
+		_ = tc.Close() // Worker 已断开，关闭错误无关紧要
+	})
+}
+
+// exec 处理 POST /v1/exec（§10）：头与请求体规则同计费端点（call id、Retry、Supersedes、sub-run 前缀、4 MiB）；
+// exec 没有缓存，带 X-Agentbox-Cache 为 400。以 target 的上下文调用 Calls.Exec：Worker 断开不取消 exec。
+func (t *target) exec(w http.ResponseWriter, r *http.Request, tc *trackedConn, subrunID string) {
+	callID, body, ok := t.callRequest(w, r, subrunID)
+	if !ok {
+		return
+	}
+	if r.Header.Get(HeaderCache) != "" {
+		t.writeError(w, http.StatusBadRequest, CodeInvalidRequest, "exec 不接受 X-Agentbox-Cache")
+		return
+	}
+	in := call.ExecInvoke{
+		TaskID: t.taskID, AttemptID: t.attemptID, CallID: callID, SubrunID: subrunID, Body: body,
+		Retry:           strings.EqualFold(strings.TrimSpace(r.Header.Get(HeaderRetry)), "true"),
+		Supersedes:      r.Header.Get(HeaderSupersedes),
+		SupersedeReason: r.Header.Get(HeaderSupersedeReason),
+	}
+	stop := detached(r, tc)
+	defer stop()
+	res, err := t.e.calls.Exec(t.ctx, in)
+	if err != nil {
+		t.internalError(w, "exec", err, "call_id", callID)
+		return
+	}
+	t.writeResult(w, callID, res)
+}
+
+func (t *target) invoke(w http.ResponseWriter, r *http.Request, tc *trackedConn, kind upstream.Kind, subrunID string) {
+	callID, body, ok := t.callRequest(w, r, subrunID)
+	if !ok {
 		return
 	}
 	noCache := false
@@ -625,11 +680,7 @@ func (t *target) invoke(w http.ResponseWriter, r *http.Request, tc *trackedConn,
 		NoCache:         noCache,
 		SubrunID:        subrunID,
 	}
-	// Worker 在响应前断开（net/http 读到 EOF 后取消 r.Context()）：立即关闭服务端连接、释放连接名额，
-	// Invoke 不受影响，响应写入失败即丢弃。处理函数返回前 stop，正常结束不会触发。
-	stop := context.AfterFunc(r.Context(), func() {
-		_ = tc.Close() // Worker 已断开，关闭错误无关紧要
-	})
+	stop := detached(r, tc)
 	defer stop()
 	// 以 target 的上下文而非 r.Context() 调用：Worker 断开不取消 Invoke（见 target.ctx）。
 	res, err := t.e.calls.Invoke(t.ctx, in)
@@ -640,6 +691,11 @@ func (t *target) invoke(w http.ResponseWriter, r *http.Request, tc *trackedConn,
 	if tb := res.ToolBudget; tb != nil {
 		w.Header().Set(HeaderToolBudget, fmt.Sprintf("%d/%d", tb.Used, tb.Limit))
 	}
+	t.writeResult(w, callID, res)
+}
+
+// writeResult 写出计费调用或 exec 的结果：拒绝与失败为错误体（Status/Code 原样）；成功时带结果 blob 与重放头。
+func (t *target) writeResult(w http.ResponseWriter, callID string, res call.Result) {
 	if res.Status != 0 && res.Code != "" {
 		t.writeError(w, res.Status, res.Code, http.StatusText(res.Status))
 		return
@@ -688,6 +744,20 @@ type budgetBody struct {
 	ToolCallLimit *int64 `json:"tool_call_limit"`
 	// Subrun 只在请求带 X-Agentbox-Subrun 时出现（不带头时响应与之前逐字节相同）。
 	Subrun *subrunBudgetBody `json:"subrun,omitempty"`
+	// Exec 是任务级 exec 配额（§10.3）；未配置 exec 时不出现。
+	Exec *execQuotaBody `json:"exec,omitempty"`
+}
+
+// execQuotaBody 是 exec 配额（尚无配额行时为策略值、用量 0）。cpu_available_usec = limit − reserved − spent −
+// unknown，可为负（超额如实记账并置 blocked）。
+type execQuotaBody struct {
+	CountLimit       int64 `json:"count_limit"`
+	CountUsed        int64 `json:"count_used"`
+	CPULimitUsec     int64 `json:"cpu_limit_usec"`
+	CPUAvailableUsec int64 `json:"cpu_available_usec"`
+	WallLimitMs      int64 `json:"wall_limit_ms"`
+	WallSpentMs      int64 `json:"wall_spent_ms"`
+	Blocked          bool  `json:"blocked"`
 }
 
 // subrunBudgetBody 是 sub-run 层账本（§9.6）。CapMicro 为 null 表示只做归属、不设上限，此时 AvailableMicro
@@ -727,6 +797,16 @@ func (t *target) budget(w http.ResponseWriter, r *http.Request, subrunID string)
 			sub.AvailableMicro = &avail
 		}
 		body.Subrun = sub
+	}
+	// 是否已有配额行不影响输出：没有时 Calls 已给出策略值与用量 0。
+	switch q, _, err := t.e.calls.ExecQuota(r.Context(), t.taskID); {
+	case errors.Is(err, call.ErrExecNotConfigured):
+	case err != nil:
+		t.internalError(w, "exec_quota", err)
+		return
+	default:
+		body.Exec = &execQuotaBody{CountLimit: q.CountLimit, CountUsed: q.CountUsed, CPULimitUsec: q.CPULimitUsec,
+			CPUAvailableUsec: q.CPUAvailable(), WallLimitMs: q.WallLimitMs, WallSpentMs: q.WallSpentMs, Blocked: q.Blocked}
 	}
 	t.writeJSON(w, http.StatusOK, body)
 }

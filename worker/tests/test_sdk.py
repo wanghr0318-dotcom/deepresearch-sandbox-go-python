@@ -1448,7 +1448,7 @@ def test_fifth_logical_subrun_is_rejected_locally(tmp_path):
 
 
 def recording_send(recorded: list[tuple[str, dict[str, str]]]):
-    def _send(self, method, path, payload, headers):
+    def _send(self, method, path, payload, headers, **_):  # exec 另传 timeout_s
         recorded.append((path, dict(headers)))
         return _Response(200, {}, b"{}")
 
@@ -1892,3 +1892,177 @@ def test_subrun_gateway_over_unix_socket(fake_gateway, tmp_path, monkeypatch):
     assert sub.headers["x-agentbox-call-id"] == "st1/s1/chat/1"
     assert "x-agentbox-subrun" not in root.headers
     assert root.headers["x-agentbox-call-id"] == "root/s1/chat/1"
+
+
+# ---- exec：GatewayClient.exec() → POST /v1/exec（规格 §10；Plan 15 Task 9） ----
+
+from agentbox_worker.gateway import (
+    EXEC_DEFAULT_WALL_MS,
+    EXEC_QUEUE_TIMEOUT_S,
+    exec_timeout_s,
+)
+
+EXEC_RESULT = {"status": "completed", "exit_code": 0, "stdout": "1\n", "stderr": ""}
+
+
+def exec_gateway(gw: FakeGateway) -> None:
+    """fake Gateway 的 /v1/exec：返回固定结果与结果 blob（同一 call id 再次到达时带重放头）。"""
+    seen: set[str] = set()
+    sha = gw.put_blob(json.dumps(EXEC_RESULT).encode())
+
+    def intercept(req):
+        if req.path != "/v1/exec":
+            return None
+        call_id = req.headers.get("x-agentbox-call-id", "")
+        headers = {"X-Agentbox-Blob": sha}
+        if call_id in seen:
+            headers["X-Agentbox-Replayed"] = "true"
+        seen.add(call_id)
+        return Reply(200, EXEC_RESULT, headers)
+
+    gw.interceptor = intercept
+
+
+def test_exec_sends_body_headers_and_call_ids(fake_gateway):
+    exec_gateway(fake_gateway)
+    gw = client(fake_gateway)
+    first = gw.exec("analyze", "print(1)")
+    inputs = [("a" * 64, "data/a.csv"), ("b" * 64, "b.txt")]
+    second = gw.exec("analyze", "print(2)", inputs=inputs, wall_ms=1500, memory_bytes=1 << 20)
+    third = gw.exec("analyze", "print(1)", retry=True)
+    got = [
+        (r.method, r.path, r.headers.get("x-agentbox-call-id"), r.json())
+        for r in fake_gateway.requests
+    ]
+    assert got == [
+        ("POST", "/v1/exec", "root/analyze/exec/1", {"language": "python3", "code": "print(1)"}),
+        (
+            "POST",
+            "/v1/exec",
+            "root/analyze/exec/2",
+            {
+                "language": "python3",
+                "code": "print(2)",
+                "inputs": [
+                    {"sha256": "a" * 64, "path": "data/a.csv"},
+                    {"sha256": "b" * 64, "path": "b.txt"},
+                ],
+                "limits": {"wall_ms": 1500, "memory_bytes": 1 << 20},
+            },
+        ),
+        ("POST", "/v1/exec", "root/analyze/exec/3", {"language": "python3", "code": "print(1)"}),
+    ]
+    retry_headers = [r.headers.get("x-agentbox-retry") for r in fake_gateway.requests]
+    assert retry_headers == [None, None, "true"]
+    for r in fake_gateway.requests:
+        assert r.headers["content-type"] == "application/json"
+        assert not {"x-agentbox-cache", "x-agentbox-supersedes", "x-agentbox-subrun"} & set(
+            r.headers
+        )
+    assert first.body == EXEC_RESULT and first.status == 200 and first.replayed is False
+    assert first.blob_sha256 == second.blob_sha256 and first.call_id == "root/analyze/exec/1"
+    assert third.call_id == "root/analyze/exec/3"
+
+
+def test_exec_call_ids_continue_after_checkpoint_restore(fake_gateway):
+    exec_gateway(fake_gateway)
+    ids = CallIds()
+    gw = client(fake_gateway, ids)
+    gw.exec("s1", "x = 1")
+    gw.exec("s1", "x = 2")
+    snap = json.loads(json.dumps(ids.snapshot()))  # 如同经 checkpoint 往返
+    assert snap == {"root/s1/exec": 2}
+    resumed = client(fake_gateway, CallIds.restore(snap))
+    assert resumed.exec("s1", "x = 3").call_id == "root/s1/exec/3"
+    # 恢复后重做同一步（快照早于该步）得到同一 call id；retry=True 允许重跑已取消的 exec
+    replay = client(fake_gateway, CallIds.restore({"root/s1/exec": 1}))
+    res = replay.exec("s1", "x = 2", retry=True)
+    assert res.call_id == "root/s1/exec/2" and res.replayed is True
+    assert fake_gateway.requests[-1].headers["x-agentbox-retry"] == "true"
+
+
+@pytest.mark.parametrize(
+    ("reply", "exc_type"),
+    [
+        (error_reply(402, "exec_quota_exhausted"), BudgetExhausted),
+        (error_reply(402, "exec_cpu_exhausted"), BudgetExhausted),
+        (error_reply(402, "exec_blocked"), BudgetExhausted),
+        # 输入未授权是请求参数问题，不是访问撤销：不得映射为 AccessRevoked（应用据它终止）
+        (error_reply(403, "input_not_authorized"), GatewayError),
+        (error_reply(403, "access_revoked"), AccessRevoked),
+        (error_reply(409, "exec_cancelled"), GatewayError),
+        (error_reply(409, "fingerprint_mismatch"), CallDivergence),
+        (error_reply(502, "exec_start_failed"), GatewayError),
+        (error_reply(502, "exec_unknown"), GatewayError),
+        (error_reply(503, "exec_env_unavailable"), GatewayError),
+        (error_reply(504, "exec_queue_timeout"), CallDeadlineExceeded),
+        (error_reply(504, "call_deadline_exceeded"), CallDeadlineExceeded),
+        (error_reply(400, "unsupported_field"), GatewayError),
+    ],
+    ids=lambda v: v.body["error"]["code"] if isinstance(v, Reply) else None,
+)
+def test_exec_errors_map_to_typed_exceptions(fake_gateway, reply, exc_type):
+    fake_gateway.replies.append(reply)
+    with pytest.raises(GatewayError) as caught:
+        client(fake_gateway).exec("s1", "print(1)")
+    assert type(caught.value) is exc_type
+    assert (caught.value.status, caught.value.code) == (reply.status, reply.body["error"]["code"])
+    assert len(fake_gateway.requests) == 1
+
+
+def test_exec_call_in_progress_is_retried_with_same_id(fake_gateway):
+    exec_gateway(fake_gateway)
+    fake_gateway.replies += [error_reply(409, "call_in_progress")] * 2
+    res = client(fake_gateway).exec("s1", "print(1)")
+    assert res.body == EXEC_RESULT
+    assert [r.headers["x-agentbox-call-id"] for r in fake_gateway.requests] == [
+        "root/s1/exec/1"
+    ] * 3
+
+
+def test_exec_timeout_covers_queue_wall_and_grace(monkeypatch):
+    # 调用期限 = 排队上限 + 生效 wall + 30 s（§9.7）；客户端再加余量，且不短于普通调用的超时
+    assert exec_timeout_s(None) == exec_timeout_s(EXEC_DEFAULT_WALL_MS)
+    assert exec_timeout_s(300_000) > EXEC_QUEUE_TIMEOUT_S + 300 + 30
+    seen: list[float | None] = []
+
+    def _send(self, method, path, payload, headers, *, timeout_s=None):
+        seen.append(timeout_s)
+        return _Response(200, {}, b"{}")
+
+    monkeypatch.setattr(GatewayClient, "_send", _send)
+    gw = GatewayClient("/x.sock", call_ids=CallIds(), timeout_s=5)
+    gw.exec("s", "pass", wall_ms=300_000)
+    gw.exec("s", "pass")
+    big = GatewayClient("/x.sock", call_ids=CallIds(), timeout_s=10_000)
+    big.exec("s", "pass")
+    assert seen == [exec_timeout_s(300_000), exec_timeout_s(None), 10_000]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"code": b"print(1)"},
+        {"inputs": [("a" * 64,)]},
+        {"inputs": [("a" * 64, 1)]},
+        {"wall_ms": 0},
+        {"memory_bytes": True},
+    ],
+)
+def test_exec_rejects_malformed_arguments_locally(kwargs):
+    gw = GatewayClient("/x.sock", call_ids=CallIds(), timeout_s=5)
+    args = {"code": "print(1)", **kwargs}
+    with pytest.raises((TypeError, ValueError)):
+        gw.exec("s", args.pop("code"), **args)
+    assert gw.call_ids.snapshot() == {}  # 本地拒绝不占号
+
+
+def test_subrun_gateway_exec_is_tagged(monkeypatch):
+    recorded: list[tuple[str, dict[str, str]]] = []
+    monkeypatch.setattr(GatewayClient, "_send", recording_send(recorded))
+    gw = SubrunGateway("/x.sock", call_ids=CallIds(), subrun_id="st1", timeout_s=5)
+    gw.exec("s1", "print(1)")
+    ((path, headers),) = recorded
+    assert path == "/v1/exec"
+    assert headers["X-Agentbox-Call-Id"] == "st1/s1/exec/1"
+    assert headers["X-Agentbox-Subrun"] == "st1"

@@ -41,6 +41,39 @@ type fakeCalls struct {
 
 	invoke func(ctx context.Context, in call.Invoke) (call.Result, error)
 	open   func(taskID, sha string) (io.ReadCloser, error)
+
+	// exec（Plan 15 Task 9）：execs 记录 Exec 的输入；exec 为空时返回 200 {"status":"completed"}。
+	// execQuota 为 nil 表示 exec 未配置（ExecQuota 返回 call.ErrExecNotConfigured）。
+	execs      []call.ExecInvoke
+	exec       func(ctx context.Context, in call.ExecInvoke) (call.Result, error)
+	execQuota  *call.ExecQuota
+	execHasRow bool
+}
+
+func (f *fakeCalls) Exec(ctx context.Context, in call.ExecInvoke) (call.Result, error) {
+	f.mu.Lock()
+	f.execs = append(f.execs, in)
+	fn := f.exec
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, in)
+	}
+	return call.Result{Body: []byte(`{"status":"completed"}`), BlobSHA256: testSHA, Status: 200}, nil
+}
+
+func (f *fakeCalls) ExecQuota(_ context.Context, _ string) (call.ExecQuota, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.execQuota == nil {
+		return call.ExecQuota{}, false, call.ErrExecNotConfigured
+	}
+	return *f.execQuota, f.execHasRow, nil
+}
+
+func (f *fakeCalls) execSnapshot() []call.ExecInvoke {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]call.ExecInvoke(nil), f.execs...)
 }
 
 func (f *fakeCalls) Invoke(ctx context.Context, in call.Invoke) (call.Result, error) {
@@ -480,7 +513,8 @@ func TestRequestValidation(t *testing.T) {
 		{"call id 过长", "POST", "/v1/fetch", callHdr(strings.Repeat("x", MaxCallIDBytes+1)), 400, CodeMissingCallID},
 		{"sub-run ID 非法", "POST", "/v1/search", map[string]string{HeaderCallID: "Sr1/1", HeaderSubrun: "Sr1"}, 400, CodeInvalidRequest},
 		{"call id 不以 sub-run 开头", "POST", "/v1/search", map[string]string{HeaderCallID: "c/1", HeaderSubrun: "sr1"}, 400, CodeInvalidRequest},
-		{"exec 未实现", "POST", "/v1/exec", callHdr("c/1"), 501, CodeNotImplemented},
+		{"exec 缺 call id", "POST", "/v1/exec", nil, 400, CodeMissingCallID},
+		{"exec 方法不符", "GET", "/v1/exec", callHdr("c/1"), 405, CodeMethodNotAllowed},
 		{"方法不符", "GET", "/v1/chat/completions", callHdr("c/1"), 405, CodeMethodNotAllowed},
 		{"未知端点", "POST", "/v1/other", callHdr("c/1"), 404, CodeNotFound},
 	}
@@ -1203,4 +1237,197 @@ func TestSubrunHeaderOnReadOnly(t *testing.T) {
 	if fmt.Sprint(calls.subBudgets) != "[st1 st1]" {
 		t.Errorf("SubrunBudget 调用 = %q（访问被拒与不带头时不读 sub-run 层）", calls.subBudgets)
 	}
+}
+
+// ==== M4 Plan 15 Task 9：POST /v1/exec 与 /v1/budget 的 exec 配额（规格 §10、§9.3） ====
+
+// /v1/exec 与计费端点同样要求 call id、接受 Retry 与 Supersedes、校验 sub-run 前缀，并把它们交给 Calls.Exec
+// （不经 Invoke）；exec 没有缓存，带 X-Agentbox-Cache 为 400；成功响应带结果 blob 与重放头。
+func TestExecEndpoint(t *testing.T) {
+	var mu sync.Mutex
+	replayed := false
+	calls := &fakeCalls{exec: func(context.Context, call.ExecInvoke) (call.Result, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return call.Result{Body: []byte(`{"status":"completed","exit_code":0}`), BlobSHA256: testSHA, Replayed: replayed, Status: 200}, nil
+	}}
+	e := newEdge(t, Config{MaxBody: 1024}, calls)
+	p := bind(t, e, "a1", "e1")
+	body := `{"language":"python3","code":"print(1)"}`
+
+	r := do(t, p, "POST", "/v1/exec", strings.NewReader(body), callHdr("root/s1/exec/1"))
+	if r.status != 200 || string(r.body) != `{"status":"completed","exit_code":0}` || r.header.Get(HeaderBlob) != testSHA ||
+		r.header.Get(HeaderReplayed) != "" || r.header.Get("Content-Type") != "application/json" {
+		t.Fatalf("exec: %d %v %s", r.status, r.header, r.body)
+	}
+	mu.Lock()
+	replayed = true
+	mu.Unlock()
+	r = do(t, p, "POST", "/v1/exec", strings.NewReader(body), map[string]string{
+		HeaderCallID: "st1/s1/exec/1", HeaderSubrun: "st1", HeaderRetry: "true",
+		HeaderSupersedes: "st1/s1/exec/0", HeaderSupersedeReason: "divergence",
+	})
+	if r.status != 200 || r.header.Get(HeaderReplayed) != "true" {
+		t.Fatalf("重放: %d %v %s", r.status, r.header, r.body)
+	}
+	for name, h := range map[string]map[string]string{
+		"缓存指令":         {HeaderCallID: "root/s1/exec/2", HeaderCache: "no-cache"},
+		"sub-run 前缀不符": {HeaderCallID: "root/s1/exec/2", HeaderSubrun: "st1"},
+	} {
+		if r := do(t, p, "POST", "/v1/exec", strings.NewReader(body), h); r.status != 400 || errCode(t, r) != CodeInvalidRequest {
+			t.Errorf("%s: %d %s", name, r.status, r.body)
+		}
+	}
+	if r := do(t, p, "POST", "/v1/exec", strings.NewReader(strings.Repeat("x", 2048)), callHdr("root/s1/exec/3")); r.status != 413 ||
+		errCode(t, r) != CodeRequestTooLarge {
+		t.Errorf("请求体超限: %d %s", r.status, r.body)
+	}
+
+	execs := calls.execSnapshot()
+	if len(execs) != 2 {
+		t.Fatalf("Exec 次数 = %d，期望 2：%+v", len(execs), execs)
+	}
+	want0 := call.ExecInvoke{TaskID: "t1", AttemptID: "a1", CallID: "root/s1/exec/1", Body: []byte(body)}
+	want1 := call.ExecInvoke{TaskID: "t1", AttemptID: "a1", CallID: "st1/s1/exec/1", SubrunID: "st1", Body: []byte(body),
+		Retry: true, Supersedes: "st1/s1/exec/0", SupersedeReason: "divergence"}
+	for i, want := range []call.ExecInvoke{want0, want1} {
+		got := execs[i]
+		if got.TaskID != want.TaskID || got.AttemptID != want.AttemptID || got.CallID != want.CallID || got.SubrunID != want.SubrunID ||
+			string(got.Body) != string(want.Body) || got.Retry != want.Retry || got.Supersedes != want.Supersedes ||
+			got.SupersedeReason != want.SupersedeReason {
+			t.Errorf("Exec #%d = %+v，期望 %+v", i, got, want)
+		}
+	}
+	if invokes, _, _, _ := calls.snapshot(); len(invokes) != 0 {
+		t.Errorf("exec 不应经 Invoke：%+v", invokes)
+	}
+}
+
+// exec 的拒绝与失败（Task 8 的 Result.Status/Code）原样映射为状态与错误体，不带结果 blob 头；内部错误为 500，
+// 协调器关闭为 503。
+func TestExecResultMapping(t *testing.T) {
+	var mu sync.Mutex
+	var next call.Result
+	var nextErr error
+	calls := &fakeCalls{exec: func(context.Context, call.ExecInvoke) (call.Result, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return next, nextErr
+	}}
+	e := newEdge(t, Config{}, calls)
+	p := bind(t, e, "a1", "e1")
+	set := func(r call.Result, err error) {
+		mu.Lock()
+		next, nextErr = r, err
+		mu.Unlock()
+	}
+	cases := []struct {
+		status int
+		code   string
+	}{
+		{402, call.CodeExecQuotaExhausted}, {402, call.CodeExecCPUExhausted}, {402, call.CodeExecWallExhausted}, {402, call.CodeExecBlocked},
+		{403, call.CodeInputNotAuthorized},
+		{409, "call_in_progress"}, {409, call.CodeExecCancelled}, {409, "fingerprint_mismatch"},
+		{502, call.CodeExecStartFailed}, {502, call.CodeExecUnknown},
+		{503, call.CodeExecEnvUnavailable},
+		{504, "call_deadline_exceeded"}, {504, call.CodeExecQueueTimeout},
+		{400, call.CodeInputsTooLarge}, {404, call.CodeEndpointNotConfigured},
+	}
+	for i, c := range cases {
+		set(call.Result{Status: c.status, Code: c.code}, nil)
+		r := do(t, p, "POST", "/v1/exec", strings.NewReader(`{}`), callHdr(fmt.Sprintf("root/s/exec/%d", i+1)))
+		if r.status != c.status || errCode(t, r) != c.code || r.header.Get(HeaderBlob) != "" {
+			t.Errorf("%s: %d %v %s，期望 %d", c.code, r.status, r.header, r.body, c.status)
+		}
+	}
+	set(call.Result{}, call.ErrClosed)
+	if r := do(t, p, "POST", "/v1/exec", strings.NewReader(`{}`), callHdr("root/s/exec/99")); r.status != 503 || errCode(t, r) != CodeGatewayUnavailable {
+		t.Errorf("协调器关闭: %d %s", r.status, r.body)
+	}
+	set(call.Result{}, errors.New("db: secret detail"))
+	if r := do(t, p, "POST", "/v1/exec", strings.NewReader(`{}`), callHdr("root/s/exec/100")); r.status != 500 ||
+		errCode(t, r) != CodeInternal || bytes.Contains(r.body, []byte("secret")) {
+		t.Errorf("内部错误: %d %s", r.status, r.body)
+	}
+}
+
+// Worker 在 exec 响应前断开：交给 Exec 的上下文不被取消（exec 继续并结算，供同 ID 重放）。
+func TestClientDisconnectDoesNotCancelExec(t *testing.T) {
+	started, release := make(chan struct{}, 1), make(chan struct{})
+	done := make(chan error, 1)
+	calls := &fakeCalls{exec: func(ctx context.Context, _ call.ExecInvoke) (call.Result, error) {
+		started <- struct{}{}
+		<-release
+		done <- ctx.Err()
+		return call.Result{Body: []byte(`{}`), Status: 200}, nil
+	}}
+	e := newEdge(t, Config{}, calls)
+	closed := watchClosed(e)
+	p := bind(t, e, "a1", "e1")
+	c, err := net.Dial("unix", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(c, "POST /v1/exec HTTP/1.1\r\nHost: gw\r\nX-Agentbox-Call-Id: root/s/exec/1\r\nContent-Length: 2\r\n\r\n{}"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("请求未进入 Exec")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitClosed(t, closed, "a1")
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Exec 完成时上下文 = %v，期望未取消", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Exec 未完成")
+	}
+}
+
+// /v1/budget 的 exec 配额：已配置 exec 时附加 "exec"（尚无配额行时 Calls 返回策略值、用量 0，edge 同样输出）；
+// cpu_available_usec = limit − reserved − spent − unknown（可为负）；未配置 exec 时不出现（见 TestSubrunHeaderOnReadOnly
+// 的逐字节断言）；读取失败为 500。
+func TestBudgetExecQuota(t *testing.T) {
+	calls := &fakeCalls{
+		budget: call.Budget{LimitMicro: 1000},
+		execQuota: &call.ExecQuota{CountLimit: 50, CountUsed: 3, CPULimitUsec: 600_000_000, CPUReservedUsec: 66_000_000,
+			CPUSpentUsec: 1_000_000, CPUUnknownUsec: 500_000, WallLimitMs: 1_800_000, WallSpentMs: 4200},
+		execHasRow: true,
+	}
+	e := newEdge(t, Config{}, calls)
+	p := bind(t, e, "a1", "e1")
+	r := do(t, p, "GET", "/v1/budget", nil, nil)
+	want := `,"exec":{"count_limit":50,"count_used":3,"cpu_limit_usec":600000000,"cpu_available_usec":532500000,` +
+		`"wall_limit_ms":1800000,"wall_spent_ms":4200,"blocked":false}}`
+	if r.status != 200 || !strings.HasSuffix(string(r.body), want) || !strings.HasPrefix(string(r.body), `{"limit_micro":1000,`) {
+		t.Errorf("/v1/budget: %d %s", r.status, r.body)
+	}
+	calls.mu.Lock()
+	calls.execQuota = &call.ExecQuota{CountLimit: 50, CountUsed: 50, CPULimitUsec: 100, CPUSpentUsec: 150, WallLimitMs: 10, Blocked: true}
+	calls.mu.Unlock()
+	r = do(t, p, "GET", "/v1/budget", nil, map[string]string{HeaderSubrun: "st1"})
+	if r.status != 200 || !strings.Contains(string(r.body), `"exec":{"count_limit":50,"count_used":50,"cpu_limit_usec":100,"cpu_available_usec":-50,`+
+		`"wall_limit_ms":10,"wall_spent_ms":0,"blocked":true}`) || !strings.Contains(string(r.body), `"subrun":`) {
+		t.Errorf("blocked、超额与 sub-run 头: %d %s", r.status, r.body)
+	}
+	e2 := newEdge(t, Config{}, &fakeCalls{execQuota: &call.ExecQuota{}})
+	e2.calls = failingQuota{e2.calls}
+	p2 := bind(t, e2, "a1", "e1")
+	if r := do(t, p2, "GET", "/v1/budget", nil, nil); r.status != 500 || errCode(t, r) != CodeInternal {
+		t.Errorf("读取失败: %d %s", r.status, r.body)
+	}
+}
+
+// failingQuota 让 ExecQuota 以存储错误失败。
+type failingQuota struct{ Calls }
+
+func (failingQuota) ExecQuota(context.Context, string) (call.ExecQuota, bool, error) {
+	return call.ExecQuota{}, false, errors.New("db down")
 }

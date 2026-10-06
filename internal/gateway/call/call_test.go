@@ -3377,3 +3377,58 @@ func TestExecNotConfigured(t *testing.T) {
 		t.Fatalf("%+v %v", r, err)
 	}
 }
+
+// ==== M4 Plan 15 Task 9：/v1/budget 的 exec 配额与 exec 码的 HTTP 状态 ====
+
+// ExecQuota：尚无配额行时为策略值（用量 0，false）；有行时原样返回（true）；未配置 exec 为 ErrExecNotConfigured；
+// 存储错误原样返回。
+func TestExecQuotaPassThrough(t *testing.T) {
+	h := newExecHarness(t, func(c *ExecConfig) {
+		c.Policy = ExecPolicy{CountLimit: 7, CPULimitUsec: 9_000_000, WallLimitMs: 120_000}
+	})
+	ctx := context.Background()
+	q, ok, err := h.c.ExecQuota(ctx, "t1")
+	if err != nil || ok || q != (ExecQuota{CountLimit: 7, CPULimitUsec: 9_000_000, WallLimitMs: 120_000}) {
+		t.Fatalf("无配额行: %+v %v %v", q, ok, err)
+	}
+	row := ExecQuota{CountLimit: 50, CountUsed: 2, CPULimitUsec: 100, CPUReservedUsec: 10, CPUSpentUsec: 20, CPUUnknownUsec: 5,
+		WallLimitMs: 1000, WallSpentMs: 300, Blocked: true}
+	h.es.mu.Lock()
+	h.es.quotas["t1"] = &row
+	h.es.mu.Unlock()
+	if q, ok, err := h.c.ExecQuota(ctx, "t1"); err != nil || !ok || q != row {
+		t.Fatalf("有配额行: %+v %v %v", q, ok, err)
+	}
+	plain := newHarness(t, testLimits(), newAdapter("p1"))
+	if _, _, err := plain.c.ExecQuota(ctx, "t1"); !errors.Is(err, ErrExecNotConfigured) {
+		t.Fatalf("未配置: %v", err)
+	}
+	failing := newExecHarness(t, func(c *ExecConfig) { c.Store = quotaErrStore{c.Store} })
+	if _, _, err := failing.c.ExecQuota(ctx, "t1"); err == nil || errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("存储错误应原样返回: %v", err)
+	}
+}
+
+type quotaErrStore struct{ ExecStore }
+
+func (quotaErrStore) LoadExecQuota(context.Context, string) (ExecQuota, error) {
+	return ExecQuota{}, errors.New("db down")
+}
+
+// edge 原样采用 Result.Status：exec 的拒绝与失败码映射（§10；Task 9 状态表；exec_unknown 为 502）。
+func TestExecStatusCodes(t *testing.T) {
+	want := map[string]int{
+		CodeExecQuotaExhausted: 402, CodeExecCPUExhausted: 402, CodeExecWallExhausted: 402, CodeExecBlocked: 402,
+		CodeInputNotAuthorized:         403,
+		persistence.CodeCallInProgress: 409, CodeExecCancelled: 409, persistence.CodeFingerprintMismatch: 409,
+		CodeExecStartFailed: 502, CodeExecUnknown: 502,
+		CodeExecEnvUnavailable:               503,
+		persistence.CodeCallDeadlineExceeded: 504, CodeExecQueueTimeout: 504,
+		CodeInputsTooLarge: 400,
+	}
+	for code, status := range want {
+		if got := statusFor(code); got != status {
+			t.Errorf("statusFor(%s) = %d，期望 %d", code, got, status)
+		}
+	}
+}

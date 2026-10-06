@@ -333,6 +333,26 @@ type execJob struct {
 // errExecCancelled 是 CancelAttempt / CancelSubrun 终止 exec 的取消原因。
 var errExecCancelled = errors.New("call: exec 所属的 attempt 或 sub-run 已撤销")
 
+// ErrExecNotConfigured 表示 Coordinator 未配置 exec（Config.Exec 为 nil）；/v1/budget 据此省略 exec 配额。
+var ErrExecNotConfigured = errors.New("call: 未配置 exec")
+
+// ExecQuota 返回任务的 exec 配额，供 GET /v1/budget（Task 9）。尚无配额行（首次 exec 之前）时返回 server 策略的
+// 上限、用量 0 与 false；有行时返回该行与 true（之后不随策略变化）。未配置 exec 为 ErrExecNotConfigured。
+func (c *Coordinator) ExecQuota(ctx context.Context, taskID string) (ExecQuota, bool, error) {
+	if c.exec == nil {
+		return ExecQuota{}, false, ErrExecNotConfigured
+	}
+	q, err := c.exec.Store.LoadExecQuota(ctx, taskID)
+	if errors.Is(err, persistence.ErrNotFound) {
+		p := c.exec.Policy
+		return ExecQuota{CountLimit: p.CountLimit, CPULimitUsec: p.CPULimitUsec, WallLimitMs: p.WallLimitMs}, false, nil
+	}
+	if err != nil {
+		return ExecQuota{}, false, err
+	}
+	return q, true, nil
+}
+
 // Exec 处理 POST /v1/exec（§10.2）。Exec 为 nil 时返回 404 endpoint_not_configured。拒绝与失败以 Result 的
 // Status/Code 返回、err 为 nil；err 非空表示存储等内部故障，或 ctx 结束（exec 在后台继续并结算，供同 ID 重放）。
 func (c *Coordinator) Exec(ctx context.Context, in ExecInvoke) (Result, error) {
