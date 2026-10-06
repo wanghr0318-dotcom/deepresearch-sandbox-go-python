@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -1415,4 +1416,1182 @@ func TestRunnerDeadlinesAndControls(t *testing.T) {
 		noViolation(t, out)
 		reply(t, p.got[0], "artifact_result", "rejected", "save_timeout") // §5.4 的稳定码，Worker 可重试
 	})
+}
+
+// ==== M4 Plan 12 Task 6：session 模式 incarnation 驱动 ====
+
+// memStore 是内存中的 runner.Store（另实现 runner.HostEventStore），供 session 模式测试使用：会话 turn 的
+// attempt 要经会话授予路径（Task 7）才能在真实 Store 中创建，runner 层只关心事件、checkpoint、产物与提议的
+// 记录。追加规则与 postgres 实现相同：同一 attempt 的 seq 严格递增、允许缺号，同序号必须同内容。
+type memStore struct {
+	mu          sync.Mutex
+	events      map[string][]runner.WorkerEvent // attempt → 已追加的事件
+	taskAppends int                             // AppendWorkerEvents（task 模式）的调用次数
+	cps         map[string]int64                // task/checkpoint → commit_seq
+	commitSeq   int64
+	proposals   map[string]runner.TerminalProposal
+	artifacts   map[string]runner.ArtifactVersion // task/artifact → 最新版本
+	host        []memHostEvent
+}
+
+type memHostEvent struct {
+	TaskID, AttemptID, Type string
+	Payload                 map[string]any
+}
+
+func newMemStore() *memStore {
+	return &memStore{events: map[string][]runner.WorkerEvent{}, cps: map[string]int64{},
+		proposals: map[string]runner.TerminalProposal{}, artifacts: map[string]runner.ArtifactVersion{}}
+}
+
+func (m *memStore) AppendWorkerEvents(context.Context, string, []runner.WorkerEvent) (runner.Watermark, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.taskAppends++
+	return runner.Watermark{}, errors.New("session 模式不应使用 AppendWorkerEvents")
+}
+
+func (m *memStore) AppendSessionWorkerEvents(_ context.Context, attemptID string, events []runner.WorkerEvent) (runner.Watermark, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	have := m.events[attemptID]
+	for _, e := range events {
+		dup := false
+		for _, o := range have {
+			if o.Seq == e.Seq {
+				if !bytes.Equal(o.Payload, e.Payload) {
+					return runner.Watermark{}, persistence.ErrConflict
+				}
+				dup = true
+			}
+		}
+		if dup {
+			continue
+		}
+		if n := len(have); n > 0 && e.Seq <= have[n-1].Seq {
+			return runner.Watermark{}, persistence.ErrConflict
+		}
+		have = append(have, e)
+	}
+	m.events[attemptID] = have
+	wm := runner.Watermark{AttemptID: attemptID}
+	if n := len(have); n > 0 {
+		wm.WorkerSeq = have[n-1].Seq
+	}
+	return wm, nil
+}
+
+func (m *memStore) WorkerEventWatermark(_ context.Context, attemptID string) (runner.Watermark, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	wm := runner.Watermark{AttemptID: attemptID}
+	if have := m.events[attemptID]; len(have) > 0 {
+		wm.WorkerSeq = have[len(have)-1].Seq
+	}
+	return wm, nil
+}
+
+func (m *memStore) CommitCheckpoint(_ context.Context, c runner.Checkpoint) (runner.CommittedCheckpoint, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := c.Scope.ID + "/" + c.CheckpointID
+	seq, ok := m.cps[key]
+	if !ok {
+		m.commitSeq++
+		seq = m.commitSeq
+		m.cps[key] = seq
+	}
+	return runner.CommittedCheckpoint{Scope: c.Scope, CheckpointID: c.CheckpointID, CommitSeq: seq}, nil
+}
+
+func (m *memStore) QueryCheckpoint(_ context.Context, scope runner.Scope, id string) (runner.CommittedCheckpoint, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seq, ok := m.cps[scope.ID+"/"+id]
+	if !ok {
+		return runner.CommittedCheckpoint{}, persistence.ErrNotFound
+	}
+	return runner.CommittedCheckpoint{Scope: scope, CheckpointID: id, CommitSeq: seq}, nil
+}
+
+func (m *memStore) RegisterArtifact(_ context.Context, a runner.Artifact) (runner.ArtifactVersion, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := a.TaskID + "/" + a.ArtifactID
+	v := m.artifacts[key]
+	if v.SHA256 != a.SHA256 {
+		v = runner.ArtifactVersion{TaskID: a.TaskID, ArtifactID: a.ArtifactID, Version: v.Version + 1, SHA256: a.SHA256}
+		m.artifacts[key] = v
+	}
+	return v, nil
+}
+
+func (m *memStore) GetArtifact(context.Context, string, string, string) (runner.ArtifactVersion, error) {
+	return runner.ArtifactVersion{}, persistence.ErrNotFound
+}
+
+func (m *memStore) LatestArtifact(_ context.Context, taskID, artifactID string) (runner.ArtifactVersion, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.artifacts[taskID+"/"+artifactID]
+	if !ok {
+		return runner.ArtifactVersion{}, persistence.ErrNotFound
+	}
+	return v, nil
+}
+
+func (m *memStore) RecordTerminalProposal(_ context.Context, p runner.TerminalProposal) (runner.TerminalProposal, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if o, ok := m.proposals[p.AttemptID]; ok && o != p {
+		return runner.TerminalProposal{}, persistence.ErrConflict
+	}
+	m.proposals[p.AttemptID] = p
+	return p, nil
+}
+
+func (m *memStore) GetTerminalProposal(_ context.Context, attemptID string) (runner.TerminalProposal, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.proposals[attemptID]
+	if !ok {
+		return runner.TerminalProposal{}, persistence.ErrNotFound
+	}
+	return p, nil
+}
+
+func (m *memStore) AppendHostEvent(_ context.Context, taskID, attemptID, typ string, payload json.RawMessage) error {
+	var p map[string]any
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.host = append(m.host, memHostEvent{TaskID: taskID, AttemptID: attemptID, Type: typ, Payload: p})
+	return nil
+}
+
+// seqs 返回 attempt 已追加事件的序号。
+func (m *memStore) seqs(attemptID string) []int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []int64
+	for _, e := range m.events[attemptID] {
+		out = append(out, e.Seq)
+	}
+	return out
+}
+
+func (m *memStore) hostEvents() []memHostEvent {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]memHostEvent(nil), m.host...)
+}
+
+var _ runner.HostEventStore = (*memStore)(nil)
+
+// untilEnd 挂起到 runner 终止本进程或关闭 stdin（会话 Worker 在两个 task 之间不退出）。
+func untilEnd() step {
+	return func(p *fakeProc) error {
+		select {
+		case <-p.kill:
+		case <-p.stdinDone:
+		case <-time.After(20 * time.Second):
+			return errors.New("未被终止")
+		}
+		return nil
+	}
+}
+
+// exitWith 设定脚本结束时的退出码（在脚本 goroutine 中设置，与 run 读取它同一 goroutine）。
+func exitWith(code int) step {
+	return func(p *fakeProc) error { p.exitCode = code; return nil }
+}
+
+// waitSent 等到宿主已写出（含被丢弃的）n 条 typ 消息：让脚本与宿主的发送确定地排序。
+func waitSent(typ string, n int) step {
+	return func(p *fakeProc) error {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			p.mu.Lock()
+			c := 0
+			for _, m := range p.all {
+				if m["type"] == typ {
+					c++
+				}
+			}
+			p.mu.Unlock()
+			if c >= n {
+				return nil
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		return fmt.Errorf("宿主未写出第 %d 条 %s", n, typ)
+	}
+}
+
+func sready(seq int) map[string]any {
+	m := ready(seq)
+	m["mode"], m["session_ext"] = "session", 1
+	return m
+}
+
+// aev 构造一条属于 attempt att 的 session 模式事件。
+func aev(typ string, seq int, att string, kv ...any) map[string]any {
+	m := ev(typ, seq, kv...)
+	m["attempt_id"] = att
+	return m
+}
+
+func sresult(seq int, att, sc string) map[string]any {
+	m := aev("result", seq, att, "summary", "done", "outputs", []string{})
+	if sc != "" {
+		m["session_state"] = map[string]any{"checkpoint_id": sc, "state": map[string]any{"sc": sc}}
+	}
+	return m
+}
+
+func scheckpoint(seq int, att, id string) map[string]any {
+	m := checkpoint(seq, id)
+	m["attempt_id"] = att
+	return m
+}
+
+func sattempt(taskID, att string, no int64) runner.SessionAttempt {
+	return runner.SessionAttempt{Attempt: runner.Attempt{TaskID: taskID, AttemptID: att, AttemptNo: no,
+		Init: protocol.Init{Config: json.RawMessage(`{"text":"hi"}`)}}}
+}
+
+// sess 是一个由脚本驱动的会话 incarnation。
+type sess struct {
+	st  *memStore
+	ws  string
+	p   *fakeProc
+	r   *runner.Runner
+	inc *runner.Incarnation
+}
+
+func sessOptions() runner.Options {
+	return runner.Options{ReadyTimeout: 5 * time.Second, TaskAcceptTimeout: 5 * time.Second,
+		ReleaseTimeout: 5 * time.Second, ControlGrace: 300 * time.Millisecond}
+}
+
+// startSess 启动 incarnation（spec 可改写默认规格）。返回 StartIncarnation 的错误；清理时关闭 incarnation
+// 并等 fake 进程结束。
+func startSess(t *testing.T, opt runner.Options, drop func(map[string]any) bool, spec func(*runner.IncarnationSpec),
+	script ...step) (*sess, error) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("产物目录依赖 Linux openat2")
+	}
+	bl, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &sess{st: newMemStore(), ws: t.TempDir()}
+	s.p = &fakeProc{script: script, drop: drop, readied: make(chan struct{})}
+	s.r = runner.New(s.st, bl, &fakeStarter{proc: s.p}, nil, opt)
+	is := runner.IncarnationSpec{SessionID: "s-1", IncarnationID: "inc-1", EnvID: "senv-1", WorkspaceRoot: s.ws,
+		Argv: []string{"python3", "-m", "chatagent"}}
+	if spec != nil {
+		spec(&is)
+	}
+	t.Cleanup(func() {
+		if s.inc != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = s.inc.Close(ctx, 100*time.Millisecond) // 清理：结果无关紧要
+			cancel()
+		}
+		select {
+		case <-s.p.done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("fake Worker 未结束")
+		}
+	})
+	s.inc, err = s.r.StartIncarnation(context.Background(), is)
+	return s, err
+}
+
+func mustStartSess(t *testing.T, opt runner.Options, drop func(map[string]any) bool, spec func(*runner.IncarnationSpec), script ...step) *sess {
+	t.Helper()
+	s, err := startSess(t, opt, drop, spec, script...)
+	if err != nil {
+		t.Fatalf("StartIncarnation: %v", err)
+	}
+	return s
+}
+
+func (s *sess) run(t *testing.T, a runner.SessionAttempt) runner.Outcome {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return s.inc.RunTask(ctx, a, nil)
+}
+
+func (s *sess) release(t *testing.T, att, verdict, committed string) runner.ReleaseResult {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return s.inc.Release(ctx, runner.TaskOutcome{AttemptID: att, Verdict: verdict, CommittedSessionCheckpointID: committed})
+}
+
+// got 返回脚本经 h() 收到的宿主消息（等脚本结束后读取）。
+func (s *sess) got(t *testing.T) []map[string]any {
+	t.Helper()
+	s.p.mu.Lock()
+	defer s.p.mu.Unlock()
+	return append([]map[string]any(nil), s.p.got...)
+}
+
+func (s *sess) killed() bool {
+	select {
+	case <-s.p.kill:
+		return true
+	default:
+		return false
+	}
+}
+
+func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s 未发生", what)
+	}
+}
+
+func TestSessionIncarnation(t *testing.T) {
+	opt := sessOptions()
+
+	t.Run("happy_path_two_tasks", func(t *testing.T) {
+		var idle []string
+		var mu sync.Mutex
+		procs := func(context.Context) ([]int, error) { return []int{1, 7}, nil }
+		s := mustStartSess(t, opt, nil, func(is *runner.IncarnationSpec) {
+			is.Procs = procs
+			is.GatewayIdle = func(_ context.Context, att string) error {
+				mu.Lock()
+				defer mu.Unlock()
+				idle = append(idle, att)
+				return nil
+			}
+		},
+			w(sready(1)),
+			h(), w(aev("task_accepted", 2, "a-1")), w(aev("progress", 3, "a-1", "kind", "step_started", "message", "x")),
+			w(scheckpoint(4, "a-1", "cp-1")), h(), w(sresult(5, "a-1", "sc-1")),
+			h(), w(aev("task_released", 6, "a-1")),
+			h(), w(aev("task_accepted", 7, "a-2")), w(sresult(8, "a-2", "sc-2")),
+			h(), w(aev("task_released", 9, "a-2")),
+			untilEnd())
+		out := s.run(t, sattempt("t-1", "a-1", 1))
+		noViolation(t, out)
+		if out.Class != runner.ClassSucceeded || out.SessionState == nil || out.SessionState.CheckpointID != "sc-1" {
+			t.Fatalf("第一个 task: %s %+v", out.Class, out.SessionState)
+		}
+		var payload struct {
+			SessionState protocol.SessionState `json:"session_state"`
+		}
+		if err := json.Unmarshal(out.ResultPayload, &payload); err != nil || payload.SessionState.CheckpointID != "sc-1" {
+			t.Fatalf("提议内容不含 session_state: %s (%v)", out.ResultPayload, err)
+		}
+		if rr := s.release(t, "a-1", protocol.VerdictSucceeded, "sc-1"); !rr.Released {
+			t.Fatalf("释放失败: %+v", rr)
+		}
+		a2 := sattempt("t-2", "a-2", 1)
+		a2.BaseSessionCheckpointID = "sc-1"
+		a2.Directive = json.RawMessage(`{"kind":"continue"}`) // 存储层的 continue = 不带 directive（契约 B）
+		out = s.run(t, a2)
+		if out.Class != runner.ClassSucceeded || out.SessionState.CheckpointID != "sc-2" {
+			t.Fatalf("第二个 task: %s %+v", out.Class, out.SessionState)
+		}
+		if rr := s.release(t, "a-2", protocol.VerdictSucceeded, "sc-2"); !rr.Released {
+			t.Fatalf("释放失败: %+v", rr)
+		}
+		// 事件以 incarnation seq 入库，每个 attempt 各自一段，跨 attempt 连续
+		if got := s.st.seqs("a-1"); !reflect.DeepEqual(got, []int64{2, 3, 4, 5, 6}) {
+			t.Fatalf("a-1 事件 %v", got)
+		}
+		if got := s.st.seqs("a-2"); !reflect.DeepEqual(got, []int64{7, 8, 9}) {
+			t.Fatalf("a-2 事件 %v", got)
+		}
+		if s.st.taskAppends != 0 {
+			t.Fatalf("session 模式调用了 AppendWorkerEvents %d 次", s.st.taskAppends)
+		}
+		if !reflect.DeepEqual(idle, []string{"a-1", "a-2"}) {
+			t.Fatalf("GatewayIdle 调用 %v", idle)
+		}
+		if err := s.inc.Close(context.Background(), 100*time.Millisecond); err == nil {
+			t.Fatal("脚本不答复 session_close，Close 应超时")
+		}
+		got := s.got(t)
+		if len(got) != 5 {
+			t.Fatalf("宿主消息 %v", got)
+		}
+		ts1, cr, to1, ts2 := got[0], got[1], got[2], got[3]
+		if ts1["type"] != "task_start" || ts1["attempt_id"] != "a-1" || ts1["out_dir"] != "/workspace/out/a-1" ||
+			!reflect.DeepEqual(ts1["config"], map[string]any{"text": "hi"}) || ts1["directive"] != nil {
+			t.Fatalf("task_start %v", ts1)
+		}
+		if cr["type"] != "checkpoint_result" || cr["attempt_id"] != "a-1" || cr["status"] != "committed" {
+			t.Fatalf("checkpoint_result %v", cr)
+		}
+		if to1["type"] != "task_outcome" || to1["verdict"] != "succeeded" || to1["committed_session_checkpoint_id"] != "sc-1" {
+			t.Fatalf("task_outcome %v", to1)
+		}
+		if ts2["base_session_checkpoint_id"] != "sc-1" || ts2["directive"] != nil {
+			t.Fatalf("第二个 task_start %v", ts2)
+		}
+		s.p.mu.Lock()
+		init := s.p.init
+		s.p.mu.Unlock()
+		if init["mode"] != "session" || init["session_id"] != "s-1" || init["incarnation_id"] != "inc-1" || init["task_id"] != nil {
+			t.Fatalf("init %v", init)
+		}
+	})
+
+	t.Run("task_start_fields", func(t *testing.T) {
+		s := mustStartSess(t, opt, nil, nil, w(sready(1)), h(), untilEnd())
+		a := sattempt("t-9", "a-9", 2)
+		a.Init.Resume = &protocol.Resume{CheckpointID: "cp-3", StepID: "s3", State: json.RawMessage(`{"n":3}`)}
+		a.Directive = json.RawMessage(`{"kind":"answer","question_id":"q-1","answers":[{"question_id":"1","choice":"A"}]}`)
+		a.RestoredFromTaskID = "t-5"
+		a.Carryover = &protocol.Carryover{TaskID: "t-4", CheckpointRef: sum("cp")}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		done := make(chan runner.Outcome, 1)
+		go func() { done <- s.inc.RunTask(ctx, a, nil) }()
+		waitSentHost(t, s.p, "task_start")
+		s.p.mu.Lock()
+		ts := s.p.all[0]
+		s.p.mu.Unlock()
+		want := map[string]any{"kind": "answer", "question_id": "q-1", "answers": []any{map[string]any{"question_id": "1", "choice": "A"}}}
+		if !reflect.DeepEqual(ts["directive"], want) || ts["restored_from_task_id"] != "t-5" || ts["attempt_no"] != float64(2) ||
+			!reflect.DeepEqual(ts["carryover"], map[string]any{"task_id": "t-4", "checkpoint_ref": sum("cp")}) ||
+			!reflect.DeepEqual(ts["resume"], map[string]any{"checkpoint_id": "cp-3", "step_id": "s3", "state": map[string]any{"n": float64(3)}}) {
+			t.Fatalf("task_start %v", ts)
+		}
+		_ = s.inc.Close(context.Background(), 50*time.Millisecond) // 结束挂起的 RunTask
+		<-done
+	})
+
+	t.Run("ready_without_session_ext", func(t *testing.T) {
+		r := ready(1)
+		r["mode"] = "session"
+		s, err := startSess(t, opt, nil, nil, w(r), untilEnd())
+		var se *runner.StartError
+		if !errors.As(err, &se) || se.Class != runner.ClassProtocolMismatch || se.Violation != protocol.CodeSessionExtMissing || se.Retry != "" {
+			t.Fatalf("StartIncarnation 错误 %v", err)
+		}
+		if s.inc != nil || !s.killed() {
+			t.Fatal("启动失败的 Worker 应被终止")
+		}
+	})
+
+	t.Run("task_accept_timeout", func(t *testing.T) {
+		o := opt
+		o.TaskAcceptTimeout = 100 * time.Millisecond
+		s := mustStartSess(t, o, nil, nil, w(sready(1)), h(), untilEnd())
+		out := s.run(t, sattempt("t-1", "a-1", 1))
+		if out.Class != runner.ClassReadyTimeout || out.Retry != runner.RetryFault || out.PlatformKill != runner.KillReadyTimeout || !out.PlatformKilled {
+			t.Fatalf("结果 %s/%q kill=%q killed=%v", out.Class, out.Retry, out.PlatformKill, out.PlatformKilled)
+		}
+		if !s.killed() {
+			t.Fatal("incarnation 未被终止")
+		}
+		waitClosed(t, s.inc.Exited(), "incarnation 退出")
+	})
+
+	t.Run("awaiting_input_latest_checkpoint", func(t *testing.T) {
+		s := mustStartSess(t, opt, nil, nil, w(sready(1)), h(), w(aev("task_accepted", 2, "a-1")),
+			w(scheckpoint(3, "a-1", "cp-1")), h(),
+			w(aev("awaiting_input", 4, "a-1", "checkpoint_id", "cp-1", "question_id", "q-1")), untilEnd())
+		out := s.run(t, sattempt("t-1", "a-1", 1))
+		noViolation(t, out)
+		if out.Class != runner.ClassAwaitingInput || out.Retry != "" || out.Proposal == nil || out.Proposal.Kind != "awaiting_input" {
+			t.Fatalf("结果 %s/%q %+v", out.Class, out.Retry, out.Proposal)
+		}
+		if string(out.ResultPayload) != `{"checkpoint_id":"cp-1","question_id":"q-1"}` {
+			t.Fatalf("提议内容 %s", out.ResultPayload)
+		}
+		if p, err := s.st.GetTerminalProposal(context.Background(), "a-1"); err != nil || p != *out.Proposal {
+			t.Fatalf("已记录的提议 %+v (%v)", p, err)
+		}
+	})
+
+	t.Run("awaiting_input_old_checkpoint", func(t *testing.T) {
+		s := mustStartSess(t, opt, nil, nil, w(sready(1)), h(), w(aev("task_accepted", 2, "a-1")),
+			w(scheckpoint(3, "a-1", "cp-1")), h(), w(scheckpoint(4, "a-1", "cp-2")), h(),
+			w(aev("awaiting_input", 5, "a-1", "checkpoint_id", "cp-1", "question_id", "q-1")), untilEnd())
+		out := s.run(t, sattempt("t-1", "a-1", 1))
+		if out.Violation != runner.ViolationPausedNotLatest || out.Class != runner.ClassProtocolViolation || out.Retry != "" {
+			t.Fatalf("结果 %s/%q violation=%q", out.Class, out.Retry, out.Violation)
+		}
+	})
+
+	t.Run("worker_exit_during_task", func(t *testing.T) {
+		s := mustStartSess(t, opt, nil, nil, w(sready(1)), h(), w(aev("task_accepted", 2, "a-1")), exitWith(3))
+		out := s.run(t, sattempt("t-1", "a-1", 1))
+		if out.Class != runner.ClassExitedNoProposal || out.Exit.Code != 3 || out.Proposal != nil {
+			t.Fatalf("结果 %s exit=%+v %+v", out.Class, out.Exit, out.Proposal)
+		}
+		if rr := s.release(t, "a-1", protocol.VerdictFailed, ""); rr.Released || rr.Reason != runner.ReleaseWorkerExited {
+			t.Fatalf("释放 %+v", rr)
+		}
+	})
+
+	t.Run("e29_task_outcome_resent_on_query", func(t *testing.T) {
+		dropped := false
+		drop := func(m map[string]any) bool {
+			if !dropped && m["type"] == "task_outcome" {
+				dropped = true
+				return true
+			}
+			return false
+		}
+		s := mustStartSess(t, opt, drop, nil, w(sready(1)), h(), w(aev("task_accepted", 2, "a-1")), w(sresult(3, "a-1", "sc-1")),
+			waitSent("task_outcome", 1), w(aev("task_outcome_query", 4, "a-1")), h(), w(aev("task_released", 5, "a-1")), untilEnd())
+		s.run(t, sattempt("t-1", "a-1", 1))
+		if rr := s.release(t, "a-1", protocol.VerdictSucceeded, "sc-1"); !rr.Released {
+			t.Fatalf("释放 %+v", rr)
+		}
+		got := s.got(t)
+		if last := got[len(got)-1]; last["type"] != "task_outcome" || last["committed_session_checkpoint_id"] != "sc-1" {
+			t.Fatalf("重发的裁决 %v", last)
+		}
+	})
+
+	t.Run("e29_release_timeout", func(t *testing.T) {
+		o := opt
+		o.ReleaseTimeout = 200 * time.Millisecond
+		s := mustStartSess(t, o, nil, nil, w(sready(1)), h(), w(aev("task_accepted", 2, "a-1")), w(sresult(3, "a-1", "")),
+			h(), untilEnd())
+		s.run(t, sattempt("t-1", "a-1", 1))
+		start := time.Now()
+		if rr := s.release(t, "a-1", protocol.VerdictSucceeded, ""); rr.Released || rr.Reason != runner.ReleaseTimeout {
+			t.Fatalf("释放 %+v", rr)
+		}
+		if d := time.Since(start); d < 200*time.Millisecond {
+			t.Fatalf("T_release 之前就放弃了: %v", d)
+		}
+	})
+
+	t.Run("e30_extra_process_after_release", func(t *testing.T) {
+		var mu sync.Mutex
+		pids := []int{1, 7}
+		s := mustStartSess(t, opt, nil, func(is *runner.IncarnationSpec) {
+			is.Procs = func(context.Context) ([]int, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				return append([]int(nil), pids...), nil
+			}
+		}, w(sready(1)), h(), w(aev("task_accepted", 2, "a-1")), w(sresult(3, "a-1", "")), h(), w(aev("task_released", 4, "a-1")), untilEnd())
+		s.run(t, sattempt("t-1", "a-1", 1))
+		mu.Lock()
+		pids = []int{7, 1, 42} // Worker 遗留了一个子进程
+		mu.Unlock()
+		if rr := s.release(t, "a-1", protocol.VerdictSucceeded, ""); rr.Released || rr.Reason != runner.ReleaseTimeout {
+			t.Fatalf("释放 %+v", rr)
+		}
+	})
+
+	t.Run("e49_business_event_after_verdict", func(t *testing.T) {
+		s := mustStartSess(t, opt, nil, nil, w(sready(1)), h(), w(aev("task_accepted", 2, "a-1")), w(sresult(3, "a-1", "")),
+			h(), w(aev("task_outcome_query", 4, "a-1")), w(aev("progress", 5, "a-1", "kind", "step_started", "message", "late")),
+			w(aev("task_released", 6, "a-1")), untilEnd())
+		out := s.run(t, sattempt("t-1", "a-1", 1))
+		if out.Class != runner.ClassSucceeded {
+			t.Fatalf("裁决前的结果 %s", out.Class)
+		}
+		if rr := s.release(t, "a-1", protocol.VerdictSucceeded, ""); rr.Released || rr.Reason != runner.ReleaseProtocolViolation {
+			t.Fatalf("释放 %+v", rr)
+		}
+		hev := s.st.hostEvents()
+		if len(hev) != 1 || hev[0].Type != runner.EventPostVerdictViolation || hev[0].TaskID != "t-1" || hev[0].AttemptID != "a-1" ||
+			hev[0].Payload["type"] != "progress" || hev[0].Payload["seq"] != float64(5) || hev[0].Payload["code"] != protocol.CodeAfterTerminal {
+			t.Fatalf("诊断事件 %+v", hev)
+		}
+		if got := s.st.seqs("a-1"); !reflect.DeepEqual(got, []int64{2, 3, 4, 6}) { // 违规事件不入库，查询与释放照常
+			t.Fatalf("a-1 事件 %v", got)
+		}
+		if s.inc.Violation() != protocol.CodeAfterTerminal {
+			t.Fatalf("incarnation 违规 %q", s.inc.Violation())
+		}
+	})
+
+	t.Run("quiesce_and_close", func(t *testing.T) {
+		s := mustStartSess(t, opt, nil, nil, w(sready(1)), h(), w(ev("quiesced", 2, "session_checkpoint_id", "sc-7")),
+			h(), w(ev("closed", 3)))
+		id, err := s.inc.Quiesce(context.Background(), time.Second)
+		if err != nil || id != "sc-7" {
+			t.Fatalf("Quiesce = %q, %v", id, err)
+		}
+		// 静止之后未运行任何 task：再次 quiesce 直接返回同一 ID，不再发送（流规则：quiesced 阶段不能再发 quiesce）
+		if id, err := s.inc.Quiesce(context.Background(), time.Second); err != nil || id != "sc-7" {
+			t.Fatalf("再次 Quiesce = %q, %v", id, err)
+		}
+		if err := s.inc.Close(context.Background(), 2*time.Second); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		waitClosed(t, s.inc.Exited(), "incarnation 退出")
+		if s.killed() || s.inc.ExitErr() != nil {
+			t.Fatalf("正常关闭却被终止 killed=%v err=%v", s.killed(), s.inc.ExitErr())
+		}
+		got := s.got(t)
+		if len(got) != 2 || got[0]["type"] != "quiesce" || got[0]["grace_ms"] != float64(1000) || got[1]["type"] != "session_close" {
+			t.Fatalf("宿主消息 %v", got)
+		}
+	})
+
+	t.Run("close_timeout_terminates", func(t *testing.T) {
+		s := mustStartSess(t, opt, nil, nil, w(sready(1)), h(), untilEnd())
+		if err := s.inc.Close(context.Background(), 100*time.Millisecond); err == nil {
+			t.Fatal("Close 应报告超时")
+		}
+		if !s.killed() {
+			t.Fatal("超时后未终止")
+		}
+		waitClosed(t, s.inc.Exited(), "incarnation 退出")
+	})
+
+	t.Run("cancel_without_proposal_then_release", func(t *testing.T) {
+		// Python SDK：宿主 cancel 后不发终态提议，等待裁决；宿主在 grace 后以 cancelled 裁决释放（incarnation 可复用）
+		s := mustStartSess(t, opt, nil, nil, w(sready(1)), h(), w(aev("task_accepted", 2, "a-1")), h(), h(),
+			w(aev("task_released", 3, "a-1")), untilEnd())
+		controls := make(chan runner.Control, 1)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		done := make(chan runner.Outcome, 1)
+		go func() { done <- s.inc.RunTask(ctx, sattempt("t-1", "a-1", 1), controls) }()
+		waitSentHost(t, s.p, "task_start")
+		controls <- runner.Control{Kind: runner.KillCancel, Reason: "superseded"}
+		out := <-done
+		if out.Class != runner.ClassCancelled || out.Control != runner.KillCancel || out.PlatformKilled || out.Retry != "" {
+			t.Fatalf("结果 %s control=%q killed=%v", out.Class, out.Control, out.PlatformKilled)
+		}
+		if rr := s.release(t, "a-1", protocol.VerdictCancelled, ""); !rr.Released {
+			t.Fatalf("释放 %+v", rr)
+		}
+		got := s.got(t)
+		if got[1]["type"] != "cancel" || got[1]["attempt_id"] != "a-1" || got[1]["reason"] != "superseded" || got[2]["verdict"] != "cancelled" {
+			t.Fatalf("宿主消息 %v", got)
+		}
+	})
+
+	t.Run("pause_grace_expired_kills", func(t *testing.T) {
+		s := mustStartSess(t, opt, nil, nil, w(sready(1)), h(), w(aev("task_accepted", 2, "a-1")), h(), untilEnd())
+		controls := make(chan runner.Control, 1)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		done := make(chan runner.Outcome, 1)
+		go func() { done <- s.inc.RunTask(ctx, sattempt("t-1", "a-1", 1), controls) }()
+		waitSentHost(t, s.p, "task_start")
+		controls <- runner.Control{Kind: runner.KillPause, GraceMs: 50}
+		out := <-done
+		if out.Class != runner.ClassPaused || out.PlatformKill != runner.KillPause || !out.PlatformKilled {
+			t.Fatalf("结果 %s kill=%q killed=%v", out.Class, out.PlatformKill, out.PlatformKilled)
+		}
+	})
+
+	t.Run("run_task_refused_while_attempt_unreleased", func(t *testing.T) {
+		s := mustStartSess(t, opt, nil, nil, w(sready(1)), h(), w(aev("task_accepted", 2, "a-1")), w(sresult(3, "a-1", "")), untilEnd())
+		s.run(t, sattempt("t-1", "a-1", 1))
+		out := s.run(t, sattempt("t-2", "a-2", 1))
+		if out.ExitErr == nil || !errors.Is(out.ExitErr, runner.ErrIncarnationBusy) {
+			t.Fatalf("第二个 RunTask 应被拒绝: %v", out.ExitErr)
+		}
+		s.p.mu.Lock()
+		n := len(s.p.all)
+		s.p.mu.Unlock()
+		if n != 1 {
+			t.Fatalf("被拒绝的 task_start 不应写出（宿主消息 %d 条）", n)
+		}
+	})
+}
+
+// waitSentHost 等宿主写出第一条 typ 消息（测试主 goroutine 使用）。
+func waitSentHost(t *testing.T, p *fakeProc, typ string) {
+	t.Helper()
+	if err := waitSent(typ, 1)(p); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClassifyAwaitingInput(t *testing.T) {
+	p := &runner.TerminalProposal{Kind: protocol.TypeAwaitingInput}
+	if c, r := runner.Classify(runner.ClassifyInput{Proposal: p}); c != runner.ClassAwaitingInput || r != "" {
+		t.Fatalf("awaiting_input → %s/%q", c, r)
+	}
+	if c, _ := runner.Classify(runner.ClassifyInput{Proposal: p, Control: runner.KillCancel}); c != runner.ClassCancelled {
+		t.Fatalf("cancel 生效时 awaiting_input → %s", c)
+	}
+	if c, r := runner.Classify(runner.ClassifyInput{Violation: protocol.CodeSessionExtMissing}); c != runner.ClassProtocolMismatch || r != "" {
+		t.Fatalf("session_ext_missing → %s/%q", c, r)
+	}
+}
+
+// ---- protocol/fixtures 的 session 模式场景（.jsonl）回放 ----
+
+type sessScenario struct {
+	Name   string
+	Expect struct {
+		Stream    string `json:"stream"`
+		Phase     string `json:"phase"`
+		Violation string `json:"violation"`
+		At        int    `json:"at"`
+	}
+	Lines []sessLine
+}
+
+type sessLine struct {
+	From    string          `json:"from"`
+	Message json.RawMessage `json:"message"`
+}
+
+func loadSessScenarios(t *testing.T, path string) []sessScenario {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	var out []sessScenario
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	for sc.Scan() {
+		if len(bytes.TrimSpace(sc.Bytes())) == 0 {
+			continue
+		}
+		var head struct {
+			Scenario string          `json:"scenario"`
+			Expect   json.RawMessage `json:"expect"`
+			sessLine
+		}
+		if err := json.Unmarshal(sc.Bytes(), &head); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		if head.Scenario != "" {
+			s := sessScenario{Name: head.Scenario}
+			if err := json.Unmarshal(head.Expect, &s.Expect); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, s)
+			continue
+		}
+		out[len(out)-1].Lines = append(out[len(out)-1].Lines, head.sessLine)
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestSessionScenarioFixtures 以 protocol/fixtures 的 session 场景驱动 incarnation：Worker 行按转录写出，
+// 宿主行由测试以 session actor/task actor 的身份调用 StartIncarnation、RunTask、Release、Quiesce、Close
+// 产生（回复类消息由 runner 自动产生），再逐字段比较 runner 实际写出的消息。stream = ok 的场景另核对
+// 每个 attempt 的事件以 incarnation seq 入库、释放成功；violation 的场景核对 runner 报告了同一违规码
+// （Worker 侧违规），或拒绝发出违规的宿主消息（宿主侧违规）。sub-run 场景待 M4 Plan 14 Task 6。
+func TestSessionScenarioFixtures(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("产物目录依赖 Linux openat2")
+	}
+	dir := filepath.Join("..", "..", "protocol", "fixtures", "v1", "scenarios")
+	files, err := filepath.Glob(filepath.Join(dir, "session_*.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ran := 0
+	for _, f := range files {
+		if filepath.Base(f) == "session_subruns.jsonl" { // sub-run 扩展：M4 Plan 14 Task 6 加入后删除这一行排除
+			continue
+		}
+		for _, sc := range loadSessScenarios(t, f) {
+			ran++
+			t.Run(sc.Name, func(t *testing.T) { replaySession(t, sc) })
+		}
+	}
+	if ran < 21 {
+		t.Fatalf("只回放了 %d 个场景", ran)
+	}
+}
+
+func replaySession(t *testing.T, sc sessScenario) {
+	opt := sessOptions()
+	opt.ReleaseTimeout = 2 * time.Second
+	violation := sc.Expect.Stream == "violation"
+	ws := t.TempDir()
+
+	// 场景的产物是占位哈希：写出真实文件，并把占位哈希替换为其 sha256
+	const placeholder = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for _, l := range sc.Lines {
+		m := decodeMap(t, l.Message)
+		if m["type"] != "artifact" {
+			continue
+		}
+		content := strings.Repeat("x", int(m["declared_size"].(float64)))
+		dirA := filepath.Join(ws, "out", m["attempt_id"].(string))
+		if err := os.MkdirAll(dirA, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dirA, m["path"].(string)), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for j := range sc.Lines {
+			sc.Lines[j].Message = bytes.ReplaceAll(sc.Lines[j].Message, []byte(placeholder), []byte(sum(content)))
+		}
+	}
+
+	// 丢弃：task_outcome_lost 中第一条 task_outcome 与由第一次查询触发的重发都"在传输中丢失"
+	var drop func(map[string]any) bool
+	dropFixture := map[int]bool{} // 转录中被丢弃的宿主行（脚本以 waitSent 代替 h()）
+	if sc.Name == "task_outcome_lost" {
+		n := 0
+		drop = func(m map[string]any) bool {
+			if m["type"] == "task_outcome" {
+				n++
+				return n <= 2
+			}
+			return false
+		}
+		for i, l := range sc.Lines {
+			if l.From == "host" && decodeMap(t, l.Message)["type"] == "task_outcome" {
+				dropFixture[i] = true
+				break
+			}
+		}
+	}
+
+	// Worker 脚本与期望的宿主消息
+	var script []step
+	var wantHost []map[string]any
+	outcomesSeen := 0
+	for i, l := range sc.Lines {
+		if i == 0 {
+			continue
+		}
+		if violation && i > sc.Expect.At {
+			break
+		}
+		m := decodeMap(t, l.Message)
+		if l.From == "host" {
+			if violation && i == sc.Expect.At {
+				break // 宿主侧违规：runner 必须拒绝发出
+			}
+			if m["type"] == "task_outcome" {
+				outcomesSeen++
+			}
+			if dropFixture[i] {
+				script = append(script, waitSent("task_outcome", outcomesSeen))
+				continue
+			}
+			script = append(script, h())
+			wantHost = append(wantHost, m)
+			continue
+		}
+		if sc.Name == "task_outcome_lost" && m["type"] == "task_outcome_query" && m["seq"] == float64(5) {
+			script = append(script, waitSent("task_outcome", 2)) // 第一次查询触发的重发已写出（并丢失）
+		}
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, l.Message); err != nil {
+			t.Fatal(err)
+		}
+		script = append(script, w(compact.String()))
+	}
+	script = append(script, untilEnd())
+
+	var initMsg protocol.Init
+	if err := json.Unmarshal(sc.Lines[0].Message, &initMsg); err != nil {
+		t.Fatal(err)
+	}
+	bl, err := blob.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := newMemStore()
+	p := &fakeProc{script: script, drop: drop, readied: make(chan struct{})}
+	r := runner.New(st, bl, &fakeStarter{proc: p}, nil, opt)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	var inc *runner.Incarnation
+	var bg sync.WaitGroup
+	t.Cleanup(func() {
+		if inc != nil {
+			_ = inc.Close(context.Background(), 100*time.Millisecond) // 清理：结果无关紧要
+		}
+		bg.Wait()
+		select {
+		case <-p.done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("fake Worker 未结束")
+		}
+	})
+
+	inc, err = r.StartIncarnation(ctx, runner.IncarnationSpec{SessionID: initMsg.SessionID, IncarnationID: initMsg.IncarnationID,
+		EnvID: "senv", WorkspaceRoot: ws, Config: initMsg.Config, Resume: initMsg.SessionResume})
+	if err != nil {
+		inc = nil
+		var se *runner.StartError
+		switch {
+		case !violation || !errors.As(err, &se):
+			t.Fatalf("StartIncarnation: %v", err)
+		case sc.Name == "startup_error_before_ready": // ready 之前的 error 是启动失败（其后的 ready 已不被读取）
+			if se.Class != runner.ClassWorkerError || se.Retry != "" {
+				t.Fatalf("启动失败分类 %s/%q", se.Class, se.Retry)
+			}
+		case se.Violation != sc.Expect.Violation:
+			t.Fatalf("启动违规 %q，期望 %q", se.Violation, sc.Expect.Violation)
+		}
+		return
+	}
+
+	runs := map[string]chan runner.Outcome{}
+	results := map[string]runner.Outcome{}
+	released := map[string]bool{}
+	var controls chan runner.Control
+	wantProposal := map[string]string{} // attempt → 终态提议类型
+	refused := false
+	hostBefore := 0
+	for i, l := range sc.Lines {
+		if violation && i > sc.Expect.At {
+			break
+		}
+		m := decodeMap(t, l.Message)
+		if l.From == "worker" {
+			if typ, _ := m["type"].(string); typ == "result" || typ == "error" || typ == "paused" || typ == "awaiting_input" {
+				if att, _ := m["attempt_id"].(string); att != "" && wantProposal[att] == "" {
+					wantProposal[att] = typ
+				}
+			}
+			continue
+		}
+		hostViolation := violation && i == sc.Expect.At
+		if hostViolation { // 先让 runner 处理完转录中此前的 Worker 事件（宿主侧违规与阶段相关）
+			waitProcessed(t, st, sc.Lines[:i])
+		}
+		if i > 0 { // 转录中此前的宿主消息（含 runner 自动产生的回复）都已写出，再执行本行的动作
+			if err := waitSentCount(p, hostBefore); err != nil {
+				t.Fatal(err)
+			}
+			hostBefore++
+		}
+		switch m["type"] {
+		case "init", "checkpoint_result", "artifact_result":
+		case "task_start":
+			var ts protocol.TaskStart
+			if err := json.Unmarshal(l.Message, &ts); err != nil {
+				t.Fatal(err)
+			}
+			a := runner.SessionAttempt{Attempt: runner.Attempt{TaskID: ts.TaskID, AttemptID: ts.AttemptID, AttemptNo: ts.AttemptNo,
+				Init: protocol.Init{Config: ts.Config, ConfigVersion: ts.ConfigVersion, BudgetLimits: ts.BudgetLimits,
+					InputRefs: ts.InputRefs, Traceparent: ts.Traceparent, OutDir: ts.OutDir, Resume: ts.Resume}},
+				BaseSessionCheckpointID: ts.BaseSessionCheckpointID, RestoredFromTaskID: ts.RestoredFromTaskID, Carryover: ts.Carryover}
+			if ts.Directive != nil {
+				if a.Directive, err = json.Marshal(ts.Directive); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if hostViolation {
+				out := inc.RunTask(ctx, a, nil)
+				if !errors.Is(out.ExitErr, runner.ErrIncarnationBusy) {
+					t.Fatalf("非空闲时的 RunTask 应被拒绝: %+v", out)
+				}
+				refused = true
+				continue
+			}
+			ch := make(chan runner.Outcome, 1)
+			runs[ts.AttemptID] = ch
+			controls = make(chan runner.Control, 2)
+			bg.Add(1)
+			go func(c chan runner.Control) {
+				defer bg.Done()
+				ch <- inc.RunTask(ctx, a, c)
+			}(controls)
+		case "cancel", "pause":
+			grace, _ := m["grace_ms"].(float64)
+			reason, _ := m["reason"].(string)
+			controls <- runner.Control{Kind: m["type"].(string), GraceMs: int64(grace), Reason: reason}
+		case "task_outcome":
+			att := m["attempt_id"].(string)
+			if _, ok := results[att]; ok {
+				continue // 重发由 runner 在查询时自动产生
+			}
+			results[att] = <-runs[att]
+			committed, _ := m["committed_session_checkpoint_id"].(string)
+			rr := inc.Release(ctx, runner.TaskOutcome{AttemptID: att, Verdict: m["verdict"].(string), CommittedSessionCheckpointID: committed})
+			if !violation && !rr.Released {
+				t.Fatalf("释放 %s: %+v", att, rr)
+			}
+			released[att] = rr.Released
+		case "quiesce":
+			grace := time.Duration(m["grace_ms"].(float64)) * time.Millisecond
+			id, err := inc.Quiesce(ctx, grace)
+			if hostViolation {
+				if protocol.CodeOf(err) != sc.Expect.Violation {
+					t.Fatalf("非空闲时的 Quiesce 应以 %s 拒绝: %v", sc.Expect.Violation, err)
+				}
+				refused = true
+				continue
+			}
+			if violation && err != nil {
+				continue // Worker 以违规事件答复 quiesce
+			}
+			if err != nil {
+				t.Fatalf("Quiesce: %v", err)
+			}
+			if next := decodeMap(t, sc.Lines[i+1].Message); next["type"] != "quiesced" || next["session_checkpoint_id"] != id {
+				t.Fatalf("Quiesce = %q，转录为 %v", id, next)
+			}
+		case "session_close":
+			grace := time.Duration(m["grace_ms"].(float64)) * time.Millisecond
+			err := inc.Close(ctx, grace)
+			if !violation && err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+		default:
+			t.Fatalf("未处理的宿主消息 %v", m)
+		}
+	}
+	if refused {
+		_ = inc.Close(ctx, 100*time.Millisecond) // 结束仍在运行的 attempt 与脚本
+	}
+	// 尚未释放的 attempt 的 RunTask 结果
+	for att, ch := range runs {
+		if _, ok := results[att]; !ok {
+			select {
+			case out := <-ch:
+				results[att] = out
+			case <-time.After(10 * time.Second):
+				t.Fatalf("RunTask(%s) 未返回", att)
+			}
+		}
+	}
+
+	if violation {
+		if refused {
+			waitScript(t, p, false)
+			p.mu.Lock()
+			all := append([]map[string]any(nil), p.all...)
+			p.mu.Unlock()
+			for _, m := range all {
+				if reflect.DeepEqual(m, decodeMap(t, sc.Lines[sc.Expect.At].Message)) {
+					t.Fatalf("违规的宿主消息被写出: %v", m)
+				}
+			}
+			return
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if inc.Violation() == sc.Expect.Violation {
+				break
+			}
+			found := false
+			for _, out := range results {
+				found = found || out.Violation == sc.Expect.Violation
+			}
+			if found {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("违规 %q 未被报告（incarnation %q，结果 %+v）", sc.Expect.Violation, inc.Violation(), results)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return
+	}
+
+	// stream = ok：runner 写出的宿主消息与转录逐字段一致
+	if sc.Expect.Phase != "closed" {
+		_ = inc.Close(ctx, 100*time.Millisecond) // 让脚本结束（session_close 不在转录中，不计入比较）
+	}
+	got := waitScript(t, p, true)
+	if !reflect.DeepEqual(got, wantHost) {
+		t.Fatalf("宿主消息\n%v\n期望\n%v", got, wantHost)
+	}
+	p.mu.Lock()
+	gotInit := p.init
+	p.mu.Unlock()
+	if want := decodeMap(t, sc.Lines[0].Message); !reflect.DeepEqual(gotInit, want) {
+		t.Fatalf("init = %v，期望 %v", gotInit, want)
+	}
+	if inc.Violation() != "" {
+		t.Fatalf("意外的违规 %q", inc.Violation())
+	}
+	// 每个 attempt：事件按 incarnation seq 入库（转录中属于它的 Worker 事件），提议与分类一致
+	wantSeqs := map[string][]int64{}
+	for _, l := range sc.Lines {
+		m := decodeMap(t, l.Message)
+		if att, _ := m["attempt_id"].(string); l.From == "worker" && att != "" {
+			wantSeqs[att] = append(wantSeqs[att], int64(m["seq"].(float64)))
+		}
+	}
+	for att, want := range wantSeqs {
+		if got := st.seqs(att); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s 已入库事件 %v，期望 %v", att, got, want)
+		}
+		out := results[att]
+		if out.Violation != "" || out.Proposal == nil || out.Proposal.Kind != wantProposal[att] || !released[att] {
+			t.Fatalf("%s: 结果 %s violation=%q 提议 %+v released=%v", att, out.Class, out.Violation, out.Proposal, released[att])
+		}
+		wantClass := map[string]string{"result": runner.ClassSucceeded, "error": runner.ClassWorkerError,
+			"awaiting_input": runner.ClassAwaitingInput}[wantProposal[att]]
+		if out.Class != wantClass {
+			t.Fatalf("%s: 分类 %s，期望 %s", att, out.Class, wantClass)
+		}
+	}
+}
+
+// waitSentCount 等宿主在 init 之后已写出（含被丢弃的）至少 n 条消息。
+func waitSentCount(p *fakeProc, n int) error {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		p.mu.Lock()
+		c := len(p.all)
+		p.mu.Unlock()
+		if c >= n {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("宿主只写出 %d 条消息，期望至少 %d", c, n)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// waitProcessed 等 lines 中最后一条带 attempt_id 的 Worker 事件已入库。
+func waitProcessed(t *testing.T, st *memStore, lines []sessLine) {
+	t.Helper()
+	for i := len(lines) - 1; i >= 0; i-- {
+		var m struct {
+			Seq       int64  `json:"seq"`
+			AttemptID string `json:"attempt_id"`
+		}
+		if lines[i].From != "worker" || json.Unmarshal(lines[i].Message, &m) != nil || m.AttemptID == "" {
+			continue
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for !slices.Contains(st.seqs(m.AttemptID), m.Seq) {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s 的事件 %d 未入库", m.AttemptID, m.Seq)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		return
+	}
+}
+
+// waitScript 等 fake Worker 结束并返回脚本经 h() 收到的消息；checkErr 时脚本必须无错结束。
+func waitScript(t *testing.T, p *fakeProc, checkErr bool) []map[string]any {
+	t.Helper()
+	select {
+	case <-p.done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("fake Worker 未结束")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if checkErr && p.scriptErr != nil {
+		t.Fatalf("脚本: %v（宿主消息 %v）", p.scriptErr, p.all)
+	}
+	return append([]map[string]any(nil), p.got...)
 }

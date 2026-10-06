@@ -6,6 +6,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
 )
 
@@ -43,6 +44,9 @@ const (
 	ClassPaused                = "paused"
 	ClassExitedNoProposal      = "exited_without_proposal"
 	ClassOutputIncomplete      = "output_incomplete"
+	// ClassAwaitingInput：session 模式的 awaiting_input 提议（契约 A），checkpoint 为最新已提交者。
+	// 不是故障：裁决 paused（原因 awaiting_input），不重试。
+	ClassAwaitingInput = "awaiting_input"
 )
 
 // 重试类别，与 task.RetryKind 的取值相同（runner 不导入 task）。
@@ -97,7 +101,7 @@ func Classify(in ClassifyInput) (class string, retry string) {
 		switch in.Violation {
 		case ViolationOutputLimit:
 			return ClassOutputLimitExceeded, RetryNone
-		case ViolationHandshakeError, ViolationModeMismatch:
+		case ViolationHandshakeError, ViolationModeMismatch, protocol.CodeSessionExtMissing:
 			return ClassProtocolMismatch, RetryNone
 		}
 		return ClassProtocolViolation, RetryNone
@@ -150,6 +154,9 @@ func Classify(in ClassifyInput) (class string, retry string) {
 		return ClassExitAfterResult, RetryNone // 含 exit_grace 到期被终止
 	case "error":
 		return ClassWorkerError, workerErrorRetry(in.Payload)
+	case protocol.TypeAwaitingInput:
+		// checkpoint 不是最新已提交者时 runner 已记为违规（第 2 步）
+		return ClassAwaitingInput, RetryNone
 	case "paused":
 		// 宿主没有请求暂停：§5.8 只在"宿主确有暂停请求"时接受 paused。保守地判为协议违规。
 		return ClassProtocolViolation, RetryNone

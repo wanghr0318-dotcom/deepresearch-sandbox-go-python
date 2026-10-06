@@ -60,7 +60,9 @@ type Outcome struct {
 	// ResultPayload 是终态提议被保存的内容（与 Proposal.Ref 指向的 blob 字节相同）：
 	// result 为 {summary, outputs[{artifact_id, version, sha256}]}，error 为 {code, message, retryable}，
 	// paused 为 {checkpoint_id}。最终事务提交的必须是这份内容（规格 §5.7）。
-	ResultPayload  json.RawMessage
+	ResultPayload json.RawMessage
+	// SessionState 是 session 模式 result 携带的新 session 状态提议（原样，规格 §12.3）；其余为 nil。
+	SessionState   *protocol.SessionState
 	Exit           provider.ExitStatus
 	ExitErr        error
 	Diag           provider.ResourceDiag
@@ -122,6 +124,9 @@ type Options struct {
 	SaveTimeout      time.Duration // 单个产物的保存期限，默认 60 s
 	WriteTimeout     time.Duration // stdin 每条消息的写期限（句柄支持 SetWriteDeadline 时），默认 5 s
 	StderrTail       int           // 保留的 stderr 字节数，默认 64 KiB
+
+	TaskAcceptTimeout time.Duration // session 模式 T_task_accept：task_start 之后等 task_accepted，默认 10 s
+	ReleaseTimeout    time.Duration // session 模式 T_release：task_outcome 之后到释放核验完成，默认 30 s
 }
 
 func (o Options) withDefaults() Options {
@@ -141,6 +146,8 @@ func (o Options) withDefaults() Options {
 	dur(&o.FinalizeTimeout, 120*time.Second)
 	dur(&o.ControlGrace, 10*time.Second)
 	dur(&o.StoreFailureWindow, 30*time.Second)
+	dur(&o.TaskAcceptTimeout, 10*time.Second)
+	dur(&o.ReleaseTimeout, 30*time.Second)
 	if o.StoreFailureCount <= 0 {
 		o.StoreFailureCount = 5
 	}
@@ -207,9 +214,10 @@ func (r *Runner) Run(ctx context.Context, a Attempt, controls <-chan Control) Ou
 		return fail(err)
 	}
 	faultinject.Point(faultinject.WorkerStarted)
-	at := &attemptRun{r: r, a: a, h: h, dir: dir, stdin: h.Stdin(), saved: map[string]pinnedOutput{},
-		committed: map[string]int64{}, stderr: &tailBuffer{max: r.opt.StderrTail},
-		readyCh: make(chan struct{}), finishing: make(chan struct{}), storeDown: make(chan struct{})}
+	at := &attemptRun{processor: newProcessor(r, a.TaskID, a.AttemptID, a.Init.Resume, dir), a: a, h: h,
+		stdin: h.Stdin(), stderr: &tailBuffer{max: r.opt.StderrTail},
+		readyCh: make(chan struct{}), finishing: make(chan struct{})}
+	at.sendFn, at.appendFn = at.sendTask, r.store.AppendWorkerEvents
 	return at.run(ctx, initLine, controls)
 }
 
@@ -222,26 +230,64 @@ func ctxKillReason(ctx context.Context) string {
 	return KillShutdown
 }
 
-// attemptRun 是一次 Run 的状态。标明的字段之外只由处理器 goroutine 访问；主循环只在处理器结束
+// processor 是一个 attempt 的事件处理状态，task 模式（attemptRun）与 session 模式（sessionRun）共用：
+// 持久化事件、保存产物、提交与查询 checkpoint、记录终态提议、执行 Store 故障阈值。除 storeDown 的
+// 关闭（由读者 select）外只由处理器 goroutine 访问；其他 goroutine 只在处理器结束、或经通道得知
+// 终态提议已处理之后读取 out。
+type processor struct {
+	r                  *Runner
+	taskID, attemptID  string
+	resumeCheckpointID string // init.resume / task_start.resume 的 checkpoint（paused 检查的候选）
+	session            bool   // session 模式：result 的内容含 session_state
+	dir                *outDir
+	out                Outcome
+	pctx               context.Context // 处理器的 ctx：屏障 B 超时或 attempt 结束后取消
+
+	sendFn   func(protocol.Message) // 写出一条回复（编码方式与 0 字节/部分写出的处理由模式决定）
+	appendFn func(ctx context.Context, attemptID string, events []WorkerEvent) (Watermark, error)
+
+	storeDown       chan struct{} // Store 故障达阈值（§14.5），由处理器关闭一次
+	storeDownClosed bool
+
+	eventBytes int64
+	pending    []WorkerEvent // 已接受但尚未持久化的 Worker 事件
+	// unresolved 是提交结果未知的 checkpoint_id：它可能仍然生效，此时提交另一个 checkpoint
+	// 会让指针顺序依赖竞争，因此以 commit_in_flight 拒绝，直到同一 ID 得到确定结果（规格 §5.5 第 4 条）。
+	unresolved string
+	saved      map[string]pinnedOutput // 本 attempt 已保存的产物：artifact_id → 最近一次保存的版本
+	// committed 是本 attempt 中得知已提交的 checkpoint：checkpoint_id → commit_seq（提交或查询的结果），
+	// 用于检查 paused/awaiting_input 的 checkpoint_id 是最新已提交者。
+	committed map[string]int64
+	// storeFailures 是连续计入故障阈值的 Store 失败次数，storeFailSince 是这一串失败的第一次时间。
+	storeFailures  int
+	storeFailSince time.Time
+}
+
+func newProcessor(r *Runner, taskID, attemptID string, resume *protocol.Resume, dir *outDir) processor {
+	p := processor{r: r, taskID: taskID, attemptID: attemptID, dir: dir, saved: map[string]pinnedOutput{},
+		committed: map[string]int64{}, storeDown: make(chan struct{})}
+	if resume != nil {
+		p.resumeCheckpointID = resume.CheckpointID
+	}
+	return p
+}
+
+// attemptRun 是一次 task 模式 Run 的状态。标明的字段之外只由处理器 goroutine 访问；主循环只在处理器结束
 // （processed 关闭）之后读取处理器写入的 out 字段。
 type attemptRun struct {
-	r      *Runner
+	processor
 	a      Attempt
 	h      provider.ExecHandle
-	dir    *outDir
-	out    Outcome
 	stderr *tailBuffer
-	pctx   context.Context // 处理器的 ctx：屏障 B 超时后取消
 
 	stdinMu     sync.Mutex
 	stdin       io.WriteCloser
 	stdinClosed bool
 
 	// 处理器 → 主循环的通知，各由处理器关闭一次（关闭不会阻塞）。
-	readyCh                                       chan struct{} // 合法的 ready 已处理（OnReady 之后）
-	finishing                                     chan struct{} // 终态提议、handshake_error 或违规：Worker 应在 exit_grace 内退出
-	storeDown                                     chan struct{} // Store 故障达阈值（§14.5）
-	readyClosed, finishingClosed, storeDownClosed bool
+	readyCh                      chan struct{} // 合法的 ready 已处理（OnReady 之后）
+	finishing                    chan struct{} // 终态提议、handshake_error 或违规：Worker 应在 exit_grace 内退出
+	readyClosed, finishingClosed bool
 
 	killMu     sync.Mutex
 	killReason string // 第一个终止原因
@@ -249,20 +295,8 @@ type attemptRun struct {
 	exitSeen   bool
 
 	stream      protocol.WorkerStream
-	eventBytes  int64
-	pending     []WorkerEvent // 已接受但尚未持久化的 Worker 事件
-	stopped     bool          // 已出现违规：其后的行只读出丢弃
+	stopped     bool // 已出现违规：其后的行只读出丢弃
 	readyCalled bool
-	// unresolved 是提交结果未知的 checkpoint_id：它可能仍然生效，此时提交另一个 checkpoint
-	// 会让指针顺序依赖竞争，因此以 commit_in_flight 拒绝，直到同一 ID 得到确定结果（规格 §5.5 第 4 条）。
-	unresolved string
-	saved      map[string]pinnedOutput // 本 attempt 已保存的产物：artifact_id → 最近一次保存的版本
-	// committed 是本 attempt 中得知已提交的 checkpoint：checkpoint_id → commit_seq（提交或查询的结果），
-	// 用于检查 paused.checkpoint_id 是最新已提交者。
-	committed map[string]int64
-	// storeFailures 是连续计入故障阈值的 Store 失败次数，storeFailSince 是这一串失败的第一次时间。
-	storeFailures  int
-	storeFailSince time.Time
 }
 
 type pinnedOutput struct {
@@ -598,10 +632,10 @@ func (at *attemptRun) handle(ctx context.Context, item lineItem) {
 // pausedIsLatest 检查 paused.checkpoint_id 是最新已提交的 checkpoint（规格 §5.9）：它必须已提交，且
 // commit_seq 不小于本 attempt 得知的任何已提交 checkpoint——包括 init.resume 指向的 checkpoint 与
 // 提交结果未知的 checkpoint（尚未查询过的向 Store 查询）。无法确认（Store 不可用）时保守地返回 false。
-func (at *attemptRun) pausedIsLatest(ctx context.Context, id string) bool {
+func (at *processor) pausedIsLatest(ctx context.Context, id string) bool {
 	candidates := []string{id}
-	if r := at.a.Init.Resume; r != nil && r.CheckpointID != "" {
-		candidates = append(candidates, r.CheckpointID)
+	if at.resumeCheckpointID != "" {
+		candidates = append(candidates, at.resumeCheckpointID)
 	}
 	if at.unresolved != "" {
 		candidates = append(candidates, at.unresolved)
@@ -610,7 +644,7 @@ func (at *attemptRun) pausedIsLatest(ctx context.Context, id string) bool {
 		if _, ok := at.committed[c]; ok {
 			continue
 		}
-		cc, err := at.r.store.QueryCheckpoint(ctx, Scope{Kind: protocol.ScopeTask, ID: at.a.TaskID}, c)
+		cc, err := at.r.store.QueryCheckpoint(ctx, Scope{Kind: protocol.ScopeTask, ID: at.taskID}, c)
 		switch {
 		case err == nil:
 			at.noteStore(nil)
@@ -670,10 +704,10 @@ func eventSeq(m protocol.Message) int64 {
 
 // flush 以一批原子追加已接受的事件。失败时事件保留在 pending 中，下次 flush 以同样的内容重试
 // （同序号同内容的重叠是幂等的）；处理不因事件日志暂时落后而停顿。
-func (at *attemptRun) flush(ctx context.Context) {
+func (at *processor) flush(ctx context.Context) {
 	for len(at.pending) > 0 {
 		n := min(len(at.pending), at.r.opt.EventBatch)
-		_, err := at.r.store.AppendWorkerEvents(ctx, at.a.AttemptID, at.pending[:n])
+		_, err := at.appendFn(ctx, at.attemptID, at.pending[:n])
 		at.noteStore(err)
 		if err != nil {
 			return
@@ -685,7 +719,7 @@ func (at *attemptRun) flush(ctx context.Context) {
 // noteStore 记录 Store 调用的结果并执行 Store 故障阈值（规格 §14.5、§19）：计入阈值的失败连续
 // StoreFailureCount 次，或这一串失败持续达到 StoreFailureWindow，通知主循环以 store_unavailable 终止。
 // 成功清零；不计入阈值的错误（冲突、拒绝、争用）不改变计数。处理器 ctx 已取消时的失败不计。
-func (at *attemptRun) noteStore(err error) {
+func (at *processor) noteStore(err error) {
 	switch {
 	case err == nil:
 		at.storeFailures = 0
@@ -710,7 +744,7 @@ func hostHeader(typ string) protocol.HostHeader {
 
 // ---- checkpoint ----
 
-func (at *attemptRun) commitCheckpoint(ctx context.Context, m *protocol.Checkpoint) *protocol.CheckpointResult {
+func (at *processor) commitCheckpoint(ctx context.Context, m *protocol.Checkpoint) *protocol.CheckpointResult {
 	res := &protocol.CheckpointResult{HostHeader: hostHeader(protocol.TypeCheckpointResult), CheckpointID: m.CheckpointID, Scope: m.Scope}
 	if at.unresolved != "" && at.unresolved != m.CheckpointID {
 		res.Status, res.Code = protocol.CheckpointRejected, codeCommitInFlight
@@ -722,9 +756,9 @@ func (at *attemptRun) commitCheckpoint(ctx context.Context, m *protocol.Checkpoi
 	}
 	faultinject.Point(faultinject.CheckpointCommitBefore)
 	cc, err := at.r.store.CommitCheckpoint(ctx, Checkpoint{
-		Scope:        Scope{Kind: protocol.ScopeTask, ID: at.a.TaskID},
+		Scope:        Scope{Kind: protocol.ScopeTask, ID: at.taskID},
 		CheckpointID: m.CheckpointID,
-		AttemptID:    at.a.AttemptID,
+		AttemptID:    at.attemptID,
 		StepID:       m.StepID,
 		State:        stateOrNil(m.State),
 		StateRef:     m.StateRef,
@@ -756,7 +790,7 @@ func (at *attemptRun) commitCheckpoint(ctx context.Context, m *protocol.Checkpoi
 
 // checkRefs 在提交前检查 refs 与 state_ref 指向的 blob 已完整保存（missing_ref）、state_ref 不超过
 // 上限（state_too_large）。授权到当前 scope 由 CommitCheckpoint 在事务内检查（ref_not_authorized）。
-func (at *attemptRun) checkRefs(m *protocol.Checkpoint) (status, code string) {
+func (at *processor) checkRefs(m *protocol.Checkpoint) (status, code string) {
 	refs := m.Refs
 	if m.StateRef != "" {
 		refs = append(append([]string(nil), m.Refs...), m.StateRef)
@@ -782,9 +816,9 @@ func stateOrNil(s json.RawMessage) json.RawMessage {
 	return s
 }
 
-func (at *attemptRun) queryCheckpoint(ctx context.Context, m *protocol.CheckpointQuery) *protocol.CheckpointResult {
+func (at *processor) queryCheckpoint(ctx context.Context, m *protocol.CheckpointQuery) *protocol.CheckpointResult {
 	res := &protocol.CheckpointResult{HostHeader: hostHeader(protocol.TypeCheckpointResult), CheckpointID: m.CheckpointID, Scope: m.Scope}
-	cc, err := at.r.store.QueryCheckpoint(ctx, Scope{Kind: m.Scope, ID: at.a.TaskID}, m.CheckpointID)
+	cc, err := at.r.store.QueryCheckpoint(ctx, Scope{Kind: m.Scope, ID: at.taskID}, m.CheckpointID)
 	if !errors.Is(err, persistence.ErrNotFound) {
 		at.noteStore(err)
 	}
@@ -829,7 +863,7 @@ func validArtifactPath(p string) bool {
 
 // saveArtifact 按规格 §5.6 保存产物：从相对 out_dir 打开的 FD 边复制边哈希写入 BlobStore，
 // 与声明值比较后登记，再答复。声明的哈希与大小只是待验证数据；已保存副本是权威内容。
-func (at *attemptRun) saveArtifact(ctx context.Context, m *protocol.Artifact) *protocol.ArtifactResult {
+func (at *processor) saveArtifact(ctx context.Context, m *protocol.Artifact) *protocol.ArtifactResult {
 	res := &protocol.ArtifactResult{HostHeader: hostHeader(protocol.TypeArtifactResult), ArtifactID: m.ArtifactID}
 	ref, version, err := at.storeArtifact(ctx, m)
 	if err != nil {
@@ -841,7 +875,7 @@ func (at *attemptRun) saveArtifact(ctx context.Context, m *protocol.Artifact) *p
 	return res
 }
 
-func (at *attemptRun) storeArtifact(ctx context.Context, m *protocol.Artifact) (blob.Ref, int64, *artifactError) {
+func (at *processor) storeArtifact(ctx context.Context, m *protocol.Artifact) (blob.Ref, int64, *artifactError) {
 	limit := at.r.opt.MaxArtifactBytes
 	if !validArtifactPath(m.Path) {
 		return blob.Ref{}, 0, &artifactError{code: codePathInvalid, err: errors.New(m.Path)}
@@ -883,7 +917,7 @@ func (at *attemptRun) storeArtifact(ctx context.Context, m *protocol.Artifact) (
 		return blob.Ref{}, 0, &artifactError{code: codeHashMismatch,
 			err: fmt.Errorf("实际 %s/%d，声明 %s/%d", ref.SHA256, ref.Size, m.DeclaredSHA256, m.DeclaredSize)}
 	}
-	v, err := at.r.store.RegisterArtifact(sctx, Artifact{TaskID: at.a.TaskID, AttemptID: at.a.AttemptID, ArtifactID: m.ArtifactID,
+	v, err := at.r.store.RegisterArtifact(sctx, Artifact{TaskID: at.taskID, AttemptID: at.attemptID, ArtifactID: m.ArtifactID,
 		SHA256: ref.SHA256, Size: ref.Size, MediaType: m.MediaType, Visibility: m.Visibility})
 	at.noteStore(err)
 	var rej *persistence.RejectedError
@@ -909,7 +943,7 @@ type pinnedRef struct {
 // result 的 outputs 固定为本 attempt 最近一次保存的 (artifact_id, version, sha256)（规格 §5.6）；本 attempt
 // 未保存的（恢复后的 attempt 不会重新登记之前保存的产物）固定为该任务中的最新版本；任务中不存在或
 // 查询失败时只记录 ID。
-func (at *attemptRun) recordProposal(ctx context.Context, m protocol.Message) {
+func (at *processor) recordProposal(ctx context.Context, m protocol.Message) {
 	var content any
 	switch m := m.(type) {
 	case *protocol.Result:
@@ -917,7 +951,7 @@ func (at *attemptRun) recordProposal(ctx context.Context, m protocol.Message) {
 		for _, id := range m.Outputs {
 			p, ok := at.saved[id]
 			if !ok {
-				v, err := at.r.store.LatestArtifact(ctx, at.a.TaskID, id)
+				v, err := at.r.store.LatestArtifact(ctx, at.taskID, id)
 				if !errors.Is(err, persistence.ErrNotFound) {
 					at.noteStore(err)
 				}
@@ -927,10 +961,21 @@ func (at *attemptRun) recordProposal(ctx context.Context, m protocol.Message) {
 			}
 			outputs = append(outputs, pinnedRef{ArtifactID: id, Version: p.Version, SHA256: p.SHA256})
 		}
+		var state *protocol.SessionState
+		if at.session && m.SessionState != nil { // task 模式忽略 session_state（协议 README）
+			state = m.SessionState
+			at.out.SessionState = m.SessionState
+		}
 		content = struct {
-			Summary string      `json:"summary"`
-			Outputs []pinnedRef `json:"outputs"`
-		}{m.Summary, outputs}
+			Summary      string                 `json:"summary"`
+			Outputs      []pinnedRef            `json:"outputs"`
+			SessionState *protocol.SessionState `json:"session_state,omitempty"`
+		}{m.Summary, outputs, state}
+	case *protocol.AwaitingInput:
+		content = struct {
+			CheckpointID string `json:"checkpoint_id"`
+			QuestionID   string `json:"question_id"`
+		}{m.CheckpointID, m.QuestionID}
 	case *protocol.ErrorEvent:
 		content = struct {
 			Code      string `json:"code"`
@@ -943,11 +988,11 @@ func (at *attemptRun) recordProposal(ctx context.Context, m protocol.Message) {
 		}{m.CheckpointID}
 	}
 	payload, err := json.Marshal(content)
-	if err != nil { // 内容只含字符串、整数与布尔值
+	if err != nil { // 内容只含字符串、整数、布尔值与已校验的 JSON（session_state.state）
 		panic(fmt.Sprintf("runner: 编码终态提议: %v", err))
 	}
 	sum := sha256.Sum256(payload)
-	p := TerminalProposal{AttemptID: at.a.AttemptID, Kind: m.MessageType(), Ref: hex.EncodeToString(sum[:])}
+	p := TerminalProposal{AttemptID: at.attemptID, Kind: m.MessageType(), Ref: hex.EncodeToString(sum[:])}
 	at.out.Proposal, at.out.ResultPayload = &p, payload
 	if _, err := at.r.blobs.Put(ctx, bytes.NewReader(payload)); err != nil {
 		return // 内容仍在 Outcome 中，最终事务提交这份内容
@@ -961,7 +1006,11 @@ func (at *attemptRun) recordProposal(ctx context.Context, m protocol.Message) {
 
 // ---- stdin ----
 
-func (at *attemptRun) send(m protocol.Message) {
+// send 写出一条回复（checkpoint_result、artifact_result 等），方式由模式决定。
+func (at *processor) send(m protocol.Message) { at.sendFn(m) }
+
+// sendTask 是 task 模式的写出：0 字节写出视为未送达，部分写出终止执行（§5.5 第 8 条）。
+func (at *attemptRun) sendTask(m protocol.Message) {
 	line, err := protocol.EncodeLine(protocol.HostToWorker, m)
 	if err != nil { // 回复由本包构造，编码失败是程序错误
 		panic(fmt.Sprintf("runner: 编码 %s: %v", m.MessageType(), err))
