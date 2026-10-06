@@ -474,9 +474,6 @@ func TestHandlersMatchOpenAPI(t *testing.T) {
 	for k, v := range spec {
 		sort.Ints(v)
 		got, ok := impl[k]
-		if !ok && slices.Contains(sessionOperations, k) {
-			continue // 会话契约由 Plan 12 Task 1 定稿，处理器由 Task 8 实现；实现后即按下文比较状态码
-		}
 		if !ok {
 			t.Errorf("openapi.yaml 声明了 %s，处理器未实现", k)
 			continue
@@ -492,6 +489,11 @@ func TestHandlersMatchOpenAPI(t *testing.T) {
 	}
 	if n := len(spec) - len(sessionOperations); n != 17 {
 		t.Errorf("openapi.yaml 解析出 %d 个非会话操作，期望 17（M1 范围加产物最新版本下载，加账号的 5 个操作）", n)
+	}
+	for _, op := range sessionOperations {
+		if _, ok := impl[op]; !ok {
+			t.Errorf("会话操作 %s 未路由", op)
+		}
 	}
 }
 
@@ -2035,7 +2037,7 @@ func TestTaskViewTopicAndCreatedAt(t *testing.T) {
 
 // ---- 会话契约（M4 Plan 12 Task 1）----
 
-// sessionOperations 是 openapi.yaml 中的会话操作全集；Task 8 实现处理器之前 TestHandlersMatchOpenAPI 允许其未路由。
+// sessionOperations 是 openapi.yaml 中的会话操作全集（Task 8 全部路由，状态码由 TestHandlersMatchOpenAPI 比较）。
 var sessionOperations = []string{
 	"POST /sessions", "GET /sessions",
 	"GET /sessions/{id}", "PATCH /sessions/{id}", "DELETE /sessions/{id}",
@@ -2378,5 +2380,939 @@ func TestOpenAPISessionContract(t *testing.T) {
 		if !slices.Contains(codes, c) {
 			t.Errorf("SessionErrorCode 缺少 %s", c)
 		}
+	}
+}
+
+// ---- 会话端点（M4 Plan 12 Task 8）----
+
+// fakeSessions 是内存中的 Sessions，按 postgres 实现的规则模拟 D5、turn_in_progress、关闭与 turn 控制的状态要求。
+type fakeSessions struct {
+	mu         sync.Mutex
+	order      []string // 创建顺序
+	sessions   map[string]*SessionView
+	usernames  map[int64]string
+	turns      map[string]*fakeTurn
+	events     map[string][]SessionEventRecord // session_id → 按 session_seq 升序
+	authorized map[string]bool                 // task_id/sha
+	requests   map[string]fakeSessionRequest
+	// failControl、failTurn 非空时，下一次 TurnControl、CreateTurn 返回该错误。
+	failControl, failTurn error
+	lastTurn              CreateTurnRequest
+	lastControl           TurnControlRequest
+}
+
+type fakeTurn struct {
+	session string
+	view    TurnView
+	version int64
+}
+
+type fakeSessionRequest struct {
+	kind string
+	hash []byte
+	resp any
+}
+
+func newFakeSessions() *fakeSessions {
+	return &fakeSessions{sessions: map[string]*SessionView{}, usernames: map[int64]string{}, turns: map[string]*fakeTurn{},
+		events: map[string][]SessionEventRecord{}, authorized: map[string]bool{}, requests: map[string]fakeSessionRequest{}}
+}
+
+// replay 按 request_id 查找已提交的请求：同 kind 同 hash 返回原结果，否则 ErrConflict。
+func (f *fakeSessions) replay(requestID, kind string, hash []byte) (any, bool, error) {
+	rec, ok := f.requests[requestID]
+	if !ok {
+		return nil, false, nil
+	}
+	if rec.kind != kind || !bytes.Equal(rec.hash, hash) {
+		return nil, false, fmt.Errorf("%w: request_conflict", persistence.ErrConflict)
+	}
+	return rec.resp, true, nil
+}
+
+func (f *fakeSessions) addSession(id string, owner int64, state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ts := time.Date(2026, 10, 6, 9, 0, len(f.order), 0, time.UTC)
+	f.sessions[id] = &SessionView{SessionID: id, State: state, OwnerUserID: owner, CreatedAt: ts, LastActiveAt: ts}
+	f.order = append(f.order, id)
+}
+
+func (f *fakeSessions) addTurn(sessionID, turnID, status string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := int64(0)
+	for _, t := range f.turns {
+		if t.session == sessionID {
+			n++
+		}
+	}
+	f.turns[turnID] = &fakeTurn{session: sessionID, view: TurnView{TurnID: turnID, TurnIndex: n, Text: "问题 " + turnID, Status: status,
+		ToolCallLimit: 30, CreatedAt: time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)}}
+}
+
+func (f *fakeSessions) setTurnStatus(turnID, status string) {
+	f.mu.Lock()
+	f.turns[turnID].view.Status = status
+	f.mu.Unlock()
+}
+
+func (f *fakeSessions) setState(sessionID, state string) {
+	f.mu.Lock()
+	f.sessions[sessionID].State = state
+	f.mu.Unlock()
+}
+
+// appendRecord 追加一条会话记录，session_seq 取下一个序号。
+func (f *fakeSessions) appendRecord(sessionID string, r SessionEventRecord) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r.SessionSeq = int64(len(f.events[sessionID]) + 1)
+	r.TS = time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	f.events[sessionID] = append(f.events[sessionID], r)
+}
+
+func (f *fakeSessions) CreateSession(_ context.Context, req CreateSessionRequest) (SessionView, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if resp, ok, err := f.replay(req.RequestID, "create_session", req.BodyHash); err != nil || ok {
+		if err != nil {
+			return SessionView{}, false, err
+		}
+		v := *f.sessions[resp.(string)]
+		v.Owner, v.InternalState = "", ""
+		return v, true, nil
+	}
+	ts := time.Date(2026, 10, 6, 9, 0, len(f.order), 0, time.UTC)
+	f.sessions[req.SessionID] = &SessionView{SessionID: req.SessionID, Title: req.Title, State: "idle", OwnerUserID: req.OwnerUserID,
+		CreatedAt: ts, LastActiveAt: ts}
+	f.order = append(f.order, req.SessionID)
+	f.requests[req.RequestID] = fakeSessionRequest{kind: "create_session", hash: req.BodyHash, resp: req.SessionID}
+	return *f.sessions[req.SessionID], false, nil
+}
+
+func (f *fakeSessions) ListSessions(_ context.Context, ownerID int64, after string, limit int) ([]SessionView, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []SessionView
+	started := after == ""
+	for i := len(f.order) - 1; i >= 0; i-- {
+		v := *f.sessions[f.order[i]]
+		if !started {
+			started = v.SessionID == after
+			continue
+		}
+		if ownerID > 0 && (v.OwnerUserID != ownerID || v.State == "closed") {
+			continue
+		}
+		if ownerID == 0 {
+			v.Owner, v.InternalState = f.usernames[v.OwnerUserID], "internal_"+v.State
+		}
+		out = append(out, v)
+		if len(out) == limit {
+			return out, v.SessionID, nil
+		}
+	}
+	return out, "", nil
+}
+
+func (f *fakeSessions) GetSession(_ context.Context, sessionID string) (SessionView, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.sessions[sessionID]
+	if !ok {
+		return SessionView{}, fmt.Errorf("%w: 会话 %s", persistence.ErrNotFound, sessionID)
+	}
+	return *v, nil
+}
+
+func (f *fakeSessions) openSession(sessionID string) (*SessionView, error) {
+	v, ok := f.sessions[sessionID]
+	switch {
+	case !ok:
+		return nil, persistence.ErrNotFound
+	case v.State == "closing" || v.State == "closed":
+		return v, fmt.Errorf("%w: %s", ErrSessionClosed, sessionID)
+	}
+	return v, nil
+}
+
+func (f *fakeSessions) RenameSession(_ context.Context, sessionID, title string) (SessionView, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, err := f.openSession(sessionID)
+	if err != nil {
+		return SessionView{}, err
+	}
+	v.Title = title
+	return *v, nil
+}
+
+func (f *fakeSessions) CloseSession(_ context.Context, sessionID string) (SessionView, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.sessions[sessionID]
+	if !ok {
+		return SessionView{}, persistence.ErrNotFound
+	}
+	if v.State != "closed" {
+		v.State = "closing"
+	}
+	return *v, nil
+}
+
+func (f *fakeSessions) WakeSession(_ context.Context, requestID string, bodyHash []byte, sessionID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok, err := f.replay(requestID, "wake", bodyHash); err != nil || ok {
+		return err
+	}
+	if _, err := f.openSession(sessionID); err != nil {
+		return err
+	}
+	f.requests[requestID] = fakeSessionRequest{kind: "wake", hash: bodyHash, resp: sessionID}
+	return nil
+}
+
+func (f *fakeSessions) CreateTurn(_ context.Context, req CreateTurnRequest) (CreateTurnResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if resp, ok, err := f.replay(req.RequestID, "create_turn", req.BodyHash); err != nil || ok {
+		if err != nil {
+			return CreateTurnResult{}, err
+		}
+		res := resp.(CreateTurnResult)
+		res.Replayed = true
+		return res, nil
+	}
+	if err := f.failTurn; err != nil {
+		f.failTurn = nil
+		return CreateTurnResult{}, err
+	}
+	s, err := f.openSession(req.SessionID)
+	if err != nil {
+		return CreateTurnResult{}, err
+	}
+	if s.OwnerUserID != req.OwnerUserID {
+		return CreateTurnResult{}, persistence.ErrNotFound
+	}
+	var res CreateTurnResult
+	var n int64
+	for _, t := range f.turns {
+		if t.session != req.SessionID {
+			continue
+		}
+		n++
+		switch t.view.Status {
+		case "queued", "running", "stopping":
+			return CreateTurnResult{}, fmt.Errorf("%w: %s", ErrTurnInProgress, t.view.TurnID)
+		case "paused", "awaiting_input":
+			res.SupersededTurnID = t.view.TurnID
+		}
+	}
+	if req.RestoredFromTaskID != "" {
+		if src := f.turns[req.RestoredFromTaskID]; src == nil || src.view.Status != "cancelled" {
+			return CreateTurnResult{}, fmt.Errorf("%w: %s", ErrNotRestorable, req.RestoredFromTaskID)
+		}
+	}
+	if res.SupersededTurnID != "" {
+		t := f.turns[res.SupersededTurnID]
+		t.view.Status, t.view.StatusReason, t.view.Restorable = "cancelled", "superseded", true
+	}
+	f.turns[req.TaskID] = &fakeTurn{session: req.SessionID, view: TurnView{TurnID: req.TaskID, TurnIndex: n, Text: req.Text,
+		DeepResearch: req.DeepResearch, Status: "queued", RestoredFromTurnID: req.RestoredFromTaskID, ToolCallLimit: 30}}
+	res.TurnID, res.TurnIndex = req.TaskID, n
+	f.lastTurn = req
+	f.requests[req.RequestID] = fakeSessionRequest{kind: "create_turn", hash: req.BodyHash, resp: res}
+	return res, nil
+}
+
+func (f *fakeSessions) ListTurns(_ context.Context, sessionID string, afterIndex int64, limit int) ([]TurnView, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.sessions[sessionID]; !ok {
+		return nil, persistence.ErrNotFound
+	}
+	var out []TurnView
+	for _, t := range f.turns {
+		if t.session == sessionID && t.view.TurnIndex > afterIndex {
+			out = append(out, t.view)
+		}
+	}
+	slices.SortFunc(out, func(a, b TurnView) int { return int(a.TurnIndex - b.TurnIndex) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (f *fakeSessions) TurnSession(_ context.Context, taskID string) (string, int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, ok := f.turns[taskID]
+	if !ok {
+		return "", 0, fmt.Errorf("%w: turn %s", persistence.ErrNotFound, taskID)
+	}
+	return t.session, f.sessions[t.session].OwnerUserID, nil
+}
+
+func (f *fakeSessions) TurnControl(_ context.Context, req TurnControlRequest) (ControlResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if resp, ok, err := f.replay(req.RequestID, "turn_control", req.BodyHash); err != nil || ok {
+		if err != nil {
+			return ControlResult{}, err
+		}
+		res := resp.(ControlResult)
+		res.Replayed = true
+		return res, nil
+	}
+	if err := f.failControl; err != nil {
+		f.failControl = nil
+		return ControlResult{}, err
+	}
+	t, ok := f.turns[req.TaskID]
+	if !ok {
+		return ControlResult{}, persistence.ErrNotFound
+	}
+	need := map[string][]string{"stop": {"queued", "running"}, "continue": {"paused"}, "finish": {"paused"}, "answer": {"awaiting_input"}}[req.Action]
+	if !slices.Contains(need, t.view.Status) {
+		return ControlResult{}, fmt.Errorf("%w: %s", ErrInvalidTurnState, t.view.Status)
+	}
+	t.version++
+	res := ControlResult{TaskID: req.TaskID, ControlVersion: t.version}
+	f.lastControl = req
+	f.requests[req.RequestID] = fakeSessionRequest{kind: "turn_control", hash: req.BodyHash, resp: res}
+	return res, nil
+}
+
+func (f *fakeSessions) ListSessionEvents(_ context.Context, sessionID string, afterSeq int64, limit int) ([]SessionEventRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []SessionEventRecord
+	for _, r := range f.events[sessionID] {
+		if r.SessionSeq > afterSeq && len(out) < limit {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeSessions) TurnBlobAuthorized(_ context.Context, taskID, sha string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.authorized[taskID+"/"+sha], nil
+}
+
+// testTurnSpec 是测试用的 TurnSpec：spec 带文本与 deep_research，limits 为 max_tool_calls = 30。
+func testTurnSpec(text string, deep bool) (json.RawMessage, json.RawMessage, error) {
+	spec, err := json.Marshal(map[string]any{"kind": "turn", "text": text, "deep_research": deep, "orchestrator_model": "kimi-k3"})
+	return spec, json.RawMessage(`{ "max_tool_calls": 30 }`), err
+}
+
+// newSessionServer 启动启用账号与会话的服务；会话 ID 依次为 s1、s2…。
+func newSessionServer(t *testing.T, mutate func(*Config)) (*testServer, *fakeAccounts, *fakeSessions) {
+	t.Helper()
+	fs := newFakeSessions()
+	var mu sync.Mutex
+	n := 0
+	ts, acc := newAccountServer(t, func(c *Config) {
+		c.Sessions = fs
+		c.TurnSpec = testTurnSpec
+		c.NewSessionID = func() string { mu.Lock(); defer mu.Unlock(); n++; return "s" + strconv.Itoa(n) }
+		if mutate != nil {
+			mutate(c)
+		}
+	})
+	return ts, acc, fs
+}
+
+// decodeJSONBody 解码响应正文。
+func decodeJSONBody(t *testing.T, b []byte, v any) {
+	t.Helper()
+	if err := json.Unmarshal(b, v); err != nil {
+		t.Fatalf("响应不是预期的 JSON: %s: %v", b, err)
+	}
+}
+
+// TestSessionIsolation：用户 A 建会话、发消息得 202；用户 B 对 A 的会话与 turn 的每个端点、无主会话与不存在的会话
+// 一律 404 且正文相同（turn 端点 turn_not_found，原文 not_found）；A 看到自己已 closed 的会话也是 404；运维可读 A 的
+// 会话（含 owner、internal_state）、turn 与事件（含 internal），一切写操作 403；日志不含消息正文与 answers。
+func TestSessionIsolation(t *testing.T) {
+	ts, acc, fs := newSessionServer(t, nil)
+	a, ca := acc.seedUser(t, "anna")
+	_, cb := acc.seedUser(t, "ben")
+	fs.usernames[a.ID] = "anna"
+
+	st, b, _ := ts.do("POST", "/sessions", `{"request_id":"c1"}`, session(ca))
+	expect(t, st, b, 201, "")
+	var sv SessionView
+	decodeJSONBody(t, b, &sv)
+	if sv.SessionID != "s1" || sv.State != "idle" || strings.Contains(string(b), "owner") || strings.Contains(string(b), "internal_state") {
+		t.Fatalf("创建会话的响应 = %s", b)
+	}
+	const secretText = "机密问题-不应出现在日志里"
+	st, b, _ = ts.do("POST", "/sessions/s1/messages", `{"request_id":"m1","text":"  `+secretText+`  ","deep_research":false}`, session(ca))
+	expect(t, st, b, 202, "")
+	var mr CreateTurnResult
+	decodeJSONBody(t, b, &mr)
+	if mr.TurnID == "" || mr.TurnIndex != 0 {
+		t.Fatalf("消息响应 = %s", b)
+	}
+	turn := mr.TurnID
+	sum := sha256.Sum256([]byte(`{}`))
+	sha := hex.EncodeToString(sum[:])
+	fs.mu.Lock()
+	fs.authorized[turn+"/"+sha] = true
+	fs.mu.Unlock()
+	ts.blobs.put(sha, []byte(`{}`))
+	fs.appendRecord("s1", SessionEventRecord{Source: "session", Type: SEvSessionState, Payload: json.RawMessage(`{"state":"idle"}`)})
+	fs.addSession("s0", 0, "idle") // 无主会话
+	fs.addTurn("s0", "t0", "paused")
+
+	type op struct{ method, path, body string }
+	sessionOps := func(id string) []op {
+		return []op{
+			{"GET", "/sessions/" + id, ""},
+			{"PATCH", "/sessions/" + id, `{"title":"新标题"}`},
+			{"DELETE", "/sessions/" + id, ""},
+			{"POST", "/sessions/" + id + "/wake", `{"request_id":"w-` + id + `"}`},
+			{"POST", "/sessions/" + id + "/messages", `{"request_id":"m-` + id + `","text":"x","deep_research":true}`},
+			{"GET", "/sessions/" + id + "/turns", ""},
+			{"GET", "/sessions/" + id + "/events", ""},
+		}
+	}
+	turnOps := func(id string) []op {
+		return []op{
+			{"POST", "/turns/" + id + "/stop", `{"request_id":"x-` + id + `"}`},
+			{"POST", "/turns/" + id + "/continue", `{"request_id":"x-` + id + `"}`},
+			{"POST", "/turns/" + id + "/finish", `{"request_id":"x-` + id + `"}`},
+			{"POST", "/turns/" + id + "/answer", `{"request_id":"x-` + id + `","answers":[{"question_id":"q1","choice":"A"}]}`},
+			{"POST", "/turns/" + id + "/restore", `{"request_id":"x-` + id + `"}`},
+		}
+	}
+	check := func(who map[string]string, ops []op, missingOps []op, code string) {
+		t.Helper()
+		for i, o := range ops {
+			_, missing, _ := ts.do(missingOps[i].method, missingOps[i].path, missingOps[i].body, who)
+			st, got, _ := ts.do(o.method, o.path, o.body, who)
+			expect(t, st, got, 404, code)
+			if !bytes.Equal(got, missing) {
+				t.Fatalf("%s %s 的 404 正文与不存在的不同: %s / %s", o.method, o.path, got, missing)
+			}
+		}
+	}
+	for _, id := range []string{"s1", "s0"} {
+		check(session(cb), sessionOps(id), sessionOps("nope"), "session_not_found")
+	}
+	for _, id := range []string{turn, "t0"} {
+		check(session(cb), turnOps(id), turnOps("nope"), "turn_not_found")
+		check(session(cb), []op{{"GET", "/turns/" + id + "/raw/" + sha, ""}}, []op{{"GET", "/turns/nope/raw/" + sha, ""}}, "not_found")
+	}
+	st, b, _ = ts.do("GET", "/sessions", "", session(cb))
+	expect(t, st, b, 200, "")
+	if strings.Contains(string(b), "s1") || strings.Contains(string(b), "s0") {
+		t.Fatalf("用户 B 的会话列表含他人会话: %s", b)
+	}
+
+	// 运维：读全部，写 403。
+	st, b, _ = ts.do("GET", "/sessions/s1", "", adminAuth)
+	expect(t, st, b, 200, "")
+	if !strings.Contains(string(b), `"owner":"anna"`) || !strings.Contains(string(b), `"internal_state":"internal_idle"`) {
+		t.Fatalf("运维的会话视图 = %s", b)
+	}
+	st, b, _ = ts.do("GET", "/sessions", "", adminAuth)
+	expect(t, st, b, 200, "")
+	if !strings.Contains(string(b), `"session_id":"s0"`) || !strings.Contains(string(b), `"owner":"anna"`) {
+		t.Fatalf("运维的会话列表 = %s", b)
+	}
+	st, b, _ = ts.do("GET", "/sessions/s1/turns", "", adminAuth)
+	expect(t, st, b, 200, "")
+	st, b, _ = ts.do("GET", "/turns/"+turn+"/raw/"+sha, "", adminAuth)
+	expect(t, st, b, 200, "")
+	fs.appendRecord("s1", SessionEventRecord{Source: "session", Type: SEvSessionState, Payload: json.RawMessage(`{"state":"closed"}`)})
+	st, b, _ = ts.do("GET", "/sessions/s1/events", "", adminAuth)
+	expect(t, st, b, 200, "")
+	if frames := readAllFrames(b); len(frames) != 2 || !strings.Contains(frames[0].data, `"internal":{"source":"session"`) {
+		t.Fatalf("运维的事件流 = %+v", frames)
+	}
+	adminWrites := append([]op{{"POST", "/sessions", `{"request_id":"adm"}`}}, sessionOps("s1")...)
+	adminWrites = append(adminWrites, turnOps(turn)...)
+	for _, o := range adminWrites {
+		if o.method == "GET" {
+			continue
+		}
+		st, got, _ := ts.do(o.method, o.path, o.body, adminAuth)
+		expect(t, st, got, 403, "forbidden")
+	}
+
+	// A 自己的会话进入 closed 后对 A 也是 404（运维仍可读）。
+	fs.setState("s1", "closed")
+	st, b, _ = ts.do("GET", "/sessions/s1", "", session(ca))
+	expect(t, st, b, 404, "session_not_found")
+	st, b, _ = ts.do("POST", "/turns/"+turn+"/stop", `{"request_id":"after-close"}`, session(ca))
+	expect(t, st, b, 404, "turn_not_found")
+	st, b, _ = ts.do("GET", "/sessions/s1", "", adminAuth)
+	expect(t, st, b, 200, "")
+
+	ts.mu.Lock()
+	logs := ts.logs.String()
+	ts.mu.Unlock()
+	if strings.Contains(logs, secretText) || strings.Contains(logs, ca) || strings.Contains(logs, cb) {
+		t.Fatalf("日志含消息正文或会话 cookie: %s", logs)
+	}
+}
+
+// TestSessionCRUD：标题校验（创建 ≤ 80，重命名 1–80）、重命名、删除为 202 closing（重复删除仍 202）、关闭中的会话
+// 重命名与发消息 409 session_closed；wake 202 无正文；列表的 limit 与游标校验；创建以 request_id 幂等，他人重用为冲突。
+func TestSessionCRUD(t *testing.T) {
+	ts, acc, _ := newSessionServer(t, nil)
+	_, ca := acc.seedUser(t, "anna")
+	_, cb := acc.seedUser(t, "ben")
+
+	st, b, _ := ts.do("POST", "/sessions", `{"request_id":"c1","title":"`+strings.Repeat("长", 81)+`"}`, session(ca))
+	expect(t, st, b, 400, "invalid_title")
+	st, b, _ = ts.do("POST", "/sessions", `{"request_id":"c1","title":"  电池研究  "}`, session(ca))
+	expect(t, st, b, 201, "")
+	if !strings.Contains(string(b), `"title":"电池研究"`) {
+		t.Fatalf("创建 = %s", b)
+	}
+	st, b, _ = ts.do("POST", "/sessions", `{"request_id":"c1","title":"  电池研究  "}`, session(ca))
+	expect(t, st, b, 201, "")
+	if !strings.Contains(string(b), `"session_id":"s1"`) {
+		t.Fatalf("重放应返回首次创建的会话: %s", b)
+	}
+	st, b, _ = ts.do("POST", "/sessions", `{"request_id":"c1","title":"  电池研究  "}`, session(cb))
+	expect(t, st, b, 409, "request_conflict")
+
+	for _, title := range []string{`"   "`, strconv.Quote(strings.Repeat("x", 81))} {
+		st, b, _ = ts.do("PATCH", "/sessions/s1", `{"title":`+title+`}`, session(ca))
+		expect(t, st, b, 400, "invalid_title")
+	}
+	st, b, _ = ts.do("PATCH", "/sessions/s1", `{"title":" 新名字 "}`, session(ca))
+	expect(t, st, b, 200, "")
+	if !strings.Contains(string(b), `"title":"新名字"`) {
+		t.Fatalf("重命名 = %s", b)
+	}
+
+	st, b, h := ts.do("POST", "/sessions/s1/wake", `{"request_id":"w1"}`, session(ca))
+	expect(t, st, b, 202, "")
+	if len(b) != 0 || h.Get("Content-Type") != "" {
+		t.Fatalf("wake 应为无正文的 202: %q %v", b, h)
+	}
+	st, b, _ = ts.do("POST", "/sessions/s1/wake", `{}`, session(ca))
+	expect(t, st, b, 400, "invalid_request")
+
+	for _, q := range []string{"?limit=0", "?limit=201", "?limit=x"} {
+		st, b, _ = ts.do("GET", "/sessions"+q, "", session(ca))
+		expect(t, st, b, 400, "invalid_request")
+	}
+	st, b, _ = ts.do("GET", "/sessions?after=%27%3B", "", session(ca))
+	expect(t, st, b, 400, "invalid_cursor")
+	st, b, _ = ts.do("POST", "/sessions", `{"request_id":"c2"}`, session(ca))
+	expect(t, st, b, 201, "")
+	var newer SessionView
+	decodeJSONBody(t, b, &newer)
+	st, b, _ = ts.do("GET", "/sessions?limit=1", "", session(ca))
+	expect(t, st, b, 200, "")
+	var page sessionListJSON
+	decodeJSONBody(t, b, &page)
+	if len(page.Sessions) != 1 || page.Sessions[0].SessionID != newer.SessionID || page.Next != newer.SessionID {
+		t.Fatalf("第一页 = %s", b)
+	}
+	st, b, _ = ts.do("GET", "/sessions?limit=1&after="+newer.SessionID, "", session(ca))
+	expect(t, st, b, 200, "")
+	decodeJSONBody(t, b, &page)
+	if len(page.Sessions) != 1 || page.Sessions[0].SessionID != "s1" {
+		t.Fatalf("第二页 = %s", b)
+	}
+
+	st, b, _ = ts.do("DELETE", "/sessions/s1", "", session(ca))
+	expect(t, st, b, 202, "")
+	if !strings.Contains(string(b), `"state":"closing"`) {
+		t.Fatalf("删除 = %s", b)
+	}
+	st, b, _ = ts.do("DELETE", "/sessions/s1", "", session(ca))
+	expect(t, st, b, 202, "")
+	st, b, _ = ts.do("PATCH", "/sessions/s1", `{"title":"x"}`, session(ca))
+	expect(t, st, b, 409, "session_closed")
+	st, b, _ = ts.do("POST", "/sessions/s1/messages", `{"request_id":"m","text":"x","deep_research":false}`, session(ca))
+	expect(t, st, b, 409, "session_closed")
+	st, b, _ = ts.do("POST", "/sessions/s1/wake", `{"request_id":"w2"}`, session(ca))
+	expect(t, st, b, 409, "session_closed")
+}
+
+// TestSessionMessages：正文校验（去首尾空白 1–4000，deep_research 必填）；TurnSpec 得到去空白的文本，limits 规范化后
+// 随 turn 存储；运行中再发消息 409 turn_in_progress；paused 时 202 并带 superseded_turn_id；同 request_id 重放返回
+// 首次结果；他人会话不能重用 request_id；每用户 1 个运行中为 409 user_task_running；turn 列表按 turn_index 分页。
+func TestSessionMessages(t *testing.T) {
+	ts, acc, fs := newSessionServer(t, nil)
+	a, ca := acc.seedUser(t, "anna")
+	st, b, _ := ts.do("POST", "/sessions", `{"request_id":"c1"}`, session(ca))
+	expect(t, st, b, 201, "")
+
+	for _, body := range []string{
+		`{"request_id":"m","text":"   ","deep_research":false}`,
+		`{"request_id":"m","text":"` + strings.Repeat("字", 4001) + `","deep_research":false}`,
+	} {
+		st, b, _ = ts.do("POST", "/sessions/s1/messages", body, session(ca))
+		expect(t, st, b, 400, "invalid_text")
+	}
+	for _, body := range []string{`{"request_id":"m","text":"x"}`, `{"request_id":"m","text":"x","deep_research":false,"model":"gpt"}`, `{"text":"x","deep_research":false}`} {
+		st, b, _ = ts.do("POST", "/sessions/s1/messages", body, session(ca))
+		expect(t, st, b, 400, "invalid_request")
+	}
+
+	st, b, _ = ts.do("POST", "/sessions/s1/messages", `{"request_id":"m1","text":"  什么是固态电池？  ","deep_research":true}`, session(ca))
+	expect(t, st, b, 202, "")
+	var first CreateTurnResult
+	decodeJSONBody(t, b, &first)
+	fs.mu.Lock()
+	req := fs.lastTurn
+	fs.mu.Unlock()
+	if req.Text != "什么是固态电池？" || !req.DeepResearch || req.OwnerUserID != a.ID || req.SessionID != "s1" || req.RestoredFromTaskID != "" ||
+		string(req.Limits) != `{"max_tool_calls":30}` || !strings.Contains(string(req.Spec), `"text":"什么是固态电池？"`) || req.MaxFaultRetries != 3 {
+		t.Fatalf("CreateTurn 请求 = %+v (spec %s, limits %s)", req, req.Spec, req.Limits)
+	}
+	st, b, _ = ts.do("POST", "/sessions/s1/messages", `{"request_id":"m1","text":"  什么是固态电池？  ","deep_research":true}`, session(ca))
+	expect(t, st, b, 202, "")
+	var again CreateTurnResult
+	decodeJSONBody(t, b, &again)
+	if again.TurnID != first.TurnID {
+		t.Fatalf("重放 = %s，首次 %+v", b, first)
+	}
+
+	for _, status := range []string{"queued", "running", "stopping"} {
+		fs.setTurnStatus(first.TurnID, status)
+		st, b, _ = ts.do("POST", "/sessions/s1/messages", `{"request_id":"m2","text":"再问","deep_research":false}`, session(ca))
+		expect(t, st, b, 409, "turn_in_progress")
+	}
+	fs.setTurnStatus(first.TurnID, "paused")
+	st, b, _ = ts.do("POST", "/sessions/s1/messages", `{"request_id":"m2","text":"再问","deep_research":false}`, session(ca))
+	expect(t, st, b, 202, "")
+	var second CreateTurnResult
+	decodeJSONBody(t, b, &second)
+	if second.SupersededTurnID != first.TurnID || second.TurnIndex != 1 || !strings.Contains(string(b), `"superseded_turn_id":"`+first.TurnID+`"`) {
+		t.Fatalf("取代暂停的 turn = %s", b)
+	}
+
+	fs.mu.Lock()
+	fs.failTurn = fmt.Errorf("CreateTurn: %w", ErrUserTaskRunning)
+	fs.mu.Unlock()
+	st, b, _ = ts.do("POST", "/sessions/s1/messages", `{"request_id":"m3","text":"三","deep_research":false}`, session(ca))
+	expect(t, st, b, 409, "user_task_running")
+
+	_, cb := acc.seedUser(t, "ben")
+	st, b, _ = ts.do("POST", "/sessions", `{"request_id":"cb"}`, session(cb))
+	expect(t, st, b, 201, "")
+	st, b, _ = ts.do("POST", "/sessions/s2/messages", `{"request_id":"m1","text":"  什么是固态电池？  ","deep_research":true}`, session(cb))
+	expect(t, st, b, 409, "request_conflict")
+
+	st, b, _ = ts.do("GET", "/sessions/s1/turns", "", session(ca))
+	expect(t, st, b, 200, "")
+	var tl turnListJSON
+	decodeJSONBody(t, b, &tl)
+	if len(tl.Turns) != 2 || tl.Turns[0].TurnIndex != 0 || tl.Turns[0].Status != "cancelled" || tl.Turns[0].StatusReason != "superseded" ||
+		!tl.Turns[0].Restorable || strings.Contains(string(b), `"next"`) {
+		t.Fatalf("turn 列表 = %s", b)
+	}
+	st, b, _ = ts.do("GET", "/sessions/s1/turns?after_index=0&limit=5", "", session(ca))
+	expect(t, st, b, 200, "")
+	decodeJSONBody(t, b, &tl)
+	if len(tl.Turns) != 1 || tl.Turns[0].TurnID != second.TurnID {
+		t.Fatalf("after_index=0 = %s", b)
+	}
+	for _, q := range []string{"?after_index=-1", "?after_index=x", "?limit=0"} {
+		st, b, _ = ts.do("GET", "/sessions/s1/turns"+q, "", session(ca))
+		expect(t, st, b, 400, "invalid_request")
+	}
+}
+
+// TestTurnControls：stop/continue/finish/answer 写入控制并回答 202 {turn_id, control_version}；状态不符 409
+// invalid_turn_state；answers 不是 1–3 项、question_id 为空、choice 与 other 不是恰一个时 400 invalid_answers，合法的
+// answers 规范化后交给存储；restore 以源 turn 的文本、deep_research = true 开新 turn，不可恢复时 409 not_restorable。
+func TestTurnControls(t *testing.T) {
+	ts, acc, fs := newSessionServer(t, nil)
+	a, ca := acc.seedUser(t, "anna")
+	fs.addSession("s1", a.ID, "idle")
+	fs.addTurn("s1", "t1", "running")
+
+	st, b, _ := ts.do("POST", "/turns/t1/stop", `{"request_id":"r1"}`, session(ca))
+	expect(t, st, b, 202, "")
+	if string(bytes.TrimSpace(b)) != `{"turn_id":"t1","control_version":1}` {
+		t.Fatalf("stop = %s", b)
+	}
+	st, b, _ = ts.do("POST", "/turns/t1/stop", `{"request_id":"r1"}`, session(ca))
+	expect(t, st, b, 202, "") // 重放
+	st, b, _ = ts.do("POST", "/turns/t1/continue", `{"request_id":"r1"}`, session(ca))
+	expect(t, st, b, 409, "request_conflict") // 同 request_id 用于另一种操作
+	st, b, _ = ts.do("POST", "/turns/t1/continue", `{"request_id":"r2"}`, session(ca))
+	expect(t, st, b, 409, "invalid_turn_state")
+	fs.mu.Lock()
+	fs.failControl = fmt.Errorf("TurnControl: %w", ErrInvalidTurnState)
+	fs.mu.Unlock()
+	fs.setTurnStatus("t1", "paused")
+	st, b, _ = ts.do("POST", "/turns/t1/continue", `{"request_id":"r3"}`, session(ca))
+	expect(t, st, b, 409, "invalid_turn_state")
+	st, b, _ = ts.do("POST", "/turns/t1/finish", `{"request_id":"r4"}`, session(ca))
+	expect(t, st, b, 202, "")
+
+	fs.setTurnStatus("t1", "awaiting_input")
+	for _, answers := range []string{
+		`[]`,
+		`[{"question_id":"q1","choice":"A"},{"question_id":"q2","choice":"A"},{"question_id":"q3","choice":"A"},{"question_id":"q4","choice":"A"}]`,
+		`[{"question_id":"","choice":"A"}]`,
+		`[{"question_id":"q1"}]`,
+		`[{"question_id":"q1","choice":"A","other":"B"}]`,
+		`[{"question_id":"q1","other":"  "}]`,
+	} {
+		st, b, _ = ts.do("POST", "/turns/t1/answer", `{"request_id":"a1","answers":`+answers+`}`, session(ca))
+		expect(t, st, b, 400, "invalid_answers")
+	}
+	st, b, _ = ts.do("POST", "/turns/t1/answer", `{"request_id":"a1"}`, session(ca))
+	expect(t, st, b, 400, "invalid_answers")
+	st, b, _ = ts.do("POST", "/turns/t1/answer", `{"request_id":"a1","answers":[{"question_id":"q1","choice":"A","extra":1}]}`, session(ca))
+	expect(t, st, b, 400, "invalid_request")
+	st, b, _ = ts.do("POST", "/turns/t1/answer", `{"request_id":"a1","answers":[{"other":"自己的说法","question_id":"q-2-1"},{"question_id":"q-2-2","choice":"B"}]}`, session(ca))
+	expect(t, st, b, 202, "")
+	fs.mu.Lock()
+	ctl := fs.lastControl
+	fs.mu.Unlock()
+	if ctl.Action != "answer" || ctl.TaskID != "t1" || string(ctl.Answers) != `[{"other":"自己的说法","question_id":"q-2-1"},{"choice":"B","question_id":"q-2-2"}]` {
+		t.Fatalf("answer 控制 = %+v (%s)", ctl, ctl.Answers)
+	}
+	st, b, _ = ts.do("POST", "/turns/t1/stop", `{"request_id":"r5"}`, session(ca))
+	expect(t, st, b, 409, "invalid_turn_state")
+
+	// restore：源 turn 未取消 → not_restorable；取消后以源文本开新 turn。
+	st, b, _ = ts.do("POST", "/turns/t1/restore", `{"request_id":"re1"}`, session(ca))
+	expect(t, st, b, 409, "not_restorable")
+	fs.setTurnStatus("t1", "cancelled")
+	st, b, _ = ts.do("POST", "/turns/t1/restore", `{"request_id":"re2"}`, session(ca))
+	expect(t, st, b, 202, "")
+	var res CreateTurnResult
+	decodeJSONBody(t, b, &res)
+	fs.mu.Lock()
+	req := fs.lastTurn
+	fs.mu.Unlock()
+	if res.TurnIndex != 1 || req.RestoredFromTaskID != "t1" || req.Text != "问题 t1" || !req.DeepResearch || req.SessionID != "s1" ||
+		!strings.Contains(string(req.Spec), `"deep_research":true`) {
+		t.Fatalf("restore = %s，CreateTurn 请求 %+v", b, req)
+	}
+	st, b, _ = ts.do("POST", "/turns/t1/restore", `{"request_id":"re3"}`, session(ca))
+	expect(t, st, b, 409, "turn_in_progress") // 新 turn 仍在排队
+}
+
+// openSessionStream 打开整会话事件流（断言 200 与 text/event-stream）。
+func (ts *testServer) openSessionStream(sessionID string, hdr map[string]string) (*http.Response, *bufio.Reader) {
+	ts.t.Helper()
+	req, err := http.NewRequest("GET", ts.srv.URL+"/sessions/"+sessionID+"/events", nil)
+	if err != nil {
+		ts.t.Fatal(err)
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	resp, err := ts.srv.Client().Do(req)
+	if err != nil {
+		ts.t.Fatal(err)
+	}
+	ts.checkDeclared(req, resp.StatusCode)
+	if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		b, _ := io.ReadAll(resp.Body)
+		ts.t.Fatalf("打开会话事件流: %d %s", resp.StatusCode, b)
+	}
+	return resp, bufio.NewReader(resp.Body)
+}
+
+// readEventFrames 读取 n 个事件帧（跳过心跳）。
+func readEventFrames(t *testing.T, r *bufio.Reader, n int) []sseFrame {
+	t.Helper()
+	var out []sseFrame
+	for len(out) < n {
+		f, err := readFrame(r)
+		if err != nil {
+			t.Fatalf("读取事件帧: %v（已读 %+v）", err, out)
+		}
+		if !f.comment {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// TestSessionSSE：5 条记录中 1 条对用户不可见，用户收到 4 条、id 为各自的 session_seq，data 为对外事件（无
+// internal）；turn 的 task_terminal 不关闭流；Last-Event-ID 3（不可见记录的 seq）续传不重复；超出最新 400；
+// session_state{closed} 之后服务端关闭；心跳为注释行。
+func TestSessionSSE(t *testing.T) {
+	ts, acc, fs := newSessionServer(t, func(c *Config) { c.Heartbeat = 20 * time.Millisecond })
+	a, ca := acc.seedUser(t, "anna")
+	fs.addSession("s1", a.ID, "idle")
+	fs.addSession("s2", a.ID, "idle")
+	for _, r := range []SessionEventRecord{
+		{Source: "session", Type: SEvSessionState, Payload: json.RawMessage(`{"state":"idle"}`)},
+		{TaskID: "t1", TaskSeq: 1, Source: "host", Type: "task_created", Payload: json.RawMessage(`{"turn_index":0,"text":"你好","deep_research":false,"spec":{"model":"kimi-k3"}}`)},
+		{TaskID: "t1", TaskSeq: 2, Source: "host", Type: "control_accepted", Payload: json.RawMessage(`{"desired":"pause","control_version":2}`)},
+		{TaskID: "t1", TaskSeq: 3, AttemptID: "att_1", Source: "worker", Type: "progress", Payload: json.RawMessage(`{"step_id":"orch","kind":"thinking","data":{"text":"想","usage":{"total_tokens":3}}}`)},
+		{TaskID: "t1", TaskSeq: 4, AttemptID: "att_1", Source: "host", Type: EventTaskTerminal, Payload: json.RawMessage(`{"attempt_id":"att_1","task_status":"succeeded","status_reason":"ok"}`)},
+	} {
+		fs.appendRecord("s1", r)
+	}
+
+	resp, r := ts.openSessionStream("s1", session(ca))
+	frames := readEventFrames(t, r, 4)
+	resp.Body.Close()
+	var ids, types []string
+	for _, f := range frames {
+		ids, types = append(ids, f.id), append(types, f.event)
+		var ev SessionEvent
+		decodeJSONBody(t, []byte(f.data), &ev)
+		if strconv.FormatInt(ev.Seq, 10) != f.id || ev.Type != f.event || ev.Internal != nil ||
+			strings.Contains(f.data, "usage") || strings.Contains(f.data, "att_1") || strings.Contains(f.data, "kimi") {
+			t.Fatalf("事件帧 = %+v", f)
+		}
+	}
+	if !slices.Equal(ids, []string{"1", "2", "4", "5"}) || !slices.Equal(types, []string{SEvSessionState, SEvTurnCreated, SEvThinking, SEvTurnStatus}) {
+		t.Fatalf("用户收到 ids %v types %v", ids, types)
+	}
+
+	// 续传：Last-Event-ID 3 指向不可见记录，之后的 4、5 不重复；task_terminal 后流不关闭，closed 后关闭。
+	hdr := session(ca)
+	hdr["Last-Event-ID"] = "3"
+	resp, r = ts.openSessionStream("s1", hdr)
+	defer resp.Body.Close()
+	frames = readEventFrames(t, r, 2)
+	if frames[0].id != "4" || frames[1].id != "5" {
+		t.Fatalf("续传 = %+v", frames)
+	}
+	for _, c := range []string{"6", "abc", "-1"} {
+		h := session(ca)
+		h["Last-Event-ID"] = c
+		st, b, _ := ts.do("GET", "/sessions/s1/events", "", h)
+		expect(t, st, b, 400, "invalid_cursor")
+	}
+	fs.appendRecord("s1", SessionEventRecord{Source: "session", Type: SEvSessionState, Payload: json.RawMessage(`{"state":"closed"}`)})
+	fs.appendRecord("s1", SessionEventRecord{Source: "session", Type: SEvSessionState, Payload: json.RawMessage(`{"state":"idle"}`)}) // 不应发送
+	var rest []string
+	for {
+		f, err := readFrame(r)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !f.comment {
+			rest = append(rest, f.id+"/"+f.data)
+		}
+	}
+	if len(rest) != 1 || !strings.HasPrefix(rest[0], `6/`) || !strings.Contains(rest[0], `"state":"closed"`) {
+		t.Fatalf("closed 之后应关闭流: %v", rest)
+	}
+
+	// 运维看到全部记录：不可见的记录以 internal 类型出现，每条带原始记录。
+	st, b, _ := ts.do("GET", "/sessions/s1/events", "", adminAuth)
+	expect(t, st, b, 200, "")
+	all := readAllFrames(b)
+	if len(all) != 6 || all[2].event != SEvInternal || !strings.Contains(all[2].data, `"internal":{"source":"host","type":"control_accepted"`) ||
+		!strings.Contains(all[3].data, `"usage"`) {
+		t.Fatalf("运维事件流 = %+v", all)
+	}
+
+	// 心跳：没有事件时只有注释行。
+	resp2, r2 := ts.openSessionStream("s2", session(ca))
+	defer resp2.Body.Close()
+	if f, err := readFrame(r2); err != nil || !f.comment || f.id != "" {
+		t.Fatalf("期望注释行心跳，得到 %+v, %v", f, err)
+	}
+}
+
+// TestTurnRaw：用户得到脱敏的原文（无 usage、顶层 id），运维原样；Content-Disposition attachment、nosniff；非 JSON
+// 为 octet-stream；未授权 sha 与非法 sha 404 not_found；内容与 sha256 不符 500 blob_unavailable。
+func TestTurnRaw(t *testing.T) {
+	ts, acc, fs := newSessionServer(t, nil)
+	a, ca := acc.seedUser(t, "anna")
+	fs.addSession("s1", a.ID, "idle")
+	fs.addTurn("s1", "t1", "running")
+	put := func(content string) string {
+		sum := sha256.Sum256([]byte(content))
+		sha := hex.EncodeToString(sum[:])
+		ts.blobs.put(sha, []byte(content))
+		fs.mu.Lock()
+		fs.authorized["t1/"+sha] = true
+		fs.mu.Unlock()
+		return sha
+	}
+	raw := `{"id":"chatcmpl-1","model":"kimi-k3","choices":[{"message":{"content":"<答>"}}],"usage":{"prompt_tokens":5}}`
+	sha := put(raw)
+
+	st, b, h := ts.do("GET", "/turns/t1/raw/"+sha, "", session(ca))
+	expect(t, st, b, 200, "")
+	if strings.Contains(string(b), "usage") || strings.Contains(string(b), "chatcmpl-1") || strings.Contains(string(b), "kimi") || !strings.Contains(string(b), "<答>") {
+		t.Fatalf("用户原文未脱敏: %s", b)
+	}
+	if h.Get("Content-Type") != "application/json" || !strings.HasPrefix(h.Get("Content-Disposition"), "attachment") || h.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("原文响应头 = %v", h)
+	}
+	st, b, _ = ts.do("GET", "/turns/t1/raw/"+sha, "", adminAuth)
+	expect(t, st, b, 200, "")
+	if string(b) != raw {
+		t.Fatalf("运维原文被改动: %s", b)
+	}
+
+	text := put("plain text, not json")
+	st, b, h = ts.do("GET", "/turns/t1/raw/"+text, "", session(ca))
+	expect(t, st, b, 200, "")
+	if string(b) != "plain text, not json" || h.Get("Content-Type") != "application/octet-stream" {
+		t.Fatalf("非 JSON 原文 = %q %v", b, h)
+	}
+
+	_, missing, _ := ts.do("GET", "/turns/nope/raw/"+sha, "", session(ca))
+	for _, s := range []string{strings.Repeat("cd", 32), strings.ToUpper(sha), "abc", sha + "0"} {
+		st, b, _ = ts.do("GET", "/turns/t1/raw/"+s, "", session(ca))
+		expect(t, st, b, 404, "not_found")
+		if !bytes.Equal(b, missing) {
+			t.Fatalf("原文 404 正文不同: %s / %s", b, missing)
+		}
+	}
+
+	tampered := strings.Repeat("ef", 32)
+	ts.blobs.put(tampered, []byte(`{"x":1}`))
+	fs.mu.Lock()
+	fs.authorized["t1/"+tampered] = true
+	fs.mu.Unlock()
+	st, b, _ = ts.do("GET", "/turns/t1/raw/"+tampered, "", session(ca))
+	expect(t, st, b, 500, "blob_unavailable")
+}
+
+// TestSessionsUnavailable：启用账号而未配置会话（Sessions 为 nil）时每个会话操作 503 sessions_unavailable（认证之后）；
+// 未启用账号时会话端点不存在；配置 Sessions 而缺少账号或 TurnSpec 时拒绝启动。
+func TestSessionsUnavailable(t *testing.T) {
+	ts, acc := newAccountServer(t, nil)
+	_, ca := acc.seedUser(t, "anna")
+	for _, op := range sessionOperations {
+		method, path, _ := strings.Cut(op, " ")
+		path = strings.NewReplacer("{id}", "x1", "{sha256}", strings.Repeat("ab", 32)).Replace(path)
+		who := session(ca)
+		if method == "GET" {
+			who = adminAuth
+		}
+		st, b, _ := ts.do(method, path, `{"request_id":"r"}`, who)
+		expect(t, st, b, 503, "sessions_unavailable")
+		st, b, _ = ts.do(method, path, `{"request_id":"r"}`, nil)
+		expect(t, st, b, 401, "unauthorized")
+	}
+
+	plain := newTestServer(t, nil)
+	st, b, _ := plain.do("GET", "/sessions", "", nil)
+	expect(t, st, b, 404, "not_found")
+
+	fs := newFakeSessions()
+	if _, err := New(Config{Store: newFakeStore(), Blobs: &fakeBlobs{}, ListenAddr: "127.0.0.1:1", Sessions: fs, TurnSpec: testTurnSpec}); err == nil {
+		t.Fatal("会话需要启用账号")
+	}
+	if _, err := New(Config{Store: newFakeStore(), Blobs: &fakeBlobs{}, ListenAddr: "127.0.0.1:1", Sessions: fs,
+		Accounts: newFakeAccounts(newFakeStore()), ResearchSpec: testResearchSpec}); err == nil {
+		t.Fatal("会话需要 TurnSpec")
 	}
 }

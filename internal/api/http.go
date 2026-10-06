@@ -98,6 +98,15 @@ type Config struct {
 	ResearchSpec  func(topic string) (json.RawMessage, error)
 	SecureCookies bool             // TLS 监听时为 true
 	Now           func() time.Time // 测试注入；nil 为 time.Now
+
+	// 会话端点（M4 Plan 12）只在启用账号时注册。Sessions 为 nil（server 未配置会话 Worker）时会话端点一律
+	// 503 sessions_unavailable。
+	Sessions Sessions
+	// TurnSpec 由消息生成 turn 的 spec 与 limits（server 固定模型；limits 含 max_tool_calls = --turn-tool-budget）。
+	// Sessions 非 nil 时必填。
+	TurnSpec func(text string, deepResearch bool) (spec, limits json.RawMessage, err error)
+	// NewSessionID 生成会话 ID（测试注入）；nil 时为 128 位随机十六进制。
+	NewSessionID func() string
 }
 
 // Handler 实现 api/openapi.yaml 描述的 REST 与 SSE 接口。
@@ -222,6 +231,12 @@ func New(cfg Config) (*Handler, error) {
 	}
 	if h.cfg.NewTaskID == nil {
 		h.cfg.NewTaskID = randomTaskID
+	}
+	if h.cfg.NewSessionID == nil {
+		h.cfg.NewSessionID = randomSessionID
+	}
+	if cfg.Sessions != nil && (cfg.Accounts == nil || cfg.TurnSpec == nil) {
+		return nil, errors.New("api: 会话（Sessions）需要启用账号（Accounts）与 TurnSpec")
 	}
 	active := routes
 	if cfg.Accounts != nil {
