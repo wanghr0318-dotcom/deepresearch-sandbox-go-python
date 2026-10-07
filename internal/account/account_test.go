@@ -62,9 +62,28 @@ func TestUsernameAndPasswordRules(t *testing.T) {
 			t.Fatalf("%q 应被拒绝", bad)
 		}
 	}
-	if ValidatePassword("1234567") == nil || ValidatePassword("12345678") != nil ||
-		ValidatePassword(strings.Repeat("密", 128)) != nil || ValidatePassword(strings.Repeat("密", 129)) == nil {
-		t.Fatal("密码长度规则错误")
+}
+
+func TestValidatePassword(t *testing.T) {
+	ok := []string{"abcdefG1", "ABCDEFG1", "abcdefgH", "Abcdefghijklmnop", "12345678a", "密码abcD1234"}
+	bad := []string{
+		"abcdeG1",           // 7 位
+		"abcdefghijklmnoP1", // 17 位
+		"abcdefgh",          // 只有小写
+		"ABCDEFGH",          // 只有大写
+		"12345678",          // 只有数字
+		"密码密码密码密码",          // 无任何一类
+		"!!!!!!!!a",         // 只有一类
+	}
+	for _, pw := range ok {
+		if err := ValidatePassword(pw); err != nil {
+			t.Errorf("%q 应当通过：%v", pw, err)
+		}
+	}
+	for _, pw := range bad {
+		if ValidatePassword(pw) == nil {
+			t.Errorf("%q 应当被拒绝", pw)
+		}
 	}
 }
 

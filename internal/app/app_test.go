@@ -1526,7 +1526,7 @@ func TestAccountsWiring(t *testing.T) {
 		return resp, b
 	}
 
-	resp, b := do("POST", "/auth/register", `{"username":"Alice","password":"correct horse"}`, nil)
+	resp, b := do("POST", "/auth/register", `{"username":"Alice","password":"Passw0rdX"}`, nil)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("POST /auth/register = %d %s", resp.StatusCode, b)
 	}
@@ -1581,7 +1581,7 @@ func TestAccountsWiring(t *testing.T) {
 // userSession 注册用户并返回带会话 cookie 的请求函数。
 func userSession(t *testing.T, base, name string) func(method, path, body string) (int, []byte) {
 	t.Helper()
-	resp, err := http.Post(base+"/auth/register", "application/json", strings.NewReader(`{"username":"`+name+`","password":"correct horse"}`))
+	resp, err := http.Post(base+"/auth/register", "application/json", strings.NewReader(`{"username":"`+name+`","password":"Passw0rdX"}`))
 	if err != nil {
 		t.Fatal(err)
 	}

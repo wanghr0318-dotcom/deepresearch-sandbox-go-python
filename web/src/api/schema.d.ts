@@ -671,6 +671,7 @@ export interface components {
         };
         Credentials: {
             username: string;
+            /** @description Registration requires 8–16 characters with at least two of digits, uppercase and lowercase letters; login accepts any stored password */
             password: string;
         };
         User: {
@@ -1674,7 +1675,7 @@ export interface operations {
                     "application/json": components["schemas"]["User"];
                 };
             };
-            /** @description `invalid_request`, `invalid_username` (3–32 of `[A-Za-z0-9_.-]`) or `invalid_password` (8–128 characters) */
+            /** @description `invalid_request`, `invalid_username` (3–32 of `[A-Za-z0-9_.-]`) or `invalid_password` (8–16 characters, at least two of digits/upper/lower) */
             400: {
                 headers: {
                     [name: string]: unknown;

@@ -146,7 +146,7 @@ const USER_MESSAGES: Record<string, string> = {
   invalid_credentials: "用户名或密码错误",
   username_taken: "用户名已被使用",
   invalid_username: "用户名需为 3–32 位字母、数字、下划线、点或连字符",
-  invalid_password: "密码需为 8–128 个字符",
+  invalid_password: "密码须为 8–16 位，且至少包含数字、大写字母、小写字母中的两种",
   invalid_topic: "主题不能为空，且不超过 500 个字符",
   task_not_found: "找不到这项研究",
   unauthorized: "登录已过期，请重新登录",

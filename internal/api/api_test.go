@@ -1521,7 +1521,7 @@ func sessionCookie(t *testing.T, h http.Header) (*http.Cookie, string) {
 // 访问日志与响应不含会话 ID 与密码。
 func TestAuthRegisterLoginLogout(t *testing.T) {
 	ts, acc := newAccountServer(t, nil)
-	const pw = "correct-horse-1"
+	const pw = "Passw0rdX"
 	st, b, h := ts.do("POST", "/auth/register", `{"username":"Alice","password":"`+pw+`"}`, nil)
 	expect(t, st, b, 201, "")
 	var me userJSON
@@ -1539,11 +1539,17 @@ func TestAuthRegisterLoginLogout(t *testing.T) {
 		t.Fatalf("/auth/me = %s", b)
 	}
 
-	st, b, _ = ts.do("POST", "/auth/register", `{"username":"alice","password":"another-pass"}`, nil)
+	st, b, _ = ts.do("POST", "/auth/register", `{"username":"alice","password":"An0therPass"}`, nil)
 	expect(t, st, b, 409, "username_taken")
 	st, b, _ = ts.do("POST", "/auth/register", `{"username":"bob","password":"short"}`, nil)
 	expect(t, st, b, 400, "invalid_password")
-	st, b, _ = ts.do("POST", "/auth/register", `{"username":"b b","password":"long-enough"}`, nil)
+	// 长度够但只有小写一类：同样 400，正文给出新规则文案。
+	st, b, _ = ts.do("POST", "/auth/register", `{"username":"bob","password":"abcdefgh"}`, nil)
+	expect(t, st, b, 400, "invalid_password")
+	if !strings.Contains(string(b), "密码须为 8–16 位，且至少包含数字、大写字母、小写字母中的两种") {
+		t.Fatalf("invalid_password 文案 = %s", b)
+	}
+	st, b, _ = ts.do("POST", "/auth/register", `{"username":"b b","password":"Passw0rdX"}`, nil)
 	expect(t, st, b, 400, "invalid_username")
 
 	// 登录失败：三种原因的正文逐字节相同。

@@ -113,20 +113,20 @@ describe("RegisterView", () => {
     const k = kit({ register });
     const w = mount(RegisterView, { global: k.global });
 
-    await fill(w, { username: "a b", password: "password123", confirm: "password123" });
+    await fill(w, { username: "a b", password: "Passw0rdX", confirm: "Passw0rdX" });
     await w.get("form").trigger("submit");
     expect(w.get('[role="alert"]').text()).toContain("用户名需为 3–32 位");
 
-    await fill(w, { username: "alice", password: "short", confirm: "short" });
+    await fill(w, { username: "alice", password: "abcdefgh", confirm: "abcdefgh" });
     await w.get("form").trigger("submit");
-    expect(w.get('[role="alert"]').text()).toContain("8–128");
+    expect(w.get('[role="alert"]').text()).toContain("两种");
 
-    await fill(w, { password: "password123", confirm: "password999" });
+    await fill(w, { password: "Passw0rdX", confirm: "Passw0rd9" });
     await w.get("form").trigger("submit");
     expect(w.get('[role="alert"]').text()).toBe("两次输入的密码不一致");
     expect(register).not.toHaveBeenCalled();
 
-    await fill(w, { confirm: "password123" });
+    await fill(w, { confirm: "Passw0rdX" });
     await w.get("form").trigger("submit");
     await flushAll();
     expect(w.get('[role="alert"]').text()).toBe("用户名已被使用");
@@ -137,8 +137,29 @@ describe("RegisterView", () => {
 
     await w.get("form").trigger("submit");
     await flushAll();
-    expect(register).toHaveBeenLastCalledWith("alice", "password123");
+    expect(register).toHaveBeenLastCalledWith("alice", "Passw0rdX");
     expect(w.emitted("signed-in")).toEqual([[ALICE]]);
+  });
+
+  it("shows live password checks and disables submit until both pass", async () => {
+    const k = kit({ register: vi.fn() });
+    const w = mount(RegisterView, { global: k.global });
+    const check = (name: string) => w.get(`[data-testid="pw-checks"] [data-check="${name}"]`);
+    const submit = () => w.get('button[type="submit"]');
+
+    await fill(w, { username: "alice", password: "abc", confirm: "abc" });
+    for (const name of ["length", "classes"]) {
+      expect(check(name).text()).toContain("✗");
+      expect(check(name).classes()).not.toContain("ok");
+    }
+    expect(submit().attributes("disabled")).toBeDefined();
+
+    await fill(w, { password: "Passw0rdX", confirm: "Passw0rdX" });
+    for (const name of ["length", "classes"]) {
+      expect(check(name).text()).toContain("✓");
+      expect(check(name).classes()).toContain("ok");
+    }
+    expect(submit().attributes("disabled")).toBeUndefined();
   });
 });
 

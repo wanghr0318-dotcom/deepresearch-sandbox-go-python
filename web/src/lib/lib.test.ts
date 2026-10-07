@@ -206,3 +206,17 @@ describe("research helpers", () => {
     expect(canCancel(task({ status: "succeeded" }))).toBe(false);
   });
 });
+
+import { passwordChecks, passwordError, PASSWORD_RULE_TEXT } from "./password";
+
+describe("password rule", () => {
+  it("accepts 8–16 chars with two of digit/upper/lower", () => {
+    for (const pw of ["abcdefG1", "ABCDEFG1", "abcdefgH", "Abcdefghijklmnop", "密码abcD1234"]) expect(passwordError(pw)).toBe("");
+  });
+  it("rejects length or class violations", () => {
+    expect(passwordChecks("abcdeG1")).toEqual({ length: false, classes: true });
+    expect(passwordChecks("abcdefghijklmnoP1")).toEqual({ length: false, classes: true });
+    expect(passwordChecks("abcdefgh")).toEqual({ length: true, classes: false });
+    expect(passwordError("密码密码密码密码")).toBe(PASSWORD_RULE_TEXT);
+  });
+});

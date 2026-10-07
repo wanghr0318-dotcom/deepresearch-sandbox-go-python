@@ -75,7 +75,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/User'}
         '400':
-          description: '`invalid_request`, `invalid_username` (3–32 of `[A-Za-z0-9_.-]`) or `invalid_password` (8–128 characters)'
+          description: '`invalid_request`, `invalid_username` (3–32 of `[A-Za-z0-9_.-]`) or `invalid_password` (8–16 characters, at least two of digits/upper/lower)'
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
@@ -1051,7 +1051,7 @@ components:
       required: [username, password]
       properties:
         username: {type: string, minLength: 3, maxLength: 32, pattern: '^[A-Za-z0-9_.-]+$'}
-        password: {type: string, minLength: 8, maxLength: 128}
+        password: {type: string, minLength: 8, maxLength: 128, description: "Registration requires 8–16 characters with at least two of digits, uppercase and lowercase letters; login accepts any stored password"}
     User:
       type: object
       required: [username, role]
