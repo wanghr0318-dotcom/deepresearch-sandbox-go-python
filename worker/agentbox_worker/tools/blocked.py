@@ -11,7 +11,8 @@ _WEAK_MAX_CHARS = 300
 # 验证页特有的句子：正文或标题命中即判定。
 _STRONG = re.compile(
     r"正在进行安全检测|请完成安全验证|"
-    r"just a moment|checking your browser|cf-browser-verification|enable javascript and cookies|"
+    r"just a moment(?:\.\.\.|…)|checking your browser|cf-browser-verification|"
+    r"enable javascript and cookies|"
     r"verify you are human",
     re.IGNORECASE,
 )

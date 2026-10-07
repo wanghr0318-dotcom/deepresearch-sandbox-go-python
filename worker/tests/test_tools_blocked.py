@@ -33,5 +33,11 @@ def test_generic_words_only_count_in_short_bodies():
     assert is_blocked_page("Access Denied\nYou don't have permission to access this server.", "")
 
 
+def test_just_a_moment_needs_the_challenge_ellipsis():
+    assert not is_blocked_page("Wait just a moment while I explain the results of the survey.", "")
+    assert is_blocked_page("Just a moment…", "")
+    assert is_blocked_page("Just a moment...", "")
+
+
 def test_challenge_title_blocks_short_pages():
     assert is_blocked_page("请稍候，正在为您加载页面。", "Just a moment...")
