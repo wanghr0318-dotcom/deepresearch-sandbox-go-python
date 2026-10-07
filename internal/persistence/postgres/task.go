@@ -262,6 +262,12 @@ func (s *Store) ApplyControl(ctx context.Context, c task.ApplyControl) (task.Con
 		if err := lockEventSeq(ctx, tx, c.TaskID); err != nil {
 			return err
 		}
+		// 没有 attempt 的停止（queued → paused）同样给出停止卡，界面据此提供"继续 / 立即写报告"（停止修复 F2）。
+		if sessionID != "" && c.Status == "paused" {
+			if err := appendFallbackStopCard(ctx, tx, c.TaskID, fmt.Sprintf("turn_stopped_fallback:ctl:%d", c.ControlVersion), ""); err != nil {
+				return err
+			}
+		}
 		payload, _ := json.Marshal(map[string]any{"control_version": c.ControlVersion, "status": c.Status})
 		if _, err := appendHostEvent(ctx, tx, hostEvent{taskID: c.TaskID, key: fmt.Sprintf("control_applied:%d", c.ControlVersion),
 			typ: "control_applied", payload: payload}); err != nil {
@@ -461,7 +467,7 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 		}
 		// 会话 turn 的停止（paused/paused）没有得到 Worker 的停止卡时，在裁决之前补一张宿主停止卡（停止修复 F2）。
 		if turn != nil && v.TaskStatus == "paused" && v.TaskStatusReason == "paused" {
-			if err := appendFallbackStopCard(ctx, tx, v.TaskID, v.AttemptID); err != nil {
+			if err := appendFallbackStopCard(ctx, tx, v.TaskID, "turn_stopped_fallback:"+v.AttemptID, v.AttemptID); err != nil {
 				return err
 			}
 		}
@@ -477,21 +483,49 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 	return out, err
 }
 
-// appendFallbackStopCard 是宿主兜底停止卡（停止修复 F2）：会话 turn 的一次停止以暂停裁决结束（Worker 在 grace 内没有写出
-// 停止卡、被宿主强制结束，或停止期间宿主重启、由恢复给出结果），而该 attempt 没有 Worker 的 turn_stopped 时，追加一条
-// host 事件 turn_stopped（payload 即 api.FallbackTurnStopped 的 data，会话事件中与 Worker 停止卡同形）。
+// appendFallbackStopCard 是宿主兜底停止卡（停止修复 F2）：会话 turn 的一次停止以暂停结束——暂停裁决（Worker 在 grace 内
+// 没有写出停止卡、被宿主强制结束，或停止期间宿主重启、由恢复给出结果；key turn_stopped_fallback:<attempt_id>），或没有
+// attempt 的 queued → paused（key turn_stopped_fallback:ctl:<control_version>）——而自该 turn 最近一次停止请求
+// （control_accepted desired = pause）以来没有任何停止卡（Worker 或宿主写的 turn_stopped）时，追加一条 host 事件
+// turn_stopped（会话事件中与 Worker 停止卡同形）。每次停止至多一张卡。
 //
-// 与判决同一事务：判决提交即停止卡存在，崩溃时两者一同回滚、由重新裁决一同写入；判决重放在加锁后核对 verdict_hash 时
-// 已返回，event_key turn_stopped_fallback:<attempt_id> 另保证每个 attempt 至多一条。调用方持有 lockEventSeq（Worker 事件
-// 的追加因此已全部提交或被栅栏挡住）。
-func appendFallbackStopCard(ctx context.Context, tx pgx.Tx, taskID, attemptID string) error {
-	var hasCard bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM events WHERE task_id = $1 AND attempt_id = $2 AND source = 'worker'
-			AND type = 'progress' AND payload->>'kind' = $3)`, taskID, attemptID, api.SEvTurnStopped).Scan(&hasCard); err != nil {
+// 内容：该 turn 已有一张停止卡、且其后没有 Worker 进度（例如继续之后在启动或握手阶段再次停止）时，复用那张卡的 data
+// （真实的"目前发现"与计数），避免以通用文案覆盖界面上的真实摘要；否则为 api.FallbackTurnStopped 由事件推出的卡片。
+//
+// 与暂停的提交同一事务：暂停提交即停止卡存在，崩溃时两者一同回滚、由重新提交一同写入；重放在核对 verdict_hash 或已应用的
+// 控制版本时已返回，event_key 另保证幂等。调用方持有 lockEventSeq（Worker 事件的追加因此已全部提交或被栅栏挡住）。
+func appendFallbackStopCard(ctx context.Context, tx pgx.Tx, taskID, key, attemptID string) error {
+	var pauseSeq int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(max(task_seq), 0) FROM events WHERE task_id = $1 AND source = 'host'
+			AND type = 'control_accepted' AND payload->>'desired' = 'pause'`, taskID).Scan(&pauseSeq); err != nil {
 		return err
 	}
-	if hasCard {
+	var cardSeq int64
+	var cardSource string
+	var cardPayload []byte
+	err := tx.QueryRow(ctx, `SELECT task_seq, source, payload FROM events WHERE task_id = $1 AND
+			((source = 'worker' AND type = 'progress' AND payload->>'kind' = $2) OR (source = 'host' AND type = $2))
+			ORDER BY task_seq DESC LIMIT 1`, taskID, api.SEvTurnStopped).Scan(&cardSeq, &cardSource, &cardPayload)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+	case err != nil:
+		return err
+	case cardSeq > pauseSeq: // 本次停止已有停止卡
 		return nil
+	default:
+		var progressed bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM events WHERE task_id = $1 AND source = 'worker' AND type = 'progress'
+				AND task_seq > $2)`, taskID, cardSeq).Scan(&progressed); err != nil {
+			return err
+		}
+		if !progressed {
+			data, err := api.StopCardData(cardSource, cardPayload)
+			if err != nil {
+				return err
+			}
+			_, err = appendHostEvent(ctx, tx, hostEvent{taskID: taskID, key: key, attemptID: attemptID, typ: api.SEvTurnStopped, payload: data})
+			return err
+		}
 	}
 	rows, err := tx.Query(ctx, `SELECT payload FROM events WHERE task_id = $1 AND source = 'worker' AND type = 'progress'
 			AND payload->>'kind' IN ($2, $3, $4, $5) ORDER BY task_seq`,
@@ -517,8 +551,7 @@ func appendFallbackStopCard(ctx context.Context, tx pgx.Tx, taskID, attemptID st
 	if err != nil {
 		return err
 	}
-	_, err = appendHostEvent(ctx, tx, hostEvent{taskID: taskID, key: "turn_stopped_fallback:" + attemptID, attemptID: attemptID,
-		typ: api.SEvTurnStopped, payload: data})
+	_, err = appendHostEvent(ctx, tx, hostEvent{taskID: taskID, key: key, attemptID: attemptID, typ: api.SEvTurnStopped, payload: data})
 	return err
 }
 

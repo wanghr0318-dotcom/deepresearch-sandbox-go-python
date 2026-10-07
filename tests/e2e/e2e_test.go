@@ -6874,6 +6874,55 @@ func TestSessionStopCrashFallbackCard(t *testing.T) {
 	s.end()
 }
 
+// TestSessionStopQueuedFallbackCard（停止修复 F2）：--run-slots 1 下排队的 turn 被停止（queued → paused，没有 attempt）
+// 也得到恰好一张宿主停止卡（固定 findings，不可写报告），之后"继续"照常运行并成功。
+func TestSessionStopQueuedFallbackCard(t *testing.T) {
+	s := newSessionSys(t, "--run-slots", "1")
+	s.startS()
+	alice, bob := s.user("alice"), s.user("bob")
+	sa, sb := alice.createSession("cs-a"), bob.createSession("cs-b")
+	ra := alice.message(sa, "m-a", "searches=1 hold_ms=120000")
+	eventually(t, "alice 的 turn 占用 run slot", func() bool {
+		return len(swFind(s.swLog(sa), swEvent("search", "task_id", ra.TurnID))) == 1
+	})
+	rb := bob.message(sb, "m-b", "searches=1")
+	bob.waitTurn(sb, rb.TurnID, "排队", turnIs("queued"))
+	bob.control(rb.TurnID, "stop", "st-b")
+	bob.waitTurn(sb, rb.TurnID, "暂停", turnIs("paused"))
+	evs := bob.sse(sb, hasEventType("turn_stopped"))
+	var cards []string
+	for _, e := range evs {
+		var v struct {
+			Type string `json:"type"`
+			Data struct {
+				Findings  string `json:"findings"`
+				CanFinish bool   `json:"can_finish"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(e, &v) == nil && v.Type == "turn_stopped" {
+			if v.Data.Findings != api.FallbackStopFindings || v.Data.CanFinish {
+				t.Errorf("排队 turn 的停止卡 = %s", e)
+			}
+			cards = append(cards, string(e))
+		}
+	}
+	if len(cards) != 1 {
+		t.Fatalf("排队 turn 应恰有一张停止卡：%v", cards)
+	}
+	alice.control(ra.TurnID, "stop", "st-a")
+	alice.waitTurn(sa, ra.TurnID, "暂停", turnIs("paused"))
+	bob.control(rb.TurnID, "continue", "ct-b")
+	bob.waitTurn(sb, rb.TurnID, "继续后成功", turnIs("succeeded"))
+	var stored int
+	s.row("SELECT count(*) FROM events WHERE task_id = $1 AND type = 'turn_stopped'", []any{rb.TurnID}, &stored)
+	if stored != 1 {
+		t.Errorf("排队 turn 存储中的停止卡 %d 条", stored)
+	}
+	alice.closeSession(sa)
+	bob.closeSession(sb)
+	s.end()
+}
+
 // TestSessionAwaitingInput：ask_user → turn awaiting_input，run slot 归还（--run-slots 1 下另一用户的 turn 照常完成）
 // → answer → 同一 turn 从原位置继续并成功，Worker 收到 directive.answer（带待答提问的 question_id）。
 func TestSessionAwaitingInput(t *testing.T) {

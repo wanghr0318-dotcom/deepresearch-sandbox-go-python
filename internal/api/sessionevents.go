@@ -213,6 +213,17 @@ func FallbackTurnStopped(progress []json.RawMessage, used int64, limit *int64) (
 	return encodeJSON(map[string]any{"card": card, "findings": FallbackStopFindings, "can_finish": done > 0})
 }
 
+// StopCardData 取出已存储停止卡（Worker progress kind=turn_stopped 的 data，或宿主 turn_stopped 的 payload）的 data，
+// 只保留 card、findings、can_finish 并去掉内部键；宿主复用它作为同一 turn 再次停止时的停止卡（停止修复 F2）。
+func StopCardData(source string, payload []byte) ([]byte, error) {
+	v, _ := decodeJSON(payload)
+	obj, _ := v.(map[string]any)
+	if source == "worker" {
+		obj, _ = obj["data"].(map[string]any)
+	}
+	return encodeJSON(pick(obj, SEvTurnStopped))
+}
+
 func turnStatusData(taskStatus, reason string) (string, map[string]any, bool) {
 	s := UserTurnStatus(taskStatus, reason)
 	if !slices.Contains(userTurnStatuses, s) {

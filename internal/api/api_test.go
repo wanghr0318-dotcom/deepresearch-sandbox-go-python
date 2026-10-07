@@ -3649,4 +3649,18 @@ func TestHostTurnStoppedLooksLikeWorkerCard(t *testing.T) {
 	}
 }
 
+// TestStopCardData：复用已存储停止卡的 data（Worker 卡取 progress.data，宿主卡取 payload），只保留契约字段、去掉内部键。
+func TestStopCardData(t *testing.T) {
+	want := `{"can_finish":true,"card":{"sources":4},"findings":"真实发现"}`
+	for source, payload := range map[string]string{
+		"worker": `{"kind":"turn_stopped","step_id":"s","data":{"card":{"sources":4,"cost_micro":1},"findings":"真实发现","can_finish":true,"x":1}}`,
+		"host":   `{"card":{"sources":4,"model":"m"},"findings":"真实发现","can_finish":true}`,
+	} {
+		b, err := StopCardData(source, []byte(payload))
+		if err != nil || string(b) != want {
+			t.Errorf("%s：%s, %v", source, b, err)
+		}
+	}
+}
+
 // ==== 停止修复 F2 段结束 ====

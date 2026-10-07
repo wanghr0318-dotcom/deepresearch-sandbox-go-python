@@ -7281,13 +7281,18 @@ func TestHostFallbackTurnStopped(t *testing.T) {
 	hostStops := func(taskID string) int {
 		return count(t, s, "SELECT count(*) FROM events WHERE task_id = $1 AND source = 'host' AND type = 'turn_stopped'", taskID)
 	}
-	pause := func(taskID string, at task.NewAttempt, platformKilled bool) task.Verdict {
+	apply := func(taskID string, cv int64, status string) {
 		t.Helper()
-		ctl("stop-"+taskID, "stop", taskID)
-		if _, err := s.ApplyControl(ctx, task.ApplyControl{TaskID: taskID, ControlVersion: 2, Status: "pausing"}); err != nil {
-			t.Fatal(err)
+		if _, err := s.ApplyControl(ctx, task.ApplyControl{TaskID: taskID, ControlVersion: cv, Status: status}); err != nil {
+			t.Fatalf("ApplyControl %s@%d → %s: %v", taskID, cv, status, err)
 		}
-		v := turnVerdictFor(at, 2, "paused", "paused")
+	}
+	// pause：第 cv 版控制为停止，running → pausing → 暂停裁决。
+	pause := func(taskID string, at task.NewAttempt, cv int64, platformKilled bool) task.Verdict {
+		t.Helper()
+		ctl(fmt.Sprintf("stop-%s-%d", taskID, cv), "stop", taskID)
+		apply(taskID, cv, "pausing")
+		v := turnVerdictFor(at, cv, "paused", "paused")
 		v.FromStatus, v.PlatformKilled = "starting", platformKilled
 		if _, err := s.FinalizeAttempt(ctx, v); err != nil {
 			t.Fatalf("暂停裁决 %s: %v", taskID, err)
@@ -7315,7 +7320,7 @@ func TestHostFallbackTurnStopped(t *testing.T) {
 		Endpoint: "/v1/search", Deadline: time.Minute}); err != nil {
 		t.Fatal(err)
 	}
-	v := pause("ta", a1, true)
+	v := pause("ta", a1, 2, true)
 	if _, err := s.FinalizeAttempt(ctx, v); err != nil {
 		t.Fatalf("判决重放: %v", err)
 	}
@@ -7367,14 +7372,92 @@ func TestHostFallbackTurnStopped(t *testing.T) {
 	if _, err := s.CreateAttempt(ctx, b1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.AppendSessionWorkerEvents(ctx, b1.AttemptID, []runner.WorkerEvent{progress(1, "turn_stopped",
-		`{"card":{"subtopics_done":0,"subtopics_total":0,"sources":0,"tool_calls_used":0,"tool_call_limit":30},"findings":"尚无发现","can_finish":false}`)}); err != nil {
+	if _, err := s.AppendSessionWorkerEvents(ctx, b1.AttemptID, []runner.WorkerEvent{
+		progress(1, "subtopic", `{"id":"1","title":"甲","status":"done"}`)}); err != nil {
 		t.Fatal(err)
 	}
-	pause("tb", b1, false)
+	ctl("stop-tb-2", "stop", "tb")
+	apply("tb", 2, "pausing")
+	if _, err := s.AppendSessionWorkerEvents(ctx, b1.AttemptID, []runner.WorkerEvent{
+		progress(2, "turn_stopped", `{"card":{"subtopics_done":1,"subtopics_total":3,"sources":4,"tool_calls_used":5,"tool_call_limit":30},`+
+			`"findings":"真实发现：甲","can_finish":true}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	vb := turnVerdictFor(b1, 2, "paused", "paused")
+	vb.FromStatus = "starting"
+	if _, err := s.FinalizeAttempt(ctx, vb); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevokeAttemptAccess(ctx, b1.AttemptID, "attempt_ended"); err != nil {
+		t.Fatal(err)
+	}
 	if n := hostStops("tb"); n != 0 {
 		t.Fatalf("Worker 已写停止卡时不应追加宿主停止卡，得到 %d", n)
 	}
+	lastHostCard := func(taskID string) map[string]any {
+		t.Helper()
+		var b []byte
+		if err := s.pool.QueryRow(ctx, `SELECT payload FROM events WHERE task_id = $1 AND source = 'host' AND type = 'turn_stopped'
+			ORDER BY task_seq DESC LIMIT 1`, taskID).Scan(&b); err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	// 继续之后在启动阶段（queued，Worker 尚未写任何进度）再次停止：没有 attempt 的暂停复用上一张真实停止卡，不以通用文案覆盖。
+	ctl("continue-tb-3", "continue", "tb")
+	apply("tb", 3, "queued")
+	ctl("stop-tb-4", "stop", "tb")
+	apply("tb", 4, "paused")
+	apply("tb", 4, "paused") // 重放：已应用，不重复追加
+	if n := hostStops("tb"); n != 1 {
+		t.Fatalf("queued → paused 应恰追加 1 张停止卡，得到 %d", n)
+	}
+	if c := lastHostCard("tb"); c["findings"] != "真实发现：甲" || c["can_finish"] != true ||
+		c["card"].(map[string]any)["sources"] != 4.0 {
+		t.Fatalf("应复用 Worker 的真实停止卡，得到 %v", c)
+	}
+	// 再继续：新 attempt 写了进度后被强制结束——此后的停止卡按事件推出（通用文案），不再复用旧卡。
+	ctl("continue-tb-5", "continue", "tb")
+	apply("tb", 5, "queued")
+	if _, err := s.pool.Exec(ctx, "UPDATE incarnations SET status = 'idle' WHERE incarnation_id = 'inc-s2'"); err != nil {
+		t.Fatal(err)
+	}
+	setSession(t, s, "s2", session.StatusIdle)
+	b2 := turnAttempt("s2", "tb", 2)
+	if _, err := s.CreateAttempt(ctx, b2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendSessionWorkerEvents(ctx, b2.AttemptID, []runner.WorkerEvent{
+		progress(1, "subtopic", `{"id":"2","title":"乙","status":"running"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	pause("tb", b2, 6, true)
+	if n := hostStops("tb"); n != 2 {
+		t.Fatalf("新进度之后的强制暂停应再追加 1 张停止卡，共 %d", n)
+	}
+	if c := lastHostCard("tb"); c["findings"] != api.FallbackStopFindings || c["can_finish"] != true ||
+		c["card"].(map[string]any)["subtopics_done"] != 1.0 || c["card"].(map[string]any)["subtopics_total"] != 2.0 {
+		t.Fatalf("新进度之后应按事件推出停止卡，得到 %v", c)
+	}
+
+	// turn td：从未运行（queued → paused，没有 attempt）——也有停止卡，之后可以继续。
+	carol := mustUser(t, s, "carol")
+	liveSession(t, s, "s4", carol)
+	mustTurn(t, s, turnReq("s4", "td", carol))
+	ctl("stop-td", "stop", "td")
+	apply("td", 2, "paused")
+	if n := hostStops("td"); n != 1 {
+		t.Fatalf("queued → paused 的 turn 应有 1 张停止卡，得到 %d", n)
+	}
+	if c := lastHostCard("td"); c["findings"] != api.FallbackStopFindings || c["can_finish"] != false {
+		t.Fatalf("从未运行的 turn 的停止卡 = %v", c)
+	}
+	ctl("continue-td", "continue", "td")
 
 	// turn tc：故障重试（回到 queued）不是暂停，不追加。
 	liveSession(t, s, "s3", alice)
