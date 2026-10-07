@@ -263,7 +263,7 @@ func (s *Store) ApplyControl(ctx context.Context, c task.ApplyControl) (task.Con
 			return err
 		}
 		// 没有 attempt 的停止（queued → paused）同样给出停止卡，界面据此提供"继续 / 立即写报告"（停止修复 F2）。
-		if sessionID != "" && c.Status == "paused" {
+		if sessionID != "" && st.Status == "queued" && c.Status == "paused" {
 			if err := appendFallbackStopCard(ctx, tx, c.TaskID, fmt.Sprintf("turn_stopped_fallback:ctl:%d", c.ControlVersion), ""); err != nil {
 				return err
 			}
