@@ -599,6 +599,8 @@ class ResearchPhase:
         st = self.st
         name, raw = tc["function"]["name"], tc["function"]["arguments"]
         args = _args(raw)
+        if self.ctx.should_pause():  # 不再开始新的工具调用（也不发出没有结果的 tool_call 事件）
+            raise CallAbandoned("宿主已请求暂停：不再开始新的工具调用")
         index = sum(1 for m in g.messages if m.get("role") == "tool") + 1
         event_id = f"{step}:{index}"
         await emit.tool_call(step, event_id, name, args, g.id)

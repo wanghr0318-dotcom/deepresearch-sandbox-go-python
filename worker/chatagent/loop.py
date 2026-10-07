@@ -112,6 +112,10 @@ def _tool_count(messages: list[dict[str, Any]]) -> int:
     return sum(1 for m in messages if m.get("role") == "tool")
 
 
+def _max_ids(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
+    return {k: max(a.get(k, 0), b.get(k, 0)) for k in sorted({*a, *b})}
+
+
 def _copy(state: dict[str, Any]) -> dict[str, Any]:
     """与活动状态无共享对象的副本（JSON 往返，同 checkpoint 的快照）。"""
     return json.loads(json.dumps(state, ensure_ascii=False))
@@ -222,8 +226,20 @@ class Agent:
         if self._anchor is None:  # 本 attempt 没有发起过可放弃的调用：当前状态即一致
             return
         state, ids = self._anchor
+        taken = self.ctx.call_ids.snapshot()  # 回退之前：含被放弃调用已占的号
         self.state = TurnState.from_json(_copy(state))
+        self.state.abandoned_ids = _max_ids(self.state.abandoned_ids, taken)
         self.ctx.rewind_call_ids(ids)
+
+    def _skip_abandoned(self) -> None:
+        """改变下一次请求内容的指令（立即写报告、回答）之前：计数器前进到被放弃的调用之后。
+
+        被放弃的调用已以原请求体记入 Gateway journal；以同一 ID 发送不同的请求体是指纹冲突
+        （409 fingerprint_mismatch）。只取决于 checkpoint 中的状态，崩溃后重放得到同样的号。"""
+        st = self.state
+        if st.abandoned_ids:
+            self.ctx.advance_call_ids(st.abandoned_ids)
+            st.abandoned_ids = {}
 
     async def _stop(self, *, rollback: bool = False) -> Paused:
         """宿主请求暂停：（放弃了在途调用时先回到锚点）停止摘要（模型调用在 "stop" checkpoint
@@ -408,6 +424,7 @@ class Agent:
         幂等：崩溃后的新 attempt 再次带 finish_now 时不重复。"""
         st = self.state
         if not st.finish_requested:
+            self._skip_abandoned()
             phase: ToolResult | None = None
             if self.subruns and st.phase_subs is not None:
                 phase = await ResearchPhase(self).finish()  # 取消仍在运行的 sub-run
@@ -458,6 +475,7 @@ class Agent:
         if pq is None or pq.get("question_id") != qid:
             want = pq.get("question_id") if pq is not None else None
             raise WorkerFailure("invalid_directive", f"回答的提问 {qid!r} 不是待答的提问 {want!r}")
+        self._skip_abandoned()
         text = answer_text(pq.get("questions") or [], directive.get("answers") or [])
         st.messages.append(_tool_message(pq["tool_call_id"], "ask_user", text))
         index = str(qid).rsplit("-", 1)[-1]  # q-<step>-<call_index>：与 tool_call 事件同一 id
@@ -501,6 +519,8 @@ class Agent:
         st = self.state
         name, raw = tc["function"]["name"], tc["function"]["arguments"]
         args = _args(raw)
+        if self.ctx.should_pause():  # 不再开始新的工具调用（也不发出没有结果的 tool_call 事件）
+            raise CallAbandoned("宿主已请求暂停：不再开始新的工具调用")
         tctx = self._tool_ctx(step, transcript, subtopic_id)
         # 事件中的配对 id：模型的工具调用 id 可能跨轮重复（如 kimi 的 "web_search:0"），
         # 改用本轮内唯一且确定的 "<step>:<序号>"；恢复后重发同一调用得到同一 id。

@@ -985,12 +985,17 @@ def test_call_in_progress_wait_is_bounded(fake_gateway):
     assert 2 <= len(fake_gateway.requests) < 10
 
 
-def test_call_in_progress_wait_defaults_to_the_call_timeout(fake_gateway):
-    # 停止后很快继续：被放弃的调用仍在 Gateway 侧进行（规格 E19），同一 ID 的重发须等它结束后
-    # 重放，而不是固定 30 s 后以 CallInProgress 失败；缺省等待上限即本次调用的客户端超时
-    assert GatewayClient.in_progress_wait_s is None
+def test_call_in_progress_wait_none_means_the_call_timeout(fake_gateway):
+    # 停止后很快继续：被放弃的调用仍在 Gateway 侧进行（规格 E19），同一 ID 的重发可等它结束后
+    # 重放（chatagent 设 None）；None 的等待上限即本次调用的客户端超时。SDK 缺省仍为 30 s
+    assert GatewayClient.in_progress_wait_s == 30.0
     fake_gateway.replies += [error_reply(409, "call_in_progress")] * 400
-    gw = client(fake_gateway, in_progress_backoff_s=0.01, in_progress_backoff_max_s=0.02)
+    gw = client(
+        fake_gateway,
+        in_progress_wait_s=None,
+        in_progress_backoff_s=0.01,
+        in_progress_backoff_max_s=0.02,
+    )
     gw.timeout_s = 0.4
     started = time.monotonic()
     with pytest.raises(CallInProgress):

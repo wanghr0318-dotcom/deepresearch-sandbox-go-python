@@ -154,6 +154,17 @@ class CallIds:
         with self._lock:
             self._last = restored
 
+    def advance(self, snapshot: dict[str, int]) -> None:
+        """每个前缀前进到 max(当前, snapshot)：跳过被放弃调用已占的号。
+
+        用于改变了下一次请求内容的指令（如立即写报告）：被放弃的调用已以原请求体记入 journal，
+        同一 ID 发送不同的请求体会是指纹冲突，故改用新号。"""
+        ahead = CallIds.restore(snapshot)._last
+        with self._lock:
+            for prefix, n in ahead.items():
+                if n > self._last.get(prefix, 0):
+                    self._last[prefix] = n
+
     @classmethod
     def restore(cls, data: dict[str, int]) -> CallIds:
         ids = cls()
@@ -263,10 +274,10 @@ def default_timeout_s() -> float:
 class GatewayClient:
     """Gateway 的同步客户端。错误映射见 errors.py；call_in_progress 在客户端有界重试（同一 ID）。"""
 
-    # call_in_progress 的有界等待：指数退避，总等待不超过 in_progress_wait_s。None（缺省）= 本次
-    # 调用的客户端超时：同一 ID 仍在进行只发生在重发被放弃或旧 attempt 留下的调用时（规格 E19），
-    # 正确的做法是等它结束后重放；固定的短上限会让停止后很快"继续"的 turn 以 CallInProgress 失败。
-    in_progress_wait_s: float | None = None
+    # call_in_progress 的有界等待：指数退避，总等待不超过 in_progress_wait_s。None = 本次调用的
+    # 客户端超时：同一 ID 仍在进行只发生在重发被放弃或旧 attempt 留下的调用时（规格 E19），
+    # 应用可选择等它结束后重放（chatagent 如此设置：停止后很快"继续"时不至于 30 s 后失败）。
+    in_progress_wait_s: float | None = 30.0
     in_progress_backoff_s: float = 0.5
     in_progress_backoff_max_s: float = 4.0
 

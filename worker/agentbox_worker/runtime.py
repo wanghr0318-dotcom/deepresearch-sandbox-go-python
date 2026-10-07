@@ -347,6 +347,12 @@ class TaskContext:
         计数器加上此后新发起的调用（如停止摘要）。"""
         self._call_ids.rewind(snapshot)
 
+    def advance_call_ids(self, snapshot: dict[str, int]) -> None:
+        """每个前缀前进到 max(当前, snapshot)：之后的调用跳过被放弃调用已占的号。
+
+        见 CallIds.advance；用于改变下一次请求内容的指令。"""
+        self._call_ids.advance(snapshot)
+
     async def progress(
         self, kind: str, message: str, *, step_id: str | None = None, data: Any = None
     ) -> None:

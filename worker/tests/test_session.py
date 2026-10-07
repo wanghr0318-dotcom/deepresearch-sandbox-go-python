@@ -312,6 +312,10 @@ def test_call_ids_rewind_restores_snapshot_in_place():
     ids.rewind(snap)
     assert ids.snapshot() == {"root/s/chat": 1}
     assert ids.next("s", "chat") == "root/s/chat/2"
+    ids.advance({"root/s/chat": 5, "root/u/fetch": 1})  # 跳过被放弃调用已占的号；不回退
+    ids.advance({"root/s/chat": 3})
+    assert ids.snapshot() == {"root/s/chat": 5, "root/u/fetch": 1}
+    assert ids.next("s", "chat") == "root/s/chat/6"
 
 
 # ---- task_outcome 丢失与查询 ----

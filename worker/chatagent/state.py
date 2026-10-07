@@ -157,6 +157,9 @@ class TurnState:
     restore_note: str | None = None  # 恢复说明：下一次编排模型调用之前追加到转录末尾
     answered: list[str] = field(default_factory=list)  # 已回答的 question_id（answer 幂等）
     phase_subs: list[str] | None = None  # 进行中的 sub-run 研究阶段：各组主子主题 id（计划顺序）
+    # 停止时被放弃的调用已占到的 root call id 序号（放弃时回退之前的计数器）。继续时同一 ID 重发
+    # 得到 journal 中的结果；改变下一次请求内容的指令（立即写报告、回答）先前进到这些序号之后
+    abandoned_ids: dict[str, int] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -183,6 +186,7 @@ class TurnState:
             "restore_note": self.restore_note,
             "answered": list(self.answered),
             "phase_subs": list(self.phase_subs) if self.phase_subs is not None else None,
+            "abandoned_ids": dict(self.abandoned_ids),
         }
 
     @classmethod
@@ -220,6 +224,15 @@ class TurnState:
         _check(isinstance(answered, list) and all(isinstance(a, str) for a in answered), "answered")
         for key in ("stop_findings", "restore_note"):
             _check(d.get(key) is None or isinstance(d.get(key), str), key)
+        abandoned = d.get("abandoned_ids", {})
+        _check(
+            isinstance(abandoned, dict)
+            and all(
+                isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v >= 0
+                for k, v in abandoned.items()
+            ),
+            "abandoned_ids",
+        )
         phase_subs = d.get("phase_subs")
         _check(
             phase_subs is None
@@ -249,6 +262,7 @@ class TurnState:
             restore_note=d.get("restore_note"),
             answered=list(answered),
             phase_subs=list(phase_subs) if phase_subs is not None else None,
+            abandoned_ids=dict(abandoned),
         )
 
     def merge_found(self, sub: SubtopicState) -> None:
