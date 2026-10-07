@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/wanghr0318-dotcom/go-agentbox/protocol/v1/session.schema.json",
+  "$id": "https://github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/protocol/v1/session.schema.json",
   "title": "session 模式消息（宿主 → Worker 与 Worker → 宿主）",
   "description": "宿主消息按 #/$defs/host 校验，Worker 事件按 #/$defs/worker 校验；顶层接受二者之一。与 internal/protocol（DecodeSessionLine）的规则逐条一致；顺序规则见 protocol/README.md。",
   "oneOf": [

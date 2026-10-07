@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 )
 
 // 本文件是会话环境的资源操作（M4 Plan 12 Task 5；规格 §12.1、§12.2、§12.4、§4.5）：按 owner 保留的 UID 范围，

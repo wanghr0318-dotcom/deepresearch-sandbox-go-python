@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/protocol"
 )
 
 // Store 是 runner 的窄接口。每个方法是一个完整、幂等的事务用例（设计 §2.3、§2.4）。

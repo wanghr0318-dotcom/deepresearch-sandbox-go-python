@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/app"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/app"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
 )
 
 // plaintextListenWarning 返回非 loopback 监听且未启用内置 TLS 时打印到 stderr 的警告行（§15.3：不拒绝，

@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/resource"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/resource"
 )
 
 // Facts 是恢复所需的数据库事实；与 recovery.Facts 逐字段对应（规则 4 禁止导入 recovery）。

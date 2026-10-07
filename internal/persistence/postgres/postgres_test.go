@@ -19,19 +19,19 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/datadir"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/invariants"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/recovery"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/resource"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/session"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/subrun"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/datadir"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/invariants"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/ownership"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/protocol"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/recovery"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/resource"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/runner"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/session"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/subrun"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/task"
 )
 
 // ---- 基础：测试数据库、安装引导（E46）、事务辅助（E12、争用、未知提交）、失锁（E13） ----

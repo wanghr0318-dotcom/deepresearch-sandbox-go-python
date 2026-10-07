@@ -9,8 +9,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/task"
 )
 
 // LoadTask 一次读取 Decide 需要的任务事实（实现 task.Store）：单个查询，含最新已提交 checkpoint 的完整内容。

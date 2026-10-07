@@ -15,15 +15,15 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/blob"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/invariants"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence/postgres"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/resource"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/blob"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/invariants"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence/postgres"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/resource"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/runner"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/task"
 )
 
 // env 是一个完成安装的测试数据库、Store、BlobStore 与一条直连（用于构造违反的状态）。

@@ -15,9 +15,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/cgroup"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/sandbox"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/cgroup"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/sandbox"
 )
 
 // 本文件实现环境生命周期（Provider 契约第 3、4、6 节）：Create、Stop、Destroy、List、

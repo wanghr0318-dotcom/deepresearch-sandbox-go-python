@@ -23,9 +23,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/account"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/jcs"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/account"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 )
 
 // Mode 是服务的运行模式（规格 §15.1 `/status`）。

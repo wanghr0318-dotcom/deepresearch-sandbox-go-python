@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/resource"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/resource"
 )
 
 var _ resource.Store = (*Store)(nil)

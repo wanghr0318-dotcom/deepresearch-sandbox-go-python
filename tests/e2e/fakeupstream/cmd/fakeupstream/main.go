@@ -19,7 +19,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/tests/e2e/fakeupstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/tests/e2e/fakeupstream"
 )
 
 // researchTasks 是固定研究题目的计划（与 tests/e2e 的业务验收相同）。

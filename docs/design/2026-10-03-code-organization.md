@@ -1,4 +1,4 @@
-# go-agentbox 代码组织设计
+# 沙箱化深度研究助手 代码组织设计
 
 > 状态：评审通过 · 2026-10-03
 > 适用于：[`2026-10-03-v0.2-first-release-design.md`](2026-10-03-v0.2-first-release-design.md)

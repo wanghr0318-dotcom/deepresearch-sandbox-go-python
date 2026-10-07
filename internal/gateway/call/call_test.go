@@ -20,12 +20,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/blob"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/cache"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/jcs"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/blob"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/cache"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
 
 // ---- 内存 Store：语义对齐 internal/persistence/postgres 的 Gateway 事务用例，每次变更后断言 I3 ----

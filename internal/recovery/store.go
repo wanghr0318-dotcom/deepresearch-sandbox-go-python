@@ -6,7 +6,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/resource"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/resource"
 )
 
 // Store 是 recovery（及其事实提供给 reconcile）的窄接口。

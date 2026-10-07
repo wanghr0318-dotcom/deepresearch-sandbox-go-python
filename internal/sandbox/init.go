@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/rootfs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/rootfs"
 )
 
 // 环境类型（与 provider.EnvKind 的取值一致；sandbox 不依赖 provider 包）。

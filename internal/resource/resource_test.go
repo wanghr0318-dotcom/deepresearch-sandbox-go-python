@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider/fake"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/fake"
 )
 
 // ---- 测试装置 ----

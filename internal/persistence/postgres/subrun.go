@@ -9,9 +9,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/subrun"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/protocol"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/subrun"
 )
 
 // sub-run 生命周期（规格 §6、§8.4、§13；migration 0007）。状态转换一律经 subrun.Next（恢复时经

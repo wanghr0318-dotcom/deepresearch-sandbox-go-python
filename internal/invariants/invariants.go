@@ -23,7 +23,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
 
 // Violation 是一条不变量违反。

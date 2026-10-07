@@ -26,16 +26,16 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/blob"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/ownership"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence/postgres"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/subrun"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/blob"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/ownership"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence/postgres"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/protocol"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/runner"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/subrun"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/task"
 )
 
 // ---- 测试装置：真实 PostgreSQL（Plan 4 Store）、临时 BlobStore、回放脚本的 fake Starter ----

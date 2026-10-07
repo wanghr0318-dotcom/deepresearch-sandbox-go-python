@@ -1,4 +1,4 @@
-"""go-agentbox Python Worker SDK：协议 v1（task 模式与 session 扩展）。
+"""沙箱化深度研究助手的 Python Worker SDK：协议 v1（task 模式与 session 扩展）。
 
 SDK 只提供运行协议与执行能力：握手、事件、checkpoint、产物登记、暂停与取消，以及 session
 模式的多轮 task 循环（task_outcome、awaiting_input、会话状态提议），以及 sub-run 扩展

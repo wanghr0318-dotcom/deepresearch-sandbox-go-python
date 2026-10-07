@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/faultinject"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/faultinject"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
 
 // RunCleanup 运行 cleanup loop，直到 ctx 结束（返回 ctx 的错误）或失去数据库所有权。

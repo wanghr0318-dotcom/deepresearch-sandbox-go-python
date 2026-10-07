@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
 )
 
 // Source 是 Gateway 调用路径的缓存接入层（§11.2、§11.5），实现 gateway/call 的 CacheSource 窄接口：

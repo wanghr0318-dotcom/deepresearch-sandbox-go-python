@@ -15,10 +15,10 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/cgroup"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/rootfs"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/sandbox"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/cgroup"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/rootfs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/sandbox"
 )
 
 // 本文件是生产 EnvStarter（规格 §4.6，Plan 2 Task 9）：每个环境 re-exec 一个专用启动进程

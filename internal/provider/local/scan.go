@@ -15,8 +15,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/cgroup"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/cgroup"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
 
 // 本文件实现独立原始扫描（契约第 3 节 Scan 行、规格 §14.1 第 5 步）与挂载表解析。

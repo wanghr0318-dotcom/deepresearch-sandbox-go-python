@@ -15,12 +15,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/blob"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/faultinject"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/cache"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/jcs"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/blob"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/faultinject"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/cache"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 )
 
 // Coordinator 的流程（规格 §9.4、§9.5、§9.7、§11.2）：

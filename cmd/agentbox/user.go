@@ -16,9 +16,9 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/account"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence/postgres"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/account"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence/postgres"
 )
 
 const userUsage = "用法: agentbox user list | disable <name> | enable <name> [--database-url URL]（默认取环境变量 " + databaseURLEnv + "）"

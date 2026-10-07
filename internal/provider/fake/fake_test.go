@@ -5,8 +5,8 @@ import (
 	"io"
 	"testing"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider/providertest"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/providertest"
 )
 
 // program：argv[0] 为 "echo" 时输出 hello 并以 3 退出；"sleep" 时一直运行到被终止。

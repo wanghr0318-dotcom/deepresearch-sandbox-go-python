@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/sandbox"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/sandbox"
 )
 
 // 本文件实现宿主侧的 StartExec 与 ExecHandle（规格 §4.1–§4.4），以及每个环境的执行闸门

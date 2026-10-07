@@ -7,10 +7,10 @@ package app
 import (
 	"context"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/subrun"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/protocol"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/runner"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/subrun"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/task"
 )
 
 // subrunStore 是 postgres Store 的 sub-run 生命周期用例（Plan 14 Task 3）。

@@ -20,8 +20,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/faultinject"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/faultinject"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 )
 
 // RunTimePersistInterval 是运行时间的持久化周期（规格 §14.4、§19），也是周期比较控制版本的周期（§8.1）。

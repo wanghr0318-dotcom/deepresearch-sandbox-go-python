@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/reconcile"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/resource"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/reconcile"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/resource"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/task"
 )
 
 // world 是 recovery.Store、task.Store、resource.Store 与 Coordinator 的内存替身（方法名互不冲突，一个类型

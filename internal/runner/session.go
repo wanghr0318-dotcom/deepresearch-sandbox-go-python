@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/protocol"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
 
 // 本文件是 session 模式（规格 §5.4 session 扩展、§5.7 session 屏障、§12.3–12.4）的 incarnation 驱动：

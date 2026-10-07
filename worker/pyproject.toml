@@ -1,7 +1,7 @@
 [project]
 name = "agentbox-worker"
 version = "0.1.0"
-description = "go-agentbox 的 Python Worker SDK 与 sim-worker"
+description = "沙箱化深度研究助手的 Python Worker SDK 与 sim-worker"
 requires-python = ">=3.11"
 dependencies = []
 

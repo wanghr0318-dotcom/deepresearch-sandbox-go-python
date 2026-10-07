@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/resource"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/resource"
 )
 
 // 按 owner 保留的 UID 范围（M4 Plan 12 Task 5；规格 §12.1"session 在整个生命周期保留其 UID 范围"、§4.5）。

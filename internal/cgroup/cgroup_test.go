@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/testutil"
 )
 
 const testRoot = "/sys/fs/cgroup/agentbox-test"

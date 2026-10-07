@@ -22,10 +22,10 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/jcs"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
 
 // exec 调度（规格 §10；Plan 15 D3、D6、D7、D8、D12、D16）。每次 POST /v1/exec 在全新的 exec 环境中执行一次：

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/wanghr0318-dotcom/go-agentbox/protocol/v1/task.schema.json",
+  "$id": "https://github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/protocol/v1/task.schema.json",
   "title": "init（宿主 → Worker）",
   "description": "type、bootstrap、protocol_versions 组成引导信封，永不改变；mode=task 时其余字段按 v1 校验。",
   "type": "object",

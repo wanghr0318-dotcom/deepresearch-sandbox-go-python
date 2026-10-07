@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/cli"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/hostcheck"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/cli"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/hostcheck"
 )
 
 func main() {

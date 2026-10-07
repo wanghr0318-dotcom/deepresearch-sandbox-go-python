@@ -1,6 +1,6 @@
 # 使用与运维参考
 
-本文是 [README](../README.zh-CN.md) 的详细补充：构建、测试、运行、各功能的用法与 server 标志。下列命令都已执行过（Go、Docker 与 PostgreSQL 命令在 WSL2 内核 6.6 上，Python 测试在 Windows 与 CI 的 Linux 上，真实模型部分在腾讯云 CVM 上）。
+本文是 [README](../README.md) 的详细补充：构建、测试、运行、各功能的用法与 server 标志。下列命令都已执行过（Go、Docker 与 PostgreSQL 命令在 WSL2 内核 6.6 上，Python 测试在 Windows 与 CI 的 Linux 上，真实模型部分在腾讯云 CVM 上）。
 
 ## 环境与测试
 
@@ -252,4 +252,4 @@ sudo -E ./bin/agentbox server --data-dir /var/lib/agentbox --web-dir web/dist \
 - **inspect。** `GET /tasks/{id}/inspect` 的 `subruns[]`，或工作台 `#/admin` 的任务详情，给出每个 sub-run 的状态、开始/结束时间、取消或失败原因，以及 sub-run 层的预留/已花/unknown 费用（task 层是两层之和的上层）。`calls[].subrun_id` 标出每个调用归属哪个 sub-run。
 - **`--worker-subruns`**（默认 true）：向 Worker 协商 `subruns` 扩展。设为 false 时，研究退回到进程内逐个执行子主题。
 - **`--subrun-cancel-timeout`**（默认 10s）：宿主取消一个 sub-run 后，等待 Worker 结束它的时限。超时则终止整个 attempt，从 checkpoint 恢复。
-- **串并行对比。** 运维可用 `POST /tasks {session_id, spec: {text, deep_research, research: {scheduling, fixed_plan}}}` 在指定会话中创建 turn。驱动与评分脚本见 [m4-gate 标签下的 `experiments/subrun-compare/`](https://github.com/wanghr0318-dotcom/go-agentbox/tree/m4-gate/experiments/subrun-compare)，结果见[对比与验收记录](evidence/2026-10-06-m4-subrun-comparison.md)。演示服务器上每组 N = 4（小样本）：墙钟时间 P50 串行 302 s、并行 184 s；费用中位数 0.48 / 0.50 USD；两组都无失败；引用可定位率都是 100%。
+- **串并行对比。** 运维可用 `POST /tasks {session_id, spec: {text, deep_research, research: {scheduling, fixed_plan}}}` 在指定会话中创建 turn。驱动与评分脚本见 [m4-gate 标签下的 `experiments/subrun-compare/`](https://github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/tree/m4-gate/experiments/subrun-compare)，结果见[对比与验收记录](evidence/2026-10-06-m4-subrun-comparison.md)。演示服务器上每组 N = 4（小样本）：墙钟时间 P50 串行 302 s、并行 184 s；费用中位数 0.48 / 0.50 USD；两组都无失败；引用可定位率都是 100%。

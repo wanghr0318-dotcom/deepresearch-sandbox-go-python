@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/wanghr0318-dotcom/go-agentbox/protocol/v1/subrun.schema.json",
+  "$id": "https://github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/protocol/v1/subrun.schema.json",
   "title": "sub-run 扩展（M4 Plan 14）",
   "description": "五个 sub-run 消息：宿主消息按 #/$defs/host，Worker 事件按 #/$defs/worker。task/session 消息中的扩展字段（init.extensions、resume.subruns、ready.subruns、progress.subrun_id、checkpoint.subruns、result.subruns）由 #/$defs/fields 描述，与 task/control/event/session 各 schema 叠加使用。不能表达的规则由编解码器检查：subruns[] 中 ID 不重复、summary 与 parent_step_id 按 UTF-8 字节计、refs 与 result_ref 合计 ≤ 1024；session 模式下 Worker 的 sub-run 事件另需 attempt_id。",
   "oneOf": [{"$ref": "#/$defs/host"}, {"$ref": "#/$defs/worker"}],

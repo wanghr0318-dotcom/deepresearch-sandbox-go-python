@@ -12,10 +12,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/admission"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/resource"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/admission"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/resource"
 )
 
 // ExecConfig 是 exec 的服务端策略（server 标志，计划 D4 的默认值）。Slots 为 0 时不启用 exec（/v1/exec 为 404

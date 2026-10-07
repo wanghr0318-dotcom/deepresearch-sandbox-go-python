@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/testutil"
 )
 
 // requireCgroupV2Host 在宿主未使用 cgroup v2 时跳过测试。

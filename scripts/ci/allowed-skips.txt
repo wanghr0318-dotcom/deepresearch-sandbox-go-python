@@ -4,4 +4,4 @@
 
 # 缓存收益测量（§16.6）是测量而不是正确性用例：耗时长、结果写入证据文件，只由 bench/cache/run.sh
 # 设置 AGENTBOX_CACHE_BENCH_OUT 后运行；缓存的正确性由 E21–E25 与 I14/I15 用例覆盖，它们必须运行。
-github.com/wanghr0318-dotcom/go-agentbox/tests/e2e TestCacheBenefit
+github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/tests/e2e TestCacheBenefit
