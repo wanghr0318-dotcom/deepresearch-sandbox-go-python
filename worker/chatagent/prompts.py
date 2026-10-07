@@ -196,7 +196,11 @@ def stop_summary_messages(state: TurnState, topic: str) -> list[dict[str, str]]:
     return [
         {
             "role": "system",
-            "content": "用 2–3 句中文概括这项被停止的研究目前的发现；只依据给出的材料，不要编造。",
+            "content": (
+                "下面是一项研究进行到一半时已经收集到的材料。用 2–3 句中文直接写出目前已经发现的要点"
+                "（具体的数字、事实与结论），只依据这些材料，不要编造。"
+                "不要评论研究过程、研究是否完成或材料是否充分，也不要提到“停止”。"
+            ),
         },
         {"role": "user", "content": "\n\n".join(lines)},
     ]
