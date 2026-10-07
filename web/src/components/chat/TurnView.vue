@@ -43,6 +43,9 @@
     <div v-if="writing" class="writing" data-testid="writing-report" role="status">
       ✍️ 正在整理资料并撰写报告… <span aria-hidden="true">{{ writingSeconds }} 秒</span>
     </div>
+    <div v-if="stopping" class="writing" data-testid="stopping" role="status">
+      正在停止… <span aria-hidden="true">{{ stoppingSecs }} 秒</span>
+    </div>
 
     <QuestionCard
       v-if="turn.question"
@@ -91,11 +94,12 @@
 // 进行中的非思考步骤默认展开、其余折叠（思考链默认不展开）；用户点击后以用户的选择为准。
 // 连续的"思考"与连续的"阅读网页"各合并为一行；一轮结束后整条链折叠为"研究过程 · N 步 · 用时"一行。
 // 子主题都结束、报告未到时显示"正在撰写报告"计时行（从最后一个事件起计）；报告到达后全文显示在对话中间。
+// 停止请求后、停止卡出现前显示"正在停止… N 秒"计时行（从停止请求起计）。
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import type { Answer, TurnAction } from "../../api/chat";
 import { routeLabel } from "../../lib/chat";
 import type { RawRef, StepRow as StepRowData, TurnView } from "../../lib/chat";
-import { durationText, groupSteps, isWritingReport, turnFinished } from "../../lib/steps";
+import { durationText, groupSteps, isStopping, isWritingReport, stoppingSeconds, turnFinished } from "../../lib/steps";
 import QuestionCard from "./QuestionCard.vue";
 import RawDialog from "./RawDialog.vue";
 import ReportBody from "./ReportBody.vue";
@@ -189,6 +193,10 @@ const writingSeconds = computed(() => {
   return at === undefined ? 0 : Math.max(0, Math.round((now.value - at) / 1000));
 });
 
+// 停止请求后到停止卡出现前：等待 Worker 收尾，每秒刷新计时
+const stopping = computed(() => isStopping(props.turn));
+const stoppingSecs = computed(() => stoppingSeconds(props.turn, now.value));
+
 const label = computed(() => routeLabel(props.turn));
 // 恢复出的轮次（没有 route 事件时）也是研究：可查看进度
 const isResearch = computed(() => props.turn.route === "research" || (!props.turn.route && !!props.turn.restoredFrom));
@@ -199,7 +207,7 @@ const statusText = computed(() => {
     case "queued":
       return "排队中…";
     case "stopping":
-      return "正在停止…";
+      return t.stop ? "正在停止…" : ""; // 停止卡到达前由下方计时行显示
     case "awaiting_input":
       return "等待你的回答";
     case "running":

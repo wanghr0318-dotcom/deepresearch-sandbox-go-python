@@ -116,6 +116,7 @@
 // - 宽屏三栏之间有可拖动（也可用 ←/→）的分隔线，宽度记在本浏览器；右侧面板默认收起，由标题栏"进度"按钮或报告卡片打开。
 // - 打开会话：listTurns → seedTurns，再从 cursor 0 订阅会话事件流（重放即可还原全部步骤）；切换会话时关闭旧流。
 // - 新对话的首条消息：createSession → 路由到 #/s/<id> → sendMessage。
+// - 最新一轮已暂停（有停止卡）时，只发"继续 / continue"等（isContinueCommand）等于点"继续"，不新建一轮。
 // - 有进行中的轮次（queued/running/stopping）时禁用发送（契约裁定 I：服务端会 409 turn_in_progress），输入框内只显示 ■ 停止。
 // - 会话 restoring，或向 frozen/evicted 会话发送中：顶部显示"正在恢复对话…"。
 // - 401 → emit("unauthorized")；其他错误只显示面向用户的文案。
@@ -130,7 +131,7 @@ import SessionSidebar from "../components/chat/SessionSidebar.vue";
 import SidePanel from "../components/chat/SidePanel.vue";
 import Splitter from "../components/chat/Splitter.vue";
 import TurnView from "../components/chat/TurnView.vue";
-import { activeResearchTurn, applyEvent, chatErrorMessage, emptyChat, recordAnswers, seedTurns } from "../lib/chat";
+import { activeResearchTurn, applyEvent, canContinueTurn, chatErrorMessage, emptyChat, isContinueCommand, recordAnswers, seedTurns } from "../lib/chat";
 import type { ChatState } from "../lib/chat";
 import { clampWidths, LAYOUT, loadWidths, saveWidths } from "../lib/layout";
 import { isUnauthorized } from "../lib/research";
@@ -383,6 +384,17 @@ async function removeSession(id: string): Promise<void> {
 
 async function send(payload: { text: string; deepResearch: boolean }): Promise<void> {
   if (sending.value || runningTurn.value) return;
+  // 最新一轮已停止且可继续时，只发"继续"等于点停止卡上的"继续"，而不是新建一轮（新一轮会取消上一轮）。
+  const last = state.value.turns[state.value.turns.length - 1];
+  if (last && canContinueTurn(last) && isContinueCommand(payload.text)) {
+    const turnId = last.turnId;
+    await withTurn(turnId, async () => {
+      await chat.control(turnId, "continue");
+      composer.value?.clear();
+      stick = true;
+    });
+    return;
+  }
   sending.value = true;
   error.value = "";
   try {

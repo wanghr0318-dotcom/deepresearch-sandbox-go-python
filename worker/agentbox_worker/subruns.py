@@ -15,8 +15,9 @@
   已经发出（与宿主的取消竞态），也照样发出 subrun_end{cancelled}，否则宿主的 T_subrun_cancel
   会终止整个 attempt；本地状态随之改为 cancelled（deadline 时为 timed_out），不再在 checkpoint
   中宣称 completed（宿主会以 invalid_transition 拒绝，E41）。
-- 暂停：SDK 不强行停止 sub-run。编排层在工具调用边界检查 ctx.should_pause()，各 sub-run
-  主体返回"未完成"，管理器保持其 started，编排层提交 checkpoint 后返回 Paused。
+- 暂停：SDK 不强行停止 sub-run。编排层在工具调用边界检查 ctx.should_pause()，在途调用经
+  ctx.run_call 发起时被放弃等待（CallAbandoned）；各 sub-run 主体返回"未完成"，管理器保持其
+  started，编排层提交 checkpoint 后返回 Paused。
 """
 
 from __future__ import annotations

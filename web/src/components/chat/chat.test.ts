@@ -765,4 +765,28 @@ describe("TurnView shows the report in the chat with a report card", () => {
       vi.useRealTimers();
     }
   });
+
+  it("shows a ticking 正在停止… row while stopping, hidden once paused or the stop card arrives", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-10-07T00:00:10Z"));
+      const stoppingSince = new Date("2026-10-07T00:00:07Z").getTime();
+      const turn = blankTurn({ status: "stopping", route: "research", steps: [searchRow(1)], stoppingSince, lastEventAt: stoppingSince });
+      const w = mountWith(TurnView, { turn, busy: false });
+      const row = w.get("[data-testid=stopping]");
+      expect(row.text()).toBe("正在停止… 3 秒");
+      expect(row.attributes("role")).toBe("status");
+      expect(row.get("[aria-hidden=true]").text()).toBe("3 秒");
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(w.get("[data-testid=stopping]").text()).toBe("正在停止… 5 秒");
+
+      const stop = { todo: [], subtopicsDone: 0, subtopicsTotal: 0, sources: 0, budget: { used: 1, limit: 30 }, findings: "f", canFinish: false };
+      await w.setProps({ turn: { ...turn, stop } } as never);
+      expect(w.find("[data-testid=stopping]").exists()).toBe(false);
+      await w.setProps({ turn: { ...turn, status: "paused", stoppingSince: undefined } } as never);
+      expect(w.find("[data-testid=stopping]").exists()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

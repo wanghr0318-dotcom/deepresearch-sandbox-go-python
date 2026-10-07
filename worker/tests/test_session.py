@@ -221,6 +221,103 @@ def test_plain_pause_request_still_proposes_paused():
     assert_valid_transcript(host)
 
 
+# ---- run_call：宿主暂停时放弃在途阻塞调用的等待（stop-fix F1） ----
+
+import threading
+import time
+
+from agentbox_worker import CallAbandoned
+from agentbox_worker.gateway import CallIds
+
+PAUSE_A1 = {"type": "pause", "v": 1, "attempt_id": "a-1", "reason": "user", "grace_ms": 0}
+
+
+def test_run_call_abandons_blocked_call_on_pause_and_fences_its_call_ids():
+    gate, entered = threading.Event(), threading.Event()
+    seen: dict[str, Any] = {}
+
+    def blocking(ids: CallIds) -> str:
+        first_id = ids.next("s", "chat")  # 进入时已占号（如同 Gateway 客户端发出请求）
+        entered.set()
+        gate.wait(5)
+        try:
+            ids.next("s", "chat")  # 被放弃之后不能再占号（不会再发出新请求）
+        except CallAbandoned:
+            seen["fenced"] = True
+        return first_id
+
+    async def app(ctx: TaskContext):
+        before = ctx.call_ids.snapshot()
+        started = time.monotonic()
+        try:
+            await ctx.run_call(blocking, ctx.call_ids)
+        except CallAbandoned:
+            seen["elapsed"] = time.monotonic() - started
+        assert ctx.call_ids.snapshot() == {"root/s/chat": 1}  # 被放弃的调用已占号
+        ctx.rewind_call_ids(before)  # 回到一致点：恢复后被放弃的调用以同一 ID 重发
+        with pytest.raises(CallAbandoned):  # 已请求暂停：不再开始新的调用
+            await ctx.run_call(lambda: "never")
+        return Paused(await ctx.checkpoint("s", state={}))
+
+    def hook(event, host):
+        if event["type"] == "task_accepted":
+            loop = asyncio.get_running_loop()
+
+            def pause_when_entered() -> None:
+                entered.wait(5)
+                loop.call_soon_threadsafe(host.send, PAUSE_A1)
+
+            threading.Thread(target=pause_when_entered, daemon=True).start()
+
+    host = SessionHost(on_event=hook)
+    host.start_task("t-1", "a-1")
+    host.close_when_idle()
+    code, events = host.run(app)
+    assert code == 0
+    assert seen["elapsed"] < 2
+    assert first(events, "paused")["attempt_id"] == "a-1"
+    assert "_agentbox" not in first(events, "checkpoint")["state"]  # 计数器已回退为空
+    gate.set()
+    deadline = time.monotonic() + 5
+    while "fenced" not in seen and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert seen.get("fenced") is True
+    assert_valid_transcript(host)
+
+
+def test_run_call_returns_result_and_propagates_errors_without_pause():
+    async def app(ctx: TaskContext):
+        assert await ctx.run_call(lambda a, b=0: a + b, 1, b=2) == 3
+        with pytest.raises(ValueError):
+            await ctx.run_call(_raise_value_error)
+        return Result(summary="ok")
+
+    host = SessionHost()
+    host.start_task("t-1", "a-1")
+    host.close_when_idle()
+    code, events = host.run(app)
+    assert code == 0 and first(events, "result")["summary"] == "ok"
+
+
+def _raise_value_error() -> None:
+    raise ValueError("boom")
+
+
+def test_call_ids_rewind_restores_snapshot_in_place():
+    ids = CallIds()
+    ids.next("s", "chat")
+    snap = ids.snapshot()
+    ids.next("s", "chat")
+    ids.next("t", "exec")
+    ids.rewind(snap)
+    assert ids.snapshot() == {"root/s/chat": 1}
+    assert ids.next("s", "chat") == "root/s/chat/2"
+    ids.advance({"root/s/chat": 5, "root/u/fetch": 1})  # 跳过被放弃调用已占的号；不回退
+    ids.advance({"root/s/chat": 3})
+    assert ids.snapshot() == {"root/s/chat": 5, "root/u/fetch": 1}
+    assert ids.next("s", "chat") == "root/s/chat/6"
+
+
 # ---- task_outcome 丢失与查询 ----
 
 
@@ -673,3 +770,42 @@ def test_session_stream_checker_rules():
     with pytest.raises(ProtocolError) as exc:
         checker.observe(ev(3, "error", code="x"))  # ready 之后的 error 必须带 attempt_id
     assert exc.value.code == "missing_field"
+
+
+def test_run_call_within_abandons_on_timeout_even_while_paused():
+    gate, entered = threading.Event(), threading.Event()
+    seen: dict[str, Any] = {}
+
+    def blocking(ids: CallIds) -> str:
+        first_id = ids.next("stop-1", "chat")
+        entered.set()
+        gate.wait(5)
+        try:
+            ids.next("stop-1", "chat")
+        except CallAbandoned:
+            seen["fenced"] = True
+        return first_id
+
+    async def app(ctx: TaskContext):
+        # 不受暂停影响（停止摘要在暂停之后发起），只受期限约束
+        assert await ctx.run_call_within(5, lambda a: a * 2, 21) == 42
+        started = time.monotonic()
+        with pytest.raises(CallAbandoned):
+            await ctx.run_call_within(0.2, blocking, ctx.call_ids)
+        seen["elapsed"] = time.monotonic() - started
+        with pytest.raises(ValueError):
+            await ctx.run_call_within(5, _raise_value_error)
+        assert ctx.call_ids.snapshot() == {"root/stop-1/chat": 1}
+        return Result(summary="ok")
+
+    host = SessionHost()
+    host.start_task("t-1", "a-1")
+    host.close_when_idle()
+    code, events = host.run(app)
+    assert code == 0 and first(events, "result")["summary"] == "ok"
+    assert entered.is_set() and seen["elapsed"] < 2
+    gate.set()
+    deadline = time.monotonic() + 5
+    while "fenced" not in seen and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert seen.get("fenced") is True

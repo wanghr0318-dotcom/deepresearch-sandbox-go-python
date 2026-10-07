@@ -43,6 +43,15 @@ class TransportBroken(Exception):
     """
 
 
+class CallAbandoned(Exception):
+    """宿主请求了暂停，在途的阻塞调用被放弃等待（TaskContext.run_call，stop-fix F1）。
+
+    在协程中表示"不再等这次调用"：调用本身可能仍在 Gateway 侧进行并记入 journal，恢复后以同一
+    call id 重发即得到其结果。在被放弃的线程中表示"不能再占用 call id、不能再发出请求"。
+    不是 WorkerFailure 也不是 GatewayError：应用按暂停处理，不应把它当作失败或 Gateway 错误。
+    """
+
+
 class GatewayError(Exception):
     """Gateway 返回错误或无法完成请求。status 为 HTTP 状态码（未得到响应时为 0），code 来自
     错误体 {"error":{"code","message"}}，客户端自身判定的失败使用 connection_lost、

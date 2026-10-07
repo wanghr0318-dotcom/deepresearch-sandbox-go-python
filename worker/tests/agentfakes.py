@@ -22,7 +22,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from agentbox_worker.errors import BudgetExhausted, GatewayError, ToolBudgetExhausted
+from agentbox_worker.errors import (
+    BudgetExhausted,
+    CallDivergence,
+    GatewayError,
+    ToolBudgetExhausted,
+)
 from agentbox_worker.gateway import CallIds, GatewayClient, GatewayResult
 from agentbox_worker.runtime import Timing
 from agentbox_worker.session import run_session_worker
@@ -93,6 +98,7 @@ class ScriptedGateway:
         self.spans: list[tuple[str | None, str, float, float]] = []
         self.rejections: list[tuple[str | None, str]] = []  # (subrun, code)
         self._results: dict[str, GatewayResult] = {}
+        self._fingerprints: dict[str, str] = {}  # call id → 首次请求的 kind 与请求体
         self._counted = 0
         self._lock = threading.Lock()
 
@@ -201,8 +207,13 @@ class ScriptedGateway:
         ids = view.call_ids if view is not None else self.call_ids
         call_id = ids.next(step_id, kind, sub)
         call = GatewayCall(kind, step_id, call_id, body, sub)
+        fingerprint = json.dumps([kind, body], ensure_ascii=False, sort_keys=True)
         with self._lock:
             self.calls.append(call)
+            known = self._fingerprints.setdefault(call_id, fingerprint)
+            if known != fingerprint:  # 同一 call id 的请求内容不同：真实 Gateway 拒绝（规格 §9.4）
+                self.rejections.append((sub, "fingerprint_mismatch"))
+                raise CallDivergence(409, "fingerprint_mismatch", call_id)
             old = self._results.get(call_id)
         if old is not None:  # 同一 call id 重发：重放已记录的结果（真实 Gateway 的重放也带额度头）
             return GatewayResult(

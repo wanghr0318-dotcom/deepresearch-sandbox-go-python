@@ -84,7 +84,21 @@ type Options struct {
 	// Alert 发出一条隔离报警（规格 §16.3 I8 的报警出口：结构化错误日志）；之后 coordinator 调用
 	// Store.MarkQuarantineAlerted。默认以 slog.Default() 记录 error 日志（字段与启动恢复的报警相同）。
 	Alert func(q Quarantine)
+	// EntryHeld 报告本进程是否仍持有环境的入口文件（Gateway 入口 socket：属主是该环境 UID 范围中映射的
+	// uid 1000，撤销访问时才删除）。为真时 cleanup 暂不回收、核查或归还该环境的 UID 范围，留在待归还集合中
+	// 由后续轮次重试：撤销可能晚于判决提交（Store 暂时不可用时撤销由 actor 的 Store 队列补提交，排在已入队的
+	// Finalize 之后），此时 socket 是仍在使用的入口，不是残留文件，不应隔离该范围。入口删除之后照常核查，
+	// 归还的前提（范围拥有的文件已不存在）不变。nil 表示没有这类入口。
+	// 会话的 owner 范围不经此检查（releaseUIDRange 先按 isOwnerRange 返回）：session 的 opDestroy 在 StopEnv
+	// 之前同步撤销 incarnation 入口（session/actor.go）。推迟超过 EntryHeldWarnAfter 时记一次 WARN。
+	EntryHeld func(envID string) bool
+	// Logger 记录 cleanup 的警告（例如入口长时间未撤销）；默认 slog.Default()。
+	Logger *slog.Logger
 }
+
+// EntryHeldWarnAfter 是 UID 范围因入口仍被持有而推迟归还多久之后记录 WARN（每个环境一次）：撤销正常只晚于
+// 判决数秒（Store 恢复后的补提交），长时间推迟说明入口泄漏，范围被静默占用。
+const EntryHeldWarnAfter = 60 * time.Second
 
 // ErrEnvStopped 表示环境已确认停止（stopped_at 已记录或待提交），不能再创建：停止之后到达的
 // 创建请求是过期操作（规格 §3.2、§4.4）。
@@ -113,6 +127,11 @@ type Coordinator struct {
 	pendingStop  map[string]time.Time // 已确认停止、stopped_at 尚未提交
 	pendingFree  map[string]struct{}  // 清理已完成、UID 范围尚未归还
 	pendingAlert map[string]struct{}  // 已隔离并报警、MarkQuarantineAlerted 尚未成功的路径
+	// entryDeferred 是因 EntryHeld 推迟归还的环境 → 首次推迟的时间；entryWarned 为已记录 WARN 的环境。
+	entryDeferred map[string]time.Time
+	entryWarned   map[string]bool
+	// holds 是进程内仍在使用、cleanup loop 不得销毁的环境（HoldEnv）→ 持有数。
+	holds        map[string]int
 	seeded       bool
 	kick         chan struct{}      // 唤醒 cleanup loop（容量 1，合并多次唤醒）
 	freed        chan struct{}      // 有 UID 范围归还时关闭并替换（广播给等待中的 CreateEnv）
@@ -143,6 +162,9 @@ func NewCoordinator(store Store, p Provider, opt Options) *Coordinator {
 	if opt.CleanupBatch <= 0 {
 		opt.CleanupBatch = 16
 	}
+	if opt.Logger == nil {
+		opt.Logger = slog.Default()
+	}
 	if opt.Alert == nil {
 		opt.Alert = func(q Quarantine) {
 			slog.Error("隔离资源报警", "alert", "quarantine", "layer", q.Layer, "path", q.Path,
@@ -151,12 +173,15 @@ func NewCoordinator(store Store, p Provider, opt Options) *Coordinator {
 	}
 	return &Coordinator{
 		store: store, p: p, opt: opt,
-		locks:        make(map[string]*envLock),
-		pendingStop:  make(map[string]time.Time),
-		pendingFree:  make(map[string]struct{}),
-		pendingAlert: make(map[string]struct{}),
-		kick:         make(chan struct{}, 1),
-		freed:        make(chan struct{}),
+		locks:         make(map[string]*envLock),
+		pendingStop:   make(map[string]time.Time),
+		pendingFree:   make(map[string]struct{}),
+		pendingAlert:  make(map[string]struct{}),
+		entryDeferred: make(map[string]time.Time),
+		entryWarned:   make(map[string]bool),
+		holds:         make(map[string]int),
+		kick:          make(chan struct{}, 1),
+		freed:         make(chan struct{}),
 	}
 }
 

@@ -179,6 +179,8 @@ type Deps struct {
 	// 成功，在提交判决之前（经 Store 队列排在 Finalize 之前），把未记账区间计入运行时间（装配为
 	// recovery.Store.AccountUnrecordedRunTime，§14.1 第 8 步）。暂时失败按退避重试，事实保留。
 	OnStopRecorded func(ctx context.Context, attemptID string, stoppedAt time.Time) error
+	// SessionPauseGrace 可选：会话 turn 停止（pause）的 grace；≤ 0 取 DefaultSessionPauseGraceMs（State.SessionPauseGraceMs）。
+	SessionPauseGrace time.Duration
 }
 
 func (d Deps) withDefaults() Deps {
@@ -405,7 +407,8 @@ func (a *Actor) load() bool {
 	a.s = State{TaskID: a.taskID, TaskStatus: ts.Status, Desired: ts.Desired, ControlVersion: ts.ControlVersion,
 		AppliedControlVersion: ts.AppliedControlVersion, FaultRetriesUsed: ts.FaultRetriesUsed,
 		MaxFaultRetries: ts.MaxFaultRetries, OOMRetriesUsed: ts.OOMRetriesUsed,
-		NextRetry: RetryAfter(ts.Status, ts.StatusReason), NotBefore: ts.NotBefore, SessionID: ts.SessionID}
+		NextRetry: RetryAfter(ts.Status, ts.StatusReason), NotBefore: ts.NotBefore, SessionID: ts.SessionID,
+		SessionPauseGraceMs: max(a.d.SessionPauseGrace.Milliseconds(), 0)}
 	if g := a.opt.stopBlocked; g != nil {
 		att, err := readRetry(a.ctx, a.d, func(ctx context.Context) (Attempt, error) {
 			return a.d.Store.GetAttempt(ctx, ts.CurrentAttemptID)

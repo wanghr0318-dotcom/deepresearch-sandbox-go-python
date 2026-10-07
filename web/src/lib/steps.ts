@@ -60,3 +60,14 @@ export function isWritingReport(t: Pick<TurnView, "route" | "status" | "report" 
     t.steps.every((s) => s.status !== "running")
   );
 }
+
+// 用户点了停止、停止卡还没到：轮次显示"正在停止… N 秒"。停止卡到达或离开 stopping 后不再显示。
+export function isStopping(t: Pick<TurnView, "status" | "stop">): boolean {
+  return t.status === "stopping" && !t.stop;
+}
+
+// 从停止请求时刻起的秒数；没有记下请求时刻（例如刷新后由历史得到 stopping）时从最后一个事件起计。
+export function stoppingSeconds(t: Pick<TurnView, "stoppingSince" | "lastEventAt">, now: number): number {
+  const since = t.stoppingSince ?? t.lastEventAt;
+  return since === undefined ? 0 : Math.max(0, Math.round((now - since) / 1000));
+}

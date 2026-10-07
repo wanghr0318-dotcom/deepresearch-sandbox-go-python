@@ -6,10 +6,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import os
 import sys
+import threading
 import traceback
 import uuid
 from collections.abc import Awaitable, Callable, Iterable
@@ -19,12 +21,20 @@ from typing import TYPE_CHECKING, Any, NoReturn
 
 from agentbox_worker.errors import (
     ArtifactRejected,
+    CallAbandoned,
     CheckpointRejected,
     CheckpointUnresolved,
     TransportBroken,
     WorkerFailure,
 )
-from agentbox_worker.gateway import DEFAULT_SOCKET_PATH, CallIds, GatewayClient, SubrunGateway
+from agentbox_worker.gateway import (
+    CURRENT_CALL,
+    DEFAULT_SOCKET_PATH,
+    CallIds,
+    CallToken,
+    GatewayClient,
+    SubrunGateway,
+)
 from agentbox_worker.outbox import Outbox, Waiters
 from agentbox_worker.protocol import (
     BOOTSTRAP_VERSION,
@@ -165,6 +175,64 @@ def _snapshot(state: Any) -> Any:
         raise WorkerFailure("invalid_field", f"checkpoint state 无法序列化为 JSON：{exc}") from exc
 
 
+async def _abandonable(
+    fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any], stop: asyncio.Event
+) -> Any:
+    """在独立的守护线程中运行 fn；stop 先于 fn 结束时放弃等待并抛出 CallAbandoned。
+
+    不用默认线程池：被放弃的线程可能还要阻塞到 Gateway 的调用期限（数分钟），占住池中的线程会
+    让之后的调用（例如停止摘要）排队。线程经 contextvars 带 CallToken；放弃时置位，此后该线程
+    占用 call id 或发出请求都在本地失败。被放弃线程的结果与异常一律丢弃（不留"未取回的异常"）。
+    """
+    loop = asyncio.get_running_loop()
+    done: asyncio.Future[Any] = loop.create_future()
+    token = CallToken()
+    context = contextvars.copy_context()
+    context.run(CURRENT_CALL.set, token)
+
+    def deliver(ok: bool, value: Any) -> None:
+        if done.done():  # 已放弃（或调用方已被取消）：结果丢弃
+            return
+        if ok:
+            done.set_result(value)
+        else:
+            done.set_exception(value)
+
+    def work() -> None:
+        try:
+            ok, value = True, context.run(fn, *args, **kwargs)
+        except BaseException as exc:  # noqa: B036  原样交给协程（同 asyncio.to_thread）
+            ok, value = False, exc
+        try:
+            loop.call_soon_threadsafe(deliver, ok, value)
+        except RuntimeError:  # 事件循环已关闭：没有人再等这个结果
+            pass
+
+    threading.Thread(target=work, name="agentbox-call", daemon=True).start()
+    paused = asyncio.ensure_future(stop.wait())
+    try:
+        await asyncio.wait({done, paused}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:  # 调用方被取消：同样放弃，线程不能再占号或发出请求
+        token.abandoned = True
+        _discard(done)
+        raise
+    finally:
+        paused.cancel()
+    if done.done():  # 调用先结束（或与暂停同时结束）：用它的结果
+        return done.result()
+    token.abandoned = True
+    _discard(done)
+    raise CallAbandoned("宿主请求了暂停：放弃等待在途的调用")
+
+
+def _discard(done: asyncio.Future[Any]) -> None:
+    """不再需要的结果：未结束的取消（之后到达的结果被丢弃），已结束的取走其异常。"""
+    if not done.done():
+        done.cancel()
+    elif not done.cancelled():
+        done.exception()
+
+
 def _hash_file(path: Path) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
@@ -225,6 +293,7 @@ class TaskContext:
         self._artifact_results = Waiters()
         self._checkpoint_lock = asyncio.Lock()
         self._pause_requested = False
+        self._pause_event = asyncio.Event()
         negotiated = requests_subruns(init.get("extensions")) if subruns is None else subruns
         # 本 attempt（session 模式下即本 turn）的 sub-run 状态所有者
         self.subruns = SubrunManager(
@@ -258,6 +327,50 @@ class TaskContext:
     def should_pause(self) -> bool:
         """宿主是否请求了暂停。应用在提交边界检查它（规格 §5.9）。"""
         return self._pause_requested
+
+    async def run_call(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        """在独立线程中运行一次阻塞调用（Gateway 调用、经 Gateway 的工具），可被暂停放弃。
+
+        宿主请求暂停时不再等它返回，抛出 CallAbandoned；暂停已被请求时不开始调用、直接抛出。
+        被放弃的调用在 Gateway 侧继续并记入 journal；此后其线程不能再占用 call id、不能再发出请求
+        （stop-fix F1）。call id 计数器仍含被放弃调用已占的号：应用回到最近一致的状态时应以
+        rewind_call_ids 回退到与该状态一起保存的计数器，恢复后被放弃的调用以同一 ID 重发。
+        """
+        if self._pause_requested:
+            raise CallAbandoned("宿主已请求暂停：不再开始新的调用")
+        return await _abandonable(fn, args, kwargs, self._pause_event)
+
+    async def run_call_within(
+        self, timeout_s: float, fn: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> Any:
+        """同 run_call，但只受期限约束：timeout_s 秒内没有结束即放弃等待并抛出 CallAbandoned。
+
+        不受暂停影响，用于暂停之后仍须有界完成的调用（停止摘要：被放弃的调用可能占满 Gateway 的
+        每任务在途槽位，摘要会在 Gateway 侧排队）。被放弃的调用在 Gateway 侧继续并记入 journal，
+        其线程此后不能再占用 call id、不能再发出请求；它已占的号留在计数器中。"""
+        if timeout_s <= 0:
+            raise CallAbandoned("调用期限已过：不再开始调用")
+        expired = asyncio.Event()
+        timer = asyncio.get_running_loop().call_later(timeout_s, expired.set)
+        try:
+            return await _abandonable(fn, args, kwargs, expired)
+        except CallAbandoned:
+            raise CallAbandoned(f"调用未在 {timeout_s:.1f} s 内结束：放弃等待") from None
+        finally:
+            timer.cancel()
+
+    def rewind_call_ids(self, snapshot: dict[str, int]) -> None:
+        """把本 attempt 的 call id 计数器原地回退到 snapshot（与某个一致的应用状态一起取得）。
+
+        只应在放弃在途调用（run_call 抛出 CallAbandoned）之后使用；之后的 checkpoint 保存回退后的
+        计数器加上此后新发起的调用（如停止摘要）。"""
+        self._call_ids.rewind(snapshot)
+
+    def advance_call_ids(self, snapshot: dict[str, int]) -> None:
+        """每个前缀前进到 max(当前, snapshot)：之后的调用跳过被放弃调用已占的号。
+
+        见 CallIds.advance；用于改变下一次请求内容的指令。"""
+        self._call_ids.advance(snapshot)
 
     async def progress(
         self, kind: str, message: str, *, step_id: str | None = None, data: Any = None
@@ -414,6 +527,7 @@ class TaskContext:
             self._artifact_results.deliver(msg["artifact_id"], msg)
         elif typ == "pause":
             self._pause_requested = True
+            self._pause_event.set()
         elif typ == "cancel":
             self.cancel_reason = msg.get("reason") or "cancel"
             return False

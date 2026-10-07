@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -363,6 +364,59 @@ func TestBindLifecycle(t *testing.T) {
 	}
 	if _, _, _, cancels := calls.snapshot(); len(cancels) != 0 {
 		t.Errorf("Close 不应调用 CancelAttempt：%v", cancels)
+	}
+}
+
+// TestEnvHeldUntilSocketRemoved：EnvHeld 覆盖入口 socket 的整个生命周期——Bind 之后为真；Revoke 把入口移出
+// 映射之后、socket 删除之前仍为真（resource 据此推迟 UID 范围归还，见 resource.Options.EntryHeld）；删除之后为
+// 假。incarnation 入口相同。同一环境的另一入口仍在时保持为真。
+func TestEnvHeldUntilSocketRemoved(t *testing.T) {
+	e := newEdge(t, Config{}, &fakeCalls{})
+	var during []bool
+	env := "e1" // 正在撤销的入口所属环境
+	e.removeHook = func(path string) {
+		_, err := os.Stat(path)
+		during = append(during, err == nil && e.EnvHeld(env))
+	}
+	if e.EnvHeld("e1") {
+		t.Fatal("未绑定时 EnvHeld(e1) 为真")
+	}
+	p1 := bind(t, e, "a1", "e1")
+	bind(t, e, "a3", "e1")
+	if !e.EnvHeld("e1") || e.EnvHeld("e2") {
+		t.Fatalf("绑定后 EnvHeld(e1)=%v EnvHeld(e2)=%v", e.EnvHeld("e1"), e.EnvHeld("e2"))
+	}
+	if err := e.Revoke(context.Background(), "a1", "attempt_stopping"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p1); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Revoke 后 socket 仍存在：%v", err)
+	}
+	if !e.EnvHeld("e1") {
+		t.Fatal("同一环境的 a3 仍绑定时 EnvHeld(e1) 为假")
+	}
+	if err := e.Revoke(context.Background(), "a3", "attempt_stopping"); err != nil {
+		t.Fatal(err)
+	}
+	if e.EnvHeld("e1") {
+		t.Fatal("全部入口撤销后 EnvHeld(e1) 仍为真")
+	}
+
+	env = "e2"
+	if _, err := e.BindIncarnation(context.Background(), "i1", "e2"); err != nil {
+		t.Fatal(err)
+	}
+	if !e.EnvHeld("e2") {
+		t.Fatal("incarnation 入口绑定后 EnvHeld(e2) 为假")
+	}
+	if err := e.RevokeIncarnation(context.Background(), "i1"); err != nil {
+		t.Fatal(err)
+	}
+	if e.EnvHeld("e2") {
+		t.Fatal("incarnation 入口撤销后 EnvHeld(e2) 仍为真")
+	}
+	if !slices.Equal(during, []bool{true, true, true}) {
+		t.Fatalf("删除 socket 之前（socket 存在且 EnvHeld 为真）= %v，期望三次均为真", during)
 	}
 }
 

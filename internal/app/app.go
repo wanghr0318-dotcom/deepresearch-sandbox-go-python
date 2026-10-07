@@ -132,6 +132,9 @@ type Config struct {
 	TurnToolBudget int
 	// SessionIdleFreeze（默认 10 min，> 0）与 SessionEvictAfter（默认 1 h，须大于前者）是会话空闲冻结与驱逐的时限。
 	SessionIdleFreeze, SessionEvictAfter time.Duration
+	// SessionPauseGrace 是会话 turn 停止（pause）的 grace（Worker 写停止卡的时限，到期宿主强制结束 attempt 并写兜底停止卡）；
+	// 0 取 task.DefaultSessionPauseGraceMs（60 s）。只供测试缩短（tests/e2e/agentbox-e2e 的 --session-pause-grace）。
+	SessionPauseGrace time.Duration
 	// SessionWorkerArgv 是会话 incarnation 内启动 Worker 的命令（--session-worker-argv；Plan 13 为 python3 -m
 	// chatagent）。为空时不启用会话：会话端点 503 sessions_unavailable。启用会话需要用户账号（Accounts）。会话 Worker
 	// 的环境变量与任务 Worker 相同（WorkerEnv）。
@@ -637,7 +640,11 @@ func (s *server) assemble() error {
 		Alert: func(q resource.Quarantine) {
 			s.log.Error("隔离资源报警", "alert", "quarantine", "layer", q.Layer, "path", q.Path,
 				"observed_owner", q.ObservedOwner, "reason", q.Reason)
-		}})
+		},
+		// Gateway 入口 socket 归环境的 UID 范围所有：撤销（可能晚于判决，见 Options.EntryHeld）之前不归还该范围。
+		// s.edge 由下方 assembleGateway 设置，cleanup loop 在 assemble 之后才启动。
+		EntryHeld: func(envID string) bool { return s.edge != nil && s.edge.EnvHeld(envID) },
+		Logger:    s.log})
 	run := runner.New(s.store, blobs, prov, prov.ResourceDiag, s.cfg.Runner)
 	if err := s.assembleGateway(blobs); err != nil {
 		return err
@@ -687,6 +694,7 @@ func (s *server) assemble() error {
 			}
 			return s.store.AccountUnrecordedRunTime(ctx, att.TaskID, attemptID, stoppedAt)
 		},
+		SessionPauseGrace: s.cfg.SessionPauseGrace,
 	}
 	return nil
 }

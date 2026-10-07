@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/faultinject"
@@ -65,9 +66,38 @@ func (c *Coordinator) cleanupPass(ctx context.Context) error {
 }
 
 // cleanupEnv 在 envID 的串行执行者内清理一个环境。Destroy 失败已记入 cleanup 列（退避重试），不作为错误返回。
+// 被 HoldEnv 持有的环境本轮跳过（仍是候选，释放之后的轮次处理）。
 func (c *Coordinator) cleanupEnv(ctx context.Context, e Environment) error {
-	_, err := c.cleanupOne(ctx, e)
+	_, err := c.cleanupOne(ctx, e, true)
 	return err
+}
+
+// HoldEnv 声明本进程仍在使用环境（exec 调用从创建到停止、收集与同步清理）：持有期间 cleanup loop 不销毁它，
+// CleanupNow 不受影响。exec 环境一记录 stopped_at 就是 cleanup 候选（不等判决，D8），而 StopEnv 记录后立即唤醒
+// cleanup loop；不持有时，loop 可能抢在 call 协调器读取诊断与收集 /out 之前把环境销毁，已完成的 exec 被结算为
+// unknown（E37 CI 偶发）。须在 StopEnv 之前取得（之后 loop 的检查在同一把 c.mu 下必然看到它）。
+// 返回的 release 只能调用一次；释放后唤醒 cleanup loop，使未被同步清理的环境不必等下一个间隔。
+func (c *Coordinator) HoldEnv(envID string) (release func()) {
+	c.mu.Lock()
+	c.holds[envID]++
+	c.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.mu.Lock()
+			if c.holds[envID]--; c.holds[envID] <= 0 {
+				delete(c.holds, envID)
+			}
+			c.mu.Unlock()
+			c.kickCleanup()
+		})
+	}
+}
+
+func (c *Coordinator) held(envID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.holds[envID] > 0
 }
 
 // CleanupNow 立即清理一个已记录 stopped_at 的环境（M4 Plan 15 D8：exec 环境在收集之后同步尽力清理，不等待
@@ -82,15 +112,16 @@ func (c *Coordinator) CleanupNow(ctx context.Context, envID string) error {
 	if e.StoppedAt == nil {
 		return fmt.Errorf("resource: 清理环境 %s: stopped_at 尚未记录", envID)
 	}
-	derr, err := c.cleanupOne(ctx, e)
+	derr, err := c.cleanupOne(ctx, e, false)
 	if derr != nil {
 		return errors.Join(fmt.Errorf("resource: 销毁环境 %s: %w", envID, derr), err)
 	}
 	return err
 }
 
-// cleanupOne 是 cleanupEnv 的实现；destroyErr 是 Destroy 的失败（已记入 cleanup 列）。
-func (c *Coordinator) cleanupOne(ctx context.Context, e Environment) (destroyErr, err error) {
+// cleanupOne 是 cleanupEnv 的实现；destroyErr 是 Destroy 的失败（已记入 cleanup 列）。fromLoop 为真（cleanup
+// loop）时跳过被 HoldEnv 持有的环境；检查在串行执行者内进行。
+func (c *Coordinator) cleanupOne(ctx context.Context, e Environment, fromLoop bool) (destroyErr, err error) {
 	if e.StoppedAt == nil || e.CleanupState == CleanupDone { // 未确认停止的环境不清理（契约第 5 节）
 		return nil, nil
 	}
@@ -99,6 +130,9 @@ func (c *Coordinator) cleanupOne(ctx context.Context, e Environment) (destroyErr
 		return nil, err
 	}
 	defer unlock()
+	if fromLoop && c.held(e.EnvID) {
+		return nil, nil
+	}
 
 	if derr := c.p.Destroy(ctx, e.EnvID); derr != nil {
 		if ctx.Err() != nil {
@@ -160,7 +194,7 @@ const (
 //     最后一个 attempt 的范围；下个 attempt 启动时会重新 chown，无损）；
 //  2. UIDFiles：数据目录其他位置仍有归该范围的文件 → QuarantineUIDRange 并报警（I8 路径），不归还。
 //
-// 回收或核查出错时本轮不归还，留在待归还集合中由下一轮重试。成功归还、已隔离、没有范围或冲突（分配已变化，
+// 回收或核查出错时、环境的入口仍被持有时（Options.EntryHeld）本轮不归还，留在待归还集合中由下一轮重试。成功归还、已隔离、没有范围或冲突（分配已变化，
 // 重试无意义，交给启动核对）时移出待归还集合。
 func (c *Coordinator) releaseUIDRange(ctx context.Context, envID string) error {
 	ur, err := c.store.GetUIDRange(ctx, envID)
@@ -171,6 +205,31 @@ func (c *Coordinator) releaseUIDRange(ctx context.Context, envID string) error {
 		c.mu.Unlock()
 		return nil
 	}
+	if err == nil && c.opt.EntryHeld != nil && c.opt.EntryHeld(envID) {
+		// 入口（Gateway socket）尚未撤销：它归该范围所有但不是残留。留在待归还集合中，撤销之后再核查归还
+		// （见 Options.EntryHeld）。推迟过久（入口泄漏）时记一次 WARN，不让范围被静默占用。
+		now := c.opt.Now()
+		c.mu.Lock()
+		first, seen := c.entryDeferred[envID]
+		if !seen {
+			first = now
+			c.entryDeferred[envID] = now
+		}
+		warn := now.Sub(first) > EntryHeldWarnAfter && !c.entryWarned[envID]
+		if warn {
+			c.entryWarned[envID] = true
+		}
+		c.mu.Unlock()
+		if warn {
+			c.opt.Logger.Warn("环境的 Gateway 入口长时间未撤销，UID 范围推迟归还", "env_id", envID,
+				"uid_range", ur.UIDRangeID, "deferred_for", now.Sub(first).Round(time.Second).String())
+		}
+		return nil
+	}
+	c.mu.Lock()
+	delete(c.entryDeferred, envID)
+	delete(c.entryWarned, envID)
+	c.mu.Unlock()
 	released := false
 	if err == nil {
 		released, err = c.checkAndRelease(ctx, ur, func(ctx context.Context) error {

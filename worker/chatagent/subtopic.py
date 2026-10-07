@@ -8,7 +8,6 @@ web_search、web_fetch、read_source；份额或全局额度用尽、或轮数�
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING, Any
 
 from agentbox_worker.tools import ToolArgsError, ToolContext, ToolResult
@@ -162,7 +161,7 @@ async def _loop(agent: Agent, sub: SubtopicState, step: str) -> str:
             sub.messages.append({"role": "user", "content": SUBTOPIC_CLOSE})
             sub.closing = True
         tools = None if sub.closing else agent.sub_registry.schemas()
-        reply = await asyncio.to_thread(
+        reply = await agent.call(
             call_model,
             agent.gw,
             step,

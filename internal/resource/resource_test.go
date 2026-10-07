@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"slices"
 	"sort"
 	"strings"
@@ -1274,6 +1275,121 @@ func TestCleanupQuarantinesRangeWithResidue(t *testing.T) {
 	}
 	if s := f.prov.specs[len(f.prov.specs)-1]; s.UIDBase == testUIDBase {
 		t.Fatalf("隔离的范围被重新分配给 e2：%+v", s)
+	}
+}
+
+// TestCleanupDefersReleaseWhileEntryHeld：环境的 Gateway 入口仍被持有（撤销晚于判决：Store 暂时不可用时
+// 撤销排在 Finalize 之后补提交）→ 入口 socket 归该范围所有但不是残留：本轮不核查、不隔离、不归还；入口撤销
+// （socket 删除）之后的轮次照常核查并归还。CI 曾在 cleanup 抢在撤销之前时把该范围隔离（E8）。
+func TestCleanupDefersReleaseWhileEntryHeld(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	held := true
+	f.c.opt.EntryHeld = func(envID string) bool { return held && envID == "e1" }
+	f.createStopped(t, "e1", true)
+	const sock = "/data/gateway/att-e1.sock"
+	f.prov.PlantUIDFile(sock, testUIDBase+1000, false)
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertLog(t, f.rec, "Destroy:ok", "ResolveIntent:released", "UpdateCleanup:done")
+	id := fmt.Sprintf("uid-%d", testUIDBase)
+	if r := f.store.rangeOf(id); r.State != "assigned" {
+		t.Fatalf("入口仍被持有时 UID 范围 = %+v，期望仍为 assigned", r)
+	}
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.rec.count("QuarantineUIDRange") + f.rec.count("ReleaseUIDRange"); n != 0 {
+		t.Fatalf("入口仍被持有时处理了该范围：%v", f.rec.snapshot())
+	}
+
+	// 撤销：socket 删除（植入属主 0 表示不再归该范围所有），入口不再被持有。
+	f.prov.PlantUIDFile(sock, 0, false)
+	held = false
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.store.rangeOf(id); r.State != "free" {
+		t.Fatalf("入口撤销后 UID 范围 = %+v，期望归还", r)
+	}
+	if n := f.rec.count("QuarantineUIDRange"); n != 0 {
+		t.Fatalf("范围被隔离：%v", f.rec.snapshot())
+	}
+}
+
+// TestCleanupWarnsOnceWhenEntryHeldTooLong：入口持续被持有（泄漏的绑定）时，推迟超过 EntryHeldWarnAfter 记一次
+// WARN（之后的轮次不重复），范围仍不归还；入口撤销后照常归还。
+func TestCleanupWarnsOnceWhenEntryHeldTooLong(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	var logBuf strings.Builder
+	f.c.opt.Logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+	held := true
+	f.c.opt.EntryHeld = func(string) bool { return held }
+	f.createStopped(t, "e1", true)
+	warns := func() int { return strings.Count(logBuf.String(), "level=WARN") }
+	for _, step := range []time.Duration{0, 30 * time.Second, 31 * time.Second, 10 * time.Second} {
+		f.clock.advance(step)
+		if err := f.c.cleanupPass(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := warns(); n != 1 || !strings.Contains(logBuf.String(), "env_id=e1") {
+		t.Fatalf("推迟 71 s 后 WARN %d 条，期望恰好 1 条：%s", n, logBuf.String())
+	}
+	id := fmt.Sprintf("uid-%d", testUIDBase)
+	if r := f.store.rangeOf(id); r.State != "assigned" {
+		t.Fatalf("入口仍被持有时 UID 范围 = %+v", r)
+	}
+	held = false
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.store.rangeOf(id); r.State != "free" {
+		t.Fatalf("入口撤销后 UID 范围 = %+v，期望归还", r)
+	}
+	if warns() != 1 {
+		t.Fatalf("归还时又记录了 WARN：%s", logBuf.String())
+	}
+}
+
+// TestCleanupLoopSkipsHeldEnv：HoldEnv 持有期间 cleanup loop 不销毁已停止的环境（exec 的诊断与收集仍在进行，
+// E37 CI 偶发）；持有者自己的 CleanupNow 不受影响；释放后下一轮照常清理。
+func TestCleanupLoopSkipsHeldEnv(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	release := f.c.HoldEnv("e1")
+	f.createStopped(t, "e1", true)
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.rec.count("Destroy:ok"); n != 0 {
+		t.Fatalf("持有期间 cleanup loop 销毁了环境：%v", f.rec.snapshot())
+	}
+	release()
+	release() // 幂等
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if e := f.store.env("e1"); e.CleanupState != CleanupDone || f.rec.count("Destroy:ok") != 1 {
+		t.Fatalf("释放后未清理：env %+v，%v", e, f.rec.snapshot())
+	}
+
+	f.store.addEnv("e2", false)
+	if _, err := f.c.CreateEnv(ctx, req("e2")); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := f.c.StopEnv(ctx, "e2"); err != nil || !res.Recorded {
+		t.Fatalf("StopEnv(e2) = %+v, %v", res, err)
+	}
+	release = f.c.HoldEnv("e2")
+	defer release()
+	if err := f.c.CleanupNow(ctx, "e2"); err != nil {
+		t.Fatalf("持有者的 CleanupNow = %v", err)
+	}
+	if e := f.store.env("e2"); e.CleanupState != CleanupDone {
+		t.Fatalf("持有期间 CleanupNow 未清理：%+v", e)
 	}
 }
 

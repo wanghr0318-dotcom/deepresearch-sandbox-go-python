@@ -2475,6 +2475,47 @@ type fakeEnvs struct {
 	files   []*os.File
 	created chan string // 每次 Create 开始时发送 env_id
 	started chan string // 每次 Start 成功时发送 env_id
+	holds   map[string]int
+}
+
+// Hold 记录持有；Create、Stop、Diag、OpenOutputs 与 Cleanup 都必须在持有期间调用（requireHeld）。
+func (f *fakeEnvs) Hold(envID string) func() {
+	f.mu.Lock()
+	if f.holds == nil {
+		f.holds = map[string]int{}
+	}
+	f.holds[envID]++
+	f.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.holds[envID]--; f.holds[envID] == 0 {
+				delete(f.holds, envID)
+			}
+		})
+	}
+}
+
+// requireHeld：cleanup loop 只在环境不被持有时销毁它，因此停止之后的诊断与收集必须仍在持有期间（E37 CI 偶发）。
+func (f *fakeEnvs) requireHeld(op, envID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.holds[envID] == 0 {
+		f.t.Errorf("%s(%s) 不在 Hold 期间：cleanup loop 可能已销毁环境", op, envID)
+	}
+}
+
+// heldCount 返回仍未释放的持有数。
+func (f *fakeEnvs) heldCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, v := range f.holds {
+		n += v
+	}
+	return n
 }
 
 func (f *fakeEnvs) env(id string) *fakeExecEnv {
@@ -2485,6 +2526,7 @@ func (f *fakeEnvs) env(id string) *fakeExecEnv {
 
 func (f *fakeEnvs) Create(_ context.Context, r ExecEnvRequest) (string, error) {
 	f.log.add("create")
+	f.requireHeld("Create", r.EnvID)
 	f.mu.Lock()
 	sc := execScript{stdout: "ok\n"}
 	if f.n < len(f.scripts) {
@@ -2592,6 +2634,7 @@ func (f *fakeEnvs) Start(_ context.Context, envID string, spec provider.ExecSpec
 
 func (f *fakeEnvs) Stop(_ context.Context, envID string) (ExecStop, error) {
 	f.log.add("stop")
+	f.requireHeld("Stop", envID)
 	e := f.env(envID)
 	if e == nil { // Create 失败：没有残留
 		f.store.markStopped(envID)
@@ -2608,13 +2651,15 @@ func (f *fakeEnvs) Stop(_ context.Context, envID string) (ExecStop, error) {
 	return ExecStop{Stopped: true, Recorded: true}, nil
 }
 
-func (f *fakeEnvs) Diag(context.Context, string) (provider.ResourceDiag, error) {
+func (f *fakeEnvs) Diag(_ context.Context, envID string) (provider.ResourceDiag, error) {
 	f.log.add("diag")
+	f.requireHeld("Diag", envID)
 	return provider.ResourceDiag{CPUUsageUsec: 81234}, nil
 }
 
 func (f *fakeEnvs) OpenOutputs(_ context.Context, envID string, max int) ([]provider.OutputFile, []provider.SkippedOutput, error) {
 	f.log.add("outputs")
+	f.requireHeld("OpenOutputs", envID)
 	if max != provider.MaxOutputFiles {
 		f.t.Errorf("OpenOutputs max = %d，期望 %d", max, provider.MaxOutputFiles)
 	}
@@ -2646,6 +2691,7 @@ func (f *fakeEnvs) OpenOutputs(_ context.Context, envID string, max int) ([]prov
 // Cleanup 与 provider 的 Destroy 相同：仍有打开的输出文件时 EBUSY（记为测试失败）。
 func (f *fakeEnvs) Cleanup(_ context.Context, envID string) error {
 	f.log.add("cleanup")
+	f.requireHeld("Cleanup", envID)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, fh := range f.files {
@@ -2961,6 +3007,9 @@ func TestExecHappyPath(t *testing.T) {
 	want := []string{"acquire", "reserve", "create", "mark", "start", "stdin_closed", "stop", "diag", "outputs", "cleanup", "settle", "release"}
 	if got := h.ops.list(); !equalStrings(got, want) {
 		t.Fatalf("操作序列\n得到 %v\n期望 %v", got, want)
+	}
+	if n := h.envs.heldCount(); n != 0 {
+		t.Fatalf("try 结束后仍有 %d 个环境持有未释放（cleanup loop 将永远跳过它）", n)
 	}
 	spec := h.envs.lastSpec(t)
 	if !equalStrings(spec.Argv, []string{"python3", "-I", "-B", "/in/.agentbox/main.py"}) || spec.Dir != "/out" ||

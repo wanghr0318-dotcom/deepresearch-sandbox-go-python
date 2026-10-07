@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Instant stop:** the stop card appears within seconds even when a model, tool or `run_python` call is in flight; the abandoned call is replayed under the same call id on continue. The stop summary has a 22 s deadline and falls back to a progress-based finding.
+- **Host fallback stop card:** when the worker cannot write a stop card (it does not respond in time, or the turn is stopped while still queued) the host writes one with a fixed finding, and continue / write-now still work.
+- **"正在停止… N 秒":** the turn shows a ticking stopping row from the moment stop is clicked until the stop card arrives.
+- **继续 / continue after a stop** continues the stopped turn instead of starting a new one.
+- **Follow-up messages after a stop** always carry the stopped turn's question and progress as context.
+
 ## v0.2.0 — 2026-10-07
 
 First public release.

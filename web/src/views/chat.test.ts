@@ -348,6 +348,40 @@ describe("ChatView", () => {
     expect(chat.restore).toHaveBeenCalledWith("u1");
   });
 
+  it("sending 继续 to a stopped turn continues it instead of starting a new turn", async () => {
+    const stream = fakeSessionStream();
+    const chat = fakeChat({ listTurns: vi.fn(async () => ({ turns: [turn({ turn_id: "u1", text: "研究", deep_research: true, status: "running" })] })) });
+    const w = track(mountChat({ chat, watchSession: stream.fn }, { sessionId: "s1" }));
+    await flushPromises();
+    stream.push(sev(1, "route", { route: "research", forced: true }, "u1"));
+    stream.push(sev(2, "turn_stopped", { card: { subtopics_done: 0, subtopics_total: 2, sources: 0, tool_calls_used: 3, tool_call_limit: 30 }, findings: "f", can_finish: false }, "u1"));
+    stream.push(sev(3, "turn_status", { status: "paused" }, "u1"));
+    await flushPromises();
+
+    await type(w, " 继续。 ");
+    await send(w);
+    expect(chat.control).toHaveBeenCalledWith("u1", "continue");
+    expect(chat.sendMessage).not.toHaveBeenCalled();
+    expect((w.get("textarea[name=message]").element as HTMLTextAreaElement).value).toBe("");
+
+    // 其他文字照旧新建一轮
+    await type(w, "继续研究，但只看中国");
+    await send(w);
+    expect(chat.control).toHaveBeenCalledTimes(1);
+    expect(chat.sendMessage.mock.calls[0]!.slice(0, 3)).toEqual(["s1", "继续研究，但只看中国", false]);
+  });
+
+  it("sending 继续 after a finished turn sends it as a new message", async () => {
+    const stream = fakeSessionStream();
+    const chat = fakeChat({ listTurns: vi.fn(async () => ({ turns: [turn({ turn_id: "u1", text: "问", status: "succeeded" })] })) });
+    const w = track(mountChat({ chat, watchSession: stream.fn }, { sessionId: "s1" }));
+    await flushPromises();
+    await type(w, "继续");
+    await send(w);
+    expect(chat.control).not.toHaveBeenCalled();
+    expect(chat.sendMessage.mock.calls[0]!.slice(0, 3)).toEqual(["s1", "继续", false]);
+  });
+
   it("side panel follows the active research turn; tabs switch between 进度/来源/报告", async () => {
     const stream = fakeSessionStream();
     const chat = fakeChat({
