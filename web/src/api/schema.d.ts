@@ -233,7 +233,8 @@ export interface paths {
          *     `host/control_accepted` (`desired`, `control_version`), `host/control_applied` (`status`,
          *     `control_version`), `host/checkpoint_committed` (`checkpoint_id`, `commit_seq`, `step_id`),
          *     `host/artifact_saved` (`artifact_id`, `version`), `host/attempt_ended` and `host/task_terminal`
-         *     (`task_status`, `status_reason`), `worker/progress` (`step_id`, `kind`, `message`),
+         *     (`task_status`, `status_reason`), `host/turn_stopped` (none; the host's fallback stop card, whose
+         *     content is sent as a `turn_stopped` session event), `worker/progress` (`step_id`, `kind`, `message`),
          *     `worker/result` (`summary`, `outputs`). `worker_seq` is omitted. Every other event (for example
          *     Gateway `replay_divergence`, worker `ready`, `checkpoint`, `checkpoint_query`, `artifact`,
          *     `paused`, `error`) is not sent, and no cost, budget, model, call, try, usage, token or
@@ -515,7 +516,10 @@ export interface paths {
         /**
          * Stop a queued or running turn (owner only; idempotent by request_id)
          * @description Requests a pause (`stopping` → `paused`); the turn keeps its last checkpoint and the worker reports
-         *     a `turn_stopped` card. Any other status is 409 `invalid_turn_state`.
+         *     a `turn_stopped` card. When the worker cannot (it does not finish within the stop grace and is ended
+         *     by the host, the host restarts meanwhile, or the turn was still queued), the host writes a fallback
+         *     `turn_stopped` card of the same shape (counts from the turn's events, fixed findings), so continue
+         *     and finish stay available. Any other status is 409 `invalid_turn_state`.
          */
         post: operations["stopTurn"];
         delete?: never;
