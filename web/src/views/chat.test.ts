@@ -153,7 +153,9 @@ describe("Composer", () => {
     await w.setProps({ running: true });
     await w.get("textarea[name=message]").setValue("再问一句");
     expect(w.get("[data-action=send]").attributes("disabled")).toBeDefined();
-    expect(w.get("[data-testid=composer-hint]").text()).toBe("先停止当前研究");
+    expect(w.find("[data-testid=composer-hint]").exists()).toBe(false);
+    expect(w.find("[data-action=stop-turn]").exists()).toBe(true);
+    expect(w.get("textarea").attributes("placeholder")).toBe("研究进行中…");
     await w.get("form").trigger("submit");
     expect(w.emitted("send")).toBeUndefined();
     await w.get("[data-action=stop-turn]").trigger("click");
@@ -212,7 +214,9 @@ describe("ChatView", () => {
     await flushPromises();
     await type(w, "再问");
     expect(w.get("[data-action=send]").attributes("disabled")).toBeDefined();
-    expect(w.get("[data-testid=composer-hint]").text()).toBe("先停止当前研究");
+    expect(w.find("[data-testid=composer-hint]").exists()).toBe(false);
+    expect(w.find("[data-action=stop-turn]").exists()).toBe(true);
+    expect(w.get("textarea").attributes("placeholder")).toBe("研究进行中…");
     await send(w);
     expect(chat.sendMessage).not.toHaveBeenCalled();
 

@@ -6,7 +6,7 @@
       name="message"
       rows="1"
       aria-label="输入消息"
-      :placeholder="placeholder ?? '问点什么…'"
+      :placeholder="running ? '研究进行中…' : (placeholder ?? '问点什么…')"
       @keydown.enter="onEnter"
       @compositionstart="composing = true"
       @compositionend="composing = false"
@@ -27,7 +27,6 @@
         <span class="dot" aria-hidden="true"></span>深度研究
       </button>
       <span v-if="error" class="err" role="alert">{{ error }}</span>
-      <span v-else-if="running" class="hint" data-testid="composer-hint">先停止当前研究</span>
       <span class="spacer"></span>
       <button
         v-if="running"
@@ -50,7 +49,7 @@
 
 <script setup lang="ts">
 // 输入框：多行（随内容增高）；Enter 发送、Shift+Enter 换行、输入法组合中不发送；"深度研究"开关（aria-pressed）。
-// 有进行中的轮次时禁用发送并提示"先停止当前研究"（契约裁定 I：运行中再发消息会 409 turn_in_progress），同时给出 ■ 停止。
+// 有进行中的轮次时禁用发送（契约裁定 I：运行中再发消息会 409 turn_in_progress），输入框内只显示 ■ 停止，占位文字为"研究进行中…"。
 // 发送成功后由父组件调用 clear()；失败时保留输入。
 import { computed, nextTick, ref, watch } from "vue";
 import { validateMessage } from "../../api/chat";
@@ -192,10 +191,6 @@ textarea::placeholder {
   border-color: #7c3aed;
   background: #7c3aed;
   box-shadow: 0 0 0 2px #ddd6fe;
-}
-.hint {
-  font-size: 0.78rem;
-  color: #92400e;
 }
 .err {
   font-size: 0.78rem;
