@@ -14,6 +14,7 @@ from agentbox_worker.tools.base import (
     failed,
     with_budget_line,
 )
+from agentbox_worker.tools.blocked import is_blocked_page
 from agentbox_worker.tools.sources import EXCERPT_MAX_BYTES, PREVIEW_MAX_CHARS
 from agentbox_worker.tools.text import page_text, site_of, truncate_utf8
 
@@ -62,6 +63,8 @@ class WebFetch:
             return failed(ctx, "抓取失败：Gateway 未返回结果 blob", raw)
         text = page_text(body) if body.get("encoding", "utf-8") == "utf-8" else ""
         title = _title(body)
+        if is_blocked_page(text, title):  # 人机验证/拦截页：不作为来源，正文不给模型
+            return failed(ctx, f"页面被拦截（需要人机验证）：{url}", raw)
         note = ""
         if not text:  # PDF 等二进制内容或没有可读文字的页面：只有搜索摘要时才作为来源
             hit_title, snippet = ctx.snippets.get(url, ("", ""))

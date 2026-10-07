@@ -96,6 +96,17 @@ describe("applyEvent", () => {
     expect(s.turns[0]!.sources).toEqual([{ n: 1, title: "新闻", url: "https://www.news.example/p", site: "news.example" }]);
   });
 
+  it("labels a fetch that hit a human-verification page as 页面被拦截 and adds no source", () => {
+    const blocked = "页面被拦截（需要人机验证）：https://m.36kr.com/p/1";
+    const s = run(started(), [
+      sev(1, "tool_call", { step_id: "orch", tool_call_id: "b1", tool: "web_fetch", input: { url: "https://m.36kr.com/p/1" } }, "u1"),
+      sev(2, "tool_result", { step_id: "orch", tool_call_id: "b1", tool: "web_fetch", ok: false, preview: { kind: "text", text: blocked }, error: blocked }, "u1"),
+    ]);
+    const row = s.turns[0]!.steps[0]!;
+    expect(row).toMatchObject({ kind: "fetch", title: "阅读网页 · m.36kr.com · 页面被拦截", status: "error", text: blocked });
+    expect(s.turns[0]!.sources).toEqual([]);
+  });
+
   it("run_python becomes a 运行代码 row with exit code and stdout; failures keep the preview; ⟨/⟩ from the exec call", () => {
     const code = "\n  rows = [(2023, 120), (2024, 150)]\nprint(150 / 120 - 1)";
     const execReq = { language: "python3", code };

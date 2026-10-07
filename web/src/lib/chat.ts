@@ -487,6 +487,10 @@ function applyToolResult(t: TurnView, d: Data, seq: number): TurnView {
   // run_python 失败（非零退出等）时预览含退出码与 stderr 末尾，比 error 的首段更完整
   const codeText = kind === "code" ? previewText(p) : undefined;
   if (!ok) row.text = toolErrorText(codeText ?? optStr(d.error) ?? row.text ?? "调用失败");
+  if (!ok && (kind === "fetch" || p.kind === "fetch") && (row.text ?? "").startsWith("页面被拦截")) {
+    const site = siteOf(row.detail ?? "");
+    row.title = site ? `阅读网页 · ${site} · 页面被拦截` : "阅读网页 · 页面被拦截";
+  }
   const raw = toRaw(d.raw);
   if (raw) row.raw = raw;
   if (i >= 0) steps[i] = row;
