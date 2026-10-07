@@ -130,11 +130,13 @@ type Coordinator struct {
 	// entryDeferred 是因 EntryHeld 推迟归还的环境 → 首次推迟的时间；entryWarned 为已记录 WARN 的环境。
 	entryDeferred map[string]time.Time
 	entryWarned   map[string]bool
-	seeded        bool
-	kick          chan struct{}      // 唤醒 cleanup loop（容量 1，合并多次唤醒）
-	freed         chan struct{}      // 有 UID 范围归还时关闭并替换（广播给等待中的 CreateEnv）
-	onLockWait    func(envID string) // 测试钩子：串行执行者被占用、开始等待时调用
-	onCleanupRun  func()             // 测试钩子：cleanup loop 每轮结束时调用
+	// holds 是进程内仍在使用、cleanup loop 不得销毁的环境（HoldEnv）→ 持有数。
+	holds        map[string]int
+	seeded       bool
+	kick         chan struct{}      // 唤醒 cleanup loop（容量 1，合并多次唤醒）
+	freed        chan struct{}      // 有 UID 范围归还时关闭并替换（广播给等待中的 CreateEnv）
+	onLockWait   func(envID string) // 测试钩子：串行执行者被占用、开始等待时调用
+	onCleanupRun func()             // 测试钩子：cleanup loop 每轮结束时调用
 }
 
 // envLock 是一个环境的串行执行者：容量为 1 的信号量，等待可被 ctx 取消。
@@ -177,6 +179,7 @@ func NewCoordinator(store Store, p Provider, opt Options) *Coordinator {
 		pendingAlert:  make(map[string]struct{}),
 		entryDeferred: make(map[string]time.Time),
 		entryWarned:   make(map[string]bool),
+		holds:         make(map[string]int),
 		kick:          make(chan struct{}, 1),
 		freed:         make(chan struct{}),
 	}

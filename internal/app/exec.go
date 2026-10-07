@@ -163,6 +163,7 @@ type execCoordinator interface {
 	CreateEnv(ctx context.Context, r resource.EnvRequest) (provider.EnvInfo, error)
 	StopEnv(ctx context.Context, envID string) (resource.StopResult, error)
 	CleanupNow(ctx context.Context, envID string) error
+	HoldEnv(envID string) (release func())
 }
 
 var _ execCoordinator = (*resource.Coordinator)(nil)
@@ -217,6 +218,8 @@ func (x execEnvAdapter) OpenOutputs(ctx context.Context, envID string, max int) 
 func (x execEnvAdapter) Cleanup(ctx context.Context, envID string) error {
 	return x.c.CleanupNow(ctx, envID)
 }
+
+func (x execEnvAdapter) Hold(envID string) func() { return x.c.HoldEnv(envID) }
 
 // ---- 启动恢复：stop_blocked 的 exec 环境 ----
 

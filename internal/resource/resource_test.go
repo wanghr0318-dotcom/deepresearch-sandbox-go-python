@@ -1354,6 +1354,45 @@ func TestCleanupWarnsOnceWhenEntryHeldTooLong(t *testing.T) {
 	}
 }
 
+// TestCleanupLoopSkipsHeldEnv：HoldEnv 持有期间 cleanup loop 不销毁已停止的环境（exec 的诊断与收集仍在进行，
+// E37 CI 偶发）；持有者自己的 CleanupNow 不受影响；释放后下一轮照常清理。
+func TestCleanupLoopSkipsHeldEnv(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	release := f.c.HoldEnv("e1")
+	f.createStopped(t, "e1", true)
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.rec.count("Destroy:ok"); n != 0 {
+		t.Fatalf("持有期间 cleanup loop 销毁了环境：%v", f.rec.snapshot())
+	}
+	release()
+	release() // 幂等
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if e := f.store.env("e1"); e.CleanupState != CleanupDone || f.rec.count("Destroy:ok") != 1 {
+		t.Fatalf("释放后未清理：env %+v，%v", e, f.rec.snapshot())
+	}
+
+	f.store.addEnv("e2", false)
+	if _, err := f.c.CreateEnv(ctx, req("e2")); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := f.c.StopEnv(ctx, "e2"); err != nil || !res.Recorded {
+		t.Fatalf("StopEnv(e2) = %+v, %v", res, err)
+	}
+	release = f.c.HoldEnv("e2")
+	defer release()
+	if err := f.c.CleanupNow(ctx, "e2"); err != nil {
+		t.Fatalf("持有者的 CleanupNow = %v", err)
+	}
+	if e := f.store.env("e2"); e.CleanupState != CleanupDone {
+		t.Fatalf("持有期间 CleanupNow 未清理：%+v", e)
+	}
+}
+
 // TestCleanupReclaimFailureRetriesNextPass：ReclaimUIDFiles 出错 → 本轮不归还（也不核查、不隔离），
 // 环境清理已完成；下一轮重试回收并归还。
 func TestCleanupReclaimFailureRetriesNextPass(t *testing.T) {

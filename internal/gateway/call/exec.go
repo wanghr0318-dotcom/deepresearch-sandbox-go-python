@@ -34,7 +34,7 @@ import (
 //	→ Tx1 BeginCall（deadline = 排队上限 + 生效 wall + 30 s）→ 按已有记录分流（§9.4 表）
 //	→ 输入授权（未授权 → failed{input_not_authorized}，403，不排队、不预留）
 //	→ 等待 exec slot（≤ 排队上限与调用期限取早；超时 → failed{exec_queue_timeout}，504）
-//	→ Tx2 ReserveExec（次数、CPU、wall 配额）→ Envs.Create → /in 暂存（main.py 与输入）
+//	→ Tx2 ReserveExec（次数、CPU、wall 配额）→ Envs.Hold（到 try 结束）→ Envs.Create → /in 暂存（main.py 与输入）
 //	→ 进程内取消检查（与 CancelAttempt 同一把锁）→ MarkExecStarting（I12 [A]）→ Envs.Start（stdin 立即关闭）
 //	→ 并发读取 stdout/stderr（各保留 1 MiB）→ 等待退出、wall 到期或取消 → Envs.Stop（整个执行树）
 //	→ Diag → OpenOutputs → 逐个 Blobs.Put（全部关闭）→ 结果 blob → Envs.Cleanup（尽力，D8）
@@ -84,6 +84,9 @@ type ExecEnvs interface {
 	OpenOutputs(ctx context.Context, envID string, max int) ([]provider.OutputFile, []provider.SkippedOutput, error)
 	// Cleanup 尽力同步清理（Destroy、归还 UID 范围）；失败只记日志，由 cleanup loop 接手（D8）。
 	Cleanup(ctx context.Context, envID string) error
+	// Hold 声明 try 仍在使用该环境：持有期间 cleanup loop 不销毁它（exec 环境一记录 stopped_at 就是 cleanup
+	// 候选，否则 loop 可能抢在诊断与收集 /out 之前销毁它）。runExecTry 在创建之前取得、结束时释放。
+	Hold(envID string) (release func())
 }
 
 // ExecEnvRequest 是 Create 的输入。
@@ -621,6 +624,8 @@ func (c *Coordinator) envCtx() (context.Context, context.CancelFunc) {
 // runExecTry 建环境、暂存、启动并等待 exec，然后停止、收集与结算（§10.2）。
 func (c *Coordinator) runExecTry(r *execRun) (Result, error) {
 	x, j, envID := c.exec, r.j, r.try.EnvID
+	// 停止（记录 stopped_at）、诊断、收集与同步清理都在持有期间：cleanup loop 不会在收集之前销毁环境。
+	defer x.Envs.Hold(envID)()
 	ctx, cancel := c.envCtx()
 	inDir, err := x.Envs.Create(ctx, ExecEnvRequest{EnvID: envID, AttemptID: j.in.AttemptID, MemoryBytes: j.req.limits.MemoryBytes})
 	cancel()
