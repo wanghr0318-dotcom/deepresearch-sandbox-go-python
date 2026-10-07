@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/runner"
 	"github.com/wanghr0318-dotcom/go-agentbox/internal/task"
@@ -458,6 +459,12 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 				return err
 			}
 		}
+		// 会话 turn 的停止（paused/paused）没有得到 Worker 的停止卡时，在裁决之前补一张宿主停止卡（停止修复 F2）。
+		if turn != nil && v.TaskStatus == "paused" && v.TaskStatusReason == "paused" {
+			if err := appendFallbackStopCard(ctx, tx, v.TaskID, v.AttemptID); err != nil {
+				return err
+			}
+		}
 		if _, err := appendHostEvent(ctx, tx, hostEvent{taskID: v.TaskID, key: "attempt_finalized:" + v.AttemptID,
 			attemptID: v.AttemptID, typ: v.EventType, payload: []byte(v.EventPayload)}); err != nil {
 			return err
@@ -468,6 +475,51 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 		return nil
 	})
 	return out, err
+}
+
+// appendFallbackStopCard 是宿主兜底停止卡（停止修复 F2）：会话 turn 的一次停止以暂停裁决结束（Worker 在 grace 内没有写出
+// 停止卡、被宿主强制结束，或停止期间宿主重启、由恢复给出结果），而该 attempt 没有 Worker 的 turn_stopped 时，追加一条
+// host 事件 turn_stopped（payload 即 api.FallbackTurnStopped 的 data，会话事件中与 Worker 停止卡同形）。
+//
+// 与判决同一事务：判决提交即停止卡存在，崩溃时两者一同回滚、由重新裁决一同写入；判决重放在加锁后核对 verdict_hash 时
+// 已返回，event_key turn_stopped_fallback:<attempt_id> 另保证每个 attempt 至多一条。调用方持有 lockEventSeq（Worker 事件
+// 的追加因此已全部提交或被栅栏挡住）。
+func appendFallbackStopCard(ctx context.Context, tx pgx.Tx, taskID, attemptID string) error {
+	var hasCard bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM events WHERE task_id = $1 AND attempt_id = $2 AND source = 'worker'
+			AND type = 'progress' AND payload->>'kind' = $3)`, taskID, attemptID, api.SEvTurnStopped).Scan(&hasCard); err != nil {
+		return err
+	}
+	if hasCard {
+		return nil
+	}
+	rows, err := tx.Query(ctx, `SELECT payload FROM events WHERE task_id = $1 AND source = 'worker' AND type = 'progress'
+			AND payload->>'kind' IN ($2, $3, $4, $5) ORDER BY task_seq`,
+		taskID, api.SEvTodoUpdated, api.SEvSubtopic, api.SEvToolResult, api.SEvBudget)
+	if err != nil {
+		return err
+	}
+	progress, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (json.RawMessage, error) {
+		var b []byte
+		err := r.Scan(&b)
+		return b, err
+	})
+	if err != nil {
+		return err
+	}
+	var used int64
+	var limit *int64
+	err = tx.QueryRow(ctx, "SELECT tool_calls_used, tool_call_limit FROM budgets WHERE task_id = $1", taskID).Scan(&used, &limit)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	data, err := api.FallbackTurnStopped(progress, used, limit)
+	if err != nil {
+		return err
+	}
+	_, err = appendHostEvent(ctx, tx, hostEvent{taskID: taskID, key: "turn_stopped_fallback:" + attemptID, attemptID: attemptID,
+		typ: api.SEvTurnStopped, payload: data})
+	return err
 }
 
 // ---- 会话 turn（规格 §8.1、§12.3；M4 Plan 12 Task 4） ----

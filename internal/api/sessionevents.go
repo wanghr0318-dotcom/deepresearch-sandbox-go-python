@@ -118,8 +118,99 @@ func userEventData(r SessionEventRecord) (string, map[string]any, bool) {
 		return kind, pick(d, kind), true
 	case "worker/result":
 		return SEvTurnResult, pick(obj, SEvTurnResult), true
+	case "host/" + SEvTurnStopped: // 宿主兜底停止卡（FallbackTurnStopped）：payload 即 data，与 Worker 停止卡同样过滤
+		return SEvTurnStopped, pick(obj, SEvTurnStopped), true
 	}
 	return "", nil, false
+}
+
+// FallbackStopFindings 是宿主兜底停止卡的固定"目前发现"（停止修复 F2）。
+const FallbackStopFindings = "停止时模型正在处理，未能生成摘要。可以继续研究，或用已完成的部分立即写报告。"
+
+// FallbackTurnStopped 构造宿主兜底停止卡的 data（与 Worker 的 turn_stopped 同形：{card, findings, can_finish}；停止修复
+// F2）：会话 turn 的一次暂停没有得到 Worker 的停止卡（Worker 在 grace 内没有写出，attempt 被宿主强制结束）时，由该 turn
+// 已有的 Worker progress 推出——
+//   - todo：最后一条 todo_updated 的计划项（只保留 id、title、status、budget_share）；
+//   - subtopics_done：最后状态为 done 的子主题数；subtopics_total：计划中有工具份额的项数与出现过的子主题数中较大者；
+//   - sources：登记为来源的抓取（web_fetch 成功且预览带来源编号 n）的不同网址数；
+//   - tool_calls_used / tool_call_limit：宿主的工具额度计数（limit 为 nil 时取最后一条 budget 事件）。
+//
+// can_finish = 至少一个子主题已完成。progress 是 Worker progress 记录的载荷（按事件顺序）；不是 JSON 的记录被忽略。
+func FallbackTurnStopped(progress []json.RawMessage, used int64, limit *int64) ([]byte, error) {
+	todo := []any{}
+	subStatus := map[string]string{}
+	urls := map[string]bool{}
+	var lastUsed, lastLimit any = json.Number("0"), json.Number("0")
+	for _, p := range progress {
+		v, _ := decodeJSON(p)
+		obj, _ := v.(map[string]any)
+		d, _ := obj["data"].(map[string]any)
+		if d == nil {
+			continue
+		}
+		switch str(obj, "kind") {
+		case SEvTodoUpdated:
+			items, ok := d["items"].([]any)
+			if !ok {
+				continue
+			}
+			todo = make([]any, 0, len(items))
+			for _, it := range items {
+				m, ok := it.(map[string]any)
+				if !ok {
+					continue
+				}
+				item := map[string]any{}
+				for _, k := range []string{"id", "title", "status", "budget_share"} {
+					if x, ok := m[k]; ok {
+						item[k] = x
+					}
+				}
+				todo = append(todo, item)
+			}
+		case SEvSubtopic:
+			if id := str(d, "id"); id != "" {
+				subStatus[id] = str(d, "status")
+			}
+		case SEvToolResult:
+			pv, _ := d["preview"].(map[string]any)
+			if str(d, "tool") == "web_fetch" && d["ok"] == true && str(pv, "kind") == "fetch" && pv["n"] != nil && str(pv, "url") != "" {
+				urls[str(pv, "url")] = true
+			}
+		case SEvBudget:
+			if u, ok := d["used"].(json.Number); ok {
+				lastUsed = u
+			}
+			if l, ok := d["limit"].(json.Number); ok {
+				lastLimit = l
+			}
+		}
+	}
+	done, planned := 0, 0
+	for _, st := range subStatus {
+		if st == "done" {
+			done++
+		}
+	}
+	for _, it := range todo {
+		if share, ok := it.(map[string]any)["budget_share"].(json.Number); ok {
+			if n, err := share.Float64(); err == nil && n > 0 {
+				planned++
+			}
+		}
+	}
+	card := map[string]any{
+		"todo":            todo,
+		"subtopics_done":  done,
+		"subtopics_total": max(planned, len(subStatus)),
+		"sources":         len(urls),
+		"tool_calls_used": lastUsed,
+		"tool_call_limit": lastLimit,
+	}
+	if limit != nil {
+		card["tool_calls_used"], card["tool_call_limit"] = used, *limit
+	}
+	return encodeJSON(map[string]any{"card": card, "findings": FallbackStopFindings, "can_finish": done > 0})
 }
 
 func turnStatusData(taskStatus, reason string) (string, map[string]any, bool) {

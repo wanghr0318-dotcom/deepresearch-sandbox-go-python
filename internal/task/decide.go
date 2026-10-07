@@ -58,8 +58,11 @@ type State struct {
 	// Jitter ∈ [0, 1) 是本次决策使用的退避抖动，由调用方提供（越界时截断）。
 	Jitter         float64
 	ControlGraceMs int64 // cancel/pause 的 grace_ms；0 取 DefaultControlGraceMs
-	SlotRequested  bool  // 已发出 RequestSlot，尚未收到 SlotGranted
-	SlotHeld       bool  // 持有 run slot：从授予到执行环境确认停止（§14.5）
+	// SessionPauseGraceMs 是 ControlGraceMs 为 0 时会话 turn 的 pause 的 grace_ms；0 取 DefaultSessionPauseGraceMs
+	// （Deps.SessionPauseGrace）。
+	SessionPauseGraceMs int64
+	SlotRequested       bool // 已发出 RequestSlot，尚未收到 SlotGranted
+	SlotHeld            bool // 持有 run slot：从授予到执行环境确认停止（§14.5）
 
 	// SessionID 非空：会话 turn（§12.1）。attempt 创建须经 session actor 授予：RequestSlot → RequestSessionGrant →
 	// CreateAttempt（带授予的 incarnation 与其环境）→ StartWorker（不创建任务环境）；停止改为交还 incarnation
@@ -664,6 +667,9 @@ func (d *decider) interrupt() {
 				grace = DefaultControlGraceMs
 				if d.s.SessionID != "" && d.s.Desired == "pause" {
 					grace = DefaultSessionPauseGraceMs
+					if d.s.SessionPauseGraceMs > 0 {
+						grace = d.s.SessionPauseGraceMs
+					}
 				}
 			}
 			// 取消生效时立即撤销 Gateway 入口（§9.1；attempt_access 留到停止时，见 RevokeGateway）；暂停不撤销。

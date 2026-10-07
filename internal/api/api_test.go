@@ -3559,3 +3559,94 @@ func TestOverlayResearch(t *testing.T) {
 }
 
 // ==== M4 Plan 14 Task 12 段结束 ====
+
+// ==== 停止修复 F2：宿主兜底停止卡 ====
+
+// TestFallbackTurnStopped：宿主由该 turn 已有的 Worker 事件构造停止卡——最新计划、子主题完成数（各子主题的最后状态）与
+// 总数、登记为来源的抓取（同一网址只计一次）、工具额度取宿主的计数；findings 为固定文案；至少一个子主题完成才可写报告。
+func TestFallbackTurnStopped(t *testing.T) {
+	limit := int64(30)
+	progress := []json.RawMessage{
+		json.RawMessage(`{"kind":"todo_updated","data":{"items":[{"id":"1","title":"旧","status":"pending","budget_share":5}]}}`),
+		json.RawMessage(`{"kind":"todo_updated","data":{"items":[{"id":"1","title":"甲","status":"done","budget_share":10,"cost_micro":3},` +
+			`{"id":"2","title":"乙","status":"in_progress","budget_share":10},{"id":"3","title":"写报告","status":"pending","budget_share":0}]}}`),
+		json.RawMessage(`{"kind":"subtopic","data":{"id":"1","title":"甲","status":"running"}}`),
+		json.RawMessage(`{"kind":"subtopic","data":{"id":"1","title":"甲","status":"done","summary":"s"}}`),
+		json.RawMessage(`{"kind":"subtopic","data":{"id":"2","title":"乙","status":"running"}}`),
+		json.RawMessage(`{"kind":"tool_result","subrun_id":"st1","data":{"tool":"web_fetch","ok":true,"preview":{"kind":"fetch","n":1,"url":"https://a.example/1"}}}`),
+		json.RawMessage(`{"kind":"tool_result","data":{"tool":"web_fetch","ok":true,"preview":{"kind":"fetch","n":1,"url":"https://a.example/1"}}}`),
+		json.RawMessage(`{"kind":"tool_result","data":{"tool":"web_fetch","ok":true,"preview":{"kind":"fetch","n":2,"url":"https://b.example/2"}}}`),
+		json.RawMessage(`{"kind":"tool_result","data":{"tool":"web_fetch","ok":true,"preview":{"kind":"fetch","url":"https://c.example/pdf","excerpt":"PDF"}}}`),
+		json.RawMessage(`{"kind":"tool_result","data":{"tool":"web_fetch","ok":false,"preview":{"kind":"text","text":"抓取失败"}}}`),
+		json.RawMessage(`{"kind":"tool_result","data":{"tool":"web_search","ok":true,"preview":{"results":[]}}}`),
+		json.RawMessage(`{"kind":"budget","data":{"used":4,"limit":30}}`),
+		json.RawMessage(`not json`),
+	}
+	b, err := FallbackTurnStopped(progress, 7, &limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("data 不是 JSON 对象：%s", b)
+	}
+	want := map[string]any{
+		"card": map[string]any{"subtopics_done": 1.0, "subtopics_total": 2.0, "sources": 2.0, "tool_calls_used": 7.0, "tool_call_limit": 30.0,
+			"todo": []any{
+				map[string]any{"id": "1", "title": "甲", "status": "done", "budget_share": 10.0},
+				map[string]any{"id": "2", "title": "乙", "status": "in_progress", "budget_share": 10.0},
+				map[string]any{"id": "3", "title": "写报告", "status": "pending", "budget_share": 0.0},
+			}},
+		"findings":   FallbackStopFindings,
+		"can_finish": true,
+	}
+	if !mapsEqualJSON(got, want) {
+		t.Errorf("停止卡 = %s", b)
+	}
+	if FallbackStopFindings != "停止时模型正在处理，未能生成摘要。可以继续研究，或用已完成的部分立即写报告。" {
+		t.Errorf("固定文案被改动：%q", FallbackStopFindings)
+	}
+
+	// 规划阶段即被强制结束：没有任何事件；额度没有宿主计数时取最后一条 budget 事件。
+	b, err = FallbackTurnStopped([]json.RawMessage{json.RawMessage(`{"kind":"budget","data":{"used":2,"limit":20}}`)}, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	want = map[string]any{"card": map[string]any{"subtopics_done": 0.0, "subtopics_total": 0.0, "sources": 0.0, "tool_calls_used": 2.0,
+		"tool_call_limit": 20.0, "todo": []any{}}, "findings": FallbackStopFindings, "can_finish": false}
+	if !mapsEqualJSON(got, want) {
+		t.Errorf("空 turn 的停止卡 = %s", b)
+	}
+}
+
+// TestHostTurnStoppedLooksLikeWorkerCard：宿主写的 turn_stopped 记录（host/turn_stopped）映射为与 Worker 停止卡相同的会话
+// 事件（同一 type、同一字段允许列表，内部键去掉）；任务事件的用户视图同样可见。
+func TestHostTurnStoppedLooksLikeWorkerCard(t *testing.T) {
+	data := `{"card":{"subtopics_done":1,"subtopics_total":2,"sources":3,"tool_calls_used":4,"tool_call_limit":30,` +
+		`"todo":[{"id":"1","title":"甲","status":"done","budget_share":10}]},"findings":"f","can_finish":true}`
+	worker, ok := ToSessionEvent(sessionRec("worker", "progress", `{"step_id":"s1","kind":"turn_stopped","message":"研究已停止","data":`+data+`}`), false)
+	if !ok {
+		t.Fatal("Worker 停止卡不可见")
+	}
+	host, ok := ToSessionEvent(sessionRec("host", SEvTurnStopped, data), false)
+	if !ok || host.Type != SEvTurnStopped || !bytes.Equal(host.Data, worker.Data) || host.TurnID != "t1" || host.Internal != nil {
+		t.Fatalf("宿主停止卡 = %+v %s, %v；Worker 停止卡 %s", host, host.Data, ok, worker.Data)
+	}
+	leaky, ok := ToSessionEvent(sessionRec("host", SEvTurnStopped, `{"card":{"sources":1,"model":"kimi-k3","cost_micro":9},"findings":"f",`+
+		`"can_finish":false,"attempt_id":"att_1"}`), false)
+	if d := eventData(t, leaky); !ok || hasKey(d, "model") || hasKey(d, "cost_micro") || hasKey(d, "attempt_id") {
+		t.Errorf("宿主停止卡泄露内部键：%s", leaky.Data)
+	}
+	adm, ok := ToSessionEvent(sessionRec("host", SEvTurnStopped, data), true)
+	if !ok || adm.Type != SEvTurnStopped || adm.Internal == nil || adm.Internal.Source != "host" {
+		t.Errorf("运维视图 = %+v, %v", adm, ok)
+	}
+	if ev, ok := userEvent(Event{Source: "host", Type: SEvTurnStopped, Payload: json.RawMessage(data)}); !ok || string(ev.Payload) != `{}` {
+		t.Errorf("任务事件的用户视图 = %+v, %v", ev, ok)
+	}
+}
+
+// ==== 停止修复 F2 段结束 ====

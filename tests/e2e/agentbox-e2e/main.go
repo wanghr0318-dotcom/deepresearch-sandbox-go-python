@@ -151,6 +151,7 @@ func runServer(args []string, stderr io.Writer) int {
 	idleFreeze := fs.Duration("session-idle-freeze", 0, "会话空闲冻结时限（0 取默认 10 min）")
 	evictAfter := fs.Duration("session-evict-after", 0, "会话驱逐时限（0 取默认 1 h）")
 	releaseTimeout := fs.Duration("release-timeout", 0, "session 模式 T_release（0 取默认 30 s）")
+	pauseGrace := fs.Duration("session-pause-grace", 0, "会话 turn 停止的 grace（0 取默认 60 s）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -198,6 +199,7 @@ func runServer(args []string, stderr io.Writer) int {
 	}
 	cfg.TurnToolBudget, cfg.SessionIdleFreeze, cfg.SessionEvictAfter = *turnToolBudget, *idleFreeze, *evictAfter
 	cfg.Runner.ReleaseTimeout = *releaseTimeout
+	cfg.SessionPauseGrace = *pauseGrace
 	deps := app.Deps{
 		DataDir: dir,
 		AcquireOwnership: func(ctx context.Context) (app.Ownership, error) {
