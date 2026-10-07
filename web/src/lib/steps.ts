@@ -47,3 +47,16 @@ export function durationText(ms: number): string {
   const m = Math.floor(s / 60);
   return m > 0 ? `${m} 分 ${s % 60} 秒` : `${s} 秒`;
 }
+
+// 研究轮次中，全部子主题都已结束、没有进行中的步骤、还没有报告：主 Agent 正在整理资料并撰写报告。
+// 模型调用不流式，这段时间没有事件，界面显示计时行。
+export function isWritingReport(t: Pick<TurnView, "route" | "status" | "report" | "subtopics" | "steps">): boolean {
+  return (
+    t.route === "research" &&
+    t.status === "running" &&
+    !t.report &&
+    t.subtopics.length > 0 &&
+    t.subtopics.every((s) => s.status !== "running") &&
+    t.steps.every((s) => s.status !== "running")
+  );
+}

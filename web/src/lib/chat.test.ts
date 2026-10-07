@@ -4,7 +4,7 @@ import { ApiError } from "../api/client";
 import { USER_ERRORS, activeResearchTurn, applyEvent, chatErrorMessage, emptyChat, recordAnswers, routeLabel, seedTurns, siteOf } from "./chat";
 import type { ChatState } from "./chat";
 import type { SessionEvent } from "../api/chat";
-import { durationText, groupSteps, turnFinished } from "./steps";
+import { durationText, groupSteps, isWritingReport, turnFinished } from "./steps";
 import type { StepRow } from "./chat";
 
 const SHA = "c".repeat(64);
@@ -455,5 +455,17 @@ describe("turn timestamps", () => {
     const again = applyEvent(s, at(2, "thinking", "2026-10-06T09:00:00Z", { step_id: "orch", text: "重放" }));
     expect(again).toBe(s);
     expect(again.turns[0]!.lastEventAt).toBe(Date.parse("2026-10-06T08:34:12Z"));
+  });
+});
+
+describe("isWritingReport", () => {
+  const base = { route: "research", status: "running", report: undefined, subtopics: [{ id: "a", title: "A", status: "done" }], steps: [] } as never;
+  it("true when all subtopics settled and nothing is running", () => expect(isWritingReport(base)).toBe(true));
+  it("false while a step or subtopic is running, after the report, or not research", () => {
+    expect(isWritingReport({ ...(base as object), steps: [{ id: "x", kind: "search", title: "", status: "running" }] } as never)).toBe(false);
+    expect(isWritingReport({ ...(base as object), subtopics: [{ id: "a", title: "A", status: "running" }] } as never)).toBe(false);
+    expect(isWritingReport({ ...(base as object), report: { artifactId: "r", version: 1, title: "T", partial: false, toolBudgetReached: false } } as never)).toBe(false);
+    expect(isWritingReport({ ...(base as object), route: "answer" } as never)).toBe(false);
+    expect(isWritingReport({ ...(base as object), subtopics: [] } as never)).toBe(false);
   });
 });

@@ -40,6 +40,9 @@
         </div>
       </template>
     </div>
+    <div v-if="writing" class="writing" data-testid="writing-report" role="status">
+      ✍️ 正在整理资料并撰写报告… {{ writingSeconds }} 秒
+    </div>
 
     <QuestionCard
       v-if="turn.question"
@@ -48,7 +51,8 @@
       @answer="(a) => emit('answer', turn.turnId, a)"
     />
 
-    <div v-if="turn.reply" class="reply" data-testid="reply">{{ turn.reply }}</div>
+    <!-- 有报告时 reply 只是摘要加指向报告的提示，报告全文已在下方，不再重复 -->
+    <div v-if="turn.reply && !turn.report" class="reply" data-testid="reply">{{ turn.reply }}</div>
 
     <StopCard
       :stop="turn.stop"
@@ -60,20 +64,21 @@
       @restore="emit('restore', turn.turnId)"
     />
 
-    <div v-if="turn.report" class="report-bar" data-testid="report-bar">
-      <span class="r-icon" aria-hidden="true">📄</span>
-      <span class="r-text">
-        <strong>报告已生成</strong>
-        <span class="r-title">{{ turn.report.title }}</span>
-        <span v-if="turn.report.partial" class="partial">部分研究</span>
-      </span>
-      <span class="spacer"></span>
-      <button class="btn primary small" type="button" data-action="view-report" @click="emit('panel', 'report')">查看报告</button>
-      <p v-if="turn.report.toolBudgetReached || turn.report.note" class="r-note">
-        <template v-if="turn.report.toolBudgetReached">本轮的工具调用额度已用完，报告基于已收集的资料。</template>
-        {{ turn.report.note }}
-      </p>
-    </div>
+    <template v-if="turn.report">
+      <ReportBody :turn="turn" />
+      <button class="report-card" type="button" data-testid="report-card" data-action="view-report" @click="emit('panel', 'report')">
+        <span class="rc-icon" aria-hidden="true">📄</span>
+        <span class="rc-main">
+          <span class="rc-title">{{ turn.report.title }}</span>
+          <span class="rc-meta">
+            <span v-if="turn.report.partial" class="partial">部分</span>
+            <span v-if="turn.report.toolBudgetReached" class="budget">已达工具额度</span>
+            <span class="open">在右侧打开全文 →</span>
+          </span>
+        </span>
+      </button>
+      <p v-if="turn.report.note" class="r-note">{{ turn.report.note }}</p>
+    </template>
 
     <div v-if="turn.error" class="t-error" role="alert">{{ turn.error }}</div>
 
@@ -82,16 +87,18 @@
 </template>
 
 <script setup lang="ts">
-// 一轮对话中 AI 一侧的渲染：路径标识、步骤行（按子主题分组）、流式回复（纯文本）、提问卡、停止卡、报告提示条与失败提示。
+// 一轮对话中 AI 一侧的渲染：路径标识、步骤行（按子主题分组）、流式回复（纯文本）、提问卡、停止卡、报告全文与报告卡片、失败提示。
 // 进行中的非思考步骤默认展开、其余折叠（思考链默认不展开）；用户点击后以用户的选择为准。
 // 连续的"思考"与连续的"阅读网页"各合并为一行；一轮结束后整条链折叠为"研究过程 · N 步 · 用时"一行。
-import { computed, ref } from "vue";
+// 子主题都结束、报告未到时显示"正在撰写报告"计时行（从最后一个事件起计）；报告到达后全文显示在对话中间。
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import type { Answer, TurnAction } from "../../api/chat";
 import { routeLabel } from "../../lib/chat";
 import type { RawRef, StepRow as StepRowData, TurnView } from "../../lib/chat";
-import { durationText, groupSteps, turnFinished } from "../../lib/steps";
+import { durationText, groupSteps, isWritingReport, turnFinished } from "../../lib/steps";
 import QuestionCard from "./QuestionCard.vue";
 import RawDialog from "./RawDialog.vue";
+import ReportBody from "./ReportBody.vue";
 import StepGroup from "./StepGroup.vue";
 import StepRow from "./StepRow.vue";
 import StopCard from "./StopCard.vue";
@@ -163,6 +170,22 @@ const chainSummary = computed(() => {
   const n = t.steps.length;
   const ms = t.startedAt !== undefined && t.lastEventAt !== undefined ? t.lastEventAt - t.startedAt : 0;
   return ms > 0 ? `研究过程 · ${n} 步 · ${durationText(ms)}` : `研究过程 · ${n} 步`;
+});
+
+// 撰写报告期间模型调用不流式、没有事件：每秒刷新一次计时
+const now = ref(Date.now());
+let tick: ReturnType<typeof setInterval> | undefined;
+onMounted(() => {
+  tick = setInterval(() => (now.value = Date.now()), 1000);
+});
+onBeforeUnmount(() => {
+  if (tick) clearInterval(tick);
+});
+
+const writing = computed(() => isWritingReport(props.turn));
+const writingSeconds = computed(() => {
+  const at = props.turn.lastEventAt;
+  return at === undefined ? 0 : Math.max(0, Math.round((now.value - at) / 1000));
 });
 
 const label = computed(() => routeLabel(props.turn));
@@ -274,38 +297,64 @@ const statusText = computed(() => {
   line-height: 1.7;
   padding: 2px 6px;
 }
-.report-bar {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 9px 12px;
-  border-radius: 10px;
-  border: 1px solid #ddd6fe;
-  background: #f5f3ff;
+.writing {
+  margin: 6px 0;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: #fff8f0;
+  color: #9a6700;
+  font-size: 13px;
 }
-.r-text {
+.report-card {
   display: flex;
+  gap: 10px;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
+  width: 100%;
+  max-width: 520px;
+  margin: 10px 0;
+  padding: 12px 14px;
+  border: 1px solid #d0d7de;
+  border-radius: 10px;
+  background: #fff;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+.report-card:hover {
+  border-color: #d97757;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+}
+.rc-icon {
+  font-size: 22px;
+}
+.rc-main {
+  display: grid;
+  gap: 4px;
   min-width: 0;
 }
-.r-title {
-  color: #4b5563;
-  font-size: 0.85rem;
-  word-break: break-word;
+.rc-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.partial {
-  font-size: 0.72rem;
-  font-weight: 700;
-  padding: 1px 7px;
+.rc-meta {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  color: #656d76;
+}
+.partial,
+.budget {
+  padding: 0 6px;
   border-radius: 10px;
-  background: #fef3c7;
-  color: #92400e;
+  background: #fdf1ec;
+  color: #b4532f;
+}
+.open {
+  color: #0969da;
 }
 .r-note {
-  flex-basis: 100%;
   margin: 0;
   font-size: 0.78rem;
   color: #6b7280;
