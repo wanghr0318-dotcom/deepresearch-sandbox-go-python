@@ -290,16 +290,27 @@ def turn_stage(state: TurnState) -> str:
     return f"子主题研究（已完成 {done}/{total}）"
 
 
+def _embed(text: str) -> str:
+    """嵌入「」之间的问题：换行与连续空白合为一个空格、去掉「」，截到 CARRY_QUESTION_CHARS。"""
+    text = " ".join(text.replace("「", "").replace("」", "").split())
+    return clip_text(text, CARRY_QUESTION_CHARS)
+
+
 _PLAN_MARK = {"done": "已完成", "skipped": "已跳过", "failed": "失败"}
 
 
 def carryover_brief(state: TurnState) -> str:
-    """被取代 turn 的问题原文、停止时的阶段与研究计划（不经 [n] 改写，从不为空）。"""
-    question = clip_text(turn_question(state), CARRY_QUESTION_CHARS)
-    lines = [
-        f"上一轮用户的问题：「{question}」" if question else "上一轮用户的问题：（未记录）",
-        f"停止时的阶段：{turn_stage(state)}",
-    ]
+    """被取代 turn 的问题原文、停止时的阶段与研究计划（不经 [n] 改写，从不为空）。
+
+    该 turn 本身是接续（如"继续"）时，先给出它接续的原始问题，再给出它自己的消息。"""
+    question = _embed(turn_question(state))
+    original = _embed(state.carried_question)
+    said = f"「{question}」" if question else "（未记录）"
+    if original and original != question:
+        lines = [f"原始问题：「{original}」", f"上一轮用户的消息：{said}"]
+    else:
+        lines = [f"上一轮用户的问题：{said}"]
+    lines.append(f"停止时的阶段：{turn_stage(state)}")
     if state.todo:
         plan = []
         for k, item in enumerate(state.todo, 1):

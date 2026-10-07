@@ -45,6 +45,7 @@ from chatagent.prompts import (
     carryover_text,
     clip_text,
     restore_instruction,
+    turn_question,
 )
 from chatagent.state import SessionMemory, TurnRecord, TurnState
 
@@ -134,15 +135,17 @@ def seed_restore(state: TurnState, budget_limit: int) -> TurnState:
 
 def carryover_context(
     carry: dict[str, Any] | None,
-) -> tuple[str | None, str | None, list[Source]]:
-    """carry = {"task_id", "state"}（被取代 turn 最新 checkpoint 的内容）→ (简况, 发现, 来源)。
+) -> tuple[str | None, str | None, list[Source], str]:
+    """carry = {"task_id", "state"}（被取代 turn 最新 checkpoint 的内容）→ (简况, 发现, 来源,
+    原始问题)。
 
     简况含该 turn 的问题原文、停止时的阶段与研究计划，从不为空（不经引用改写）；发现含已完成
     子主题的标题与摘要及来源列表，[n] 为该 turn 的编号（由 adopt_carryover 改写），无发现时为
-    None；来源为该 turn 的全部来源，其本轮来源的 origin 改为该 task_id。
-    无 carryover 或状态无法解析 → (None, None, [])。"""
+    None；来源为该 turn 的全部来源，其本轮来源的 origin 改为该 task_id；原始问题为该 turn 接续的
+    原始问题（它本身也是接续时），否则为它自己的问题。
+    无 carryover 或状态无法解析 → (None, None, [], "")。"""
     if not carry:
-        return None, None, []
+        return None, None, [], ""
     raw = carry.get("state")
     if isinstance(raw, dict) and "schema_version" not in raw and isinstance(raw.get("state"), dict):
         raw = raw["state"]  # checkpoint 信封 {"state": …}
@@ -153,13 +156,14 @@ def carryover_context(
         state = TurnState.from_json(raw).merged_copy()  # type: ignore[arg-type]
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         _log(f"carryover 状态无法解析，本轮不带上一轮的发现：{exc}")
-        return None, None, []
+        return None, None, [], ""
     origin = str(carry.get("task_id") or "carryover")
     sources = [
         Source(s.n, s.sha256, s.url, s.title, s.excerpt, s.call_id, s.origin or origin)
         for s in state.sources.all()
     ]
-    return carryover_brief(state), carryover_lines(state) or None, sources
+    original = state.carried_question or turn_question(state)
+    return carryover_brief(state), carryover_lines(state) or None, sources, original
 
 
 def adopt_carryover(store: SourceStore, text: str | None, sources: list[Source]) -> str | None:
@@ -214,7 +218,8 @@ async def _state(
         question=clip_text(cfg.text, QUESTION_STORE_CHARS),  # 被取代时随 carryover 带给下一轮
     )
     state.sources.adopt(memory.sources)  # 既往来源续编号，可被 read_source 与本轮报告引用
-    brief, findings, sources = carryover_context(await _read_carryover(ctx, gw))
+    brief, findings, sources, original = carryover_context(await _read_carryover(ctx, gw))
+    state.carried_question = clip_text(original, QUESTION_STORE_CHARS)
     return state, carryover_text(brief, adopt_carryover(state.sources, findings, sources))
 
 
