@@ -48,8 +48,9 @@ function start(e: PointerEvent): void {
 </script>
 
 <style scoped>
-.splitter { width: 6px; margin: 0 -3px; cursor: col-resize; position: relative; z-index: 2; background: transparent; }
+.splitter { width: 6px; margin: 0 -3px; cursor: col-resize; position: relative; z-index: 2; background: transparent; touch-action: none; }
 .splitter::after { content: ""; position: absolute; inset: 0 2px; background: #d0d7de; opacity: 0; transition: opacity .15s; }
 .splitter:hover::after, .splitter:focus-visible::after { opacity: 1; }
 .splitter:focus-visible { outline: none; }
+.splitter:focus-visible::after { background: #0969da; }
 </style>

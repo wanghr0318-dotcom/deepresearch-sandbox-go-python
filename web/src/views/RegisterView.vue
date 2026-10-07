@@ -15,7 +15,7 @@
         </label>
         <label class="field">
           密码
-          <input v-model="password" name="password" type="password" autocomplete="new-password" maxlength="16" placeholder="8–16 位，数字/大写/小写至少两种" />
+          <input v-model="password" name="password" type="password" autocomplete="new-password" placeholder="8–16 位，数字/大写/小写至少两种" />
         </label>
         <ul class="pw-checks" data-testid="pw-checks" aria-live="polite">
           <li :class="{ ok: checks.length }" data-check="length">{{ checks.length ? "✓" : "✗" }} 8–16 个字符</li>
@@ -23,7 +23,7 @@
         </ul>
         <label class="field">
           确认密码
-          <input v-model="confirm" name="confirm" type="password" autocomplete="new-password" maxlength="16" placeholder="再输入一次密码" />
+          <input v-model="confirm" name="confirm" type="password" autocomplete="new-password" placeholder="再输入一次密码" />
         </label>
         <div v-if="error" class="auth-error" role="alert">{{ error }}</div>
         <button class="btn primary auth-submit" type="submit" :disabled="busy || !checks.length || !checks.classes">{{ busy ? "注册中…" : "注册并登录" }}</button>

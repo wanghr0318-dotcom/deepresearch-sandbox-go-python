@@ -685,6 +685,14 @@ describe("TurnView merges consecutive steps and folds the chain after the turn",
     const running = mount(TurnView, { props: { turn: blankTurn({ steps, status: "running" }), busy: false } });
     expect(running.find("[data-testid=chain-toggle]").exists()).toBe(false);
   });
+
+  it("a finished direct-answer turn folds to 过程, not 研究过程", () => {
+    const steps: StepRowData[] = [thinkRow("t1", "想")];
+    const answer = mount(TurnView, { props: { turn: blankTurn({ steps, status: "succeeded", route: "answer" }), busy: false } });
+    expect(answer.get("[data-testid=chain-toggle]").text()).toBe("▸ 过程 · 1 步");
+    const research = mount(TurnView, { props: { turn: blankTurn({ steps, status: "succeeded", route: "research" }), busy: false } });
+    expect(research.get("[data-testid=chain-toggle]").text()).toBe("▸ 研究过程 · 1 步");
+  });
 });
 
 describe("TurnView shows the report in the chat with a report card", () => {

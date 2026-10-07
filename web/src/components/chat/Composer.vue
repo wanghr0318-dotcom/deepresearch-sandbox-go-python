@@ -40,7 +40,7 @@
       >
         <span class="sq" aria-hidden="true"></span>
       </button>
-      <button class="round send" type="submit" data-action="send" aria-label="发送" title="发送（Enter）" :disabled="!canSend">
+      <button v-else class="round send" type="submit" data-action="send" aria-label="发送" title="发送（Enter）" :disabled="!canSend">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5" /></svg>
       </button>
     </div>
@@ -49,7 +49,7 @@
 
 <script setup lang="ts">
 // 输入框：多行（随内容增高）；Enter 发送、Shift+Enter 换行、输入法组合中不发送；"深度研究"开关（aria-pressed）。
-// 有进行中的轮次时禁用发送（契约裁定 I：运行中再发消息会 409 turn_in_progress），输入框内只显示 ■ 停止，占位文字为"研究进行中…"。
+// 有进行中的轮次时不能发送（契约裁定 I：运行中再发消息会 409 turn_in_progress）：发送按钮变为 ■ 停止，占位文字为"研究进行中…"。
 // 发送成功后由父组件调用 clear()；失败时保留输入。
 import { computed, nextTick, ref, watch } from "vue";
 import { validateMessage } from "../../api/chat";

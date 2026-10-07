@@ -41,7 +41,7 @@
       </template>
     </div>
     <div v-if="writing" class="writing" data-testid="writing-report" role="status">
-      ✍️ 正在整理资料并撰写报告… {{ writingSeconds }} 秒
+      ✍️ 正在整理资料并撰写报告… <span aria-hidden="true">{{ writingSeconds }} 秒</span>
     </div>
 
     <QuestionCard
@@ -169,7 +169,8 @@ const chainSummary = computed(() => {
   const t = props.turn;
   const n = t.steps.length;
   const ms = t.startedAt !== undefined && t.lastEventAt !== undefined ? t.lastEventAt - t.startedAt : 0;
-  return ms > 0 ? `研究过程 · ${n} 步 · ${durationText(ms)}` : `研究过程 · ${n} 步`;
+  const name = t.route === "answer" ? "过程" : "研究过程"; // 直接回答的轮次不叫"研究过程"
+  return ms > 0 ? `${name} · ${n} 步 · ${durationText(ms)}` : `${name} · ${n} 步`;
 });
 
 // 撰写报告期间模型调用不流式、没有事件：每秒刷新一次计时

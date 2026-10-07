@@ -161,6 +161,22 @@ describe("RegisterView", () => {
     }
     expect(submit().attributes("disabled")).toBeUndefined();
   });
+
+  it("does not truncate an over-long password: the length check fails and submit stays disabled", async () => {
+    const k = kit({ register: vi.fn() });
+    const w = mount(RegisterView, { global: k.global });
+    const long = "Passw0rdXYZabcdef"; // 17 个字符，字符种类满足
+    await fill(w, { username: "alice", password: long, confirm: long });
+    const check = (name: string) => w.get(`[data-testid="pw-checks"] [data-check="${name}"]`);
+    expect(check("length").text()).toContain("✗");
+    expect(check("classes").text()).toContain("✓");
+    expect(w.get('button[type="submit"]').attributes("disabled")).toBeDefined();
+    for (const name of ["password", "confirm"]) {
+      const input = w.get(`[name="${name}"]`);
+      expect(input.attributes("maxlength")).toBeUndefined();
+      expect((input.element as HTMLInputElement).value).toBe(long);
+    }
+  });
 });
 
 describe("App routing and session guard", () => {

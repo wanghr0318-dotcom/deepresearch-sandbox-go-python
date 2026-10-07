@@ -142,7 +142,7 @@ describe("Composer", () => {
     expect(w.emitted("send")).toEqual([[{ text: "你好", deepResearch: true }]]);
   });
 
-  it("validates locally and disables send while a turn is running", async () => {
+  it("validates locally and replaces send with stop while a turn is running", async () => {
     const w = track(mount(Composer, { props: { disabled: false } }));
     expect(w.get("[data-action=send]").attributes("disabled")).toBeDefined();
     await w.get("textarea[name=message]").setValue("长".repeat(4001));
@@ -152,7 +152,7 @@ describe("Composer", () => {
 
     await w.setProps({ running: true });
     await w.get("textarea[name=message]").setValue("再问一句");
-    expect(w.get("[data-action=send]").attributes("disabled")).toBeDefined();
+    expect(w.find("[data-action=send]").exists()).toBe(false);
     expect(w.find("[data-testid=composer-hint]").exists()).toBe(false);
     expect(w.find("[data-action=stop-turn]").exists()).toBe(true);
     expect(w.get("textarea").attributes("placeholder")).toBe("研究进行中…");
@@ -160,6 +160,10 @@ describe("Composer", () => {
     expect(w.emitted("send")).toBeUndefined();
     await w.get("[data-action=stop-turn]").trigger("click");
     expect(w.emitted("stop")).toHaveLength(1);
+
+    await w.setProps({ running: false });
+    expect(w.find("[data-action=stop-turn]").exists()).toBe(false);
+    expect(w.get("[data-action=send]").attributes("disabled")).toBeUndefined();
   });
 });
 
@@ -207,13 +211,13 @@ describe("ChatView", () => {
     expect(stream.opts()).toEqual(expect.objectContaining({ sessionId: "s1", cursor: 0 }));
   });
 
-  it("disables send while a turn is running (409 turn_in_progress is never provoked) and stops it", async () => {
+  it("shows stop instead of send while a turn is running (409 turn_in_progress is never provoked) and stops it", async () => {
     const stream = fakeSessionStream();
     const chat = fakeChat({ listTurns: vi.fn(async () => ({ turns: [turn({ turn_id: "u1", text: "研究", status: "running" })] })) });
     const w = track(mountChat({ chat, watchSession: stream.fn }, { sessionId: "s1" }));
     await flushPromises();
     await type(w, "再问");
-    expect(w.get("[data-action=send]").attributes("disabled")).toBeDefined();
+    expect(w.find("[data-action=send]").exists()).toBe(false);
     expect(w.find("[data-testid=composer-hint]").exists()).toBe(false);
     expect(w.find("[data-action=stop-turn]").exists()).toBe(true);
     expect(w.get("textarea").attributes("placeholder")).toBe("研究进行中…");
@@ -226,6 +230,7 @@ describe("ChatView", () => {
 
     stream.push(sev(3, "turn_status", { status: "cancelled" }, "u1"));
     await flushPromises();
+    expect(w.find("[data-action=stop-turn]").exists()).toBe(false);
     expect(w.get("[data-action=send]").attributes("disabled")).toBeUndefined();
     await send(w);
     expect(chat.sendMessage.mock.calls[0]!.slice(0, 3)).toEqual(["s1", "再问", false]);
