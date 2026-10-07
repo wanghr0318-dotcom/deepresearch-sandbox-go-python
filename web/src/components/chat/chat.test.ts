@@ -386,6 +386,8 @@ describe("TurnView", () => {
     const w = mountWith(TurnView, { turn, busy: false });
     expect(w.get("[data-testid=reply]").text()).toContain("<b>不是 HTML</b>");
     expect(w.get("[data-testid=reply]").find("b").exists()).toBe(false);
+    // 已结束的轮次：步骤链先折叠为"研究过程"，点开后才显示各行
+    await w.get("[data-testid=chain-toggle]").trigger("click");
     await w.get("[aria-label=查看原始请求与响应]").trigger("click");
     await flushPromises();
     expect(w.find("[role=dialog]").exists()).toBe(true);
@@ -535,7 +537,9 @@ describe("user-facing views hide internals", () => {
     const turn = s.turns[0]!;
 
     const tv = mountWith(TurnView, { turn, busy: false });
-    // 展开所有行
+    // 已结束的轮次先点开"研究过程"，再展开所有合并行与各行
+    await tv.get("[data-testid=chain-toggle]").trigger("click");
+    for (const m of tv.findAll("[data-testid=merged-row] > button")) await m.trigger("click");
     for (const h of tv.findAll("[data-testid=step-head]")) await h.trigger("click");
     const downloadArtifact = vi.fn(async () => ({ blob: new Blob(["# 报告"]), contentType: "text/markdown", etag: "", contentDisposition: "" }));
     const htmls: string[] = [tv.html()];
@@ -621,5 +625,62 @@ describe("TurnView groups interleaved sub-run steps by subtopic", () => {
     const w = mount(TurnView, { props: { turn: blankTurn({ steps }), busy: false } });
     expect(w.findAll("[data-testid=subtopic-heading]").map((h) => h.text())).toEqual(["技术路线", "成本"]);
     expect(w.findAll("[data-testid=subtopic-group]")[0]!.findAll("[data-testid=step-head]")).toHaveLength(2);
+  });
+});
+
+describe("TurnView merges consecutive steps and folds the chain after the turn", () => {
+  const fetchRow = (id: string, over: Partial<StepRowData> = {}): StepRowData =>
+    ({ id, kind: "fetch", title: `阅读网页 · ${id}.example`, status: "done", text: `${id} 正文`, ...over });
+  const thinkRow = (id: string, text: string): StepRowData => ({ id, kind: "thinking", title: "思考", status: "done", text });
+
+  it("renders consecutive fetch rows inside a subtopic as one merged row that expands to each row", async () => {
+    const steps = ["f1", "f2", "f3"].map((id) => fetchRow(id, { subtopic: "技术路线" }));
+    const w = mount(TurnView, { props: { turn: blankTurn({ steps }), busy: false } });
+    const merged = w.findAll("[data-testid=merged-row]");
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.text()).toContain("阅读网页 · 3 个网页");
+    expect(w.findAll("[data-testid=step-head]")).toHaveLength(0);
+    await merged[0]!.get("button").trigger("click");
+    expect(w.findAll("[data-testid=step-head]")).toHaveLength(3);
+  });
+
+  it("merges consecutive top-level rows too and keeps subtopic groups in place", () => {
+    const steps: StepRowData[] = [
+      thinkRow("t1", "先想一想"),
+      thinkRow("t2", "再想一想"),
+      { id: "s1", kind: "search", title: "搜索网页", status: "done", subtopic: "技术路线" },
+      fetchRow("f1"),
+      fetchRow("f2"),
+    ];
+    const w = mount(TurnView, { props: { turn: blankTurn({ steps }), busy: false } });
+    const order = w.findAll("[data-testid=merged-row], [data-testid=subtopic-group]").map((e) => e.attributes("data-testid") + ":" + (e.attributes("data-kind") ?? ""));
+    expect(order).toEqual(["merged-row:thinking", "subtopic-group:", "merged-row:fetch"]);
+    expect(w.text()).toContain("思考 · 2 次");
+    expect(w.text()).toContain("阅读网页 · 2 个网页");
+  });
+
+  it("thinking rows are not expanded while the turn runs", () => {
+    const steps: StepRowData[] = [{ id: "t1", kind: "thinking", title: "思考", status: "running", text: "内部推理文本" }];
+    const w = mount(TurnView, { props: { turn: blankTurn({ steps, status: "running" }), busy: false } });
+    expect(w.get("[data-testid=step-head]").attributes("aria-expanded")).toBe("false");
+    expect(w.text()).not.toContain("内部推理文本");
+  });
+
+  it("a finished turn shows only the 研究过程 summary until clicked", async () => {
+    const steps: StepRowData[] = [searchRow(1), fetchRow("f1"), thinkRow("t1", "想")];
+    const turn = blankTurn({ steps, status: "succeeded", startedAt: 1_000, lastEventAt: 253_000 });
+    const w = mount(TurnView, { props: { turn, busy: false } });
+    const toggle = w.get("[data-testid=chain-toggle]");
+    expect(toggle.text()).toContain("研究过程 · 3 步 · 4 分 12 秒");
+    expect(toggle.attributes("aria-expanded")).toBe("false");
+    expect(w.find(".steps").exists()).toBe(false);
+    await toggle.trigger("click");
+    expect(w.find(".steps").exists()).toBe(true);
+    expect(w.findAll("[data-testid=step-head]")).toHaveLength(3);
+
+    const noTime = mount(TurnView, { props: { turn: blankTurn({ steps, status: "paused" }), busy: false } });
+    expect(noTime.get("[data-testid=chain-toggle]").text()).toBe("▸ 研究过程 · 3 步");
+    const running = mount(TurnView, { props: { turn: blankTurn({ steps, status: "running" }), busy: false } });
+    expect(running.find("[data-testid=chain-toggle]").exists()).toBe(false);
   });
 });

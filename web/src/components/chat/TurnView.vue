@@ -19,12 +19,24 @@
       </button>
     </div>
 
-    <div v-if="turn.steps.length" class="steps">
-      <template v-for="(block, bi) in blocks" :key="block.kind === 'row' ? block.row.id : `group-${bi}`">
-        <StepRow v-if="block.kind === 'row'" :row="block.row" :expanded="isExpanded(block.row)" @toggle="toggle(block.row)" @raw="openRaw" />
-        <div v-else class="sub-group" data-testid="subtopic-group">
-          <div class="sub-heading" data-testid="subtopic-heading">{{ block.title }}</div>
-          <StepRow v-for="row in block.rows" :key="row.id" :row="row" :expanded="isExpanded(row)" @toggle="toggle(row)" @raw="openRaw" />
+    <button
+      v-if="turn.steps.length && finished"
+      class="chain-toggle"
+      type="button"
+      data-testid="chain-toggle"
+      :aria-expanded="chainOpen ? 'true' : 'false'"
+      @click="chainOpen = !chainOpen"
+    >
+      <span aria-hidden="true">{{ chainOpen ? "▾" : "▸" }}</span> {{ chainSummary }}
+    </button>
+    <div v-if="turn.steps.length && (!finished || chainOpen)" class="steps">
+      <template v-for="(block, bi) in blocks" :key="`${block.kind}-${bi}`">
+        <div :class="block.kind === 'group' ? 'sub-group' : 'top-rows'" :data-testid="block.kind === 'group' ? 'subtopic-group' : undefined">
+          <div v-if="block.kind === 'group'" class="sub-heading" data-testid="subtopic-heading">{{ block.title }}</div>
+          <template v-for="item in groupSteps(block.rows)" :key="item.kind === 'row' ? item.row.id : item.id">
+            <StepRow v-if="item.kind === 'row'" :row="item.row" :expanded="isExpanded(item.row)" @toggle="toggle(item.row)" @raw="openRaw" />
+            <StepGroup v-else :item="item" :is-expanded="isExpanded" @toggle="toggle" @raw="openRaw" />
+          </template>
         </div>
       </template>
     </div>
@@ -71,13 +83,16 @@
 
 <script setup lang="ts">
 // 一轮对话中 AI 一侧的渲染：路径标识、步骤行（按子主题分组）、流式回复（纯文本）、提问卡、停止卡、报告提示条与失败提示。
-// 进行中的步骤默认展开、其余折叠；用户点击后以用户的选择为准。
+// 进行中的非思考步骤默认展开、其余折叠（思考链默认不展开）；用户点击后以用户的选择为准。
+// 连续的"思考"与连续的"阅读网页"各合并为一行；一轮结束后整条链折叠为"研究过程 · N 步 · 用时"一行。
 import { computed, ref } from "vue";
 import type { Answer, TurnAction } from "../../api/chat";
 import { routeLabel } from "../../lib/chat";
 import type { RawRef, StepRow as StepRowData, TurnView } from "../../lib/chat";
+import { durationText, groupSteps, turnFinished } from "../../lib/steps";
 import QuestionCard from "./QuestionCard.vue";
 import RawDialog from "./RawDialog.vue";
+import StepGroup from "./StepGroup.vue";
 import StepRow from "./StepRow.vue";
 import StopCard from "./StopCard.vue";
 
@@ -93,7 +108,7 @@ const overrides = ref(new Map<string, boolean>());
 const rawRef = ref<RawRef | null>(null);
 
 function isExpanded(row: StepRowData): boolean {
-  return overrides.value.get(row.id) ?? row.status === "running";
+  return overrides.value.get(row.id) ?? (row.status === "running" && row.kind !== "thinking");
 }
 
 function toggle(row: StepRowData): void {
@@ -108,8 +123,8 @@ function openRaw(r: RawRef): void {
 
 // 步骤行按子主题归组：并行的子主题（sub-run）事件交错到达，同一子主题的行仍放在一起，分组出现在该子主题
 // 第一行的位置。分组键是 subtopicId（缺省时用子主题标题）；research_subtopic 行本身不归组。分组标题只显示
-// 子主题名，不显示任何 ID。
-type Block = { kind: "row"; row: StepRowData } | { kind: "group"; key: string; title: string; rows: StepRowData[] };
+// 子主题名，不显示任何 ID。不属于子主题的相邻顶层行累积为一个 top 块，块内与分组内一样合并连续的思考/阅读网页行。
+type Block = { kind: "top"; rows: StepRowData[] } | { kind: "group"; key: string; title: string; rows: StepRowData[] };
 
 const blocks = computed<Block[]>(() => {
   const t = props.turn;
@@ -118,7 +133,9 @@ const blocks = computed<Block[]>(() => {
   for (const row of t.steps) {
     const key = row.kind === "subtopic" ? undefined : (row.subtopicId ?? row.subtopic);
     if (!key) {
-      out.push({ kind: "row", row });
+      const last = out[out.length - 1];
+      if (last?.kind === "top") last.rows.push(row);
+      else out.push({ kind: "top", rows: [row] });
       continue;
     }
     let g = groups.get(key);
@@ -137,6 +154,15 @@ const blocks = computed<Block[]>(() => {
       "子主题";
   }
   return out;
+});
+
+const chainOpen = ref(false);
+const finished = computed(() => turnFinished(props.turn));
+const chainSummary = computed(() => {
+  const t = props.turn;
+  const n = t.steps.length;
+  const ms = t.startedAt !== undefined && t.lastEventAt !== undefined ? t.lastEventAt - t.startedAt : 0;
+  return ms > 0 ? `研究过程 · ${n} 步 · ${durationText(ms)}` : `研究过程 · ${n} 步`;
 });
 
 const label = computed(() => routeLabel(props.turn));
@@ -214,6 +240,22 @@ const statusText = computed(() => {
   flex-direction: column;
   gap: 1px;
 }
+.chain-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: none;
+  padding: 3px 6px;
+  border-radius: 6px;
+  color: #656d76;
+  font: inherit;
+  cursor: pointer;
+}
+.chain-toggle:hover {
+  background: #f6f8fa;
+}
+.top-rows,
 .sub-group {
   display: flex;
   flex-direction: column;
