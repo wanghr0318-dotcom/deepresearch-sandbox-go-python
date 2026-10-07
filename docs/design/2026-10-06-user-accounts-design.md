@@ -1,6 +1,6 @@
 # 用户账号体系：面向用户的 DeepResearch 助手
 
-> 日期：2026-10-06。状态：设计已批准（项目负责人，2026-10-06）。顺序：M3 门槛 → 本设计的实施（M3 Plan 11）→ 仓库整合（[整合设计](2026-10-06-repo-consolidation-design.md)）。
+> 日期：2026-10-06。状态：设计已批准（项目负责人，2026-10-06）。顺序：M3 门槛 → 本设计的实施（M3 Plan 11）→ 仓库整合（[整合设计](https://github.com/wanghr0318-dotcom/go-agentbox/blob/m4-gate/docs/superpowers/specs/2026-10-06-repo-consolidation-design.md)）。
 
 ## 目标
 

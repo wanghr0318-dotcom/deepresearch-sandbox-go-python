@@ -1,7 +1,7 @@
 # M4 第一部分：会话与对话式 DeepResearch 助手（Plan 12 + Plan 13）
 
 > 日期：2026-10-06。状态：设计已批准（项目负责人，2026-10-06，逐节确认）。
-> 依据：[v0.2 规格](../../design/2026-10-03-v0.2-first-release-design.md) §12（会话）、§8（状态机）、§9（Gateway）、§13（sub-run，Plan 14）、§10（exec，Plan 15）；[用户账号设计](2026-10-06-user-accounts-design.md)。
+> 依据：[v0.2 规格](2026-10-03-v0.2-first-release-design.md) §12（会话）、§8（状态机）、§9（Gateway）、§13（sub-run，Plan 14）、§10（exec，Plan 15）；[用户账号设计](2026-10-06-user-accounts-design.md)。
 > M4 拆分：**Plan 12 会话后端** + **Plan 13 skill 化的 Agent、工具包与对话界面**（本文）→ Plan 14 受限多 Agent（sub-run）→ Plan 15 独立 exec 与隔离加固 → 发布门槛（全量回归、性能报告）。
 
 ## 1. 目标

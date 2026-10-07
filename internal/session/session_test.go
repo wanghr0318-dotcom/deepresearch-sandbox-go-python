@@ -423,7 +423,7 @@ func newFkStore(clk *fkClock, log *fkLog) *fkStore {
 func (m *fkStore) addSession(id string, turns ...string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	s := &fkSession{st: State{SessionID: id, Status: StatusCreating, Desired: "active", LastActiveAt: m.clk.now}}
+	s := &fkSession{st: State{SessionID: id, Status: StatusCreating, Desired: "active", LastActiveAt: m.clk.Now()}}
 	for i, t := range turns {
 		s.st.NonTerminalTurns = append(s.st.NonTerminalTurns, TurnFact{TaskID: t, Status: "queued", TurnIndex: int64(i)})
 	}
@@ -486,7 +486,7 @@ func (m *fkStore) Transition(_ context.Context, t Transition) (State, error) {
 		return State{}, &persistence.RejectedError{Code: CodeInvalidTransition}
 	}
 	m.log.add("transition:%s:%s→%s", t.SessionID, s.st.Status, t.To)
-	now := m.clk.now
+	now := m.clk.Now()
 	s.st.Status, s.st.RowVersion = t.To, s.st.RowVersion+1
 	s.st.IdleSince, s.st.FrozenSince = nil, nil
 	switch t.To {
@@ -527,7 +527,7 @@ func (m *fkStore) CreateIncarnation(_ context.Context, n NewIncarnation) (Incarn
 			return Incarnation{}, persistence.ErrConflict
 		}
 	}
-	inc := &Incarnation{IncarnationID: n.IncarnationID, SessionID: n.SessionID, EnvID: n.EnvID, Status: IncStarting, StartedAt: m.clk.now}
+	inc := &Incarnation{IncarnationID: n.IncarnationID, SessionID: n.SessionID, EnvID: n.EnvID, Status: IncStarting, StartedAt: m.clk.Now()}
 	m.incs[n.IncarnationID] = inc
 	s.st.CurrentIncarnationID = n.IncarnationID
 	m.log.add("create_incarnation:%s:%s", n.IncarnationID, n.EnvID)
@@ -556,7 +556,7 @@ func (m *fkStore) EndIncarnation(_ context.Context, id, reason string) (Incarnat
 	defer m.mu.Unlock()
 	inc := m.incs[id]
 	if inc.Status != IncEnded {
-		now := m.clk.now
+		now := m.clk.Now()
 		inc.Status, inc.EndedAt, inc.EndReason = IncEnded, &now, reason
 		m.log.add("end_incarnation:%s:%s", id, reason)
 	}
@@ -626,7 +626,7 @@ func (m *fkStore) startTurn(t *testing.T, sid, taskID string, g GrantInfo) {
 		s.st.RowVersion++
 	}
 	s.st.Status, s.st.CurrentTaskID, s.st.BlockedByTaskID, s.st.IdleSince = StatusRunning, taskID, "", nil
-	s.st.LastActiveAt = m.clk.now
+	s.st.LastActiveAt = m.clk.Now()
 }
 
 // verdict 模拟裁决事务：incarnation busy → releasing；非 queued 清除占用，paused 阻塞会话，终态移出非终态 turn。
