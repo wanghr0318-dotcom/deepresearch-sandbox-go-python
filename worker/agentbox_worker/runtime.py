@@ -340,6 +340,25 @@ class TaskContext:
             raise CallAbandoned("宿主已请求暂停：不再开始新的调用")
         return await _abandonable(fn, args, kwargs, self._pause_event)
 
+    async def run_call_within(
+        self, timeout_s: float, fn: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> Any:
+        """同 run_call，但只受期限约束：timeout_s 秒内没有结束即放弃等待并抛出 CallAbandoned。
+
+        不受暂停影响，用于暂停之后仍须有界完成的调用（停止摘要：被放弃的调用可能占满 Gateway 的
+        每任务在途槽位，摘要会在 Gateway 侧排队）。被放弃的调用在 Gateway 侧继续并记入 journal，
+        其线程此后不能再占用 call id、不能再发出请求；它已占的号留在计数器中。"""
+        if timeout_s <= 0:
+            raise CallAbandoned("调用期限已过：不再开始调用")
+        expired = asyncio.Event()
+        timer = asyncio.get_running_loop().call_later(timeout_s, expired.set)
+        try:
+            return await _abandonable(fn, args, kwargs, expired)
+        except CallAbandoned:
+            raise CallAbandoned(f"调用未在 {timeout_s:.1f} s 内结束：放弃等待") from None
+        finally:
+            timer.cancel()
+
     def rewind_call_ids(self, snapshot: dict[str, int]) -> None:
         """把本 attempt 的 call id 计数器原地回退到 snapshot（与某个一致的应用状态一起取得）。
 

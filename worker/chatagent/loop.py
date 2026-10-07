@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -244,11 +245,12 @@ class Agent:
     async def _stop(self, *, rollback: bool = False) -> Paused:
         """宿主请求暂停：（放弃了在途调用时先回到锚点）停止摘要（模型调用在 "stop" checkpoint
         之前，call id 计数器随之保存）→ "stop" checkpoint → turn_stopped 停止卡。"""
+        started = time.monotonic()  # 停止摘要的期限从这里算起
         if rollback:
             self._rollback()
         st = self.state
         st.stops += 1
-        findings = await stop_summary(self.ctx, self.gw, st, self.cfg)
+        findings = await stop_summary(self.ctx, self.gw, st, self.cfg, started=started)
         st.stop_findings = findings
         cp = await self.save(STOP_STEP)
         await self.emit.turn_stopped(stop_card(st), findings, can_finish(st))

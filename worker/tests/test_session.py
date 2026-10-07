@@ -770,3 +770,42 @@ def test_session_stream_checker_rules():
     with pytest.raises(ProtocolError) as exc:
         checker.observe(ev(3, "error", code="x"))  # ready 之后的 error 必须带 attempt_id
     assert exc.value.code == "missing_field"
+
+
+def test_run_call_within_abandons_on_timeout_even_while_paused():
+    gate, entered = threading.Event(), threading.Event()
+    seen: dict[str, Any] = {}
+
+    def blocking(ids: CallIds) -> str:
+        first_id = ids.next("stop-1", "chat")
+        entered.set()
+        gate.wait(5)
+        try:
+            ids.next("stop-1", "chat")
+        except CallAbandoned:
+            seen["fenced"] = True
+        return first_id
+
+    async def app(ctx: TaskContext):
+        # 不受暂停影响（停止摘要在暂停之后发起），只受期限约束
+        assert await ctx.run_call_within(5, lambda a: a * 2, 21) == 42
+        started = time.monotonic()
+        with pytest.raises(CallAbandoned):
+            await ctx.run_call_within(0.2, blocking, ctx.call_ids)
+        seen["elapsed"] = time.monotonic() - started
+        with pytest.raises(ValueError):
+            await ctx.run_call_within(5, _raise_value_error)
+        assert ctx.call_ids.snapshot() == {"root/stop-1/chat": 1}
+        return Result(summary="ok")
+
+    host = SessionHost()
+    host.start_task("t-1", "a-1")
+    host.close_when_idle()
+    code, events = host.run(app)
+    assert code == 0 and first(events, "result")["summary"] == "ok"
+    assert entered.is_set() and seen["elapsed"] < 2
+    gate.set()
+    deadline = time.monotonic() + 5
+    while "fenced" not in seen and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert seen.get("fenced") is True

@@ -3,15 +3,19 @@
 停止摘要的模型调用发生在最后一个（"stop"）checkpoint 之前，call id 计数器随之保存；摘要失败或
 为空时退回固定句子，停止本身从不失败。没有任何发现（无已完成子主题摘要、无本轮来源）时不调用
 模型，给出 NO_FINDINGS。
+
+停止摘要有期限（STOP_DEADLINE_S，自停止路径开始计）：被放弃的在途调用仍占着 Gateway 的每任务
+在途槽位时摘要会排队；超过期限即放弃等待，停止卡用确定性的固定句子。被放弃的 stop-<stops> 调用
+已占的号随 "stop" checkpoint 保存；之后的停止 stops 递增、用新的 step id，它不会以别的请求体重发。
 """
 
 from __future__ import annotations
 
-import asyncio
 import sys
+import time
 from typing import Any
 
-from agentbox_worker.errors import GatewayError, WorkerFailure
+from agentbox_worker.errors import CallAbandoned, GatewayError, WorkerFailure
 from agentbox_worker.runtime import TaskContext
 from agentbox_worker.tools import GatewayLike
 from chatagent.config import TurnConfig
@@ -22,6 +26,8 @@ from chatagent.state import TurnState
 NO_FINDINGS = "尚无发现，研究在规划阶段被停止"
 STOP_MAX_TOKENS = 4096
 FINDINGS_MAX_CHARS = 600
+# 停止路径（回退 + 摘要）的期限（秒）：停止卡的目标是约 30 s 内出现，宿主兜底在 60 s
+STOP_DEADLINE_S = 22.0
 
 
 def _log(message: str) -> None:
@@ -78,13 +84,25 @@ def fallback_findings(state: TurnState) -> str:
     return f"已完成 {len(_done(state))} 个子主题、阅读 {_fresh_sources(state)} 个来源。"
 
 
-async def stop_summary(ctx: TaskContext, gw: GatewayLike, state: TurnState, cfg: TurnConfig) -> str:
-    """kimi-k2.6 写 2–3 句"目前发现"（step_id=stop-<stops>）；失败或为空 → 固定句子。"""
+async def stop_summary(
+    ctx: TaskContext,
+    gw: GatewayLike,
+    state: TurnState,
+    cfg: TurnConfig,
+    *,
+    started: float | None = None,
+) -> str:
+    """kimi-k2.6 写 2–3 句"目前发现"（step_id=stop-<stops>）；失败、为空或超过期限 → 固定句子。
+
+    started：停止路径开始的 time.monotonic()（缺省为现在）；期限 STOP_DEADLINE_S 从它算起。"""
     messages = findings_messages(state, cfg.text)
     if messages is None:
         return NO_FINDINGS
+    begin = time.monotonic() if started is None else started
+    remaining = STOP_DEADLINE_S - (time.monotonic() - begin)
     try:
-        reply = await asyncio.to_thread(
+        reply = await ctx.run_call_within(
+            remaining,
             call_model,
             gw,
             f"stop-{state.stops}",
@@ -93,6 +111,9 @@ async def stop_summary(ctx: TaskContext, gw: GatewayLike, state: TurnState, cfg:
             max_tokens=STOP_MAX_TOKENS,
             tools=None,
         )
+    except CallAbandoned as exc:  # 超过期限：不再等它，停止卡立即写出
+        _log(f"停止摘要未能及时完成，使用固定句子：{exc}")
+        return fallback_findings(state)
     except (GatewayError, WorkerFailure) as exc:  # 停止从不因摘要失败
         _log(f"停止摘要失败，使用固定句子：{exc}")
         return fallback_findings(state)

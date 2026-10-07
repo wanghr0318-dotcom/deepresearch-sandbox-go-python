@@ -2366,3 +2366,56 @@ def test_turn_gateway_waits_for_in_progress_calls_up_to_the_call_timeout():
     gw = turn_gateway(Ctx())  # type: ignore[arg-type]
     assert gw is Ctx.gateway and gw.in_progress_wait_s is None
     assert GatewayClient.in_progress_wait_s == 30.0  # SDK 缺省不变
+
+
+# ---- 停止摘要有期限（stop-fix 终审）：被放弃的调用占满 Gateway 每任务在途槽位时摘要会排队 ----
+
+
+def test_stop_summary_past_deadline_writes_fallback_card_and_resume_does_not_diverge(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import chatagent.stop as stop_mod
+
+    monkeypatch.setattr(stop_mod, "STOP_DEADLINE_S", 0.5)
+    gate = threading.Event()
+
+    def slow_summary(body: dict[str, Any]) -> dict[str, Any]:
+        gate.wait(BLOCK_S)  # 如同在 Gateway 的 acquire 中等槽位
+        return reply(STOP_FINDINGS)
+
+    model = research_model()
+    model.scripts["stop-1"] = [slow_summary]
+    model.scripts["stop-2"] = [reply(STOP_FINDINGS)]
+    started = time.monotonic()
+    code, events, gw = run_turn(model, config=RESEARCH_CONFIG, host=pausing_host("sub-1", 2))
+    elapsed = time.monotonic() - started
+    assert code == 0, errors(events)
+    assert elapsed < QUICK_S and not gate.is_set()
+    stopped = progress(events, "turn_stopped")[0]["data"]
+    assert stopped["findings"] == "已完成 0 个子主题、阅读 1 个来源。"  # 确定性的兜底句子
+    last = checkpoints(events)[-1]
+    assert last["step_id"] == "stop" and last["state"]["stops"] == 1
+    assert last["state"]["stop_findings"] == stopped["findings"]
+    assert sdk_ids(last)["root/stop-1/chat"] == 1  # 被放弃的摘要已占的号随停止 checkpoint 保存
+    assert proposal(events, "paused")["checkpoint_id"] == last["checkpoint_id"]
+
+    # 被放弃的摘要在 Gateway 侧完成；继续时不再发出 stop-1，再次停止用 stop-2
+    gate.set()
+    wait_journaled(gw, "root/stop-1/chat/1")
+    before = len(gw.calls)
+    code2, events2, _ = continue_turn(model, last, gw, host=pausing_host("sub-2", 1, "a-2"))
+    assert code2 == 0, errors(events2)
+    assert not gw.rejections
+    assert "stop-1" not in [c.step_id for c in gw.calls[before:]]
+    assert chat_steps(gw)[-1] == "stop-2"
+    stopped2 = progress(events2, "turn_stopped")[0]["data"]
+    assert stopped2["findings"] == STOP_FINDINGS
+    last2 = checkpoints(events2)[-1]
+    assert last2["state"]["stops"] == 2
+    assert sdk_ids(last2)["root/stop-1/chat"] == 1 and sdk_ids(last2)["root/stop-2/chat"] == 1
+
+    # 再继续到结束：没有指纹冲突
+    code3, events3, _ = continue_turn(model, last2, gw, attempt="a-3", attempt_no=3)
+    assert code3 == 0, errors(events3)
+    assert not gw.rejections
+    assert result(events3)["outputs"] == ["report"]
