@@ -173,9 +173,29 @@ func (c *Coordinator) releaseUIDRange(ctx context.Context, envID string) error {
 	}
 	if err == nil && c.opt.EntryHeld != nil && c.opt.EntryHeld(envID) {
 		// 入口（Gateway socket）尚未撤销：它归该范围所有但不是残留。留在待归还集合中，撤销之后再核查归还
-		// （见 Options.EntryHeld）。
+		// （见 Options.EntryHeld）。推迟过久（入口泄漏）时记一次 WARN，不让范围被静默占用。
+		now := c.opt.Now()
+		c.mu.Lock()
+		first, seen := c.entryDeferred[envID]
+		if !seen {
+			first = now
+			c.entryDeferred[envID] = now
+		}
+		warn := now.Sub(first) > EntryHeldWarnAfter && !c.entryWarned[envID]
+		if warn {
+			c.entryWarned[envID] = true
+		}
+		c.mu.Unlock()
+		if warn {
+			c.opt.Logger.Warn("环境的 Gateway 入口长时间未撤销，UID 范围推迟归还", "env_id", envID,
+				"uid_range", ur.UIDRangeID, "deferred_for", now.Sub(first).Round(time.Second).String())
+		}
 		return nil
 	}
+	c.mu.Lock()
+	delete(c.entryDeferred, envID)
+	delete(c.entryWarned, envID)
+	c.mu.Unlock()
 	released := false
 	if err == nil {
 		released, err = c.checkAndRelease(ctx, ur, func(ctx context.Context) error {

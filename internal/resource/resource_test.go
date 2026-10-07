@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"slices"
 	"sort"
 	"strings"
@@ -1314,6 +1315,42 @@ func TestCleanupDefersReleaseWhileEntryHeld(t *testing.T) {
 	}
 	if n := f.rec.count("QuarantineUIDRange"); n != 0 {
 		t.Fatalf("范围被隔离：%v", f.rec.snapshot())
+	}
+}
+
+// TestCleanupWarnsOnceWhenEntryHeldTooLong：入口持续被持有（泄漏的绑定）时，推迟超过 EntryHeldWarnAfter 记一次
+// WARN（之后的轮次不重复），范围仍不归还；入口撤销后照常归还。
+func TestCleanupWarnsOnceWhenEntryHeldTooLong(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	var logBuf strings.Builder
+	f.c.opt.Logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+	held := true
+	f.c.opt.EntryHeld = func(string) bool { return held }
+	f.createStopped(t, "e1", true)
+	warns := func() int { return strings.Count(logBuf.String(), "level=WARN") }
+	for _, step := range []time.Duration{0, 30 * time.Second, 31 * time.Second, 10 * time.Second} {
+		f.clock.advance(step)
+		if err := f.c.cleanupPass(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := warns(); n != 1 || !strings.Contains(logBuf.String(), "env_id=e1") {
+		t.Fatalf("推迟 71 s 后 WARN %d 条，期望恰好 1 条：%s", n, logBuf.String())
+	}
+	id := fmt.Sprintf("uid-%d", testUIDBase)
+	if r := f.store.rangeOf(id); r.State != "assigned" {
+		t.Fatalf("入口仍被持有时 UID 范围 = %+v", r)
+	}
+	held = false
+	if err := f.c.cleanupPass(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.store.rangeOf(id); r.State != "free" {
+		t.Fatalf("入口撤销后 UID 范围 = %+v，期望归还", r)
+	}
+	if warns() != 1 {
+		t.Fatalf("归还时又记录了 WARN：%s", logBuf.String())
 	}
 }
 

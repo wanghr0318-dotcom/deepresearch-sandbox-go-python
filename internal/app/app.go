@@ -643,7 +643,8 @@ func (s *server) assemble() error {
 		},
 		// Gateway 入口 socket 归环境的 UID 范围所有：撤销（可能晚于判决，见 Options.EntryHeld）之前不归还该范围。
 		// s.edge 由下方 assembleGateway 设置，cleanup loop 在 assemble 之后才启动。
-		EntryHeld: func(envID string) bool { return s.edge != nil && s.edge.EnvHeld(envID) }})
+		EntryHeld: func(envID string) bool { return s.edge != nil && s.edge.EnvHeld(envID) },
+		Logger:    s.log})
 	run := runner.New(s.store, blobs, prov, prov.ResourceDiag, s.cfg.Runner)
 	if err := s.assembleGateway(blobs); err != nil {
 		return err
