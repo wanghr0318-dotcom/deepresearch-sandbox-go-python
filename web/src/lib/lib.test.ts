@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ApiError, NetworkError } from "../api/client";
 import { ev, task } from "../components/testkit";
 import { collectArtifacts } from "./artifacts";
@@ -218,5 +218,25 @@ describe("password rule", () => {
     expect(passwordChecks("abcdefghijklmnoP1")).toEqual({ length: false, classes: true });
     expect(passwordChecks("abcdefgh")).toEqual({ length: true, classes: false });
     expect(passwordError("密码密码密码密码")).toBe(PASSWORD_RULE_TEXT);
+  });
+});
+
+import { clampWidths, LAYOUT, loadWidths, saveWidths } from "./layout";
+
+describe("layout widths", () => {
+  it("clamps to min/max and keeps the chat at least chatMin wide", () => {
+    expect(clampWidths({ sidebar: 100, panel: 2000 }, 1600, true)).toEqual({ sidebar: 200, panel: 720 });
+    const w = clampWidths({ sidebar: 420, panel: 720 }, 1100, true);
+    expect(1100 - w.sidebar - w.panel).toBeGreaterThanOrEqual(LAYOUT.chatMin);
+    expect(clampWidths({ sidebar: 300, panel: 700 }, 900, false).sidebar).toBe(300);
+  });
+  it("falls back to defaults when storage throws or holds junk", () => {
+    const spy = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => { throw new Error("blocked"); });
+    expect(loadWidths()).toEqual({ sidebar: LAYOUT.sidebar.def, panel: LAYOUT.panel.def });
+    spy.mockRestore();
+    localStorage.setItem("agentbox.chat.widths", "{bad");
+    expect(loadWidths()).toEqual({ sidebar: LAYOUT.sidebar.def, panel: LAYOUT.panel.def });
+    saveWidths({ sidebar: 300, panel: 400 });
+    expect(loadWidths()).toEqual({ sidebar: 300, panel: 400 });
   });
 });

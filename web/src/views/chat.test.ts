@@ -1,6 +1,6 @@
 import { flushPromises, mount } from "@vue/test-utils";
 import type { VueWrapper } from "@vue/test-utils";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { ApiError } from "../api/client";
 import type { ChatApi } from "../api/chat";
 import { fakeChat, fakeSessionStream, session, sev, turn } from "../components/chat/chatkit";
@@ -47,6 +47,7 @@ function track(w: VueWrapper): VueWrapper {
 
 beforeEach(() => {
   window.location.hash = "";
+  localStorage.clear();
 });
 
 afterEach(() => {
@@ -352,6 +353,9 @@ describe("ChatView", () => {
     stream.push(sev(3, "tool_result", { tool: "web_fetch", ok: true, preview: { kind: "fetch", url: "https://a.example/x", title: "来源甲", n: 1 } }, "u1"));
     stream.push(sev(4, "route", { route: "answer" }, "u2"));
     await flushPromises();
+    // 右侧面板默认收起：标题栏"进度"按钮打开它
+    expect(w.find(".side-panel").exists()).toBe(false);
+    await w.get("[data-action=toggle-panel]").trigger("click");
     const panel = w.get(".side-panel");
     expect(panel.text()).toContain("梳理技术路线");
     await panel.get("[data-tab=sources]").trigger("click");
@@ -361,6 +365,95 @@ describe("ChatView", () => {
     // 轮次里的"查看进度"切回进度标签
     await w.get("[data-action=view-progress]").trigger("click");
     expect(w.get(".side-panel [data-tab=progress]").attributes("aria-selected")).toBe("true");
+  });
+
+  it("right panel is collapsed by default; the header button opens it on 进度 and × closes it", async () => {
+    const w = track(mountChat({}, { sessionId: "s1" }));
+    await flushPromises();
+    expect(w.find(".side-panel").exists()).toBe(false);
+    const toggle = w.get("[data-action=toggle-panel]");
+    expect(toggle.text()).toBe("进度");
+    expect(toggle.attributes("aria-pressed")).toBe("false");
+    await toggle.trigger("click");
+    expect(w.find(".side-panel").exists()).toBe(true);
+    expect(w.get(".side-panel [data-tab=progress]").attributes("aria-selected")).toBe("true");
+    expect(w.get("[data-action=toggle-panel]").attributes("aria-pressed")).toBe("true");
+    await w.get("[data-action=close-panel]").trigger("click");
+    expect(w.find(".side-panel").exists()).toBe(false);
+    // 再点一次打开，标题栏按钮也能收起
+    await w.get("[data-action=toggle-panel]").trigger("click");
+    expect(w.get("[data-action=toggle-panel]").text()).toBe("收起面板");
+    await w.get("[data-action=toggle-panel]").trigger("click");
+    expect(w.find(".side-panel").exists()).toBe(false);
+  });
+
+  it("the report card opens the panel on the 报告 tab", async () => {
+    const stream = fakeSessionStream();
+    const chat = fakeChat({ listTurns: vi.fn(async () => ({ turns: [turn({ turn_id: "u1", text: "研究", deep_research: true, status: "succeeded" })] })) });
+    const w = track(mountChat({ chat, watchSession: stream.fn }, { sessionId: "s1" }));
+    await flushPromises();
+    stream.push(sev(1, "route", { route: "research" }, "u1"));
+    stream.push(sev(2, "report_ready", { artifact_id: "report", version: 1, title: "固态电池报告" }, "u1"));
+    stream.push(sev(3, "turn_status", { status: "succeeded" }, "u1"));
+    await flushPromises();
+    expect(w.find(".side-panel").exists()).toBe(false);
+    await w.get("[data-testid=report-card]").trigger("click");
+    await flushPromises();
+    expect(w.find(".side-panel").exists()).toBe(true);
+    expect(w.get(".side-panel [data-tab=report]").attributes("aria-selected")).toBe("true");
+  });
+
+  it("keeps the chat column at least chatMin wide on a small window", async () => {
+    Object.defineProperty(window, "innerWidth", { value: 1100, configurable: true });
+    onTestFinished(() => {
+      Object.defineProperty(window, "innerWidth", { value: 1024, configurable: true });
+    });
+    localStorage.setItem("agentbox.chat.widths", JSON.stringify({ sidebar: 420, panel: 720 }));
+    const w = track(mountChat({}, { sessionId: "s1" }));
+    await flushPromises();
+    await w.get("[data-action=toggle-panel]").trigger("click");
+    const cols = (w.get(".chat-view").element as HTMLElement).style.gridTemplateColumns;
+    const px = [...cols.matchAll(/(\d+)px/g)].map((m) => Number(m[1]));
+    expect(px[0]! + px[px.length - 1]!).toBeLessThanOrEqual(1100 - 420);
+  });
+
+  it("dividers resize the columns by keyboard and pointer and remember the widths", async () => {
+    const w0 = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", { value: 1440, configurable: true });
+    onTestFinished(() => {
+      Object.defineProperty(window, "innerWidth", { value: w0, configurable: true });
+    });
+    const w = track(mountChat({}, { sessionId: "s1" }));
+    await flushPromises();
+    expect(w.findAll("[role=separator]")).toHaveLength(1);
+    const side = w.get("[role=separator][aria-label=会话栏宽度]");
+    expect(side.attributes("aria-valuenow")).toBe("264");
+    await side.trigger("keydown", { key: "ArrowRight" });
+    expect(w.get("[aria-label=会话栏宽度]").attributes("aria-valuenow")).toBe("280");
+    expect(JSON.parse(localStorage.getItem("agentbox.chat.widths") ?? "null")).toEqual({ sidebar: 280, panel: 380 });
+    await side.trigger("keydown", { key: "ArrowLeft" });
+    expect(w.get("[aria-label=会话栏宽度]").attributes("aria-valuenow")).toBe("264");
+
+    await w.get("[data-action=toggle-panel]").trigger("click");
+    expect(w.findAll("[role=separator]")).toHaveLength(2);
+    const panelSep = w.get("[role=separator][aria-label=面板宽度]");
+    expect(panelSep.attributes("aria-valuenow")).toBe("380");
+    // 右侧面板的分隔线向左拖动 = 面板变宽
+    const el = panelSep.element as HTMLElement;
+    el.dispatchEvent(Object.assign(new MouseEvent("pointerdown", { clientX: 1000, bubbles: true }), { pointerId: 1 }));
+    el.dispatchEvent(new MouseEvent("pointermove", { clientX: 960, bubbles: true }));
+    el.dispatchEvent(new MouseEvent("pointerup", { clientX: 960, bubbles: true }));
+    el.dispatchEvent(new MouseEvent("pointermove", { clientX: 900, bubbles: true }));
+    await flushPromises();
+    expect(w.get("[aria-label=面板宽度]").attributes("aria-valuenow")).toBe("420");
+    expect(JSON.parse(localStorage.getItem("agentbox.chat.widths") ?? "null")).toEqual({ sidebar: 264, panel: 420 });
+
+    // 宽度记在本浏览器：重新打开页面沿用
+    const w2 = track(mountChat({}, { sessionId: "s1" }));
+    await flushPromises();
+    expect(w2.get("[aria-label=会话栏宽度]").attributes("aria-valuenow")).toBe("264");
+    await w2.get("[data-action=toggle-panel]").trigger("click");
+    expect(w2.get("[aria-label=面板宽度]").attributes("aria-valuenow")).toBe("420");
   });
 
   it("shows 正在恢复对话… while the session is restoring", async () => {
@@ -402,6 +495,8 @@ describe("ChatView", () => {
     expect(w.get(".chat-view").classes()).toContain("narrow");
     expect(w.find(".sidebar").exists()).toBe(false);
     expect(w.find(".side-panel").exists()).toBe(false);
+    expect(w.find("[role=separator]").exists()).toBe(false);
+    expect(w.find("[data-action=toggle-panel]").exists()).toBe(false);
 
     await w.get("[data-action=open-sessions]").trigger("click");
     expect(w.find(".drawer .sidebar").exists()).toBe(true);

@@ -16,6 +16,7 @@
       >
         {{ t.key === "sources" && turn?.sources.length ? `${t.name} ${turn.sources.length}` : t.name }}
       </button>
+      <button v-if="closable" class="close" type="button" data-action="close-panel" aria-label="收起面板" @click="emit('close')">×</button>
     </div>
 
     <div id="side-tabpanel" class="body" role="tabpanel" :aria-labelledby="`side-tab-${tab}`">
@@ -88,8 +89,8 @@ import { useUserServices } from "../../lib/userServices";
 
 type Tab = "progress" | "sources" | "report";
 
-const props = defineProps<{ turn?: TurnView; tab: Tab }>();
-const emit = defineEmits<{ "update:tab": [tab: Tab] }>();
+const props = withDefaults(defineProps<{ turn?: TurnView; tab: Tab; closable?: boolean }>(), { turn: undefined, closable: false });
+const emit = defineEmits<{ "update:tab": [tab: Tab]; close: [] }>();
 
 const { saveBlob } = useUserServices();
 
@@ -139,6 +140,14 @@ function isHttp(url: string): boolean {
   gap: 14px;
   padding: 10px 14px 0;
   border-bottom: 1px solid #e5e7eb;
+}
+.close {
+  margin-left: auto;
+  border: 0;
+  background: none;
+  font-size: 18px;
+  color: #656d76;
+  cursor: pointer;
 }
 .s-tab {
   border: 0;
