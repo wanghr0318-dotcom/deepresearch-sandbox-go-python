@@ -3338,18 +3338,23 @@ for fd in range(3, 1024):
         pass
 import ctypes, json, resource, threading
 ev = threading.Event()
-th = threading.Thread(target=ev.wait)
+th = threading.Thread(target=ev.wait, daemon=True)
 th.start()
 tasks = {}
-for tid in os.listdir('/proc/self/task'):
-    d = {}
-    with open('/proc/self/task/%s/status' % tid) as f:
-        for line in f:
-            k, _, v = line.partition(':')
-            d[k] = v.strip()
-    tasks[tid] = {k: d.get(k) for k in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb', 'NoNewPrivs', 'Seccomp')}
-ev.set()
-th.join()
+try:
+    for tid in os.listdir('/proc/self/task'):
+        d = {}
+        try:
+            with open('/proc/self/task/%s/status' % tid) as f:
+                for line in f:
+                    k, _, v = line.partition(':')
+                    d[k] = v.strip()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        tasks[tid] = {k: d.get(k) for k in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb', 'NoNewPrivs', 'Seccomp')}
+finally:
+    ev.set()
+    th.join()
 libc = ctypes.CDLL(None, use_errno=True)
 print(json.dumps({
     'fds': fds, 'resuid': os.getresuid(), 'resgid': os.getresgid(), 'groups': os.getgroups(), 'tasks': tasks,
@@ -3976,19 +3981,27 @@ ts = [threading.Thread(target=out.append, args=(i,)) for i in range(16)]
 [t.start() for t in ts]; [t.join() for t in ts]
 check("py_threads", sorted(out) == list(range(16)), "16 threads ran")
 ev = threading.Event()
-hs = [threading.Thread(target=ev.wait) for _ in range(4)]
+# daemon 线程且 finally 中释放：读取出错时解释器也能退出（否则 cmd.Run 永远等待，CI 上表现为"等待消息超时"）
+hs = [threading.Thread(target=ev.wait, daemon=True) for _ in range(4)]
 [h.start() for h in hs]
 bad = []
-tids = os.listdir("/proc/self/task")
-for tid in tids:
-    d = {}
-    for l in open("/proc/self/task/%s/status" % tid):
-        k, _, v = l.partition(":")
-        d[k] = v.strip()
-    for k in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"):
-        if d[k] != "0000000000000000": bad.append((tid, k, d[k]))
-    if d["NoNewPrivs"] != "1" or d["Seccomp"] != "2" or int(d["Seccomp_filters"]) < base + 1: bad.append((tid, "nnp/seccomp", d["Seccomp_filters"]))
-ev.set(); [h.join() for h in hs]
+tids = []
+try:
+    for tid in os.listdir("/proc/self/task"):
+        d = {}
+        try:
+            with open("/proc/self/task/%s/status" % tid) as f:
+                for l in f:
+                    k, _, v = l.partition(":")
+                    d[k] = v.strip()
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # 刚 join 的线程可能在列目录之后才在内核中退出
+        tids.append(tid)
+        for k in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"):
+            if d[k] != "0000000000000000": bad.append((tid, k, d[k]))
+        if d["NoNewPrivs"] != "1" or d["Seccomp"] != "2" or int(d["Seccomp_filters"]) < base + 1: bad.append((tid, "nnp/seccomp", d["Seccomp_filters"]))
+finally:
+    ev.set(); [h.join() for h in hs]
 check("py_thread_status", not bad and len(tids) >= 5, "threads=%d bad=%r" % (len(tids), bad))
 p = subprocess.run(["/usr/bin/echo", "sub-ok"], capture_output=True, text=True)
 check("py_subprocess_run", p.returncode == 0 and p.stdout.strip() == "sub-ok", "rc=%d out=%r" % (p.returncode, p.stdout.strip()))
