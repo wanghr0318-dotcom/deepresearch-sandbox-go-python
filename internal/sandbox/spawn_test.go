@@ -2045,12 +2045,62 @@ type sandboxInit struct {
 	conn       *Conn
 	ready      error
 	stderr     *os.File
+	cgroup     string // 测试 cgroup（init 与沙箱内全部进程都在其中或其子 cgroup 中）
 }
 
 // output 返回启动进程与 init 的 stderr。
 func (s *sandboxInit) output() string {
 	b, _ := os.ReadFile(s.stderr.Name())
 	return string(b)
+}
+
+// procDump 列出测试 cgroup（含子 cgroup）中每个进程的 comm、state、wchan 与内核栈，供挂起时诊断：沙箱内的进程
+// 停在哪里（helper 降权步骤、workload、python 子进程）从控制消息上看不出来。
+func (s *sandboxInit) procDump() string {
+	var b strings.Builder
+	// short 是 /proc/<pid>/stat 的 "pid (comm) state ppid"（comm 可含空格，按最后一个 ')' 切分）。
+	short := func(stat []byte) string {
+		s := strings.TrimSpace(string(stat))
+		if i := strings.LastIndexByte(s, ')'); i >= 0 {
+			f := strings.Fields(s[i+1:])
+			return s[:i+1] + " " + strings.Join(f[:min(2, len(f))], " ")
+		}
+		return s
+	}
+	_ = filepath.WalkDir(s.cgroup, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || d.Name() != "cgroup.procs" {
+			return nil
+		}
+		procs, _ := os.ReadFile(p)
+		for _, pid := range strings.Fields(string(procs)) {
+			dir := "/proc/" + pid
+			stat, _ := os.ReadFile(dir + "/stat")
+			cmdline, _ := os.ReadFile(dir + "/cmdline")
+			wchan, _ := os.ReadFile(dir + "/wchan")
+			stack, _ := os.ReadFile(dir + "/stack")
+			argv := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
+			for i, a := range argv {
+				if len(a) > 64 { // 检查器的配置 JSON 与 python 脚本很长，只留开头
+					argv[i] = a[:64] + "…"
+				}
+			}
+			fmt.Fprintf(&b, "%s argv=%q wchan=%s\n%s", short(stat), argv, wchan, stack)
+			tasks, _ := os.ReadDir(dir + "/task")
+			for _, tk := range tasks {
+				if tk.Name() == pid {
+					continue
+				}
+				tst, _ := os.ReadFile(dir + "/task/" + tk.Name() + "/stat")
+				tw, _ := os.ReadFile(dir + "/task/" + tk.Name() + "/wchan")
+				fmt.Fprintf(&b, "  线程 %s wchan=%s\n", short(tst), tw)
+			}
+		}
+		return nil
+	})
+	if b.Len() == 0 {
+		return "（测试 cgroup 中没有进程）"
+	}
+	return b.String()
 }
 
 // waitPidfdExit 等待 pidfd 对应的进程退出（pidfd 可读），超时返回 false。init 不是本进程的子进程，不收割它。
@@ -2083,7 +2133,7 @@ func startSandboxInit(t *testing.T, spec LaunchSpec) *sandboxInit {
 	if err := os.Mkdir(cg, 0o755); err != nil {
 		t.Fatalf("创建测试 cgroup: %v", err)
 	}
-	s := &sandboxInit{pidfd: -1}
+	s := &sandboxInit{pidfd: -1, cgroup: cg}
 	t.Cleanup(func() {
 		if s.conn != nil {
 			s.conn.Close()
@@ -3913,6 +3963,14 @@ base = int(os.environ["AGENTBOX_BASELINE_FILTERS"])
 libc = ctypes.CDLL(None, use_errno=True)
 r = libc.syscall(435, None, 0); e = ctypes.get_errno()
 check("py_clone3_enosys", r == -1 and e == errno.ENOSYS, "r=%d errno=%s" % (r, errno.errorcode.get(e, e)))
+# os.fork 在创建任何线程之前做：进程是单线程的。join 只等到 Python 线程的结束标记，OS 线程此时可能仍在退出，
+# 而多线程进程中 fork 的子进程可能死锁（Python 文档与 3.12 的 DeprecationWarning）；本项只验证 clone3 = ENOSYS
+# 时 fork 可用，不验证多线程下的 fork。
+pid = os.fork()
+if pid == 0:
+    os._exit(7)
+_, st = os.waitpid(pid, 0)
+check("py_fork", os.waitstatus_to_exitcode(st) == 7, "exit=%d" % os.waitstatus_to_exitcode(st))
 out = []
 ts = [threading.Thread(target=out.append, args=(i,)) for i in range(16)]
 [t.start() for t in ts]; [t.join() for t in ts]
@@ -3939,11 +3997,6 @@ check("py_subprocess_shell", p.returncode == 0 and p.stdout.strip() == "SHELL-OK
 pid = os.posix_spawn("/usr/bin/true", ["true"], {})
 _, st = os.waitpid(pid, 0)
 check("py_posix_spawn", st == 0, "status=%d" % st)
-pid = os.fork()
-if pid == 0:
-    os._exit(7)
-_, st = os.waitpid(pid, 0)
-check("py_fork", os.waitstatus_to_exitcode(st) == 7, "exit=%d" % os.waitstatus_to_exitcode(st))
 try:
     import concurrent.futures as cf
     with cf.ThreadPoolExecutor(8) as ex:
@@ -4104,11 +4157,35 @@ func runChecker(t *testing.T, spec LaunchSpec, cfg checkConfig, path string) map
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 输出边读边存：检查器每完成一项就输出一行 CHECK，挂起时已输出的部分指明它停在哪一项。
+	var outMu sync.Mutex
+	var outBuf []byte
 	outc := make(chan []byte, 1)
 	go func() {
-		b, _ := io.ReadAll(outR)
-		outc <- b
+		b := make([]byte, 4096)
+		for {
+			n, err := outR.Read(b)
+			outMu.Lock()
+			outBuf = append(outBuf, b[:n]...)
+			outMu.Unlock()
+			if err != nil {
+				break
+			}
+		}
+		outMu.Lock()
+		defer outMu.Unlock()
+		outc <- outBuf
 	}()
+	// 失败（包括等待消息超时）时在 init 被关闭之前（Cleanup 后注册先运行）记录检查器已输出的部分与沙箱内进程的状态。
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		outMu.Lock()
+		partial := string(outBuf)
+		outMu.Unlock()
+		t.Logf("检查器 %s 已输出：\n%s\n沙箱进程：\n%s", path, partial, s.procDump())
+	})
 	_, ex := expectAckExit(t, s, ch, "check")
 	var out []byte
 	select {
