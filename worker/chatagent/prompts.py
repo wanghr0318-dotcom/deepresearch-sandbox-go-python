@@ -75,13 +75,22 @@ def orchestrator_system(
     parts.append("## 工具\n" + tools)
     parts.append("## 会话状态\n" + session_summary(memory))
     if carry:
-        parts.append("## 上一轮被停止的研究的发现（可直接使用，不要重复搜索）\n" + carry)
+        parts.append(_CARRY_HEAD + carry)
     if cfg.deep_research:
         parts.append(
             "## 本轮要求\n用户打开了“深度研究”：本轮必须按 deep-research skill 研究"
             "（系统已为你读取 skill 正文，见对话中的 read_skill 结果）。"
         )
     return "\n\n".join(parts)
+
+
+_CARRY_HEAD = (
+    "## 上一轮被用户停止\n"
+    "上一轮在进行中被用户停止，本轮取代了它（它的问题不在上面的会话记忆中）。"
+    "若本条消息是在要求继续（如“继续”“接着”）或基于上一轮追问，就沿用上一轮的主题回答；"
+    "上一轮是研究时继续那项研究：沿用它的计划与已有来源，不要重复已完成的子主题，"
+    "也不要说没有之前的上下文。若本条消息是与之无关的新问题，忽略上一轮。\n\n"
+)
 
 
 def session_summary(memory: SessionMemory) -> str:
@@ -244,6 +253,81 @@ def answer_text(questions: list[dict[str, Any]], answers: list[Any]) -> str:
             said = str(a.get("choice", "")).strip()[:200] or "（未回答）"
         lines.append(f"{i}. {q.get('question', '')} → {said}")
     return "\n".join(lines)
+
+
+QUESTION_STORE_CHARS = 4000  # 状态中保存的本轮问题（字符）
+CARRY_QUESTION_CHARS = 1000  # carryover 中展示的上一轮问题（字符）
+
+
+def clip_text(text: str, n: int) -> str:
+    """去首尾空白后截到 ≤ n 个字符（保留原文的换行与括号）。"""
+    text = text.strip()
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def turn_question(state: TurnState) -> str:
+    """该 turn 的用户问题：状态中的 question；旧 checkpoint 没有时取自编排转录（第一次工具调用
+    之前的最后一条 user 消息，此前为会话历史）；都没有时为空串。"""
+    if state.question.strip():
+        return state.question
+    last = ""
+    for msg in state.messages:
+        if msg.get("role") == "tool" or (msg.get("role") == "assistant" and msg.get("tool_calls")):
+            break
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+            last = msg["content"]
+    return last
+
+
+def turn_stage(state: TurnState) -> str:
+    """停止时的阶段：规划 / 子主题研究 k/n / 撰写报告（与停止卡的计数一致）。"""
+    if state.phase == "reporting":
+        return "撰写报告（子主题研究已结束）"
+    total = sum(1 for i in state.todo if i.budget > 0)
+    if total == 0:
+        return "规划（尚未写出研究计划，也未开始子主题研究）"
+    done = sum(1 for s in state.subtopics.values() if s.status == "done")
+    return f"子主题研究（已完成 {done}/{total}）"
+
+
+def _embed(text: str) -> str:
+    """嵌入「」之间的问题：换行与连续空白合为一个空格、去掉「」，截到 CARRY_QUESTION_CHARS。"""
+    text = " ".join(text.replace("「", "").replace("」", "").split())
+    return clip_text(text, CARRY_QUESTION_CHARS)
+
+
+_PLAN_MARK = {"done": "已完成", "skipped": "已跳过", "failed": "失败"}
+
+
+def carryover_brief(state: TurnState) -> str:
+    """被取代 turn 的问题原文、停止时的阶段与研究计划（不经 [n] 改写，从不为空）。
+
+    该 turn 本身是接续（如"继续"）时，先给出它接续的原始问题，再给出它自己的消息。"""
+    question = _embed(turn_question(state))
+    original = _embed(state.carried_question)
+    said = f"「{question}」" if question else "（未记录）"
+    if original and original != question:
+        lines = [f"原始问题：「{original}」", f"上一轮用户的消息：{said}"]
+    else:
+        lines = [f"上一轮用户的问题：{said}"]
+    lines.append(f"停止时的阶段：{turn_stage(state)}")
+    if state.todo:
+        plan = []
+        for k, item in enumerate(state.todo, 1):
+            sub = state.subtopics.get(item.id)
+            mark = _PLAN_MARK.get(sub.status, "未完成") if sub is not None else "未开始"
+            plan.append(f"{k}. {item.title}（{mark}）")
+        lines.append("上一轮的研究计划：\n" + "\n".join(plan))
+    return "\n".join(lines)
+
+
+def carryover_text(brief: str | None, findings: str | None) -> str | None:
+    """系统提示中 carryover 一节的正文：问题与进度，以及（有时）已完成的发现与来源。"""
+    if not brief:
+        return None
+    if not findings:
+        return brief
+    return brief + "\n\n### 上一轮被停止的研究的发现（可直接使用，不要重复搜索）\n" + findings
 
 
 def carryover_lines(state: TurnState) -> str:

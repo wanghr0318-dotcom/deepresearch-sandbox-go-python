@@ -2,8 +2,9 @@
 构造 Result（成功时提议新的会话记忆）或 Paused（awaiting_input / 宿主暂停）。
 
 入口决策（resume_mode）：
-- fresh：无 resume，新建状态；有 carryover 时经 Gateway 读取被取代 turn 的 checkpoint，其发现进入
-  系统提示、来源并入本轮来源表（续编号，摘要中的 [n] 随之改写）；读不到或损坏时不带它继续。
+- fresh：无 resume，新建状态；有 carryover 时经 Gateway 读取被取代 turn 的 checkpoint，其问题、停止
+  时的阶段与发现进入系统提示、来源并入本轮来源表（续编号，摘要中的 [n] 随之改写）；读不到或损坏
+  时不带它继续。
 - continue：无 directive 的 resume（继续、崩溃恢复）：从 checkpoint 原处继续，额度沿用。
 - finish：directive finish_now；answer：directive answer{question_id, answers}。
 - restore：宿主把被取消 turn 的最新 checkpoint 复制为本 task 的种子（restored_from_task_id 仅用于
@@ -33,10 +34,19 @@ from agentbox_worker.tools.budget import TurnBudget
 from agentbox_worker.tools.skills import SkillCatalog, default_skills_root
 from agentbox_worker.tools.sources import Source, SourceStore
 from agentbox_worker.tools.text import renumber_citations, truncate_utf8
-from chatagent.config import parse_turn_config
+from chatagent.config import TurnConfig, parse_turn_config
 from chatagent.events import Emitter
 from chatagent.loop import Agent, LoopOutcome
-from chatagent.prompts import UNANSWERED_ON_RESTORE, carryover_lines, restore_instruction
+from chatagent.prompts import (
+    QUESTION_STORE_CHARS,
+    UNANSWERED_ON_RESTORE,
+    carryover_brief,
+    carryover_lines,
+    carryover_text,
+    clip_text,
+    restore_instruction,
+    turn_question,
+)
 from chatagent.state import SessionMemory, TurnRecord, TurnState
 
 SUMMARY_MAX_BYTES = 60 * 1024  # result.summary（协议上限 64 KiB，留余量）
@@ -123,13 +133,19 @@ def seed_restore(state: TurnState, budget_limit: int) -> TurnState:
 # ---- carryover（被取代 turn 的上下文，设计 D5） ----
 
 
-def carryover_context(carry: dict[str, Any] | None) -> tuple[str | None, list[Source]]:
-    """carry = {"task_id", "state"}（被取代 turn 最新 checkpoint 的内容）→ (发现文本, 来源)。
+def carryover_context(
+    carry: dict[str, Any] | None,
+) -> tuple[str | None, str | None, list[Source], str]:
+    """carry = {"task_id", "state"}（被取代 turn 最新 checkpoint 的内容）→ (简况, 发现, 来源,
+    原始问题)。
 
-    文本含已完成子主题的标题与摘要及来源列表，[n] 为该 turn 的编号（由 adopt_carryover 改写）；
-    来源为该 turn 的全部来源，其本轮来源的 origin 改为该 task_id。状态无法解析 → (None, [])。"""
+    简况含该 turn 的问题原文、停止时的阶段与研究计划，从不为空（不经引用改写）；发现含已完成
+    子主题的标题与摘要及来源列表，[n] 为该 turn 的编号（由 adopt_carryover 改写），无发现时为
+    None；来源为该 turn 的全部来源，其本轮来源的 origin 改为该 task_id；原始问题为该 turn 接续的
+    原始问题（它本身也是接续时），否则为它自己的问题。
+    无 carryover 或状态无法解析 → (None, None, [], "")。"""
     if not carry:
-        return None, []
+        return None, None, [], ""
     raw = carry.get("state")
     if isinstance(raw, dict) and "schema_version" not in raw and isinstance(raw.get("state"), dict):
         raw = raw["state"]  # checkpoint 信封 {"state": …}
@@ -140,13 +156,14 @@ def carryover_context(carry: dict[str, Any] | None) -> tuple[str | None, list[So
         state = TurnState.from_json(raw).merged_copy()  # type: ignore[arg-type]
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         _log(f"carryover 状态无法解析，本轮不带上一轮的发现：{exc}")
-        return None, []
+        return None, None, [], ""
     origin = str(carry.get("task_id") or "carryover")
     sources = [
         Source(s.n, s.sha256, s.url, s.title, s.excerpt, s.call_id, s.origin or origin)
         for s in state.sources.all()
     ]
-    return carryover_lines(state) or None, sources
+    original = state.carried_question or turn_question(state)
+    return carryover_brief(state), carryover_lines(state) or None, sources, original
 
 
 def adopt_carryover(store: SourceStore, text: str | None, sources: list[Source]) -> str | None:
@@ -185,20 +202,25 @@ def _resumed_state(ctx: TaskContext) -> TurnState:
 
 
 async def _state(
-    ctx: TaskContext, mode: str, tool_budget: int, memory: SessionMemory, gw: GatewayLike
+    ctx: TaskContext, mode: str, cfg: TurnConfig, memory: SessionMemory, gw: GatewayLike
 ) -> tuple[TurnState, str | None]:
     """本轮起点状态与 carryover 文本（只在 fresh 时；恢复后系统提示已在转录中）。"""
     if mode != "fresh":
         state = _resumed_state(ctx)
         if mode == "restore":
-            state = seed_restore(state, tool_budget)
+            state = seed_restore(state, cfg.tool_budget)
         state.task_id = ctx.task_id
         state.stop_findings = None
         return state, None
-    state = TurnState(budget=TurnBudget(limit=tool_budget), task_id=ctx.task_id)
+    state = TurnState(
+        budget=TurnBudget(limit=cfg.tool_budget),
+        task_id=ctx.task_id,
+        question=clip_text(cfg.text, QUESTION_STORE_CHARS),  # 被取代时随 carryover 带给下一轮
+    )
     state.sources.adopt(memory.sources)  # 既往来源续编号，可被 read_source 与本轮报告引用
-    text, sources = carryover_context(await _read_carryover(ctx, gw))
-    return state, adopt_carryover(state.sources, text, sources)
+    brief, findings, sources, original = carryover_context(await _read_carryover(ctx, gw))
+    state.carried_question = clip_text(original, QUESTION_STORE_CHARS)
+    return state, carryover_text(brief, adopt_carryover(state.sources, findings, sources))
 
 
 def _skills(root: Path | None) -> SkillCatalog:
@@ -244,7 +266,7 @@ def make_app(
         memory = _memory(ctx)
         gw = gateway(ctx) if gateway is not None else ctx.gateway
         try:
-            state, carry = await _state(ctx, mode, cfg.tool_budget, memory, gw)
+            state, carry = await _state(ctx, mode, cfg, memory, gw)
             emit = Emitter(ctx)
             agent = Agent(
                 ctx,

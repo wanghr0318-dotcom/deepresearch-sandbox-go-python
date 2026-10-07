@@ -1111,9 +1111,9 @@ def test_carryover_sources_and_summaries_are_available_to_new_turn():
 def test_corrupt_or_missing_carryover_is_ignored(blob: bytes | None):
     model, events, gw = run_with_carry(blob)
     system = model.bodies("orch")[0]["messages"][0]["content"]
-    assert "上一轮被停止的研究" not in system
+    assert "上一轮被停止的研究" not in system and "被用户停止" not in system
     assert result(events)["summary"]  # 正常完成
-    assert carryover_context(None) == (None, [])
+    assert carryover_context(None) == (None, None, [], "")
 
 
 def test_crash_after_tool_checkpoint_loses_at_most_the_in_flight_call():
@@ -1832,3 +1832,133 @@ def test_research_skill_mentions_run_python_for_report_figures():
     body = (SKILLS / "deep-research" / "SKILL.md").read_text(encoding="utf-8")
     section = body.split("## 8. 写报告", 1)[1].split("\n## ", 1)[0]
     assert "run_python" in section and "表" in section
+
+
+# ---- carryover 总带上上一轮的问题与进度（stop-fix F5） ----
+
+from agentbox_worker.tools.todo import TodoItem  # noqa: E402
+from chatagent.prompts import carryover_brief, orchestrator_system  # noqa: E402
+from chatagent.state import SubtopicState  # noqa: E402
+
+STOPPED_QUESTION = "2026 年固态电池的量产进展 [5] 与主要厂商对比"
+
+
+def _carry_of(state: TurnState) -> dict[str, Any]:
+    return {"task_id": "t-1", "state": state.to_json()}
+
+
+def test_carryover_from_planning_stop_has_question_and_planning_stage():
+    state = TurnState(task_id="t-1", phase="orchestrating", question=STOPPED_QUESTION)
+    brief, findings, sources, _ = carryover_context(_carry_of(state))
+    assert brief and STOPPED_QUESTION in brief  # 原文（[5] 不被引用改写删掉）
+    assert "规划" in brief
+    assert findings is None and sources == []
+
+
+def test_carryover_mid_subtopics_has_question_progress_and_summaries():
+    state = TurnState(task_id="t-1", phase="subtopic", route="research", question="固态电池现状")
+    state.todo = [
+        TodoItem.from_json(todo("1", "材料", 8)),
+        TodoItem.from_json(todo("2", "产业", 8)),
+        TodoItem.from_json(todo("3", "政策", 8)),
+    ]
+    state.subtopics = {
+        "1": SubtopicState(id="1", status="done", summary="硫化物路线领先"),
+        "2": SubtopicState(id="2", status="running"),
+    }
+    brief, findings, _, _ = carryover_context(_carry_of(state))
+    assert "固态电池现状" in brief and "1/3" in brief
+    assert "材料" in brief and "政策" in brief  # 计划清单可沿用
+    assert findings and "硫化物路线领先" in findings
+
+
+def test_carryover_from_old_checkpoint_without_question_still_works():
+    raw = TurnState(task_id="t-1", phase="orchestrating").to_json()
+    raw.pop("question")
+    brief, findings, _, _ = carryover_context({"task_id": "t-1", "state": raw})
+    assert brief and "规划" in brief  # 没有问题也不为空
+    # 旧 checkpoint 的转录中有问题时取自转录
+    raw["messages"] = [
+        {"role": "system", "content": "系统"},
+        {"role": "user", "content": "之前的问题"},
+        {"role": "assistant", "content": "之前的回答"},
+        {"role": "user", "content": "旧问题原文"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+        {"role": "tool", "tool_call_id": "c1", "name": "read_skill", "content": "…"},
+        {"role": "user", "content": "这是对之前被停止研究的恢复"},
+    ]
+    brief2, _, _, _ = carryover_context({"task_id": "t-1", "state": raw})
+    assert "旧问题原文" in brief2 and "之前的问题" not in brief2
+    assert carryover_brief(TurnState()) and "规划" in carryover_brief(TurnState())
+
+
+def test_orchestrator_prompt_with_carryover_says_previous_turn_was_stopped():
+    from agentbox_worker.tools import ToolRegistry
+    from agentbox_worker.tools.skills import SkillCatalog
+    from chatagent.state import SessionMemory
+
+    cfg = parse_turn_config({"text": "继续"})
+    system = orchestrator_system(
+        SkillCatalog.load(SKILLS), ToolRegistry([]), SessionMemory(), cfg, "上一轮用户的问题：「X」"
+    )
+    assert "被用户停止" in system and "继续" in system and "沿用上一轮的主题" in system
+    assert "上一轮用户的问题：「X」" in system
+
+
+def test_continue_message_after_planning_stop_sees_previous_question():
+    model = stoppable_model()
+    _, events, _ = run_turn(model, config=RESEARCH_CONFIG, host=pausing_host("orch", 1))
+    stopped = checkpoints(events)[-1]["state"]
+    assert stopped["question"] == "固态电池现状"
+    model2 = ScriptedModel(orch=[reply("好的，继续研究固态电池现状。")])
+    gw2 = make_gateway(model2)
+    ref = gw2.put_blob(json.dumps(stopped, ensure_ascii=False).encode())
+    host = SessionHost()
+    carry = {"task_id": "t-1", "checkpoint_ref": ref}
+    start_task(host, "t-2", "a-1", {"text": "继续"}, carryover=carry)
+    code, events2, _ = run_turn(model2, gw=gw2, host=host, start=False)
+    assert code == 0
+    first = model2.bodies("orch")[0]["messages"]
+    system = first[0]["content"]
+    assert "固态电池现状" in system and "规划" in system and "被用户停止" in system
+    assert first[-1] == {"role": "user", "content": "继续"}
+    assert result(events2)["summary"]
+
+
+def test_carryover_question_collapses_newlines_and_strips_corner_brackets():
+    state = TurnState(task_id="t-1", phase="orchestrating", question="第一行\n\n「第二行」")
+    brief = carryover_brief(state)
+    assert "「第一行 第二行」" in brief
+
+
+def _stop_in_planning(
+    model: ScriptedModel, task: str, text: str, carry: dict[str, Any] | None
+) -> tuple[dict[str, Any], ScriptedGateway]:
+    gw = make_gateway(model)
+    host = pausing_host("orch", 1)
+    fields: dict[str, Any] = {}
+    if carry is not None:
+        ref = gw.put_blob(json.dumps(carry["state"], ensure_ascii=False).encode())
+        fields["carryover"] = {"task_id": carry["task_id"], "checkpoint_ref": ref}
+    start_task(host, task, "a-1", {"text": text}, **fields)
+    code, events, _ = run_turn(model, gw=gw, host=host, start=False)
+    assert code == 0 and progress(events, "turn_stopped")
+    return {"task_id": task, "state": checkpoints(events)[-1]["state"]}, gw
+
+
+def test_double_stop_keeps_original_question_in_carryover():
+    plan = [call("read_skill", name="deep-research")]
+    first, _ = _stop_in_planning(ScriptedModel(orch=list(plan)), "t-1", "固态电池现状", None)
+    second, _ = _stop_in_planning(ScriptedModel(orch=list(plan)), "t-2", "继续", first)
+    assert second["state"]["carried_question"] == "固态电池现状"
+    model3 = ScriptedModel(orch=[reply("好的。")])
+    gw3 = make_gateway(model3)
+    ref = gw3.put_blob(json.dumps(second["state"], ensure_ascii=False).encode())
+    host = SessionHost()
+    carry = {"task_id": "t-2", "checkpoint_ref": ref}
+    start_task(host, "t-3", "a-1", {"text": "继续"}, carryover=carry)
+    code, _, _ = run_turn(model3, gw=gw3, host=host, start=False)
+    assert code == 0
+    system = model3.bodies("orch")[0]["messages"][0]["content"]
+    assert "原始问题：「固态电池现状」" in system
+    assert "上一轮用户的消息：「继续」" in system
