@@ -1,6 +1,6 @@
 # Plan 4 设计：PostgreSQL 持久化与 BlobStore（M1 第 1 批）
 
-> 依据：[v0.2 规格](2026-10-03-v0.2-first-release-design.md) §3、§6、§7、§14.1、§14.5；[代码组织设计](2026-10-03-code-organization.md) §2–§4、§9；[计划索引](../plans/2026-10-03-m1-index.md) 中 Plan 4 一行。
+> 依据：[v0.2 规格](2026-10-03-v0.2-first-release-design.md) §3、§6、§7、§14.1、§14.5；[代码组织设计](2026-10-03-code-organization.md) §2–§4、§9；[计划索引](https://github.com/wanghr0318-dotcom/go-agentbox/blob/m4-gate/docs/plans/2026-10-03-m1-index.md) 中 Plan 4 一行。
 > 状态：实现前设计，已经两轮评审，结论已并入。本文档不代表存储代码已经开始实现。
 
 ## 1. 包、依赖方向与职责

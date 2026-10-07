@@ -14,8 +14,5 @@ linters:
     - unused
 
 issues:
-  # experiments/ 是一次性实验的原始记录（Plan 1B spike 的证据），保持实验时的原样，不作为产品代码检查。
-  exclude-dirs:
-    - experiments
   max-issues-per-linter: 0
   max-same-issues: 0

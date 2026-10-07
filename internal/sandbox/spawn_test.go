@@ -3422,7 +3422,7 @@ func TestParseStatStateFlags(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // Task 12（12b）：cgo 守卫（规格 §4.6 实现门槛 3）与 §16.2 生产验收。
-// 检查器是本测试二进制的 isolation-check 子命令（移植自 experiments/spike-1b/check.go）：复制进沙箱后，经生产启动
+// 检查器是本测试二进制的 isolation-check 子命令（移植自 Plan 1B spike 的 check.go，见 docs/experiments/2026-10-05-spike-1b.md）：复制进沙箱后，经生产启动
 // 路径——专用启动进程（RunLaunch）→ init（RunInit：命名空间、挂载、pivot_root、init 能力集）→ 生产 Launcher
 // （rawfork + execveat）→ stage-2 helper（降权、seccomp）→ execve——作为 workload 运行，在 workload 内核验并逐项输出
 // `CHECK <名称> PASS|FAIL <细节>`；宿主侧按 §16.2 条目汇总，每个条目一个子测试。
