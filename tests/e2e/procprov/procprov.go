@@ -42,7 +42,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
 
 // MarkerEnv 是执行树的标记环境变量。

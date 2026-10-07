@@ -17,8 +17,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/protocol"
 )
 
 // ReloadInterval 是 actor 周期重新读取会话事实的间隔：没有通知的变化（另一 turn 的控制应用清除了阻塞、turn 终态

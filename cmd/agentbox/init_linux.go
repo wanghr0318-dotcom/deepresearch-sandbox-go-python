@@ -8,9 +8,9 @@ import (
 	"io"
 	"path/filepath"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/datadir"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/cache"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/sandbox"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/datadir"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/cache"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/sandbox"
 )
 
 func runSandboxInit() error { return sandbox.RunInit() }

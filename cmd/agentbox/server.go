@@ -19,17 +19,17 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/admission"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/app"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/call"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/hostcheck"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence/postgres"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider/local"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/rootfs"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/subrun"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/admission"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/app"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/hostcheck"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence/postgres"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/local"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/rootfs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/subrun"
 )
 
 const (

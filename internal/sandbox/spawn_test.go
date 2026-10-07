@@ -26,8 +26,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/rootfs"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/testutil"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/rootfs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/testutil"
 )
 
 // TestMain 让这个测试二进制在被以 "init" 或 "sandbox-launch" re-exec 时，表现得

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/wanghr0318-dotcom/go-agentbox/protocol/v1/event.schema.json",
+  "$id": "https://github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/protocol/v1/event.schema.json",
   "title": "Worker → 宿主事件（task 模式）",
   "oneOf": [
     {"$ref": "#/$defs/ready"},

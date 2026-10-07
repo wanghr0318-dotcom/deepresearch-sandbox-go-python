@@ -21,11 +21,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/cgroup"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider/providertest"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/rootfs"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/sandbox"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/cgroup"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/providertest"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/rootfs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/sandbox"
 )
 
 // ---------------------------------------------------------------------------

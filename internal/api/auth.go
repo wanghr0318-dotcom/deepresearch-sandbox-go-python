@@ -11,9 +11,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/account"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/jcs"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/account"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 )
 
 // SessionCookie 是用户会话 cookie 的名称（值为会话 ID 明文；库中只存其 sha256）。

@@ -1,137 +1,137 @@
-# go-agentbox
+# 沙箱化深度研究助手（Go + Python）
 
-**A chat-style DeepResearch assistant running on a self-built agent runtime.** Go owns execution and every security boundary. Python owns the research logic.
+**运行在自研 Agent Runtime 上的对话式 DeepResearch 助手。** Go 负责执行与全部安全边界，Python 负责研究逻辑。
 
-[中文说明](README.zh-CN.md) · [Usage and operations reference (中文)](docs/usage.zh-CN.md) · [Design spec (中文)](docs/design/2026-10-03-v0.2-first-release-design.md)
+[English](README.en.md) · [使用与运维参考](docs/usage.zh-CN.md) · [设计规格](docs/design/2026-10-03-v0.2-first-release-design.md)
 
-A user asks a question in a chat UI. The agent either answers directly or starts a deep research turn:
+用户在对话界面中提问，Agent 直接回答，或开始一轮深度研究：
 
-1. It reads its research skill.
-2. If the scope is unclear, it asks up to three multiple-choice questions.
-3. It writes a todo list.
-4. It researches 2–4 sub-topics in parallel.
-5. It writes a report with numbered citations to the pages it actually read.
+1. 读取研究 skill。
+2. 范围不明确时，问至多 3 个选择题。
+3. 写待办清单。
+4. 并行研究 2–4 个子主题。
+5. 写出带编号引用的报告，引用只指向本轮实际读过的网页。
 
-The user can stop at any point, see a short summary of what was found, and then continue, have the report written from what exists so far, or restore a cancelled turn later.
+用户随时可以停止，看到"目前发现"的简短摘要，然后选择继续、立即用已有资料写报告，或之后恢复被取消的一轮。
 
-Underneath is the part this project is really about: a single-host **agent runtime** that runs untrusted-ish agent code in Linux sandboxes. It survives crashes and restarts without losing committed work, and it keeps API keys out of the sandbox entirely.
+这个项目真正的重点在下面一层：单主机的 **Agent Runtime**，在 Linux 沙箱中运行 Agent 代码。崩溃和重启不会丢失已提交的进度，API Key 完全不进入沙箱。
 
-## Architecture
+## 架构
 
 ```
-Browser (Vue 3) / CLI ── REST + SSE ──► Go control plane
-                                         ├─ task & session state machines, admission, scheduling
-                                         ├─ checkpoints, crash recovery, event replay (Last-Event-ID)
-                                         ├─ Gateway: credential isolation, call journal, budgets,
-                                         │           per-turn tool quota, SSRF-safe egress, exec scheduling
-                                         ├─ PostgreSQL (only source of truth)   Redis (cache only)
-                                         └─ Sandbox: user/pid/mount/net namespaces, mapped UIDs,
-                                            read-only rootfs, seccomp, capabilities {KILL}, cgroup v2
-                                                   │
-                         ┌─────────────────────────┴─────────────────────────┐
-              Orchestration sandbox: Python agent                 Exec sandbox: model-written Python
-              (talks to the Gateway over a Unix socket)           (no network, no Gateway, one-shot)
+浏览器（Vue 3）/ CLI ── REST + SSE ──► Go 控制面
+                                        ├─ 任务与会话状态机、准入、调度
+                                        ├─ checkpoint、崩溃恢复、事件续传（Last-Event-ID）
+                                        ├─ Gateway：凭据隔离、调用 journal、预算、每轮工具额度、
+                                        │           防 SSRF 的出网、exec 调度
+                                        ├─ PostgreSQL（唯一事实来源）   Redis（只做缓存）
+                                        └─ 沙箱：user/pid/mount/net 命名空间、映射 UID、
+                                           只读 rootfs、seccomp、能力集 {KILL}、cgroup v2
+                                                  │
+                        ┌─────────────────────────┴─────────────────────────┐
+             编排沙箱：Python Agent                               exec 沙箱：模型生成的 Python
+             （经 Unix socket 访问 Gateway）                      （无网络、无 Gateway、单次）
 ```
 
-## What it does
+## 实现了什么
 
-| Area | What is implemented |
+| 方面 | 内容 |
 |---|---|
-| **Crash-safe execution** | Workers commit checkpoints to the host. A killed worker, a killed server or a lost database connection resumes from the last committed checkpoint. `agentbox verify-invariants` checks the stored state against 16 invariants; a fault-injection mode drives the crash paths in tests. |
-| **Credential isolation** | Model and search API keys live only in the host process. The sandbox reaches providers through a per-attempt Unix-socket Gateway that journals every call, enforces budgets and can revoke access mid-call. The research demo (`scripts/demo-m2.sh`) reads `/proc/<pid>/environ` and the command line of every sandbox process to show that no key is visible. |
-| **Sandbox** | Namespaces, mapped UID ranges with reuse checks, a read-only rootfs template, seccomp, capability set `{KILL}`, and cgroup v2 limits for memory, pids and CPU. Execution trees are confirmed empty before cleanup. |
-| **Sessions** | Each chat session is one long-lived sandbox process. It is frozen after 10 idle minutes (cgroup freezer), evicted after 1 hour, and restored on the next message from its last committed session checkpoint. |
-| **Agent** | A tool-calling agent with progressive-disclosure skills (`read_skill`), `ask_user`, a todo list, `web_search`, `web_fetch` and `run_python`. Each turn gets 30 search and fetch calls, enforced by the Gateway rather than the model. |
-| **Parallel sub-runs** | 2–4 sub-topics run concurrently inside one turn under a two-level ledger (task and sub-run). They can be cancelled, and they resume after stop or crash without re-running finished sub-topics. |
-| **Exec sandbox** | Model-written Python runs in a fresh, network-less environment per call, with separate UIDs, CPU and wall quotas and output collection. |
-| **Product** | Accounts (PBKDF2, `HttpOnly` sessions, rate-limited login), per-user isolation (other users' data always returns 404), server-side redaction of costs, models and internal IDs, a CSP and sanitized Markdown rendering. |
+| **崩溃安全的执行** | Worker 向宿主提交 checkpoint；Worker 被杀、server 被杀或数据库断连后，从最后一个已提交的 checkpoint 恢复。`agentbox verify-invariants` 按 16 条不变量核对存储状态；故障注入模式在测试中驱动各崩溃路径。 |
+| **凭据隔离** | 模型与搜索 Key 只在宿主进程内。沙箱经每个 attempt 独立的 Unix socket Gateway 访问供应商；Gateway 记录每次调用、执行预算，并可在调用中途撤销访问。研究演示（`scripts/demo-m2.sh`）读取沙箱内每个进程的 `/proc/<pid>/environ` 与命令行，确认看不到任何 Key。 |
+| **沙箱** | 命名空间、带回收检查的映射 UID 范围、只读 rootfs 模板、seccomp、能力集 `{KILL}`，以及 cgroup v2 的内存、进程数与 CPU 限额；执行树确认清空后才清理。 |
+| **会话** | 每个对话是一个长期运行的沙箱进程：空闲 10 分钟冻结（cgroup freezer），1 小时后驱逐，下一条消息从最后提交的会话 checkpoint 恢复。 |
+| **Agent** | 工具调用式 Agent：渐进披露的 skill（`read_skill`）、`ask_user`、待办清单、`web_search`、`web_fetch`、`run_python`。每轮 30 次搜索与抓取，由 Gateway 强制，不靠模型自觉。 |
+| **并行 sub-run** | 同一轮内 2–4 个子主题并发执行，采用两层账本（task 与 sub-run）；可以取消，停止或崩溃后继续时，已完成的子主题不会重跑。 |
+| **exec 沙箱** | 模型写的 Python 每次在全新、无网络的环境中运行，有独立 UID、CPU 与墙钟配额，并收集输出文件。 |
+| **产品层** | 账号（PBKDF2、`HttpOnly` 会话、登录限速）；用户隔离（他人的数据一律 404）；费用、模型与内部 ID 在服务端脱敏；CSP 与 Markdown 安全渲染。 |
 
-## Evidence
+## 证据
 
-All numbers come from recorded runs. The evidence files say exactly what each run did and did not show.
+所有数字都来自有记录的运行，证据文件写明每次运行证明了什么、没有证明什么。
 
-- **Tests:**
-  - about 700 Go test functions, including real-sandbox end-to-end tests run as root;
-  - about 280 Python tests;
-  - about 170 web component tests.
-- **CI (6 jobs):**
-  - non-root suite with `-race`;
-  - root suite in real sandboxes on `ubuntu-24.04`;
-  - Python 3.11 and 3.13;
-  - web lint, typecheck and tests;
-  - lint and a complexity report.
-- **Real acceptance** on a 4 vCPU / 8 GiB Linux VM (Tencent Cloud, Shanghai) with real models (Moonshot `kimi-k3` lead, `kimi-k2.6` workers) and Google results via Serper: [chat assistant](docs/evidence/2026-10-06-m4-chat-acceptance.md), [exec sandbox](docs/evidence/2026-10-06-m4-exec-hardening.md), [accounts](docs/evidence/2026-10-06-m3-accounts.md), [backup and restore](docs/evidence/2026-10-06-backup-restore.md).
-- **Serial vs. parallel research** ([record](docs/evidence/2026-10-06-m4-subrun-comparison.md)). Small sample, N = 4 per mode:
+- **测试：**
+  - 约 700 个 Go 测试函数，含以 root 在真实沙箱中运行的端到端测试；
+  - 约 280 个 Python 测试；
+  - 约 170 个 Web 组件测试。
+- **CI（6 个作业）：**
+  - 非 root 全量（`-race`）；
+  - 在 `ubuntu-24.04` 上以 root 在真实沙箱中运行的全量；
+  - Python 3.11 与 3.13；
+  - Web 的 lint、类型检查与测试；
+  - lint 与复杂度报告。
+- **真实验收**：在 4 vCPU / 8 GiB 的 Linux 云主机（腾讯云上海）上，使用真实模型（Moonshot：`kimi-k3` 主导、`kimi-k2.6` 执行）与经 Serper 的 Google 搜索结果。记录：[对话助手](docs/evidence/2026-10-06-m4-chat-acceptance.md)、[exec 沙箱](docs/evidence/2026-10-06-m4-exec-hardening.md)、[账号](docs/evidence/2026-10-06-m3-accounts.md)、[备份与恢复](docs/evidence/2026-10-06-backup-restore.md)。
+- **串行与并行研究对比**（[记录](docs/evidence/2026-10-06-m4-subrun-comparison.md)）。小样本，每组 N = 4：
 
-  | | Serial | Parallel |
+  | | 串行 | 并行 |
   |---|---|---|
-  | Median wall time | 302 s | 184 s |
-  | Median cost per run | 0.48 USD | 0.50 USD |
-  | Failures | 0 | 0 |
-  | Locatable citations | 100% | 100% |
+  | 墙钟时间中位数 | 302 s | 184 s |
+  | 每次费用中位数 | 0.48 USD | 0.50 USD |
+  | 失败 | 0 | 0 |
+  | 可定位的引用 | 100% | 100% |
 
-## Quick start
+## 快速开始
 
-Requirements: Linux with cgroup v2 (or WSL2), Go 1.24+, Python 3.11+ with [uv](https://docs.astral.sh/uv/), Docker for PostgreSQL, and Node.js 24 for the web UI.
+依赖：Linux（cgroup v2）或 WSL2、Go 1.24+、Python 3.11+ 与 [uv](https://docs.astral.sh/uv/)、Docker（运行 PostgreSQL）、Node.js 24（Web 界面）。
 
 ```bash
-# Unit tests (no database; tests that need root are skipped)
+# 单元测试（不需要数据库；需要 root 的用例会跳过）
 go vet ./...
 go test ./...
 
-# Database-backed tests
+# 依赖数据库的测试
 docker compose -f deploy/docker-compose.yml up -d --wait
 export AGENTBOX_TEST_DATABASE_URL='postgres://agentbox:agentbox@127.0.0.1:5432/agentbox?sslmode=disable'
 CI=true go test -count=1 ./internal/persistence/postgres/ ./tests/e2e/...
 
-# Python worker SDK and agent
+# Python Worker SDK 与 Agent
 (cd worker && uv run pytest -q)
 
-# Web UI
+# Web 界面
 (cd web && npm ci && npm test && npm run build)
 ```
 
-**Real-sandbox demo.** `sudo bash scripts/demo-m1.sh` runs the whole chain on a fresh data directory, as root:
+**真实沙箱演示**：`sudo bash scripts/demo-m1.sh` 以 root 在全新的数据目录上跑完整条链路：
 
-1. submit a task;
-2. checkpoint;
-3. kill the worker and recover;
-4. produce the result;
-5. SIGKILL the server and restart-recover;
-6. check invariants and leaks.
+1. 提交任务；
+2. 写 checkpoint；
+3. 杀死 Worker 后恢复；
+4. 输出结果；
+5. SIGKILL server 后重启恢复；
+6. 检查不变量与泄漏。
 
-[Recorded output](docs/evidence/2026-10-05-m1-demo-run.md).
+[运行记录](docs/evidence/2026-10-05-m1-demo-run.md)。
 
-**Running the full assistant** (sandbox, Gateway, real models, chat UI) takes a model key and a search key. Step-by-step commands and every server flag are in the [usage reference](docs/usage.zh-CN.md). [`deploy/systemd/agentbox-demo.service.example`](deploy/systemd/agentbox-demo.service.example) is a template of the unit the demo server runs (copy it to `/etc/systemd/system/` and set `AGENTBOX_PUBLIC_HOST` in `/etc/agentbox/agentbox.env`).
+**运行完整助手**（沙箱、Gateway、真实模型、对话界面）需要一个模型 Key 和一个搜索 Key。逐步命令与全部 server 标志见[使用参考](docs/usage.zh-CN.md)；演示服务器所用 unit 的模板是 [`deploy/systemd/agentbox-demo.service.example`](deploy/systemd/agentbox-demo.service.example)（复制到 `/etc/systemd/system/`，并在 `/etc/agentbox/agentbox.env` 中设置 `AGENTBOX_PUBLIC_HOST`）。
 
-## Repository layout
+## 目录
 
-| Path | Contents |
+| 路径 | 内容 |
 |---|---|
-| `cmd/agentbox` | Single binary: `server`, `doctor`, `task …`, `user …`, `verify-invariants` |
-| `internal/sandbox`, `provider/local`, `cgroup`, `rootfs`, `hostcheck` | Sandbox launcher, init, environment lifecycle, host self-check |
-| `internal/task`, `runner`, `session`, `subrun`, `admission`, `resource` | Control plane: actors, attempts, sessions, sub-runs, admission |
-| `internal/gateway/{edge,call,upstream,cache}` | Gateway: per-attempt socket, call journal and ledger, provider adapters, Redis cache |
-| `internal/persistence/postgres`, `blob`, `recovery`, `reconcile`, `invariants` | Storage, content-addressed blobs, startup recovery, invariant checker |
-| `internal/api`, `account` | REST/SSE API ([OpenAPI](api/openapi.yaml)), accounts |
-| `protocol/` | Versioned Go ↔ Python worker protocol and shared fixtures |
-| `worker/` | Python worker SDK, `chatagent`, tools, the `deep-research` skill |
-| `web/` | Vue 3 + TypeScript chat UI and operator workbench |
-| `tests/e2e` | End-to-end tests (process provider and real sandbox) |
-| `docs/` | [Design](docs/design/), [evidence](docs/evidence/), [usage](docs/usage.zh-CN.md) |
+| `cmd/agentbox` | 单一二进制：`server`、`doctor`、`task …`、`user …`、`verify-invariants` |
+| `internal/sandbox`、`provider/local`、`cgroup`、`rootfs`、`hostcheck` | 沙箱启动器、init、环境生命周期、宿主自检 |
+| `internal/task`、`runner`、`session`、`subrun`、`admission`、`resource` | 控制面：actor、attempt、会话、sub-run、准入 |
+| `internal/gateway/{edge,call,upstream,cache}` | Gateway：每 attempt 的 socket、调用 journal 与账本、供应商 adapter、Redis 缓存 |
+| `internal/persistence/postgres`、`blob`、`recovery`、`reconcile`、`invariants` | 存储、内容寻址的 blob、启动恢复、不变量检查 |
+| `internal/api`、`account` | REST/SSE API（[OpenAPI](api/openapi.yaml)）、账号 |
+| `protocol/` | 版本化的 Go ↔ Python Worker 协议与共享 fixtures |
+| `worker/` | Python Worker SDK、`chatagent`、工具、`deep-research` skill |
+| `web/` | Vue 3 + TypeScript 的对话界面与运维工作台 |
+| `tests/e2e` | 端到端测试（进程型 provider 与真实沙箱） |
+| `docs/` | [设计](docs/design/)、[证据](docs/evidence/)、[使用参考](docs/usage.zh-CN.md) |
 
-## Limits
+## 能力边界
 
-These are stated in the design and not hidden:
+以下边界在设计中写明，不加掩饰：
 
-- **Container-level isolation on a shared kernel.** The privilege-boundary tests are regression tests, not a proof of no escape. Don't rely on this to contain hostile multi-tenant code.
-- **Single execution host.** There is no cross-host failover.
-- **No exactly-once.** External calls are not exactly-once. Unknown outcomes are charged conservatively, and budgets can overshoot slightly.
-- **Workspace not rolled back.** The workspace is not rolled back with checkpoints.
+- **容器级隔离，共享宿主内核。** 权限边界测试是回归测试，不是无逃逸证明；不应依赖它隔离恶意的多租户代码。
+- **单执行主机。** 没有跨主机故障接管。
+- **不保证 exactly-once。** 外部调用不保证 exactly-once；结果未知时按保守方式计费，预算可能略有超出。
+- **Workspace 不回滚。** workspace 不随 checkpoint 回滚。
 
-## Acknowledgements
+## 致谢
 
-Designs studied, code written from scratch: [runc](https://github.com/opencontainers/runc) (re-exec init, privilege drop, `/proc` masking), [Tencent Cloud CubeSandbox](https://github.com/tencentcloud/CubeSandbox) (agent sandbox surface), E2B (in-sandbox daemon semantics). The research flow draws on gpt-researcher, dzhng/deep-research and Anthropic's write-up on multi-agent research.
+参考其设计，代码自行实现：[runc](https://github.com/opencontainers/runc)（re-exec init、降权、`/proc` 掩蔽）、[Tencent Cloud CubeSandbox](https://github.com/tencentcloud/CubeSandbox)（Agent 沙箱能力面）、E2B（沙箱内 daemon 语义）。研究流程参考 gpt-researcher、dzhng/deep-research 与 Anthropic 关于多 Agent 研究系统的文章。
 
 ## License
 

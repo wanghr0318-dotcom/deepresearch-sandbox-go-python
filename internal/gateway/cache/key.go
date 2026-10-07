@@ -14,8 +14,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/jcs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
 )
 
 // FetchAcceptEncoding 是 Gateway 抓取时固定发送的 Accept-Encoding；它计入抓取的缓存键（§11.3）。

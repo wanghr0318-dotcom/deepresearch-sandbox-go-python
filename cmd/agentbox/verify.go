@@ -17,14 +17,14 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/blob"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/cgroup"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/datadir"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/invariants"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/persistence/postgres"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider/local"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/sandbox"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/blob"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/cgroup"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/datadir"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/invariants"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence/postgres"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/local"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/sandbox"
 )
 
 // scanOnlyStarter 是只供扫描的 provider/local 的启动器：local.New 要求非空的 EnvStarter，而 Scan 不使用它。

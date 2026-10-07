@@ -11,7 +11,7 @@
 # M4：对话式助手（会话 Worker = python3 -m chatagent，每个 turn 30 次搜索/抓取额度，空闲 10 分钟冻结、1 小时驱逐）；
 # 独立 exec 沙箱只开 2 个 slot（exec 内存 = 2 × 1 GiB，不计入 4 GiB 任务池；对话 Agent 目前不调用 run_python）。
 [Unit]
-Description=go-agentbox server (demo, HTTPS)
+Description=Sandboxed DeepResearch Assistant server (demo, HTTPS)
 After=network-online.target postgresql.service redis-server.service
 Wants=network-online.target
 

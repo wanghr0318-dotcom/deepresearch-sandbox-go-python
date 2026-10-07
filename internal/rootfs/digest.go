@@ -10,7 +10,7 @@ import (
 	"os"
 	"sort"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/jcs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
 )
 
 // TemplateDigest 是 exec 模板的摘要（Plan 15 D5，规格 §10.1 指纹中的 image_digest）：

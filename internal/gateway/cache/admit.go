@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
 )
 
 // MaxCacheableBytes 是可缓存响应的大小上限（§19：2 MiB）。

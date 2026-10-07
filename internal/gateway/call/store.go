@@ -8,7 +8,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/subrun"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/subrun"
 )
 
 // AccessFacts 是规格 §9.2 访问检查所需的事实，在一致快照中读取。

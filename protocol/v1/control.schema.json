@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/wanghr0318-dotcom/go-agentbox/protocol/v1/control.schema.json",
+  "$id": "https://github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/protocol/v1/control.schema.json",
   "title": "宿主 → Worker 控制消息（init 除外）",
   "oneOf": [
     {"$ref": "#/$defs/checkpoint_result"},

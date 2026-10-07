@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
 
 // 本文件实现 OpenOutputs（Plan 15 Task 2、规格 §10.2）：在 exec 环境停止后，按规格 §5.6 的打开规则收集

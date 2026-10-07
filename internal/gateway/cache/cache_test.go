@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
 )
 
 // Redis 往返用例使用真实 Redis：本地由 deploy/docker-compose.yml 提供，CI 由 Redis service 容器提供。

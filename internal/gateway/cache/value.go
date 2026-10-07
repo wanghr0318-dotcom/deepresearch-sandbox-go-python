@@ -11,7 +11,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/jcs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
 )
 
 // MaxSealedBytes 是编码后缓存值的大小上限（§11.3、§19：4 KiB）。

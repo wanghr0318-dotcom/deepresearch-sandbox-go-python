@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
 
 // Program 是一次执行的行为。它必须在 ctx 结束时尽快返回（Terminate 与 Stop 通过取消 ctx 终止执行）。

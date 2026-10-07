@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
 
 // Harness 由各实现提供：构造 provider、spec 与两个程序，以及注入残留、外来资源与"启动在途"的手段。

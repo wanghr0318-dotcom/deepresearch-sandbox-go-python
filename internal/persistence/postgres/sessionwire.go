@@ -10,7 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/api"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
 )
 
 // Sessions 以 api.Sessions 接口返回会话 API 用例（装配以接口持有，不导入本包）。

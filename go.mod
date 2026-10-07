@@ -1,4 +1,4 @@
-module github.com/wanghr0318-dotcom/go-agentbox
+module github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python
 
 go 1.24.0
 

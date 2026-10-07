@@ -13,7 +13,7 @@ import (
 	"testing"
 )
 
-const module = "github.com/wanghr0318-dotcom/go-agentbox"
+const module = "github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python"
 
 // deps 返回包的全部传递依赖（含自身），以 GOOS=linux 计算。
 func deps(t *testing.T, pkg string) []string {

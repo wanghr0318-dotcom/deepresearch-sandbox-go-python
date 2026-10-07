@@ -1,10 +1,10 @@
 # 用户账号体系：面向用户的 DeepResearch 助手
 
-> 日期：2026-10-06。状态：设计已批准（项目负责人，2026-10-06）。顺序：M3 门槛 → 本设计的实施（M3 Plan 11）→ 仓库整合（[整合设计](https://github.com/wanghr0318-dotcom/go-agentbox/blob/m4-gate/docs/superpowers/specs/2026-10-06-repo-consolidation-design.md)）。
+> 日期：2026-10-06。状态：设计已批准（项目负责人，2026-10-06）。顺序：M3 门槛 → 本设计的实施（M3 Plan 11）→ 仓库整合（[整合设计](https://github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/blob/m4-gate/docs/superpowers/specs/2026-10-06-repo-consolidation-design.md)）。
 
 ## 目标
 
-对用户而言，go-agentbox 是一个 **DeepResearch 助手**：注册、登录、输入研究主题、观看进度、阅读与下载报告。模型与搜索的用量由项目负责人的 Key 承担；用户看不到 API Key、token、预算或调用内部细节。现有工作台保留为**运维后台**。
+对用户而言，沙箱化深度研究助手是一个 **DeepResearch 助手**：注册、登录、输入研究主题、观看进度、阅读与下载报告。模型与搜索的用量由项目负责人的 Key 承担；用户看不到 API Key、token、预算或调用内部细节。现有工作台保留为**运维后台**。
 
 不做：按用户的用量配额（项目负责人明确不做）、密码找回、邮件/短信验证、第三方登录。
 

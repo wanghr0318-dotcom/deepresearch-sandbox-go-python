@@ -6,8 +6,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/protocol"
-	"github.com/wanghr0318-dotcom/go-agentbox/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/protocol"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
 
 // 本文件是规格 §5.8（宿主裁决）与 §14.3（故障分类）的唯一实现：把一次 attempt 的结束事实映射为
