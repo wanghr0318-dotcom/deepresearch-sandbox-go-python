@@ -2077,15 +2077,28 @@ def test_finish_now_after_stop_during_orch_call_uses_a_fresh_call_id():
 
 
 def test_pause_after_model_reply_starts_no_tool_call_and_continue_replays():
-    # 模型调用返回之前宿主已请求暂停：不再开始工具调用，也不发出没有结果的 tool_call 事件
-    blocker = Blocker()
-    blocker.release()  # 不阻塞：送出 pause 之后立即返回
-    model = ScriptedModel(
-        orch=[blocker.block(call("web_fetch", url="https://a.example/1")), reply("答案 [1]")]
-    )
-    code, events, gw = run_turn(
-        model, config=ANSWER_CONFIG, host=SessionHost(on_event=blocker.hook)
-    )
+    # 模型调用的结果与暂停请求同时到达（结果优先被采用），之后不再开始工具调用，也不发出没有
+    # 结果的 tool_call 事件。确定性：暂停在结果交付之前、同一线程中排入事件循环，直接交给 ctx
+    # （不经宿主转发的跳数），再由宿主照常送出一次（迟到的 pause 被忽略）
+    seen: dict[str, Any] = {}
+
+    def pausing(body: dict[str, Any]) -> dict[str, Any]:
+        loop, ctx = seen["loop"], seen["ctx"]
+        loop.call_soon_threadsafe(ctx._handle_control, pause_message("a-1"))
+        loop.call_soon_threadsafe(seen["host"].send, pause_message("a-1"))
+        return call("web_fetch", url="https://a.example/1")
+
+    model = ScriptedModel(orch=[pausing, reply("答案 [1]")])
+    gw = make_gateway(model)
+    host = SessionHost()
+    start_task(host, "t-1", "a-1", ANSWER_CONFIG)
+
+    def factory(ctx: Any) -> ScriptedGateway:
+        gw.call_ids = ctx.call_ids
+        seen.update(loop=asyncio.get_running_loop(), ctx=ctx, host=host)
+        return gw
+
+    code, events = host.run(make_app(gateway=factory, skills_root=SKILLS), timeout=20)
     assert code == 0, errors(events)
     assert progress(events, "turn_stopped")
     started_calls = {e["data"]["tool_call_id"] for e in progress(events, "tool_call")}
