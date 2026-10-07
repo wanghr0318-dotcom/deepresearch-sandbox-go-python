@@ -11,7 +11,8 @@
 //   - ask_user：没有 answer 指令时提交 checkpoint 后发 awaiting_input，收到 directive.answer 后完成；
 //   - exit_when_idle：释放之后退出（E28：会话 idle 时 Worker 死亡）。
 //
-// 其余选项：sleep_ms=N（每次搜索之后等待）、hold_ms=N（结果之前等待，只在没有 resume 的 attempt 中；期间响应 pause/cancel）。
+// 其余选项：sleep_ms=N（每次搜索之后等待）、hold_ms=N（结果之前等待，只在没有 resume 的 attempt 中；期间响应 pause/cancel）、
+// progress=1（搜索之后发出计划、已完成子主题与抓取来源的进度）、ignore_pause=1（hold 期间不响应 pause，直到 grace 到期被终止）。
 //
 // 每个 turn 把计数写入 /workspace/session/note.txt，并在 /workspace/.sw/log.jsonl 追加观察记录（恢复时读到的状态与
 // 文件、恢复期间连接 Gateway 是否被拒、收到的 task_start 字段、每次搜索的状态码与额度头），供测试读取。
@@ -347,6 +348,9 @@ type opts struct {
 	script, stateMode string
 	searches          int
 	sleepMs, holdMs   int
+	// progress=1：搜索之后发出计划、一个已完成的子主题与一个已登记为来源的抓取（与 chatagent 同形的 progress）。
+	// ignore_pause=1：hold 期间收到 pause 不响应（模拟正在等模型调用的 Worker），直到 grace 到期被宿主终止。
+	progress, ignorePause bool
 }
 
 func (w *worker) turnOpts(cfg json.RawMessage) opts {
@@ -372,6 +376,10 @@ func (w *worker) turnOpts(cfg json.RawMessage) opts {
 			o.sleepMs = n
 		case "hold_ms":
 			o.holdMs = n
+		case "progress":
+			o.progress = n == 1
+		case "ignore_pause":
+			o.ignorePause = n == 1
 		}
 	}
 	return o
@@ -438,8 +446,17 @@ func (w *worker) task(ts *protocol.TaskStart) error {
 		}
 		w.poll()
 	}
+	if o.progress && w.ctrl == "" {
+		if err := w.researchProgress(ts.TaskID, att); err != nil {
+			return err
+		}
+	}
 	if w.ctrl == "" && o.holdMs > 0 && ts.Resume == nil {
-		w.sleep(time.Duration(o.holdMs) * time.Millisecond)
+		if o.ignorePause {
+			w.holdIgnoringPause(ts.TaskID, att, time.Duration(o.holdMs)*time.Millisecond)
+		} else {
+			w.sleep(time.Duration(o.holdMs) * time.Millisecond)
+		}
 	}
 	switch w.ctrl {
 	case protocol.TypeCancel: // 取消：不发提议，等裁决（Python SDK 的行为）
@@ -488,6 +505,38 @@ func (w *worker) task(ts *protocol.TaskStart) error {
 		return err
 	}
 	return w.outcome(att, o, newState)
+}
+
+// researchProgress 发出与 chatagent 同形的研究进度：两项计划、子主题 1 完成、一个登记为来源的抓取。
+func (w *worker) researchProgress(taskID, att string) error {
+	for _, p := range []struct{ step, kind, data string }{
+		{"orch", "todo_updated", `{"items":[{"id":"1","title":"甲","status":"done","budget_share":10},` +
+			`{"id":"2","title":"乙","status":"in_progress","budget_share":10}]}`},
+		{"sub-1", "subtopic", `{"id":"1","title":"甲","status":"done","summary":"甲的结论"}`},
+		{"sub-2", "tool_result", `{"step_id":"sub-2","tool_call_id":"tc1","tool":"web_fetch","ok":true,` +
+			`"preview":{"kind":"fetch","n":1,"title":"A","url":"https://a.example/1","site":"a.example","excerpt":"x"}}`},
+	} {
+		if err := w.send(&protocol.Progress{EventHeader: w.hdr(protocol.TypeProgress, att), StepID: p.step, Kind: p.kind,
+			Message: p.kind, Data: json.RawMessage(p.data)}); err != nil {
+			return err
+		}
+	}
+	w.log(map[string]any{"event": "progress_sent", "task_id": taskID, "attempt_id": att})
+	return nil
+}
+
+// holdIgnoringPause 等待 d：pause 记录后不响应（继续等待，直到被宿主终止）；cancel 照常结束等待。
+func (w *worker) holdIgnoringPause(taskID, att string, d time.Duration) {
+	end := time.Now().Add(d)
+	logged := false
+	for time.Now().Before(end) && w.ctrl != protocol.TypeCancel {
+		w.poll()
+		if w.ctrl == protocol.TypePause && !logged {
+			logged = true
+			w.log(map[string]any{"event": "ignoring_pause", "task_id": taskID, "attempt_id": att})
+		}
+		time.Sleep(min(20*time.Millisecond, time.Until(end)))
+	}
 }
 
 // stateArtifact 把会话状态写到 out_dir 并登记为产物（内部可见），返回其 sha256（作为 state_ref）。

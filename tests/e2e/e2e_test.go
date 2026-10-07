@@ -6739,6 +6739,190 @@ func TestSessionStopSupersedeRestore(t *testing.T) {
 	s.end()
 }
 
+// TestSessionStopGraceFallbackCard（停止修复 F2）：Worker 在停止的 grace（--session-pause-grace 1s）内不响应 pause，宿主
+// 强制结束 attempt（platform_killed）→ turn paused，事件流中恰有一条宿主写的 turn_stopped（固定 findings，卡片取自该 turn
+// 的计划、子主题、来源与宿主的工具额度，can_finish）；随后"继续"与"立即写报告"都从 checkpoint 恢复并成功，停止卡不重复。
+func TestSessionStopGraceFallbackCard(t *testing.T) {
+	s := newSessionSys(t, "--session-pause-grace", "1s")
+	s.startS()
+	u := s.user("alice")
+	sid := u.createSession("cs-1")
+	// turnEvents 返回该 turn 的某类事件的 data。
+	turnEvents := func(evs []json.RawMessage, turnID, typ string) []json.RawMessage {
+		var out []json.RawMessage
+		for _, e := range evs {
+			var v struct {
+				Type   string          `json:"type"`
+				TurnID string          `json:"turn_id"`
+				Data   json.RawMessage `json:"data"`
+			}
+			if json.Unmarshal(e, &v) == nil && v.Type == typ && v.TurnID == turnID {
+				out = append(out, v.Data)
+			}
+		}
+		return out
+	}
+	// 两个 turn 分别以"继续"（不带 directive）与"立即写报告"（directive finish_now）从宿主停止卡的暂停状态恢复。
+	for i, c := range []struct{ action, directive string }{{"continue", ""}, {"finish", "finish_now"}} {
+		n := fmt.Sprint(i + 1)
+		r := u.message(sid, "m-"+n, "searches=1 progress=1 ignore_pause=1 hold_ms=120000")
+		eventually(t, "turn "+n+" 发出研究进度", func() bool {
+			return len(swFind(s.swLog(sid), swEvent("progress_sent", "task_id", r.TurnID))) == 1
+		})
+		u.control(r.TurnID, "stop", "st-"+n)
+		u.waitTurn(sid, r.TurnID, "暂停", turnIs("paused"))
+		if len(swFind(s.swLog(sid), swEvent("ignoring_pause", "task_id", r.TurnID))) != 1 {
+			t.Fatalf("turn %s：Worker 应收到并忽略了 pause", n)
+		}
+		var killed bool
+		s.row("SELECT platform_killed FROM attempts WHERE task_id = $1 AND attempt_no = 1", []any{r.TurnID}, &killed)
+		if !killed {
+			t.Fatalf("turn %s：grace 到期应由宿主强制结束 attempt（platform_killed）", n)
+		}
+		cards := turnEvents(u.sse(sid, func(evs []json.RawMessage) bool { return len(turnEvents(evs, r.TurnID, "turn_stopped")) > 0 }),
+			r.TurnID, "turn_stopped")
+		var card struct {
+			Card      map[string]any `json:"card"`
+			Findings  string         `json:"findings"`
+			CanFinish bool           `json:"can_finish"`
+		}
+		if len(cards) != 1 || json.Unmarshal(cards[0], &card) != nil {
+			t.Fatalf("turn %s 应恰有一条停止卡：%s", n, cards)
+		}
+		if card.Findings != api.FallbackStopFindings || !card.CanFinish {
+			t.Errorf("turn %s 的宿主停止卡 = %s", n, cards[0])
+		}
+		todo, _ := card.Card["todo"].([]any)
+		if card.Card["subtopics_done"] != 1.0 || card.Card["subtopics_total"] != 2.0 || card.Card["sources"] != 1.0 ||
+			card.Card["tool_calls_used"] != 1.0 || card.Card["tool_call_limit"] != 30.0 || len(todo) != 2 {
+			t.Errorf("turn %s 的停止卡内容 = %s", n, cards[0])
+		}
+		if s := string(cards[0]); strings.Contains(s, "attempt") || strings.Contains(s, "cost") || strings.Contains(s, fakeupstream.Model) {
+			t.Errorf("停止卡含内部字段：%s", s)
+		}
+
+		u.control(r.TurnID, c.action, c.action+"-"+n)
+		u.waitTurn(sid, r.TurnID, c.action+" 后成功", turnIs("succeeded"))
+		starts := swFind(s.swLog(sid), swEvent("task_start", "task_id", r.TurnID))
+		if len(starts) != 2 || starts[1].str("resume_checkpoint_id") != "tc-"+starts[0].str("attempt_id") {
+			t.Fatalf("%s 的 task_start = %v，期望从第一个 attempt 的 checkpoint 恢复", c.action, starts)
+		}
+		dir, _ := starts[1]["directive"].(map[string]any)
+		if got, _ := dir["kind"].(string); got != c.directive {
+			t.Errorf("%s 的 directive = %v，期望 %q", c.action, starts[1]["directive"], c.directive)
+		}
+		evs := u.sse(sid, func(evs []json.RawMessage) bool { return len(turnEvents(evs, r.TurnID, "turn_result")) > 0 })
+		if k := len(turnEvents(evs, r.TurnID, "turn_stopped")); k != 1 {
+			t.Errorf("%s 之后 turn %s 的停止卡应仍只有一条，得到 %d", c.action, n, k)
+		}
+		var stored int
+		s.row("SELECT count(*) FROM events WHERE task_id = $1 AND type = 'turn_stopped'", []any{r.TurnID}, &stored)
+		if stored != 1 {
+			t.Errorf("turn %s 存储中的停止卡 %d 条", n, stored)
+		}
+	}
+	u.closeSession(sid)
+	s.end()
+}
+
+// TestSessionStopCrashFallbackCard（停止修复 F2，崩溃安全）：停止请求已应用（turn stopping）、Worker 仍在忽略 pause 时
+// server 被 SIGKILL；重启后恢复以暂停裁决结束该 attempt，同一事务写出恰好一条宿主停止卡；之后"继续"照常成功。
+func TestSessionStopCrashFallbackCard(t *testing.T) {
+	s := newSessionSys(t)
+	s.startS()
+	u := s.user("alice")
+	sid := u.createSession("cs-1")
+	r := u.message(sid, "m-1", "searches=1 progress=1 ignore_pause=1 hold_ms=120000")
+	eventually(t, "turn 发出研究进度", func() bool {
+		return len(swFind(s.swLog(sid), swEvent("progress_sent", "task_id", r.TurnID))) == 1
+	})
+	u.control(r.TurnID, "stop", "st-1")
+	eventually(t, "Worker 收到 pause", func() bool {
+		return len(swFind(s.swLog(sid), swEvent("ignoring_pause", "task_id", r.TurnID))) == 1
+	})
+	s.kill()
+	s.startS()
+	u.waitTurn(sid, r.TurnID, "恢复后暂停", turnIs("paused"))
+	var stored int
+	s.row("SELECT count(*) FROM events WHERE task_id = $1 AND type = 'turn_stopped'", []any{r.TurnID}, &stored)
+	if stored != 1 {
+		t.Fatalf("恢复后存储中的停止卡 %d 条，期望 1", stored)
+	}
+	evs := u.sse(sid, hasEventType("turn_stopped"))
+	var findings []string
+	for _, e := range evs {
+		var v struct {
+			Type string `json:"type"`
+			Data struct {
+				Findings string `json:"findings"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(e, &v) == nil && v.Type == "turn_stopped" {
+			findings = append(findings, v.Data.Findings)
+		}
+	}
+	if len(findings) != 1 || findings[0] != api.FallbackStopFindings {
+		t.Fatalf("恢复后的停止卡 = %v", findings)
+	}
+	u.control(r.TurnID, "continue", "ct-1")
+	u.waitTurn(sid, r.TurnID, "继续后成功", turnIs("succeeded"))
+	s.row("SELECT count(*) FROM events WHERE task_id = $1 AND type = 'turn_stopped'", []any{r.TurnID}, &stored)
+	if stored != 1 {
+		t.Errorf("继续后存储中的停止卡 %d 条", stored)
+	}
+	u.closeSession(sid)
+	s.end()
+}
+
+// TestSessionStopQueuedFallbackCard（停止修复 F2）：--run-slots 1 下排队的 turn 被停止（queued → paused，没有 attempt）
+// 也得到恰好一张宿主停止卡（固定 findings，不可写报告），之后"继续"照常运行并成功。
+func TestSessionStopQueuedFallbackCard(t *testing.T) {
+	s := newSessionSys(t, "--run-slots", "1")
+	s.startS()
+	alice, bob := s.user("alice"), s.user("bob")
+	sa, sb := alice.createSession("cs-a"), bob.createSession("cs-b")
+	ra := alice.message(sa, "m-a", "searches=1 hold_ms=120000")
+	eventually(t, "alice 的 turn 占用 run slot", func() bool {
+		return len(swFind(s.swLog(sa), swEvent("search", "task_id", ra.TurnID))) == 1
+	})
+	rb := bob.message(sb, "m-b", "searches=1")
+	bob.waitTurn(sb, rb.TurnID, "排队", turnIs("queued"))
+	bob.control(rb.TurnID, "stop", "st-b")
+	bob.waitTurn(sb, rb.TurnID, "暂停", turnIs("paused"))
+	evs := bob.sse(sb, hasEventType("turn_stopped"))
+	var cards []string
+	for _, e := range evs {
+		var v struct {
+			Type string `json:"type"`
+			Data struct {
+				Findings  string `json:"findings"`
+				CanFinish bool   `json:"can_finish"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(e, &v) == nil && v.Type == "turn_stopped" {
+			if v.Data.Findings != api.FallbackStopFindings || v.Data.CanFinish {
+				t.Errorf("排队 turn 的停止卡 = %s", e)
+			}
+			cards = append(cards, string(e))
+		}
+	}
+	if len(cards) != 1 {
+		t.Fatalf("排队 turn 应恰有一张停止卡：%v", cards)
+	}
+	alice.control(ra.TurnID, "stop", "st-a")
+	alice.waitTurn(sa, ra.TurnID, "暂停", turnIs("paused"))
+	bob.control(rb.TurnID, "continue", "ct-b")
+	bob.waitTurn(sb, rb.TurnID, "继续后成功", turnIs("succeeded"))
+	var stored int
+	s.row("SELECT count(*) FROM events WHERE task_id = $1 AND type = 'turn_stopped'", []any{rb.TurnID}, &stored)
+	if stored != 1 {
+		t.Errorf("排队 turn 存储中的停止卡 %d 条", stored)
+	}
+	alice.closeSession(sa)
+	bob.closeSession(sb)
+	s.end()
+}
+
 // TestSessionAwaitingInput：ask_user → turn awaiting_input，run slot 归还（--run-slots 1 下另一用户的 turn 照常完成）
 // → answer → 同一 turn 从原位置继续并成功，Worker 收到 directive.answer（带待答提问的 question_id）。
 func TestSessionAwaitingInput(t *testing.T) {

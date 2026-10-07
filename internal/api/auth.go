@@ -166,6 +166,7 @@ var userEventFields = map[string][]string{
 	"host/artifact_saved":       {"artifact_id", "version"},
 	"host/attempt_ended":        {"task_status", "status_reason"},
 	"host/" + EventTaskTerminal: {"task_status", "status_reason"},
+	"host/" + SEvTurnStopped:    {}, // 宿主兜底停止卡：任务事件中只示出类型（卡片经会话事件流给出）
 	"worker/progress":           {"step_id", "kind", "message"},
 	"worker/result":             {"summary", "outputs"},
 }
