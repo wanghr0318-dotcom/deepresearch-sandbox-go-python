@@ -1962,3 +1962,407 @@ def test_double_stop_keeps_original_question_in_carryover():
     system = model3.bodies("orch")[0]["messages"][0]["content"]
     assert "原始问题：「固态电池现状」" in system
     assert "上一轮用户的消息：「继续」" in system
+
+
+# ---- 立即停止：放弃在途调用的等待（stop-fix F1） ----
+# 用户停止时 Worker 不再等在途的模型调用、工具调用或 run_python：立即放弃等待，回到最近一致的
+# checkpoint 状态写停止卡；恢复时被放弃的调用以同一 call id 重发（替身 Gateway 的重放 = journal）。
+
+import asyncio
+import threading
+import time
+
+BLOCK_S = 8.0  # 被阻塞的调用最多等这么久；修复前停止卡要等它返回（或根本不出现）
+QUICK_S = 4.0  # 修复后整轮应在此之内结束
+
+
+def pause_message(attempt: str) -> dict[str, Any]:
+    return {"type": "pause", "v": 1, "attempt_id": attempt, "reason": "user", "grace_ms": 0}
+
+
+class Blocker:
+    """把一个脚本项变成"第一次进入时请宿主送出 pause、然后阻塞到 release()"的调用。
+
+    hook 作为宿主的 on_event 记下事件循环（调用在线程中进入，经 call_soon_threadsafe 送出 pause）。
+    """
+
+    def __init__(self, attempt: str = "a-1") -> None:
+        self.attempt = attempt
+        self.entered = threading.Event()
+        self.gate = threading.Event()
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.host: SessionHost | None = None
+
+    def hook(self, event: dict[str, Any], host: SessionHost) -> None:
+        if self.loop is None:
+            self.loop = asyncio.get_running_loop()
+            self.host = host
+
+    def block(self, value: Any) -> Any:
+        def run(*args: Any) -> Any:
+            if self.entered.is_set():  # 只阻塞第一次（恢复后的同类调用照常返回）
+                return value(*args) if callable(value) else value
+            assert self.loop is not None and self.host is not None
+            self.entered.set()
+            self.loop.call_soon_threadsafe(self.host.send, pause_message(self.attempt))
+            self.gate.wait(BLOCK_S)
+            return value(*args) if callable(value) else value
+
+        return run
+
+    def release(self) -> None:
+        self.gate.set()
+
+
+def wait_journaled(gw: ScriptedGateway, call_id: str, timeout: float = 5.0) -> None:
+    """等被放弃的调用在替身 Gateway 侧完成并记入结果（真实 Gateway 的 journal）。"""
+    deadline = time.monotonic() + timeout
+    while call_id not in gw._results:
+        assert time.monotonic() < deadline, f"{call_id} 没有完成"
+        time.sleep(0.01)
+
+
+def sdk_ids(cp: dict[str, Any]) -> dict[str, int]:
+    return (cp["state"].get("_agentbox") or {}).get("call_ids", {})
+
+
+ANSWER_CONFIG = {"text": "问题", "orchestrator_model": "kimi-k3", "worker_model": "kimi-k2.6"}
+
+
+def errors(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [e for e in events if e["type"] == "error"]
+
+
+def test_stop_while_model_call_blocks_does_not_wait_and_resume_replays_same_call_id():
+    blocker = Blocker()
+    model = ScriptedModel(
+        orch=[call("web_fetch", url="https://a.example/1"), blocker.block(reply("答案 [1]"))],
+        other={"stop-1": [reply(STOP_FINDINGS)]},
+    )
+    host = SessionHost(on_event=blocker.hook)
+    started = time.monotonic()
+    code, events, gw = run_turn(model, config=ANSWER_CONFIG, host=host)
+    elapsed = time.monotonic() - started
+    assert blocker.entered.is_set()
+    assert code == 0, errors(events)
+    assert elapsed < QUICK_S and not blocker.gate.is_set()
+    stopped = progress(events, "turn_stopped")[0]["data"]
+    assert stopped["findings"] == STOP_FINDINGS
+    abandoned = [c.call_id for c in gw.calls if c.step_id == "orch"][-1]
+    assert abandoned == "root/orch/chat/2"
+    last = checkpoints(events)[-1]
+    assert last["step_id"] == "stop"
+    assert proposal(events, "paused")["checkpoint_id"] == last["checkpoint_id"]
+    # 停止 checkpoint 回到最近一致的状态：没有被放弃调用的回复，计数器不越过它
+    assert last["state"]["messages"][-1]["role"] == "tool"
+    assert sdk_ids(last)["root/orch/chat"] == 1
+    assert sdk_ids(last)["root/stop-1/chat"] == 1
+    assert last["state"]["abandoned_ids"]["root/orch/chat"] == 2  # 被放弃的调用已占的号
+    assert not progress(events, "assistant_text") and not of_type(events, "result")
+
+    # 继续：被放弃的调用以同一 call id、同一请求体重发，得到 journal 中的结果，不重复计费
+    blocker.release()
+    wait_journaled(gw, abandoned)
+    before = len(gw.calls)
+    code2, events2, _ = continue_turn(model, last, gw, config=ANSWER_CONFIG)
+    assert code2 == 0, errors(events2)
+    assert not gw.rejections  # 替身 Gateway 校验同一 call id 的请求体（指纹）相同
+    assert [c.call_id for c in gw.calls[before:]] == [abandoned]
+    assert len(model.bodies("orch")) == 2  # 第二次编排调用只真正送达一次
+    assert counted_bodies(gw) == [{"url": "https://a.example/1"}]
+    assert result(events2)["summary"] == "答案 [1]"
+    assert not progress(events2, "turn_stopped")
+
+
+def test_stop_while_run_python_blocks_does_not_wait_and_resume_replays_same_exec_id():
+    blocker = Blocker()
+    model = ScriptedModel(orch=[call("run_python", code="print(6 * 7)"), reply("算出 42。")])
+    gw = make_gateway(model)
+    gw.exec_script = blocker.block(exec_ok("42\n"))
+    host = SessionHost(on_event=blocker.hook)
+    started = time.monotonic()
+    code, events, gw = run_turn(model, config=ANSWER_CONFIG, gw=gw, host=host)
+    elapsed = time.monotonic() - started
+    assert blocker.entered.is_set()
+    assert code == 0, errors(events)
+    assert elapsed < QUICK_S and not blocker.gate.is_set()
+    stopped = progress(events, "turn_stopped")[0]["data"]
+    assert stopped["findings"] == NO_FINDINGS
+    (exec_call,) = [c for c in gw.calls if c.kind == "exec"]
+    assert exec_call.call_id == "root/orch/exec/1"
+    last = checkpoints(events)[-1]
+    assert last["step_id"] == "stop"
+    assert "root/orch/exec" not in sdk_ids(last)  # 被放弃的 exec 不进入计数器
+    assert not progress(events, "tool_result")
+
+    blocker.release()
+    wait_journaled(gw, exec_call.call_id)
+    before = len(gw.calls)
+    code2, events2, _ = continue_turn(model, last, gw, config=ANSWER_CONFIG)
+    assert code2 == 0, errors(events2)
+    new_exec = [c.call_id for c in gw.calls[before:] if c.kind == "exec"]
+    assert new_exec == [exec_call.call_id]  # 同一 call id 重发（重放，不再执行）
+    assert len(model.bodies("orch")) == 2
+    assert result(events2)["summary"] == "算出 42。"
+
+
+def test_stop_while_in_process_subtopic_fetch_blocks_does_not_wait():
+    blocker = Blocker()
+    model = stoppable_model()
+    gw = make_gateway(model, fetch=blocker.block(page))
+    host = SessionHost(on_event=blocker.hook)
+    started = time.monotonic()
+    code, events, gw = run_turn(model, config=RESEARCH_CONFIG, gw=gw, host=host)
+    elapsed = time.monotonic() - started
+    assert blocker.entered.is_set()
+    assert code == 0, errors(events)
+    assert elapsed < QUICK_S and not blocker.gate.is_set()
+    assert progress(events, "turn_stopped")
+    (fetch_call,) = [c for c in gw.calls if c.kind == "fetch"]
+    last = checkpoints(events)[-1]
+    assert last["step_id"] == "stop"
+    assert "root/sub-1/fetch" not in sdk_ids(last)
+
+    blocker.release()
+    wait_journaled(gw, fetch_call.call_id)
+    before = len(gw.calls)
+    code2, events2, _ = continue_turn(model, last, gw)
+    assert code2 == 0, errors(events2)
+    fetches = [c.call_id for c in gw.calls[before:] if c.kind == "fetch"]
+    assert fetches[0] == fetch_call.call_id
+    assert result(events2)["outputs"] == ["report"]
+
+
+def test_stop_while_subrun_model_call_blocks_does_not_wait_and_resume_replays():
+    blocker = Blocker()
+    first = sub_steps("1")
+    model = par_model(**{"1": [blocker.block(first[0]), *first[1:]]})
+    model.scripts["stop-1"] = [reply(STOP_FINDINGS)]
+    gw = par_gateway(model, latency=0.05, tool_budget=lambda k: (k, 30))
+    host = subrun_host(gw, blocker.hook)
+    started = time.monotonic()
+    code, events, gw, _ = par_run(model, gw=gw, host=host)
+    elapsed = time.monotonic() - started
+    assert blocker.entered.is_set()
+    assert code == 0, of_type(events, "error")
+    assert elapsed < QUICK_S and not blocker.gate.is_set()
+    assert progress(events, "turn_stopped")
+    last = checkpoints(events)[-1]
+    assert last["step_id"] == "stop"
+    assert proposal(events, "paused")["checkpoint_id"] == last["checkpoint_id"]
+    abandoned = next(c.call_id for c in gw.calls if c.subrun == "st1" and c.kind == "chat")
+    assert abandoned == "st1/sub-1/chat/1"
+    st1 = without_sdk_key(last["state"])["subtopics"]["1"]
+    assert st1["call_ids"].get("st1/sub-1/chat", 0) == 0  # 被放弃的调用不进入 sub-run 计数器
+    listed = {s["subrun_id"]: s["status"] for s in last["subruns"]}
+    assert listed["st1"] == "started"
+
+    blocker.release()
+    wait_journaled(gw, abandoned)
+    n_sub1 = len(model.bodies("sub-1"))
+    before = len(gw.calls)
+    host2 = subrun_host(gw)
+    start_task(host2, "t-1", "a-2", par_config(), attempt_no=2, resume=resume_with_subruns(last))
+    code2, events2, _, _ = par_run(model, gw=gw, host=host2, start=False)
+    assert code2 == 0, of_type(events2, "error")
+    st1_chats = [c.call_id for c in gw.calls[before:] if c.subrun == "st1" and c.kind == "chat"]
+    assert st1_chats[0] == abandoned  # 同一 call id 重发
+    assert len(model.bodies("sub-1")) == n_sub1 + 2  # 首次调用是重放；之后只有剩余两次
+    assert sub_result(events2) == {"st1": "completed", "st2": "completed", "st3": "completed"}
+    assert result(events2)["outputs"] == ["report"]
+
+
+def test_finish_now_after_stop_during_orch_call_uses_a_fresh_call_id():
+    # 被放弃的调用已以原请求体记入 journal；立即写报告的请求体不同（不带工具、报告 max_tokens），
+    # 以同一 call id 发送会是 409 fingerprint_mismatch：须跳过被放弃调用已占的号
+    blocker = Blocker()
+    model = ScriptedModel(
+        orch=[
+            call("web_fetch", url="https://a.example/1"),
+            blocker.block(reply("答案 [1]")),
+            reply("# 报告\n\n要点 [1]"),
+        ],
+        other={"stop-1": [reply(STOP_FINDINGS)]},
+    )
+    code, events, gw = run_turn(
+        model, config=ANSWER_CONFIG, host=SessionHost(on_event=blocker.hook)
+    )
+    assert code == 0, errors(events)
+    last = checkpoints(events)[-1]
+    assert last["step_id"] == "stop" and sdk_ids(last)["root/orch/chat"] == 1
+    blocker.release()
+    wait_journaled(gw, "root/orch/chat/2")
+    before = len(gw.calls)
+    code2, events2, _ = continue_turn(
+        model, last, gw, config=ANSWER_CONFIG, directive={"kind": "finish_now"}
+    )
+    assert code2 == 0, errors(events2)
+    assert not gw.rejections
+    chats = [c for c in gw.calls[before:] if c.kind == "chat"]
+    assert [c.call_id for c in chats] == ["root/orch/chat/3"]
+    assert "tools" not in chats[0].body
+    assert result(events2)["summary"] == "# 报告\n\n要点 [1]"
+    finish_cp = checkpoints(events2)
+    assert all(cp["state"]["abandoned_ids"] == {} for cp in finish_cp)
+
+
+def test_pause_after_model_reply_starts_no_tool_call_and_continue_replays():
+    # 模型调用的结果与暂停请求同时到达（结果优先被采用），之后不再开始工具调用，也不发出没有
+    # 结果的 tool_call 事件。确定性：暂停在结果交付之前、同一线程中排入事件循环，直接交给 ctx
+    # （不经宿主转发的跳数），再由宿主照常送出一次（迟到的 pause 被忽略）
+    seen: dict[str, Any] = {}
+
+    def pausing(body: dict[str, Any]) -> dict[str, Any]:
+        loop, ctx = seen["loop"], seen["ctx"]
+        loop.call_soon_threadsafe(ctx._handle_control, pause_message("a-1"))
+        loop.call_soon_threadsafe(seen["host"].send, pause_message("a-1"))
+        return call("web_fetch", url="https://a.example/1")
+
+    model = ScriptedModel(orch=[pausing, reply("答案 [1]")])
+    gw = make_gateway(model)
+    host = SessionHost()
+    start_task(host, "t-1", "a-1", ANSWER_CONFIG)
+
+    def factory(ctx: Any) -> ScriptedGateway:
+        gw.call_ids = ctx.call_ids
+        seen.update(loop=asyncio.get_running_loop(), ctx=ctx, host=host)
+        return gw
+
+    code, events = host.run(make_app(gateway=factory, skills_root=SKILLS), timeout=20)
+    assert code == 0, errors(events)
+    assert progress(events, "turn_stopped")
+    started_calls = {e["data"]["tool_call_id"] for e in progress(events, "tool_call")}
+    finished = {e["data"]["tool_call_id"] for e in progress(events, "tool_result")}
+    assert started_calls <= finished  # 没有停在"进行中"的工具行
+    assert gw.counts().get("fetch", 0) == 0
+    last = checkpoints(events)[-1]
+    before = len(gw.calls)
+    code2, events2, _ = continue_turn(model, last, gw, config=ANSWER_CONFIG)
+    assert code2 == 0, errors(events2)
+    assert not gw.rejections
+    assert gw.calls[before].call_id == "root/orch/chat/1"  # 同一 call id 重放
+    assert len(model.bodies("orch")) == 2
+    assert result(events2)["summary"] == "答案 [1]"
+
+
+def pause_on_first(step: str, attempt: str = "a-1") -> Any:
+    """在 attempt 的第一个 step checkpoint 之后送出 pause（checkpoint 结果之前到达）。"""
+
+    def hook(event: dict[str, Any], host: SessionHost) -> None:
+        if (
+            event["type"] == "checkpoint"
+            and event.get("attempt_id") == attempt
+            and event["step_id"] == step
+            and not getattr(host, "paused_once", False)
+        ):
+            host.paused_once = True  # type: ignore[attr-defined]
+            host.send(pause_message(attempt))
+
+    return hook
+
+
+def test_pause_right_after_allocation_stops_before_any_subrun_call():
+    model = par_model()
+    model.scripts["stop-1"] = [reply(STOP_FINDINGS)]
+    gw = par_gateway(model, tool_budget=lambda k: (k, 30))
+    code, events, gw, _ = par_run(model, gw=gw, host=subrun_host(gw, pause_on_first("research")))
+    assert code == 0, of_type(events, "error")
+    assert progress(events, "turn_stopped")
+    assert not [c for c in gw.calls if c.subrun]  # 没有任何 sub-run 调用
+    started_calls = {e["data"]["tool_call_id"] for e in progress(events, "tool_call")}
+    finished = {e["data"]["tool_call_id"] for e in progress(events, "tool_result")}
+    assert started_calls - finished <= {"orch:3"}  # 只有研究阶段本身（research_subtopic）
+    last = checkpoints(events)[-1]
+    assert last["step_id"] == "stop"
+    assert {s["status"] for s in last.get("subruns", [])} <= {"started"}
+    host2 = subrun_host(gw)
+    start_task(host2, "t-1", "a-2", par_config(), attempt_no=2, resume=resume_with_subruns(last))
+    code2, events2, _, _ = par_run(model, gw=gw, host=host2, start=False)
+    assert code2 == 0, of_type(events2, "error")
+    assert not gw.rejections
+    assert sub_result(events2) == {"st1": "completed", "st2": "completed", "st3": "completed"}
+    assert result(events2)["outputs"] == ["report"]
+
+
+def test_pause_right_after_finish_now_directive_keeps_finish_and_continue_writes_report():
+    # 立即写报告的指令已应用、尚无提交时暂停（报告调用在途被放弃）：停止 checkpoint 保留指令的
+    # 效果；继续时报告调用以同一 call id、同一请求体重发（journal 重放）
+    model = finish_model()
+    model.scripts["stop-2"] = [reply(STOP_FINDINGS)]
+    blocker = Blocker(attempt="a-2")
+    model.scripts["orch"][3] = blocker.block(model.scripts["orch"][3])
+    code, events, gw = run_turn(model, config=RESEARCH_CONFIG, host=pausing_host("orch", 3))
+    assert code == 0
+    cp = checkpoints(events)[-1]
+    before = len(gw.calls)
+    code2, events2, _ = continue_turn(
+        model, cp, gw, directive={"kind": "finish_now"}, host=SessionHost(on_event=blocker.hook)
+    )
+    assert code2 == 0, errors(events2)
+    assert blocker.entered.is_set() and progress(events2, "turn_stopped")
+    report_call = next(c for c in gw.calls[before:] if c.step_id == "orch")
+    assert "tools" not in report_call.body
+    stop2 = checkpoints(events2)[-1]
+    assert stop2["step_id"] == "stop" and stop2["state"]["finish_requested"] is True
+    assert stop2["state"]["stops"] == 2
+    blocker.release()
+    wait_journaled(gw, report_call.call_id)
+    n_orch = len(model.bodies("orch"))
+    before = len(gw.calls)
+    code3, events3, _ = continue_turn(model, stop2, gw, attempt="a-3", attempt_no=3)
+    assert code3 == 0, errors(events3)
+    assert not gw.rejections
+    assert [c.call_id for c in gw.calls[before:] if c.kind == "chat"] == [report_call.call_id]
+    assert len(model.bodies("orch")) == n_orch  # 重放，不再送达模型
+    assert result(events3)["outputs"] == ["report"]
+    assert progress(events3, "report_ready")[0]["data"]["partial"] is True
+
+
+def test_pause_right_after_answer_directive_keeps_the_answer():
+    model = ask_model()
+    blocker = Blocker(attempt="a-2")
+    model.scripts["orch"][2] = blocker.block(model.scripts["orch"][2])
+    _, events, gw = run_turn(model, config={"text": "储能电池市场"})
+    awaiting = proposal(events, "awaiting_input")
+    cp = checkpoints(events)[-1]
+    good = {"kind": "answer", "question_id": awaiting["question_id"], "answers": ANSWERS}
+    before = len(gw.calls)
+    code2, events2, _ = continue_turn(
+        model,
+        cp,
+        gw,
+        directive=good,
+        config={"text": "储能电池市场"},
+        host=SessionHost(on_event=blocker.hook),
+    )
+    assert code2 == 0, errors(events2)
+    assert blocker.entered.is_set() and progress(events2, "turn_stopped")
+    answer_call = next(c for c in gw.calls[before:] if c.step_id == "orch")
+    stop = checkpoints(events2)[-1]
+    assert stop["step_id"] == "stop"
+    assert stop["state"]["pending_question"] is None
+    assert awaiting["question_id"] in stop["state"]["answered"]
+    blocker.release()
+    wait_journaled(gw, answer_call.call_id)
+    before = len(gw.calls)
+    code3, events3, _ = continue_turn(
+        model, stop, gw, attempt="a-3", attempt_no=3, config={"text": "储能电池市场"}
+    )
+    assert code3 == 0, errors(events3)
+    assert not gw.rejections
+    assert not of_type(events3, "awaiting_input")  # 回答已保留，不再重问
+    assert [c.call_id for c in gw.calls[before:] if c.kind == "chat"] == [answer_call.call_id]
+    assert result(events3)["summary"] == "好的，按中国市场回答。"
+
+
+def test_turn_gateway_waits_for_in_progress_calls_up_to_the_call_timeout():
+    from agentbox_worker import GatewayClient
+    from agentbox_worker.gateway import CallIds
+    from chatagent.app import turn_gateway
+
+    class Ctx:
+        gateway = GatewayClient("/nonexistent.sock", call_ids=CallIds(), timeout_s=5)
+
+    gw = turn_gateway(Ctx())  # type: ignore[arg-type]
+    assert gw is Ctx.gateway and gw.in_progress_wait_s is None
+    assert GatewayClient.in_progress_wait_s == 30.0  # SDK 缺省不变

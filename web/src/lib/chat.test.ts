@@ -148,11 +148,24 @@ describe("applyEvent", () => {
     ]);
     expect(s.turns[0]!.steps.map((x) => [x.id, x.kind, x.title, x.status])).toEqual([
       ["skill_read-1", "skill", "读取 skill：deep-research · report.md", "done"],
-      ["thinking-2", "thinking", "思考", "done"],
+      [`thinking-orch-${SHA}`, "thinking", "思考", "done"],
       ["thinking-3", "thinking", "思考", "done"],
     ]);
     expect(s.turns[0]!.steps[1]!.raw?.responseRef).toBe(SHA);
     expect(s.turns[0]!.steps[2]!.raw).toBeUndefined();
+  });
+
+  it("keeps one thinking row when continue after stop re-sends the same model call", () => {
+    const raw = { request: { messages: [] }, response_ref: SHA };
+    const s = run(started(), [
+      sev(1, "thinking", { step_id: "orch", text: "先拆分子主题", raw }, "u1"),
+      sev(2, "tool_call", { step_id: "orch", tool_call_id: "orch:1", tool: "web_search", input: { query: "x" } }, "u1"),
+      // 停止后继续：同一次模型调用重放（同一结果 blob），thinking 与 tool_call 重发
+      sev(3, "thinking", { step_id: "orch", text: "先拆分子主题", raw }, "u1"),
+      sev(4, "tool_call", { step_id: "orch", tool_call_id: "orch:1", tool: "web_search", input: { query: "x" } }, "u1"),
+      sev(5, "thinking", { step_id: "sub-1", text: "另一步", raw }, "u1"),
+    ]);
+    expect(s.turns[0]!.steps.map((x) => x.id)).toEqual([`thinking-orch-${SHA}`, "orch:1", `thinking-sub-1-${SHA}`]);
   });
 
   it("tracks todo, subtopics, budget, sources and report", () => {

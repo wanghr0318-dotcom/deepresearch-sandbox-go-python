@@ -21,7 +21,9 @@
 - 部分失败（规格 §13.6）：模型不可用 → fail；deadline 取消 → timed_out；sub-run 或 task 费用耗尽
   → 不再发起付费调用，以已收集来源的抽取式摘要 complete（partial）；task 级工具额度用尽 → 各
   sub-run 不再发起工具调用，以已有证据写摘要。
-- 停止：各 sub-run 在下一个工具边界返回（宿主侧仍为 started），由编排层写停止摘要与 checkpoint；
+- 停止：各 sub-run 在下一个工具边界返回，在途的模型或工具调用被放弃等待（stop-fix F1：调用在
+  Gateway 侧继续并记入 journal；sub-run 的计数器只随其转录保存，不含被放弃的调用）；宿主侧仍为
+  started。编排层回到最近一次提交的状态，写停止摘要与 checkpoint；
   继续时 completed 的从结果产物读取、不重跑，started 的同 ID 重发 subrun_start 后从转录继续。
   立即写报告：对仍在运行的 sub-run cancel(reason="finish_now")。E41：取消与完成竞态时宿主拒绝
   仍列出 completed 的 checkpoint → 等 SDK 处理完取消，按本地状态重建后重提一次。
@@ -37,7 +39,12 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any
 
-from agentbox_worker.errors import BudgetExhausted, CheckpointRejected, GatewayError
+from agentbox_worker.errors import (
+    BudgetExhausted,
+    CallAbandoned,
+    CheckpointRejected,
+    GatewayError,
+)
 from agentbox_worker.gateway import CallIds
 from agentbox_worker.protocol import MAX_SUBRUNS_PER_TASK
 from agentbox_worker.subruns import SubrunCancelled, SubrunHandle, SubrunRejected
@@ -60,7 +67,7 @@ if TYPE_CHECKING:
 PARENT_STEP = "research"  # subrun_start.parent_step_id，也是阶段级 checkpoint 的 step_id
 RESULT_MEDIA_TYPE = "application/json"
 FINISH_REASON = "finish_now"
-REFS_MAX = 1024  # 与编排循环的 MAX_REFS 相同
+
 THINKING_MAX_CHARS = 600
 PREVIEW_MAX_CHARS = 600
 EXCERPT_CHARS = 300
@@ -530,6 +537,12 @@ class ResearchPhase:
         view = h.gateway
         if hasattr(view, "call_ids"):  # 本 sub-run 的计数器随其转录保存（见模块说明）
             view.call_ids = CallIds.restore(g.call_ids)
+        try:
+            return await self._steps(view, emit, g)
+        except CallAbandoned:  # 宿主请求暂停：放弃了在途调用（未写入转录，计数器未保存）
+            return _PAUSED
+
+    async def _steps(self, view: Any, emit: Emitter, g: SubtopicState) -> Any:
         step = f"sub-{g.id}"
         while True:
             if self.ctx.should_pause():
@@ -552,7 +565,7 @@ class ResearchPhase:
                 g.closing = True
             tools = None if g.closing else self.agent.sub_registry.schemas()
             try:
-                reply = await asyncio.to_thread(
+                reply = await self.agent.call(
                     call_model,
                     view,
                     step,
@@ -586,6 +599,8 @@ class ResearchPhase:
         st = self.st
         name, raw = tc["function"]["name"], tc["function"]["arguments"]
         args = _args(raw)
+        if self.ctx.should_pause():  # 不再开始新的工具调用（也不发出没有结果的 tool_call 事件）
+            raise CallAbandoned("宿主已请求暂停：不再开始新的工具调用")
         index = sum(1 for m in g.messages if m.get("role") == "tool") + 1
         event_id = f"{step}:{index}"
         await emit.tool_call(step, event_id, name, args, g.id)
@@ -603,7 +618,7 @@ class ResearchPhase:
             snippets=search_snippets(g.messages),
         )
         try:
-            result = await asyncio.to_thread(self.agent.sub_registry.dispatch, name, raw, tctx)
+            result = await self.agent.call(self.agent.sub_registry.dispatch, name, raw, tctx)
         except BudgetExhausted:
             failed = ToolResult(content="费用上限已到", ok=False)
             await emit.tool_result(step, event_id, name, failed, g.id, args)
@@ -693,13 +708,11 @@ class ResearchPhase:
         await asyncio.shield(task)
 
     async def _commit(self, step: str) -> None:
-        st = self.st
         for attempt in (1, 2):
             self._sync()
-            st.compact()
             before = self.mgr.snapshot()
             try:
-                await self.ctx.checkpoint(step, state=st.to_json(), refs=st.refs[-REFS_MAX:])
+                await self.agent.save(step)  # 同时记为停止时回退的锚点
                 return
             except CheckpointRejected:
                 completed = any(s["status"] == "completed" for s in before)

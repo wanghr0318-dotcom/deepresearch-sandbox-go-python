@@ -606,10 +606,17 @@ function applyTurnEvent(t: TurnView, ev: SessionEvent, restored: Set<string>): T
     case "skill_read":
       return applySkillRead(t, d, ev.seq);
     case "thinking": {
-      const row: StepRow = { id: `thinking-${ev.seq}`, kind: "thinking", title: "思考", status: "done", text: str(d.text) };
+      // 停止后"继续"会重放同一次模型调用并重发 thinking：宿主对用户去掉了 raw.call_id，
+      // 故以步骤与结果 blob（同一调用重放时不变）为键，相同则替换而不是新增一行。
       const raw = toRaw(d.raw);
+      const id = raw ? `thinking-${str(d.step_id)}-${raw.responseRef}` : `thinking-${ev.seq}`;
+      const row: StepRow = { id, kind: "thinking", title: "思考", status: "done", text: str(d.text) };
       if (raw) row.raw = raw;
-      return { ...t, steps: [...t.steps, row] };
+      const i = t.steps.findIndex((s) => s.id === id);
+      if (i < 0) return { ...t, steps: [...t.steps, row] };
+      const steps = t.steps.slice();
+      steps[i] = row;
+      return { ...t, steps };
     }
     case "ask_user":
       return applyAskUser(t, d, ev.seq);

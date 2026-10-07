@@ -27,6 +27,7 @@ from agentbox_worker.errors import (
     GatewayError,
     WorkerFailure,
 )
+from agentbox_worker.gateway import GatewayClient
 from agentbox_worker.runtime import RESERVED_STATE_KEY, Paused, Result, TaskContext
 from agentbox_worker.session import SessionApp
 from agentbox_worker.tools import GatewayLike
@@ -253,6 +254,15 @@ def _origin(sources: list[Source], task_id: str) -> list[Source]:
     return [Source(s.n, s.sha256, s.url, s.title, s.excerpt, s.call_id, task_id) for s in sources]
 
 
+def turn_gateway(ctx: TaskContext) -> GatewayClient:
+    """本轮的 Gateway 客户端。call_in_progress 一直等到本次调用的客户端超时（而非 SDK 缺省的
+    30 s）：停止时被放弃的调用仍在 Gateway 侧进行（规格 E19），很快"继续"时同一 ID 的重发应等它
+    结束后重放，而不是以 CallInProgress 让本轮失败。sub-run 视图由它派生，沿用同一设置。"""
+    gw = ctx.gateway
+    gw.in_progress_wait_s = None
+    return gw
+
+
 def make_app(
     *,
     gateway: Callable[[TaskContext], GatewayLike] | None = None,
@@ -264,7 +274,7 @@ def make_app(
         cfg = parse_turn_config(ctx.config)
         mode = resume_mode(ctx)
         memory = _memory(ctx)
-        gw = gateway(ctx) if gateway is not None else ctx.gateway
+        gw = gateway(ctx) if gateway is not None else turn_gateway(ctx)
         try:
             state, carry = await _state(ctx, mode, cfg, memory, gw)
             emit = Emitter(ctx)
