@@ -789,3 +789,16 @@ def test_search_timeout_message_names_the_search_service():
     ctx = tool_ctx(ScriptedGateway(search=fail))
     r = ToolRegistry([WebSearch()]).dispatch("web_search", '{"query":"储能"}', ctx)
     assert not r.ok and r.preview == {"kind": "text", "text": "搜索失败：搜索服务无法访问或超时"}
+
+
+def test_fetched_challenge_page_is_not_a_source():
+    challenge = (
+        "火山引擎 正在进行安全检测... 为保障您的访问安全，"
+        "系统正在检测当前网络环境，该过程通常需要几秒钟，请耐心等待"
+    )
+    gw = ScriptedGateway(fetch=lambda url: page("", challenge))
+    ctx = tool_ctx(gw)
+    r = ToolRegistry([WebFetch()]).dispatch("web_fetch", '{"url":"https://m.36kr.com/p/1"}', ctx)
+    assert r.ok is False and r.content.startswith("页面被拦截")
+    assert "https://m.36kr.com/p/1" in r.content and challenge not in r.content
+    assert ctx.sources.all() == [] and ctx.budget.used == 1

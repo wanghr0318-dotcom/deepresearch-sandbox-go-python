@@ -102,7 +102,7 @@ CI=true go test -count=1 ./internal/persistence/postgres/ ./tests/e2e/...
 
 [运行记录](docs/evidence/2026-10-05-m1-demo-run.md)。
 
-**运行完整助手**（沙箱、Gateway、真实模型、对话界面）需要一个模型 Key 和一个搜索 Key。逐步命令与全部 server 标志见[使用参考](docs/usage.zh-CN.md)；演示服务器使用的 unit 是 [`deploy/systemd/agentbox-demo.service`](deploy/systemd/agentbox-demo.service)。
+**运行完整助手**（沙箱、Gateway、真实模型、对话界面）需要一个模型 Key 和一个搜索 Key。逐步命令与全部 server 标志见[使用参考](docs/usage.zh-CN.md)；演示服务器所用 unit 的模板是 [`deploy/systemd/agentbox-demo.service.example`](deploy/systemd/agentbox-demo.service.example)（复制到 `/etc/systemd/system/`，并在 `/etc/agentbox/agentbox.env` 中设置 `AGENTBOX_PUBLIC_HOST`）。
 
 ## 目录
 

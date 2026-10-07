@@ -1,6 +1,6 @@
 # M4 Plan 15 验收记录：独立 exec 沙箱与加固（WSL2 本地部分）
 
-> 日期 2026-10-06。分支 `m4-p15-t12`（基于 `m4-batch` 948d8f8）。本文件记录 Plan 15 Task 12 在本地 WSL2 上的验收。**服务器（CVM ins-22zj0xj5）、CI 与真实模型 `run_python` 的验收由协调者在联合验收中补入本文件**，在此之前这些项不成立。文中不含 token、cookie 或密钥。
+> 日期 2026-10-06。分支 `m4-p15-t12`（基于 `m4-batch` 948d8f8）。本文件记录 Plan 15 Task 12 在本地 WSL2 上的验收。**服务器（CVM <instance>）、CI 与真实模型 `run_python` 的验收由协调者在联合验收中补入本文件**，在此之前这些项不成立。文中不含 token、cookie 或密钥。
 
 ## 环境
 

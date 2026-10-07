@@ -129,6 +129,9 @@ export interface TurnView {
   restoredFrom?: string;
   /** 已取消、可从最后 checkpoint 恢复，且还没有被恢复过 */
   canRestore: boolean;
+  /** 本轮第一个与最后一个事件的时间（毫秒，取自事件 ts），用于"研究过程 · 用时"与"正在撰写报告 · N 秒" */
+  startedAt?: number;
+  lastEventAt?: number;
 }
 
 export interface ChatState {
@@ -487,6 +490,10 @@ function applyToolResult(t: TurnView, d: Data, seq: number): TurnView {
   // run_python 失败（非零退出等）时预览含退出码与 stderr 末尾，比 error 的首段更完整
   const codeText = kind === "code" ? previewText(p) : undefined;
   if (!ok) row.text = toolErrorText(codeText ?? optStr(d.error) ?? row.text ?? "调用失败");
+  if (!ok && (kind === "fetch" || p.kind === "fetch") && (row.text ?? "").startsWith("页面被拦截")) {
+    const site = siteOf(row.detail ?? "");
+    row.title = site ? `阅读网页 · ${site} · 页面被拦截` : "阅读网页 · 页面被拦截";
+  }
   const raw = toRaw(d.raw);
   if (raw) row.raw = raw;
   if (i >= 0) steps[i] = row;
@@ -676,7 +683,9 @@ export function applyEvent(state: ChatState, ev: SessionEvent): ChatState {
     i = turns.length - 1;
   }
   const restored = restoredSet(turns);
-  const next = applyTurnEvent(turns[i]!, ev, restored);
+  let next = applyTurnEvent(turns[i]!, ev, restored);
+  const at = Date.parse(ev.ts);
+  if (Number.isFinite(at)) next = { ...next, startedAt: next.startedAt ?? at, lastEventAt: at };
   turns[i] = next;
   if (ev.type === "turn_created") {
     // 恢复出的新一轮：源轮次不再显示"恢复"。

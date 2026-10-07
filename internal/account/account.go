@@ -19,7 +19,7 @@ import (
 
 var (
 	ErrUsername = errors.New("account: 用户名须为 3–32 位字母、数字、下划线、点或连字符")
-	ErrPassword = errors.New("account: 密码须为 8–128 个字符")
+	ErrPassword = errors.New("account: 密码须为 8–16 位，且至少包含数字、大写字母、小写字母中的两种")
 )
 
 // Iterations 是新哈希使用的 PBKDF2 迭代次数（OWASP 当前建议）。
@@ -49,9 +49,30 @@ func NormalizeUsername(s string) (display, key string, err error) {
 	return display, strings.ToLower(display), nil
 }
 
-// ValidatePassword 校验长度（按 rune）。
+// ValidatePassword 校验注册密码：8–16 个字符（按 rune），且数字、大写字母、小写字母三类中至少有两类。
+// 只用于注册；登录只比较哈希，规则变化不影响已有账号。
 func ValidatePassword(pw string) error {
-	if n := utf8.RuneCountInString(pw); n < 8 || n > 128 {
+	if n := utf8.RuneCountInString(pw); n < 8 || n > 16 {
+		return ErrPassword
+	}
+	var digit, upper, lower bool
+	for _, r := range pw {
+		switch {
+		case r >= '0' && r <= '9':
+			digit = true
+		case r >= 'A' && r <= 'Z':
+			upper = true
+		case r >= 'a' && r <= 'z':
+			lower = true
+		}
+	}
+	classes := 0
+	for _, b := range []bool{digit, upper, lower} {
+		if b {
+			classes++
+		}
+	}
+	if classes < 2 {
 		return ErrPassword
 	}
 	return nil

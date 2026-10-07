@@ -8,13 +8,12 @@ import { ApiClient, ApiError, newRequestId } from "./client";
 import type { ClientOptions, ControlResult, CreateTaskResult, Download, ResearchRequest, Task, TaskList, TaskResult, User } from "./client";
 import { watchTaskEvents } from "./sse";
 import type { EventStream, WatchOptions } from "./sse";
+import { passwordError } from "../lib/password";
 
 export type SessionOptions = Pick<ClientOptions, "baseUrl" | "fetch" | "maxAttempts" | "backoffBaseMs" | "backoffCapMs">;
 
 /** 用户名规则（与服务端一致）：3–32 位，字母、数字、下划线、点、连字符。 */
 export const USERNAME_RE = /^[A-Za-z0-9_.-]{3,32}$/;
-export const PASSWORD_MIN = 8;
-export const PASSWORD_MAX = 128;
 export const TOPIC_MAX = 500;
 
 /** 按 Unicode 码点计数（与服务端按 rune 计一致）。 */
@@ -25,8 +24,8 @@ export function runeLength(s: string): number {
 /** 校验注册表单；返回面向用户的中文提示，合法时返回空串。 */
 export function validateRegistration(username: string, password: string, confirm: string): string {
   if (!USERNAME_RE.test(username.trim())) return "用户名需为 3–32 位字母、数字、下划线、点或连字符";
-  const n = runeLength(password);
-  if (n < PASSWORD_MIN || n > PASSWORD_MAX) return `密码需为 ${PASSWORD_MIN}–${PASSWORD_MAX} 个字符`;
+  const pw = passwordError(password);
+  if (pw) return pw;
   if (password !== confirm) return "两次输入的密码不一致";
   return "";
 }

@@ -15,14 +15,18 @@
         </label>
         <label class="field">
           密码
-          <input v-model="password" name="password" type="password" autocomplete="new-password" maxlength="128" placeholder="8–128 个字符" />
+          <input v-model="password" name="password" type="password" autocomplete="new-password" placeholder="8–16 位，数字/大写/小写至少两种" />
         </label>
+        <ul class="pw-checks" data-testid="pw-checks" aria-live="polite">
+          <li :class="{ ok: checks.length }" data-check="length">{{ checks.length ? "✓" : "✗" }} 8–16 个字符</li>
+          <li :class="{ ok: checks.classes }" data-check="classes">{{ checks.classes ? "✓" : "✗" }} 数字、大写字母、小写字母至少两种</li>
+        </ul>
         <label class="field">
           确认密码
-          <input v-model="confirm" name="confirm" type="password" autocomplete="new-password" maxlength="128" placeholder="再输入一次密码" />
+          <input v-model="confirm" name="confirm" type="password" autocomplete="new-password" placeholder="再输入一次密码" />
         </label>
         <div v-if="error" class="auth-error" role="alert">{{ error }}</div>
-        <button class="btn primary auth-submit" type="submit" :disabled="busy">{{ busy ? "注册中…" : "注册并登录" }}</button>
+        <button class="btn primary auth-submit" type="submit" :disabled="busy || !checks.length || !checks.classes">{{ busy ? "注册中…" : "注册并登录" }}</button>
       </form>
 
       <p class="auth-switch">已有账号？<a class="link" :href="loginHref()">去登录</a></p>
@@ -31,10 +35,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import type { User } from "../api/client";
 import { validateRegistration } from "../api/session";
 import BrandMark from "../components/BrandMark.vue";
+import { passwordChecks } from "../lib/password";
 import { userErrorMessage } from "../lib/research";
 import { loginHref } from "../lib/router";
 import { useUserServices } from "../lib/userServices";
@@ -47,6 +52,7 @@ const password = ref("");
 const confirm = ref("");
 const error = ref("");
 const busy = ref(false);
+const checks = computed(() => passwordChecks(password.value));
 
 async function submit(): Promise<void> {
   if (busy.value) return;
@@ -65,3 +71,8 @@ async function submit(): Promise<void> {
   }
 }
 </script>
+
+<style scoped>
+.pw-checks { list-style: none; margin: -4px 0 4px; padding: 0; font-size: 12px; color: #8c959f; display: grid; gap: 2px; }
+.pw-checks li.ok { color: #1a7f37; }
+</style>

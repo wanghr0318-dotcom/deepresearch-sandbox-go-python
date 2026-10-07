@@ -1,5 +1,5 @@
 <template>
-  <div class="chat-view" :class="{ narrow }" @keydown.esc="drawer = null">
+  <div class="chat-view" :class="{ narrow }" :style="gridStyle" @keydown.esc="drawer = null">
     <SessionSidebar
       v-if="!narrow"
       :sessions="sessions"
@@ -10,6 +10,7 @@
       @rename="renameSession"
       @remove="removeSession"
     />
+    <Splitter v-if="!narrow" label="会话栏宽度" :value="cols.sidebar" :min="LAYOUT.sidebar.min" :max="LAYOUT.sidebar.max" @update:value="setSidebar" />
 
     <section class="conv" aria-label="对话">
       <header v-if="narrow || currentId" class="conv-head">
@@ -17,6 +18,9 @@
           <span aria-hidden="true">☰</span> 会话
         </button>
         <h1 class="conv-title" :title="title">{{ title }}</h1>
+        <button v-if="!narrow && currentId" class="head-btn" type="button" data-action="toggle-panel" :aria-pressed="panelOpen ? 'true' : 'false'" @click="panelOpen ? closePanel() : openPanel(panelTurnId ?? '', 'progress')">
+          {{ panelOpen ? "收起面板" : "进度" }}
+        </button>
         <button v-if="narrow" class="head-btn" type="button" data-action="open-panel" @click="drawer = 'panel'">进度/来源/报告</button>
       </header>
 
@@ -78,7 +82,10 @@
       </div>
     </section>
 
-    <SidePanel v-if="!narrow" v-model:tab="panelTab" :turn="panelTurn" />
+    <template v-if="!narrow && panelOpen">
+      <Splitter label="面板宽度" invert :value="cols.panel" :min="LAYOUT.panel.min" :max="LAYOUT.panel.max" @update:value="setPanel" />
+      <SidePanel v-model:tab="panelTab" :turn="panelTurn" closable @close="closePanel" />
+    </template>
 
     <!-- 窄屏：侧栏与右侧面板收为抽屉 -->
     <div v-if="narrow && drawer" class="drawer-layer">
@@ -106,9 +113,10 @@
 
 <script setup lang="ts">
 // 对话页（布局 B）：左侧会话列表 | 中间对话（用户气泡在右、AI 在左）与输入框 | 右侧研究面板（进度/来源/报告）。
+// - 宽屏三栏之间有可拖动（也可用 ←/→）的分隔线，宽度记在本浏览器；右侧面板默认收起，由标题栏"进度"按钮或报告卡片打开。
 // - 打开会话：listTurns → seedTurns，再从 cursor 0 订阅会话事件流（重放即可还原全部步骤）；切换会话时关闭旧流。
 // - 新对话的首条消息：createSession → 路由到 #/s/<id> → sendMessage。
-// - 有进行中的轮次（queued/running/stopping）时禁用发送（契约裁定 I：服务端会 409 turn_in_progress），提示"先停止当前研究"。
+// - 有进行中的轮次（queued/running/stopping）时禁用发送（契约裁定 I：服务端会 409 turn_in_progress），输入框内只显示 ■ 停止。
 // - 会话 restoring，或向 frozen/evicted 会话发送中：顶部显示"正在恢复对话…"。
 // - 401 → emit("unauthorized")；其他错误只显示面向用户的文案。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
@@ -120,9 +128,11 @@ import Composer from "../components/chat/Composer.vue";
 import MessageBubble from "../components/chat/MessageBubble.vue";
 import SessionSidebar from "../components/chat/SessionSidebar.vue";
 import SidePanel from "../components/chat/SidePanel.vue";
+import Splitter from "../components/chat/Splitter.vue";
 import TurnView from "../components/chat/TurnView.vue";
 import { activeResearchTurn, applyEvent, chatErrorMessage, emptyChat, recordAnswers, seedTurns } from "../lib/chat";
 import type { ChatState } from "../lib/chat";
+import { clampWidths, LAYOUT, loadWidths, saveWidths } from "../lib/layout";
 import { isUnauthorized } from "../lib/research";
 import { homeHref, navigate, sessionHref } from "../lib/router";
 import { useUserServices } from "../lib/userServices";
@@ -165,6 +175,29 @@ let mql: MediaQueryList | null = null;
 function onMedia(e: MediaQueryListEvent): void {
   narrow.value = e.matches;
   if (!e.matches) drawer.value = null;
+}
+
+// ---- 三栏宽度（宽屏） ----
+
+const panelOpen = ref(false); // 右侧默认收起
+const widths = ref(loadWidths());
+const viewW = ref(typeof window === "undefined" ? 1440 : window.innerWidth);
+const cols = computed(() => clampWidths(widths.value, viewW.value, panelOpen.value));
+const gridStyle = computed(() =>
+  narrow.value
+    ? undefined
+    : { gridTemplateColumns: panelOpen.value ? `${cols.value.sidebar}px 0 minmax(0,1fr) 0 ${cols.value.panel}px` : `${cols.value.sidebar}px 0 minmax(0,1fr)` },
+);
+function setSidebar(v: number): void {
+  widths.value = { ...widths.value, sidebar: v };
+  saveWidths(widths.value);
+}
+function setPanel(v: number): void {
+  widths.value = { ...widths.value, panel: v };
+  saveWidths(widths.value);
+}
+function onResize(): void {
+  viewW.value = window.innerWidth;
 }
 
 // ---- 派生状态 ----
@@ -434,6 +467,11 @@ function openPanel(turnId: string, tab: Tab): void {
   panelTurnId.value = turnId;
   panelTab.value = tab;
   if (narrow.value) drawer.value = "panel";
+  if (!narrow.value) panelOpen.value = true;
+}
+
+function closePanel(): void {
+  panelOpen.value = false;
 }
 
 // ---- 自动滚动：停在底部时跟随新内容 ----
@@ -461,6 +499,7 @@ onMounted(() => {
     narrow.value = mql.matches;
     mql.addEventListener?.("change", onMedia);
   }
+  window.addEventListener("resize", onResize);
   void loadSessions();
   openSession(props.sessionId);
 });
@@ -469,6 +508,7 @@ onBeforeUnmount(() => {
   generation++;
   closeStream();
   mql?.removeEventListener?.("change", onMedia);
+  window.removeEventListener("resize", onResize);
 });
 </script>
 
@@ -477,16 +517,10 @@ onBeforeUnmount(() => {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 264px minmax(0, 1fr) 340px;
   background: #fff;
 }
 .chat-view.narrow {
   grid-template-columns: minmax(0, 1fr);
-}
-@media (max-width: 1180px) {
-  .chat-view:not(.narrow) {
-    grid-template-columns: 232px minmax(0, 1fr) 300px;
-  }
 }
 .chat-view > :deep(.side-panel) {
   min-height: 0;

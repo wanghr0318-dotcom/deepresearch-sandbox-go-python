@@ -4,6 +4,8 @@ import { ApiError } from "../api/client";
 import { USER_ERRORS, activeResearchTurn, applyEvent, chatErrorMessage, emptyChat, recordAnswers, routeLabel, seedTurns, siteOf } from "./chat";
 import type { ChatState } from "./chat";
 import type { SessionEvent } from "../api/chat";
+import { durationText, groupSteps, isWritingReport, turnFinished } from "./steps";
+import type { StepRow } from "./chat";
 
 const SHA = "c".repeat(64);
 const r = (title: string, url: string) => ({ title, url, snippet: `${title} 摘要` });
@@ -94,6 +96,17 @@ describe("applyEvent", () => {
     expect(other).toMatchObject({ kind: "tool", title: "调用工具：future_tool", status: "running" });
     expect(s.turns[0]!.steps).toHaveLength(4);
     expect(s.turns[0]!.sources).toEqual([{ n: 1, title: "新闻", url: "https://www.news.example/p", site: "news.example" }]);
+  });
+
+  it("labels a fetch that hit a human-verification page as 页面被拦截 and adds no source", () => {
+    const blocked = "页面被拦截（需要人机验证）：https://m.36kr.com/p/1";
+    const s = run(started(), [
+      sev(1, "tool_call", { step_id: "orch", tool_call_id: "b1", tool: "web_fetch", input: { url: "https://m.36kr.com/p/1" } }, "u1"),
+      sev(2, "tool_result", { step_id: "orch", tool_call_id: "b1", tool: "web_fetch", ok: false, preview: { kind: "text", text: blocked }, error: blocked }, "u1"),
+    ]);
+    const row = s.turns[0]!.steps[0]!;
+    expect(row).toMatchObject({ kind: "fetch", title: "阅读网页 · m.36kr.com · 页面被拦截", status: "error", text: blocked });
+    expect(s.turns[0]!.sources).toEqual([]);
   });
 
   it("run_python becomes a 运行代码 row with exit code and stdout; failures keep the preview; ⟨/⟩ from the exec call", () => {
@@ -397,5 +410,62 @@ describe("chatErrorMessage", () => {
     expect(USER_ERRORS.turn_in_progress).toContain("先停止当前研究");
     expect(chatErrorMessage(new ApiError(503, "session_unavailable", ""))).toBe("会话暂时无法恢复");
     expect(chatErrorMessage(new ApiError(500, "boom", ""))).toBe("服务暂时不可用，请稍后再试");
+  });
+});
+
+const sr = (id: string, kind: StepRow["kind"], status: StepRow["status"] = "done"): StepRow => ({ id, kind, title: kind, status });
+
+describe("groupSteps", () => {
+  it("merges consecutive thinking and fetch rows only", () => {
+    const items = groupSteps([sr("t1", "thinking"), sr("t2", "thinking"), sr("s1", "search"), sr("f1", "fetch"), sr("f2", "fetch"), sr("f3", "fetch"), sr("t3", "thinking")]);
+    expect(items.map((i) => (i.kind === "row" ? i.row.id : `${i.rowKind}:${i.rows.length}`))).toEqual(["thinking:2", "s1", "fetch:3", "t3"]);
+    const merged = items[2]!;
+    expect(merged.kind === "merged" && merged.title).toBe("阅读网页 · 3 个网页");
+    expect(items[0]!.kind === "merged" && items[0]!.title).toBe("思考 · 2 次");
+  });
+  it("keeps a single row unmerged and keeps running rows visible", () => {
+    expect(groupSteps([sr("f1", "fetch")])[0]!.kind).toBe("row");
+    const items = groupSteps([sr("f1", "fetch"), sr("f2", "fetch", "running")]);
+    expect(items).toHaveLength(1);
+    expect(items[0]!.kind === "merged" && items[0]!.rows[1]!.status).toBe("running");
+  });
+});
+
+describe("turnFinished / durationText", () => {
+  it("finished for terminal and paused turns", () => {
+    for (const s of ["succeeded", "failed", "cancelled", "paused"]) expect(turnFinished({ status: s } as never)).toBe(true);
+    for (const s of ["queued", "running", "stopping", "awaiting_input"]) expect(turnFinished({ status: s } as never)).toBe(false);
+  });
+  it("formats durations", () => {
+    expect(durationText(47_000)).toBe("47 秒");
+    expect(durationText(252_000)).toBe("4 分 12 秒");
+    expect(durationText(0)).toBe("0 秒");
+  });
+});
+
+describe("turn timestamps", () => {
+  const at = (seq: number, type: string, ts: string, data: Record<string, unknown> = {}): SessionEvent =>
+    ({ ...sev(seq, type, data, "u1"), ts }) as SessionEvent;
+  it("records the first and last event time of a turn; replays do not change them", () => {
+    let s = started();
+    s = applyEvent(s, at(1, "thinking", "2026-10-06T08:30:00Z", { step_id: "orch", text: "想一想" }));
+    s = applyEvent(s, at(2, "thinking", "2026-10-06T08:34:12Z", { step_id: "orch", text: "再想想" }));
+    expect(s.turns[0]!.startedAt).toBe(Date.parse("2026-10-06T08:30:00Z"));
+    expect(s.turns[0]!.lastEventAt).toBe(Date.parse("2026-10-06T08:34:12Z"));
+    const again = applyEvent(s, at(2, "thinking", "2026-10-06T09:00:00Z", { step_id: "orch", text: "重放" }));
+    expect(again).toBe(s);
+    expect(again.turns[0]!.lastEventAt).toBe(Date.parse("2026-10-06T08:34:12Z"));
+  });
+});
+
+describe("isWritingReport", () => {
+  const base = { route: "research", status: "running", report: undefined, subtopics: [{ id: "a", title: "A", status: "done" }], steps: [] } as never;
+  it("true when all subtopics settled and nothing is running", () => expect(isWritingReport(base)).toBe(true));
+  it("false while a step or subtopic is running, after the report, or not research", () => {
+    expect(isWritingReport({ ...(base as object), steps: [{ id: "x", kind: "search", title: "", status: "running" }] } as never)).toBe(false);
+    expect(isWritingReport({ ...(base as object), subtopics: [{ id: "a", title: "A", status: "running" }] } as never)).toBe(false);
+    expect(isWritingReport({ ...(base as object), report: { artifactId: "r", version: 1, title: "T", partial: false, toolBudgetReached: false } } as never)).toBe(false);
+    expect(isWritingReport({ ...(base as object), route: "answer" } as never)).toBe(false);
+    expect(isWritingReport({ ...(base as object), subtopics: [] } as never)).toBe(false);
   });
 });

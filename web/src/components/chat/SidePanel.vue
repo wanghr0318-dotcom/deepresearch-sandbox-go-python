@@ -16,6 +16,7 @@
       >
         {{ t.key === "sources" && turn?.sources.length ? `${t.name} ${turn.sources.length}` : t.name }}
       </button>
+      <button v-if="closable" class="close" type="button" data-action="close-panel" aria-label="收起面板" @click="emit('close')">×</button>
     </div>
 
     <div id="side-tabpanel" class="body" role="tabpanel" :aria-labelledby="`side-tab-${tab}`">
@@ -80,18 +81,18 @@
 <script setup lang="ts">
 // 右侧面板（布局 B）：进度（待办清单 + 30 次工具调用额度条）、来源（编号列表，新标签页打开）、报告（安全渲染 + 下载）。
 // 报告只在切到"报告"标签时读取，同一版本只读一次。
-import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { computed } from "vue";
 import type { TodoItem, TurnView } from "../../lib/chat";
-import { renderMarkdown } from "../../lib/markdown";
 import { reportFilename } from "../../lib/research";
+import { useReport } from "../../lib/useReport";
 import { useUserServices } from "../../lib/userServices";
 
 type Tab = "progress" | "sources" | "report";
 
-const props = defineProps<{ turn?: TurnView; tab: Tab }>();
-const emit = defineEmits<{ "update:tab": [tab: Tab] }>();
+const props = withDefaults(defineProps<{ turn?: TurnView; tab: Tab; closable?: boolean }>(), { turn: undefined, closable: false });
+const emit = defineEmits<{ "update:tab": [tab: Tab]; close: [] }>();
 
-const { chat, saveBlob } = useUserServices();
+const { saveBlob } = useUserServices();
 
 const TABS: { key: Tab; name: string }[] = [
   { key: "progress", name: "进度" },
@@ -111,59 +112,7 @@ const budgetPct = computed(() => {
   return b ? Math.min(100, Math.max(0, (b.used / b.limit) * 100)) : 0;
 });
 
-interface Loaded {
-  key: string;
-  blob: Blob;
-  html: string;
-}
-
-const report = ref<Loaded | null>(null);
-const loading = ref(false);
-const loadError = ref("");
-let generation = 0;
-
-const reportKey = computed(() => {
-  const t = props.turn;
-  return t?.report ? `${t.turnId}\n${t.report.artifactId}\n${t.report.version}` : "";
-});
-
-async function loadReport(): Promise<void> {
-  const t = props.turn;
-  const key = reportKey.value;
-  if (!t?.report || !key || report.value?.key === key) return;
-  const gen = ++generation;
-  report.value = null;
-  loadError.value = "";
-  loading.value = true;
-  try {
-    const dl = await chat.downloadArtifact(t.turnId, t.report.artifactId, t.report.version);
-    const text = await dl.blob.text();
-    if (gen !== generation) return;
-    report.value = { key, blob: dl.blob, html: renderMarkdown(text) };
-  } catch {
-    if (gen === generation) loadError.value = "报告加载失败，请稍后重试";
-  } finally {
-    if (gen === generation) loading.value = false;
-  }
-}
-
-watch(
-  () => [props.tab, reportKey.value] as const,
-  ([tab, key]) => {
-    if (report.value && report.value.key !== key) {
-      generation++;
-      report.value = null;
-      loading.value = false;
-      loadError.value = "";
-    }
-    if (tab === "report") void loadReport();
-  },
-  { immediate: true },
-);
-
-onBeforeUnmount(() => {
-  generation++;
-});
+const { report, loading, loadError } = useReport(() => props.turn, () => props.tab === "report");
 
 function download(): void {
   const t = props.turn;
@@ -191,6 +140,14 @@ function isHttp(url: string): boolean {
   gap: 14px;
   padding: 10px 14px 0;
   border-bottom: 1px solid #e5e7eb;
+}
+.close {
+  margin-left: auto;
+  border: 0;
+  background: none;
+  font-size: 18px;
+  color: #656d76;
+  cursor: pointer;
 }
 .s-tab {
   border: 0;

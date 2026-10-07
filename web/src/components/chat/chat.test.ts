@@ -386,6 +386,8 @@ describe("TurnView", () => {
     const w = mountWith(TurnView, { turn, busy: false });
     expect(w.get("[data-testid=reply]").text()).toContain("<b>不是 HTML</b>");
     expect(w.get("[data-testid=reply]").find("b").exists()).toBe(false);
+    // 已结束的轮次：步骤链先折叠为"研究过程"，点开后才显示各行
+    await w.get("[data-testid=chain-toggle]").trigger("click");
     await w.get("[aria-label=查看原始请求与响应]").trigger("click");
     await flushPromises();
     expect(w.find("[role=dialog]").exists()).toBe(true);
@@ -394,7 +396,7 @@ describe("TurnView", () => {
     expect(w.find("[role=dialog]").exists()).toBe(false);
   });
 
-  it("question, stop card, restore and report bar emit the right events", async () => {
+  it("question, stop card, restore and report card emit the right events", async () => {
     const asking = mount(TurnView, { props: { turn: blankTurn({ status: "awaiting_input", question: question({ questions: [question().questions[1]!] }) }), busy: false } });
     await asking.get("[data-action=option]").trigger("click");
     await asking.get("[data-action=submit-answers]").trigger("click");
@@ -410,9 +412,8 @@ describe("TurnView", () => {
     expect(cancelled.emitted("restore")).toEqual([["u1"]]);
 
     const report = { artifactId: "report", version: 2, title: "固态电池报告", partial: true, toolBudgetReached: true };
-    const done = mount(TurnView, { props: { turn: blankTurn({ status: "succeeded", route: "research", report }), busy: false } });
-    expect(done.text()).toContain("报告已生成");
-    expect(done.text()).toContain("部分研究");
+    const done = mountWith(TurnView, { turn: blankTurn({ status: "succeeded", route: "research", report }), busy: false });
+    expect(done.get("[data-testid=report-card]").text()).toContain("部分");
     await done.get("[data-action=view-report]").trigger("click");
     expect(done.emitted("panel")?.[0]).toEqual(["report"]);
   });
@@ -534,10 +535,13 @@ describe("user-facing views hide internals", () => {
     for (const e of events) s = applyEvent(s, e);
     const turn = s.turns[0]!;
 
-    const tv = mountWith(TurnView, { turn, busy: false });
-    // 展开所有行
+    const downloadArtifact = vi.fn(async () => ({ blob: new Blob(["# 报告\n\n报告正文"]), contentType: "text/markdown", etag: "", contentDisposition: "" }));
+    const tv = mountWith(TurnView, { turn, busy: false }, { chat: fakeChat({ downloadArtifact }) });
+    await flushPromises();
+    // 已结束的轮次先点开"研究过程"，再展开所有合并行与各行
+    await tv.get("[data-testid=chain-toggle]").trigger("click");
+    for (const m of tv.findAll("[data-testid=merged-row] > button")) await m.trigger("click");
     for (const h of tv.findAll("[data-testid=step-head]")) await h.trigger("click");
-    const downloadArtifact = vi.fn(async () => ({ blob: new Blob(["# 报告"]), contentType: "text/markdown", etag: "", contentDisposition: "" }));
     const htmls: string[] = [tv.html()];
     for (const tab of ["progress", "sources", "report"] as const) {
       const sp = mountWith(SidePanel, { turn, tab }, { chat: fakeChat({ downloadArtifact }) });
@@ -554,7 +558,9 @@ describe("user-facing views hide internals", () => {
       expect(html).not.toContain("msg-internal-1");
       expect(html).not.toContain(SHA);
     }
-    expect(htmls[0]).toContain("结论如下");
+    // 有报告时对话中显示报告全文（reply 只是摘要，不再重复）
+    expect(htmls[0]).toContain("报告正文");
+    expect(htmls[0]).not.toContain("结论如下");
     expect(htmls[0]).toContain("结果一");
   });
 });
@@ -621,5 +627,142 @@ describe("TurnView groups interleaved sub-run steps by subtopic", () => {
     const w = mount(TurnView, { props: { turn: blankTurn({ steps }), busy: false } });
     expect(w.findAll("[data-testid=subtopic-heading]").map((h) => h.text())).toEqual(["技术路线", "成本"]);
     expect(w.findAll("[data-testid=subtopic-group]")[0]!.findAll("[data-testid=step-head]")).toHaveLength(2);
+  });
+});
+
+describe("TurnView merges consecutive steps and folds the chain after the turn", () => {
+  const fetchRow = (id: string, over: Partial<StepRowData> = {}): StepRowData =>
+    ({ id, kind: "fetch", title: `阅读网页 · ${id}.example`, status: "done", text: `${id} 正文`, ...over });
+  const thinkRow = (id: string, text: string): StepRowData => ({ id, kind: "thinking", title: "思考", status: "done", text });
+
+  it("renders consecutive fetch rows inside a subtopic as one merged row that expands to each row", async () => {
+    const steps = ["f1", "f2", "f3"].map((id) => fetchRow(id, { subtopic: "技术路线" }));
+    const w = mount(TurnView, { props: { turn: blankTurn({ steps }), busy: false } });
+    const merged = w.findAll("[data-testid=merged-row]");
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.text()).toContain("阅读网页 · 3 个网页");
+    expect(w.findAll("[data-testid=step-head]")).toHaveLength(0);
+    await merged[0]!.get("button").trigger("click");
+    expect(w.findAll("[data-testid=step-head]")).toHaveLength(3);
+  });
+
+  it("merges consecutive top-level rows too and keeps subtopic groups in place", () => {
+    const steps: StepRowData[] = [
+      thinkRow("t1", "先想一想"),
+      thinkRow("t2", "再想一想"),
+      { id: "s1", kind: "search", title: "搜索网页", status: "done", subtopic: "技术路线" },
+      fetchRow("f1"),
+      fetchRow("f2"),
+    ];
+    const w = mount(TurnView, { props: { turn: blankTurn({ steps }), busy: false } });
+    const order = w.findAll("[data-testid=merged-row], [data-testid=subtopic-group]").map((e) => e.attributes("data-testid") + ":" + (e.attributes("data-kind") ?? ""));
+    expect(order).toEqual(["merged-row:thinking", "subtopic-group:", "merged-row:fetch"]);
+    expect(w.text()).toContain("思考 · 2 次");
+    expect(w.text()).toContain("阅读网页 · 2 个网页");
+  });
+
+  it("thinking rows are not expanded while the turn runs", () => {
+    const steps: StepRowData[] = [{ id: "t1", kind: "thinking", title: "思考", status: "running", text: "内部推理文本" }];
+    const w = mount(TurnView, { props: { turn: blankTurn({ steps, status: "running" }), busy: false } });
+    expect(w.get("[data-testid=step-head]").attributes("aria-expanded")).toBe("false");
+    expect(w.text()).not.toContain("内部推理文本");
+  });
+
+  it("a finished turn shows only the 研究过程 summary until clicked", async () => {
+    const steps: StepRowData[] = [searchRow(1), fetchRow("f1"), thinkRow("t1", "想")];
+    const turn = blankTurn({ steps, status: "succeeded", startedAt: 1_000, lastEventAt: 253_000 });
+    const w = mount(TurnView, { props: { turn, busy: false } });
+    const toggle = w.get("[data-testid=chain-toggle]");
+    expect(toggle.text()).toContain("研究过程 · 3 步 · 4 分 12 秒");
+    expect(toggle.attributes("aria-expanded")).toBe("false");
+    expect(w.find(".steps").exists()).toBe(false);
+    await toggle.trigger("click");
+    expect(w.find(".steps").exists()).toBe(true);
+    expect(w.findAll("[data-testid=step-head]")).toHaveLength(3);
+
+    const noTime = mount(TurnView, { props: { turn: blankTurn({ steps, status: "paused" }), busy: false } });
+    expect(noTime.get("[data-testid=chain-toggle]").text()).toBe("▸ 研究过程 · 3 步");
+    const running = mount(TurnView, { props: { turn: blankTurn({ steps, status: "running" }), busy: false } });
+    expect(running.find("[data-testid=chain-toggle]").exists()).toBe(false);
+  });
+
+  it("a finished direct-answer turn folds to 过程, not 研究过程", () => {
+    const steps: StepRowData[] = [thinkRow("t1", "想")];
+    const answer = mount(TurnView, { props: { turn: blankTurn({ steps, status: "succeeded", route: "answer" }), busy: false } });
+    expect(answer.get("[data-testid=chain-toggle]").text()).toBe("▸ 过程 · 1 步");
+    const research = mount(TurnView, { props: { turn: blankTurn({ steps, status: "succeeded", route: "research" }), busy: false } });
+    expect(research.get("[data-testid=chain-toggle]").text()).toBe("▸ 研究过程 · 1 步");
+  });
+});
+
+describe("TurnView shows the report in the chat with a report card", () => {
+  const reportOf = (over: Partial<NonNullable<TurnViewData["report"]>> = {}) => ({
+    artifactId: "report",
+    version: 2,
+    title: "固态电池报告",
+    partial: false,
+    toolBudgetReached: false,
+    ...over,
+  });
+  const dl = (md: string) => vi.fn(async () => ({ blob: new Blob([md]), contentType: "text/markdown", etag: "", contentDisposition: "" }));
+
+  it("renders the full report in the middle, hides the reply, and the card opens the report tab", async () => {
+    const downloadArtifact = dl("# 标题\n\n正文 [1]");
+    const turn = blankTurn({ status: "succeeded", route: "research", reply: "摘要：详见报告", report: reportOf({ partial: true, toolBudgetReached: true }) });
+    const w = mountWith(TurnView, { turn, busy: false }, { chat: fakeChat({ downloadArtifact }) });
+    await flushPromises();
+    expect(downloadArtifact).toHaveBeenCalledWith("u1", "report", 2);
+    expect(w.get("[data-testid=report-body]").text()).toContain("正文");
+    const card = w.get("[data-testid=report-card]");
+    expect(card.text()).toContain("固态电池报告");
+    expect(card.text()).toContain("部分");
+    expect(card.text()).toContain("已达工具额度");
+    expect(w.find("[data-testid=reply]").exists()).toBe(false);
+    await card.trigger("click");
+    expect(w.emitted("panel")?.[0]).toEqual(["report"]);
+  });
+
+  it("the card omits the badges when the report is complete", async () => {
+    const w = mountWith(TurnView, { turn: blankTurn({ status: "succeeded", route: "research", report: reportOf() }), busy: false }, { chat: fakeChat({ downloadArtifact: dl("# 标题") }) });
+    await flushPromises();
+    const card = w.get("[data-testid=report-card]");
+    expect(card.text()).not.toContain("部分");
+    expect(card.text()).not.toContain("已达工具额度");
+  });
+
+  it("sanitizes the in-chat report like the side panel (no script, handlers or javascript: links)", async () => {
+    const md = "# 报告\n\n正文\n\n<script>alert(1)</script><img src=x onerror=alert(2)>\n\n[坏链接](javascript:alert(3))";
+    const w = mountWith(TurnView, { turn: blankTurn({ status: "succeeded", route: "research", report: reportOf() }), busy: false }, { chat: fakeChat({ downloadArtifact: dl(md) }) });
+    await flushPromises();
+    const body = w.get("[data-testid=report-body]").get("article");
+    expect(body.find("h1").text()).toBe("报告");
+    expect(body.find("script").exists()).toBe(false);
+    expect(body.html()).not.toContain("onerror");
+    expect(body.html()).not.toContain("javascript:");
+  });
+
+  it("shows a ticking writing row while the lead agent writes the report", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-10-07T00:00:10Z"));
+      const lastEventAt = new Date("2026-10-07T00:00:05Z").getTime();
+      const turn = blankTurn({
+        status: "running",
+        route: "research",
+        subtopics: [{ id: "s1", title: "技术路线", status: "done" }],
+        steps: [searchRow(1, { status: "done" })],
+        lastEventAt,
+      });
+      const w = mountWith(TurnView, { turn, busy: false });
+      const row = w.get("[data-testid=writing-report]");
+      expect(row.text()).toBe("✍️ 正在整理资料并撰写报告… 5 秒");
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(w.get("[data-testid=writing-report]").text()).toBe("✍️ 正在整理资料并撰写报告… 8 秒");
+
+      await w.setProps({ turn: { ...turn, steps: [searchRow(1, { status: "running" })] } } as never);
+      expect(w.find("[data-testid=writing-report]").exists()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

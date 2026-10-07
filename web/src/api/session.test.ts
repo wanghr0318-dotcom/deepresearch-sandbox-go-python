@@ -108,14 +108,14 @@ describe("SessionApi (cookie mode)", () => {
 });
 
 describe("form validation", () => {
-  it("checks username, password length (in characters) and confirmation", () => {
-    expect(validateRegistration("ab", "password123", "password123")).toContain("用户名");
-    expect(validateRegistration("bad name", "password123", "password123")).toContain("用户名");
-    expect(validateRegistration("a".repeat(33), "password123", "password123")).toContain("用户名");
-    expect(validateRegistration("alice", "short", "short")).toContain("8–128");
-    expect(validateRegistration("alice", "x".repeat(129), "x".repeat(129))).toContain("8–128");
-    expect(validateRegistration("alice", "password123", "password124")).toBe("两次输入的密码不一致");
-    expect(validateRegistration("a.l-i_ce", "密码密码密码密码", "密码密码密码密码")).toBe("");
+  it("checks username, password rule and confirmation", () => {
+    expect(validateRegistration("ab", "Passw0rdX", "Passw0rdX")).toContain("用户名");
+    expect(validateRegistration("bad name", "Passw0rdX", "Passw0rdX")).toContain("用户名");
+    expect(validateRegistration("a".repeat(33), "Passw0rdX", "Passw0rdX")).toContain("用户名");
+    expect(validateRegistration("alice", "short", "short")).toContain("8–16");
+    expect(validateRegistration("alice", "abcdefgh", "abcdefgh")).toContain("两种");
+    expect(validateRegistration("alice", "Passw0rdX", "Passw0rdY")).toBe("两次输入的密码不一致");
+    expect(validateRegistration("a.l-i_ce", "Passw0rdX", "Passw0rdX")).toBe("");
     expect(runeLength("😀😀")).toBe(2);
     expect(validateLogin("", "x")).toBe("请输入用户名和密码");
     expect(validateLogin("alice", "")).toBe("请输入用户名和密码");

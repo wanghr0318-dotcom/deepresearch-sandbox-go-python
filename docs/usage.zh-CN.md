@@ -85,7 +85,7 @@ sudo sh -c 'set -a; . deploy/agentbox.env.example; exec ./bin/agentbox verify-in
 
 Worker 在沙箱中以映射 UID 运行，只读看到宿主的 `/usr`、`/etc` 的子集与 `/opt/agentbox`，可写的只有 `/workspace`（宿主 `<data>/workspaces/<task_id>`）与限额 tmpfs。产物按固定版本保存在 `<data>/blobs`（版本与 sha256 见 `task watch` 的 `artifact_saved` 事件），经 API 下载：`GET /tasks/{id}/result` 返回终态任务的结果（固定输出 `(artifact_id, version, sha256)`），`GET /tasks/{id}/artifacts/{artifact_id}/versions/{v}`（或 `?version=N`，省略时为最新版本）返回产物内容，`ETag` 为带引号的 sha256；只有 `visibility = output` 的产物可下载，HTML、SVG 等主动内容一律以 attachment 下载。`agentbox task result <task_id>` 下载结果，`--artifact <artifact_id> [--version N]` 下载产物，两者都按 `ETag` 校验 sha256，不符则报错且不输出。
 
-**Gateway 配置**：每个 attempt 在 `<data>/gateway/<attempt_id>.sock` 有一个 Gateway 入口，挂载到沙箱内的 `/run/agentbox/gateway.sock`（属主为环境映射 uid 1000、0600）；attempt 结束或取消生效时先在数据库撤销访问、再关闭入口。供应商 Key 只从宿主环境变量 `AGENTBOX_MODEL_API_KEY`、`AGENTBOX_SEARCH_API_KEY` 读取，不进入 Worker 的 init、沙箱环境变量与日志；`--worker-env` 的键须在白名单中（如 `PYTHONPATH`）。相关标志（含义与默认值见配置示例）：`--default-budget-micro` / `--budget-cap-micro`（task 层预算，微美元；任务可用 `limits.budget_micro` 指定，超过上限返回 `400 invalid_limits`）、`--model-base-url` / `--model-name` / `--models` / `--model-price-in-micro-per-mtok` / `--model-price-out-micro-per-mtok` / `--model-price`（OpenAI 兼容模型上游；不设 `--model-base-url` 时不提供模型端点；`--model-name` 是请求未指定 `model` 时的默认模型，`--models` 是声明的白名单（须包含默认模型），请求可按调用在其中选择 `model`，白名单外为 `400 unsupported_model`；`--model-price model=IN:OUT` 给出按模型的单价，用于预留估算与结算，只是配置、不代表供应商实际计费）、`--search-provider ddg_lite|tavily|serper|fake`（`serper` 为经 Serper.dev 的 Google 结果：`POST https://google.serper.dev/search`，Key 只放在 `X-API-KEY` 头；`tavily` 与 `serper` 都读同一个 `AGENTBOX_SEARCH_API_KEY`，未设置时 server 以退出码 2 拒绝启动。serper 的请求与响应映射只经本机 fake Serper 服务器的单元测试验证，未用真实 Key 执行）、`--upstream-allow-private`（显式放行的私有上游，例如本机模型服务）。`agentbox task inspect` 除 attempt 与 checkpoint 外列出每个 Gateway 调用及其 try（端点、chat 调用解析后的模型、状态、费用、延迟、上游请求 ID；不含请求与响应正文）。
+**Gateway 配置**：每个 attempt 在 `<data>/gateway/<attempt_id>.sock` 有一个 Gateway 入口，挂载到沙箱内的 `/run/agentbox/gateway.sock`（属主为环境映射 uid 1000、0600）；attempt 结束或取消生效时先在数据库撤销访问、再关闭入口。供应商 Key 只从宿主环境变量 `AGENTBOX_MODEL_API_KEY`、`AGENTBOX_SEARCH_API_KEY` 读取，不进入 Worker 的 init、沙箱环境变量与日志；`--worker-env` 的键须在白名单中（如 `PYTHONPATH`）。相关标志（含义与默认值见配置示例）：`--default-budget-micro` / `--budget-cap-micro`（task 层预算，微美元；任务可用 `limits.budget_micro` 指定，超过上限返回 `400 invalid_limits`）、`--model-base-url` / `--model-name` / `--models` / `--model-price-in-micro-per-mtok` / `--model-price-out-micro-per-mtok` / `--model-price`（OpenAI 兼容模型上游；不设 `--model-base-url` 时不提供模型端点；`--model-name` 是请求未指定 `model` 时的默认模型，`--models` 是声明的白名单（须包含默认模型），请求可按调用在其中选择 `model`，白名单外为 `400 unsupported_model`；`--model-price model=IN:OUT` 给出按模型的单价，用于预留估算与结算，只是配置、不代表供应商实际计费）、`--search-provider ddg_lite|tavily|serper|fake`（`serper` 为经 Serper.dev 的 Google 结果：`POST https://google.serper.dev/search`，Key 只放在 `X-API-KEY` 头；`tavily` 与 `serper` 都读同一个 `AGENTBOX_SEARCH_API_KEY`，未设置时 server 以退出码 2 拒绝启动。serper 已在演示服务器上以真实 Key 运行，见 [M3 服务器验收记录](evidence/2026-10-06-m3-server-acceptance.md)）、`--upstream-allow-private`（显式放行的私有上游，例如本机模型服务）。`agentbox task inspect` 除 attempt 与 checkpoint 外列出每个 Gateway 调用及其 try（端点、chat 调用解析后的模型、状态、费用、延迟、上游请求 ID；不含请求与响应正文）。
 
 ### 真实研究演示
 
@@ -95,7 +95,7 @@ Worker 在沙箱中以映射 UID 运行，只读看到宿主的 `/usr`、`/etc` 
 
 **主/从模型**：DeepResearch 的主 agent（编排：计划与最终报告）与任务内的 worker（各任务的总结）可以用不同的模型。任务 config 的 `orchestrator_model` 与 `worker_model` 决定每次 chat 调用请求体中的 `model`（未配置时不带 `model`，由 Gateway 用 `--model-name` 的默认模型）；两者都须在 server 的 `--models` 白名单中。模型名进入调用指纹，恢复后同一步骤重发同一模型。演示脚本默认编排 `kimi-k3`、worker `kimi-k2.6`，以 `--model-name <worker 模型> --models <白名单>` 启动 server，`inspect` 明细显示每个调用的模型（取自结果 blob 中上游回复的 `model` 字段）并检查路由：plan/report 为编排模型，任务内 chat 为 worker 模型。费用按配置的单价估算与结算，不代表供应商的实际计费。
 
-**变量**（变量名也列在 [`deploy/agentbox.env.example`](../deploy/agentbox.env.example)）：`AGENTBOX_DEMO_MODEL_BASE_URL`（默认 `https://api.moonshot.cn/v1`，OpenAI 兼容端点）、`AGENTBOX_DEMO_ORCHESTRATOR_MODEL`（默认 `kimi-k3`）、`AGENTBOX_DEMO_WORKER_MODEL`（默认 `kimi-k2.6`）、`AGENTBOX_DEMO_MODELS`（白名单，默认 `kimi-k2.6,kimi-k2.7-code,kimi-k2.7-code-highspeed,kimi-k3`）、`AGENTBOX_DEMO_MODEL_PRICES`（可选，`model=IN:OUT`，逗号分隔）、`AGENTBOX_DEMO_SEARCH_PROVIDER`（`ddg_lite` 默认、无 Key；`tavily` 需要 `AGENTBOX_SEARCH_API_KEY`；`serper` 需要 `AGENTBOX_SERPER_API_KEY`，脚本把它作为 `AGENTBOX_SEARCH_API_KEY` 交给 server，因此两种 Key 可并存于 `.env`，只读取所选供应商的那一行，并纳入 G3 与日志的 Key 泄漏检查；`serper` 的真实运行未在此执行）、`AGENTBOX_DEMO_TOPIC`（默认一个固定中文题目）、`AGENTBOX_DEMO_PRICE_IN_MICRO_PER_MTOK` / `AGENTBOX_DEMO_PRICE_OUT_MICRO_PER_MTOK`、`AGENTBOX_DEMO_BUDGET_MICRO`（可选）。模型 Key 取环境变量 `AGENTBOX_MODEL_API_KEY`，未设置时从仓库根的 `.env`（git 忽略；可用 `AGENTBOX_DEMO_ENV_FILE` 指定）中**只读取这一行**，不 `source` 整个文件；脚本只报告"已设置"，不打印、不写入任何文件，只经环境变量交给 server。
+**变量**（变量名也列在 [`deploy/agentbox.env.example`](../deploy/agentbox.env.example)）：`AGENTBOX_DEMO_MODEL_BASE_URL`（默认 `https://api.moonshot.cn/v1`，OpenAI 兼容端点）、`AGENTBOX_DEMO_ORCHESTRATOR_MODEL`（默认 `kimi-k3`）、`AGENTBOX_DEMO_WORKER_MODEL`（默认 `kimi-k2.6`）、`AGENTBOX_DEMO_MODELS`（白名单，默认 `kimi-k2.6,kimi-k2.7-code,kimi-k2.7-code-highspeed,kimi-k3`）、`AGENTBOX_DEMO_MODEL_PRICES`（可选，`model=IN:OUT`，逗号分隔）、`AGENTBOX_DEMO_SEARCH_PROVIDER`（`ddg_lite` 默认、无 Key；`tavily` 需要 `AGENTBOX_SEARCH_API_KEY`；`serper` 需要 `AGENTBOX_SERPER_API_KEY`，脚本把它作为 `AGENTBOX_SEARCH_API_KEY` 交给 server，因此两种 Key 可并存于 `.env`，只读取所选供应商的那一行，并纳入 G3 与日志的 Key 泄漏检查；`serper` 的真实运行见 M3 服务器验收记录）、`AGENTBOX_DEMO_TOPIC`（默认一个固定中文题目）、`AGENTBOX_DEMO_PRICE_IN_MICRO_PER_MTOK` / `AGENTBOX_DEMO_PRICE_OUT_MICRO_PER_MTOK`、`AGENTBOX_DEMO_BUDGET_MICRO`（可选）。模型 Key 取环境变量 `AGENTBOX_MODEL_API_KEY`，未设置时从仓库根的 `.env`（git 忽略；可用 `AGENTBOX_DEMO_ENV_FILE` 指定）中**只读取这一行**，不 `source` 整个文件；脚本只报告"已设置"，不打印、不写入任何文件，只经环境变量交给 server。
 
 **演练**（fake upstream 扮演模型、搜索与网页，不访问外网，原样回显请求的 `model`；Key 为随机生成的假值；其余流程与真实模式相同，含主/从模型路由检查。已在 WSL2 6.6 x86_64 上以 root 执行，16 步全部通过）：
 
@@ -155,7 +155,7 @@ ssh -L 8080:127.0.0.1:8080 ubuntu@<server>
 
 配置了模型上游（`--model-base-url`）时，server 启用用户账号，浏览器打开站点根路径即是面向用户的研究助手：
 
-1. **注册 / 登录**：用户名 3–32 位字母、数字、`_`、`.`、`-`；密码 8–128 个字符。会话保存在 `HttpOnly; Secure; SameSite=Strict` cookie 中，有效期 7 天。
+1. **注册 / 登录**：用户名 3–32 位字母、数字、`_`、`.`、`-`；注册密码 8–16 位，且至少包含数字、大写字母、小写字母中的两种（登录不校验此规则）。会话保存在 `HttpOnly; Secure; SameSite=Strict` cookie 中，有效期 7 天。
 2. **新研究**：只需输入研究主题。模型、搜索与预算由 server 固定（编排 `--user-orchestrator-model`，默认 `kimi-k3`；worker `--user-worker-model`，默认 `kimi-k2.6`）。每个用户同一时间最多 1 个进行中的研究。
 3. **我的研究**：只列出自己的研究；进度按"计划 → 子任务 → 报告"显示；完成后在页面中阅读报告（安全渲染）并下载。
 
@@ -169,7 +169,7 @@ sudo AGENTBOX_DATABASE_URL=... agentbox user disable <username>   # 同时吊销
 sudo AGENTBOX_DATABASE_URL=... agentbox user enable <username>
 ```
 
-演示服务器的常驻服务见 `deploy/systemd/agentbox-demo.service`（HTTPS 443、自签证书、serper、Redis、4C8G 资源与预算上限）。
+演示服务器的常驻服务见 `deploy/systemd/agentbox-demo.service.example`（HTTPS 443、自签证书、serper、Redis、4C8G 资源与预算上限；复制为 `/etc/systemd/system/agentbox-demo.service`，并在 `/etc/agentbox/agentbox.env` 中设置 `AGENTBOX_PUBLIC_HOST`）。
 
 ### 会话
 
@@ -222,15 +222,15 @@ CI=true CGO_ENABLED=0 go test -count=1 -p 1 -run 'TestRealExec|TestRealE3[5-8]' 
 
 ### 对话式助手
 
-启用会话后（`--session-worker-argv python3,-m,chatagent`），登录后打开站点根路径即是对话式研究助手：左栏是会话列表，中间是对话，右侧面板有"进度 / 来源 / 报告"三个标签（窄屏折叠为单列）。
+启用会话后（`--session-worker-argv python3,-m,chatagent`），登录后打开站点根路径即是对话式研究助手：左栏是会话列表，中间是对话，右侧面板有"进度 / 来源 / 报告"三个标签，默认收起，由对话标题栏的"进度"按钮或报告卡片打开、× 收起。宽屏下三栏之间的分隔线可拖动（或聚焦后用 ←/→ 每次 16 px），宽度记在本浏览器；窄屏（≤ 900 px）为单列，会话列表与面板以抽屉打开。
 
 - **新对话**：左栏"＋ 新对话"；首条消息的前 40 个字符作为标题。日常问题由模型直接回答（标注"直接回答"），也可从本会话的记忆（此前的回答与报告）作答。
-- **深度研究**：输入框中的"深度研究"开关强制研究（否则由模型决定）。Agent 先读取 deep-research skill，范围不明确时用**提问卡**问一轮（至多 3 个选择题，可选"其他"自填），然后写待办清单、把子主题并行交给各自的执行者检索与阅读，最后写带编号引用 `[n]` 的报告，报告末尾附系统生成的证据列表（引用只指向本轮读过的网页）。每轮 `web_search` + `web_fetch` 合计至多 30 次（第 31 次被 Gateway 拒绝）；额度用尽时用已有资料写报告并标注"已达工具额度"。
-- **步骤行**：读取 skill、待办清单、搜索网页、阅读网页等逐行显示、可展开；⟨/⟩ 显示发给模型或工具的请求与服务端脱敏后的响应，不含 Key、费用、模型名与内部调用 ID。
-- **停止 / 继续 / 立即写报告**：研究进行中点 ■ 停止，turn 暂停并显示停止卡（进度卡与 2–3 句"目前发现"）；"继续"从停止处接着研究，"立即写报告"（至少一个子主题完成时可用）用已有资料写出标注"部分"的报告。研究进行中不能发新消息（先停止当前研究）。
+- **深度研究**：输入框中的"深度研究"开关强制研究（否则由模型决定）。Agent 先读取 deep-research skill，范围不明确时用**提问卡**问一轮（至多 3 个选择题，可选"其他"自填），然后写待办清单、把子主题并行交给各自的执行者检索与阅读，最后写带编号引用 `[n]` 的报告，报告末尾附系统生成的证据列表（引用只指向本轮读过的网页）。抓取到的人机验证/拦截页不交给模型、不作为来源，步骤行标注"页面被拦截"（仍计入额度）。每轮 `web_search` + `web_fetch` 合计至多 30 次（第 31 次被 Gateway 拒绝）；额度用尽时用已有资料写报告并标注"已达工具额度"。报告生成后全文显示在对话中，其后是报告卡片（"部分""已达工具额度"标记），点击卡片在右侧"报告"标签中打开并可下载；撰写报告期间显示"正在整理资料并撰写报告… N 秒"。
+- **步骤行**：读取 skill、待办清单、搜索网页、阅读网页等逐行显示、可展开，按子主题分组；连续的"思考"与连续的"阅读网页"各合并为一行（如"阅读网页 · 5 个网页"），点击展开；一轮结束后整条链折叠为"研究过程 · N 步 · 用时"。⟨/⟩ 显示发给模型或工具的请求与服务端脱敏后的响应，不含 Key、费用、模型名与内部调用 ID。
+- **停止 / 继续 / 立即写报告**：研究进行中点输入框内的 ■ 停止，turn 暂停并显示停止卡（进度卡与 2–3 句"目前发现"）；"继续"从停止处接着研究，"立即写报告"（至少一个子主题完成时可用）用已有资料写出标注"部分"的报告。研究进行中输入框的发送按钮变为 ■（停止），不能发新消息。
 - **恢复**：停止后直接发新消息，原研究被取消但内容保留（卡片显示"已停止"与"恢复"），其来源与已完成的子主题摘要作为新一轮的上下文；之后点"恢复"会在同一会话开新一轮，从原研究的最后 checkpoint 继续，并获得新的 30 次额度。
 
-**安装与运维**：Worker 包（含 `chatagent` 与 `skills/`）安装到沙箱默认模板中的 `/opt/agentbox`，界面由 `--web-dir` 同源提供；演示服务器的常驻服务 `deploy/systemd/agentbox-demo.service` 即以下列配置运行（另加 TLS、Redis 与资源、预算参数）：
+**安装与运维**：Worker 包（含 `chatagent` 与 `skills/`）安装到沙箱默认模板中的 `/opt/agentbox`，界面由 `--web-dir` 同源提供；演示服务器的常驻服务 `deploy/systemd/agentbox-demo.service.example` 即以下列配置运行（另加 TLS、Redis 与资源、预算参数）：
 
 ```bash
 sudo bash scripts/dev/install-worker.sh /opt/agentbox   # agentbox_worker、deepresearch、chatagent、skills（与 sim_worker）
@@ -245,7 +245,7 @@ sudo -E ./bin/agentbox server --data-dir /var/lib/agentbox --web-dir web/dist \
 
 ### 并行研究（sub-run）
 
-用户侧无需任何操作：深度研究的子主题（2–4 个）作为同一 turn 内的 sub-run 并行执行。主 Agent（kimi-k3）负责规划与写报告，每个 sub-run 内的搜索/阅读循环由 kimi-k2.6 驱动。右侧"进度"面板中多个子主题同时显示"进行中"。每轮 30 次工具额度由全部 sub-run 共享。停止、继续、立即写报告与恢复的用法不变；已完成的子主题在继续或恢复后不会重跑。
+用户侧无需任何操作：深度研究的子主题（2–4 个）作为同一 turn 内的 sub-run 并行执行。主 Agent（kimi-k3）负责规划与写报告，每个 sub-run 内的搜索/阅读循环由 kimi-k2.6 驱动。对话中的步骤按子主题分组，右侧"进度"面板（标题栏"进度"按钮打开）中多个子主题同时显示"进行中"。每轮 30 次工具额度由全部 sub-run 共享。停止、继续、立即写报告与恢复的用法不变；已完成的子主题在继续或恢复后不会重跑。
 
 运维侧：
 

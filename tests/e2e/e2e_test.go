@@ -6353,7 +6353,7 @@ type sessUser struct {
 func (s *sessSys) user(name string) *sessUser {
 	s.t.Helper()
 	resp, err := http.Post(s.srv.base+"/auth/register", "application/json",
-		strings.NewReader(`{"username":"`+name+`","password":"correct horse battery"}`))
+		strings.NewReader(`{"username":"`+name+`","password":"Passw0rdX"}`))
 	if err != nil {
 		s.t.Fatal(err)
 	}

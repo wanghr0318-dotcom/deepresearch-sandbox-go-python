@@ -102,7 +102,7 @@ CI=true go test -count=1 ./internal/persistence/postgres/ ./tests/e2e/...
 
 [Recorded output](docs/evidence/2026-10-05-m1-demo-run.md).
 
-**Running the full assistant** (sandbox, Gateway, real models, chat UI) takes a model key and a search key. Step-by-step commands and every server flag are in the [usage reference](docs/usage.zh-CN.md). [`deploy/systemd/agentbox-demo.service`](deploy/systemd/agentbox-demo.service) is the unit the demo server runs.
+**Running the full assistant** (sandbox, Gateway, real models, chat UI) takes a model key and a search key. Step-by-step commands and every server flag are in the [usage reference](docs/usage.zh-CN.md). [`deploy/systemd/agentbox-demo.service.example`](deploy/systemd/agentbox-demo.service.example) is a template of the unit the demo server runs (copy it to `/etc/systemd/system/` and set `AGENTBOX_PUBLIC_HOST` in `/etc/agentbox/agentbox.env`).
 
 ## Repository layout
 

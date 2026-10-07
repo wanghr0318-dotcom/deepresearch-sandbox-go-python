@@ -246,7 +246,7 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if account.ValidatePassword(body.Password) != nil {
-		writeError(w, http.StatusBadRequest, "invalid_password", "密码须为 8–128 个字符")
+		writeError(w, http.StatusBadRequest, "invalid_password", "密码须为 8–16 位，且至少包含数字、大写字母、小写字母中的两种")
 		return
 	}
 	hash, err := account.HashPassword(body.Password)
