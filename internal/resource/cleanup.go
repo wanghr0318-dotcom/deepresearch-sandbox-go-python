@@ -160,7 +160,7 @@ const (
 //     最后一个 attempt 的范围；下个 attempt 启动时会重新 chown，无损）；
 //  2. UIDFiles：数据目录其他位置仍有归该范围的文件 → QuarantineUIDRange 并报警（I8 路径），不归还。
 //
-// 回收或核查出错时本轮不归还，留在待归还集合中由下一轮重试。成功归还、已隔离、没有范围或冲突（分配已变化，
+// 回收或核查出错时、环境的入口仍被持有时（Options.EntryHeld）本轮不归还，留在待归还集合中由下一轮重试。成功归还、已隔离、没有范围或冲突（分配已变化，
 // 重试无意义，交给启动核对）时移出待归还集合。
 func (c *Coordinator) releaseUIDRange(ctx context.Context, envID string) error {
 	ur, err := c.store.GetUIDRange(ctx, envID)
@@ -169,6 +169,11 @@ func (c *Coordinator) releaseUIDRange(ctx context.Context, envID string) error {
 		c.mu.Lock()
 		delete(c.pendingFree, envID)
 		c.mu.Unlock()
+		return nil
+	}
+	if err == nil && c.opt.EntryHeld != nil && c.opt.EntryHeld(envID) {
+		// 入口（Gateway socket）尚未撤销：它归该范围所有但不是残留。留在待归还集合中，撤销之后再核查归还
+		// （见 Options.EntryHeld）。
 		return nil
 	}
 	released := false

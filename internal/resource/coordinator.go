@@ -84,6 +84,12 @@ type Options struct {
 	// Alert 发出一条隔离报警（规格 §16.3 I8 的报警出口：结构化错误日志）；之后 coordinator 调用
 	// Store.MarkQuarantineAlerted。默认以 slog.Default() 记录 error 日志（字段与启动恢复的报警相同）。
 	Alert func(q Quarantine)
+	// EntryHeld 报告本进程是否仍持有环境的入口文件（Gateway 入口 socket：属主是该环境 UID 范围中映射的
+	// uid 1000，撤销访问时才删除）。为真时 cleanup 暂不回收、核查或归还该环境的 UID 范围，留在待归还集合中
+	// 由后续轮次重试：撤销可能晚于判决提交（Store 暂时不可用时撤销由 actor 的 Store 队列补提交，排在已入队的
+	// Finalize 之后），此时 socket 是仍在使用的入口，不是残留文件，不应隔离该范围。入口删除之后照常核查，
+	// 归还的前提（范围拥有的文件已不存在）不变。nil 表示没有这类入口。
+	EntryHeld func(envID string) bool
 }
 
 // ErrEnvStopped 表示环境已确认停止（stopped_at 已记录或待提交），不能再创建：停止之后到达的

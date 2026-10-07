@@ -136,10 +136,67 @@ type Edge struct {
 	closed   bool
 	bindings map[string]*binding // attempt_id → 独立 task 的入口
 	incs     map[string]*binding // incarnation_id → session 的入口
+	// removing 是已移出 bindings/incs、socket 文件尚未删除的入口数（env_id → 数量）：EnvHeld 在 socket
+	// 删除之前一直为真。
+	removing map[string]int
 
 	// connStateHook 是只供测试的观察点（生产中为 nil）：连接状态变化时在 edge 已更新自身连接集合之后调用；
 	// StateClosed 时该连接已从 attempt 的连接集合中移除。须在 Bind 之前设置。
 	connStateHook func(attemptID string, state http.ConnState)
+	// removeHook 是只供测试的观察点（生产中为 nil）：撤销入口时在删除其 socket 文件之前调用。
+	removeHook func(path string)
+}
+
+// EnvHeld 报告 envID 是否仍有入口的 socket 文件由本 Edge 持有：已绑定（attempt 或 incarnation 的入口），
+// 或正在撤销而 socket 尚未删除。socket 的属主是该环境 UID 范围中映射的 uid（provider 启动器 chown），
+// 因此为真时该环境的 UID 范围不能归还（resource.Options.EntryHeld）。
+func (e *Edge) EnvHeld(envID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.removing[envID] > 0 {
+		return true
+	}
+	for _, m := range []map[string]*binding{e.bindings, e.incs} {
+		for _, b := range m {
+			if b.envID == envID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// takeBinding 在 e.mu 内把入口移出 m，并登记为"socket 尚未删除"（由 removed 结束登记）。
+func (e *Edge) takeBinding(m map[string]*binding, id string) *binding {
+	b := m[id]
+	if b != nil {
+		delete(m, id)
+		e.removing[b.envID]++
+	}
+	return b
+}
+
+// removed 结束 takeBinding 的登记（socket 已删除或删除已失败）。
+func (e *Edge) removed(b *binding) {
+	if b == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.removing[b.envID]--; e.removing[b.envID] <= 0 {
+		delete(e.removing, b.envID)
+	}
+}
+
+// removeSocket 删除 socket 文件（不存在不是错误）。
+func (e *Edge) removeSocket(path string) error {
+	if e.removeHook != nil {
+		e.removeHook(path)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // New 创建 Edge。
@@ -159,7 +216,7 @@ func New(cfg Config, calls Calls, attempts Attempts) *Edge {
 	}
 	return &Edge{
 		cfg: cfg, calls: calls, attempts: attempts, log: log,
-		bindings: make(map[string]*binding), incs: make(map[string]*binding),
+		bindings: make(map[string]*binding), incs: make(map[string]*binding), removing: make(map[string]int),
 	}
 }
 
@@ -309,16 +366,16 @@ func (e *Edge) Detach(ctx context.Context, incarnationID, attemptID, reason stri
 // CancelAttempt：attempt 的离开原因经 Detach 转交，调用方应在撤销 incarnation 之前 Detach 当前 attempt。
 func (e *Edge) RevokeIncarnation(_ context.Context, incarnationID string) error {
 	e.mu.Lock()
-	b := e.incs[incarnationID]
-	delete(e.incs, incarnationID)
+	b := e.takeBinding(e.incs, incarnationID)
 	e.mu.Unlock()
+	defer e.removed(b) // socket 删除（或失败）之后才不再算作持有
 
 	if b != nil {
 		b.shutdown()
 		e.log.Info("gateway: incarnation 入口已撤销", "incarnation_id", incarnationID)
 	}
 	if idPattern.MatchString(incarnationID) {
-		if err := os.Remove(e.IncarnationSocketPath(incarnationID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := e.removeSocket(e.IncarnationSocketPath(incarnationID)); err != nil {
 			return fmt.Errorf("edge: 删除 incarnation %s 的 socket: %w", incarnationID, err)
 		}
 	}
@@ -372,8 +429,7 @@ func listenPrivate(log *slog.Logger, dir, path string) (*net.UnixListener, error
 // （只有 call.ReasonCancel 取消在途 try）。未绑定的 attempt 也会删除残留 socket 并转交 reason（幂等）。
 func (e *Edge) Revoke(ctx context.Context, attemptID string, reason string) error {
 	e.mu.Lock()
-	b := e.bindings[attemptID]
-	delete(e.bindings, attemptID)
+	b := e.takeBinding(e.bindings, attemptID)
 	e.mu.Unlock()
 
 	var err error
@@ -382,10 +438,11 @@ func (e *Edge) Revoke(ctx context.Context, attemptID string, reason string) erro
 		e.log.Info("gateway: attempt 入口已撤销", "attempt_id", attemptID, "reason", reason)
 	}
 	if idPattern.MatchString(attemptID) {
-		if rerr := os.Remove(e.SocketPath(attemptID)); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+		if rerr := e.removeSocket(e.SocketPath(attemptID)); rerr != nil {
 			err = fmt.Errorf("edge: 删除 attempt %s 的 socket: %w", attemptID, rerr)
 		}
 	}
+	e.removed(b) // socket 删除（或失败）之后才不再算作持有
 	e.calls.CancelAttempt(attemptID, reason)
 	return err
 }
@@ -396,22 +453,20 @@ func (e *Edge) Close() error {
 	e.mu.Lock()
 	e.closed = true
 	bs := make([]*binding, 0, len(e.bindings)+len(e.incs))
-	for _, b := range e.bindings {
-		bs = append(bs, b)
+	for _, m := range []map[string]*binding{e.bindings, e.incs} {
+		for id := range m {
+			bs = append(bs, e.takeBinding(m, id))
+		}
 	}
-	for _, b := range e.incs {
-		bs = append(bs, b)
-	}
-	e.bindings = make(map[string]*binding)
-	e.incs = make(map[string]*binding)
 	e.mu.Unlock()
 
 	var errs []error
 	for _, b := range bs {
 		b.shutdown()
-		if err := os.Remove(b.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := e.removeSocket(b.path); err != nil {
 			errs = append(errs, fmt.Errorf("edge: 删除 %s %s 的 socket: %w", b.idKey, b.id, err))
 		}
+		e.removed(b)
 	}
 	return errors.Join(errs...)
 }
