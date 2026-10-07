@@ -3,16 +3,24 @@
 循环可从任意 checkpoint 重入：待执行的工具调用由转录推出（最后一个 assistant 消息中尚无
 tool 结果的调用），提示词与工具参数只由状态确定性地生成。每个工具调用之后、每个子主题完成
 之后写 checkpoint；收尾指令在模型调用之前按已提交的状态确定性地追加，故恢复后的请求体不变。
+
+立即停止（stop-fix F1）：模型、工具与 run_python 调用经 Agent.call（SDK 的 run_call）发起，宿主请求
+暂停时不再等它们返回。Agent 记着最近一致的锚点——最近一次提交的状态及与之一起保存的 call id
+计数器（本 attempt 尚未提交时为第一次可放弃调用之前的状态与计数器）；放弃之后状态与计数器回到
+锚点，再写停止摘要、"stop" checkpoint 与停止卡。被放弃的调用在 Gateway 侧继续并记入 journal，
+恢复后从锚点确定性地重放到同一位置，以同一 call id 重发而得到其结果，不重复计费。
 """
 
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from agentbox_worker.errors import BudgetExhausted, WorkerFailure
+from agentbox_worker.errors import BudgetExhausted, CallAbandoned, WorkerFailure
 from agentbox_worker.runtime import Paused, TaskContext
 from agentbox_worker.tools import GatewayLike, ToolContext, ToolRegistry, ToolResult
 from agentbox_worker.tools.ask_user import AskUser
@@ -104,6 +112,11 @@ def _tool_count(messages: list[dict[str, Any]]) -> int:
     return sum(1 for m in messages if m.get("role") == "tool")
 
 
+def _copy(state: dict[str, Any]) -> dict[str, Any]:
+    """与活动状态无共享对象的副本（JSON 往返，同 checkpoint 的快照）。"""
+    return json.loads(json.dumps(state, ensure_ascii=False))
+
+
 class Agent:
     def __init__(
         self,
@@ -143,6 +156,10 @@ class Agent:
         )
         self.sub_registry = ToolRegistry([WebSearch(), WebFetch(), ReadSource()])
         self._strategy: str | None = None
+        # 停止时回退的锚点：(状态快照, call id 计数器)；_anchor_seq 为其提交序号（0 = 未提交的起点）
+        self._anchor: tuple[dict[str, Any], dict[str, int]] | None = None
+        self._anchor_seq = 0
+        self._seq = itertools.count(1)
 
     # ---- 入口 ----
 
@@ -160,27 +177,64 @@ class Agent:
             return await self._run()
         except _Pause as p:
             return LoopOutcome("paused", checkpoint_id=p.paused.checkpoint_id)
+        except CallAbandoned:  # 宿主请求暂停时放弃了在途调用：回到锚点后停止
+            paused = await self._stop(rollback=True)
+            return LoopOutcome("paused", checkpoint_id=paused.checkpoint_id)
         except BudgetExhausted:
             return await self._cost_budget_exhausted()
 
     async def commit(self, step_id: str) -> Paused | None:
         """压缩状态 → 写 checkpoint；之后宿主已请求暂停时返回 Paused。"""
-        st = self.state
-        st.compact()
-        await self.ctx.checkpoint(step_id, state=st.to_json(), refs=st.refs[-MAX_REFS:])
+        await self.save(step_id)
         if self.ctx.should_pause():
             return await self._stop()
         return None
 
-    async def _stop(self) -> Paused:
-        """宿主请求暂停：停止摘要（模型调用在 "stop" checkpoint 之前，call id 计数器随之保存）
-        → "stop" checkpoint → turn_stopped 停止卡。"""
+    async def save(self, step_id: str) -> str:
+        """压缩状态 → 写 checkpoint；提交后记为停止时回退的锚点。
+
+        计数器快照与 SDK 并入 checkpoint 的快照取于同一时刻（其间没有 await）。并发的提交（sub-run）
+        由 SDK 按调用顺序串行提交，锚点只前进到序号更大的那次。"""
+        st = self.state
+        st.compact()
+        state = st.to_json()
+        anchor = (_copy(state), self.ctx.call_ids.snapshot())
+        seq = next(self._seq)
+        cp = await self.ctx.checkpoint(step_id, state=state, refs=st.refs[-MAX_REFS:])
+        if seq > self._anchor_seq:
+            self._anchor, self._anchor_seq = anchor, seq
+        return cp
+
+    async def call(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        """可被暂停放弃的阻塞调用（模型、工具、run_python）：宿主请求暂停时抛出 CallAbandoned。
+
+        本 attempt 尚无锚点时先记下当前状态与计数器：此刻没有在途调用，二者一致，且恢复后从这里
+        确定性地重放（之前的变化只取决于已提交的状态）。"""
+        if self._anchor is None:
+            self._anchor = (_copy(self.state.to_json()), self.ctx.call_ids.snapshot())
+        return await self.ctx.run_call(fn, *args, **kwargs)
+
+    def _rollback(self) -> None:
+        """放弃在途调用之后：状态与 call id 计数器回到锚点。
+
+        状态换成锚点快照的新对象：被放弃的线程（工具在线程中更新额度与来源）只能改动旧对象，
+        不会影响停止卡与之后的 checkpoint；其线程也不能再占号（SDK 的 CallToken）。"""
+        if self._anchor is None:  # 本 attempt 没有发起过可放弃的调用：当前状态即一致
+            return
+        state, ids = self._anchor
+        self.state = TurnState.from_json(_copy(state))
+        self.ctx.rewind_call_ids(ids)
+
+    async def _stop(self, *, rollback: bool = False) -> Paused:
+        """宿主请求暂停：（放弃了在途调用时先回到锚点）停止摘要（模型调用在 "stop" checkpoint
+        之前，call id 计数器随之保存）→ "stop" checkpoint → turn_stopped 停止卡。"""
+        if rollback:
+            self._rollback()
         st = self.state
         st.stops += 1
         findings = await stop_summary(self.ctx, self.gw, st, self.cfg)
         st.stop_findings = findings
-        st.compact()
-        cp = await self.ctx.checkpoint(STOP_STEP, state=st.to_json(), refs=st.refs[-MAX_REFS:])
+        cp = await self.save(STOP_STEP)
         await self.emit.turn_stopped(stop_card(st), findings, can_finish(st))
         return Paused(cp)
 
@@ -218,7 +272,7 @@ class Agent:
                 st.restore_note = None
             self._maybe_close()
             tools = None if st.closing else self.registry.schemas(self._available())
-            reply = await asyncio.to_thread(
+            reply = await self.call(
                 call_model,
                 self.gw,
                 ORCH,
@@ -342,10 +396,7 @@ class Agent:
         pq = self.state.pending_question
         assert pq is not None
         await self.emit.ask_user(ORCH, pq["question_id"], pq["questions"])
-        self.state.compact()
-        cp = await self.ctx.checkpoint(
-            ASK_STEP, state=self.state.to_json(), refs=self.state.refs[-MAX_REFS:]
-        )
+        cp = await self.save(ASK_STEP)
         return LoopOutcome("awaiting", checkpoint_id=cp, question_id=pq["question_id"])
 
     # ---- 停止之后的指令 ----
@@ -459,13 +510,14 @@ class Agent:
             result = registry.dispatch(name, raw, tctx)
             if self.subruns and (result.control == RUN_SUBTOPIC or st.phase_subs is not None):
                 phase = await ResearchPhase(self).run()  # 全部子主题作为 sub-run 执行
-                if phase is None:  # 各 sub-run 已在工具边界返回：停止
-                    raise _Pause(await self._stop())
+                if phase is None:  # 各 sub-run 已在工具边界返回或放弃了在途调用：停止
+                    # 线程中的工具会直接更新共享的额度：回到最近一次提交的一致状态
+                    raise _Pause(await self._stop(rollback=True))
                 result = phase
             elif result.control == RUN_SUBTOPIC:
                 result = await run_subtopic(self, (result.data or {})["id"])
         else:
-            result = await asyncio.to_thread(registry.dispatch, name, raw, tctx)
+            result = await self.call(registry.dispatch, name, raw, tctx)
         if result.control == "await_user":
             return result
         transcript.append(_tool_message(tc["id"], name, result.content))

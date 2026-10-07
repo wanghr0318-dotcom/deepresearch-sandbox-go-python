@@ -5,10 +5,15 @@ asyncio.to_thread 调用，避免阻塞控制消息处理。每个请求使用�
 
 计费调用都携带确定性的 X-Agentbox-Call-Id（<subrun_id|root>/<step_id>/<kind>/<n>），序号由
 CallIds 持有；TaskContext 在 checkpoint 时把 CallIds 快照并入状态，恢复后续号不重复、不回退。
+
+可放弃的调用（TaskContext.run_call，stop-fix F1）：线程经 contextvars 带一个 CallToken；宿主请求
+暂停、应用放弃等待后 token 被标记，该线程此后占用 call id 或发出请求都以 CallAbandoned 在本地
+失败。
 """
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import http.client
 import json
@@ -24,6 +29,7 @@ from typing import Any
 from agentbox_worker.errors import (
     AccessRevoked,
     BudgetExhausted,
+    CallAbandoned,
     CallDeadlineExceeded,
     CallDivergence,
     CallInProgress,
@@ -83,6 +89,31 @@ TOOL_BUDGET_HEADER = "x-agentbox-tool-budget"
 _TOOL_BUDGET = re.compile(r"(\d{1,9})/(\d{1,9})")
 
 
+class CallToken:
+    """一次可放弃的阻塞调用的标记（TaskContext.run_call 在其线程的 contextvars 中设置）。
+
+    abandoned 一经置位不再复位；之后该线程占用 call id（CallIds.next）或发出请求
+    （GatewayClient._call）都以 CallAbandoned 在本地失败，不会越过回退后的计数器，也不会再计费。
+    """
+
+    __slots__ = ("abandoned",)
+
+    def __init__(self) -> None:
+        self.abandoned = False
+
+
+CURRENT_CALL: contextvars.ContextVar[CallToken | None] = contextvars.ContextVar(
+    "agentbox_current_call", default=None
+)
+
+
+def check_not_abandoned() -> None:
+    """当前线程所属的可放弃调用已被放弃时抛出 CallAbandoned（不在可放弃调用中时不做任何事）。"""
+    token = CURRENT_CALL.get()
+    if token is not None and token.abandoned:
+        raise CallAbandoned("调用已被放弃（宿主请求了暂停）：不再占用 call id、不再发出请求")
+
+
 class CallIds:
     """调用 ID 计数器：每个 (subrun|root, step_id, kind) 一个从 1 开始的序号。
 
@@ -101,6 +132,8 @@ class CallIds:
             raise ValueError("subrun_id 不能为空字符串")
         prefix = f"{subrun_id or 'root'}/{step_id}/{kind}"
         with self._lock:
+            # 在锁内检查：与 rewind 互斥，被放弃的调用不会在回退之后再占号
+            check_not_abandoned()
             n = self._last.get(prefix, 0) + 1
             call_id = f"{prefix}/{n}"
             if len(call_id.encode("utf-8")) > MAX_CALL_ID_BYTES:
@@ -111,6 +144,15 @@ class CallIds:
     def snapshot(self) -> dict[str, int]:
         with self._lock:
             return dict(self._last)
+
+    def rewind(self, snapshot: dict[str, int]) -> None:
+        """原地回退到 snapshot（同一对象：Gateway 客户端与替身共用它）。
+
+        用于放弃在途调用之后回到最近一致的状态：被放弃的调用已占的号被收回，恢复后以同一 ID
+        重发。调用方须先把被放弃调用的 CallToken 置位，否则其线程可能在回退之后再占号。"""
+        restored = CallIds.restore(snapshot)._last
+        with self._lock:
+            self._last = restored
 
     @classmethod
     def restore(cls, data: dict[str, int]) -> CallIds:
@@ -221,8 +263,10 @@ def default_timeout_s() -> float:
 class GatewayClient:
     """Gateway 的同步客户端。错误映射见 errors.py；call_in_progress 在客户端有界重试（同一 ID）。"""
 
-    # call_in_progress 的有界等待：指数退避，总等待不超过 in_progress_wait_s
-    in_progress_wait_s: float = 30.0
+    # call_in_progress 的有界等待：指数退避，总等待不超过 in_progress_wait_s。None（缺省）= 本次
+    # 调用的客户端超时：同一 ID 仍在进行只发生在重发被放弃或旧 attempt 留下的调用时（规格 E19），
+    # 正确的做法是等它结束后重放；固定的短上限会让停止后很快"继续"的 turn 以 CallInProgress 失败。
+    in_progress_wait_s: float | None = None
     in_progress_backoff_s: float = 0.5
     in_progress_backoff_max_s: float = 4.0
 
@@ -419,9 +463,13 @@ class GatewayClient:
             wall = limits.get("wall_ms") if isinstance(limits, dict) else None
             wall_ms = wall if isinstance(wall, int) and not isinstance(wall, bool) else None
             send_kw["timeout_s"] = max(self.timeout_s, exec_timeout_s(wall_ms))
-        deadline = time.monotonic() + self.in_progress_wait_s
+        wait = self.in_progress_wait_s
+        if wait is None:
+            wait = send_kw.get("timeout_s", self.timeout_s)
+        deadline = time.monotonic() + wait
         delay = self.in_progress_backoff_s
         while True:
+            check_not_abandoned()  # 被放弃的调用不再发出（含 call_in_progress 的重试）
             resp = self._send("POST", path, payload, headers, **send_kw)
             if 200 <= resp.status < 300:
                 return self._result(call_id, resp)
