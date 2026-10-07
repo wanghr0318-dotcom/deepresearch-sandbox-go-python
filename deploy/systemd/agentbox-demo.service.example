@@ -1,4 +1,7 @@
 # 演示服务器上的常驻 agentbox server（HTTPS 443，同源提供工作台）。
+# 本文件是示例：复制为 /etc/systemd/system/agentbox-demo.service，并在 /etc/agentbox/agentbox.env 中设置
+# AGENTBOX_PUBLIC_HOST=<你的域名或 IP>（systemd 从 EnvironmentFile 展开下面 ExecStart 中的 ${AGENTBOX_PUBLIC_HOST}）；
+# 然后 systemctl daemon-reload 并启动。
 # 安装：二进制 /usr/local/bin/agentbox；工作台 /opt/agentbox-web（web/dist）；worker 包 /opt/agentbox
 # （sudo bash scripts/dev/install-worker.sh /opt/agentbox：agentbox_worker、deepresearch、chatagent、skills）；
 # 机密只在 /etc/agentbox/agentbox.env（root 0600）：AGENTBOX_MODEL_API_KEY、AGENTBOX_SEARCH_API_KEY（serper 的 Key）、
@@ -18,8 +21,8 @@ EnvironmentFile=/etc/agentbox/agentbox.env
 ExecStart=/usr/local/bin/agentbox server \
   --data-dir /var/lib/agentbox \
   --listen 0.0.0.0:443 \
-  --allowed-host 49.235.41.14 \
-  --allowed-origin https://49.235.41.14 \
+  --allowed-host ${AGENTBOX_PUBLIC_HOST} \
+  --allowed-origin https://${AGENTBOX_PUBLIC_HOST} \
   --tls-cert /etc/agentbox/tls.crt --tls-key /etc/agentbox/tls.key \
   --web-dir /opt/agentbox-web \
   --worker-argv python3,-m,deepresearch \

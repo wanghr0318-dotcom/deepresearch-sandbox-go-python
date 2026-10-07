@@ -24,13 +24,13 @@
 
 ## 3. HTTPS 常驻服务（工作台同源提供）
 
-`deploy/systemd/agentbox-demo.service`：`--listen 0.0.0.0:443`、自签证书（SAN = IP 49.235.41.14）、`--web-dir /opt/agentbox-web`、serper、Redis、4 GiB 内存池、3 个 run slot、单任务预算 2 USD（上限 3 USD）。从公网（维护者本机）探测：
+`deploy/systemd/agentbox-demo.service`：`--listen 0.0.0.0:443`、自签证书（SAN = IP <server>）、`--web-dir /opt/agentbox-web`、serper、Redis、4 GiB 内存池、3 个 run slot、单任务预算 2 USD（上限 3 USD）。从公网（维护者本机）探测：
 
 | 请求 | 结果 |
 |---|---|
-| `GET https://49.235.41.14/` | 200 `text/html`（工作台） |
+| `GET https://<server>/` | 200 `text/html`（工作台） |
 | `GET /status`、`GET /tasks` 无 token | 401 `unauthorized` |
-| `http://49.235.41.14/`（明文 80） | 不可达（安全组未放通） |
+| `http://<server>/`（明文 80） | 不可达（安全组未放通） |
 
 浏览器中由项目负责人试用（工作台与随后的用户账号功能）待 Plan 11 完成后进行，结果追加到 [用户账号验收记录](2026-10-06-m3-accounts.md)。
 
@@ -62,7 +62,7 @@
      OK  18 个 .py 文件；/opt/agentbox/deepresearch 存在
 
 [04] 构建（CGO_ENABLED=0）并运行 doctor
-     OK  /home/ubuntu/go-agentbox-m3/bin/agentbox
+     OK  ~/<checkout>/bin/agentbox
          [通过] cgroup v2：cgroup v2、cgroup.kill（内核 ≥ 5.14）与必需控制器可用；内核 6.8.0-138-generic
          [通过] 新挂载 API（open_tree/mount_setattr）：open_tree 与 mount_setattr 可用
          [通过] close_range：close_range 可用（空区间返回 EINVAL）
@@ -70,7 +70,7 @@
          宿主环境检查通过
 
 [05] 启动 agentbox server（生产启动器、Gateway、Worker = python3 -m deepresearch）
-         agentbox server --data-dir /var/lib/agentbox-demo-m2 --listen 127.0.0.1:8080 --worker-argv python3,-m,deepresearch --model-base-url https://api.moonshot.cn/v1 --model-name kimi-k2.6 --models kimi-k2.6,kimi-k2.7-code,kimi-k2.7-code-highspeed,kimi-k3 --search-provider serper --web-dir /home/ubuntu/go-agentbox-m3/web/dist --redis-addr 127.0.0.1:6379
+         agentbox server --data-dir /var/lib/agentbox-demo-m2 --listen 127.0.0.1:8080 --worker-argv python3,-m,deepresearch --model-base-url https://api.moonshot.cn/v1 --model-name kimi-k2.6 --models kimi-k2.6,kimi-k2.7-code,kimi-k2.7-code-highspeed,kimi-k3 --search-provider serper --web-dir ~/<checkout>/web/dist --redis-addr 127.0.0.1:6379
      OK  server pid 81863 已就绪（http://127.0.0.1:8080，日志 /tmp/agentbox-demo-m2.BREBYV/server.log）
          工作台：浏览器打开 http://127.0.0.1:8080/（远程主机经 ssh -L 8080:127.0.0.1:8080 隧道访问）
 

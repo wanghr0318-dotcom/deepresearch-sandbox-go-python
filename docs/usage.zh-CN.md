@@ -169,7 +169,7 @@ sudo AGENTBOX_DATABASE_URL=... agentbox user disable <username>   # 同时吊销
 sudo AGENTBOX_DATABASE_URL=... agentbox user enable <username>
 ```
 
-演示服务器的常驻服务见 `deploy/systemd/agentbox-demo.service`（HTTPS 443、自签证书、serper、Redis、4C8G 资源与预算上限）。
+演示服务器的常驻服务见 `deploy/systemd/agentbox-demo.service.example`（HTTPS 443、自签证书、serper、Redis、4C8G 资源与预算上限；复制为 `/etc/systemd/system/agentbox-demo.service`，并在 `/etc/agentbox/agentbox.env` 中设置 `AGENTBOX_PUBLIC_HOST`）。
 
 ### 会话
 
@@ -230,7 +230,7 @@ CI=true CGO_ENABLED=0 go test -count=1 -p 1 -run 'TestRealExec|TestRealE3[5-8]' 
 - **停止 / 继续 / 立即写报告**：研究进行中点 ■ 停止，turn 暂停并显示停止卡（进度卡与 2–3 句"目前发现"）；"继续"从停止处接着研究，"立即写报告"（至少一个子主题完成时可用）用已有资料写出标注"部分"的报告。研究进行中不能发新消息（先停止当前研究）。
 - **恢复**：停止后直接发新消息，原研究被取消但内容保留（卡片显示"已停止"与"恢复"），其来源与已完成的子主题摘要作为新一轮的上下文；之后点"恢复"会在同一会话开新一轮，从原研究的最后 checkpoint 继续，并获得新的 30 次额度。
 
-**安装与运维**：Worker 包（含 `chatagent` 与 `skills/`）安装到沙箱默认模板中的 `/opt/agentbox`，界面由 `--web-dir` 同源提供；演示服务器的常驻服务 `deploy/systemd/agentbox-demo.service` 即以下列配置运行（另加 TLS、Redis 与资源、预算参数）：
+**安装与运维**：Worker 包（含 `chatagent` 与 `skills/`）安装到沙箱默认模板中的 `/opt/agentbox`，界面由 `--web-dir` 同源提供；演示服务器的常驻服务 `deploy/systemd/agentbox-demo.service.example` 即以下列配置运行（另加 TLS、Redis 与资源、预算参数）：
 
 ```bash
 sudo bash scripts/dev/install-worker.sh /opt/agentbox   # agentbox_worker、deepresearch、chatagent、skills（与 sim_worker）
