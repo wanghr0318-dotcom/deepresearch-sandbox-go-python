@@ -132,6 +132,8 @@ export interface TurnView {
   /** 本轮第一个与最后一个事件的时间（毫秒，取自事件 ts），用于"研究过程 · 用时"与"正在撰写报告 · N 秒" */
   startedAt?: number;
   lastEventAt?: number;
+  /** 进入 stopping 的时刻（毫秒，取自该 turn_status 事件的 ts），用于"正在停止… N 秒"；离开 stopping 后清除 */
+  stoppingSince?: number;
 }
 
 export interface ChatState {
@@ -686,6 +688,14 @@ export function applyEvent(state: ChatState, ev: SessionEvent): ChatState {
   let next = applyTurnEvent(turns[i]!, ev, restored);
   const at = Date.parse(ev.ts);
   if (Number.isFinite(at)) next = { ...next, startedAt: next.startedAt ?? at, lastEventAt: at };
+  if (ev.type === "turn_status") {
+    // 停止请求的时刻：第一次进入 stopping 时记下，重复的 stopping 不改；离开 stopping 后清除。
+    if (next.status !== "stopping") {
+      if (next.stoppingSince !== undefined) next = { ...next, stoppingSince: undefined };
+    } else if (next.stoppingSince === undefined && Number.isFinite(at)) {
+      next = { ...next, stoppingSince: at };
+    }
+  }
   turns[i] = next;
   if (ev.type === "turn_created") {
     // 恢复出的新一轮：源轮次不再显示"恢复"。
@@ -705,6 +715,23 @@ export function recordAnswers(state: ChatState, turnId: string, answers: string[
   const turns = state.turns.slice();
   turns[i] = { ...t, question: { ...t.question, answers: answers.slice() } };
   return { ...state, turns };
+}
+
+/** 已暂停且有停止卡（停止卡显示"继续"按钮的条件）。 */
+export function canContinueTurn(t: Pick<TurnView, "status" | "stop"> | undefined): boolean {
+  return t?.status === "paused" && t.stop !== undefined;
+}
+
+const CONTINUE_WORDS = new Set(["继续", "继续研究", "接着", "接着研究", "continue", "go on", "resume"]);
+const TRAILING_PUNCT = /[。.!！~～]+$/;
+
+/**
+ * 用户发送的文字是否只是"继续"（去首尾空白与句末标点后，不区分大小写）。
+ * 最新一轮已停止且可继续时，这样的消息改为调用该轮的"继续"，而不是新建一轮。
+ */
+export function isContinueCommand(text: string): boolean {
+  const s = text.trim().replace(TRAILING_PUNCT, "").trim().toLowerCase();
+  return CONTINUE_WORDS.has(s);
 }
 
 /** 右侧面板跟随的轮次：最近一轮研究（已走研究路径，或强制研究且尚未定路径）。 */

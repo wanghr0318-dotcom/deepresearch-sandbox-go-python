@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { sev, turn } from "../components/chat/chatkit";
 import { ApiError } from "../api/client";
-import { USER_ERRORS, activeResearchTurn, applyEvent, chatErrorMessage, emptyChat, recordAnswers, routeLabel, seedTurns, siteOf } from "./chat";
+import { USER_ERRORS, activeResearchTurn, applyEvent, canContinueTurn, chatErrorMessage, emptyChat, isContinueCommand, recordAnswers, routeLabel, seedTurns, siteOf } from "./chat";
 import type { ChatState } from "./chat";
 import type { SessionEvent } from "../api/chat";
-import { durationText, groupSteps, isWritingReport, turnFinished } from "./steps";
+import { durationText, groupSteps, isStopping, isWritingReport, stoppingSeconds, turnFinished } from "./steps";
 import type { StepRow } from "./chat";
 
 const SHA = "c".repeat(64);
@@ -467,5 +467,61 @@ describe("isWritingReport", () => {
     expect(isWritingReport({ ...(base as object), report: { artifactId: "r", version: 1, title: "T", partial: false, toolBudgetReached: false } } as never)).toBe(false);
     expect(isWritingReport({ ...(base as object), route: "answer" } as never)).toBe(false);
     expect(isWritingReport({ ...(base as object), subtopics: [] } as never)).toBe(false);
+  });
+});
+
+describe("stoppingSince", () => {
+  const at = (seq: number, type: string, ts: string, data: Record<string, unknown> = {}): SessionEvent =>
+    ({ ...sev(seq, type, data, "u1"), ts }) as SessionEvent;
+  it("records when the stop was requested, keeps it across repeated stopping events, and clears it afterwards", () => {
+    let s = started();
+    s = applyEvent(s, at(1, "thinking", "2026-10-07T00:00:00Z", { text: "想" }));
+    expect(s.turns[0]!.stoppingSince).toBeUndefined();
+    s = applyEvent(s, at(2, "turn_status", "2026-10-07T00:00:05Z", { status: "stopping" }));
+    expect(s.turns[0]!.stoppingSince).toBe(Date.parse("2026-10-07T00:00:05Z"));
+    s = applyEvent(s, at(3, "turn_status", "2026-10-07T00:00:09Z", { status: "stopping" }));
+    s = applyEvent(s, at(4, "thinking", "2026-10-07T00:00:12Z", { text: "还在想" }));
+    expect(s.turns[0]!.stoppingSince).toBe(Date.parse("2026-10-07T00:00:05Z"));
+    s = applyEvent(s, at(5, "turn_status", "2026-10-07T00:00:20Z", { status: "paused" }));
+    expect(s.turns[0]!.stoppingSince).toBeUndefined();
+  });
+});
+
+describe("isStopping / stoppingSeconds", () => {
+  const base = { status: "stopping", stop: undefined, stoppingSince: 1_000, lastEventAt: 4_000 } as never;
+  it("true only while stopping and before the stop card arrives", () => {
+    expect(isStopping(base)).toBe(true);
+    expect(isStopping({ ...(base as object), status: "paused" } as never)).toBe(false);
+    expect(isStopping({ ...(base as object), status: "running" } as never)).toBe(false);
+    expect(isStopping({ ...(base as object), stop: { findings: "f" } } as never)).toBe(false);
+  });
+  it("counts seconds from the stop request, falling back to the last event", () => {
+    expect(stoppingSeconds(base, 8_400)).toBe(7);
+    expect(stoppingSeconds(base, 0)).toBe(0);
+    expect(stoppingSeconds({ ...(base as object), stoppingSince: undefined } as never, 8_400)).toBe(4);
+    expect(stoppingSeconds({ status: "stopping" } as never, 8_400)).toBe(0);
+  });
+});
+
+describe("isContinueCommand", () => {
+  it("matches the continue words after trimming whitespace and trailing punctuation, case-insensitively", () => {
+    for (const s of ["继续", " 继续 ", "继续。", "继续研究", "接着", "接着研究！", "continue", "Continue.", "GO ON", "go on!", "resume", "继续~", "继续～", "继续!!"]) {
+      expect(isContinueCommand(s), s).toBe(true);
+    }
+  });
+  it("does not match anything else", () => {
+    for (const s of ["", "。", "继续研究，但只看中国", "请继续", "continue with China", "goon", "继续？", "继 续"]) {
+      expect(isContinueCommand(s), s).toBe(false);
+    }
+  });
+});
+
+describe("canContinueTurn", () => {
+  it("true only for a paused turn with a stop card", () => {
+    const stop = { todo: [], subtopicsDone: 0, subtopicsTotal: 0, sources: 0, budget: { used: 0, limit: 30 }, findings: "", canFinish: false };
+    expect(canContinueTurn({ status: "paused", stop } as never)).toBe(true);
+    expect(canContinueTurn({ status: "paused" } as never)).toBe(false);
+    expect(canContinueTurn({ status: "succeeded", stop } as never)).toBe(false);
+    expect(canContinueTurn(undefined)).toBe(false);
   });
 });
