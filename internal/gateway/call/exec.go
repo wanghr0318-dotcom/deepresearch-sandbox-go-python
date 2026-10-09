@@ -24,6 +24,7 @@ import (
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
@@ -358,7 +359,16 @@ func (c *Coordinator) ExecQuota(ctx context.Context, taskID string) (ExecQuota, 
 
 // Exec 处理 POST /v1/exec（§10.2）。Exec 为 nil 时返回 404 endpoint_not_configured。拒绝与失败以 Result 的
 // Status/Code 返回、err 为 nil；err 非空表示存储等内部故障，或 ctx 结束（exec 在后台继续并结算，供同 ID 重放）。
-func (c *Coordinator) Exec(ctx context.Context, in ExecInvoke) (Result, error) {
+func (c *Coordinator) Exec(ctx context.Context, in ExecInvoke) (res Result, err error) {
+	ctx, span := obs.Start(ctx, "gateway.call", callAttrs(kindExec, in.TaskID, in.AttemptID, in.CallID, in.SubrunID)...)
+	defer func() { endCall(span, kindExec, in.TaskID, res, err) }()
+	return c.execCall(ctx, in)
+}
+
+// kindExec 是 exec 调用在可观测性中的类别（gateway.kind、指标 kind 标签）。
+const kindExec = "exec"
+
+func (c *Coordinator) execCall(ctx context.Context, in ExecInvoke) (Result, error) {
 	if in.TaskID == "" || in.AttemptID == "" || in.CallID == "" {
 		return Result{}, fmt.Errorf("%w: Exec 缺少 task_id、attempt_id 或 call_id", persistence.ErrInvalid)
 	}
@@ -382,6 +392,7 @@ func (c *Coordinator) Exec(ctx context.Context, in ExecInvoke) (Result, error) {
 	}
 	j := &execJob{in: in, req: req, fp: fp}
 	j.ctx, j.cancel = context.WithCancelCause(c.root)
+	j.ctx = obs.Carry(j.ctx, ctx)
 	if !c.registerExec(j) {
 		j.cancel(nil)
 		c.unclaim(key)

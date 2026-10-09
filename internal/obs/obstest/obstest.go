@@ -230,6 +230,9 @@ func (r *Recorder) GatewayCall(kind, result string) {
 func (r *Recorder) UpstreamTry(kind, provider, model, outcome string, status int, _ time.Duration) {
 	r.add("UpstreamTry kind=%s provider=%s model=%s outcome=%s status=%d", kind, provider, model, outcome, status)
 }
+func (r *Recorder) BreakerTransition(kind, route, to string) {
+	r.add("BreakerTransition kind=%s route=%s to=%s", kind, route, to)
+}
 func (r *Recorder) Cost(kind, provider, model string, micro int64) {
 	r.add("Cost kind=%s provider=%s model=%s micro=%d", kind, provider, model, micro)
 }

@@ -23,6 +23,7 @@ import (
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/faultinject"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 )
 
 // hedgeRun 是一次可能对冲的 try 的进行状态（只在调用方 goroutine 中读写，results 除外）。
@@ -65,10 +66,13 @@ func (c *Coordinator) startLeg(ctx context.Context, j *job, rs *routeSet, h *hed
 	h.routes = append(h.routes, l.route)
 	h.running++
 	go func() {
+		// 每条腿一个 gateway.try span，在腿内、c.do 之前开始：对冲的两条腿是 gateway.call 下的兄弟 span。
+		tctx, span := obs.Start(lctx, "gateway.try", tryAttrs(rs, l, try)...)
 		begin := c.now()
 		resp, uerr, aborted := c.do(lctx, j, rs, l)
 		faultinject.Point(faultinject.CallInFlight)
-		r := legResult{leg: l, try: try, resp: resp, uerr: uerr, latency: c.now().Sub(begin), aborted: aborted}
+		r := legResult{leg: l, try: try, resp: resp, uerr: uerr, latency: c.now().Sub(begin), aborted: aborted,
+			span: span, tctx: tctx}
 		release()
 		lcancel(nil)
 		h.results <- r
@@ -137,7 +141,7 @@ func (c *Coordinator) finishLegs(j *job, rs *routeSet, h *hedgeRun, done []legRe
 		} else {
 			rs.report(r.leg, r.uerr, r.aborted)
 		}
-		c.logTry(j, rs, r)
+		c.logTry(j, rs, r, lost)
 		if !isFinal {
 			c.settleSibling(j, rs, r, lost)
 		}
@@ -188,6 +192,7 @@ func (c *Coordinator) settleSibling(j *job, rs *routeSet, r legResult, lost bool
 			st.Outcome, st.Error = string(upstream.OutcomeUnknown), CodeBlobWriteFailed
 		} else {
 			st.ActualMicro, st.ResultSHA256, st.ResultSize = c.costOn(j, rs, r.leg, r.resp.Usage), ref.SHA256, ref.Size
+			obs.M().Cost(string(j.in.Kind), legProvider(j, r.leg), j.model, st.ActualMicro) // 费用已发生（不是调用结果）
 		}
 	} else {
 		st.Error = r.uerr.Code

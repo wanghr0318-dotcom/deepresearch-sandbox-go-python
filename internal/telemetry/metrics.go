@@ -37,6 +37,7 @@ type metrics struct {
 	tries        *prometheus.CounterVec
 	tryDur       *prometheus.HistogramVec
 	cost         *prometheus.CounterVec
+	breakers     *prometheus.CounterVec
 	tools        *prometheus.HistogramVec
 
 	mu        sync.Mutex
@@ -70,13 +71,15 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Help: "Upstream try latency.", Buckets: latencyBuckets}, []string{"kind", "provider", "model"}),
 		cost: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "cost_micro_usd_total",
 			Help: "Settled actual cost of successful upstream calls in micro-USD."}, []string{"kind", "provider", "model"}),
+		breakers: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "breaker_transitions_total",
+			Help: "Circuit breaker state changes of model routes (to: closed, open, half_open)."}, []string{"kind", "route", "to"}),
 		tools: prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "tool_calls_per_task",
 			Help: "search/fetch/exec calls per task or turn, observed at the terminal verdict.", Buckets: toolBuckets}, []string{"kind"}),
 		toolCount: map[string]int{},
 		gauges:    &gaugeCollector{},
 	}
 	reg.MustRegister(m.httpReqs, m.httpDur, m.tasks, m.attempts, m.attemptReady, m.taskStart, m.stop, m.calls,
-		m.tries, m.tryDur, m.cost, m.tools, m.gauges)
+		m.tries, m.tryDur, m.cost, m.breakers, m.tools, m.gauges)
 	return m
 }
 
@@ -115,6 +118,10 @@ func (m *metrics) GatewayCall(kind, result string) { m.calls.WithLabelValues(kin
 func (m *metrics) UpstreamTry(kind, provider, model, outcome string, status int, d time.Duration) {
 	m.tries.WithLabelValues(kind, provider, model, strconv.Itoa(status), outcome).Inc()
 	m.tryDur.WithLabelValues(kind, provider, model).Observe(d.Seconds())
+}
+
+func (m *metrics) BreakerTransition(kind, route, to string) {
+	m.breakers.WithLabelValues(kind, route, to).Inc()
 }
 
 func (m *metrics) Cost(kind, provider, model string, micro int64) {

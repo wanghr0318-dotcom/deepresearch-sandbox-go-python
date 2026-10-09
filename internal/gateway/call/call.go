@@ -20,6 +20,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/cache"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 )
 
@@ -204,6 +205,8 @@ type Result struct {
 	Code       string
 	// ToolBudget 是搜索与抓取在任务有上限时的工具调用额度（X-Agentbox-Tool-Budget），含 429 与重放；其余为 nil。
 	ToolBudget *ToolBudget
+	// source 是成功结果的来源（只供可观测性）：空为上游，ResultCacheHit 或 ResultCoalesced。
+	source string
 }
 
 // Coordinator 是 Gateway 唯一的记账与 journal 所有者。
@@ -274,6 +277,7 @@ type job struct {
 	est      int64
 	ctx      context.Context // Coordinator 自有；CancelAttempt / CancelSubrun 以取消类原因取消
 	cancel   context.CancelCauseFunc
+	span     obs.Span // 本调用的 gateway.call span（关闭时为 no-op）
 }
 
 // New 构造 Coordinator。
@@ -525,7 +529,17 @@ func (c *Coordinator) CancelSubrun(taskID, attemptID, subrunID string) {
 
 // Invoke 执行一次计费调用（§9.4–§9.7）。Gateway 的拒绝与上游失败以 Result.Status/Code 返回、err 为 nil；
 // err 非空表示存储等内部故障，或 ctx 结束（此时调用仍在后台继续并结算）。
-func (c *Coordinator) Invoke(ctx context.Context, in Invoke) (Result, error) {
+//
+// 可观测性：一次调用一个 gateway.call span（ctx 中的父 span 由 edge 给出），后台执行经 obs.Carry 留在同一
+// trace 中，每个上游 try 一个 gateway.try 子 span；结果（completed、replayed、cache_hit、coalesced 或稳定错误码）
+// 记入 span 属性 call.result 与 agentbox_gateway_calls_total。
+func (c *Coordinator) Invoke(ctx context.Context, in Invoke) (res Result, err error) {
+	ctx, span := obs.Start(ctx, "gateway.call", callAttrs(string(in.Kind), in.TaskID, in.AttemptID, in.CallID, in.SubrunID)...)
+	defer func() { endCall(span, string(in.Kind), in.TaskID, res, err) }()
+	return c.invoke(ctx, span, in)
+}
+
+func (c *Coordinator) invoke(ctx context.Context, span obs.Span, in Invoke) (Result, error) {
 	if in.TaskID == "" || in.AttemptID == "" || in.CallID == "" {
 		return Result{}, fmt.Errorf("%w: Invoke 缺少 task_id、attempt_id 或 call_id", persistence.ErrInvalid)
 	}
@@ -564,13 +578,15 @@ func (c *Coordinator) Invoke(ctx context.Context, in Invoke) (Result, error) {
 	if err != nil {
 		return reject(upstream.CodeInvalidRequest), nil
 	}
+	span.SetAttrs(obs.Str("gateway.provider", ad.Provider()), obs.Str("gateway.model", model), obs.Int("budget.estimate_micro", est))
 
 	key := callKey{in.TaskID, in.CallID}
 	if !c.claim(key) {
 		return c.contended(ctx, in, fp)
 	}
-	j := &job{in: in, ad: ad, resolved: resolved, model: model, fp: fp, est: est}
+	j := &job{in: in, ad: ad, resolved: resolved, model: model, fp: fp, est: est, span: span}
 	j.ctx, j.cancel = context.WithCancelCause(c.root)
+	j.ctx = obs.Carry(j.ctx, ctx) // 后台执行留在调用的 trace 中（取消语义不变：派生自 j.ctx）
 	if !c.register(j) {
 		j.cancel(nil)
 		c.unclaim(key)
@@ -843,9 +859,9 @@ func (c *Coordinator) follow(j *job, rec CallRecord, f *flight) (Result, error) 
 		}
 		return Result{}, err
 	}
-	c.log.Info("gateway: coalesced", "task_id", in.TaskID, "attempt_id", in.AttemptID, "call_id", in.CallID,
+	c.log.InfoContext(j.ctx, "gateway: coalesced", "task_id", in.TaskID, "attempt_id", in.AttemptID, "call_id", in.CallID,
 		"endpoint", endpointOf(in.Kind), "provider", j.ad.Provider(), "blob", lr.BlobSHA256)
-	return Result{Body: lr.Body, BlobSHA256: lr.BlobSHA256, Status: 200}, nil
+	return Result{Body: lr.Body, BlobSHA256: lr.BlobSHA256, Status: 200, source: ResultCoalesced}, nil
 }
 
 // cacheable 报告类别是否使用共享缓存（§11.1：公开搜索结果与抓取页面；不缓存模型调用）。
@@ -895,9 +911,9 @@ func (c *Coordinator) resolveFromCache(j *job) (Result, bool, error) {
 		}
 		return Result{}, true, err
 	}
-	c.log.Info("gateway: cache hit", "task_id", in.TaskID, "attempt_id", in.AttemptID, "call_id", in.CallID,
+	c.log.InfoContext(j.ctx, "gateway: cache hit", "task_id", in.TaskID, "attempt_id", in.AttemptID, "call_id", in.CallID,
 		"endpoint", endpointOf(in.Kind), "provider", j.ad.Provider(), "blob", sha)
-	return Result{Body: body, BlobSHA256: sha, Status: 200}, true, nil
+	return Result{Body: body, BlobSHA256: sha, Status: 200, source: ResultCacheHit}, true, nil
 }
 
 // readResult 读取结果 blob，并确认其大小与 sha256 与期望一致（命中的内容在返回给 Worker 前再核对一次）。
@@ -1057,13 +1073,14 @@ func (c *Coordinator) execute(j *job, rec CallRecord) (Result, error) {
 		// 3. 上游 try：使用 Coordinator 自有上下文（期限 = deadline_at；adapter 的客户端另有自身超时）。启用对冲时
 		// 可能另有一条并发的腿；除最终结果之外的腿已在 runTry 中结算。
 		fr, legsTried := c.runTry(ctx, j, rs, l, try, release, tried)
+		callRoute(j, fr.leg) // gateway.call 的路由属性取最终结果那条腿
 		outcome, status, code := upstream.OutcomeOK, 200, ""
 		if fr.uerr != nil {
 			outcome, status, code = fr.uerr.Outcome, fr.uerr.Status, fr.uerr.Code
 		}
 		switch outcome {
 		case upstream.OutcomeOK:
-			return c.complete(j, fr.try, fr.resp, fr.latency, c.costOn(j, rs, fr.leg, fr.resp.Usage))
+			return c.complete(j, fr.try, fr.resp, fr.latency, c.costOn(j, rs, fr.leg, fr.resp.Usage), legProvider(j, fr.leg))
 		case upstream.OutcomeFatal:
 			if _, err := c.settle(Settlement{Try: fr.try, Outcome: "fatal", LatencyMs: fr.latency.Milliseconds(), Error: code}); err != nil {
 				return Result{}, err
@@ -1161,6 +1178,9 @@ type legResult struct {
 	uerr    *upstream.Error
 	latency time.Duration
 	aborted bool
+	// span 是这条腿的 gateway.try span（在腿内、c.do 之前开始，logTry 结束）；tctx 带着它（日志的 trace_id）。
+	span obs.Span
+	tctx context.Context
 }
 
 func (r legResult) outcome() upstream.Outcome {
@@ -1177,19 +1197,22 @@ func (c *Coordinator) runTry(ctx context.Context, j *job, rs *routeSet, l leg, t
 	if rs != nil && c.routing.HedgeDelay > 0 {
 		return c.runHedged(ctx, j, rs, l, try, release, tried)
 	}
+	tctx, span := obs.Start(ctx, "gateway.try", tryAttrs(rs, l, try)...)
 	start := c.now()
 	resp, uerr, aborted := c.do(ctx, j, rs, l)
 	faultinject.Point(faultinject.CallInFlight)
-	r := legResult{leg: l, try: try, resp: resp, uerr: uerr, latency: c.now().Sub(start), aborted: aborted}
+	r := legResult{leg: l, try: try, resp: resp, uerr: uerr, latency: c.now().Sub(start), aborted: aborted, span: span, tctx: tctx}
 	release()
 	rs.report(l, uerr, aborted)
-	c.logTry(j, rs, r)
+	c.logTry(j, rs, r, false)
 	return r, []int{l.route}
 }
 
 // logTry 写 "gateway: try" 日志行（不含请求与响应正文）。按路由执行时另带 route、route_skipped、hedge 与该路由
-// 熔断器的当前状态 breaker（属性名稳定，供指标与追踪使用）。
-func (c *Coordinator) logTry(j *job, rs *routeSet, r legResult) {
+// 熔断器的当前状态 breaker（属性名稳定，供指标与追踪使用）。它同时结束这条腿的 gateway.try span 并记录
+// agentbox_upstream_tries_total / _duration_seconds；lost 为对冲中落败而被取消的腿（try.outcome = hedge_lost）。
+func (c *Coordinator) logTry(j *job, rs *routeSet, r legResult, lost bool) {
+	endLeg(j, rs, r, lost)
 	in := j.in
 	status, code := 200, ""
 	if r.uerr != nil {
@@ -1202,7 +1225,11 @@ func (c *Coordinator) logTry(j *job, rs *routeSet, r legResult) {
 		attrs = append(attrs, "route", r.leg.provider, "route_skipped", r.leg.skipped, "hedge", r.leg.hedge,
 			"breaker", rs.breakers[r.leg.route].State().String())
 	}
-	c.log.Info("gateway: try", attrs...)
+	ctx := r.tctx
+	if ctx == nil {
+		ctx = j.ctx
+	}
+	c.log.InfoContext(ctx, "gateway: try", attrs...)
 }
 
 // pauseRequested 报告调用所属任务是否已请求暂停（task_control.desired = pause）：try 循环据此不再自动新建 try。
@@ -1221,7 +1248,7 @@ func (c *Coordinator) pauseRequested(in Invoke) bool {
 // complete 是第二个原子提交点：先完整保存结果 blob，再在单个事务中结算、completed 与 scope_blobs。
 // blob 保存失败时不能 completed：结果没有落地，try 按 unknown 结算（全额估算转 unknown，§9.6），不再重试。
 // actual 是按执行该 try 的供应商价格计算的实际费用（costOn）。
-func (c *Coordinator) complete(j *job, try Try, resp upstream.Response, latency time.Duration, actual int64) (Result, error) {
+func (c *Coordinator) complete(j *job, try Try, resp upstream.Response, latency time.Duration, actual int64, provider string) (Result, error) {
 	ctx, cancel := c.opCtx()
 	ref, err := c.blobs.Put(ctx, bytes.NewReader(resp.Body))
 	cancel()
@@ -1240,6 +1267,8 @@ func (c *Coordinator) complete(j *job, try Try, resp upstream.Response, latency 
 	if err != nil {
 		return Result{}, err
 	}
+	j.span.SetAttrs(obs.Int("cost.actual_micro", actual))
+	obs.M().Cost(string(j.in.Kind), provider, j.model, actual)
 	// 只有本次结算使调用 completed 时才写缓存（迟到的结算不改变 journal，也不产生缓存条目）。
 	if rec.State == StateCompleted && rec.ResultRef == ref.SHA256 {
 		c.offerCache(j, resp, ref, latency)

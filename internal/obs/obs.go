@@ -77,6 +77,8 @@ type Recorder interface {
 	GatewayCall(kind, result string)
 	// UpstreamTry is one upstream try.
 	UpstreamTry(kind, provider, model, outcome string, status int, d time.Duration)
+	// BreakerTransition is a circuit breaker of a model route changing state (to: closed, open, half_open).
+	BreakerTransition(kind, route, to string)
 	// Cost is the settled actual cost of an upstream call in micro-USD.
 	Cost(kind, provider, model string, micro int64)
 	// ToolCall counts a search/fetch/exec call against a task (observed per task at TaskFinished).
@@ -182,6 +184,7 @@ type nop struct{}
 
 func (nop) APIRequest(string, string, int, time.Duration)                  {}
 func (nop) TaskFinished(string, string, string)                            {}
+func (nop) BreakerTransition(string, string, string)                       {}
 func (nop) AttemptFinished(string, string)                                 {}
 func (nop) AttemptReady(string, time.Duration)                             {}
 func (nop) TaskStarted(string, time.Duration)                              {}
