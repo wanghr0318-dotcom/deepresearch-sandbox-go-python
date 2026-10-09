@@ -37,6 +37,8 @@ from agentbox_worker.errors import (
     ToolBudgetExhausted,
 )
 from agentbox_worker.protocol import valid_subrun_id
+from agentbox_worker.tracecontext import HEADER as TRACEPARENT_HEADER
+from agentbox_worker.tracecontext import valid_traceparent
 
 DEFAULT_SOCKET_PATH = "/run/agentbox/gateway.sock"
 MAX_CALL_ID_BYTES = 256
@@ -287,10 +289,14 @@ class GatewayClient:
         *,
         call_ids: CallIds,
         timeout_s: float | None = None,
+        traceparent: str | None = None,
     ) -> None:
+        """traceparent：宿主在 init / task_start 中给出的 W3C traceparent；合法时随每个请求发送
+        （traceparent 头），使本 Worker 的调用加入宿主的 trace；不合法或缺省时不发送。"""
         self.socket_path = socket_path
         self.call_ids = call_ids
         self.timeout_s = default_timeout_s() if timeout_s is None else timeout_s
+        self.traceparent = valid_traceparent(traceparent)
 
     # 调用归属：None = root（task 本身）；SubrunGateway 设为其 sub-run ID
     subrun_id: str | None = None
@@ -519,6 +525,8 @@ class GatewayClient:
         timeout_s: float | None = None,
     ) -> _Response:
         timeout = self.timeout_s if timeout_s is None else timeout_s
+        if self.traceparent is not None:
+            headers = {**headers, TRACEPARENT_HEADER: self.traceparent}
         conn = _UnixHTTPConnection(self.socket_path, timeout)
         try:
             try:
@@ -564,10 +572,13 @@ class SubrunGateway(GatewayClient):
         call_ids: CallIds,
         subrun_id: str,
         timeout_s: float | None = None,
+        traceparent: str | None = None,
     ) -> None:
         if not valid_subrun_id(subrun_id):
             raise ValueError(f"sub-run ID 不合法：{subrun_id!r}")
-        super().__init__(socket_path, call_ids=call_ids, timeout_s=timeout_s)
+        super().__init__(
+            socket_path, call_ids=call_ids, timeout_s=timeout_s, traceparent=traceparent
+        )
         self.subrun_id = subrun_id
         self._slots = threading.BoundedSemaphore(MAX_SUBRUN_IN_FLIGHT)
         self._closed = threading.Event()
@@ -582,6 +593,7 @@ class SubrunGateway(GatewayClient):
             call_ids=client.call_ids,
             subrun_id=subrun_id,
             timeout_s=client.timeout_s,
+            traceparent=client.traceparent,
         )
         view.in_progress_wait_s = client.in_progress_wait_s
         view.in_progress_backoff_s = client.in_progress_backoff_s
