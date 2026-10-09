@@ -1,0 +1,429 @@
+# Demo suite for `agentbox eval` (docs/design/2026-10-10-eval-platform-design.md).
+#
+# 10 coding/terminal tasks + 3 research questions. Coding checkers run in the exec sandbox (no network);
+# each prints PASS on success and exits non-zero otherwise. `reference` is a known-good solution
+# (`--agent reference` validates the harness); `fake_reply` is what the fake upstream answers in
+# zero-cost mode (`fakeupstream -eval-suite`) — 4 of them are deliberately wrong so the report shows
+# real failure categories (wrong exit code, checker timeout, prose instead of code).
+name: demo
+version: 1
+description: Coding/terminal tasks checked in the exec sandbox, plus DeepResearch questions.
+defaults:
+  timeout: 3m
+  wall_ms: 20000
+  limits: {budget_micro: 300000}
+tasks:
+  - id: fizzbuzz
+    kind: coding
+    tags: [python, basics]
+    prompt: |
+      Write fizzbuzz(n) that returns a list of strings for 1..n: "Fizz" for multiples of 3,
+      "Buzz" for multiples of 5, "FizzBuzz" for multiples of both, otherwise the number itself.
+    reference: |
+      def fizzbuzz(n):
+          out = []
+          for i in range(1, n + 1):
+              s = ("Fizz" if i % 3 == 0 else "") + ("Buzz" if i % 5 == 0 else "")
+              out.append(s or str(i))
+          return out
+    check: |
+      from solution import fizzbuzz
+      assert fizzbuzz(5) == ["1", "2", "Fizz", "4", "Buzz"]
+      assert fizzbuzz(15)[-1] == "FizzBuzz"
+      assert fizzbuzz(0) == []
+      print("PASS")
+    fake_reply: |
+      ```python
+      def fizzbuzz(n):
+          res = []
+          for i in range(1, n + 1):
+              if i % 15 == 0:
+                  res.append("FizzBuzz")
+              elif i % 3 == 0:
+                  res.append("Fizz")
+              elif i % 5 == 0:
+                  res.append("Buzz")
+              else:
+                  res.append(str(i))
+          return res
+      ```
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: word-freq
+    kind: coding
+    tags: [python, text]
+    prompt: |
+      Write top_words(text, n) returning the n most frequent words as (word, count) tuples. Words are
+      lowercase runs of letters a-z (split on anything else). Sort by count descending, then word
+      ascending.
+    reference: |
+      import re
+      from collections import Counter
+
+      def top_words(text, n):
+          c = Counter(re.findall(r"[a-z]+", text.lower()))
+          return sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+    check: |
+      from solution import top_words
+      t = "The cat and the hat. The CAT sat; a hat!"
+      assert top_words(t, 3) == [("the", 3), ("cat", 2), ("hat", 2)], top_words(t, 3)
+      assert top_words("", 2) == []
+      print("PASS")
+    fake_reply: |
+      Here is the solution:
+      ```python
+      import re
+      from collections import Counter
+
+
+      def top_words(text, n):
+          counts = Counter(re.findall(r"[a-z]+", text.lower()))
+          return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+      ```
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: csv-region-totals
+    kind: coding
+    tags: [terminal, csv]
+    prompt: |
+      Write a script that reads sales.csv (columns: region,amount, with a header row) from the current
+      directory and prints one line per region "<region> <total>" with the total rounded to 2 decimals,
+      regions in alphabetical order.
+    files:
+      sales.csv: |
+        region,amount
+        north,10.5
+        south,3
+        north,4.25
+        east,7
+        south,0.5
+    reference: |
+      import csv
+      from collections import defaultdict
+
+      totals = defaultdict(float)
+      with open("sales.csv", newline="") as f:
+          for row in csv.DictReader(f):
+              totals[row["region"]] += float(row["amount"])
+      for region in sorted(totals):
+          print(f"{region} {totals[region]:.2f}")
+    check: |
+      import subprocess, sys
+      p = subprocess.run([sys.executable, "solution.py"], capture_output=True, text=True, timeout=20)
+      sys.stderr.write(p.stderr)
+      assert p.returncode == 0, f"script exited {p.returncode}"
+      want = "east 7.00\nnorth 14.75\nsouth 3.50"
+      assert p.stdout.strip() == want, repr(p.stdout)
+      print("PASS")
+    fake_reply: |
+      ```python
+      totals = {}
+      for line in open("sales.csv"):
+          region, amount = line.strip().split(",")
+          totals[region] = totals.get(region, 0) + float(amount)
+      for region in sorted(totals):
+          print(f"{region} {totals[region]:.2f}")
+      ```
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: roman
+    kind: coding
+    tags: [python, basics]
+    prompt: Write to_roman(n) converting an integer 1..3999 to a Roman numeral string.
+    reference: |
+      def to_roman(n):
+          vals = [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+                  (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")]
+          out = ""
+          for v, s in vals:
+              while n >= v:
+                  out += s
+                  n -= v
+          return out
+    check: |
+      from solution import to_roman
+      cases = {1: "I", 4: "IV", 9: "IX", 14: "XIV", 40: "XL", 90: "XC", 400: "CD", 1994: "MCMXCIV", 3999: "MMMCMXCIX"}
+      for n, s in cases.items():
+          assert to_roman(n) == s, (n, to_roman(n))
+      print("PASS")
+    fake_reply: |
+      ```python
+      def to_roman(n):
+          table = [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+                   (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")]
+          parts = []
+          for value, sym in table:
+              count, n = divmod(n, value)
+              parts.append(sym * count)
+          return "".join(parts)
+      ```
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: binary-search
+    kind: coding
+    tags: [python, algorithms]
+    prompt: |
+      Write bsearch(xs, x) returning the index of x in the sorted list xs, or -1 if absent.
+      Must be O(log n).
+    reference: |
+      def bsearch(xs, x):
+          lo, hi = 0, len(xs) - 1
+          while lo <= hi:
+              mid = (lo + hi) // 2
+              if xs[mid] == x:
+                  return mid
+              if xs[mid] < x:
+                  lo = mid + 1
+              else:
+                  hi = mid - 1
+          return -1
+    check: |
+      from solution import bsearch
+      xs = list(range(0, 100, 3))
+      for i, v in enumerate(xs):
+          assert bsearch(xs, v) == i, (v, bsearch(xs, v))
+      assert bsearch(xs, 1) == -1 and bsearch([], 5) == -1 and bsearch([7], 7) == 0
+      print("PASS")
+    fake_reply: |
+      ```python
+      def bsearch(xs, x):
+          lo, hi = 0, len(xs) - 1
+          while lo < hi:
+              mid = (lo + hi) // 2
+              if xs[mid] == x:
+                  return mid
+              if xs[mid] < x:
+                  lo = mid + 1
+              else:
+                  hi = mid - 1
+          return -1
+      ```
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: json-flatten
+    kind: coding
+    tags: [python, data]
+    prompt: |
+      Write flatten(d) that flattens nested dicts into a single dict with dotted keys, e.g.
+      {"a": {"b": 1}, "c": 2} -> {"a.b": 1, "c": 2}. Non-dict values (including lists) are leaves.
+    reference: |
+      def flatten(d, prefix=""):
+          out = {}
+          for k, v in d.items():
+              key = f"{prefix}.{k}" if prefix else str(k)
+              if isinstance(v, dict) and v:
+                  out.update(flatten(v, key))
+              else:
+                  out[key] = v
+          return out
+    check: |
+      from solution import flatten
+      assert flatten({"a": {"b": 1, "c": {"d": [1, 2]}}, "e": 3}) == {"a.b": 1, "a.c.d": [1, 2], "e": 3}
+      assert flatten({}) == {}
+      print("PASS")
+    fake_reply: |
+      ```python
+      def flatten(d, prefix=""):
+          flat = {}
+          for key, value in d.items():
+              name = f"{prefix}.{key}" if prefix else str(key)
+              if isinstance(value, dict) and value:
+                  flat.update(flatten(value, name))
+              else:
+                  flat[name] = value
+          return flat
+      ```
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: log-5xx
+    kind: coding
+    tags: [terminal, logs]
+    prompt: |
+      Write a script that reads access.log in the current directory (one request per line:
+      "<ip> <method> <path> <status>") and prints a JSON object mapping each path to the number of
+      5xx responses, only for paths with at least one 5xx, keys sorted.
+    files:
+      access.log: |
+        10.0.0.1 GET /api/a 200
+        10.0.0.2 GET /api/b 503
+        10.0.0.3 POST /api/b 500
+        10.0.0.1 GET /api/c 404
+        10.0.0.4 GET /api/a 502
+        10.0.0.5 GET /api/b 200
+    reference: |
+      import json
+      from collections import Counter
+
+      c = Counter()
+      for line in open("access.log"):
+          parts = line.split()
+          if len(parts) == 4 and parts[3].startswith("5"):
+              c[parts[2]] += 1
+      print(json.dumps(dict(sorted(c.items()))))
+    check: |
+      import json, subprocess, sys
+      p = subprocess.run([sys.executable, "solution.py"], capture_output=True, text=True, timeout=20)
+      sys.stderr.write(p.stderr)
+      assert p.returncode == 0, p.returncode
+      assert json.loads(p.stdout) == {"/api/a": 1, "/api/b": 2}, p.stdout
+      print("PASS")
+    fake_reply: |
+      ```python
+      import json
+
+      errors = {}
+      with open("access.log") as f:
+          for line in f:
+              ip, method, path, status = line.split()
+              if status.startswith("5"):
+                  errors[path] = errors.get(path, 0) + 1
+      print(json.dumps(dict(sorted(errors.items()))))
+      ```
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: primes-fast
+    kind: coding
+    tags: [python, performance]
+    prompt: |
+      Write primes_below(n) returning the list of all primes < n. It must handle n = 3_000_000 in
+      well under a few seconds.
+    wall_ms: 12000
+    reference: |
+      def primes_below(n):
+          if n < 3:
+              return []
+          sieve = bytearray([1]) * n
+          sieve[0] = sieve[1] = 0
+          for i in range(2, int(n ** 0.5) + 1):
+              if sieve[i]:
+                  sieve[i * i::i] = bytearray(len(range(i * i, n, i)))
+          return [i for i in range(n) if sieve[i]]
+    check: |
+      from solution import primes_below
+      assert primes_below(30) == [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+      assert primes_below(2) == []
+      ps = primes_below(3_000_000)
+      assert len(ps) == 216816 and ps[-1] == 2999999, (len(ps), ps[-1:])
+      print("PASS")
+    fake_reply: |
+      ```python
+      def primes_below(n):
+          primes = []
+          for k in range(2, n):
+              if all(k % d for d in range(2, k)):
+                  primes.append(k)
+          return primes
+      ```
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: rle
+    kind: coding
+    tags: [python, strings]
+    prompt: |
+      Write rle_encode(s) and rle_decode(s) for run-length encoding of letters: "aaab" <-> "3a1b".
+      Runs may be longer than 9.
+    reference: |
+      import re
+
+      def rle_encode(s):
+          out, i = [], 0
+          while i < len(s):
+              j = i
+              while j < len(s) and s[j] == s[i]:
+                  j += 1
+              out.append(f"{j - i}{s[i]}")
+              i = j
+          return "".join(out)
+
+      def rle_decode(s):
+          return "".join(ch * int(n) for n, ch in re.findall(r"(\d+)(\D)", s))
+    check: |
+      from solution import rle_encode, rle_decode
+      assert rle_encode("aaab") == "3a1b"
+      assert rle_encode("") == ""
+      assert rle_encode("z" * 12) == "12z"
+      for s in ["abc", "aabbbcccc", "x" * 25 + "y"]:
+          assert rle_decode(rle_encode(s)) == s, s
+      print("PASS")
+    fake_reply: |
+      ```python
+      import itertools
+      import re
+
+
+      def rle_encode(s):
+          return "".join(f"{len(list(g))}{ch}" for ch, g in itertools.groupby(s))
+
+
+      def rle_decode(s):
+          return "".join(ch * int(n) for n, ch in re.findall(r"(\d+)(\D)", s))
+      ```
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: dedupe-lines
+    kind: coding
+    tags: [terminal, text]
+    prompt: |
+      Write a script that reads lines.txt in the current directory and prints its lines with
+      duplicates removed, keeping the first occurrence order. Lines compare after stripping
+      trailing whitespace.
+    files:
+      lines.txt: "b\na\nb  \nc\na\n"
+    reference: |
+      seen = set()
+      for line in open("lines.txt"):
+          key = line.rstrip()
+          if key not in seen:
+              seen.add(key)
+              print(key)
+    check: |
+      import subprocess, sys
+      p = subprocess.run([sys.executable, "solution.py"], capture_output=True, text=True, timeout=20)
+      sys.stderr.write(p.stderr)
+      assert p.returncode == 0, p.returncode
+      assert p.stdout.split() == ["b", "a", "c"], p.stdout
+      print("PASS")
+    fake_reply: |
+      To remove duplicate lines you can read the file into a set and print it back; sets
+      automatically discard duplicates, which is the simplest approach.
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: solid-state-battery
+    kind: research
+    tags: [research, energy]
+    topic: 固态电池的技术路线与量产进展
+    timeout: 15m
+    research: {max_tasks: 2, max_results: 3, max_fetch: 3}
+    limits: {budget_micro: 1500000}
+    expect: {min_citations: 3, min_locatable_ratio: 1.0, must_mention: [电解质]}
+    judge:
+      rubric: >-
+        The report should compare at least two electrolyte routes (sulfide, oxide, polymer), discuss
+        mass-production timelines or cost, and support claims with numbered citations.
+      threshold: 0.6
+
+  - id: sodium-ion-storage
+    kind: research
+    tags: [research, energy]
+    topic: 钠离子电池在储能中的应用前景
+    timeout: 15m
+    research: {max_tasks: 2, max_results: 3, max_fetch: 3}
+    limits: {budget_micro: 1500000}
+    expect: {min_citations: 3, min_locatable_ratio: 1.0}
+    judge:
+      rubric: >-
+        The report should cover cost and safety versus lithium-ion, at least one deployment example,
+        and use numbered citations.
+
+  - id: agent-sandbox-isolation
+    kind: research
+    tags: [research, infra]
+    topic: AI 智能体代码执行沙箱的隔离技术对比（容器、gVisor、Firecracker 微虚拟机）
+    timeout: 15m
+    research: {max_tasks: 2, max_results: 3, max_fetch: 3}
+    limits: {budget_micro: 1500000}
+    expect: {min_citations: 3, min_locatable_ratio: 1.0}
+    judge:
+      rubric: >-
+        The report should contrast namespaces/containers, gVisor and Firecracker on isolation strength
+        and startup overhead, with numbered citations.
