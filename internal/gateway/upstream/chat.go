@@ -21,6 +21,24 @@ type ChatConfig struct {
 	MaxTokensDefault int          // max_tokens 缺省值；≤ 0 时取 1024（不超过 MaxTokensCap）
 	MaxTokensCap     int          // max_tokens 上限，超出者截断（§9.6）；≤ 0 时取 4096
 	HTTP             *http.Client // 须来自验证 Dialer.HTTPClient；nil 时用默认 Dialer（8 MiB）
+	// PrimaryName 是主供应商的路由名（Router.Routes()[0]）；空时为 "primary"。
+	PrimaryName string
+	// Fallbacks 是按顺序的后备供应商（模型降级链）；空时只有主供应商，行为与引入降级链之前完全相同。
+	// 非空时（链模式）2xx 但没有非空 choices 数组的响应按 unknown / upstream_bad_response 处理（可转下一供应商）。
+	Fallbacks []ChatRoute
+}
+
+// ChatRoute 是降级链中的一个后备供应商（OpenAI 兼容）。
+type ChatRoute struct {
+	Name    string // 路由名（进入 call_tries.provider 与日志）
+	BaseURL string // 请求发往 BaseURL + "/chat/completions"
+	APIKey  string // 来自宿主环境变量（配置给出变量名）；只放在 Authorization 头
+	// Models 把逻辑模型（声明的白名单中的名字）映射为该供应商的模型名；不在其中的逻辑模型不由它提供。
+	// 空时以同名提供全部声明的模型。
+	Models         map[string]string
+	Pricing        Pricing            // 该供应商的默认价格表
+	PricingByModel map[string]Pricing // 按逻辑模型的价格表；缺项用 Pricing
+	HTTP           *http.Client       // 须来自验证 Dialer.HTTPClient；nil 时用默认 Dialer（8 MiB）
 }
 
 // PricingFor 返回模型的价格表：PricingByModel 中有该模型时取它，否则取默认 Pricing。
@@ -32,9 +50,20 @@ func (c ChatConfig) PricingFor(model string) Pricing {
 }
 
 type chatAdapter struct {
-	cfg     ChatConfig
-	allowed map[string]bool // Model ∪ Models
-	http    *http.Client
+	cfg      ChatConfig
+	allowed  map[string]bool // Model ∪ Models
+	http     *http.Client
+	routes   []chatRoute // 下标 0 为主供应商（由 cfg 构造）
+	strictOK bool        // 链模式：2xx 须有非空 choices
+}
+
+// chatRoute 是一个路由的执行参数。主供应商（下标 0）的 models 为 nil（逻辑模型名原样发出），价格取 cfg.PricingFor。
+type chatRoute struct {
+	name, baseURL, apiKey string
+	models                map[string]string
+	pricing               Pricing
+	pricingByModel        map[string]Pricing
+	http                  *http.Client
 }
 
 // NewChat 构造 OpenAI 兼容的 chat adapter（§9.3 子集：仅声明的模型、纯文本消息、非流式）。
@@ -51,7 +80,57 @@ func NewChat(cfg ChatConfig) Adapter {
 	}
 	cfg.MaxTokensDefault = min(cfg.MaxTokensDefault, cfg.MaxTokensCap)
 	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
-	return &chatAdapter{cfg: cfg, allowed: allowed, http: defaultClient(cfg.HTTP, DefaultModelMaxBody)}
+	if cfg.PrimaryName == "" {
+		cfg.PrimaryName = "primary"
+	}
+	a := &chatAdapter{cfg: cfg, allowed: allowed, http: defaultClient(cfg.HTTP, DefaultModelMaxBody), strictOK: len(cfg.Fallbacks) > 0}
+	a.routes = append(a.routes, chatRoute{name: cfg.PrimaryName, baseURL: cfg.BaseURL, apiKey: cfg.APIKey, http: a.http})
+	for _, r := range cfg.Fallbacks {
+		a.routes = append(a.routes, chatRoute{name: r.Name, baseURL: strings.TrimRight(r.BaseURL, "/"), apiKey: r.APIKey,
+			models: r.Models, pricing: r.Pricing, pricingByModel: r.PricingByModel, http: defaultClient(r.HTTP, DefaultModelMaxBody)})
+	}
+	return a
+}
+
+// Routes 实现 Router：主供应商在前，后备供应商按配置顺序。
+func (a *chatAdapter) Routes() []string {
+	out := make([]string, len(a.routes))
+	for i, r := range a.routes {
+		out[i] = r.name
+	}
+	return out
+}
+
+// Serves 实现 Router：主供应商提供全部声明的模型；后备供应商提供 Models 中的逻辑模型（Models 为空时全部）。
+func (a *chatAdapter) Serves(route int, model string) bool {
+	if route < 0 || route >= len(a.routes) || !a.allowed[model] {
+		return false
+	}
+	if route == 0 || len(a.routes[route].models) == 0 {
+		return true
+	}
+	_, ok := a.routes[route].models[model]
+	return ok
+}
+
+// PricingOn 实现 Router：主供应商为 cfg.PricingFor；后备供应商为其按模型的价格表，缺项用其默认价格表。
+func (a *chatAdapter) PricingOn(route int, model string) Pricing {
+	if route <= 0 || route >= len(a.routes) {
+		return a.cfg.PricingFor(model)
+	}
+	r := a.routes[route]
+	if p, ok := r.pricingByModel[model]; ok {
+		return p
+	}
+	return r.pricing
+}
+
+// providerModel 返回路由对逻辑模型使用的模型名（主供应商与未映射时原样）。
+func (r chatRoute) providerModel(model string) string {
+	if m, ok := r.models[model]; ok && m != "" {
+		return m
+	}
+	return model
 }
 
 func (a *chatAdapter) Kind() Kind       { return KindChat }
@@ -174,6 +253,12 @@ func checkAssistantFields(i int, role string, m map[string]json.RawMessage) *Err
 	return nil
 }
 
+// nonEmptyArray 报告 raw 是否为非空 JSON 数组。
+func nonEmptyArray(raw json.RawMessage) bool {
+	var xs []json.RawMessage
+	return json.Unmarshal(raw, &xs) == nil && len(xs) > 0
+}
+
 func hasToolCalls(m map[string]json.RawMessage) bool {
 	var calls []json.RawMessage
 	return json.Unmarshal(m["tool_calls"], &calls) == nil && len(calls) > 0
@@ -205,12 +290,15 @@ func chatInputs(resolved []byte) (inputEst, maxTokens int64, model string, e *Er
 
 // Estimate = input_estimate × 输入单价 + max_tokens × 输出单价（单价按每百万 token 微美元，各项向上取整）。
 // 单价取解析后模型的价格表（PricingFor）。
-func (a *chatAdapter) Estimate(resolved []byte) (int64, error) {
+func (a *chatAdapter) Estimate(resolved []byte) (int64, error) { return a.EstimateOn(0, resolved) }
+
+// EstimateOn 实现 Router：同 Estimate，单价取该路由的价格表（PricingOn）。
+func (a *chatAdapter) EstimateOn(route int, resolved []byte) (int64, error) {
 	in, maxTok, model, e := chatInputs(resolved)
 	if e != nil {
 		return 0, e
 	}
-	p := a.cfg.PricingFor(model)
+	p := a.PricingOn(route, model)
 	ci, err := mulCeil(in, p.InputMicroPerMTok, microPerMillionTokens)
 	if err != nil {
 		return 0, err
@@ -226,8 +314,9 @@ func (a *chatAdapter) Estimate(resolved []byte) (int64, error) {
 }
 
 type chatReply struct {
-	ID    string `json:"id"`
-	Usage *struct {
+	ID      string          `json:"id"`
+	Choices json.RawMessage `json:"choices"` // 只在链模式下检查（非空数组）
+	Usage   *struct {
 		PromptTokens     int64 `json:"prompt_tokens"`
 		CompletionTokens int64 `json:"completion_tokens"`
 	} `json:"usage"`
@@ -236,27 +325,52 @@ type chatReply struct {
 // Do 发出非流式请求。2xx 且可解析 → ok（Body 为上游原文）；上游未返回 usage 时按保守估算计量
 // （input_estimate、max_tokens）；2xx 但无法解析 → unknown（已发出、用量无法确认）。
 func (a *chatAdapter) Do(ctx context.Context, resolved []byte) (Response, *Error) {
-	in, maxTok, _, e := chatInputs(resolved)
+	return a.DoOn(ctx, 0, resolved)
+}
+
+// DoOn 实现 Router：向该路由发出请求（请求体的 model 换成该供应商的模型名，其余不变）。链模式下 2xx 但没有
+// 非空 choices 的响应为 unknown / upstream_bad_response（已发出、可能已计费；Coordinator 可转下一供应商）。
+func (a *chatAdapter) DoOn(ctx context.Context, route int, resolved []byte) (Response, *Error) {
+	if route < 0 || route >= len(a.routes) {
+		return Response{}, fatalf(http.StatusBadGateway, CodeUnsupportedProvider, "路由 %d 不存在", route)
+	}
+	rt := a.routes[route]
+	in, maxTok, model, e := chatInputs(resolved)
 	if e != nil {
 		return Response{}, e
 	}
-	req, err := http.NewRequest(http.MethodPost, a.cfg.BaseURL+"/chat/completions", bytes.NewReader(resolved))
+	if pm := rt.providerModel(model); pm != model {
+		obj, e := decodeObject(resolved)
+		if e != nil {
+			return Response{}, e
+		}
+		obj["model"], _ = json.Marshal(pm)
+		out, err := json.Marshal(obj)
+		if err != nil {
+			return Response{}, fatalf(http.StatusBadRequest, CodeInvalidRequest, "无法编码请求")
+		}
+		resolved = out
+	}
+	req, err := http.NewRequest(http.MethodPost, rt.baseURL+"/chat/completions", bytes.NewReader(resolved))
 	if err != nil {
 		return Response{}, newErr(OutcomeFatal, http.StatusBadGateway, CodeInvalidURL, errors.New("模型上游地址不合法"))
 	}
 	req.Header.Set("Content-Type", contentTypeJSON)
 	req.Header.Set("Accept", contentTypeJSON)
 	req.Header.Set("User-Agent", userAgent)
-	if a.cfg.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+a.cfg.APIKey)
+	if rt.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+rt.apiKey)
 	}
-	r, e := exchange(ctx, a.http, req, true)
+	r, e := exchange(ctx, rt.http, req, true)
 	if e != nil {
 		return Response{RetryAfter: r.retryAfter}, e
 	}
 	var reply chatReply
 	if err := json.Unmarshal(r.body, &reply); err != nil {
 		return Response{}, newErr(OutcomeUnknown, http.StatusBadGateway, CodeUpstreamBadResponse, errors.New("上游响应不是合法 JSON"))
+	}
+	if a.strictOK && !nonEmptyArray(reply.Choices) {
+		return Response{}, newErr(OutcomeUnknown, http.StatusBadGateway, CodeUpstreamBadResponse, errors.New("上游响应没有 choices"))
 	}
 	usage := Usage{Requests: 1, ResponseBytes: int64(len(r.body)), InputTokens: in, OutputTokens: maxTok}
 	if reply.Usage != nil {

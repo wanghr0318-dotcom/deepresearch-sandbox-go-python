@@ -124,6 +124,17 @@ type Adapter interface {
 	Do(ctx context.Context, resolved []byte) (Response, *Error)
 }
 
+// Router 是带供应商链的 adapter（模型降级链，docs/design/2026-10-10-model-fallback-design.md §4.2）。
+// 路由 0 是主供应商：Estimate、Do 等价于 EstimateOn(0)、DoOn(0)。路由只改变"由谁执行"，不改变逻辑请求：
+// 规范化请求体、指纹与 applied_defaults 与路由无关。Coordinator 只在 len(Routes()) > 1 时按路由执行。
+type Router interface {
+	Routes() []string                                     // 路由名（进入 call_tries.provider 与日志），下标 0 为主供应商
+	Serves(route int, model string) bool                  // 该路由是否提供（逻辑）模型；否则跳过（model_not_served）
+	EstimateOn(route int, resolved []byte) (int64, error) // 按该路由的价格估算（预留）
+	DoOn(ctx context.Context, route int, resolved []byte) (Response, *Error)
+	PricingOn(route int, model string) Pricing // 该路由对（逻辑）模型的价格表（结算）
+}
+
 // Pricing 是价格表；Version 标识价格表版本。
 type Pricing struct {
 	Version                                     string
