@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -57,13 +58,42 @@ func (f *fakeRoutes) calls(i int) int {
 	return n
 }
 
-// routeLimits makes backoff long (1 s) so a test can tell immediate failover from a backoff.
+// routeLimits makes any backoff impossible: a backoff of 1 h would exceed the 10 s call deadline, so the
+// Coordinator gives up with call_deadline_exceeded instead of waiting. A successful failover under these limits
+// therefore proves it happened without backoff — deterministically, without wall-clock assertions.
 func routeLimits() Limits {
-	return Limits{CallDeadline: 10 * time.Second, ModelCallDeadline: 10 * time.Second, BackoffBase: time.Second, BackoffMax: time.Second}
+	return Limits{CallDeadline: 10 * time.Second, ModelCallDeadline: 10 * time.Second, BackoffBase: time.Hour, BackoffMax: time.Hour}
 }
 
-func newRouteHarness(t *testing.T, lim Limits, rc RoutingConfig, fr *fakeRoutes) *harness {
+// shortBackoff is for tests that need a real round of backoff.
+func shortBackoff() Limits {
+	lim := routeLimits()
+	lim.BackoffBase, lim.BackoffMax = time.Millisecond, time.Millisecond
+	return lim
+}
+
+// testClock is the breakers' injected clock (RoutingConfig.breakerNow); deadlines still use real time.
+type testClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *testClock) now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.t }
+func (c *testClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
+type routeHarness struct {
+	*harness
+	clk *testClock
+}
+
+func newRouteHarness(t *testing.T, lim Limits, rc RoutingConfig, fr *fakeRoutes) routeHarness {
 	t.Helper()
+	clk := &testClock{t: time.Unix(1_000_000, 0)}
+	rc.breakerNow = clk.now
 	h := &harness{store: newFakeStore(t), ad: fr.fakeAdapter, blobs: &fakeBlobs{m: map[string][]byte{}}, events: &fakeEvents{},
 		logs: &syncBuffer{}}
 	c, err := New(Config{
@@ -76,7 +106,7 @@ func newRouteHarness(t *testing.T, lim Limits, rc RoutingConfig, fr *fakeRoutes)
 	}
 	t.Cleanup(c.Close)
 	h.c = c
-	return h
+	return routeHarness{harness: h, clk: clk}
 }
 
 func providers(tries []TryRecord) string {
@@ -88,6 +118,9 @@ func providers(tries []TryRecord) string {
 		}
 		if tr.Hedge {
 			p += "+hedge"
+		}
+		if tr.HedgeLost {
+			p += "+lost"
 		}
 		parts = append(parts, p)
 	}
@@ -102,22 +135,17 @@ func states(c *Coordinator) string {
 	return strings.Join(parts, ",")
 }
 
-// A down → B serves, immediately (no backoff between providers); the try rows say which provider ran and
-// why the next one was chosen; B's settlement uses B's price; the logical call (fingerprint, model) is the
-// same as without fallback.
+// A down → B serves without backoff (routeLimits makes any backoff fail the call); the try rows say which
+// provider ran and why the next one was chosen; B's settlement uses B's price; the logical call (fingerprint,
+// model) is the same as without fallback.
 func TestRouteFailoverAToB(t *testing.T) {
 	fr := newRoutes("primary", "backup")
 	fr.setDown(0, true)
 	fr.legs[1].script = []step{{body: `{"answer":"from-b"}`, usage: upstream.Usage{InputTokens: 10, OutputTokens: 20}}}
 	h := newRouteHarness(t, routeLimits(), RoutingConfig{}, fr)
-	start := time.Now()
 	r := h.invoke(t, inv("c1", chatBody))
-	elapsed := time.Since(start)
 	if r.Status != 200 || string(r.Body) != `{"answer":"from-b"}` {
-		t.Fatalf("result %+v", r)
-	}
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("failover waited %s (backoff is 1 s): should be immediate", elapsed)
+		t.Fatalf("result %+v (a backoff would have been call_deadline_exceeded)", r)
 	}
 	rec, tries := h.call(t, "t1", "c1")
 	if got := providers(tries); got != "primary/retryable backup/ok[primary:tried]" {
@@ -142,12 +170,12 @@ func TestRouteFailoverAToB(t *testing.T) {
 }
 
 // A flapping: consecutive failures open A's breaker; while open A is skipped without a try
-// ("primary:circuit_open"); after the open duration one half-open probe goes to A; a failing probe re-opens
-// it, a succeeding probe closes it.
+// ("primary:circuit_open"); after the open duration (fake clock) one half-open probe goes to A; a failing probe
+// re-opens it, a succeeding probe closes it.
 func TestRouteBreakerOpensAndHalfOpens(t *testing.T) {
 	fr := newRoutes("primary", "backup")
 	fr.setDown(0, true)
-	h := newRouteHarness(t, routeLimits(), RoutingConfig{BreakerFailures: 2, BreakerOpen: 150 * time.Millisecond}, fr)
+	h := newRouteHarness(t, routeLimits(), RoutingConfig{BreakerFailures: 2, BreakerOpen: time.Minute}, fr)
 	for _, id := range []string{"c1", "c2"} {
 		if r := h.invoke(t, inv(id, chatBody)); r.Status != 200 {
 			t.Fatalf("%s %+v", id, r)
@@ -157,16 +185,14 @@ func TestRouteBreakerOpensAndHalfOpens(t *testing.T) {
 		t.Fatalf("after 2 failures: %s", got)
 	}
 	aCalls := fr.calls(0)
-	start := time.Now()
-	r := h.invoke(t, inv("c3", chatBody))
-	if r.Status != 200 || fr.calls(0) != aCalls || time.Since(start) > 100*time.Millisecond {
+	if r := h.invoke(t, inv("c3", chatBody)); r.Status != 200 || fr.calls(0) != aCalls {
 		t.Fatalf("open A must be skipped without a try: %+v, A calls %d→%d", r, aCalls, fr.calls(0))
 	}
 	if _, tries := h.call(t, "t1", "c3"); providers(tries) != "backup/ok[primary:circuit_open]" {
 		t.Fatalf("c3 tries %s", providers(tries))
 	}
 	// Probe fails → open again.
-	time.Sleep(160 * time.Millisecond)
+	h.clk.advance(time.Minute)
 	h.invoke(t, inv("c4", chatBody))
 	if _, tries := h.call(t, "t1", "c4"); providers(tries) != "primary/retryable backup/ok[primary:tried]" {
 		t.Fatalf("c4 (failed probe) tries %s", providers(tries))
@@ -174,12 +200,18 @@ func TestRouteBreakerOpensAndHalfOpens(t *testing.T) {
 	if got := states(h.c); got != "primary:open,backup:closed" {
 		t.Fatalf("after failed probe: %s", got)
 	}
+	// Still open just before the duration elapses again.
+	h.clk.advance(time.Minute - time.Second)
+	h.invoke(t, inv("c5", chatBody))
+	if _, tries := h.call(t, "t1", "c5"); providers(tries) != "backup/ok[primary:circuit_open]" {
+		t.Fatalf("c5 tries %s", providers(tries))
+	}
 	// A recovers; the next probe succeeds and closes the breaker.
 	fr.setDown(0, false)
-	time.Sleep(160 * time.Millisecond)
-	h.invoke(t, inv("c5", chatBody))
-	if _, tries := h.call(t, "t1", "c5"); providers(tries) != "primary/ok" {
-		t.Fatalf("c5 (probe) tries %s", providers(tries))
+	h.clk.advance(time.Second)
+	h.invoke(t, inv("c6", chatBody))
+	if _, tries := h.call(t, "t1", "c6"); providers(tries) != "primary/ok" {
+		t.Fatalf("c6 (probe) tries %s", providers(tries))
 	}
 	if got := states(h.c); got != "primary:closed,backup:closed" {
 		t.Fatalf("after successful probe: %s", got)
@@ -199,9 +231,7 @@ func TestRouteAllDownDegraded(t *testing.T) {
 	fr := newRoutes("primary", "backup")
 	fr.setDown(0, true)
 	fr.setDown(1, true)
-	lim := routeLimits()
-	lim.BackoffBase, lim.BackoffMax = 10*time.Millisecond, 10*time.Millisecond
-	h := newRouteHarness(t, lim, RoutingConfig{BreakerFailures: 1, BreakerOpen: time.Minute}, fr)
+	h := newRouteHarness(t, shortBackoff(), RoutingConfig{BreakerFailures: 1, BreakerOpen: time.Minute}, fr)
 	r := h.invoke(t, inv("c1", chatBody))
 	if r.Status != 503 || r.Code != CodeModelDegraded {
 		t.Fatalf("c1 %+v", r)
@@ -210,14 +240,9 @@ func TestRouteAllDownDegraded(t *testing.T) {
 		t.Fatalf("c1 tries %s", providers(tries))
 	}
 	before := fr.calls(0) + fr.calls(1)
-	start := time.Now()
 	r = h.invoke(t, inv("c2", chatBody))
-	elapsed := time.Since(start)
-	if r.Status != 503 || r.Code != CodeModelDegraded {
-		t.Fatalf("c2 %+v", r)
-	}
-	if elapsed > 50*time.Millisecond || fr.calls(0)+fr.calls(1) != before {
-		t.Fatalf("degraded must be fast and contact no provider: %s, calls %d→%d", elapsed, before, fr.calls(0)+fr.calls(1))
+	if r.Status != 503 || r.Code != CodeModelDegraded || fr.calls(0)+fr.calls(1) != before {
+		t.Fatalf("c2 %+v, provider calls %d→%d", r, before, fr.calls(0)+fr.calls(1))
 	}
 	rec, tries := h.call(t, "t1", "c2")
 	if rec.State != StateFailed || rec.FailReason != CodeModelDegraded || len(tries) != 0 {
@@ -229,8 +254,6 @@ func TestRouteAllDownDegraded(t *testing.T) {
 	if !retryableReason(CodeModelDegraded) || statusFor(CodeModelDegraded) != 503 {
 		t.Fatal("model_degraded must be a retryable 503")
 	}
-	// Replay without the retry header returns the persisted failure; with it, a new attempt is made (still
-	// degraded here).
 	if r := h.invoke(t, inv("c2", chatBody)); r.Code != CodeModelDegraded {
 		t.Fatalf("replayed failure %+v", r)
 	}
@@ -239,6 +262,11 @@ func TestRouteAllDownDegraded(t *testing.T) {
 	fr.setDown(1, false)
 	if r := h.invoke(t, retry); r.Code != CodeModelDegraded {
 		t.Fatalf("breakers still open → degraded again: %+v", r)
+	}
+	// After the open duration the retry probes the recovered backup and succeeds.
+	h.clk.advance(time.Minute)
+	if r := h.invoke(t, retry); r.Status != 200 {
+		t.Fatalf("retry after recovery %+v", r)
 	}
 	if !strings.Contains(h.logs.String(), `"msg":"gateway: degraded"`) {
 		t.Fatal("degraded not logged")
@@ -250,7 +278,7 @@ func TestRouteAllDownDegraded(t *testing.T) {
 func TestRouteReplayDoesNotReexecute(t *testing.T) {
 	fr := newRoutes("primary", "backup")
 	fr.setDown(0, true)
-	h := newRouteHarness(t, routeLimits(), RoutingConfig{BreakerFailures: 1, BreakerOpen: time.Minute}, fr)
+	h := newRouteHarness(t, shortBackoff(), RoutingConfig{BreakerFailures: 1, BreakerOpen: time.Minute}, fr)
 	first := h.invoke(t, inv("c1", chatBody))
 	fr.setDown(1, true) // now every provider is down / open
 	h.invoke(t, inv("c2", chatBody))
@@ -318,15 +346,13 @@ func TestRouteCrashMidFallbackReplay(t *testing.T) {
 }
 
 // Per-try timeout: a hanging provider is abandoned after TryTimeout (sent → unknown, its estimate charged)
-// and the next provider serves the call.
+// and the next provider serves the call without backoff.
 func TestRouteTryTimeout(t *testing.T) {
 	fr := newRoutes("primary", "backup")
 	fr.legs[0].script = []step{{hang: true, sent: true}}
 	h := newRouteHarness(t, routeLimits(), RoutingConfig{TryTimeout: 50 * time.Millisecond}, fr)
-	start := time.Now()
-	r := h.invoke(t, inv("c1", chatBody))
-	if r.Status != 200 || time.Since(start) > 500*time.Millisecond {
-		t.Fatalf("%+v after %s", r, time.Since(start))
+	if r := h.invoke(t, inv("c1", chatBody)); r.Status != 200 {
+		t.Fatalf("%+v", r)
 	}
 	if _, tries := h.call(t, "t1", "c1"); providers(tries) != "primary/unknown backup/ok[primary:tried]" {
 		t.Fatalf("tries %s", providers(tries))
@@ -336,8 +362,7 @@ func TestRouteTryTimeout(t *testing.T) {
 	}
 }
 
-// A provider that does not serve the requested model is skipped as model_not_served; if none serves it
-// besides open ones, the call is degraded.
+// A provider that does not serve the requested model is skipped as model_not_served.
 func TestRouteModelNotServed(t *testing.T) {
 	fr := newRoutes("primary", "backup")
 	fr.serves[0] = map[string]bool{"other": true}
@@ -348,16 +373,26 @@ func TestRouteModelNotServed(t *testing.T) {
 	}
 }
 
-// Fatal outcomes do not fail over (the request is invalid for every provider) and count as a provider answer.
+// Fatal outcomes do not fail over. A request rejection (400) counts as a provider answer; a provider-side fault
+// (401/403/404, egress blocked) counts as a breaker failure.
 func TestRouteFatalDoesNotFailOver(t *testing.T) {
 	fr := newRoutes("primary", "backup")
-	fr.legs[0].script = []step{{err: &upstream.Error{Outcome: upstream.OutcomeFatal, Status: 400, Code: upstream.CodeUpstreamRejected}}}
+	fr.legs[0].script = []step{
+		{err: &upstream.Error{Outcome: upstream.OutcomeFatal, Status: 400, Code: upstream.CodeUpstreamRejected}},
+		{err: &upstream.Error{Outcome: upstream.OutcomeFatal, Status: 401, Code: upstream.CodeUpstreamRejected}},
+	}
 	h := newRouteHarness(t, routeLimits(), RoutingConfig{BreakerFailures: 1}, fr)
 	if r := h.invoke(t, inv("c1", chatBody)); r.Status != 400 || fr.calls(1) != 0 {
 		t.Fatalf("%+v backup calls %d", r, fr.calls(1))
 	}
 	if got := states(h.c); got != "primary:closed,backup:closed" {
-		t.Fatalf("fatal must not open the breaker: %s", got)
+		t.Fatalf("400 must not open the breaker: %s", got)
+	}
+	if r := h.invoke(t, inv("c2", chatBody)); r.Status != 401 || fr.calls(1) != 0 {
+		t.Fatalf("%+v backup calls %d", r, fr.calls(1))
+	}
+	if got := states(h.c); got != "primary:open,backup:closed" {
+		t.Fatalf("401 must count as a provider failure: %s", got)
 	}
 }
 
@@ -391,30 +426,31 @@ func TestHedgeOffByDefault(t *testing.T) {
 	gate := make(chan struct{})
 	fr.legs[0].script = []step{{gate: gate, body: `{"answer":"slow-a"}`}}
 	h := newRouteHarness(t, routeLimits(), RoutingConfig{}, fr)
-	go func() { time.Sleep(100 * time.Millisecond); close(gate) }()
+	go func() { time.Sleep(50 * time.Millisecond); close(gate) }()
 	if r := h.invoke(t, inv("c1", chatBody)); string(r.Body) != `{"answer":"slow-a"}` || fr.calls(1) != 0 {
 		t.Fatalf("%+v backup calls %d", r, fr.calls(1))
 	}
 }
 
-// Primary slow (already sent, never answers) → after HedgeDelay the backup is asked too and wins; the primary
-// leg is cancelled and, because it had been sent, settled as unknown (hedge_lost) with its full estimate —
-// before the winner, so the call ends completed with the backup's result.
-func TestHedgeBackupWins(t *testing.T) {
+// Primary slow (already sent, never answers) → after HedgeDelay the backup is asked too and wins. The primary
+// leg is cancelled and, because it had been sent, charged its full estimate as unknown with its own error code
+// and hedge_lost; it is settled charge-only before the winner, so the call ends completed with the backup's
+// result. The primary ran longer than HedgeDelay without a result: that is a (slow) failure for its breaker,
+// so a persistently hanging primary is eventually skipped.
+func TestHedgeBackupWinsAndSlowPrimaryTripsBreaker(t *testing.T) {
 	fr := newRoutes("primary", "backup")
-	fr.legs[0].script = []step{{hang: true, sent: true}}
+	fr.legs[0].script = []step{{hang: true, sent: true}, {hang: true, sent: true}}
 	fr.legs[1].script = []step{{body: `{"answer":"hedge-b"}`, usage: upstream.Usage{InputTokens: 1, OutputTokens: 1}}}
-	h := newRouteHarness(t, routeLimits(), RoutingConfig{HedgeDelay: 30 * time.Millisecond}, fr)
-	start := time.Now()
+	h := newRouteHarness(t, routeLimits(), RoutingConfig{HedgeDelay: 20 * time.Millisecond, BreakerFailures: 2}, fr)
 	r := h.invoke(t, inv("c1", chatBody))
-	if r.Status != 200 || string(r.Body) != `{"answer":"hedge-b"}` || time.Since(start) > 500*time.Millisecond {
-		t.Fatalf("%+v after %s", r, time.Since(start))
+	if r.Status != 200 || string(r.Body) != `{"answer":"hedge-b"}` {
+		t.Fatalf("%+v", r)
 	}
 	rec, tries := h.call(t, "t1", "c1")
 	if rec.State != StateCompleted || rec.ResultRef != r.BlobSHA256 || !rec.PossibleExternalDuplicate {
 		t.Fatalf("journal %+v", rec)
 	}
-	if got := providers(tries); got != "primary/unknown backup/ok[primary:tried]+hedge" || tries[0].Error != CodeHedgeLost {
+	if got := providers(tries); got != "primary/unknown+lost backup/ok[primary:tried]+hedge" || tries[0].Error != upstream.CodeUpstreamUnconfirmed {
 		t.Fatalf("tries %s (%q)", got, tries[0].Error)
 	}
 	// Loser charged conservatively: A's estimate 100 to unknown; B's actual 1×2 + 1×4 = 6 spent.
@@ -422,7 +458,15 @@ func TestHedgeBackupWins(t *testing.T) {
 		t.Fatalf("budget %+v", b)
 	}
 	if got := states(h.c); got != "primary:closed,backup:closed" {
-		t.Fatalf("a hedge loser must not count as a provider failure: %s", got)
+		t.Fatalf("one slow failure: %s", got)
+	}
+	h.invoke(t, inv("c2", chatBody))
+	if got := states(h.c); got != "primary:open,backup:closed" {
+		t.Fatalf("two slow failures must open the primary: %s", got)
+	}
+	h.invoke(t, inv("c3", chatBody))
+	if _, tries := h.call(t, "t1", "c3"); providers(tries) != "backup/ok[primary:circuit_open]" {
+		t.Fatalf("c3 tries %s", providers(tries))
 	}
 }
 
@@ -443,11 +487,102 @@ func TestHedgePrimaryWins(t *testing.T) {
 		t.Fatalf("%+v", r)
 	}
 	_, tries := h.call(t, "t1", "c1")
-	if got := providers(tries); got != "primary/ok backup/retryable[primary:tried]+hedge" || tries[1].Error != CodeHedgeLost {
-		t.Fatalf("tries %s", got)
+	if got := providers(tries); got != "primary/ok backup/retryable[primary:tried]+hedge+lost" || tries[1].Error != upstream.CodeUpstreamUnreachable {
+		t.Fatalf("tries %s (%q)", got, tries[1].Error)
 	}
 	if b := h.budget(t, "t1"); b.UnknownMicro != 0 || b.ReservedMicro != 0 {
 		t.Fatalf("budget %+v", b)
+	}
+	if got := states(h.c); got != "primary:closed,backup:closed" {
+		t.Fatalf("a cancelled hedge leg is not a failure: %s", got)
+	}
+}
+
+// Both legs return ok (the loser finished before the cancellation took effect): the loser's result is stored
+// and its cost charged, but it never becomes the call's result — the call completes once, with the winner's
+// blob and upstream request id.
+func TestHedgeBothOK(t *testing.T) {
+	fr := newRoutes("primary", "backup")
+	gate := make(chan struct{})
+	fr.legs[0].script = []step{{gate: gate, hold: true, body: `{"answer":"late-a"}`, usage: upstream.Usage{InputTokens: 1, OutputTokens: 1}}}
+	fr.legs[1].script = []step{{body: `{"answer":"fast-b"}`, usage: upstream.Usage{InputTokens: 1, OutputTokens: 1}}}
+	h := newRouteHarness(t, routeLimits(), RoutingConfig{HedgeDelay: 10 * time.Millisecond}, fr)
+	go func() {
+		<-fr.legs[1].entered
+		time.Sleep(10 * time.Millisecond)
+		close(gate) // A ignores the cancellation and answers ok
+	}()
+	r := h.invoke(t, inv("c1", chatBody))
+	if string(r.Body) != `{"answer":"fast-b"}` {
+		t.Fatalf("%+v", r)
+	}
+	rec, tries := h.call(t, "t1", "c1")
+	if rec.State != StateCompleted || rec.ResultRef != r.BlobSHA256 || rec.FailReason != "" {
+		t.Fatalf("journal %+v", rec)
+	}
+	if got := providers(tries); got != "primary/ok+lost backup/ok[primary:tried]+hedge" {
+		t.Fatalf("tries %s", got)
+	}
+	// Both costs are real: A 1×1+1×2 = 3, B 1×2+1×4 = 6.
+	if b := h.budget(t, "t1"); b.SpentMicro != 9 || b.ReservedMicro != 0 || rec.CostCharged != 9 {
+		t.Fatalf("budget %+v cost_charged %d", b, rec.CostCharged)
+	}
+}
+
+// A fatal answer from the hedge (backup) leg — e.g. a wrong backup key — is not decisive: the slow but healthy
+// primary is still waited for and wins. The backup's fatal is settled charge-only (the call never becomes
+// failed) and counts against the backup's breaker.
+func TestHedgeFatalFromHedgeLegNotDecisive(t *testing.T) {
+	fr := newRoutes("primary", "backup")
+	gate := make(chan struct{})
+	fr.legs[0].script = []step{{gate: gate, body: `{"answer":"a"}`}}
+	fr.legs[1].script = []step{{err: &upstream.Error{Outcome: upstream.OutcomeFatal, Status: 401, Code: upstream.CodeUpstreamRejected}}}
+	h := newRouteHarness(t, routeLimits(), RoutingConfig{HedgeDelay: 10 * time.Millisecond, BreakerFailures: 1}, fr)
+	go func() {
+		<-fr.legs[1].entered
+		time.Sleep(20 * time.Millisecond)
+		close(gate)
+	}()
+	r := h.invoke(t, inv("c1", chatBody))
+	if r.Status != 200 || string(r.Body) != `{"answer":"a"}` {
+		t.Fatalf("%+v", r)
+	}
+	rec, tries := h.call(t, "t1", "c1")
+	if rec.State != StateCompleted || rec.FailReason != "" {
+		t.Fatalf("journal %+v", rec)
+	}
+	if got := providers(tries); got != "primary/ok backup/fatal[primary:tried]+hedge" {
+		t.Fatalf("tries %s", got)
+	}
+	if got := states(h.c); got != "primary:closed,backup:open" {
+		t.Fatalf("breakers %s", got)
+	}
+}
+
+// The first leg's fatal arrives first, but the hedge leg answers ok while being cancelled: the ok is the final
+// result. The fatal leg is settled charge-only, so the call is never failed, not even between the settlements.
+func TestHedgeFatalFirstThenOK(t *testing.T) {
+	fr := newRoutes("primary", "backup")
+	gateA, gateB := make(chan struct{}), make(chan struct{})
+	fr.legs[0].script = []step{{gate: gateA, err: &upstream.Error{Outcome: upstream.OutcomeFatal, Status: 400, Code: upstream.CodeUpstreamRejected}}}
+	fr.legs[1].script = []step{{gate: gateB, hold: true, body: `{"answer":"b"}`}}
+	h := newRouteHarness(t, routeLimits(), RoutingConfig{HedgeDelay: 10 * time.Millisecond}, fr)
+	go func() {
+		<-fr.legs[1].entered
+		close(gateA)
+		time.Sleep(20 * time.Millisecond)
+		close(gateB)
+	}()
+	r := h.invoke(t, inv("c1", chatBody))
+	if r.Status != 200 || string(r.Body) != `{"answer":"b"}` {
+		t.Fatalf("%+v", r)
+	}
+	rec, tries := h.call(t, "t1", "c1")
+	if rec.State != StateCompleted || rec.FailReason != "" || rec.ResultRef != r.BlobSHA256 {
+		t.Fatalf("journal %+v", rec)
+	}
+	if got := providers(tries); got != "primary/fatal backup/ok[primary:tried]+hedge" {
+		t.Fatalf("tries %s", got)
 	}
 }
 
@@ -457,9 +592,7 @@ func TestHedgeBothFail(t *testing.T) {
 	gate := make(chan struct{})
 	fr.legs[0].script = []step{{gate: gate, err: unavailable()}, {body: `{"answer":"round2"}`}}
 	fr.legs[1].script = []step{{err: unavailable()}}
-	lim := routeLimits()
-	lim.BackoffBase, lim.BackoffMax = 50*time.Millisecond, 50*time.Millisecond
-	h := newRouteHarness(t, lim, RoutingConfig{HedgeDelay: 10 * time.Millisecond}, fr)
+	h := newRouteHarness(t, shortBackoff(), RoutingConfig{HedgeDelay: 10 * time.Millisecond}, fr)
 	go func() {
 		<-fr.legs[1].entered
 		time.Sleep(10 * time.Millisecond)

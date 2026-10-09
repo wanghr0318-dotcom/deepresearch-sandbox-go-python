@@ -24,7 +24,8 @@ type ChatConfig struct {
 	// PrimaryName 是主供应商的路由名（Router.Routes()[0]）；空时为 "primary"。
 	PrimaryName string
 	// Fallbacks 是按顺序的后备供应商（模型降级链）；空时只有主供应商，行为与引入降级链之前完全相同。
-	// 非空时（链模式）2xx 但没有非空 choices 数组的响应按 unknown / upstream_bad_response 处理（可转下一供应商）。
+	// 非空时（链模式）2xx 但没有非空 choices 数组的响应按 unknown / upstream_bad_response 处理（可转下一供应商）；
+	// 这也适用于主供应商（路由 0）：链模式下 Do 与 DoOn(0) 同样检查。
 	Fallbacks []ChatRoute
 }
 

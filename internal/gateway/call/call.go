@@ -1182,7 +1182,7 @@ func (c *Coordinator) runTry(ctx context.Context, j *job, rs *routeSet, l leg, t
 	faultinject.Point(faultinject.CallInFlight)
 	r := legResult{leg: l, try: try, resp: resp, uerr: uerr, latency: c.now().Sub(start), aborted: aborted}
 	release()
-	rs.report(l, r.outcome(), aborted)
+	rs.report(l, uerr, aborted)
 	c.logTry(j, rs, r)
 	return r, []int{l.route}
 }

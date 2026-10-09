@@ -8,6 +8,8 @@ package call
 //
 //	AGENTBOX_CHAOS_RUNS=5 go test ./internal/gateway/call -run TestChaos -v
 //
+// They measure real backoff and timeouts (seconds) and assert wall-clock bounds, so they only run when
+// AGENTBOX_CHAOS_RUNS is set; the same behaviours are covered deterministically by routing_test.go.
 // Zero cost: no real provider is contacted.
 
 import (
@@ -37,6 +39,9 @@ func chaosRuns() int {
 
 func chaosServer(t *testing.T) *fakeupstream.Server {
 	t.Helper()
+	if os.Getenv("AGENTBOX_CHAOS_RUNS") == "" {
+		t.Skip("chaos measurement: set AGENTBOX_CHAOS_RUNS=N to run")
+	}
 	s := fakeupstream.New()
 	t.Cleanup(s.Close)
 	s.SetLatency(fakeupstream.Chat, chaosLatency)
@@ -172,7 +177,8 @@ func TestChaosPrimaryDown(t *testing.T) {
 // TestChaosPrimaryUnreachable: the primary's port refuses connections; the backup serves.
 func TestChaosPrimaryUnreachable(t *testing.T) {
 	b := chaosServer(t)
-	chain := chaosHarness(t, chaosAdapter(deadURL(t), b.ModelBaseURL()), Limits{}, RoutingConfig{})
+	dead := deadURL(t)
+	chain := chaosHarness(t, chaosAdapter(dead, b.ModelBaseURL()), Limits{}, RoutingConfig{})
 	rows := []sample{measure(t, "primary connection refused, fallback", max(chaosRuns(), 3), chain, 200, "")}
 	logTable(t, rows)
 	_, tries := chain.call(t, "t1", fmt.Sprintf("chaos-%d", chaosSeq))

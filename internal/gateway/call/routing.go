@@ -37,6 +37,9 @@ type RoutingConfig struct {
 	TryTimeout time.Duration
 	// HedgeDelay > 0 时启用对冲：try 发出后这么久仍未结束、且另有就绪路由时，向它并发发出同一请求（hedge.go）。
 	HedgeDelay time.Duration
+
+	// breakerNow 是熔断器的时钟（测试注入；nil 时用 Coordinator 的时钟）。
+	breakerNow func() time.Time
 }
 
 // 降级链默认值。
@@ -79,13 +82,20 @@ func (c *Coordinator) newRouteSet(a upstream.Adapter) *routeSet {
 	for _, name := range rs.names {
 		name, kind := name, a.Kind()
 		rs.breakers = append(rs.breakers, breaker.New(breaker.Config{
-			FailureThreshold: c.routing.BreakerFailures, OpenDuration: c.routing.BreakerOpen, Now: c.now,
+			FailureThreshold: c.routing.BreakerFailures, OpenDuration: c.routing.BreakerOpen, Now: c.breakerClock(),
 			OnTransition: func(from, to breaker.State) {
 				c.log.Warn("gateway: breaker", "endpoint", endpointOf(kind), "route", name, "from", from.String(), "to", to.String())
 			},
 		}))
 	}
 	return rs
+}
+
+func (c *Coordinator) breakerClock() func() time.Time {
+	if c.routing.breakerNow != nil {
+		return c.routing.breakerNow
+	}
+	return c.now
 }
 
 // RouteStates 返回全部多路由类别的路由与熔断器状态（按类别、路由顺序）。
@@ -169,9 +179,10 @@ func (rs *routeSet) states() string {
 	return strings.Join(parts, ",")
 }
 
-// report 把一次已放行 try 的结果报告给熔断器：ok 与 fatal（供应商作出了回答）→ 成功；retryable 与 unknown → 失败；
-// 被 Coordinator 自己取消（取消类原因、期限、关闭、对冲落败）→ 中止（不作判定，只释放半开试探名额）。
-func (rs *routeSet) report(l leg, outcome upstream.Outcome, aborted bool) {
+// report 把一次已放行 try 的结果报告给熔断器：ok 与请求本身被拒的 fatal（供应商作出了回答）→ 成功；retryable、
+// unknown 与供应商配置类的 fatal（providerFault）→ 失败；被 Coordinator 自己取消（取消类原因、期限、关闭、对冲
+// 落败）→ 中止（不作判定，只释放半开试探名额）。
+func (rs *routeSet) report(l leg, uerr *upstream.Error, aborted bool) {
 	if rs == nil || l.route < 0 {
 		return
 	}
@@ -179,11 +190,21 @@ func (rs *routeSet) report(l leg, outcome upstream.Outcome, aborted bool) {
 	switch {
 	case aborted:
 		b.Abort()
-	case outcome == upstream.OutcomeOK || outcome == upstream.OutcomeFatal:
+	case uerr == nil || (uerr.Outcome == upstream.OutcomeFatal && !providerFault(uerr)):
 		b.Success()
 	default:
 		b.Failure()
 	}
+}
+
+// providerFault 报告 fatal 结果是否源于供应商本身或其配置，而不是请求：鉴权失败（401、403）、地址或模型不存在
+// （404）、出站防护拒绝、地址不合法、重定向过多。它们不换供应商（fatal 仍结束调用），但计入熔断。
+func providerFault(e *upstream.Error) bool {
+	switch e.Code {
+	case upstream.CodeEgressBlocked, upstream.CodeInvalidURL, upstream.CodeTooManyRedirects:
+		return true
+	}
+	return e.Status == 401 || e.Status == 403 || e.Status == 404
 }
 
 // release 结束一个已放行但没有发出的路由（预留被拒、槽位等待被取消）：熔断器中止。

@@ -277,7 +277,24 @@ func (s *fakeStore) SettleTry(_ context.Context, st Settlement) (CallRecord, err
 	}
 	b := s.budget(t.TaskID)
 	b.ReservedMicro -= ft.amount
-	ft.rec.State, ft.rec.Outcome, ft.rec.LatencyMs, ft.rec.Error = "settled", st.Outcome, st.LatencyMs, st.Error
+	ft.rec.State, ft.rec.Outcome, ft.rec.LatencyMs, ft.rec.Error, ft.rec.HedgeLost = "settled", st.Outcome, st.LatencyMs, st.Error, st.HedgeLost
+	if st.Sibling { // 只记账（同 postgres）：不改变调用的状态与结局
+		switch st.Outcome {
+		case "ok":
+			ft.rstate, ft.actual, ft.rec.CostMicro = "settled", st.ActualMicro, st.ActualMicro
+			b.SpentMicro += st.ActualMicro
+			rec.CostCharged += st.ActualMicro
+		case "retryable", "fatal":
+			ft.rstate = "released"
+		case "unknown":
+			ft.rstate = "charged_unknown"
+			b.UnknownMicro += ft.amount
+			rec.PossibleExternalDuplicate = true
+		default:
+			return CallRecord{}, persistence.ErrInvalid
+		}
+		return *rec, nil
+	}
 	switch st.Outcome {
 	case "ok":
 		ft.rstate, ft.actual, ft.rec.CostMicro = "settled", st.ActualMicro, st.ActualMicro
