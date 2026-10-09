@@ -362,7 +362,7 @@ func TestSlotsBindWorkspaceAndGateway(t *testing.T) {
 	if err := s.create("pod2"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.remove("pod1", ws); err != nil { // destroyed first: its workspace is kept (still referenced)
+	if err := s.remove("pod1"); err != nil { // destroyed first: its workspace is kept (still referenced)
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(s.workspace("pod1")); err != nil {
@@ -383,8 +383,74 @@ func TestSlotsBindWorkspaceAndGateway(t *testing.T) {
 	if err := s.unbindRun("pod2"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.remove("pod2", ""); err != nil {
+	if err := s.remove("pod2"); err != nil { // still referenced by the workspace symlink: data kept
 		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(s.workspace("pod2"), "out", "a1", "report.md")); err != nil {
+		t.Fatalf("referenced workspace data removed: %v", err)
+	}
+	// A Pod with no workspace leaves nothing behind.
+	if err := s.create("pod3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.remove("pod3"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(s.hostDir("pod3")); !os.IsNotExist(err) {
+		t.Fatalf("unreferenced slot kept: %v", err)
+	}
+}
+
+// TestSlotGCRemovesClosedSessionWorkspace: a session close deletes its workspace directory (RemoveAll unlinks
+// only the symlink); the slot GC then removes the slot that held the data, but never a live Pod's slot, a
+// still-referenced workspace, or a slot younger than the minimum age.
+func TestSlotGCRemovesClosedSessionWorkspace(t *testing.T) {
+	root := t.TempDir()
+	s := slots{hostRoot: filepath.Join(root, "slots"), nodeRoot: "/n", uid: -1}
+	_ = os.MkdirAll(s.hostRoot, 0o711)
+	sessDir := filepath.Join(root, "sessions", "s1")
+	ws := filepath.Join(sessDir, "workspace")
+	_ = os.MkdirAll(ws, 0o700)
+	_ = os.WriteFile(filepath.Join(ws, "notes.md"), []byte("user data"), 0o600)
+	keep := filepath.Join(root, "workspaces", "t1")
+	_ = os.MkdirAll(keep, 0o700)
+	for _, pod := range []string{"p-sess", "p-task", "p-live"} {
+		if err := s.create(pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.bind("p-sess", provider.Mounts{Workspace: ws}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.bind("p-task", provider.Mounts{Workspace: keep}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.remove("p-sess")
+	_ = s.remove("p-task")
+	if removed, _ := s.gc(map[string]bool{"p-live": true}, time.Hour); len(removed) != 0 {
+		t.Fatalf("young slots must be kept: %v", removed)
+	}
+	if removed, _ := s.gc(map[string]bool{"p-live": true}, 0); len(removed) != 0 {
+		t.Fatalf("referenced workspaces must be kept: %v", removed)
+	}
+	// Session close (app.sessionEnv.DeleteWorkspace): RemoveAll of the session directory.
+	if err := os.RemoveAll(sessDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(s.workspace("p-sess"), "notes.md")); err != nil {
+		t.Fatalf("precondition: data still in the slot until gc: %v", err)
+	}
+	removed, err := s.gc(map[string]bool{"p-live": true}, 0)
+	if err != nil || len(removed) != 1 || removed[0] != "p-sess" {
+		t.Fatalf("gc removed %v %v", removed, err)
+	}
+	if _, err := os.Stat(s.hostDir("p-sess")); !os.IsNotExist(err) {
+		t.Fatalf("closed session's slot data still present: %v", err)
+	}
+	for _, pod := range []string{"p-task", "p-live"} {
+		if _, err := os.Stat(s.hostDir(pod)); err != nil {
+			t.Fatalf("%s removed: %v", pod, err)
+		}
 	}
 }
 

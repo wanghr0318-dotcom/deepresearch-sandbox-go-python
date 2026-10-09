@@ -70,15 +70,21 @@ func (pl *pool) reconcile(ctx context.Context) {
 	alive := 0
 	for i := range pods {
 		pod := &pods[i]
-		if pod.Labels[LabelPool] != pl.key || stopped(pod) || pod.DeletionTimestamp != nil {
-			if pod.DeletionTimestamp == nil {
-				if err := pl.p.deletePod(ctx, pod); err == nil && pl.p.slots.enabled() {
-					_ = pl.p.slots.remove(pod.Name, "")
-				}
-			}
+		if pod.DeletionTimestamp != nil {
 			continue
 		}
-		alive++
+		stuck := !ready(pod) && !pod.CreationTimestamp.IsZero() && time.Since(pod.CreationTimestamp.Time) > pl.p.opt.WarmReadyTimeout
+		if pod.Labels[LabelPool] == pl.key && !stopped(pod) && !stuck {
+			alive++
+			continue
+		}
+		if stuck {
+			pl.p.log.Warn("k8s: warm pod not ready, replacing", "pod", pod.Name, "phase", pod.Status.Phase, "reason", waitingReason(pod))
+		}
+		// Other pool key (image or profile changed), dead, or stuck: replace it.
+		if err := pl.p.deletePod(ctx, pod); err == nil && pl.p.slots.enabled() {
+			_ = pl.p.slots.remove(pod.Name)
+		}
 	}
 	pl.mu.Lock()
 	missing := pl.size - alive - pl.creating
@@ -98,6 +104,16 @@ func (pl *pool) reconcile(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// waitingReason is the first container's waiting reason (e.g. ImagePullBackOff), for logs.
+func waitingReason(pod *corev1.Pod) string {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Waiting != nil {
+			return cs.State.Waiting.Reason
+		}
+	}
+	return pod.Status.Reason
 }
 
 // claim binds a ready warm Pod to the environment: the owner annotation, env label and state are written
@@ -122,7 +138,7 @@ func (pl *pool) claim(ctx context.Context, o owner, ws string) *corev1.Pod {
 		}
 		pod.Annotations[AnnoOwner] = o.encode()
 		if ws != "" {
-			pod.Annotations[AnnoWorkspace] = ws
+			pod.Annotations[AnnoWorkspace] = pathHash(ws)
 		}
 		updated, err := pl.p.pods().Update(ctx, pod, metav1.UpdateOptions{})
 		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {

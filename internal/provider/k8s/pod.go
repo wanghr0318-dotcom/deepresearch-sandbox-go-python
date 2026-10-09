@@ -27,7 +27,8 @@ const (
 	LabelEnv      = "agentbox.io/env"
 	AnnoOwner     = "agentbox.io/owner"
 	AnnoImage     = "agentbox.io/image"
-	AnnoWorkspace = "agentbox.io/workspace"
+	// AnnoWorkspace carries a hash of the host workspace path (the path itself is not published to the API).
+	AnnoWorkspace = "agentbox.io/workspace-sha256"
 
 	StateWarm     = "warm"
 	StateAssigned = "assigned"
@@ -74,6 +75,12 @@ func labelValue(s string) string {
 	}
 	sum := sha256.Sum256([]byte(s))
 	return "h-" + hex.EncodeToString(sum[:])[:40]
+}
+
+// pathHash identifies a host path without publishing it.
+func pathHash(p string) string {
+	sum := sha256.Sum256([]byte(p))
+	return hex.EncodeToString(sum[:])[:32]
 }
 
 // newPodName returns a random DNS-1123 Pod name.
@@ -124,7 +131,7 @@ func buildPod(pp podParams) *corev1.Pod {
 		labels[LabelEnv] = labelValue(pp.Owner.EnvID)
 		annotations[AnnoOwner] = pp.Owner.encode()
 		if pp.Workspace != "" {
-			annotations[AnnoWorkspace] = pp.Workspace
+			annotations[AnnoWorkspace] = pathHash(pp.Workspace)
 		}
 	} else {
 		labels[LabelState] = StateWarm

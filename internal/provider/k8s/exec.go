@@ -175,6 +175,10 @@ func (p *Provider) startExec(ctx context.Context, pod string, nofile, fsize uint
 		}
 		return nil, fmt.Errorf("%w: %v", provider.ErrControlLost, h.err)
 	case <-ctx.Done():
+		// The caller gives up on this start: make the stream fail fast instead of blocking on unread output.
+		outR.CloseWithError(ctx.Err())
+		errR.CloseWithError(ctx.Err())
+		_ = stdinW.CloseWithError(ctx.Err())
 		return nil, ctx.Err()
 	}
 }

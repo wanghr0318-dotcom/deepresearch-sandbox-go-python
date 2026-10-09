@@ -47,6 +47,12 @@ type Options struct {
 	CreateTimeout time.Duration
 	// StopTimeout bounds Stop and Destroy when ctx has no deadline (default 30 s).
 	StopTimeout time.Duration
+	// WarmReadyTimeout: a warm Pod not Ready after this long (Pending, ImagePullBackOff, …) is replaced
+	// (default 3 min).
+	WarmReadyTimeout time.Duration
+	// SlotGCInterval is how often slot directories of vanished Pods with unreferenced workspaces are removed
+	// (default 1 min; slots younger than 10 min are kept).
+	SlotGCInterval time.Duration
 	// EnsureNetworkPolicy creates the namespace's deny-all NetworkPolicy if missing.
 	EnsureNetworkPolicy bool
 	Logger              *slog.Logger
@@ -107,6 +113,12 @@ func New(ctx context.Context, opt Options) (*Provider, error) {
 	if opt.StopTimeout <= 0 {
 		opt.StopTimeout = 30 * time.Second
 	}
+	if opt.WarmReadyTimeout <= 0 {
+		opt.WarmReadyTimeout = 3 * time.Minute
+	}
+	if opt.SlotGCInterval <= 0 {
+		opt.SlotGCInterval = time.Minute
+	}
 	if opt.SlotNodeDir == "" {
 		opt.SlotNodeDir = opt.SlotHostDir
 	}
@@ -134,6 +146,10 @@ func New(ctx context.Context, opt Options) (*Provider, error) {
 		}
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
+	if p.slots.enabled() {
+		p.wg.Add(1)
+		go func() { defer p.wg.Done(); p.slotGCLoop(p.ctx) }()
+	}
 	if opt.WarmPool > 0 {
 		pr := profileOf(opt.WarmProfile)
 		p.pool = &pool{p: p, size: opt.WarmPool, profile: pr, key: poolKey(opt.Image, pr, opt.RuntimeClass), kick: make(chan struct{}, 1)}
@@ -141,6 +157,42 @@ func New(ctx context.Context, opt Options) (*Provider, error) {
 		go func() { defer p.wg.Done(); p.pool.run(p.ctx) }()
 	}
 	return p, nil
+}
+
+// slotGCMinAge protects slots created just before their Pod.
+var slotGCMinAge = 10 * time.Minute
+
+func (p *Provider) slotGCLoop(ctx context.Context) {
+	t := time.NewTicker(p.opt.SlotGCInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			p.gcSlots(ctx)
+		}
+	}
+}
+
+// gcSlots removes slot directories whose Pod no longer exists and whose workspace is no longer referenced by
+// any workspace symlink (e.g. a session was closed and its workspace deleted).
+func (p *Provider) gcSlots(ctx context.Context) {
+	l, err := p.pods().List(ctx, metav1.ListOptions{LabelSelector: labels.Set{LabelManaged: "true"}.AsSelector().String()})
+	if err != nil {
+		return
+	}
+	live := make(map[string]bool, len(l.Items))
+	for i := range l.Items {
+		live[l.Items[i].Name] = true
+	}
+	removed, err := p.slots.gc(live, slotGCMinAge)
+	if err != nil {
+		p.log.Warn("k8s: slot gc", "err", err)
+	}
+	if len(removed) > 0 {
+		p.log.Info("k8s: removed unreferenced slots", "count", len(removed))
+	}
 }
 
 // Close stops the warm pool loop and open exec streams. Pods are left in place (the pool's warm Pods are
@@ -296,7 +348,7 @@ func (p *Provider) createPod(ctx context.Context, pr profile, o *owner, ws strin
 	created, err := p.pods().Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
 		if p.slots.enabled() {
-			_ = p.slots.remove(name, "")
+			_ = p.slots.remove(name)
 		}
 		return nil, fmt.Errorf("k8s: create pod: %w", err)
 	}
@@ -409,9 +461,18 @@ func (p *Provider) Stop(ctx context.Context, envID string) error {
 		ctx, cancel = context.WithTimeout(ctx, p.opt.StopTimeout)
 		defer cancel()
 	}
+	if !stopped(ours) && ours.Spec.NodeName == "" {
+		// Re-read: the list may be stale and the scheduler may have bound the Pod since.
+		if fresh, err := p.pods().Get(ctx, ours.Name, metav1.GetOptions{}); err == nil {
+			ours = fresh
+		} else if apierrors.IsNotFound(err) {
+			return nil
+		}
+	}
 	if !stopped(ours) {
 		if ours.Spec.NodeName == "" {
-			// Not scheduled: no containers exist yet. Delete it so it can never start.
+			// Not scheduled: no containers exist yet. Delete it (UID precondition) so it can never start; if the
+			// scheduler binds it concurrently, the deletion still removes it before any container stays running.
 			if err := p.deletePod(ctx, ours); err != nil {
 				return err
 			}
@@ -482,7 +543,7 @@ func (p *Provider) Destroy(ctx context.Context, envID string) error {
 			return fmt.Errorf("k8s: pod %s still present after delete: %v", ours.Name, err)
 		}
 		if p.slots.enabled() {
-			if err := p.slots.remove(ours.Name, ours.Annotations[AnnoWorkspace]); err != nil {
+			if err := p.slots.remove(ours.Name); err != nil {
 				return fmt.Errorf("k8s: remove slot: %w", err)
 			}
 		}

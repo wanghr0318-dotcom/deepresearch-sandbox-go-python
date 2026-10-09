@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
@@ -15,6 +16,9 @@ const (
 	slotRun       = "run"
 	gatewayName   = "gateway.sock"
 	restoreName   = "restore"
+	// workspaceRef (host side only, not mounted into the Pod) records the workspace path whose symlink points
+	// at this slot's workspace; gc uses it to decide whether the slot still holds live workspace data.
+	workspaceRef = "workspace.ref"
 )
 
 // slots manages the host side of the per-Pod shared directories. hostRoot is the directory as seen by
@@ -122,6 +126,9 @@ func (s slots) swingWorkspace(pod, ws string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("k8s: read workspace: %w", err)
 	}
+	if err := os.WriteFile(filepath.Join(s.hostDir(pod), workspaceRef), []byte(ws), 0o600); err != nil {
+		return fmt.Errorf("k8s: workspace back-reference: %w", err)
+	}
 	if src == ws {
 		if err := os.Remove(ws); err != nil {
 			return fmt.Errorf("k8s: replace workspace directory: %w", err)
@@ -139,12 +146,25 @@ func (s slots) swingWorkspace(pod, ws string) error {
 	if err := os.Rename(tmp, ws); err != nil {
 		return fmt.Errorf("k8s: workspace symlink: %w", err)
 	}
-	// The previous slot's workspace is now empty; drop it and its slot directory if nothing else is left.
-	if filepath.Dir(filepath.Dir(src)) == filepath.Clean(s.hostRoot) {
+	// The previous slot's workspace is now empty; drop it, its back-reference and its slot directory if
+	// nothing else is left.
+	if old := filepath.Dir(src); filepath.Dir(old) == filepath.Clean(s.hostRoot) {
 		_ = os.Remove(src)
-		_ = os.Remove(filepath.Dir(src))
+		_ = os.Remove(filepath.Join(old, workspaceRef))
+		_ = os.Remove(old)
 	}
 	return nil
+}
+
+// referenced reports whether the slot's workspace still holds a workspace's data: its back-reference names a
+// path that is a symlink to this slot.
+func (s slots) referenced(pod string) bool {
+	ws, err := os.ReadFile(filepath.Join(s.hostDir(pod), workspaceRef))
+	if err != nil {
+		return false
+	}
+	dst, err := os.Readlink(string(ws))
+	return err == nil && dst == s.workspace(pod)
 }
 
 // unbindRun removes the Gateway socket link and restore links of a stopped Pod.
@@ -159,22 +179,39 @@ func (s slots) unbindRun(pod string) error {
 	return nil
 }
 
-// remove deletes a destroyed Pod's slot, except a workspace that ws (the environment's workspace path)
-// still points to: that directory now holds the workspace's content.
-func (s slots) remove(pod, ws string) error {
+// remove deletes a destroyed Pod's slot, except a workspace that its workspace path still points to: that
+// directory now holds the workspace's content (gc removes it once the workspace path is gone).
+func (s slots) remove(pod string) error {
 	if err := os.RemoveAll(filepath.Join(s.hostDir(pod), slotRun)); err != nil {
 		return err
 	}
-	if ws != "" {
-		if dst, err := os.Readlink(ws); err == nil && dst == s.workspace(pod) {
-			return nil
+	if s.referenced(pod) {
+		return nil
+	}
+	return os.RemoveAll(s.hostDir(pod))
+}
+
+// gc removes slot directories that belong to no Pod in live and whose workspace is no longer referenced (for
+// example a closed session deleted its workspace symlink). Slots younger than minAge are skipped: a slot is
+// created just before its Pod. Returns the removed slot names.
+func (s slots) gc(live map[string]bool, minAge time.Duration) ([]string, error) {
+	ents, err := os.ReadDir(s.hostRoot)
+	if err != nil {
+		return nil, err
+	}
+	var removed []string
+	for _, e := range ents {
+		name := e.Name()
+		if !e.IsDir() || live[name] || s.referenced(name) {
+			continue
 		}
+		if fi, err := e.Info(); err != nil || time.Since(fi.ModTime()) < minAge {
+			continue
+		}
+		if err := os.RemoveAll(s.hostDir(name)); err != nil {
+			return removed, err
+		}
+		removed = append(removed, name)
 	}
-	if err := os.RemoveAll(s.workspace(pod)); err != nil {
-		return err
-	}
-	if err := os.Remove(s.hostDir(pod)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return nil
+	return removed, nil
 }
