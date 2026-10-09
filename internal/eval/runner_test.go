@@ -55,7 +55,9 @@ func codingArt(exit int, stdout string) []byte {
 func testPlan(spec map[string]any) plan {
 	cost := &Budget{LimitMicro: 1000, SpentMicro: 120}
 	chat := Call{CallID: "root/solve/chat/1", Endpoint: "/v1/chat/completions", Model: "fake-model", State: "completed", TriesUsed: 1,
-		CostChargedMicro: 100, Tries: []Try{{TryNo: 1, State: "completed", LatencyMs: 40}}}
+		CostChargedMicro: 100, Tries: []Try{ // S4 fallback chain: a hedged try on the backup route wins
+			{TryNo: 1, State: "settled", LatencyMs: 40, Provider: "primary", HedgeLost: true},
+			{TryNo: 2, State: "settled", LatencyMs: 30, Provider: "backup", Hedge: true, Skipped: "primary:hedged"}}}
 	exec := Call{CallID: "root/check/exec/1", Endpoint: "/v1/exec", State: "completed", TriesUsed: 2,
 		Tries: []Try{{TryNo: 1, State: "failed"}, {TryNo: 2, State: "completed", LatencyMs: 300}}}
 	switch specTaskID(spec) {
@@ -130,12 +132,16 @@ func TestRunEndToEndAgainstFakeServer(t *testing.T) {
 	if len(m.ExecDigests) != 1 || len(m.ModelsUsed) != 2 {
 		t.Fatalf("provenance %v %v", m.ExecDigests, m.ModelsUsed)
 	}
+	if strings.Join(m.ProvidersUsed, ",") != "backup,primary" {
+		t.Fatalf("providers used %v", m.ProvidersUsed)
+	}
 	for _, tr := range lr.Trajectories {
 		if tr.TaskID == "ok" && tr.Outcome.Verdict == VerdictPass {
 			if len(tr.Events) != 3 || tr.Events[2].Type != "task_terminal" { // reconnect deduplicated
 				t.Fatalf("events %+v", tr.Events)
 			}
-			if tr.Metrics.ExecCalls != 1 || tr.Metrics.ModelCalls != 1 || tr.Metrics.CostMicro != 120 {
+			if tr.Metrics.ExecCalls != 1 || tr.Metrics.ModelCalls != 1 || tr.Metrics.CostMicro != 120 || tr.Metrics.HedgeTries != 1 ||
+				tr.Calls[0].Tries[1].Provider != "backup" {
 				t.Fatalf("metrics %+v", tr.Metrics)
 			}
 		}

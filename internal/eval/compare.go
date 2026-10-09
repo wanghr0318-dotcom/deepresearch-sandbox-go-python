@@ -214,6 +214,7 @@ func manifestDiff(a, b *Manifest) []string {
 	add("workers", strings.Join(a.Workers, ","), strings.Join(b.Workers, ","))
 	add("models_used", strings.Join(a.ModelsUsed, ","), strings.Join(b.ModelsUsed, ","))
 	add("exec_digests", shortList(a.ExecDigests), shortList(b.ExecDigests))
+	add("providers_used", strings.Join(a.ProvidersUsed, ","), strings.Join(b.ProvidersUsed, ","))
 	for _, d := range []struct {
 		prefix string
 		a, b   json.RawMessage

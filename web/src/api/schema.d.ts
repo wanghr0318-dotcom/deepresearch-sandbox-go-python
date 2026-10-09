@@ -701,6 +701,8 @@ export interface components {
             search_provider?: string;
             /** @description First 16 hex digits of the sha256 of the model and search upstream configuration (addresses, models, prices, max_tokens cap); never contains keys */
             upstream_fingerprint?: string;
+            /** @description Provider routes of the model fallback chain in priority order (primary first); absent with a single provider */
+            model_routes?: string[];
             accounts?: boolean;
             sessions?: boolean;
             worker_subruns?: boolean;

@@ -10,6 +10,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"sort"
+
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
 )
 
 func (s *server) serverInfo() map[string]any {
@@ -37,21 +39,33 @@ func (s *server) serverInfo() map[string]any {
 		"worker_subruns":       c.WorkerSubruns,
 		"exec":                 map[string]any{"enabled": c.Exec.Enabled(), "slots": c.Exec.Slots, "image_digest": s.execDigest},
 	}
+	if len(c.Model.Fallbacks) > 0 {
+		routes := []string{PrimaryRoute}
+		for _, fb := range c.Model.Fallbacks {
+			routes = append(routes, fb.Name)
+		}
+		info["model_routes"] = routes // 降级链的路由名（顺序即优先级）；地址与价格只进入 upstream_fingerprint
+	}
 	if c.sessionsEnabled() {
 		info["session_worker_argv"] = append([]string{}, c.SessionWorkerArgv...)
 	}
 	return info
 }
 
-// upstreamFingerprint 是模型与搜索上游配置（地址、默认模型与白名单、单价、max_tokens 上限、搜索供应商与地址）的
-// 摘要；不含任何 Key。
+// upstreamFingerprint 是模型与搜索上游配置（地址、默认模型与白名单、单价、max_tokens 上限、降级链的路由、地址、
+// 模型映射、单价与路由参数、搜索供应商与地址）的摘要；不含任何 Key。
 func upstreamFingerprint(c Config) string {
-	byModel := make([]string, 0, len(c.Model.PricingByModel))
-	for name, p := range c.Model.PricingByModel {
-		b, _ := json.Marshal(p)
-		byModel = append(byModel, name+"="+string(b))
+	byModel := sortedPricing(c.Model.PricingByModel)
+	type fallback struct {
+		Name, BaseURL  string
+		Models         map[string]string
+		Pricing        any
+		PricingByModel []string
 	}
-	sort.Strings(byModel)
+	fbs := make([]fallback, 0, len(c.Model.Fallbacks))
+	for _, fb := range c.Model.Fallbacks { // 不含 APIKey
+		fbs = append(fbs, fallback{fb.Name, fb.BaseURL, fb.Models, fb.Pricing, sortedPricing(fb.PricingByModel)})
+	}
 	b, _ := json.Marshal(struct {
 		BaseURL, Name     string
 		Models            []string
@@ -59,8 +73,10 @@ func upstreamFingerprint(c Config) string {
 		PricingByModel    []string
 		MaxTokensCap      int
 		Search, SearchURL string
+		Fallbacks         []fallback
+		Routing           any
 	}{c.Model.BaseURL, c.Model.Name, c.Model.Models, c.Model.Pricing, byModel, c.Model.MaxTokensCap,
-		c.SearchProvider, c.SearchBaseURL})
+		c.SearchProvider, c.SearchBaseURL, fbs, c.Model.Routing})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:8])
 }
@@ -74,4 +90,14 @@ func declaredModels(m ModelConfig) []string {
 		return out
 	}
 	return append(out, m.Models...)
+}
+
+func sortedPricing(m map[string]upstream.Pricing) []string {
+	out := make([]string, 0, len(m))
+	for name, p := range m {
+		b, _ := json.Marshal(p)
+		out = append(out, name+"="+string(b))
+	}
+	sort.Strings(out)
+	return out
 }

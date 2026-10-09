@@ -57,24 +57,25 @@ type Options struct {
 
 // Manifest pins what a run evaluated.
 type Manifest struct {
-	Schema      string            `json:"schema"`
-	RunID       string            `json:"run_id"`
-	Nonce       string            `json:"nonce"` // part of every request id of the run
-	StartedAt   time.Time         `json:"started_at"`
-	FinishedAt  time.Time         `json:"finished_at,omitempty"`
-	Suite       SuiteRef          `json:"suite"`
-	Seed        int64             `json:"seed"`
-	Concurrency int               `json:"concurrency"`
-	Repetitions int               `json:"repetitions"`
-	Agent       string            `json:"agent"`
-	Model       string            `json:"model,omitempty"`
-	Tasks       []string          `json:"tasks,omitempty"`
-	Server      ServerRef         `json:"server"`
-	Workers     []string          `json:"workers,omitempty"`      // name@version from the workers' ready events
-	ModelsUsed  []string          `json:"models_used,omitempty"`  // resolved models in the call journal
-	ExecDigests []string          `json:"exec_digests,omitempty"` // exec image digests reported by checker runs
-	EvalBuild   map[string]string `json:"eval_build,omitempty"`   // build of the agentbox binary running the eval
-	Judge       *JudgeRef         `json:"judge,omitempty"`
+	Schema        string            `json:"schema"`
+	RunID         string            `json:"run_id"`
+	Nonce         string            `json:"nonce"` // part of every request id of the run
+	StartedAt     time.Time         `json:"started_at"`
+	FinishedAt    time.Time         `json:"finished_at,omitempty"`
+	Suite         SuiteRef          `json:"suite"`
+	Seed          int64             `json:"seed"`
+	Concurrency   int               `json:"concurrency"`
+	Repetitions   int               `json:"repetitions"`
+	Agent         string            `json:"agent"`
+	Model         string            `json:"model,omitempty"`
+	Tasks         []string          `json:"tasks,omitempty"`
+	Server        ServerRef         `json:"server"`
+	Workers       []string          `json:"workers,omitempty"`        // name@version from the workers' ready events
+	ModelsUsed    []string          `json:"models_used,omitempty"`    // resolved models in the call journal
+	ProvidersUsed []string          `json:"providers_used,omitempty"` // provider routes that ran model tries
+	ExecDigests   []string          `json:"exec_digests,omitempty"`   // exec image digests reported by checker runs
+	EvalBuild     map[string]string `json:"eval_build,omitempty"`     // build of the agentbox binary running the eval
+	Judge         *JudgeRef         `json:"judge,omitempty"`
 }
 
 // SuiteRef identifies the suite.
@@ -147,6 +148,8 @@ type Metrics struct {
 	Tries        int64            `json:"tries"`
 	Attempts     int64            `json:"attempts"`
 	Models       []string         `json:"models,omitempty"`
+	Providers    []string         `json:"providers,omitempty"`       // fallback-chain routes that ran tries
+	HedgeTries   int              `json:"hedge_tries,omitempty"`     // hedged tries (fallback chain)
 	CallLatency  map[string]int64 `json:"call_latency_ms,omitempty"` // summed try latency per kind
 }
 
@@ -311,6 +314,7 @@ func (r *run) finalize(ctx context.Context) (string, *Summary, error) {
 	}
 	r.man.FinishedAt = r.o.Now().UTC()
 	r.man.Workers, r.man.ModelsUsed, r.man.ExecDigests = r.provenance()
+	r.man.ProvidersUsed = r.providersUsed()
 	if err := writeJSONFile(filepath.Join(r.dir, "manifest.json"), r.man); err != nil {
 		return r.dir, nil, err
 	}
@@ -404,6 +408,20 @@ func (r *run) provenance() (workers, models, digests []string) {
 	return sortedKeys(ws), sortedKeys(ms), sortedKeys(ds)
 }
 
+// providersUsed is the set of fallback-chain routes that ran tries in this run (empty with a single provider).
+func (r *run) providersUsed() []string {
+	ps := map[string]bool{}
+	for _, t := range r.trajs {
+		for _, p := range t.Metrics.Providers {
+			ps[p] = true
+		}
+	}
+	if len(ps) == 0 {
+		return nil
+	}
+	return sortedKeys(ps)
+}
+
 func sortedKeys(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
@@ -477,7 +495,7 @@ func metricsOf(in *Inspection) Metrics {
 	if in.Budget != nil {
 		m.CostMicro, m.UnknownMicro = in.Budget.SpentMicro, in.Budget.UnknownMicro
 	}
-	models := map[string]bool{}
+	models, providers := map[string]bool{}, map[string]bool{}
 	var charged int64
 	for _, c := range in.Calls {
 		k := endpointKind(c.Endpoint)
@@ -486,6 +504,12 @@ func metricsOf(in *Inspection) Metrics {
 		charged += c.CostChargedMicro
 		for _, t := range c.Tries {
 			m.CallLatency[k] += t.LatencyMs
+			if t.Provider != "" {
+				providers[t.Provider] = true
+			}
+			if t.Hedge {
+				m.HedgeTries++
+			}
 		}
 		switch k {
 		case "chat":
@@ -503,6 +527,9 @@ func metricsOf(in *Inspection) Metrics {
 		m.CostMicro = charged
 	}
 	m.Models = sortedKeys(models)
+	if len(providers) > 0 {
+		m.Providers = sortedKeys(providers)
+	}
 	return m
 }
 

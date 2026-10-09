@@ -97,6 +97,12 @@ type Try struct {
 	Error     string `json:"error,omitempty"`
 	QueueMs   int64  `json:"queue_ms,omitempty"`
 	WallMs    int64  `json:"wall_ms,omitempty"`
+	// Model fallback chain (present only with fallback providers configured): the provider route that ran the
+	// try, routes skipped before it ("name:reason,..."), and hedge markers.
+	Provider  string `json:"provider,omitempty"`
+	Skipped   string `json:"skipped,omitempty"`
+	Hedge     bool   `json:"hedge,omitempty"`
+	HedgeLost bool   `json:"hedge_lost,omitempty"`
 }
 
 // Budget is the task-layer ledger.

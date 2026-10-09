@@ -36,6 +36,15 @@ func TestServerInfoHasNoSecrets(t *testing.T) {
 	if len(fp) != 16 || other.serverInfo()["upstream_fingerprint"] == fp || s.serverInfo()["upstream_fingerprint"] != fp {
 		t.Fatalf("upstream_fingerprint 须稳定且随单价变化: %q", fp)
 	}
+	// 降级链（S4）：路由名公开，地址与 Key 不公开；后备供应商进入指纹。
+	chain := &server{execDigest: s.execDigest, cfg: s.cfg}
+	chain.cfg.Model.Fallbacks = []ModelFallback{{Name: "backup", BaseURL: "https://backup.example/v1", APIKey: "sk-backup"}}
+	ci := chain.serverInfo()
+	cb, _ := json.Marshal(ci)
+	if ci["upstream_fingerprint"] == fp || strings.Contains(string(cb), "sk-backup") || strings.Contains(string(cb), "backup.example") ||
+		!strings.Contains(string(cb), `"model_routes":["primary","backup"]`) {
+		t.Fatalf("降级链的 server-info: %s", cb)
+	}
 	none := (&server{cfg: Config{}}).serverInfo()
 	if m := none["models"].(map[string]any); len(m) != 0 {
 		t.Fatalf("未配置模型上游时 models 应为空: %v", m)
