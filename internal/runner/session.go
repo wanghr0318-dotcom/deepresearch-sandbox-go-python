@@ -789,6 +789,10 @@ func (inc *Incarnation) RunTask(ctx context.Context, a SessionAttempt, controls 
 	ctx, span := obs.Start(ctx, "worker.run", runAttrs("session", a.Attempt)...)
 	defer func() { endRun(span, out) }()
 	a.Init.Traceparent = obs.Traceparent(ctx) // task_start.traceparent（见 Runner.Run）
+	return inc.runTask(ctx, a, controls)
+}
+
+func (inc *Incarnation) runTask(ctx context.Context, a SessionAttempt, controls <-chan Control) Outcome {
 	fail := func(err error) Outcome {
 		in := ClassifyInput{StartErr: err}
 		if ctx.Err() != nil {

@@ -63,9 +63,3 @@ func TakeSubmit(taskID string) (traceparent string, at time.Time, ok bool) {
 	}
 	return s.traceparent, s.at, true
 }
-
-func registryLen() int {
-	reg.Lock()
-	defer reg.Unlock()
-	return len(reg.m)
-}

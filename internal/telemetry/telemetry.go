@@ -98,65 +98,83 @@ func Setup(ctx context.Context, c Config) (*Telemetry, error) {
 	t := &Telemetry{}
 	var tracer obs.Tracer
 	if c.OTLPEndpoint != "" || c.SpanExporter != nil {
-		exp := c.SpanExporter
-		if exp == nil {
-			u, _ := url.Parse(c.OTLPEndpoint)
-			opts := []otlptracehttp.Option{otlptracehttp.WithEndpoint(u.Host)}
-			if u.Scheme == "http" {
-				opts = append(opts, otlptracehttp.WithInsecure())
-			}
-			if p := strings.TrimSuffix(u.Path, "/"); p != "" {
-				opts = append(opts, otlptracehttp.WithURLPath(p+"/v1/traces"))
-			}
-			var err error
-			// New does not connect: an unreachable collector only drops spans later (never blocks requests).
-			if exp, err = otlptracehttp.New(ctx, opts...); err != nil {
-				return nil, fmt.Errorf("telemetry: OTLP exporter: %w", err)
-			}
-		}
-		ratio := c.SampleRatio
-		if ratio == 0 {
-			ratio = 1
-		}
-		res, err := resource.Merge(resource.Default(), resource.NewSchemaless(
-			attribute.String("service.name", ServiceName), attribute.String("service.version", c.ServiceVersion)))
+		tp, err := newTracerProvider(ctx, c)
 		if err != nil {
-			return nil, fmt.Errorf("telemetry: resource: %w", err)
+			return nil, err
 		}
-		t.tp = sdktrace.NewTracerProvider(sdktrace.WithBatcher(exp), sdktrace.WithResource(res),
-			sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))))
-		tracer = newTracer(t.tp)
+		t.tp, tracer = tp, newTracer(tp)
 	}
 	var rec obs.Recorder
 	if c.MetricsListen != "" {
-		t.reg = prometheus.NewRegistry()
-		t.reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-		m := newMetrics(t.reg)
-		rec = m
-		listen := c.Listen
-		if listen == nil {
-			listen = func(addr string) (net.Listener, error) { return net.Listen("tcp", addr) }
-		}
-		ln, err := listen(c.MetricsListen)
+		m, err := t.serveMetrics(c)
 		if err != nil {
 			if t.tp != nil {
 				_ = t.tp.Shutdown(ctx)
 			}
-			return nil, fmt.Errorf("telemetry: metrics listener %s: %w", c.MetricsListen, err)
+			return nil, err
 		}
-		mux := http.NewServeMux()
-		mux.Handle("GET /metrics", promhttp.HandlerFor(t.reg, promhttp.HandlerOpts{}))
-		t.ln, t.srv = ln, &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-		go func() {
-			if err := t.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) && c.Logger != nil {
-				c.Logger.Error("telemetry: metrics listener stopped", "error", err.Error())
-			}
-		}()
+		rec = m
 	}
 	if tracer != nil || rec != nil {
 		t.restore = obs.Set(tracer, rec)
 	}
 	return t, nil
+}
+
+// newTracerProvider builds the SDK tracer provider: OTLP/HTTP exporter (or c.SpanExporter), batch processor,
+// parent-based ratio sampler. otlptracehttp.New does not connect: an unreachable collector only drops spans later
+// (requests are never blocked).
+func newTracerProvider(ctx context.Context, c Config) (*sdktrace.TracerProvider, error) {
+	exp := c.SpanExporter
+	if exp == nil {
+		u, _ := url.Parse(c.OTLPEndpoint)
+		opts := []otlptracehttp.Option{otlptracehttp.WithEndpoint(u.Host)}
+		if u.Scheme == "http" {
+			opts = append(opts, otlptracehttp.WithInsecure())
+		}
+		if p := strings.TrimSuffix(u.Path, "/"); p != "" {
+			opts = append(opts, otlptracehttp.WithURLPath(p+"/v1/traces"))
+		}
+		var err error
+		if exp, err = otlptracehttp.New(ctx, opts...); err != nil {
+			return nil, fmt.Errorf("telemetry: OTLP exporter: %w", err)
+		}
+	}
+	ratio := c.SampleRatio
+	if ratio == 0 {
+		ratio = 1
+	}
+	res, err := resource.Merge(resource.Default(), resource.NewSchemaless(
+		attribute.String("service.name", ServiceName), attribute.String("service.version", c.ServiceVersion)))
+	if err != nil {
+		return nil, fmt.Errorf("telemetry: resource: %w", err)
+	}
+	return sdktrace.NewTracerProvider(sdktrace.WithBatcher(exp), sdktrace.WithResource(res),
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio)))), nil
+}
+
+// serveMetrics creates the Prometheus registry and recorder and starts the /metrics listener.
+func (t *Telemetry) serveMetrics(c Config) (*metrics, error) {
+	t.reg = prometheus.NewRegistry()
+	t.reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	m := newMetrics(t.reg)
+	listen := c.Listen
+	if listen == nil {
+		listen = func(addr string) (net.Listener, error) { return net.Listen("tcp", addr) }
+	}
+	ln, err := listen(c.MetricsListen)
+	if err != nil {
+		return nil, fmt.Errorf("telemetry: metrics listener %s: %w", c.MetricsListen, err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", promhttp.HandlerFor(t.reg, promhttp.HandlerOpts{}))
+	t.ln, t.srv = ln, &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		if err := t.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) && c.Logger != nil {
+			c.Logger.Error("telemetry: metrics listener stopped", "error", err.Error())
+		}
+	}()
+	return m, nil
 }
 
 // MetricsAddr returns the actual metrics listen address ("" when metrics are off).
