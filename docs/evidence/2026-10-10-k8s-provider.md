@@ -69,6 +69,17 @@ protocol handshake and polling at 0.2 s.
 The cold "env ready" figure is higher through the server than in the provider test. In the demo, warm Pods
 are being refilled while cold Pods start, and the kubelet starts them at the same time.
 
+### Caveats
+
+- **Warm is the best case.** Every warm sample waited for a ready warm Pod before starting, so the pool
+  was never exhausted. When more Creates arrive at once than the pool holds, the extra ones are cold
+  starts. They are counted as `path=cold`; `TestBurstOnRealCluster` measures that case: N concurrent
+  Creates against a pool of 2.
+- **Cold does not include an image pull.** The image was already on the node, so the cold numbers are
+  scheduling, container start and readiness only. A first start on a node without the image adds the
+  pull time.
+- **Scale.** Single node, sequential samples, laptop hardware.
+
 ## 3. Pod isolation, checked inside a running sandbox
 
 Step 8 of the demo. A task is running in a claimed Pod, and the script runs a probe through `kubectl exec`:

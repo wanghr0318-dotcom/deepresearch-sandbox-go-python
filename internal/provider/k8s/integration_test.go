@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -172,5 +173,62 @@ func TestStartLatencyOnRealCluster(t *testing.T) {
 		if err := os.WriteFile(path, b, 0o644); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// TestBurstOnRealCluster: AGENTBOX_K8S_TEST_BURST (default 6) concurrent Creates against a warm pool of 2 —
+// the pool is exhausted and the rest start cold, so this is the "pool too small" case the warm numbers above
+// exclude.
+func TestBurstOnRealCluster(t *testing.T) {
+	realCluster(t)
+	n := 6
+	if v, err := strconv.Atoi(os.Getenv("AGENTBOX_K8S_TEST_BURST")); err == nil && v > 0 {
+		n = v
+	}
+	p := newRealProvider(t, randomInstall(), func(o *Options) { o.WarmPool = 2; o.WarmProfile = testLimits() })
+	deadline := time.Now().Add(3 * time.Minute)
+	for {
+		pods, _ := p.pool.warmPods(context.Background())
+		r := 0
+		for i := range pods {
+			if ready(&pods[i]) {
+				r++
+			}
+		}
+		if r >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("warm pool did not fill")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	var wg sync.WaitGroup
+	lat := make([]time.Duration, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+			t0 := time.Now()
+			_, errs[i] = p.Create(ctx, specFor(p.opt.InstallID)("burst-"+strconv.Itoa(i)))
+			lat[i] = time.Since(t0)
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := p.Stats()
+	all := Summarize(lat)
+	t.Logf("burst n=%d pool=2: warm=%d cold=%d; all P50=%v P95=%v; warm P50=%v; cold P50=%v P95=%v", n, s["warm"].Count,
+		s["cold"].Count, all.P50.Round(time.Millisecond), all.P95.Round(time.Millisecond), s["warm"].P50.Round(time.Millisecond),
+		s["cold"].P50.Round(time.Millisecond), s["cold"].P95.Round(time.Millisecond))
+	if s["warm"].Count > 2 || s["warm"].Count+s["cold"].Count != n {
+		t.Fatalf("unexpected paths %+v", s)
 	}
 }

@@ -20,4 +20,8 @@ github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/cal
 # 用例在 fake clientset 上的 TestConformanceOnFakeCluster 必须运行。
 github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/k8s TestConformanceOnRealCluster
 github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/k8s TestStartLatencyOnRealCluster
+<<<<<<< HEAD
 >>>>>>> b1d089c (test(k8s): fix data race in TestExecSignalStatusAndTerminate; allow opt-in real-cluster skips)
+=======
+github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/k8s TestBurstOnRealCluster
+>>>>>>> 8cc034a (test(k8s): opt-in burst measurement (N concurrent Creates vs pool of 2); evidence caveats)
