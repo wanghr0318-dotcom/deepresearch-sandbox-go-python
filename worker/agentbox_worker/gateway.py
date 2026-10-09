@@ -57,7 +57,13 @@ ENDPOINTS: dict[str, str] = {
     "search": "/v1/search",
     "fetch": "/v1/fetch",
     "exec": "/v1/exec",
+    # 工作区命令与 MCP 工具调用（设计 2026-10-10-shell-file-mcp；
+    # 服务端以 --workspace-tools / --mcp-config 启用）
+    "workspace_exec": "/v1/workspace/exec",
+    "mcp": "/v1/mcp/call",
 }
+# 工作区的文件操作（不计费、无 call id）
+WORKSPACE_FILE_OPS = ("read", "write", "list")
 
 # exec（规格 §10、§19 补充）：服务端的调用期限 = 排队上限 + 生效 wall + 30 s（§9.7）。客户端超时按
 # server 默认值估算并加余量，且不短于普通调用的超时，让 Gateway 先给出 504 而不是客户端先放弃。
@@ -428,6 +434,56 @@ class GatewayClient:
             body["limits"] = limits
         return body
 
+    def workspace_exec(
+        self, step_id: str, command: str, *, timeout_ms: int | None = None, retry: bool = False
+    ) -> GatewayResult:
+        """POST /v1/workspace/exec：在本轮工作区中运行一条 bash 命令（每条命令一个全新的 exec 环境，
+        文件在命令之间保留）；call id 为 <root|subrun>/<step_id>/workspace_exec/<n>，按 exec 记账。
+        请求内容进入调用指纹（含当时的工作区文件），恢复后同一 call id 重发得到同一结果。"""
+        body = self.workspace_exec_body(command, timeout_ms=timeout_ms)
+        extra = {"X-Agentbox-Retry": "true"} if retry else {}
+        return self._call("workspace_exec", self._next_id(step_id, "workspace_exec"), body, extra)
+
+    @staticmethod
+    def workspace_exec_body(command: str, *, timeout_ms: int | None = None) -> dict[str, Any]:
+        if not isinstance(command, str):
+            raise TypeError(f"command 须为 str，得到 {type(command).__name__}")
+        _positive_int("timeout_ms", timeout_ms)
+        body: dict[str, Any] = {"command": command}
+        if timeout_ms is not None:
+            body["timeout_ms"] = timeout_ms
+        return body
+
+    def workspace(self, op: str, body: dict[str, Any]) -> dict[str, Any]:
+        """工作区文件操作 read / write / list（POST /v1/workspace/<op>）：不计费、无 call id，
+        返回响应 JSON；错误按 errors.py 映射抛出。"""
+        if op not in WORKSPACE_FILE_OPS:
+            raise ValueError(f"未知的工作区操作：{op!r}")
+        check_not_abandoned()  # 被放弃的调用不再发出
+        payload = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        resp = self._send(
+            "POST", f"/v1/workspace/{op}", payload, {"Content-Type": "application/json"}
+        )
+        if resp.status != 200:
+            raise _error_from(resp.status, resp.data)
+        return self._json(resp)
+
+    def mcp_tools(self) -> list[dict[str, Any]]:
+        """GET /v1/mcp/tools：服务端允许的 MCP 工具（name 为 mcp__<server>__<tool>）。"""
+        resp = self._send("GET", "/v1/mcp/tools", None, {})
+        if resp.status != 200:
+            raise _error_from(resp.status, resp.data)
+        tools = self._json(resp).get("tools")
+        return [t for t in tools if isinstance(t, dict)] if isinstance(tools, list) else []
+
+    def mcp_call(
+        self, step_id: str, server: str, tool: str, arguments: dict[str, Any]
+    ) -> GatewayResult:
+        """POST /v1/mcp/call：经 Gateway 调用 MCP 工具（计入本轮工具额度，响应带额度头）；
+        call id 为 <root|subrun>/<step_id>/mcp/<n>。"""
+        body = {"server": server, "tool": tool, "arguments": arguments}
+        return self._call("mcp", self._next_id(step_id, "mcp"), body, {})
+
     def retry(
         self, step_id: str, kind: str, call_id: str, body: dict, *, no_cache: bool = False
     ) -> GatewayResult:
@@ -475,9 +531,12 @@ class GatewayClient:
         headers = {"Content-Type": "application/json", "X-Agentbox-Call-Id": call_id, **extra}
         # exec（含 retry/supersede 发出的 exec）的等待上限随 wall 变化；其他调用用 timeout_s
         send_kw: dict[str, float] = {}
-        if kind == "exec":
-            limits = body.get("limits")
-            wall = limits.get("wall_ms") if isinstance(limits, dict) else None
+        if kind in ("exec", "workspace_exec"):
+            if kind == "exec":
+                limits = body.get("limits")
+                wall = limits.get("wall_ms") if isinstance(limits, dict) else None
+            else:
+                wall = body.get("timeout_ms")
             wall_ms = wall if isinstance(wall, int) and not isinstance(wall, bool) else None
             send_kw["timeout_s"] = max(self.timeout_s, exec_timeout_s(wall_ms))
         wait = self.in_progress_wait_s

@@ -59,6 +59,16 @@ def _int(v: Any, what: str) -> int:
     return v
 
 
+def _mcp_tools(v: Any) -> list[dict[str, Any]] | None:
+    """mcp_tools：None 或描述对象的列表（name、server、tool 为字符串）。"""
+    if v is None:
+        return None
+    _check(isinstance(v, list) and all(isinstance(t, dict) for t in v), "mcp_tools")
+    for t in v:
+        _check(all(isinstance(t.get(k), str) for k in ("name", "server", "tool")), "mcp_tools.name")
+    return [dict(t) for t in v]
+
+
 @dataclass
 class SubtopicState:
     id: str
@@ -162,8 +172,17 @@ class TurnState:
     # 停止时被放弃的调用已占到的 root call id 序号（放弃时回退之前的计数器）。继续时同一 ID 重发
     # 得到 journal 中的结果；改变下一次请求内容的指令（立即写报告、回答）先前进到这些序号之后
     abandoned_ids: dict[str, int] = field(default_factory=dict)
+    # 本轮开始时取得的 MCP 工具描述（config.tools.mcp 时；None = 未取或未启用）。
+    # 保存在状态中：恢复后发给模型的 tools 与原来相同
+    mcp_tools: list[dict[str, Any]] | None = None
 
     def to_json(self) -> dict[str, Any]:
+        out = self._json()
+        if self.mcp_tools is not None:  # 未启用 MCP 时状态与之前相同
+            out["mcp_tools"] = [dict(t) for t in self.mcp_tools]
+        return out
+
+    def _json(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
             "phase": self.phase,
@@ -271,6 +290,7 @@ class TurnState:
             question=d.get("question", ""),
             carried_question=d.get("carried_question", ""),
             abandoned_ids=dict(abandoned),
+            mcp_tools=_mcp_tools(d.get("mcp_tools")),
         )
 
     def merge_found(self, sub: SubtopicState) -> None:

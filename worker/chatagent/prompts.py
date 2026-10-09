@@ -46,6 +46,35 @@ _ORCHESTRATOR_RULES = "\n".join(
 )
 
 
+WORKSPACE_SECTION = "\n".join(
+    [
+        "## 工作区（写代码、跑测试）",
+        "本轮有一个工作区：write_file / read_file / list_dir 读写其中的文件，"
+        "exec_shell 在其中运行 bash 命令（当前目录即工作区根目录，用相对路径）。"
+        "文件在工具调用之间保留，进程不保留：每条命令都在全新的无网络沙箱中运行，"
+        "不要启动后台服务，也不要安装网络上的包。",
+        "- 需要多个文件、反复修改并运行（例如写代码再跑测试、看报错再修）时用工作区；"
+        "一次性的计算仍用 run_python。",
+        "- 典型流程：write_file 写代码与测试 → exec_shell 运行（如 python3 -m unittest -v）"
+        "→ 读输出，失败时 read_file 查看、修改后再运行。回复中的运行结果以命令的实际输出为准。",
+        "- exec_shell 与 run_python 共用本任务的代码执行配额，不计入工具额度；"
+        "read_file、write_file、list_dir 不计额度。结果提示代码执行配额已用完时"
+        "不要再调用 exec_shell 或 run_python。",
+        "- 工作区只属于本轮，下一轮不保留。",
+    ]
+)
+
+MCP_SECTION = "\n".join(
+    [
+        "## 外部工具（MCP）",
+        "名称以 mcp__ 开头的工具来自服务端配置的外部服务，经 Gateway 调用。"
+        "每次调用与 web_search、web_fetch 一样消耗 1 次本轮工具额度（三者合计 {budget} 次）。"
+        "只在它们比网页搜索或自己计算更直接时使用；工具报告错误时根据错误信息改正参数，"
+        "不要原样重试。",
+    ]
+)
+
+
 def _first_sentence(text: str) -> str:
     head = text.split("。", 1)[0].strip()
     return head + ("。" if "。" in text else "")
@@ -73,6 +102,10 @@ def orchestrator_system(
         for s in registry.schemas()
     )
     parts.append("## 工具\n" + tools)
+    if cfg.workspace_tools:
+        parts.append(WORKSPACE_SECTION)
+    if any(name.startswith("mcp__") for name in registry.names()):
+        parts.append(MCP_SECTION.format(budget=cfg.tool_budget))
     parts.append("## 会话状态\n" + session_summary(memory))
     if carry:
         parts.append(_CARRY_HEAD + carry)

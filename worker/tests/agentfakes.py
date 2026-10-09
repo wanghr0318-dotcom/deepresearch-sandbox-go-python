@@ -76,7 +76,19 @@ class ScriptedGateway:
         budget_limit_micro: int | None = None,
         cost: Callable[[GatewayCall], int] | None = None,
         inject: Callable[[GatewayCall], BaseException | None] | None = None,
+        shell: Callable[[dict[str, Any]], Any] | None = None,
+        workspace: Callable[[str, dict[str, Any]], Any] | None = None,
+        mcp_list: list[dict[str, Any]] | BaseException | None = None,
+        mcp: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
+        # 工作区与 MCP（设计 2026-10-10-shell-file-mcp）：shell 收到 /v1/workspace/exec 的请求体；
+        # workspace(op, body) 回答文件操作（不计费、无 call id，记入 file_ops）；mcp_list 是
+        # GET /v1/mcp/tools 的清单（或要抛出的异常）；mcp 收到 /v1/mcp/call 的请求体（计入工具额度）
+        self.shell_script = shell
+        self.workspace_script = workspace
+        self.mcp_list = mcp_list
+        self.mcp_script = mcp
+        self.file_ops: list[tuple[str, dict[str, Any]]] = []
         self.chat_script = chat
         self.search_script = search
         self.fetch_script = fetch
@@ -156,6 +168,32 @@ class ScriptedGateway:
         script = self.exec_script
         return self._call("exec", step_id, body, lambda: _need(script, "exec")(body))
 
+    def workspace_exec(
+        self, step_id: str, command: str, *, timeout_ms: int | None = None, retry: bool = False
+    ) -> GatewayResult:
+        body = GatewayClient.workspace_exec_body(command, timeout_ms=timeout_ms)
+        script = self.shell_script
+        return self._call(
+            "workspace_exec", step_id, body, lambda: _need(script, "workspace_exec")(body)
+        )
+
+    def workspace(self, op: str, body: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            self.file_ops.append((op, json.loads(json.dumps(body))))
+        return _need(self.workspace_script, "workspace")(op, body)
+
+    def mcp_tools(self) -> list[dict[str, Any]]:
+        if isinstance(self.mcp_list, BaseException):
+            raise self.mcp_list
+        return [dict(t) for t in self.mcp_list or []]
+
+    def mcp_call(
+        self, step_id: str, server: str, tool: str, arguments: dict[str, Any]
+    ) -> GatewayResult:
+        body = {"server": server, "tool": tool, "arguments": arguments}
+        script = self.mcp_script
+        return self._call("mcp", step_id, body, lambda: _need(script, "mcp")(body))
+
     def read_blob(self, sha256: str) -> bytes:
         self.blob_reads.append(sha256)
         if self.read_blob_error is not None:
@@ -224,7 +262,7 @@ class ScriptedGateway:
         budget = None
         with self._lock:
             self._charge(call)
-            if kind in ("search", "fetch"):
+            if kind in ("search", "fetch", "mcp"):
                 if self.tool_limit is not None and self._counted >= self.tool_limit:
                     self.rejections.append((sub, "tool_budget_exhausted"))
                     raise ToolBudgetExhausted(429, "tool_budget_exhausted")
