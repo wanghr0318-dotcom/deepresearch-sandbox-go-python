@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-24.04
     services:
       postgres:
-        image: postgres:16-alpine
+        image: public.ecr.aws/docker/library/postgres:16-alpine
         env:
           POSTGRES_USER: agentbox
           POSTGRES_PASSWORD: agentbox
@@ -32,7 +32,7 @@ jobs:
           --health-cmd "pg_isready -U agentbox -d agentbox"
           --health-interval 2s --health-timeout 2s --health-retries 30
       redis:
-        image: redis:7-alpine
+        image: public.ecr.aws/docker/library/redis:7-alpine
         ports:
           - 6379:6379
         options: >-
@@ -89,7 +89,7 @@ jobs:
     runs-on: ubuntu-24.04
     services:
       postgres:
-        image: postgres:16-alpine
+        image: public.ecr.aws/docker/library/postgres:16-alpine
         env:
           POSTGRES_USER: agentbox
           POSTGRES_PASSWORD: agentbox
@@ -100,7 +100,7 @@ jobs:
           --health-cmd "pg_isready -U agentbox -d agentbox"
           --health-interval 2s --health-timeout 2s --health-retries 30
       redis:
-        image: redis:7-alpine
+        image: public.ecr.aws/docker/library/redis:7-alpine
         ports:
           - 6379:6379
         options: >-
