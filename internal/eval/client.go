@@ -378,47 +378,76 @@ func (c *Client) eventsOnce(ctx context.Context, taskID string, last *int64, fn 
 	}
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 64<<10), 16<<20)
-	var id, typ string
-	var data strings.Builder
+	var p sseParser
 	for sc.Scan() {
-		line := strings.TrimSuffix(sc.Text(), "\r")
-		switch {
-		case line == "":
-			if data.Len() > 0 {
-				seq, perr := strconv.ParseInt(id, 10, 64)
-				if perr == nil && seq > *last {
-					var ev Event
-					if json.Unmarshal([]byte(data.String()), &ev) == nil {
-						if ev.Type == "" {
-							ev.Type = typ
-						}
-						if ev.TaskSeq == 0 {
-							ev.TaskSeq = seq
-						}
-						fn(ev)
-						*last = seq
-						progressed = true
-						if typ == "task_terminal" || ev.Type == "task_terminal" {
-							return true, true, nil
-						}
-					}
-				}
-			}
-			id, typ = "", ""
-			data.Reset()
-		case strings.HasPrefix(line, ":"):
-		case strings.HasPrefix(line, "id:"):
-			id = strings.TrimSpace(strings.TrimPrefix(line, "id:"))
-		case strings.HasPrefix(line, "event:"):
-			typ = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-		case strings.HasPrefix(line, "data:"):
-			if data.Len() > 0 {
-				data.WriteByte('\n')
-			}
-			data.WriteString(strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+		f, ok := p.line(sc.Text())
+		if !ok {
+			continue
+		}
+		ev, ok := f.event()
+		if !ok || ev.TaskSeq <= *last {
+			continue // malformed or already seen (reconnect)
+		}
+		fn(ev)
+		*last, progressed = ev.TaskSeq, true
+		if ev.Type == "task_terminal" {
+			return true, true, nil
 		}
 	}
 	return false, progressed, sc.Err()
+}
+
+// sseFrame is one dispatched server-sent event.
+type sseFrame struct {
+	ID, Type, Data string
+}
+
+// sseParser accumulates SSE lines into frames (text/event-stream: "id:", "event:", "data:" fields, comment
+// lines starting with ":", a blank line dispatches).
+type sseParser struct {
+	id, typ string
+	data    strings.Builder
+}
+
+// line feeds one line (without its newline); ok is true when it completes a frame with data.
+func (p *sseParser) line(line string) (f sseFrame, ok bool) {
+	line = strings.TrimSuffix(line, "\r")
+	switch {
+	case line == "":
+		f, ok = sseFrame{ID: p.id, Type: p.typ, Data: p.data.String()}, p.data.Len() > 0
+		p.id, p.typ = "", ""
+		p.data.Reset()
+	case strings.HasPrefix(line, ":"):
+	case strings.HasPrefix(line, "id:"):
+		p.id = strings.TrimSpace(strings.TrimPrefix(line, "id:"))
+	case strings.HasPrefix(line, "event:"):
+		p.typ = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+	case strings.HasPrefix(line, "data:"):
+		if p.data.Len() > 0 {
+			p.data.WriteByte('\n')
+		}
+		p.data.WriteString(strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+	}
+	return f, ok
+}
+
+// event decodes a frame as a task event; the SSE id and event type fill in missing fields.
+func (f sseFrame) event() (Event, bool) {
+	seq, err := strconv.ParseInt(f.ID, 10, 64)
+	if err != nil || seq <= 0 {
+		return Event{}, false
+	}
+	var ev Event
+	if json.Unmarshal([]byte(f.Data), &ev) != nil {
+		return Event{}, false
+	}
+	if ev.Type == "" {
+		ev.Type = f.Type
+	}
+	if ev.TaskSeq == 0 {
+		ev.TaskSeq = seq
+	}
+	return ev, true
 }
 
 func truncate(s string, n int) string {

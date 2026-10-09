@@ -2,11 +2,15 @@ package eval
 
 import (
 	"context"
+	crand "crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -47,12 +51,15 @@ type Options struct {
 	Judge          *Judge
 	Log            io.Writer
 	Now            func() time.Time
+	// Nonce makes this run's request ids unique (default: 64 random bits); recorded in the manifest.
+	Nonce string
 }
 
 // Manifest pins what a run evaluated.
 type Manifest struct {
 	Schema      string            `json:"schema"`
 	RunID       string            `json:"run_id"`
+	Nonce       string            `json:"nonce"` // part of every request id of the run
 	StartedAt   time.Time         `json:"started_at"`
 	FinishedAt  time.Time         `json:"finished_at,omitempty"`
 	Suite       SuiteRef          `json:"suite"`
@@ -81,15 +88,21 @@ type SuiteRef struct {
 
 // ServerRef identifies the server under evaluation.
 type ServerRef struct {
-	Addr string          `json:"addr"`
+	Addr string          `json:"addr"`           // without userinfo
 	Info json.RawMessage `json:"info,omitempty"` // GET /server-info; absent on older servers
 	Note string          `json:"note,omitempty"`
 }
 
-// JudgeRef records the judge configuration.
+// JudgeRef records the judge configuration (endpoint host only; never the key).
 type JudgeRef struct {
-	Model       string `json:"model"`
-	BudgetMicro int64  `json:"budget_micro"`
+	Model                string `json:"model"`
+	Host                 string `json:"host"`
+	BudgetMicro          int64  `json:"budget_micro"`
+	PriceInMicroPerMTok  int64  `json:"price_in_micro_per_mtok"`
+	PriceOutMicroPerMTok int64  `json:"price_out_micro_per_mtok"`
+	MaxCalls             int    `json:"max_calls"`
+	MaxTokens            int    `json:"max_tokens"`
+	Required             bool   `json:"required,omitempty"`
 }
 
 // Trajectory is one line of trajectories.jsonl.
@@ -148,18 +161,25 @@ type workItem struct {
 // OutDir/RunID. It returns the run directory and the summary. A cancelled ctx cancels the server tasks this
 // run created and still writes the partial outputs.
 func Run(ctx context.Context, o Options) (string, *Summary, error) {
+	r, err := setupRun(ctx, o)
+	if err != nil {
+		return "", nil, err
+	}
+	defer r.file.Close()
+	r.runPool(ctx)
+	return r.finalize(ctx)
+}
+
+// withDefaults validates the options and fills in the defaults.
+func (o Options) withDefaults() (Options, error) {
 	if o.Suite == nil || o.Client == nil {
-		return "", nil, errors.New("eval: Suite and Client are required")
+		return o, errors.New("eval: Suite and Client are required")
 	}
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	if o.Concurrency <= 0 {
-		o.Concurrency = 1
-	}
-	if o.Repetitions <= 0 {
-		o.Repetitions = 1
-	}
+	o.Concurrency = max(o.Concurrency, 1)
+	o.Repetitions = max(o.Repetitions, 1)
 	if o.Seed == 0 {
 		o.Seed = 1
 	}
@@ -167,7 +187,7 @@ func Run(ctx context.Context, o Options) (string, *Summary, error) {
 		o.Agent = AgentModel
 	}
 	if o.Agent != AgentModel && o.Agent != AgentReference {
-		return "", nil, fmt.Errorf("eval: unknown agent %q", o.Agent)
+		return o, fmt.Errorf("eval: unknown agent %q", o.Agent)
 	}
 	if o.DefaultTimeout <= 0 {
 		o.DefaultTimeout = 10 * time.Minute
@@ -175,76 +195,105 @@ func Run(ctx context.Context, o Options) (string, *Summary, error) {
 	if o.Log == nil {
 		o.Log = io.Discard
 	}
+	if o.Nonce == "" {
+		o.Nonce = newNonce()
+	}
+	return o, nil
+}
+
+// setupRun validates the options, checks the server, creates the run directory and writes the initial
+// manifest; it returns the run with its shuffled work items.
+func setupRun(ctx context.Context, o Options) (*run, error) {
+	o, err := o.withDefaults()
+	if err != nil {
+		return nil, err
+	}
 	started := o.Now().UTC()
 	if o.RunID == "" {
 		o.RunID = o.Suite.Name + "-" + started.Format("20060102T150405Z")
 	}
 	if !idPattern.MatchString(o.RunID) {
-		return "", nil, fmt.Errorf("eval: run id %q must match %s", o.RunID, idPattern)
+		return nil, fmt.Errorf("eval: run id %q must match %s", o.RunID, idPattern)
 	}
 	tasks, err := selectTasks(o.Suite, o.Tasks)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	hash, err := o.Suite.Hash()
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	if err := o.Client.Status(ctx); err != nil {
-		return "", nil, fmt.Errorf("eval: server unreachable: %w", err)
+		return nil, fmt.Errorf("eval: server unreachable: %w", err)
 	}
 	dir := filepath.Join(o.OutDir, o.RunID)
 	if _, err := os.Stat(dir); err == nil {
-		return "", nil, fmt.Errorf("eval: run directory %s already exists", dir)
+		return nil, fmt.Errorf("eval: run directory %s already exists", dir)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", nil, fmt.Errorf("eval: %w", err)
+		return nil, fmt.Errorf("eval: %w", err)
 	}
+	man := newManifest(ctx, o, started, SuiteRef{Name: o.Suite.Name, Version: o.Suite.Version,
+		Path: filepath.ToSlash(o.SuitePath), SHA256: hash, Tasks: len(tasks)})
+	if err := writeJSONFile(filepath.Join(dir, "manifest.json"), man); err != nil {
+		return nil, err
+	}
+	f, err := os.Create(filepath.Join(dir, "trajectories.jsonl"))
+	if err != nil {
+		return nil, fmt.Errorf("eval: %w", err)
+	}
+	return &run{o: o, dir: dir, man: man, file: f, out: f, items: workItems(tasks, o.Repetitions, o.Seed)}, nil
+}
 
-	man := &Manifest{Schema: SchemaManifest, RunID: o.RunID, StartedAt: started,
-		Suite: SuiteRef{Name: o.Suite.Name, Version: o.Suite.Version, Path: filepath.ToSlash(o.SuitePath), SHA256: hash, Tasks: len(tasks)},
-		Seed:  o.Seed, Concurrency: o.Concurrency, Repetitions: o.Repetitions, Agent: o.Agent, Model: o.Model,
-		Tasks: o.Tasks, Server: ServerRef{Addr: o.Client.Base}, EvalBuild: buildInfo()}
+// newManifest pins what the run evaluates (completed with provenance in finalize).
+func newManifest(ctx context.Context, o Options, started time.Time, suite SuiteRef) *Manifest {
+	man := &Manifest{Schema: SchemaManifest, RunID: o.RunID, Nonce: o.Nonce, StartedAt: started, Suite: suite,
+		Seed: o.Seed, Concurrency: o.Concurrency, Repetitions: o.Repetitions, Agent: o.Agent, Model: o.Model,
+		Tasks: o.Tasks, Server: ServerRef{Addr: redactURL(o.Client.Base)}, EvalBuild: buildInfo()}
 	if info, err := o.Client.ServerInfo(ctx); err == nil {
 		man.Server.Info = info
 	} else {
 		man.Server.Note = "server-info unavailable: " + err.Error()
 	}
-	if o.Judge != nil {
-		man.Judge = &JudgeRef{Model: o.Judge.Model, BudgetMicro: o.Judge.BudgetMicro}
+	if j := o.Judge; j != nil {
+		man.Judge = &JudgeRef{Model: j.Model, Host: urlHost(j.BaseURL), BudgetMicro: j.BudgetMicro,
+			PriceInMicroPerMTok: j.PriceInMicroPerMTok, PriceOutMicroPerMTok: j.PriceOutMicroPerMTok,
+			MaxCalls: j.maxCalls(), MaxTokens: j.maxTokens(), Required: j.Required}
 	}
-	if err := writeJSONFile(filepath.Join(dir, "manifest.json"), man); err != nil {
-		return "", nil, err
-	}
+	return man
+}
 
-	items := make([]workItem, 0, len(tasks)*o.Repetitions)
-	for rep := 1; rep <= o.Repetitions; rep++ {
+// workItems expands tasks × repetitions and shuffles them with the seed (reproducible order).
+func workItems(tasks []*Task, reps int, seed int64) []workItem {
+	items := make([]workItem, 0, len(tasks)*reps)
+	for rep := 1; rep <= reps; rep++ {
 		for _, t := range tasks {
 			items = append(items, workItem{task: t, rep: rep})
 		}
 	}
-	rng := rand.New(rand.NewSource(o.Seed))
+	rng := rand.New(rand.NewSource(seed))
 	rng.Shuffle(len(items), func(i, j int) { items[i], items[j] = items[j], items[i] })
+	return items
+}
 
-	f, err := os.Create(filepath.Join(dir, "trajectories.jsonl"))
-	if err != nil {
-		return "", nil, fmt.Errorf("eval: %w", err)
-	}
-	defer f.Close()
-	r := &run{o: o, out: f}
+// runPool runs the work items with Concurrency workers; after ctx ends no new item is submitted.
+func (r *run) runPool(ctx context.Context) {
 	queue := make(chan workItem)
 	var wg sync.WaitGroup
-	for range o.Concurrency {
+	for range r.o.Concurrency {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for it := range queue {
+				if ctx.Err() != nil {
+					continue // interrupted: drain without submitting
+				}
 				r.record(r.runItem(ctx, it))
 			}
 		}()
 	}
 feed:
-	for _, it := range items {
+	for _, it := range r.items {
 		select {
 		case queue <- it:
 		case <-ctx.Done():
@@ -253,27 +302,30 @@ feed:
 	}
 	close(queue)
 	wg.Wait()
-	if r.err != nil {
-		return dir, nil, r.err
-	}
+}
 
-	man.FinishedAt = o.Now().UTC()
-	man.Workers, man.ModelsUsed, man.ExecDigests = r.provenance()
-	if err := writeJSONFile(filepath.Join(dir, "manifest.json"), man); err != nil {
-		return dir, nil, err
+// finalize completes the manifest with provenance and writes summary.json and report.md.
+func (r *run) finalize(ctx context.Context) (string, *Summary, error) {
+	if r.err != nil {
+		return r.dir, nil, r.err
 	}
-	sum := Summarize(man, r.trajs)
-	if o.Judge != nil {
-		js := o.Judge.Stats()
+	r.man.FinishedAt = r.o.Now().UTC()
+	r.man.Workers, r.man.ModelsUsed, r.man.ExecDigests = r.provenance()
+	if err := writeJSONFile(filepath.Join(r.dir, "manifest.json"), r.man); err != nil {
+		return r.dir, nil, err
+	}
+	sum := Summarize(r.man, r.trajs)
+	if r.o.Judge != nil {
+		js := r.o.Judge.Stats()
 		sum.Judge = &js
 	}
-	if err := WriteReports(dir, sum); err != nil {
-		return dir, nil, err
+	if err := WriteReports(r.dir, sum); err != nil {
+		return r.dir, nil, err
 	}
 	if ctx.Err() != nil {
-		return dir, sum, ctx.Err()
+		return r.dir, sum, ctx.Err()
 	}
-	return dir, sum, nil
+	return r.dir, sum, nil
 }
 
 func selectTasks(s *Suite, ids []string) ([]*Task, error) {
@@ -297,6 +349,10 @@ func selectTasks(s *Suite, ids []string) ([]*Task, error) {
 
 type run struct {
 	o     Options
+	dir   string
+	man   *Manifest
+	file  *os.File
+	items []workItem
 	mu    sync.Mutex
 	out   io.Writer
 	trajs []*Trajectory
@@ -357,160 +413,39 @@ func sortedKeys(m map[string]bool) []string {
 	return out
 }
 
-// spec builds the POST /tasks spec for a task.
-func (r *run) spec(t *Task) (json.RawMessage, error) {
-	ev := map[string]any{"kind": t.Kind, "task_id": t.ID, "suite": r.o.Suite.Name}
-	switch t.Kind {
-	case KindCoding:
-		ev["agent"] = r.o.Agent
-		ev["prompt"] = t.Prompt
-		ev["check"] = t.Check
-		if len(t.Files) > 0 {
-			ev["files"] = t.Files
-		}
-		if r.o.Agent == AgentReference {
-			if t.Reference == "" {
-				return nil, fmt.Errorf("task %s has no reference solution", t.ID)
-			}
-			ev["reference"] = t.Reference // never sent to the model agent
-		}
-		if w := r.o.Suite.EffectiveWallMs(t); w > 0 {
-			ev["wall_ms"] = w
-		}
-		if r.o.Model != "" {
-			ev["model"] = r.o.Model
-		}
-		return json.Marshal(map[string]any{"eval": ev})
-	default:
-		cfg := map[string]any{}
-		if len(t.Research) > 0 {
-			if err := json.Unmarshal(t.Research, &cfg); err != nil {
-				return nil, err
-			}
-		}
-		cfg["topic"] = t.Topic
-		if r.o.Model != "" {
-			for _, k := range []string{"orchestrator_model", "worker_model"} {
-				if _, ok := cfg[k]; !ok {
-					cfg[k] = r.o.Model
-				}
-			}
-		}
-		cfg["eval"] = ev
-		return json.Marshal(cfg)
+// newNonce is a random per-run value that makes request ids unique across runs (also with the same run id).
+func newNonce() string {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		panic("eval: crypto/rand unavailable: " + err.Error())
 	}
+	return hex.EncodeToString(b[:])
 }
 
-// terminalGrace bounds how long the runner waits for task_terminal after cancelling a timed-out task.
-const terminalGrace = 60 * time.Second
+// requestID is the idempotency key of one work item: stable within a run (client retries reuse it), unique
+// across runs thanks to the nonce, and at most 64 bytes whatever the run and task ids (server limit 128).
+func requestID(nonce, runID, taskID string, rep int) string {
+	sum := sha256.Sum256([]byte(runID + "\x00" + taskID + "\x00" + strconv.Itoa(rep)))
+	return "eval-" + nonce + "-" + hex.EncodeToString(sum[:16])
+}
 
-func (r *run) runItem(ctx context.Context, it workItem) *Trajectory {
-	t := it.task
-	tr := &Trajectory{Schema: SchemaTrajectory, RunID: r.o.RunID, Suite: r.o.Suite.Name, TaskID: t.ID, Kind: t.Kind,
-		Rep: it.rep, Agent: r.o.Agent, Events: []Event{}, Calls: []Call{}, Grades: []Grade{}}
-	if t.Kind == KindResearch {
-		tr.Agent = "deepresearch"
-	}
-	fail := func(cat string, err error) *Trajectory {
-		tr.Outcome = Outcome{Verdict: VerdictError, Category: cat}
-		if err != nil {
-			tr.Error = err.Error()
-		}
-		return tr
-	}
-	spec, err := r.spec(t)
+// redactURL drops userinfo (credentials) from a URL for recording; unparsable input is kept as host only.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
 	if err != nil {
-		return fail("invalid_task", err)
+		return "unparsable-url"
 	}
-	tr.SubmittedAt = r.o.Now().UTC()
-	rid := "eval-" + r.o.RunID + "-" + t.ID + "-" + strconv.Itoa(it.rep)
-	id, err := r.o.Client.CreateTask(ctx, rid, spec, r.o.Suite.EffectiveLimits(t))
+	u.User = nil
+	return u.String()
+}
+
+// urlHost is the host[:port] of a URL (the judge endpoint is recorded without path or credentials).
+func urlHost(raw string) string {
+	u, err := url.Parse(raw)
 	if err != nil {
-		return fail("infra_error", err)
+		return ""
 	}
-	tr.ServerTaskID = id
-
-	timeout := r.o.Suite.EffectiveTimeout(t, r.o.DefaultTimeout)
-	wctx, cancel := context.WithTimeout(ctx, timeout)
-	var evMu sync.Mutex
-	collect := func(ev Event) {
-		evMu.Lock()
-		tr.Events = append(tr.Events, ev)
-		evMu.Unlock()
-	}
-	werr := r.o.Client.Events(wctx, id, collect)
-	cancel()
-	timedOut := false
-	if werr != nil {
-		// Timeout or interrupted run: cancel the server task, then wait (bounded) for its terminal event.
-		timedOut = errors.Is(werr, context.DeadlineExceeded) && ctx.Err() == nil
-		cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), terminalGrace)
-		reason := "eval timeout"
-		if !timedOut {
-			reason = "eval interrupted"
-		}
-		_ = r.o.Client.Cancel(cctx, id, rid+"-cancel", reason)
-		evMu.Lock()
-		tr.Events = tr.Events[:0]
-		evMu.Unlock()
-		_ = r.o.Client.Events(cctx, id, collect)
-		ccancel()
-	}
-	tr.TerminalAt = r.o.Now().UTC()
-	tr.LatencyMs = tr.TerminalAt.Sub(tr.SubmittedAt).Milliseconds()
-
-	ictx, icancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-	defer icancel()
-	in, _, err := r.o.Client.Inspect(ictx, id)
-	if err != nil {
-		return fail("infra_error", fmt.Errorf("inspect: %w", err))
-	}
-	tr.Status, tr.StatusReason = in.Task.Status, in.Task.StatusReason
-	tr.Calls = in.Calls
-	if tr.Calls == nil {
-		tr.Calls = []Call{}
-	}
-	tr.Attempts, tr.Checkpoints, tr.Subruns, tr.Budget = in.Attempts, in.Checkpoints, in.Subruns, in.Budget
-	tr.Metrics = metricsOf(in)
-	if res, err := r.o.Client.Result(ictx, id); err == nil {
-		tr.Result = res
-	}
-
-	var answer string
-	switch t.Kind {
-	case KindCoding:
-		var art *CodingArtifact
-		if b, ok := r.artifact(ictx, tr, "eval"); ok {
-			tr.Artifact = json.RawMessage(b)
-			if a, err := parseCodingArtifact(b); err == nil {
-				art = a
-			} else {
-				tr.Error = err.Error()
-			}
-		}
-		tr.Grades = GradeCoding(t, tr.Status, tr.StatusReason, art)
-		if b, ok := r.artifact(ictx, tr, "solution"); ok {
-			answer = string(b)
-		}
-	default:
-		if b, ok := r.artifact(ictx, tr, reportArtifactID(t)); ok {
-			answer = string(b)
-			tr.Report = answer
-			if len(tr.Report) > maxReportBytes {
-				tr.Report = tr.Report[:maxReportBytes]
-			}
-		}
-		gs, st := GradeResearch(t, tr.Status, tr.StatusReason, answer, tr.Calls)
-		tr.Grades, tr.Citations = gs, &st
-	}
-	if r.o.Judge != nil && t.Judge != nil && answer != "" {
-		tr.Grades = append(tr.Grades, r.o.Judge.Grade(ictx, t, answer))
-	}
-	tr.Outcome = Decide(tr.Grades)
-	if timedOut {
-		tr.Outcome = Outcome{Verdict: VerdictFail, Category: "timeout"}
-	}
-	return tr
+	return u.Host
 }
 
 // artifact downloads a pinned output of the result (only artifacts pinned in the result are fetched).

@@ -168,8 +168,9 @@ func gradeStdout(e Expect, stdout string) (Grade, bool) {
 // Citation analysis of a research report.
 
 var (
-	citeRef      = regexp.MustCompile(`\[(\d{1,4})\]`)
-	evidenceLine = regexp.MustCompile(`^\s*[-*]\s*\[(\d{1,4})\].*sha256:([0-9a-f]{64})`)
+	// Citation numbers have 1–3 digits: bracketed years such as [2024] are not citations.
+	citeRef      = regexp.MustCompile(`\[(\d{1,3})\]`)
+	evidenceLine = regexp.MustCompile(`^\s*[-*]\s*\[(\d{1,3})\].*sha256:([0-9a-f]{64})`)
 	evidenceHead = regexp.MustCompile(`(?m)^#{1,6}\s*(证据|Evidence)\s*$`)
 )
 

@@ -2,6 +2,7 @@ package eval
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,7 +84,7 @@ func TestSummarizeAndMarkdown(t *testing.T) {
 		t.Fatalf("by task %+v", s.ByTask[0])
 	}
 	md := RenderMarkdown(s)
-	for _, want := range []string{"| Success rate | 25.0% |", "| timeout | 1 |", "| t1 | coding | 1/2 |", "Citations locatable | 1 / 2"} {
+	for _, want := range []string{"| Success rate | 25.0% (95% CI 4.6%–69.9%, N = 4) |", "| timeout | 1 |", "| t1 | coding | 1/2 |", "Citations locatable | 1 / 2"} {
 		if !strings.Contains(md, want) {
 			t.Errorf("markdown lacks %q\n%s", want, md)
 		}
@@ -136,7 +137,8 @@ func TestCompare(t *testing.T) {
 		t.Fatalf("cost %+v", cost)
 	}
 	md := RenderCompare(c)
-	for _, want := range []string{"| fixme | 0/1 | 1/1 |", "| breaks | 1/1 | 0/1 |", "regressed", "| cost_per_run | $0.0001 | $0.0001 |", "| exec_timeout | 0 | 1 |"} {
+	for _, want := range []string{"| fixme | 0/1 | 1/1 |", "| breaks | 1/1 | 0/1 |", "regressed", "| cost_per_run | $0.0001 | $0.0001 |", "| exec_timeout | 0 | 1 |",
+		"Sample: N = 4 (A) vs 4 (B)", "single repetition", "small sample", "| extra_tries_per_run | 1 | 1 |"} {
 		if !strings.Contains(md, want) {
 			t.Errorf("compare lacks %q\n%s", want, md)
 		}
@@ -149,5 +151,35 @@ func TestCompare(t *testing.T) {
 	}
 	if _, err := LoadRun(filepath.Join(root, "missing")); err == nil {
 		t.Fatal("missing run loaded")
+	}
+}
+
+func TestWilson(t *testing.T) {
+	for _, c := range []struct {
+		passed, runs int
+		lo, hi       float64
+	}{
+		{0, 0, 0, 0},
+		{1, 4, 0.0456, 0.6994},
+		{9, 13, 0.4237, 0.8732},
+		{30, 30, 0.8865, 1},
+		{0, 10, 0, 0.2775},
+	} {
+		lo, hi := Wilson(c.passed, c.runs)
+		if math.Abs(lo-c.lo) > 0.0005 || math.Abs(hi-c.hi) > 0.0005 {
+			t.Errorf("Wilson(%d, %d) = %.4f–%.4f, want %.4f–%.4f", c.passed, c.runs, lo, hi, c.lo, c.hi)
+		}
+	}
+}
+
+func TestManifestDiffJudgeAndBuild(t *testing.T) {
+	a := &Manifest{EvalBuild: map[string]string{"vcs.revision": "r1"}, Server: ServerRef{Info: json.RawMessage(`{"upstream_fingerprint":"f1"}`)}}
+	b := &Manifest{EvalBuild: map[string]string{"vcs.revision": "r2"}, Server: ServerRef{Info: json.RawMessage(`{"upstream_fingerprint":"f2"}`)},
+		Judge: &JudgeRef{Model: "jm", Host: "j.example", PriceInMicroPerMTok: 1}}
+	d := strings.Join(manifestDiff(a, b), "\n")
+	for _, want := range []string{"eval_build.vcs.revision: r1 → r2", "server.upstream_fingerprint: f1 → f2", "judge.model: – → jm", "judge.host: – → j.example"} {
+		if !strings.Contains(d, want) {
+			t.Errorf("diff lacks %q:\n%s", want, d)
+		}
 	}
 }
