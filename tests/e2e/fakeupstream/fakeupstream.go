@@ -128,6 +128,8 @@ type Server struct {
 	searchFixed int
 	// latency 是各类别正常回复前的固定延迟（SetLatency；缓存收益测量用）。
 	latency map[Kind]time.Duration
+	// always 是各类别没有按序号注入故障的请求所用的动作（SetAlways；模型降级链的混沌测试用：供应商持续故障）。
+	always map[Kind]Action
 }
 
 type page struct {
@@ -143,6 +145,7 @@ func New() *Server {
 		faults:   map[Kind]map[int]Action{},
 		pages:    map[string]page{},
 		latency:  map[Kind]time.Duration{},
+		always:   map[Kind]Action{},
 		released: make(chan struct{}),
 		stages: map[string]string{
 			StagePlan:      `{"tasks":[{"title":"fake 任务","intent":"fake 意图","query":"fake 查询"}]}`,
@@ -207,6 +210,13 @@ func (s *Server) SetPageHeader(path, contentType, body string, header http.Heade
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pages[path] = page{contentType: contentType, body: body, header: header.Clone()}
+}
+
+// SetAlways 让该类别此后每个没有按序号注入故障的请求都执行动作 a（零值恢复正常回复）：模拟持续故障的供应商。
+func (s *Server) SetAlways(kind Kind, a Action) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.always[kind] = a
 }
 
 // SetLatency 让类别 kind 的每个正常回复（不含注入的故障）在发出前等待 d（客户端离开时提前结束）。
@@ -362,6 +372,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	rec := &Request{Seq: s.seq, Kind: kind, N: s.counts[kind], Key: key, Path: r.URL.Path,
 		Authorization: r.Header.Get("Authorization"), Stage: stage, Body: string(body),
 		Action: s.faults[kind][s.counts[kind]], At: time.Now()}
+	if rec.Action == (Action{}) {
+		rec.Action = s.always[kind]
+	}
 	s.reqs = append(s.reqs, rec)
 	released := s.released
 	if rec.Action.Hang {

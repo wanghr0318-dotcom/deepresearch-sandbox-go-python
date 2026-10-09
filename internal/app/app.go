@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -163,11 +164,101 @@ type ModelConfig struct {
 	// MaxTokensCap 是 max_tokens 的上限（超出者截断，§9.6）；≤ 0 时取 adapter 默认值。推理模型先消耗
 	// 推理 token，上限过低会得到空的 content。
 	MaxTokensCap int
+	// Fallbacks 是按顺序的后备供应商（模型降级链，docs/design/2026-10-10-model-fallback-design.md）；空时只有
+	// 主供应商，行为与引入降级链之前完全相同。主供应商的路由名为 "primary"。
+	Fallbacks []ModelFallback
+	// Routing 是降级链的熔断、每 try 超时与对冲配置（只在有后备供应商时生效）。
+	Routing call.RoutingConfig
+}
+
+// ModelFallback 是一个后备模型供应商（OpenAI 兼容）。APIKey 来自宿主环境变量（配置给出变量名），与主供应商的 Key
+// 一样只交给 chat adapter。
+type ModelFallback struct {
+	Name    string // 路由名：小写字母、数字、- 与 _，1–32 个字符，不能为 primary，不能重复
+	BaseURL string // http(s)
+	APIKey  string
+	// Models 把逻辑模型（须为声明的模型）映射为该供应商的模型名；空时以同名提供全部声明的模型。
+	Models         map[string]string
+	Pricing        upstream.Pricing            // 该供应商的默认单价；Version 为空时由单价生成
+	PricingByModel map[string]upstream.Pricing // 按逻辑模型（须为声明的模型）
+}
+
+// PrimaryRoute 是主供应商在降级链中的路由名。
+const PrimaryRoute = "primary"
+
+var routeNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+
+// validateFallbacks 校验后备供应商：需要主供应商；路由名合法、不重复、不是 primary；地址为 http(s) 且通过出站
+// 防护（§9.8；私有地址与 localhost 须在 allowPrivate 中，否则每次转到它都会被拒绝）；映射与按模型单价只涉及
+// 声明的模型；单价非负；熔断、超时与对冲参数非负，每 try 超时与对冲只在有后备供应商时可用。
+func (m ModelConfig) validateFallbacks(allowPrivate []string) error {
+	r := m.Routing
+	if r.BreakerFailures < 0 || r.BreakerOpen < 0 || r.TryTimeout < 0 || r.HedgeDelay < 0 {
+		return errors.New("app: 降级链的熔断、每 try 超时与对冲参数不能为负")
+	}
+	if len(m.Fallbacks) == 0 {
+		if r.TryTimeout > 0 || r.HedgeDelay > 0 {
+			return errors.New("app: 每 try 超时与对冲（--model-try-timeout、--model-hedge-delay）需要后备供应商（--model-fallback-file）")
+		}
+		return nil
+	}
+	egress := upstream.NewDialer(upstream.DialerConfig{AllowPrivate: allowPrivate})
+	if m.BaseURL == "" {
+		return errors.New("app: 后备模型供应商需要主模型上游（--model-base-url）")
+	}
+	seen := map[string]bool{PrimaryRoute: true}
+	for _, fb := range m.Fallbacks {
+		if !routeNameRE.MatchString(fb.Name) || seen[fb.Name] {
+			return fmt.Errorf("app: 后备供应商名 %q 须为 1–32 个小写字母、数字、- 或 _，不能重复，也不能为 %s", fb.Name, PrimaryRoute)
+		}
+		seen[fb.Name] = true
+		u, err := url.Parse(fb.BaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("app: 后备供应商 %s 的地址须为 http(s) URL", fb.Name)
+		}
+		if err := egress.CheckURL(u); err != nil {
+			return fmt.Errorf("app: 后备供应商 %s 的地址不能通过出站防护（私有地址须在 --upstream-allow-private 中）: %w", fb.Name, err)
+		}
+		if strings.EqualFold(u.Hostname(), "localhost") && !slices.ContainsFunc(allowPrivate, func(h string) bool {
+			return strings.EqualFold(h, "localhost") || strings.EqualFold(h, u.Host)
+		}) {
+			return fmt.Errorf("app: 后备供应商 %s 的地址 localhost 须在 --upstream-allow-private 中", fb.Name)
+		}
+		for logical, vendor := range fb.Models {
+			if !m.declared(logical) || vendor == "" {
+				return fmt.Errorf("app: 后备供应商 %s 的模型映射 %q → %q：逻辑模型须已声明、供应商模型名非空", fb.Name, logical, vendor)
+			}
+		}
+		if fb.Pricing.InputMicroPerMTok < 0 || fb.Pricing.OutputMicroPerMTok < 0 {
+			return fmt.Errorf("app: 后备供应商 %s 的单价不能为负数", fb.Name)
+		}
+		for model, p := range fb.PricingByModel {
+			if !m.declared(model) || p.InputMicroPerMTok < 0 || p.OutputMicroPerMTok < 0 {
+				return fmt.Errorf("app: 后备供应商 %s 的模型 %q 单价：模型须已声明、单价非负", fb.Name, model)
+			}
+		}
+	}
+	return nil
 }
 
 // declared 报告模型是否在声明的白名单中（Models 为空时只有 Name）。
 func (m ModelConfig) declared(name string) bool {
 	return name == m.Name || slices.Contains(m.Models, name)
+}
+
+// withPricingVersions 返回补上 Version 的按模型价格表副本（不改调用方的 map）；空时原样返回。
+func withPricingVersions(m map[string]upstream.Pricing) map[string]upstream.Pricing {
+	if len(m) == 0 {
+		return m
+	}
+	out := make(map[string]upstream.Pricing, len(m))
+	for k, p := range m {
+		if p.Version == "" {
+			p.Version = configPricingVersion(p)
+		}
+		out[k] = p
+	}
+	return out
 }
 
 func configPricingVersion(p upstream.Pricing) string {
@@ -257,15 +348,17 @@ func (c Config) withDefaults() Config {
 	if p := &c.Model.Pricing; p.Version == "" {
 		p.Version = configPricingVersion(*p)
 	}
-	if len(c.Model.PricingByModel) > 0 {
-		byModel := make(map[string]upstream.Pricing, len(c.Model.PricingByModel)) // 不改调用方的 map
-		for m, p := range c.Model.PricingByModel {
-			if p.Version == "" {
-				p.Version = configPricingVersion(p)
+	c.Model.PricingByModel = withPricingVersions(c.Model.PricingByModel)
+	if len(c.Model.Fallbacks) > 0 {
+		fbs := make([]ModelFallback, len(c.Model.Fallbacks)) // 不改调用方的切片
+		for i, fb := range c.Model.Fallbacks {
+			if fb.Pricing.Version == "" {
+				fb.Pricing.Version = configPricingVersion(fb.Pricing)
 			}
-			byModel[m] = p
+			fb.PricingByModel = withPricingVersions(fb.PricingByModel)
+			fbs[i] = fb
 		}
-		c.Model.PricingByModel = byModel
+		c.Model.Fallbacks = fbs
 	}
 	return c
 }
@@ -311,6 +404,9 @@ func (c Config) validate() error {
 		if p.InputMicroPerMTok < 0 || p.OutputMicroPerMTok < 0 {
 			return fmt.Errorf("app: 模型 %q 的单价不能为负数", m)
 		}
+	}
+	if err := c.Model.validateFallbacks(c.UpstreamAllowPrivate); err != nil {
+		return err
 	}
 	switch c.SearchProvider {
 	case upstream.SearchFake:
@@ -721,7 +817,15 @@ func (s *server) assembleGateway(blobs blob.Store) error {
 	dialer := upstream.NewDialer(upstream.DialerConfig{AllowPrivate: s.cfg.UpstreamAllowPrivate})
 	adapters, pricing, chatPricing := s.cfg.gatewayAdapters(dialer)
 	cfg := call.Config{Store: s.store, Adapters: adapters, Pricing: pricing, ChatPricing: chatPricing,
-		Blobs: blobs, Events: hostEvents{s: s.store}, Limits: s.cfg.Gateway, Logger: s.log}
+		Blobs: blobs, Events: hostEvents{s: s.store}, Limits: s.cfg.Gateway, Logger: s.log, Routing: s.cfg.Model.Routing}
+	if n := len(s.cfg.Model.Fallbacks); n > 0 {
+		names := []string{PrimaryRoute}
+		for _, fb := range s.cfg.Model.Fallbacks {
+			names = append(names, fb.Name)
+		}
+		s.log.Info("模型降级链已启用", "routes", strings.Join(names, ","), "try_timeout", s.cfg.Model.Routing.TryTimeout,
+			"hedge_delay", s.cfg.Model.Routing.HedgeDelay)
+	}
 	if err := s.assembleCache(blobs); err != nil {
 		return err
 	}

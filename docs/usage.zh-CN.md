@@ -253,3 +253,61 @@ sudo -E ./bin/agentbox server --data-dir /var/lib/agentbox --web-dir web/dist \
 - **`--worker-subruns`**（默认 true）：向 Worker 协商 `subruns` 扩展。设为 false 时，研究退回到进程内逐个执行子主题。
 - **`--subrun-cancel-timeout`**（默认 10s）：宿主取消一个 sub-run 后，等待 Worker 结束它的时限。超时则终止整个 attempt，从 checkpoint 恢复。
 - **串并行对比。** 运维可用 `POST /tasks {session_id, spec: {text, deep_research, research: {scheduling, fixed_plan}}}` 在指定会话中创建 turn。驱动与评分脚本见 [m4-gate 标签下的 `experiments/subrun-compare/`](https://github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/tree/m4-gate/experiments/subrun-compare)，结果见[对比与验收记录](evidence/2026-10-06-m4-subrun-comparison.md)。演示服务器上每组 N = 4（小样本）：墙钟时间 P50 串行 302 s、并行 184 s；费用中位数 0.48 / 0.50 USD；两组都无失败；引用可定位率都是 100%。
+
+### 模型降级链（多供应商、熔断、对冲）
+
+设计见 [2026-10-10-model-fallback-design.md](design/2026-10-10-model-fallback-design.md)。不给 `--model-fallback-file` 时只有主供应商（`--model-base-url`），行为与之前完全相同。
+
+后备供应商写在一个 JSON 文件里，按顺序尝试；Key 不写在文件里，只给出宿主环境变量名（`key_env`，可省略，用于无鉴权的本机服务）：
+
+```json
+{"providers": [
+  {"name": "backup", "base_url": "https://api.example.com/v1", "key_env": "AGENTBOX_MODEL_BACKUP_API_KEY",
+   "models": {"kimi-k3": "vendor-model-a", "kimi-k2.6": "vendor-model-b"},
+   "price": {"in": 2000000, "out": 8000000},
+   "model_prices": {"kimi-k3": {"in": 4000000, "out": 16000000}}}
+]}
+```
+
+- `models` 把逻辑模型（`--model-name` / `--models` 中声明的名字，Worker 请求里写的就是它）映射为该供应商的模型名；不在其中的逻辑模型不由它提供（跳过原因 `model_not_served`）。省略 `models` 表示以同名提供全部声明的模型。
+- `price` 必填，`model_prices` 按逻辑模型覆盖；单位与 `--model-price` 相同（每百万 token 的微美元）。转到后备供应商的 try 按它的价格预留与结算。
+- 后备供应商的地址同样经出网防护；私有地址须在 `--upstream-allow-private` 中。
+
+在上文的 `agentbox server` 命令后加：
+
+```bash
+export AGENTBOX_MODEL_BACKUP_API_KEY=...        # 只从环境变量读取
+sudo -E ./bin/agentbox server ... --model-fallback-file /etc/agentbox/model-fallback.json \
+  --model-try-timeout 90s --model-breaker-failures 3 --model-breaker-open 30s
+```
+
+| 标志 | 默认 | 含义 |
+|---|---|---|
+| `--model-fallback-file` | 空 | 后备供应商列表（JSON，见上）。为空时没有降级链。 |
+| `--model-breaker-failures` | 3 | 供应商连续失败（retryable 或 unknown）多少次后熔断：之后直接跳过它，不花 try。 |
+| `--model-breaker-open` | 30s | 熔断打开时长；届满后下一次调用向它放行一个半开试探，成功则恢复，失败则再打开。 |
+| `--model-try-timeout` | 0（不设） | 每次模型 try 的超时（需要 `--model-fallback-file`）。不设时挂起的供应商会占满整个 `--model-call-deadline`，无法转到下一个；推理模型的长输出可能需要几十秒，取值应高于正常 p99。超时时请求已发出，按 unknown 结算（估算计入 unknown）。 |
+| `--model-hedge-delay` | 0（关闭） | 对冲（需要 `--model-fallback-file`）：try 发出这么久仍未结束时，向下一个就绪的供应商并发发出同一请求，先成功者胜出，另一方被取消。落败方已发出时按估算全额计入 unknown，最坏情况约两倍费用；建议设在主供应商 p95 附近。 |
+
+行为：
+
+- 可重试的失败（连不上、429、5xx、每 try 超时、2xx 但没有 `choices`——链模式下主供应商也按此判定）之后**立即**换下一个供应商，不退避；本轮所有供应商都失败才按 `--model-call-deadline` 内的指数退避重来。一次逻辑调用的 try 总数仍受上限 3 约束（跨供应商累计）。
+- 400/401/403/404 等明确拒绝（fatal）不换供应商：请求本身不被接受，换供应商也一样；鉴权失败应修配置，而不是被掩盖。其中 401/403/404 与出站防护拒绝计入该供应商的熔断。
+- 后备供应商的地址在启动时按出站防护检查：私有地址与 localhost 须在 `--upstream-allow-private` 中，否则拒绝启动。
+- 对冲：任一腿的 ok 或第一条腿的 fatal 才是决定性结果；对冲腿的 fatal（例如后备 Key 配错）不取消第一条腿。只有最终结果决定调用的状态与结果，其余的腿只记账（`hedge_lost` 标记被取消的一方，`error` 保留它自己的错误码）；触发对冲后落败的第一条腿计为一次熔断失败。
+- 所有提供该模型的供应商都处于熔断时，调用立即以 `503 model_degraded` 失败（不预留、不访问上游）。Worker 把它当作暂时性错误；对话界面显示"模型服务暂时不可用"。
+- 指纹只含逻辑模型，与哪个供应商执行无关；已完成调用的重放直接返回 journal 中的结果，不访问任何供应商，也不受熔断状态影响。
+
+查看每次 try 由谁执行、为什么跳过了别的供应商：
+
+```bash
+./bin/agentbox task inspect <task_id> --format text   # "MODEL CALL" 表：TRY、PROVIDER、LATENCY、OUTCOME、HEDGE、SKIPPED
+```
+
+`GET /tasks/{id}/inspect` 的 `calls[].tries[]` 带 `provider`、`skipped`（`name:reason`，原因为 `circuit_open`、`tried`、`model_not_served`）、`hedge` 与 `hedge_lost`；单供应商配置下这些字段省略。Gateway 日志的 `gateway: try` 行另带 `route`、`route_skipped`、`hedge`、`breaker`；熔断状态变化记为 `gateway: breaker`（`route`、`from`、`to`），降级记为 `gateway: degraded`。
+
+混沌测试（fake upstream，零费用；测量有无降级链时一次模型调用的延迟，结果见[证据](evidence/2026-10-10-model-fallback.md)；只在设置 `AGENTBOX_CHAOS_RUNS` 时运行，平时由确定性的 `TestRoute*`/`TestHedge*` 覆盖）：
+
+```bash
+AGENTBOX_CHAOS_RUNS=5 go test ./internal/gateway/call -run TestChaos -v
+```

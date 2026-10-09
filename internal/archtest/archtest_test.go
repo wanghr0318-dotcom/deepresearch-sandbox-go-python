@@ -68,6 +68,11 @@ func TestGatewayLayering(t *testing.T) {
 	forbid(t, "internal/gateway/upstream", []string{
 		module + "/internal/persistence", module + "/internal/gateway/call", module + "/internal/gateway/edge",
 	})
+	for _, d := range deps(t, "internal/gateway/breaker") { // 熔断器只依赖标准库（cache 与模型供应商链共用）
+		if first, _, _ := strings.Cut(d, "/"); strings.Contains(first, ".") && d != module+"/internal/gateway/breaker" {
+			t.Errorf("internal/gateway/breaker 依赖了标准库之外的包 %s", d)
+		}
+	}
 	forbidDirect(t, "internal/gateway/edge", []string{module + "/internal/persistence"})
 	forbid(t, "internal/task", []string{module + "/internal/gateway"})
 }
@@ -143,7 +148,7 @@ func TestProtocolIsStdlibOnly(t *testing.T) {
 		if d == module+"/internal/protocol" {
 			continue
 		}
-		if first, _, _ := strings.Cut(d, "/"); strings.Contains(first, ".") {
+		if first, _, _ := strings.Cut(d, "/"); strings.Contains(first, ".") && d != module+"/internal/gateway/breaker" {
 			t.Errorf("internal/protocol 依赖了非标准库包 %s", d)
 		}
 	}

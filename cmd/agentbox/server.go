@@ -102,6 +102,11 @@ func runServer(args []string, stderr io.Writer) int {
 	fs.Var(&modelPrices, "model-price", "按模型的单价 model=IN:OUT（每百万 token 的微美元；可重复或逗号分隔；模型须已声明）")
 	searchBaseURL := fs.String("search-base-url", "", "搜索供应商地址覆盖（空时取供应商默认）；与 --search-provider fake 同用时 fake 搜索向 <地址>/search 发出请求（测试用 fake upstream，主机须在 --upstream-allow-private 中）")
 	searchProvider := fs.String("search-provider", upstream.SearchDDGLite, "搜索供应商：ddg_lite | tavily | serper | fake（tavily 与 serper 的 Key 只读环境变量 "+searchKeyEnv+"；serper 为经 Serper.dev 的 Google 结果；fake 只用于测试，须同时设置 --upstream-allow-private）")
+	fallbackFile := fs.String("model-fallback-file", "", "模型降级链：按顺序列出后备供应商的 JSON 文件（name、base_url、key_env、models、price、model_prices；见 docs/usage.zh-CN.md）。为空时只有主供应商（--model-base-url），行为不变")
+	breakerFailures := fs.Int("model-breaker-failures", call.DefaultBreakerFailures, "降级链：供应商连续失败多少次后熔断（跳过它，直到 --model-breaker-open 之后的半开试探成功）")
+	breakerOpen := fs.Duration("model-breaker-open", call.DefaultBreakerOpen, "降级链：熔断打开时长（之后放行一次半开试探）")
+	tryTimeout := fs.Duration("model-try-timeout", 0, "降级链：每次模型 try 的超时（0 = 不设，只受 --model-call-deadline 约束；不设时挂起的供应商无法转到下一个）")
+	hedgeDelay := fs.Duration("model-hedge-delay", 0, "降级链：对冲请求的延迟（0 = 关闭）。try 发出这么久仍未结束时向下一个就绪供应商并发发出同一请求，先成功者胜出；落败方已发出时按估算全额计入 unknown（最多约两倍费用）")
 	maxTokensCap := fs.Int("model-max-tokens-cap", 32768, "模型请求 max_tokens 的上限（超出者截断并进入 applied_defaults）；推理模型先消耗推理 token，过低会得到空回答")
 	allowPrivate := fs.String("upstream-allow-private", "", "显式放行的私有上游主机（逗号分隔的 host 或 host:port；例如本机模型服务或测试用 fake upstream）")
 	redisAddr := fs.String("redis-addr", "", "共享缓存的 Redis 地址 host:port（例如 deploy/docker-compose.yml 的 127.0.0.1:6379）；为空时缓存不启用")
@@ -158,8 +163,16 @@ func runServer(args []string, stderr io.Writer) int {
 		return 2
 	}
 	// 供应商 Key 只从宿主环境变量读取（不设标志，避免出现在进程参数与 shell 历史中），只交给 Gateway 的
-	// upstream adapter；不写日志、不进入 init 与沙箱环境（§9.9）。
+	// upstream adapter；不写日志、不进入 init 与沙箱环境（§9.9）。后备供应商的 Key 同样只来自环境变量（文件只给变量名）。
 	model.APIKey = os.Getenv(modelKeyEnv)
+	if model.Fallbacks, err = modelFallbacks(*fallbackFile, os.Getenv); err != nil {
+		fmt.Fprintln(stderr, "agentbox server:", err)
+		return 2
+	}
+	if model.Routing, err = modelRouting(*breakerFailures, *breakerOpen, *tryTimeout, *hedgeDelay); err != nil {
+		fmt.Fprintln(stderr, "agentbox server:", err)
+		return 2
+	}
 	// 配置了模型上游时启用用户账号：用户研究的两个模型须在声明的白名单中（在取得锁、连接数据库之前拒绝）。
 	accounts := model.BaseURL != ""
 	if accounts {

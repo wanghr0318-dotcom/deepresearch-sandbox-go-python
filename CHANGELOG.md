@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Model provider fallback:** a logical model can be served by an ordered chain of OpenAI-compatible providers (`--model-fallback-file`). Retryable failures (connect error, 429, 5xx, per-try timeout `--model-try-timeout`, empty response) fail over to the next provider immediately; every provider attempt is a journaled try with its own reservation at that provider's price; replay and fingerprints are unchanged. Per-provider circuit breakers (`--model-breaker-failures`, `--model-breaker-open`) skip a dead provider without spending a try; when every provider is open the Gateway answers `503 model_degraded` at once. Optional hedged requests (`--model-hedge-delay`, off by default; a cancelled sent leg is charged its estimate as unknown). `inspect` shows the provider, skipped providers and hedge flag of each try. Without a fallback file behaviour is unchanged. Design: `docs/design/2026-10-10-model-fallback-design.md`; measurements: `docs/evidence/2026-10-10-model-fallback.md`.
+
 - **Instant stop:** the stop card appears within seconds even when a model, tool or `run_python` call is in flight; the abandoned call is replayed under the same call id on continue. The stop summary has a 22 s deadline and falls back to a progress-based finding.
 - **Host fallback stop card:** when the worker cannot write a stop card (it does not respond in time, or the turn is stopped while still queued) the host writes one with a fixed finding, and continue / write-now still work.
 - **"正在停止… N 秒":** the turn shows a ticking stopping row from the moment stop is clicked until the stop card arrives.

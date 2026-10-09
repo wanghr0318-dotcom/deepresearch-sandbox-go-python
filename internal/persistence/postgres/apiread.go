@@ -213,7 +213,7 @@ func inspectCalls(ctx context.Context, q queryer, taskID string) ([]api.CallView
 		return calls, err
 	}
 	rows, err = q.Query(ctx, `SELECT call_id, try_no, attempt_id, COALESCE(env_id, ''), state, outcome, latency_ms, cost_micro, error,
-			queue_ms, wall_ms, cpu_usec, exec_started_at
+			queue_ms, wall_ms, cpu_usec, exec_started_at, provider, skipped, hedge, hedge_lost
 		FROM call_tries WHERE task_id = $1 ORDER BY call_id, try_no`, taskID)
 	if err != nil {
 		return nil, err
@@ -226,7 +226,7 @@ func inspectCalls(ctx context.Context, q queryer, taskID string) ([]api.CallView
 		var t tryRow
 		err := r.Scan(&t.callID, &t.try.TryNo, &t.try.AttemptID, &t.try.EnvID, &t.try.State, &t.try.Outcome,
 			&t.try.LatencyMs, &t.try.CostMicro, &t.try.Error,
-			&t.try.QueueMs, &t.try.WallMs, &t.try.CPUUsec, &t.try.ExecStartedAt)
+			&t.try.QueueMs, &t.try.WallMs, &t.try.CPUUsec, &t.try.ExecStartedAt, &t.try.Provider, &t.try.Skipped, &t.try.Hedge, &t.try.HedgeLost)
 		return t, err
 	})
 	if err != nil {

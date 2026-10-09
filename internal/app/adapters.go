@@ -470,9 +470,14 @@ func (c Config) gatewayAdapters(d *upstream.Dialer) ([]upstream.Adapter, map[ups
 	if c.Model.BaseURL != "" {
 		pricing[upstream.KindChat] = c.Model.Pricing
 		chatPricing = c.Model.PricingByModel
+		var fallbacks []upstream.ChatRoute
+		for _, fb := range c.Model.Fallbacks {
+			fallbacks = append(fallbacks, upstream.ChatRoute{Name: fb.Name, BaseURL: fb.BaseURL, APIKey: fb.APIKey, Models: fb.Models,
+				Pricing: fb.Pricing, PricingByModel: fb.PricingByModel, HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0)})
+		}
 		adapters = append(adapters, upstream.NewChat(upstream.ChatConfig{BaseURL: c.Model.BaseURL, Model: c.Model.Name,
 			Models: c.Model.Models, APIKey: c.Model.APIKey, Pricing: c.Model.Pricing, PricingByModel: chatPricing, MaxTokensCap: c.Model.MaxTokensCap,
-			HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0)}))
+			HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0), PrimaryName: PrimaryRoute, Fallbacks: fallbacks}))
 	}
 	return adapters, pricing, chatPricing
 }

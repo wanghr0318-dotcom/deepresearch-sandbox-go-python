@@ -471,6 +471,45 @@ func TestInspectTextWithoutSubruns(t *testing.T) {
 
 // ==== M4 Plan 14 Task 10 段结束 ====
 
+// TestInspectTextRouteTries：使用模型降级链时 --format text 为每个按路由执行的 try 输出供应商、延迟、结局、对冲与
+// 此前跳过的供应商；没有 provider 的 try（单供应商）不列出。
+func TestInspectTextRouteTries(t *testing.T) {
+	const body = `{"task":{"task_id":"t6","status":"running"},"attempts":[],"checkpoints":[],"subruns":[],"calls":[
+		{"call_id":"root/s1/chat/1","endpoint":"/v1/chat/completions","tries":[
+			{"try_no":1,"state":"settled","outcome":"retryable","error":"upstream_unavailable","latency_ms":3,"provider":"primary"},
+			{"try_no":2,"state":"settled","outcome":"ok","latency_ms":120,"provider":"backup","skipped":"primary:tried"}]},
+		{"call_id":"root/s1/chat/2","endpoint":"/v1/chat/completions","tries":[
+			{"try_no":1,"state":"settled","outcome":"ok","latency_ms":80,"provider":"backup","skipped":"primary:circuit_open","hedge":true},
+			{"try_no":2,"state":"settled","outcome":"unknown","error":"upstream_unconfirmed","latency_ms":300,"provider":"primary","hedge_lost":true}]},
+		{"call_id":"root/s1/search/1","endpoint":"/v1/search","tries":[{"try_no":1,"state":"settled","outcome":"ok"}]}]}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := fmt.Fprint(w, body); err != nil {
+			t.Errorf("写响应: %v", err)
+		}
+	}))
+	defer srv.Close()
+	res := run(t, srv, nil, "task", "inspect", "t6", "--format", "text")
+	if res.code != 0 {
+		t.Fatalf("code=%d err=%s", res.code, res.err)
+	}
+	var rows []string
+	for _, l := range strings.Split(res.stdout, "\n") {
+		if strings.HasPrefix(l, "root/") || strings.HasPrefix(l, "MODEL CALL") {
+			rows = append(rows, strings.Join(strings.Fields(l), " "))
+		}
+	}
+	want := []string{
+		"MODEL CALL TRY PROVIDER LATENCY OUTCOME HEDGE SKIPPED",
+		"root/s1/chat/1 1 primary 3ms retryable (upstream_unavailable) - -",
+		"root/s1/chat/1 2 backup 120ms ok - primary:tried",
+		"root/s1/chat/2 1 backup 80ms ok hedge primary:circuit_open",
+		"root/s1/chat/2 2 primary 300ms unknown (upstream_unconfirmed) lost - -",
+	}
+	if strings.Join(rows, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("路由行\n%s\n期望\n%s\n完整输出：\n%s", strings.Join(rows, "\n"), strings.Join(want, "\n"), res.stdout)
+	}
+}
+
 // ==== M4 Plan 15 Task 10：inspect 的 exec 列 ====
 
 // TestInspectTextExecTries：--format text 为 exec 调用的每个 try 输出环境、排队、运行、CPU、启动时间与结局；未测得的

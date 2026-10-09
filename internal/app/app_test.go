@@ -1079,6 +1079,52 @@ func TestGatewayConfigValidation(t *testing.T) {
 			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a"}
 			c.Accounts, c.UserOrchestratorModel, c.UserWorkerModel = true, "a", ""
 		}, "worker模型"},
+		// 模型降级链（docs/design/2026-10-10-model-fallback-design.md）。
+		{"后备供应商", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Models: []string{"a", "b"},
+				Fallbacks: []ModelFallback{{Name: "backup", BaseURL: "https://b.example/v1", Models: map[string]string{"a": "vendor-a"},
+					PricingByModel: map[string]upstream.Pricing{"b": {InputMicroPerMTok: 1}}}}}
+		}, ""},
+		{"后备供应商无主上游", func(c *Config) {
+			c.Model = ModelConfig{Fallbacks: []ModelFallback{{Name: "backup", BaseURL: "https://b.example/v1"}}}
+		}, "主模型上游"},
+		{"后备供应商名为 primary", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Fallbacks: []ModelFallback{{Name: "primary", BaseURL: "https://b.example/v1"}}}
+		}, "不能重复"},
+		{"后备供应商名重复", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Fallbacks: []ModelFallback{
+				{Name: "b", BaseURL: "https://b.example/v1"}, {Name: "b", BaseURL: "https://c.example/v1"}}}
+		}, "不能重复"},
+		{"后备供应商地址", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Fallbacks: []ModelFallback{{Name: "b", BaseURL: "ftp://b"}}}
+		}, "http(s)"},
+		{"后备供应商映射未声明的模型", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a",
+				Fallbacks: []ModelFallback{{Name: "b", BaseURL: "https://b.example/v1", Models: map[string]string{"zz": "x"}}}}
+		}, "模型映射"},
+		{"后备供应商负单价", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a",
+				Fallbacks: []ModelFallback{{Name: "b", BaseURL: "https://b.example/v1", Pricing: upstream.Pricing{OutputMicroPerMTok: -1}}}}
+		}, "不能为负数"},
+		{"后备供应商私有地址未放行", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Fallbacks: []ModelFallback{{Name: "b", BaseURL: "http://10.0.0.5/v1"}}}
+		}, "出站防护"},
+		{"后备供应商 localhost 未放行", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Fallbacks: []ModelFallback{{Name: "b", BaseURL: "http://localhost/v1"}}}
+		}, "localhost"},
+		{"后备供应商私有地址已放行", func(c *Config) {
+			c.UpstreamAllowPrivate = []string{"127.0.0.1:9000"}
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Fallbacks: []ModelFallback{{Name: "b", BaseURL: "http://127.0.0.1:9000/v1"}}}
+		}, ""},
+		{"每 try 超时无后备供应商", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Routing: call.RoutingConfig{TryTimeout: time.Second}}
+		}, "需要后备供应商"},
+		{"对冲无后备供应商", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Routing: call.RoutingConfig{HedgeDelay: time.Second}}
+		}, "需要后备供应商"},
+		{"降级链参数为负", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Routing: call.RoutingConfig{HedgeDelay: -1}}
+		}, "不能为负"},
 	}
 	for _, tc := range cases {
 		c := base
@@ -1097,6 +1143,37 @@ func TestGatewayConfigValidation(t *testing.T) {
 }
 
 // ---- Gateway 装配 ----
+
+// 配置了后备供应商时 chat adapter 有多条路由（主供应商名为 primary），后备供应商的价格补上 Version；没有时只有一条。
+func TestGatewayAdaptersFallbackRoutes(t *testing.T) {
+	for _, tc := range []struct {
+		fallbacks []ModelFallback
+		want      []string
+	}{
+		{nil, []string{"primary"}},
+		{[]ModelFallback{{Name: "backup", BaseURL: "http://127.0.0.1:2/v1", Pricing: upstream.Pricing{InputMicroPerMTok: 7}}}, []string{"primary", "backup"}},
+	} {
+		cfg := testConfig()
+		cfg.UpstreamAllowPrivate = []string{"127.0.0.1:2"}
+		cfg.Model = ModelConfig{BaseURL: "http://127.0.0.1:1/v1", Name: "m", Fallbacks: tc.fallbacks}
+		cfg = cfg.withDefaults()
+		if err := cfg.validate(); err != nil {
+			t.Fatal(err)
+		}
+		if len(tc.fallbacks) > 0 && cfg.Model.Fallbacks[0].Pricing.Version != "config/in=7,out=0" {
+			t.Fatalf("fallback pricing version %+v", cfg.Model.Fallbacks[0].Pricing)
+		}
+		adapters, _, _ := cfg.gatewayAdapters(upstream.NewDialer(upstream.DialerConfig{}))
+		for _, a := range adapters {
+			if a.Kind() != upstream.KindChat {
+				continue
+			}
+			if got := a.(upstream.Router).Routes(); strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("routes %v, want %v", got, tc.want)
+			}
+		}
+	}
+}
 
 // gatewayAdapters 把模型白名单与按模型的价格表交给 chat adapter，并把同一份价格表（补上 Version）交给 call
 // 结算：白名单内的模型按其价格估算，未给价格的模型用默认价格，白名单外的模型被拒绝。

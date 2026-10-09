@@ -107,6 +107,13 @@ type ReserveTryRequest struct {
 	// SubrunID 须与调用登记的 sub-run 相同（否则 fingerprint_mismatch）；非空时另须 sub-run 可用（subrun_closed），
 	// 有上限时 sub-run 层可用 ≤ 0 → subrun_budget_exhausted、< 估算 → budget_insufficient_for_request。
 	SubrunID string
+	// 模型降级链（docs/design/2026-10-10-model-fallback-design.md）：Provider 是执行该 try 的路由名（单供应商时为空），
+	// Skipped 是本 try 之前跳过的路由（"name:reason,..."），二者只是审计元数据。Provider 也参与幂等身份：
+	// 最近的 try 仍持有预留时，只有同 attempt、同环境、同估算且同 Provider 的请求才被视为同一请求的重试。
+	Provider, Skipped string
+	// Hedge 请求对冲 try：最近的 try 仍持有预留、恰有一个持有预留的 try 且它的 Provider 与本请求不同时，
+	// 另建一个并发的 try（其余检查不变）；否则与普通请求相同（call_in_progress 或幂等返回）。
+	Hedge bool
 }
 
 // Try 标识一次已预留的 try；身份为 (TaskID, CallID, TryNo)。
@@ -128,6 +135,12 @@ type Settlement struct {
 	ResultSHA256      string
 	ResultSize        int64
 	Error             string
+	// Sibling 是只记账的结算（对冲中不是最终结果的一条腿，hedge.go）：预留、账本、try 行与 calls.cost_charged、
+	// possible_external_duplicate 照常，但不改变 calls.state、result_ref、upstream_request_id 与 fail_reason——调用的
+	// 结局只由最终的一条腿决定。ok 的 Sibling 结算仍须给出已保存的结果 blob（登记来源，不成为 result_ref）。
+	Sibling bool
+	// HedgeLost 记录这条腿因另一条腿得出决定性结果而被取消（call_tries.hedge_lost；Error 保留它自己的错误码）。
+	HedgeLost bool
 }
 
 // CacheCompletion 是不经上游 try 完成调用的 Tx2 输入：结果 blob 已存在且已由 Gateway 校验内容哈希（§11.5）。
@@ -194,4 +207,7 @@ type TryRecord struct {
 	LatencyMs, CostMicro int64
 	ReservationID        string
 	Error                string
+	Provider, Skipped    string // 模型降级链的审计元数据（单供应商时为空）
+	Hedge                bool   // 对冲 try
+	HedgeLost            bool   // 对冲中落败而被取消的 try
 }

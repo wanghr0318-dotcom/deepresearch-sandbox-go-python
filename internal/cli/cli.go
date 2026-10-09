@@ -450,6 +450,11 @@ type inspectView struct {
 		Tries      []struct {
 			TryNo         int64      `json:"try_no"`
 			EnvID         string     `json:"env_id"`
+			LatencyMs     int64      `json:"latency_ms"`
+			Provider      string     `json:"provider"`
+			Skipped       string     `json:"skipped"`
+			Hedge         bool       `json:"hedge"`
+			HedgeLost     bool       `json:"hedge_lost"`
 			State         string     `json:"state"`
 			Outcome       string     `json:"outcome"`
 			Error         string     `json:"error"`
@@ -534,6 +539,9 @@ func (c *cmd) inspectText(path string) error {
 	if err := writeExecTries(&buf, in); err != nil {
 		return err
 	}
+	if err := writeRouteTries(&buf, in); err != nil {
+		return err
+	}
 	_, err = c.out.Write(buf.Bytes())
 	return err
 }
@@ -572,6 +580,47 @@ func writeExecTries(buf *bytes.Buffer, in inspectView) error {
 				outcome += " (" + t.Error + ")"
 			}
 			fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n", cl.CallID, t.TryNo, t.EnvID, ms(t.QueueMs), ms(t.WallMs), cpu, started, outcome)
+		}
+	}
+	if n == 0 {
+		return nil
+	}
+	return tw.Flush()
+}
+
+// writeRouteTries 在使用模型降级链时为每个按路由执行的 try 输出一行：调用、try、供应商、延迟、结局、对冲与此前
+// 跳过的供应商（"name:reason"）。单供应商配置下 try 没有 provider，不输出。
+func writeRouteTries(buf *bytes.Buffer, in inspectView) error {
+	n := 0
+	tw := tabwriter.NewWriter(buf, 0, 0, 2, ' ', 0)
+	for _, cl := range in.Calls {
+		for _, t := range cl.Tries {
+			if t.Provider == "" {
+				continue
+			}
+			if n == 0 {
+				fmt.Fprintln(tw, "MODEL CALL\tTRY\tPROVIDER\tLATENCY\tOUTCOME\tHEDGE\tSKIPPED")
+			}
+			n++
+			outcome := t.State
+			if t.Outcome != "" {
+				outcome = t.Outcome
+			}
+			if t.Error != "" {
+				outcome += " (" + t.Error + ")"
+			}
+			if t.HedgeLost {
+				outcome += " lost"
+			}
+			hedge, skipped := "-", "-"
+			if t.Hedge {
+				hedge = "hedge"
+			}
+			if t.Skipped != "" {
+				skipped = t.Skipped
+			}
+			fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\n", cl.CallID, t.TryNo, t.Provider,
+				(time.Duration(t.LatencyMs) * time.Millisecond).String(), outcome, hedge, skipped)
 		}
 	}
 	if n == 0 {
