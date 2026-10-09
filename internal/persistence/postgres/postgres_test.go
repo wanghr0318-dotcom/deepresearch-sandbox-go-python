@@ -258,7 +258,7 @@ func TestInstallationBootstrapE46(t *testing.T) {
 			t.Fatal(err)
 		}
 		// 还原为只应用了 0001 的旧库
-		if _, err := s.pool.Exec(ctx, undo0010+undo0009+undo0008+undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions;
+		if _, err := s.pool.Exec(ctx, undo0011+undo0010+undo0009+undo0008+undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions;
 			ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
 			ALTER TABLE installation DROP COLUMN bootstrap_token_hash; DELETE FROM schema_migrations WHERE version >= 2`); err != nil {
 			t.Fatal(err)
@@ -2602,7 +2602,7 @@ func TestMigrationBackfillsBudgets(t *testing.T) {
 	s := newStore(t, Options{})
 	fixture(t, s, "t1")
 	// 还原为只应用了 0001、0002 的旧库：任务 t1 没有预算行
-	if _, err := s.pool.Exec(ctx, undo0010+undo0009+undo0008+undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions; ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
+	if _, err := s.pool.Exec(ctx, undo0011+undo0010+undo0009+undo0008+undo0007+undo0006+`DROP TABLE call_tries, reservations, calls, budgets, sessions; ALTER TABLE tasks DROP COLUMN owner_user_id; DROP TABLE users;
 		DELETE FROM schema_migrations WHERE version >= 3`); err != nil {
 		t.Fatal(err)
 	}
@@ -3119,7 +3119,7 @@ func TestMigration0006(t *testing.T) {
 	t.Run("从 0005 升级", func(t *testing.T) {
 		s := newStore(t, Options{})
 		fixture(t, s, "old")
-		if _, err := s.pool.Exec(ctx, undo0010+undo0009+undo0008+undo0007+undo0006); err != nil {
+		if _, err := s.pool.Exec(ctx, undo0011+undo0010+undo0009+undo0008+undo0007+undo0006); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := s.pool.Exec(ctx, `INSERT INTO users (username, username_key, password_hash) VALUES ('carol', 'carol', 'h');
@@ -4130,7 +4130,7 @@ func TestMigration0007(t *testing.T) {
 	}
 	gwFixture(t, s, "t1", 1000)
 	beginCall(t, s, "t1", "c1")
-	if _, err := s.pool.Exec(ctx, undo0010+undo0009+undo0008+undo0007); err != nil {
+	if _, err := s.pool.Exec(ctx, undo0011+undo0010+undo0009+undo0008+undo0007); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Migrate(ctx); err != nil {
@@ -5794,7 +5794,7 @@ func TestMigration0008(t *testing.T) {
 	gwFixture(t, s, "t1", 1000)
 	beginCall(t, s, "t1", "c1")
 	mustReserve(t, s, "t1", "c1", 10)
-	if _, err := s.pool.Exec(ctx, undo0010+undo0009+undo0008); err != nil {
+	if _, err := s.pool.Exec(ctx, undo0011+undo0010+undo0009+undo0008); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Migrate(ctx); err != nil {
@@ -7061,7 +7061,7 @@ func TestMigration0009(t *testing.T) {
 	if got := violationsOf(t, s, "I13"); len(got) != 5 {
 		t.Fatalf("升级前 I13 应报告 5 个未收尾的 sub-run：%q", got)
 	}
-	if _, err := s.pool.Exec(ctx, undo0010+undo0009); err != nil {
+	if _, err := s.pool.Exec(ctx, undo0011+undo0010+undo0009); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Migrate(ctx); err != nil {
@@ -7092,6 +7092,11 @@ func TestMigration0009(t *testing.T) {
 		t.Fatal("不限额的任务也记录工具计数")
 	}
 }
+
+// undo0011 把库还原为只应用了 0010 的形状（模型降级链的 try 审计列）。
+const undo0011 = `ALTER TABLE call_tries DROP COLUMN provider, DROP COLUMN skipped, DROP COLUMN hedge;
+	DELETE FROM schema_migrations WHERE version >= 11;
+`
 
 // undo0010 把库还原为只应用了 0009 的形状；回滚到更早迁移的测试先执行它。
 const undo0010 = `ALTER TABLE subruns DROP COLUMN remaining_ms;

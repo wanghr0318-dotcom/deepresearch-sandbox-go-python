@@ -107,6 +107,13 @@ type ReserveTryRequest struct {
 	// SubrunID 须与调用登记的 sub-run 相同（否则 fingerprint_mismatch）；非空时另须 sub-run 可用（subrun_closed），
 	// 有上限时 sub-run 层可用 ≤ 0 → subrun_budget_exhausted、< 估算 → budget_insufficient_for_request。
 	SubrunID string
+	// 模型降级链（docs/design/2026-10-10-model-fallback-design.md）：Provider 是执行该 try 的路由名（单供应商时为空），
+	// Skipped 是本 try 之前跳过的路由（"name:reason,..."），二者只是审计元数据。Provider 也参与幂等身份：
+	// 最近的 try 仍持有预留时，只有同 attempt、同环境、同估算且同 Provider 的请求才被视为同一请求的重试。
+	Provider, Skipped string
+	// Hedge 请求对冲 try：最近的 try 仍持有预留、恰有一个持有预留的 try 且它的 Provider 与本请求不同时，
+	// 另建一个并发的 try（其余检查不变）；否则与普通请求相同（call_in_progress 或幂等返回）。
+	Hedge bool
 }
 
 // Try 标识一次已预留的 try；身份为 (TaskID, CallID, TryNo)。
@@ -194,4 +201,6 @@ type TryRecord struct {
 	LatencyMs, CostMicro int64
 	ReservationID        string
 	Error                string
+	Provider, Skipped    string // 模型降级链的审计元数据（单供应商时为空）
+	Hedge                bool   // 对冲 try
 }

@@ -317,21 +317,29 @@ func (s *Store) ReserveTry(ctx context.Context, r call.ReserveTryRequest) (call.
 		}
 		if tries > 0 {
 			var prev call.Try
-			var rstate, env string
+			var rstate, env, provider string
 			var amount int64
-			if err := tx.QueryRow(ctx, `SELECT r.reservation_id, r.state, r.amount, t.attempt_id, COALESCE(t.env_id, '')
+			if err := tx.QueryRow(ctx, `SELECT r.reservation_id, r.state, r.amount, t.attempt_id, COALESCE(t.env_id, ''), t.provider
 				FROM call_tries t JOIN reservations r USING (reservation_id)
 				WHERE t.task_id = $1 AND t.call_id = $2 AND t.try_no = $3 FOR UPDATE OF r`, r.TaskID, r.CallID, tries).
-				Scan(&prev.ReservationID, &rstate, &amount, &prev.AttemptID, &env); err != nil {
+				Scan(&prev.ReservationID, &rstate, &amount, &prev.AttemptID, &env, &provider); err != nil {
 				return err
 			}
 			if rstate == "held" {
-				if prev.ReservationID == rid || (prev.AttemptID == r.AttemptID && env == r.EnvID && amount == r.EstimateMicro) {
+				if prev.ReservationID == rid || (prev.AttemptID == r.AttemptID && env == r.EnvID && amount == r.EstimateMicro &&
+					provider == r.Provider) {
 					prev.TaskID, prev.CallID, prev.TryNo = r.TaskID, r.CallID, tries
 					out = prev
 					return nil
 				}
-				return rejectf(persistence.CodeCallInProgress, "调用 %s 的 try %d 仍在执行", r.CallID, tries)
+				ok, err := hedgeAllowed(ctx, tx, r, provider)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return rejectf(persistence.CodeCallInProgress, "调用 %s 的 try %d 仍在执行", r.CallID, tries)
+				}
+				// 对冲：另建一个并发的 try，其余检查（期限、次数、预算）照常。
 			}
 		}
 		switch {
@@ -361,8 +369,9 @@ func (s *Store) ReserveTry(ctx context.Context, r call.ReserveTryRequest) (call.
 				return err
 			}
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO call_tries (task_id, call_id, try_no, attempt_id, env_id, state, reservation_id)
-			VALUES ($1, $2, $3, $4, NULLIF($5, ''), 'in_flight', $6)`, r.TaskID, r.CallID, tryNo, r.AttemptID, r.EnvID, rid); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO call_tries (task_id, call_id, try_no, attempt_id, env_id, state, reservation_id, provider, skipped, hedge)
+			VALUES ($1, $2, $3, $4, NULLIF($5, ''), 'in_flight', $6, $7, $8, $9)`, r.TaskID, r.CallID, tryNo, r.AttemptID, r.EnvID, rid,
+			r.Provider, r.Skipped, r.Hedge); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, "UPDATE budgets SET reserved_micro = reserved_micro + $2 WHERE task_id = $1", r.TaskID, r.EstimateMicro); err != nil {
@@ -388,23 +397,37 @@ func (s *Store) ReserveTry(ctx context.Context, r call.ReserveTryRequest) (call.
 // 读到的是已提交的事实。
 func heldTry(ctx context.Context, tx pgx.Tx, r call.ReserveTryRequest, rid string) (call.Try, bool, error) {
 	prev := call.Try{TaskID: r.TaskID, CallID: r.CallID}
-	var env string
+	var env, provider string
 	var amount int64
-	err := tx.QueryRow(ctx, `SELECT t.try_no, r.reservation_id, r.amount, t.attempt_id, COALESCE(t.env_id, '')
+	err := tx.QueryRow(ctx, `SELECT t.try_no, r.reservation_id, r.amount, t.attempt_id, COALESCE(t.env_id, ''), t.provider
 		FROM calls c JOIN call_tries t ON t.task_id = c.task_id AND t.call_id = c.call_id AND t.try_no = c.tries_used
 		JOIN reservations r ON r.reservation_id = t.reservation_id
 		WHERE c.task_id = $1 AND c.call_id = $2 AND r.state = 'held' AND COALESCE(c.subrun_id, '') = $3`, r.TaskID, r.CallID, r.SubrunID).
-		Scan(&prev.TryNo, &prev.ReservationID, &amount, &prev.AttemptID, &env)
+		Scan(&prev.TryNo, &prev.ReservationID, &amount, &prev.AttemptID, &env, &provider)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return call.Try{}, false, nil
 	}
 	if err != nil {
 		return call.Try{}, false, err
 	}
-	if prev.ReservationID == rid || (prev.AttemptID == r.AttemptID && env == r.EnvID && amount == r.EstimateMicro) {
+	if prev.ReservationID == rid || (prev.AttemptID == r.AttemptID && env == r.EnvID && amount == r.EstimateMicro && provider == r.Provider) {
 		return prev, true, nil
 	}
 	return call.Try{}, false, nil
+}
+
+// hedgeAllowed 报告最近的 try 仍持有预留时能否另建对冲 try：须为对冲请求、Provider 与持有预留的 try 不同，
+// 且该调用恰有一个持有预留的 try（对冲最多两条腿）。reservations 行已由调用方按锁顺序锁住。
+func hedgeAllowed(ctx context.Context, tx pgx.Tx, r call.ReserveTryRequest, heldProvider string) (bool, error) {
+	if !r.Hedge || r.Provider == heldProvider {
+		return false, nil
+	}
+	var held int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM reservations WHERE task_id = $1 AND call_id = $2 AND state = 'held'`,
+		r.TaskID, r.CallID).Scan(&held); err != nil {
+		return false, err
+	}
+	return held == 1, nil
 }
 
 func isSHA256Hex(s string) bool {
@@ -740,7 +763,7 @@ func (s *Store) LoadCall(ctx context.Context, taskID, callID string) (call.CallR
 		tries = nil
 		rows, err := q.Query(ctx, `WITH c AS (SELECT `+callColumns+` FROM calls WHERE task_id = $1 AND call_id = $2)
 			SELECT c.*, t.try_no, t.attempt_id, COALESCE(t.env_id, ''), t.state, t.outcome, t.latency_ms, t.cost_micro,
-				t.reservation_id, t.error
+				t.reservation_id, t.error, t.provider, t.skipped, t.hedge
 			FROM c LEFT JOIN call_tries t ON t.task_id = $1 AND t.call_id = $2 ORDER BY t.try_no`, taskID, callID)
 		if err != nil {
 			return err
@@ -753,12 +776,13 @@ func (s *Store) LoadCall(ctx context.Context, taskID, callID string) (call.CallR
 			var state string
 			var tryNo *int
 			var tr call.TryRecord
-			var attempt, env, tstate, outcome, rid, terr *string
+			var attempt, env, tstate, outcome, rid, terr, provider, skipped *string
 			var latency, cost *int64
+			var hedge *bool
 			if err := rows.Scan(&r.TaskID, &r.CallID, &r.Fingerprint, &r.Endpoint, &state, &r.Source, &r.ResultRef, &r.TriesUsed,
 				&r.CreatedAt, &r.DeadlineAt, &r.CostCharged, &r.FirstAttemptID, &r.UpstreamRequestID, &r.SupersedesCallID,
 				&r.SupersedeReason, &r.PossibleExternalDuplicate, &r.FailReason, &r.ResolvingSince, &r.Model, &r.SubrunID,
-				&tryNo, &attempt, &env, &tstate, &outcome, &latency, &cost, &rid, &terr); err != nil {
+				&tryNo, &attempt, &env, &tstate, &outcome, &latency, &cost, &rid, &terr, &provider, &skipped, &hedge); err != nil {
 				return err
 			}
 			r.State = call.CallState(state)
@@ -767,7 +791,8 @@ func (s *Store) LoadCall(ctx context.Context, taskID, callID string) (call.CallR
 				continue
 			}
 			tr = call.TryRecord{TryNo: *tryNo, AttemptID: *attempt, EnvID: *env, State: *tstate, Outcome: *outcome,
-				LatencyMs: *latency, CostMicro: *cost, ReservationID: *rid, Error: *terr}
+				LatencyMs: *latency, CostMicro: *cost, ReservationID: *rid, Error: *terr, Provider: *provider, Skipped: *skipped,
+				Hedge: *hedge}
 			tries = append(tries, tr)
 		}
 		if err := rows.Err(); err != nil {
