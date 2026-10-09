@@ -188,16 +188,21 @@ const PrimaryRoute = "primary"
 
 var routeNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
-// validateFallbacks 校验后备供应商：需要主供应商；路由名合法、不重复、不是 primary；地址为 http(s)；映射与按模型
-// 单价只涉及声明的模型；单价非负；熔断、超时与对冲参数非负。
-func (m ModelConfig) validateFallbacks() error {
+// validateFallbacks 校验后备供应商：需要主供应商；路由名合法、不重复、不是 primary；地址为 http(s) 且通过出站
+// 防护（§9.8；私有地址与 localhost 须在 allowPrivate 中，否则每次转到它都会被拒绝）；映射与按模型单价只涉及
+// 声明的模型；单价非负；熔断、超时与对冲参数非负，每 try 超时与对冲只在有后备供应商时可用。
+func (m ModelConfig) validateFallbacks(allowPrivate []string) error {
 	r := m.Routing
 	if r.BreakerFailures < 0 || r.BreakerOpen < 0 || r.TryTimeout < 0 || r.HedgeDelay < 0 {
 		return errors.New("app: 降级链的熔断、每 try 超时与对冲参数不能为负")
 	}
 	if len(m.Fallbacks) == 0 {
+		if r.TryTimeout > 0 || r.HedgeDelay > 0 {
+			return errors.New("app: 每 try 超时与对冲（--model-try-timeout、--model-hedge-delay）需要后备供应商（--model-fallback-file）")
+		}
 		return nil
 	}
+	egress := upstream.NewDialer(upstream.DialerConfig{AllowPrivate: allowPrivate})
 	if m.BaseURL == "" {
 		return errors.New("app: 后备模型供应商需要主模型上游（--model-base-url）")
 	}
@@ -207,8 +212,17 @@ func (m ModelConfig) validateFallbacks() error {
 			return fmt.Errorf("app: 后备供应商名 %q 须为 1–32 个小写字母、数字、- 或 _，不能重复，也不能为 %s", fb.Name, PrimaryRoute)
 		}
 		seen[fb.Name] = true
-		if u, err := url.Parse(fb.BaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		u, err := url.Parse(fb.BaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("app: 后备供应商 %s 的地址须为 http(s) URL", fb.Name)
+		}
+		if err := egress.CheckURL(u); err != nil {
+			return fmt.Errorf("app: 后备供应商 %s 的地址不能通过出站防护（私有地址须在 --upstream-allow-private 中）: %w", fb.Name, err)
+		}
+		if strings.EqualFold(u.Hostname(), "localhost") && !slices.ContainsFunc(allowPrivate, func(h string) bool {
+			return strings.EqualFold(h, "localhost") || strings.EqualFold(h, u.Host)
+		}) {
+			return fmt.Errorf("app: 后备供应商 %s 的地址 localhost 须在 --upstream-allow-private 中", fb.Name)
 		}
 		for logical, vendor := range fb.Models {
 			if !m.declared(logical) || vendor == "" {
@@ -391,7 +405,7 @@ func (c Config) validate() error {
 			return fmt.Errorf("app: 模型 %q 的单价不能为负数", m)
 		}
 	}
-	if err := c.Model.validateFallbacks(); err != nil {
+	if err := c.Model.validateFallbacks(c.UpstreamAllowPrivate); err != nil {
 		return err
 	}
 	switch c.SearchProvider {

@@ -1106,6 +1106,22 @@ func TestGatewayConfigValidation(t *testing.T) {
 			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a",
 				Fallbacks: []ModelFallback{{Name: "b", BaseURL: "https://b.example/v1", Pricing: upstream.Pricing{OutputMicroPerMTok: -1}}}}
 		}, "不能为负数"},
+		{"后备供应商私有地址未放行", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Fallbacks: []ModelFallback{{Name: "b", BaseURL: "http://10.0.0.5/v1"}}}
+		}, "出站防护"},
+		{"后备供应商 localhost 未放行", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Fallbacks: []ModelFallback{{Name: "b", BaseURL: "http://localhost/v1"}}}
+		}, "localhost"},
+		{"后备供应商私有地址已放行", func(c *Config) {
+			c.UpstreamAllowPrivate = []string{"127.0.0.1:9000"}
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Fallbacks: []ModelFallback{{Name: "b", BaseURL: "http://127.0.0.1:9000/v1"}}}
+		}, ""},
+		{"每 try 超时无后备供应商", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Routing: call.RoutingConfig{TryTimeout: time.Second}}
+		}, "需要后备供应商"},
+		{"对冲无后备供应商", func(c *Config) {
+			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Routing: call.RoutingConfig{HedgeDelay: time.Second}}
+		}, "需要后备供应商"},
 		{"降级链参数为负", func(c *Config) {
 			c.Model = ModelConfig{BaseURL: "https://m.example/v1", Name: "a", Routing: call.RoutingConfig{HedgeDelay: -1}}
 		}, "不能为负"},
@@ -1138,6 +1154,7 @@ func TestGatewayAdaptersFallbackRoutes(t *testing.T) {
 		{[]ModelFallback{{Name: "backup", BaseURL: "http://127.0.0.1:2/v1", Pricing: upstream.Pricing{InputMicroPerMTok: 7}}}, []string{"primary", "backup"}},
 	} {
 		cfg := testConfig()
+		cfg.UpstreamAllowPrivate = []string{"127.0.0.1:2"}
 		cfg.Model = ModelConfig{BaseURL: "http://127.0.0.1:1/v1", Name: "m", Fallbacks: tc.fallbacks}
 		cfg = cfg.withDefaults()
 		if err := cfg.validate(); err != nil {
