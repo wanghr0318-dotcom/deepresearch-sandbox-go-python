@@ -101,3 +101,22 @@ func TestActorTraceOff(t *testing.T) {
 		t.Errorf("traceparent %q with observability off", r.traceparent)
 	}
 }
+
+// A session turn hands its incarnation back after the verdict: the handoff span stays in the turn's trace (child of
+// the ended attempt) and does not open a second run.
+func TestActorTraceTurnHandoffStaysInTrace(t *testing.T) {
+	tr, _ := obstest.Install(t)
+	h := newActorHarness(t, turnTask("t1"))
+	h.spawn("t1")
+	r := h.nextRun()
+	r.ready()
+	r.finish(turnSuccess())
+	h.waitDone()
+	runs, handoffs, attempts := tr.Named("turn"), tr.Named("session.handoff"), tr.Named("attempt")
+	if len(runs) != 1 || len(handoffs) != 1 || len(attempts) != 1 {
+		t.Fatalf("runs %d, handoffs %d, attempts %d", len(runs), len(handoffs), len(attempts))
+	}
+	if handoffs[0].ParentID != attempts[0].SpanID || handoffs[0].TraceID != runs[0].TraceID {
+		t.Errorf("handoff %+v not under attempt %s", handoffs[0], attempts[0].SpanID)
+	}
+}

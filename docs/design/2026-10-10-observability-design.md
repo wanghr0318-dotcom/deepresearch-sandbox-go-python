@@ -62,7 +62,7 @@ Status: implemented on branch `s1-observability`.
 | Span | Where | Parent | Key attributes |
 |---|---|---|---|
 | `HTTP <METHOD> <route>` | `api.Handler.ServeHTTP` | new root | `http.method`, `http.route` (pattern, not path), `http.status_code` |
-| `task` / `turn` | task actor, from load to exit | API span that created it (via submit registry), else new root | `task.id`, `session.id`, `task.kind`, `task.status` (final) |
+| `task` / `turn` (run span) | task actor, one per *run*: first effect of the run → the verdict that stops it running (paused, awaiting_input, terminal; fault retries stay in the run) | the API request that started the run — create, resume, continue or answer (submit registry), else new root | `task.id`, `session.id`, `task.kind`, `task.run`, `task.status` |
 | `attempt` | task actor, attempt committed → verdict committed | task span | `attempt.id`, `attempt.no`, `env.id`, `outcome.class`, `attempt.status` |
 | `admission.acquire` | actor slot request | task span | `queued_ms` |
 | `env.create` / `env.stop` / `session.handoff` | actor async effects | attempt span | `env.id`, `stopped`, `recorded` |
@@ -90,7 +90,12 @@ users' traces or forge new traces.
 semantics); the span context is carried over explicitly (`obs.Carry`) so the call and its tries stay in the trace.
 The task actor runs asynchronously after the API request; the API records `traceparent` + submit time for the
 task id in a bounded in-memory registry (≤ 4096 entries, 1 h TTL). After a restart the registry is empty and
-the task span becomes a new root — a deliberate best-effort limit.
+the run span becomes a new root — a deliberate best-effort limit.
+
+**One user action = one trace.** A paused task can wait for days; keeping one span open across the pause would
+produce unbounded spans that never export. Each run of a task therefore gets its own run span and trace, rooted at
+the request that caused it (POST /tasks, POST /tasks/{id}/resume, turn continue/answer). Effects that complete
+after the verdict (the session handoff of a turn) stay under the ended attempt span.
 
 ## 5. Metrics
 

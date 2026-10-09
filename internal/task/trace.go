@@ -35,6 +35,9 @@ type actorTrace struct {
 	started  bool      // first worker ready of the current run observed
 
 	attempts map[string]*attemptTrace
+	// ended keeps the context of attempts whose span has ended: effects that complete after the verdict (the
+	// session handoff of a turn) stay in the attempt's trace instead of opening a new run.
+	ended map[string]context.Context
 
 	stopDesired string // pause/cancel first observed (stop latency start)
 	stopAt      time.Time
@@ -56,7 +59,7 @@ func (t *actorTrace) begin(base context.Context, taskID string, s State) {
 	if s.SessionID != "" {
 		t.kind = "turn"
 	}
-	t.attempts = map[string]*attemptTrace{}
+	t.attempts, t.ended = map[string]*attemptTrace{}, map[string]context.Context{}
 	if s.Desired == "pause" || s.Desired == "cancel" {
 		t.stopDesired, t.stopAt = s.Desired, time.Now()
 	}
@@ -86,6 +89,7 @@ func (t *actorTrace) endRun(status, failCode string) {
 	for id, at := range t.attempts {
 		at.span.Fail("run_ended")
 		at.span.End()
+		t.ended[id] = at.ctx
 		delete(t.attempts, id)
 	}
 	if t.span == nil {
@@ -119,6 +123,9 @@ func (t *actorTrace) taskCtx(base context.Context) context.Context {
 func (t *actorTrace) attemptCtx(base context.Context, attemptID string) context.Context {
 	if at := t.attempts[attemptID]; at != nil {
 		return obs.Carry(base, at.ctx)
+	}
+	if ctx := t.ended[attemptID]; ctx != nil {
+		return obs.Carry(base, ctx)
 	}
 	return t.taskCtx(base)
 }
@@ -189,6 +196,7 @@ func (t *actorTrace) verdict(v Verdict) {
 			at.span.Fail(v.OutcomeClass)
 		}
 		at.span.End()
+		t.ended[v.AttemptID] = at.ctx
 		delete(t.attempts, v.AttemptID)
 	}
 	if v.TaskStatus == "queued" || v.TaskStatus == "" {
