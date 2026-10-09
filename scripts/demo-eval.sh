@@ -7,7 +7,7 @@
 # 步骤：环境检查 → 全新的数据目录与数据库 → 安装 worker 包（agentbox_worker、deepresearch、evalworker）到
 # /opt/agentbox → 构建 agentbox 与 fakeupstream → 启动 fake upstream（-eval-suite：编码任务按 suite 的 fake_reply
 # 作答）→ 启动 server（--worker-argv python3,-m,evalworker，exec 默认开启）→ 运行 A：--agent reference
-# （验证评测链路：参考解应全部通过）→ 运行 B：--agent model（fake 模型，其中 4 个回复故意有错）→ 运行 C：同 B，
+# （验证评测链路：参考解应全部通过）→ 运行 B：--agent model（fake 模型，其中 6 个回复故意有错，含两个提前 exit 0 的奖励作弊）→ 运行 C：同 B，
 # --concurrency 1 → compare A B、compare C B → 正常停止 → verify-invariants --quiescent → 泄漏检查。
 # 任何一步失败即以非零状态退出。
 #
@@ -177,13 +177,22 @@ run_eval() { # run_eval <run-id> <标志...>
 step "运行 A：--agent reference（参考解；验证评测链路），并发 $CONC"
 A="demo-$STAMP-reference"
 run_eval "$A" --agent reference --concurrency "$CONC"
-[ "$(summary_field "$OUT/$A" "d['by_kind']['coding']['passed']")" = 10 ] || fail "参考解没有全部通过：评测链路有问题"
-ok "编码任务 10/10 通过；研究 $(summary_field "$OUT/$A" "d['by_kind']['research']['passed']")/3"
+[ "$(summary_field "$OUT/$A" "d['by_kind']['coding']['passed']")" = "$(summary_field "$OUT/$A" "d['by_kind']['coding']['runs']")" ] || fail "参考解没有全部通过：评测链路有问题"
+ok "编码任务全部通过（$(summary_field "$OUT/$A" "d['by_kind']['coding']['runs']") 个）；研究 $(summary_field "$OUT/$A" "d['by_kind']['research']['passed']")/3"
 
 step "运行 B：--agent model（fake 模型），并发 $CONC"
 B="demo-$STAMP-model-c$CONC"
 run_eval "$B" --agent model --concurrency "$CONC"
 ok "成功率 $(summary_field "$OUT/$B" "d['success_rate']")；失败类别 $(summary_field "$OUT/$B" "d['failure_categories']")"
+# 奖励作弊（解答在导入时 exit 0）必须判为 check_incomplete，而不是通过。
+hacks=$(python3 -c '
+import json, sys
+bad = {t["task_id"]: t["outcome"].get("category") for t in map(json.loads, open(sys.argv[1], encoding="utf-8"))
+       if t["task_id"] in ("clamp", "median")}
+print(" ".join(f"{k}={v}" for k, v in sorted(bad.items())))
+sys.exit(0 if bad and all(v == "check_incomplete" for v in bad.values()) else 1)' "$OUT/$B/trajectories.jsonl") ||
+  fail "奖励作弊没有被拒绝：$hacks"
+ok "奖励作弊被拒绝：$hacks"
 
 step "运行 C：--agent model，并发 1"
 C="demo-$STAMP-model-c1"
