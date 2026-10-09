@@ -1069,6 +1069,7 @@ components:
             user_orchestrator: {type: string}
             user_worker: {type: string}
         search_provider: {type: string}
+        upstream_fingerprint: {type: string, description: 'First 16 hex digits of the sha256 of the model and search upstream configuration (addresses, models, prices, max_tokens cap); never contains keys'}
         accounts: {type: boolean}
         sessions: {type: boolean}
         worker_subruns: {type: boolean}

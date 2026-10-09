@@ -30,6 +30,12 @@ func TestServerInfoHasNoSecrets(t *testing.T) {
 			t.Fatalf("server-info 缺少 %s: %s", want, out)
 		}
 	}
+	fp := s.serverInfo()["upstream_fingerprint"].(string)
+	other := &server{execDigest: s.execDigest, cfg: s.cfg}
+	other.cfg.Model.Pricing.InputMicroPerMTok++
+	if len(fp) != 16 || other.serverInfo()["upstream_fingerprint"] == fp || s.serverInfo()["upstream_fingerprint"] != fp {
+		t.Fatalf("upstream_fingerprint 须稳定且随单价变化: %q", fp)
+	}
 	none := (&server{cfg: Config{}}).serverInfo()
 	if m := none["models"].(map[string]any); len(m) != 0 {
 		t.Fatalf("未配置模型上游时 models 应为空: %v", m)

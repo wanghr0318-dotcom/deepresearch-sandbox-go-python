@@ -699,6 +699,8 @@ export interface components {
                 user_worker?: string;
             };
             search_provider?: string;
+            /** @description First 16 hex digits of the sha256 of the model and search upstream configuration (addresses, models, prices, max_tokens cap); never contains keys */
+            upstream_fingerprint?: string;
             accounts?: boolean;
             sessions?: boolean;
             worker_subruns?: boolean;
