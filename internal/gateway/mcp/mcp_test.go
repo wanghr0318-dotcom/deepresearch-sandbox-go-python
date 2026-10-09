@@ -21,6 +21,9 @@ import (
 // The test binary doubles as the demo stdio server (helper-process pattern).
 func TestMain(m *testing.M) {
 	if os.Getenv("MCPDEMO_HELPER") == "1" {
+		if f := os.Getenv("MCPDEMO_REPORT"); f != "" { // process-tree test: start a child, report its pid and our cwd
+			reportHelper(f)
+		}
 		if err := mcpdemo.ServeStdio(os.Stdin, os.Stdout); err != nil {
 			os.Exit(1)
 		}
@@ -316,3 +319,66 @@ func TestDemoEvaluate(t *testing.T) {
 }
 
 func ioNop(b []byte) io.ReadCloser { return io.NopCloser(bytes.NewReader(b)) }
+
+func TestHTTPStatusClassification(t *testing.T) {
+	for _, tc := range []struct {
+		status  int
+		outcome upstream.Outcome
+		code    string
+	}{
+		{401, upstream.OutcomeFatal, upstream.CodeUpstreamRejected},
+		{403, upstream.OutcomeFatal, upstream.CodeUpstreamRejected},
+		{400, upstream.OutcomeFatal, upstream.CodeUpstreamRejected},
+		{429, upstream.OutcomeRetryable, upstream.CodeUpstreamRateLimited},
+		{500, upstream.OutcomeUnknown, upstream.CodeUpstreamUnconfirmed},
+	} {
+		demo := mcpdemo.Handler(false, false)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var buf bytes.Buffer
+			_, _ = buf.ReadFrom(r.Body)
+			if strings.Contains(buf.String(), `"tools/call"`) {
+				w.WriteHeader(tc.status)
+				return
+			}
+			r.Body = ioNop(buf.Bytes())
+			demo.ServeHTTP(w, r)
+		}))
+		h := newHub(t, httpCfg(srv.URL, "calculate"))
+		_, uerr := h.Call(context.Background(), "web", "calculate", json.RawMessage(`{"expression":"1"}`))
+		if uerr == nil || uerr.Outcome != tc.outcome || uerr.Code != tc.code {
+			t.Errorf("HTTP %d: %v", tc.status, uerr)
+		}
+		srv.Close()
+	}
+	// A refusal at initialize (401) is fatal too, not "not sent".
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(401) }))
+	defer srv.Close()
+	h := newHub(t, httpCfg(srv.URL, "calculate"))
+	if _, uerr := h.Call(context.Background(), "web", "calculate", json.RawMessage(`{}`)); uerr == nil ||
+		uerr.Outcome != upstream.OutcomeFatal {
+		t.Fatalf("401 at initialize: %v", uerr)
+	}
+}
+
+func TestArgumentsCap(t *testing.T) {
+	a := NewAdapter(newHub(t, stdioCfg("calculate")))
+	big := `{"server":"calc","tool":"calculate","arguments":{"expression":"` + strings.Repeat("1", MaxArgumentsBytes) + `"}}`
+	_, _, err := a.Resolve([]byte(big))
+	if ue, ok := err.(*upstream.Error); !ok || ue.Code != CodeArgumentsTooLarge || ue.Status != 413 {
+		t.Fatalf("big arguments: %v", err)
+	}
+}
+
+func TestConfigDirUIDValidation(t *testing.T) {
+	for name, b := range map[string]string{
+		"relative dir": `{"servers":[{"name":"a","transport":"stdio","command":["x"],"dir":"rel","allowed_tools":["t"]}]}`,
+		"http uid":     `{"servers":[{"name":"a","transport":"http","url":"https://x/","uid":1000,"allowed_tools":["t"]}]}`,
+	} {
+		if _, err := ParseConfig([]byte(b)); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	if _, err := ParseConfig([]byte(`{"servers":[{"name":"a","transport":"stdio","command":["x"],"dir":"/srv/mcp","uid":1000,"gid":1000,"allowed_tools":["t"]}]}`)); err != nil {
+		t.Fatalf("valid stdio dir/uid: %v", err)
+	}
+}

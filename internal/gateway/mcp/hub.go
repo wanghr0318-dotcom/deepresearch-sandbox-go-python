@@ -167,18 +167,38 @@ func (h *Hub) Call(ctx context.Context, srv, tool string, args json.RawMessage) 
 	defer cancel()
 	raw, err := s.client.callTool(ctx, tool, args)
 	if err != nil {
-		var re *rpcError
-		switch {
-		case errors.As(err, &re):
-			return CallResult{}, &upstream.Error{Outcome: upstream.OutcomeFatal, Status: http.StatusBadGateway, Code: CodeMCPError, Err: err}
-		case wasSent(err):
-			return CallResult{}, &upstream.Error{Outcome: upstream.OutcomeUnknown, Status: http.StatusBadGateway,
-				Code: upstream.CodeUpstreamUnconfirmed, Err: err}
-		default:
-			return CallResult{}, &upstream.Error{Outcome: upstream.OutcomeRetryable, Status: http.StatusBadGateway,
-				Code: upstream.CodeUpstreamUnreachable, Err: err}
-		}
+		return CallResult{}, classify(err)
 	}
+	return shapeResult(srv, tool, raw)
+}
+
+// classify maps a failed tools/call to the coordinator's outcomes: a JSON-RPC error or an HTTP 4xx refusal is fatal
+// (408/429 retryable: not processed); a 5xx or a lost response after sending is unknown (the tool may have acted, so
+// it is not retried automatically); a failure before anything was sent is retryable.
+func classify(err error) *upstream.Error {
+	var re *rpcError
+	var hse *httpStatusError
+	switch {
+	case errors.As(err, &re):
+		return &upstream.Error{Outcome: upstream.OutcomeFatal, Status: http.StatusBadGateway, Code: CodeMCPError, Err: err}
+	case errors.As(err, &hse) && (hse.Status == http.StatusRequestTimeout || hse.Status == http.StatusTooManyRequests):
+		return &upstream.Error{Outcome: upstream.OutcomeRetryable, Status: http.StatusBadGateway,
+			Code: upstream.CodeUpstreamRateLimited, Err: err}
+	case errors.As(err, &hse) && hse.Status < 500:
+		return &upstream.Error{Outcome: upstream.OutcomeFatal, Status: http.StatusBadGateway,
+			Code: upstream.CodeUpstreamRejected, Err: err}
+	case errors.As(err, &hse), wasSent(err):
+		return &upstream.Error{Outcome: upstream.OutcomeUnknown, Status: http.StatusBadGateway,
+			Code: upstream.CodeUpstreamUnconfirmed, Err: err}
+	default:
+		return &upstream.Error{Outcome: upstream.OutcomeRetryable, Status: http.StatusBadGateway,
+			Code: upstream.CodeUpstreamUnreachable, Err: err}
+	}
+}
+
+// shapeResult keeps text content (≤ MaxTextBytes in total), reports other content types, and passes structured
+// content through when small.
+func shapeResult(srv, tool string, raw json.RawMessage) (CallResult, *upstream.Error) {
 	var r struct {
 		Content []struct {
 			Type string `json:"type"`

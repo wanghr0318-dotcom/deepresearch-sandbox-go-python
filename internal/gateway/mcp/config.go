@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"time"
@@ -54,6 +55,11 @@ type ServerConfig struct {
 	HeadersFromEnv map[string]string `json:"headers_from_env,omitempty"` // http: header → host env var
 	AllowedTools   []string          `json:"allowed_tools"`
 	TimeoutMs      int64             `json:"timeout_ms,omitempty"`
+	// stdio only: working directory (absolute; default a fresh empty temp directory) and the uid/gid to run as
+	// (default: the server's own user). Linux only.
+	Dir string  `json:"dir,omitempty"`
+	UID *uint32 `json:"uid,omitempty"`
+	GID *uint32 `json:"gid,omitempty"`
 }
 
 // Timeout is the per-call timeout (default 30 s, at most 120 s).
@@ -99,56 +105,74 @@ func (c Config) Validate() error {
 	}
 	seen := map[string]bool{}
 	for i, s := range c.Servers {
-		where := fmt.Sprintf("mcp: servers[%d]", i)
-		if !namePattern.MatchString(s.Name) {
-			return fmt.Errorf("%s: name %q must match %s", where, s.Name, namePattern)
-		}
+		where := fmt.Sprintf("mcp: servers[%d] (%s)", i, s.Name)
 		if seen[s.Name] {
-			return fmt.Errorf("%s: duplicate name %q", where, s.Name)
+			return fmt.Errorf("%s: duplicate name", where)
 		}
 		seen[s.Name] = true
-		if len(s.AllowedTools) == 0 || len(s.AllowedTools) > MaxToolsPerSrv {
-			return fmt.Errorf("%s (%s): allowed_tools must list 1–%d tools", where, s.Name, MaxToolsPerSrv)
+		if err := s.validate(); err != nil {
+			return fmt.Errorf("%s: %w", where, err)
 		}
-		for _, t := range s.AllowedTools {
-			if !toolPattern.MatchString(t) || len(ToolName(s.Name, t)) > MaxToolNameBytes {
-				return fmt.Errorf("%s (%s): tool name %q must match %s and mcp__<server>__<tool> must fit %d bytes",
-					where, s.Name, t, toolPattern, MaxToolNameBytes)
-			}
+	}
+	return nil
+}
+
+func (s ServerConfig) validate() error {
+	if !namePattern.MatchString(s.Name) {
+		return fmt.Errorf("name must match %s", namePattern)
+	}
+	if len(s.AllowedTools) == 0 || len(s.AllowedTools) > MaxToolsPerSrv {
+		return fmt.Errorf("allowed_tools must list 1–%d tools", MaxToolsPerSrv)
+	}
+	for _, t := range s.AllowedTools {
+		if !toolPattern.MatchString(t) || len(ToolName(s.Name, t)) > MaxToolNameBytes {
+			return fmt.Errorf("tool name %q must match %s and mcp__<server>__<tool> must fit %d bytes", t, toolPattern,
+				MaxToolNameBytes)
 		}
-		if s.TimeoutMs < 0 {
-			return fmt.Errorf("%s (%s): timeout_ms must be ≥ 0", where, s.Name)
+	}
+	if s.TimeoutMs < 0 {
+		return errors.New("timeout_ms must be ≥ 0")
+	}
+	switch s.Transport {
+	case TransportStdio:
+		return s.validateStdio()
+	case TransportHTTP:
+		return s.validateHTTP()
+	}
+	return errors.New("transport must be stdio or http")
+}
+
+func (s ServerConfig) validateStdio() error {
+	if len(s.Command) == 0 || s.Command[0] == "" || s.URL != "" || len(s.HeadersFromEnv) > 0 {
+		return errors.New("stdio needs command and no url/headers_from_env")
+	}
+	if s.Dir != "" && !filepath.IsAbs(s.Dir) {
+		return errors.New("dir must be absolute")
+	}
+	for k := range s.Env {
+		if !envPattern.MatchString(k) {
+			return fmt.Errorf("env name %q", k)
 		}
-		switch s.Transport {
-		case TransportStdio:
-			if len(s.Command) == 0 || s.Command[0] == "" || s.URL != "" || len(s.HeadersFromEnv) > 0 {
-				return fmt.Errorf("%s (%s): stdio needs command and no url/headers_from_env", where, s.Name)
-			}
-			for k := range s.Env {
-				if !envPattern.MatchString(k) {
-					return fmt.Errorf("%s (%s): env name %q", where, s.Name, k)
-				}
-			}
-			for k, v := range s.EnvFrom {
-				if !envPattern.MatchString(k) || !envPattern.MatchString(v) {
-					return fmt.Errorf("%s (%s): env_from %q → %q", where, s.Name, k, v)
-				}
-			}
-		case TransportHTTP:
-			u, err := url.Parse(s.URL)
-			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
-				return fmt.Errorf("%s (%s): url must be http(s)://host/... without credentials", where, s.Name)
-			}
-			if len(s.Command) > 0 || len(s.Env) > 0 || len(s.EnvFrom) > 0 {
-				return fmt.Errorf("%s (%s): http takes no command/env/env_from", where, s.Name)
-			}
-			for k, v := range s.HeadersFromEnv {
-				if !hdrPattern.MatchString(k) || !envPattern.MatchString(v) {
-					return fmt.Errorf("%s (%s): headers_from_env %q → %q", where, s.Name, k, v)
-				}
-			}
-		default:
-			return fmt.Errorf("%s (%s): transport must be stdio or http", where, s.Name)
+	}
+	for k, v := range s.EnvFrom {
+		if !envPattern.MatchString(k) || !envPattern.MatchString(v) {
+			return fmt.Errorf("env_from %q → %q", k, v)
+		}
+	}
+	return nil
+}
+
+func (s ServerConfig) validateHTTP() error {
+	u, err := url.Parse(s.URL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		return errors.New("url must be http(s)://host/... without credentials")
+	}
+	if len(s.Command) > 0 || len(s.Env) > 0 || len(s.EnvFrom) > 0 || s.Dir != "" || s.UID != nil || s.GID != nil {
+		return errors.New("http takes no command/env/env_from/dir/uid/gid")
+	}
+	for k, v := range s.HeadersFromEnv {
+		if !hdrPattern.MatchString(k) || !envPattern.MatchString(v) {
+			return fmt.Errorf("headers_from_env %q → %q", k, v)
 		}
 	}
 	return nil

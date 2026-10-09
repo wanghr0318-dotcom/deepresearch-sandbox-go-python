@@ -13,6 +13,13 @@ import (
 // KindMCP is the upstream kind of MCP tool calls; the call coordinator journals them under endpoint /v1/mcp.
 const KindMCP upstream.Kind = "mcp"
 
+// MaxArgumentsBytes bounds the arguments of one tools/call (they reach a host process; the edge already caps the body
+// at 4 MiB).
+const MaxArgumentsBytes = 64 << 10
+
+// CodeArgumentsTooLarge rejects arguments over MaxArgumentsBytes (413, nothing sent).
+const CodeArgumentsTooLarge = "mcp_arguments_too_large"
+
 // Adapter executes POST /v1/mcp/call bodies {"server","tool","arguments"} as upstream calls (price 0).
 type Adapter struct{ hub *Hub }
 
@@ -56,6 +63,9 @@ func (a *Adapter) Resolve(body []byte) ([]byte, map[string]any, error) {
 	}
 	if !cfg.Allowed(r.Tool) {
 		return nil, nil, fatal(http.StatusForbidden, CodeToolNotAllowed, "tool not allowlisted")
+	}
+	if len(r.Arguments) > MaxArgumentsBytes {
+		return nil, nil, fatal(http.StatusRequestEntityTooLarge, CodeArgumentsTooLarge, "arguments too large")
 	}
 	args := bytes.TrimSpace(r.Arguments)
 	if len(args) == 0 || string(args) == "null" {

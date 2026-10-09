@@ -96,11 +96,18 @@ func idMatches(raw json.RawMessage, id int64) bool {
 // ---- stdio ----
 
 // stdioTransport runs the server as a child process (argv, no shell) and speaks newline-delimited JSON-RPC over its
-// stdin/stdout. Requests are serialized. A process that died, or whose request timed out (state unknown), is killed
-// and restarted on the next request.
+// stdin/stdout. Requests are serialized: one call at a time per server, so a slow call delays the others. A process
+// that died, or whose request timed out (state unknown), is killed together with its whole process group — which
+// also aborts nothing else, since nothing else is in flight on it — and restarted on the next request.
+//
+// Containment (Linux): own process group (Setpgid; the group is killed), Pdeathsig SIGKILL (dies with the
+// Gateway), optional uid/gid from the config, working directory from the config or a fresh empty temp directory.
+// The server still runs on the host as that user (root by default) with arguments chosen by the model: only allowlist
+// tools that are safe with hostile arguments.
 type stdioTransport struct {
 	cfg ServerConfig
 	log *slog.Logger
+	dir string // working directory created for the server when the config has none (removed on close)
 
 	mu    sync.Mutex // serializes requests and protects the fields below
 	cmd   *exec.Cmd
@@ -140,6 +147,14 @@ func (t *stdioTransport) startLocked() error {
 	}
 	cmd := exec.Command(t.cfg.Command[0], t.cfg.Command[1:]...)
 	cmd.Env = t.environ()
+	dir, err := t.workDir()
+	if err != nil {
+		return err
+	}
+	cmd.Dir = dir
+	if err := contain(cmd, t.cfg); err != nil {
+		return err
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -185,12 +200,31 @@ func (t *stdioTransport) startLocked() error {
 	return nil
 }
 
-// killLocked stops the process (state unknown after a timeout or protocol error).
+// workDir is the configured directory, or an empty temp directory made once per transport.
+func (t *stdioTransport) workDir() (string, error) {
+	if t.cfg.Dir != "" {
+		return t.cfg.Dir, nil
+	}
+	if t.dir == "" {
+		d, err := os.MkdirTemp("", "agentbox-mcp-"+t.cfg.Name+"-")
+		if err != nil {
+			return "", err
+		}
+		if err := chownTo(d, t.cfg); err != nil {
+			_ = os.Remove(d)
+			return "", err
+		}
+		t.dir = d
+	}
+	return t.dir, nil
+}
+
+// killLocked stops the process and its process group (state unknown after a timeout or protocol error).
 func (t *stdioTransport) killLocked() {
 	if t.cmd == nil {
 		return
 	}
-	_ = t.cmd.Process.Kill() // already exiting is fine
+	killTree(t.cmd) // already exiting is fine
 	_ = t.stdin.Close()
 	<-t.dead
 	go func(ch <-chan []byte) { // let the stdout reader finish
@@ -235,17 +269,7 @@ func (t *stdioTransport) request(ctx context.Context, id int64, method string, p
 				return nil, sent(fmt.Errorf("invalid message: %w", err))
 			}
 			if m.Method != "" { // a server request or notification
-				if len(m.ID) > 0 { // answer requests: ping → {}, anything else → method not found
-					reply := map[string]any{"jsonrpc": "2.0", "id": m.ID}
-					if m.Method == "ping" {
-						reply["result"] = map[string]any{}
-					} else {
-						reply["error"] = rpcError{Code: -32601, Message: "method not found"}
-					}
-					if rb, err := json.Marshal(reply); err == nil {
-						_ = t.write(rb) // best effort
-					}
-				}
+				t.handleServerRequest(m)
 				continue
 			}
 			if !idMatches(m.ID, id) {
@@ -256,6 +280,23 @@ func (t *stdioTransport) request(ctx context.Context, id int64, method string, p
 			}
 			return m.Result, nil
 		}
+	}
+}
+
+// handleServerRequest answers requests from the server (ping → {}, anything else → method not found); notifications
+// are ignored.
+func (t *stdioTransport) handleServerRequest(m message) {
+	if len(m.ID) == 0 {
+		return
+	}
+	reply := map[string]any{"jsonrpc": "2.0", "id": m.ID}
+	if m.Method == "ping" {
+		reply["result"] = map[string]any{}
+	} else {
+		reply["error"] = rpcError{Code: -32601, Message: "method not found"}
+	}
+	if rb, err := json.Marshal(reply); err == nil {
+		_ = t.write(rb) // best effort
 	}
 }
 
@@ -291,6 +332,10 @@ func (t *stdioTransport) close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.killLocked()
+	if t.dir != "" {
+		_ = os.RemoveAll(t.dir) // shutdown: best effort
+		t.dir = ""
+	}
 	return nil
 }
 
@@ -363,11 +408,23 @@ func (t *httpTransport) post(ctx context.Context, body []byte, id int64) (json.R
 		return nil, &sessionExpired{}
 	}
 	if resp.StatusCode/100 != 2 {
-		return nil, sent(fmt.Errorf("HTTP %d", resp.StatusCode))
+		return nil, &httpStatusError{Status: resp.StatusCode}
 	}
+	return decodeResponse(resp, id)
+}
+
+// httpStatusError is a non-2xx answer to a request: the server answered, so the outcome is known to be a refusal
+// for 4xx (fatal; 408/429 retryable) and unknown for 5xx (it may have acted).
+type httpStatusError struct{ Status int }
+
+func (e *httpStatusError) Error() string { return fmt.Sprintf("HTTP %d", e.Status) }
+
+// decodeResponse reads the JSON-RPC response with the given id from a JSON body or an SSE stream (≤ 1 MiB).
+func decodeResponse(resp *http.Response, id int64) (json.RawMessage, error) {
 	limited := io.LimitReader(resp.Body, MaxMessageBytes+1)
 	ct, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	var m *message
+	var err error
 	if ct == "text/event-stream" {
 		m, err = readSSE(limited, id)
 	} else {
@@ -520,6 +577,10 @@ func (c *client) ensureInit(ctx context.Context) error {
 	params := map[string]any{"protocolVersion": ProtocolVersion, "capabilities": map[string]any{},
 		"clientInfo": map[string]any{"name": "agentbox-gateway", "version": "1"}}
 	if _, err := c.tr.request(ctx, c.id(), "initialize", params); err != nil {
+		var hse *httpStatusError
+		if errors.As(err, &hse) {
+			return err // the server refused the session (e.g. 401): classified by status
+		}
 		return notSent(fmt.Errorf("initialize: %w", err)) // nothing of the actual request was sent yet
 	}
 	if err := c.tr.notify(ctx, "notifications/initialized", nil); err != nil {
