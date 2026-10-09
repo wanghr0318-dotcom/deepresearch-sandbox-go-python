@@ -28,7 +28,7 @@
  ┌──────────────────────────┐   unix socket   ┌─────────────────────────────────────────────┐
  │ exec_shell / read_file / │ ──────────────▶ │ edge: /v1/workspace/{exec,read,write,list}  │
  │ write_file / list_dir    │                 │   └─ workspace.Manager (per task)            │
- │ mcp__<server>__<tool>    │                 │        head manifest ⇄ <data>/workspaces/    │
+ │ mcp__<server>__<tool>    │                 │        manifest ⇄ <data>/tool-workspaces/    │
  └──────────────────────────┘                 │        exec → call.Coordinator.ExecShell ───┼──▶ fresh exec env
                                               │ edge: GET /v1/mcp/tools, POST /v1/mcp/call   │    (/in/ws ro, /out rw)
                                               │   └─ call.Coordinator.Invoke(kind "mcp")     │
@@ -55,7 +55,7 @@ Symlinks, FIFOs and devices created by a command are **not** carried into the ne
 
 ### 3.2 Where the head lives (lifecycle and crash recovery)
 
-`workspace.Manager` (package `internal/gateway/workspace`) keeps one workspace per **task** (= chat turn). Its state is a small JSON file `<data>/workspaces/<task_id>.json`, written atomically (temp file + fsync + rename + fsync dir):
+`workspace.Manager` (package `internal/gateway/workspace`) keeps one workspace per **task** (= chat turn). Its state is a small JSON file `<data>/tool-workspaces/<sha256(task_id)[:32]>.json` (not `<data>/workspaces`, which holds the task environments' `/workspace` mounts), written atomically (temp file + fsync + rename + fsync dir):
 
 ```json
 {"task_id": "...", "state": "active|expired|lost", "reason": "", "version": "<sha256 of canonical manifest>",

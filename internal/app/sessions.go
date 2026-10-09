@@ -79,11 +79,13 @@ func (c Config) turnSpec(text string, deepResearch bool) (json.RawMessage, json.
 			OrchestratorOutput int64 `json:"orchestrator_output_micro_per_mtok"`
 			WorkerOutput       int64 `json:"worker_output_micro_per_mtok"`
 		} `json:"research"`
+		// Tools 只在启用工作区工具或 MCP 时出现（tools.go）；都关闭时 spec 与之前逐字节相同。
+		Tools *turnToolsSpec `json:"tools,omitempty"`
 	}{Kind: "turn", Text: text, DeepResearch: deepResearch, OrchestratorModel: c.UserOrchestratorModel,
 		WorkerModel: c.UserWorkerModel, Research: struct {
 			OrchestratorOutput int64 `json:"orchestrator_output_micro_per_mtok"`
 			WorkerOutput       int64 `json:"worker_output_micro_per_mtok"`
-		}{c.outputPrice(c.UserOrchestratorModel), c.outputPrice(c.UserWorkerModel)}})
+		}{c.outputPrice(c.UserOrchestratorModel), c.outputPrice(c.UserWorkerModel)}, Tools: c.turnTools()})
 	if err != nil {
 		return nil, nil, err
 	}

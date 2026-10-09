@@ -79,7 +79,7 @@ type Tasks interface {
 
 // Config assembles a Manager. Dir, Exec, Access, Blobs and Tasks are required.
 type Config struct {
-	Dir         string // <data>/workspaces
+	Dir         string // <data>/tool-workspaces
 	Exec        Execer
 	Access      Access
 	Blobs       Blobs
@@ -700,7 +700,8 @@ func (m *Manager) Sweep(ctx context.Context) error {
 		}
 		name := e.Name()
 		if !strings.HasSuffix(name, ".json") || strings.HasPrefix(name, ".") {
-			if strings.HasPrefix(name, ".tmp-") { // a crashed writer's leftover
+			// A crashed writer's leftover; a fresh one may belong to a write in progress (rename pending).
+			if fi, err := e.Info(); err == nil && strings.HasPrefix(name, ".tmp-") && time.Since(fi.ModTime()) > time.Minute {
 				_ = os.Remove(filepath.Join(m.cfg.Dir, name))
 			}
 			continue
@@ -710,7 +711,7 @@ func (m *Manager) Sweep(ctx context.Context) error {
 		if rerr != nil || st == nil {
 			// Unreadable without a task id: nothing can address it any more except its task, and the next access
 			// marks it lost. Remove it only when it is also older than the idle timeout.
-			if fi, serr := os.Stat(full); serr == nil && now.Sub(fi.ModTime()) > m.cfg.IdleTimeout {
+			if fi, serr := os.Stat(full); serr == nil && time.Since(fi.ModTime()) > m.cfg.IdleTimeout {
 				_ = os.Remove(full)
 			}
 			continue
