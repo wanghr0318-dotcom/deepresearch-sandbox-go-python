@@ -349,3 +349,30 @@ func contains(list []string, s string) bool {
 	}
 	return false
 }
+
+// EnvironmentStats 返回运维指标（agentbox_sandbox_envs、agentbox_sandbox_cleanup_backlog）：按 kind 统计尚未记录
+// stopped_at 的环境数，以及已停止、清理尚未完成的环境数。只读；扫描 environments（规模随历史增长，由调用方缓存）。
+func (s *Store) EnvironmentStats(ctx context.Context) (running map[string]int64, cleanupBacklog int64, err error) {
+	running = map[string]int64{}
+	err = s.read(ctx, "EnvironmentStats", func(ctx context.Context, q queryer) error {
+		rows, err := q.Query(ctx, `SELECT kind,
+			count(*) FILTER (WHERE stopped_at IS NULL),
+			count(*) FILTER (WHERE stopped_at IS NOT NULL AND cleanup_state <> 'done')
+			FROM environments GROUP BY kind`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var kind string
+			var live, backlog int64
+			if err := rows.Scan(&kind, &live, &backlog); err != nil {
+				return err
+			}
+			running[kind] = live
+			cleanupBacklog += backlog
+		}
+		return rows.Err()
+	})
+	return running, cleanupBacklog, err
+}

@@ -543,7 +543,8 @@ func (d Deps) withDefaults() Deps {
 		d.Listen = func(addr string) (net.Listener, error) { return net.Listen("tcp", addr) }
 	}
 	if d.Logger == nil {
-		d.Logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
+		// obs.LogHandler 只在 ctx 带有活动 span 时加 trace_id/span_id：可观测性关闭时输出与此前相同。
+		d.Logger = slog.New(obs.LogHandler(slog.NewJSONHandler(os.Stderr, nil)))
 	}
 	return d
 }
@@ -793,6 +794,7 @@ func (s *server) assemble() error {
 		},
 		SessionPauseGrace: s.cfg.SessionPauseGrace,
 	}
+	s.registerGauges()
 	return nil
 }
 

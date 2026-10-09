@@ -30,6 +30,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/local"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/rootfs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/subrun"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/telemetry"
 )
 
 const (
@@ -136,7 +137,17 @@ func runServer(args []string, stderr io.Writer) int {
 	fs.Int64Var(&ex.CPUQuotaUs, "exec-cpu-quota-us", app.DefaultExecCPUQuotaUs, "exec 环境 cpu.max 的 quota（period 100000；100000 = 1 核），也是 CPU 预留的速率")
 	fs.Int64Var(&ex.TmpBytes, "exec-tmp-bytes", app.DefaultExecTmpBytes, "exec 环境 /tmp tmpfs 的大小（字节）")
 	fs.Int64Var(&ex.OutBytes, "exec-out-bytes", app.DefaultExecOutBytes, "exec 环境 /out tmpfs 的大小（字节；也是 RLIMIT_FSIZE）")
+	// 可观测性（docs/design/2026-10-10-observability-design.md）：默认全部关闭，行为与此前相同。
+	var tel telemetry.Config
+	fs.StringVar(&tel.OTLPEndpoint, "otlp-endpoint", "", "OpenTelemetry trace 导出地址（OTLP/HTTP，例如 http://127.0.0.1:4318）；为空时不追踪")
+	fs.Float64Var(&tel.SampleRatio, "trace-sample-ratio", 1, "新 trace 的采样比例 (0, 1]（父 span 已采样的子 span 跟随父 span）")
+	fs.StringVar(&tel.MetricsListen, "metrics-listen", "", "Prometheus /metrics 的监听地址（只供运维，例如 127.0.0.1:9464；无鉴权，不得暴露给用户）；为空时不提供指标")
+	logFile := fs.String("log-file", "", "结构化日志另外追加写入的文件（0600；例如供 Loki 的采集器读取）；为空时只写 stderr")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if err := tel.Validate(); err != nil {
+		fmt.Fprintln(stderr, "agentbox server:", err)
 		return 2
 	}
 	if *dataDir == "" || *dsn == "" {
@@ -284,8 +295,34 @@ func runServer(args []string, stderr io.Writer) int {
 			return p, nil
 		},
 	}
+	logger, closeLog, err := serverLogger(*logFile, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, "agentbox server:", err)
+		return 1
+	}
+	defer closeLog()
+	deps.Logger = logger
+	if w := telemetry.MetricsWarning(tel.MetricsListen); w != "" {
+		fmt.Fprintln(stderr, w)
+	}
+	tel.Logger, tel.ServiceVersion = logger, buildVersion()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	t, err := telemetry.Setup(ctx, tel)
+	if err != nil {
+		fmt.Fprintln(stderr, "agentbox server:", err)
+		return 1
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := t.Shutdown(sctx); err != nil {
+			fmt.Fprintln(stderr, "agentbox server: telemetry shutdown:", err)
+		}
+	}()
+	if a := t.MetricsAddr(); a != "" {
+		logger.Info("metrics listening", "addr", a)
+	}
 	if err := app.Run(ctx, cfg, deps); err != nil {
 		fmt.Fprintln(stderr, "agentbox server:", err)
 		return 1

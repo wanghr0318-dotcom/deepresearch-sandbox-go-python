@@ -3,6 +3,7 @@ package telemetry
 import (
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -177,6 +178,7 @@ func (g *gaugeCollector) Collect(ch chan<- prometheus.Metric) {
 	g.mu.Lock()
 	fns := append([]func() []obs.Gauge(nil), g.fns...)
 	g.mu.Unlock()
+	seen := map[string]bool{} // a later registration of the same series wins nothing: duplicates would fail the scrape
 	for _, fn := range fns {
 		for _, s := range fn() {
 			keys := make([]string, 0, len(s.Labels))
@@ -188,6 +190,11 @@ func (g *gaugeCollector) Collect(ch chan<- prometheus.Metric) {
 			for i, k := range keys {
 				vals[i] = s.Labels[k]
 			}
+			id := s.Name + "|" + strings.Join(keys, ",") + "|" + strings.Join(vals, ",")
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
 			d := prometheus.NewDesc(prometheus.BuildFQName(ns, "", s.Name), s.Help, keys, nil)
 			if mt, err := prometheus.NewConstMetric(d, prometheus.GaugeValue, s.Value, vals...); err == nil {
 				ch <- mt
