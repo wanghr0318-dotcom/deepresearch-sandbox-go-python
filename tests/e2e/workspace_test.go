@@ -243,7 +243,8 @@ func TestRealWorkspaceShellMCPDemo(t *testing.T) {
 	// Numbers: per-operation latency from the Gateway's workspace log lines, exec queue/wall/CPU from call_tries,
 	// MCP call latency from its try.
 	lat := map[string][]int64{}
-	re := regexp.MustCompile(`gateway: workspace.*op=(\w+).*latency_ms=(\d+)`)
+	// The server logs JSON: {"msg":"gateway: workspace","op":"read",…,"latency_ms":3}.
+	re := regexp.MustCompile(`"msg":"gateway: workspace","op":"(\w+)".*"latency_ms":(\d+)`)
 	for _, line := range strings.Split(srv.logs.tail(8<<20), "\n") {
 		if m := re.FindStringSubmatch(line); m != nil {
 			n, _ := strconv.ParseInt(m[2], 10, 64)
