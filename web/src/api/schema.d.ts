@@ -814,6 +814,12 @@ export interface components {
              * @description Exec tries only — when the host marked the exec as starting; omitted if it never started
              */
             exec_started_at?: string;
+            /** @description Model provider chain only — the provider route that ran this try (primary, backup, …); omitted with a single provider */
+            provider?: string;
+            /** @description Model provider chain only — providers passed over before this try as name:reason (circuit_open, tried, model_not_served), comma-separated */
+            skipped?: string;
+            /** @description Model provider chain only — true for the second */
+            hedge?: boolean;
         };
         /** @description A Gateway logical call (journal entry). Metadata only — no request or response bodies, prompts or credentials. */
         Call: {

@@ -297,8 +297,8 @@ describe("CallsPanel", () => {
           created_at: "2026-10-05T00:00:00Z",
           deadline_at: "2026-10-05T00:01:00Z",
           tries: [
-            { try_no: 1, attempt_id: "a-1", state: "settled" as const, outcome: "retryable" as const, latency_ms: 300, cost_micro: 0, error: "upstream 502" },
-            { try_no: 2, attempt_id: "a-1", state: "settled" as const, outcome: "ok" as const, latency_ms: 900, cost_micro: 1234 },
+            { try_no: 1, attempt_id: "a-1", state: "settled" as const, outcome: "retryable" as const, latency_ms: 300, cost_micro: 0, error: "upstream 502", provider: "primary" },
+            { try_no: 2, attempt_id: "a-1", state: "settled" as const, outcome: "ok" as const, latency_ms: 900, cost_micro: 1234, provider: "backup", skipped: "primary:tried", hedge: true },
           ],
         },
         {
@@ -330,6 +330,10 @@ describe("CallsPanel", () => {
     expect(w.get('[data-testid="budget-failure"]').text()).toContain("budget_exhausted");
     await c1.get("button.expander").trigger("click");
     expect(w.text()).toContain("upstream 502");
+    // 模型降级链：结果列附执行该 try 的供应商（对冲标注），跳过的供应商在 title 中。
+    const route = w.findAll(".tries .route");
+    expect(route.map((r) => r.text())).toEqual(["· primary", "· backup（对冲）"]);
+    expect(route[1]!.attributes("title")).toBe("跳过：primary:tried");
   });
 });
 

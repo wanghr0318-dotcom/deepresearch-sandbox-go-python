@@ -149,6 +149,7 @@ USER_ERRORS: dict[str, str] = {
     "budget_insufficient_for_request": "已达费用额度",
     "subrun_budget_exhausted": "已达费用额度",
     "call_in_progress": "同一请求仍在进行中",
+    "model_degraded": "模型服务暂时不可用（所有供应商均不可用），请稍后再试",
 }
 
 

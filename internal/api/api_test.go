@@ -689,8 +689,11 @@ func TestInspect(t *testing.T) {
 		Attempts:    []AttemptView{{AttemptID: "a1", AttemptNo: 1, Status: "ended", OutcomeClass: "oom", ExitSignal: &code, OOMKillDelta: 1, EnvID: "e1", CleanupState: "done"}},
 		Checkpoints: []CheckpointView{{CheckpointID: "c1", StepID: "s1", AttemptID: "a1", CommitSeq: 4}},
 		// 调用表的 model 来自 journal：chat 调用给出解析后的模型，其他端点（空值）省略该字段。
-		Calls: []CallView{{CallID: "k1", Endpoint: "/v1/chat/completions", Model: "kimi-k2.6", State: "completed"},
-			{CallID: "k2", Endpoint: "/v1/search", State: "completed"}},
+		Calls: []CallView{{CallID: "k1", Endpoint: "/v1/chat/completions", Model: "kimi-k2.6", State: "completed",
+			// 模型降级链：try 带 provider、skipped 与 hedge；单供应商的 try（k2）省略这三个字段。
+			Tries: []TryView{{TryNo: 1, State: "settled", Outcome: "retryable", Provider: "primary"},
+				{TryNo: 2, State: "settled", Outcome: "ok", Provider: "backup", Skipped: "primary:tried", Hedge: true}}},
+			{CallID: "k2", Endpoint: "/v1/search", State: "completed", Tries: []TryView{{TryNo: 1, State: "settled", Outcome: "ok"}}}},
 	}
 	st, b, _ := ts.do("GET", "/tasks/t1/inspect", "", nil)
 	expect(t, st, b, 200, "")
@@ -726,6 +729,19 @@ func TestInspect(t *testing.T) {
 	}
 	if _, has := raw.Calls[1]["model"]; has {
 		t.Fatalf("非 chat 调用不应有 model 字段：%s", b)
+	}
+	tries, _ := raw.Calls[0]["tries"].([]any)
+	if len(tries) != 2 {
+		t.Fatalf("tries：%s", b)
+	}
+	if t2, _ := tries[1].(map[string]any); t2["provider"] != "backup" || t2["skipped"] != "primary:tried" || t2["hedge"] != true {
+		t.Fatalf("try 应带 provider、skipped 与 hedge：%s", b)
+	}
+	single, _ := raw.Calls[1]["tries"].([]any)
+	for _, k := range []string{"provider", "skipped", "hedge"} {
+		if _, has := single[0].(map[string]any)[k]; has {
+			t.Fatalf("单供应商的 try 不应有 %s：%s", k, b)
+		}
 	}
 	st, b, _ = ts.do("GET", "/tasks/nope/inspect", "", nil)
 	expect(t, st, b, 404, "task_not_found")

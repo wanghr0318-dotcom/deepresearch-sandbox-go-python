@@ -361,6 +361,7 @@ describe("applyEvent", () => {
     let s = applyEvent(started(), sev(1, "turn_status", { status: "failed", reason: "model_unavailable" }, "u1"));
     expect(s.turns[0]!.error).toBe("模型服务暂时不可用，请重试");
     expect(USER_ERRORS.model_unavailable).toBe("模型服务暂时不可用，请重试");
+    expect(USER_ERRORS.model_degraded).toContain("所有供应商均不可用");
     s = applyEvent(started(), sev(1, "turn_status", { status: "failed", reason: "worker_crashed_xyz" }, "u1"));
     expect(s.turns[0]!.error).toBe("本轮未能完成，请重试");
     expect(s.turns[0]!.error).not.toContain("worker_crashed_xyz");

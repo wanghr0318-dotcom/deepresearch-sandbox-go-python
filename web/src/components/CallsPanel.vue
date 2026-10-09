@@ -82,7 +82,12 @@
                     <td class="mono">{{ t.try_no }}</td>
                     <td class="mono" :title="t.attempt_id">{{ shortId(t.attempt_id) }}</td>
                     <td>{{ t.state }}</td>
-                    <td>{{ t.outcome ?? "—" }}</td>
+                    <td>
+                      {{ t.outcome ?? "—" }}
+                      <span v-if="t.provider" class="muted route" :title="t.skipped ? '跳过：' + t.skipped : ''">
+                        · {{ t.provider }}<template v-if="t.hedge">（对冲）</template>
+                      </span>
+                    </td>
                     <td class="num mono">{{ formatMicroUSD(t.cost_micro) }}</td>
                     <td class="num mono">{{ formatMs(t.latency_ms) }}</td>
                     <td class="small bad">{{ t.error ?? "" }}</td>

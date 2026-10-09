@@ -148,6 +148,7 @@ export interface ChatState {
 /** 面向用户的错误文案（按错误码或失败原因）。 */
 export const USER_ERRORS: Record<string, string> = {
   model_unavailable: "模型服务暂时不可用，请重试",
+  model_degraded: "模型服务暂时不可用（所有供应商均不可用），请稍后再试",
   session_unavailable: "会话暂时无法恢复",
   sessions_unavailable: "对话服务暂未开放，请稍后再试",
   session_not_found: "找不到这个对话，可能已被删除",
