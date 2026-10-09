@@ -104,6 +104,11 @@ pg_sql() {
     { command -v "$dk" >/dev/null 2>&1 || [ -x "$dk" ]; } || continue
     "$dk" compose -f "$REPO/deploy/docker-compose.yml" exec -T postgres psql -v ON_ERROR_STOP=1 -U agentbox -d postgres -qc "$sql" >/dev/null 2>&1 && return 0
     "$dk" exec agentbox-pg psql -v ON_ERROR_STOP=1 -U agentbox -d postgres -qc "$sql" >/dev/null 2>&1 && return 0
+    # 任何发布了 PostgreSQL 端口的容器（例如另一份检出启动的 compose 项目）
+    local c
+    for c in $("$dk" ps --filter "publish=$pgport" --format '{{.Names}}' 2>/dev/null | tr -d '\r'); do
+      "$dk" exec "$c" psql -v ON_ERROR_STOP=1 -U agentbox -d postgres -qc "$sql" >/dev/null 2>&1 && return 0
+    done
   done
   return 1
 }

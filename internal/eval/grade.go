@@ -66,14 +66,14 @@ const checkTimeoutExit = 124
 // gradeStatus is the task_status grader common to all kinds.
 func gradeStatus(status, reason string) Grade {
 	g := Grade{Grader: "task_status", Pass: status == "succeeded", Detail: status}
-	if reason != "" {
+	if reason != "" && reason != status {
 		g.Detail += " (" + reason + ")"
 	}
 	if g.Pass {
 		g.Score = 1
 	} else {
 		cat := "task_" + status
-		if reason != "" {
+		if reason != "" && reason != status {
 			cat += ":" + reason
 		}
 		g.Category = cat
