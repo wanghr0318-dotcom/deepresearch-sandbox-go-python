@@ -175,6 +175,11 @@ func TestRealWorkspaceShellMCPDemo(t *testing.T) {
 		t.Fatalf("test output read back: %q", testOut)
 	}
 	escape := results[4].Preview.Text
+	t.Logf("test output read back:
+%s", testOut)
+	t.Logf("escape command output:
+%s", escape)
+	t.Logf("escape reads: %q / %q; list_dir: %q", results[5].Error, results[6].Error, results[7].Preview.Text)
 	if !strings.Contains(escape, "NET-BLOCKED") || strings.Contains(escape, "NET-OK") || strings.Contains(escape, "whoami=0") {
 		t.Fatalf("escape command output: %q", escape)
 	}

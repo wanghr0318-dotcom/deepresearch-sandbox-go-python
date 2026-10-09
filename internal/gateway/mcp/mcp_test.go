@@ -86,12 +86,16 @@ func TestConfigValidation(t *testing.T) {
 
 func TestStdioListAndCall(t *testing.T) {
 	h := newHub(t, stdioCfg("calculate", "unit_convert"))
-	tools := h.Tools(context.Background())
+	start := time.Now()
+	tools := h.Tools(context.Background()) // starts the process, initialize, tools/list
+	listDur := time.Since(start)
 	if len(tools) != 2 || tools[0].Name != "mcp__calc__calculate" || tools[1].Name != "mcp__calc__unit_convert" ||
 		!strings.Contains(string(tools[0].InputSchema), "expression") {
 		t.Fatalf("tools = %+v", tools)
 	}
+	start = time.Now()
 	r, uerr := h.Call(context.Background(), "calc", "calculate", json.RawMessage(`{"expression":"(1.5 + 2) * 4 ^ 2"}`))
+	t.Logf("stdio: spawn+initialize+tools/list %v; tools/call %v", listDur, time.Since(start))
 	if uerr != nil || r.IsError || textOf(r) != "(1.5 + 2) * 4 ^ 2 = 56" || string(r.StructuredContent) != `{"value":56}` {
 		t.Fatalf("calculate = %+v %v", r, uerr)
 	}
