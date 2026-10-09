@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/cli"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/eval"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/hostcheck"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/mcpdemo"
 )
@@ -66,6 +67,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "cache" {
 		os.Exit(runCache(os.Args[2:], os.Stdout, os.Stderr))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "eval" {
+		os.Exit(eval.Main(os.Args[2:], os.Stdout, os.Stderr, os.Getenv))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "user" {
 		os.Exit(runUser(os.Args[2:], os.Stdout, os.Stderr))
 	}
@@ -77,6 +81,6 @@ func main() {
 		}
 		return
 	}
-	fmt.Fprintln(os.Stderr, "用法: agentbox doctor | server ... | verify-invariants [--quiescent] ... | cache rotate-key --data-dir DIR | user list|disable|enable ... | task ... | status | mcp-demo-server")
+	fmt.Fprintln(os.Stderr, "用法: agentbox doctor | server ... | verify-invariants [--quiescent] ... | cache rotate-key --data-dir DIR | user list|disable|enable ... | task ... | status | eval run|report|compare ... | mcp-demo-server")
 	os.Exit(2)
 }
