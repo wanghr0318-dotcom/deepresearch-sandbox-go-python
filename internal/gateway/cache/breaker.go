@@ -2,124 +2,34 @@ package cache
 
 import (
 	"context"
-	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/breaker"
 )
 
-// 熔断默认值（规格 §11.5、§19）。
+// 熔断器的实现在 internal/gateway/breaker（与模型供应商链共用）；这里保留缓存一直使用的名字与默认值
+// （连续失败 5 次 → 打开 30 s → 半开，放行一次试探）。
 const (
-	DefaultFailureThreshold = 5
-	DefaultOpenDuration     = 30 * time.Second
+	DefaultFailureThreshold = breaker.DefaultFailureThreshold
+	DefaultOpenDuration     = breaker.DefaultOpenDuration
 )
 
 // BreakerState 是熔断器状态。
-type BreakerState int
+type BreakerState = breaker.State
 
 const (
-	StateClosed   BreakerState = iota // 正常放行
-	StateOpen                         // 拒绝所有操作，直到打开时长届满
-	StateHalfOpen                     // 届满后只放行一次试探
+	StateClosed   = breaker.StateClosed
+	StateOpen     = breaker.StateOpen
+	StateHalfOpen = breaker.StateHalfOpen
 )
 
-func (s BreakerState) String() string {
-	switch s {
-	case StateClosed:
-		return "closed"
-	case StateOpen:
-		return "open"
-	case StateHalfOpen:
-		return "half_open"
-	}
-	return "unknown"
-}
+// Breaker 是连续失败熔断器（breaker.Breaker）。零值可用（默认值、time.Now）；每次 Allow 返回 true 之后必须恰好
+// 报告一次 Success、Failure 或 Abort。
+type Breaker = breaker.Breaker
 
-// Breaker 是连续失败熔断器：连续失败 5 次 → 打开 30 s → 半开，放行一次试探；试探成功则关闭，失败则重新打开。
-// 零值可用（使用 time.Now）；测试用 NewBreaker 注入时钟。每次 Allow 返回 true 之后必须恰好报告一次
-// Success、Failure 或 Abort，否则半开试探不会结束。
-type Breaker struct {
-	now func() time.Time
-
-	mu       sync.Mutex
-	state    BreakerState
-	failures int
-	openedAt time.Time
-	probing  bool
-}
-
-// NewBreaker 创建使用给定时钟的熔断器；now 为 nil 时用 time.Now。
-func NewBreaker(now func() time.Time) *Breaker { return &Breaker{now: now} }
-
-func (b *Breaker) clock() time.Time {
-	if b.now == nil {
-		return time.Now()
-	}
-	return b.now()
-}
-
-// Allow 报告本次操作能否发出。打开期满后转为半开并只放行一个试探。
-func (b *Breaker) Allow() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	switch b.state {
-	case StateClosed:
-		return true
-	case StateOpen:
-		if b.clock().Sub(b.openedAt) < DefaultOpenDuration {
-			return false
-		}
-		b.state = StateHalfOpen
-	}
-	if b.probing {
-		return false
-	}
-	b.probing = true
-	return true
-}
-
-// Success 报告一次成功：半开时关闭熔断器；关闭时清零连续失败计数。
-// 打开状态下迟到的成功（熔断前发出的操作）不改变状态。
-func (b *Breaker) Success() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	switch b.state {
-	case StateHalfOpen:
-		b.state, b.probing, b.failures = StateClosed, false, 0
-	case StateClosed:
-		b.failures = 0
-	}
-}
-
-// Failure 报告一次失败：半开时重新打开；关闭时累计，连续达到 5 次则打开。打开状态下迟到的失败被忽略。
-func (b *Breaker) Failure() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	switch b.state {
-	case StateHalfOpen:
-		b.state, b.probing, b.openedAt = StateOpen, false, b.clock()
-	case StateClosed:
-		b.failures++
-		if b.failures >= DefaultFailureThreshold {
-			b.state, b.failures, b.openedAt = StateOpen, 0, b.clock()
-		}
-	}
-}
-
-// Abort 结束一次既非成功也非失败的操作（例如调用方取消了 ctx）：不改变状态与计数，只释放半开试探名额。
-func (b *Breaker) Abort() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.state == StateHalfOpen {
-		b.probing = false
-	}
-}
-
-// State 返回当前状态（打开期满但尚未有操作到来时仍报告 open）。
-func (b *Breaker) State() BreakerState {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.state
-}
+// NewBreaker 创建使用给定时钟的熔断器（默认阈值与打开时长）；now 为 nil 时用 time.Now。
+func NewBreaker(now func() time.Time) *Breaker { return breaker.New(breaker.Config{Now: now}) }
 
 // Metrics 是缓存指标（§11.5）。Guarded 只记录 Error 与 BreakerOpen；Hit、Miss、Bypass、Coalesced、
 // IntegrityFailure 由知道校验结果的上层记录（Redis 返回了条目不等于命中：条目还要通过完整性校验）。
