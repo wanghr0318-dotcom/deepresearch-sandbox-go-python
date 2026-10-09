@@ -1345,7 +1345,7 @@ export interface components {
             step_id: string;
             /** @description Pairs the call with its `tool_result`: a worker-assigned id `<step>:<n>` such as `orch:2` (a resumed attempt re-emits the same id), not the model's tool-call id */
             tool_call_id?: string;
-            /** @description web_search, web_fetch, read_source, read_skill, ask_user, todo_write, research_subtopic (later also run_python) */
+            /** @description web_search, web_fetch, read_source, read_skill, ask_user, todo_write, research_subtopic, run_python; with --workspace-tools also exec_shell, read_file, write_file, list_dir; with --mcp-config mcp__<server>__<tool> */
             tool: string;
             /** @description The tool arguments */
             input: Record<string, unknown>;

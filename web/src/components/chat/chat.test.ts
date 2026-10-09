@@ -210,6 +210,26 @@ describe("StepRow", () => {
     expect(short.get("[data-testid=code-output]").text()).toBe("退出码 1\nstderr：\nboom");
     expect(short.text()).toContain("失败");
   });
+
+  it("运行命令 (workspace) rows render like 运行代码; file and external-tool rows show plain text", async () => {
+    const shell: StepRowData = {
+      id: "orch:1", kind: "shell", title: "运行命令", detail: "python3 -m unittest -v", status: "done",
+      text: "退出码 0\nRan 1 test\nOK", raw: raw({ request: { command: "python3 -m unittest -v" } }),
+    };
+    const w = mount(StepRow, { props: { row: shell, expanded: true } });
+    expect(w.get("[data-testid=step-head]").text()).toContain("运行命令");
+    expect(w.get("[data-testid=code-output]").text()).toBe("退出码 0\nRan 1 test\nOK");
+    expect(w.get(".detail").classes()).toContain("mono");
+    expect(w.find("button.raw").exists()).toBe(true);
+
+    const file = mount(StepRow, { props: { row: { id: "orch:2", kind: "file", title: "写入文件 · calc.py", status: "done", text: "已新建 calc.py" }, expanded: true } });
+    expect(file.find("[data-testid=code-output]").exists()).toBe(false);
+    expect(file.find("button.raw").exists()).toBe(false);
+    expect(file.text()).toContain("已新建 calc.py");
+
+    const mcp = mount(StepRow, { props: { row: { id: "orch:3", kind: "mcp", title: "外部工具 · calc/calculate", status: "done", text: "6*7 = 42" }, expanded: false } });
+    expect(mcp.get("[data-testid=step-head]").text()).toContain("外部工具 · calc/calculate");
+  });
 });
 
 describe("RawDialog", () => {

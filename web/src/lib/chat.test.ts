@@ -140,6 +140,37 @@ describe("applyEvent", () => {
     expect(quota!.raw).toBeUndefined(); // 配额拒绝没有结果 blob
   });
 
+  it("workspace and MCP tools get shell, file and mcp rows; ⟨/⟩ only for the journaled calls", () => {
+    const shellReq = { command: "python3 -m unittest -v" };
+    const s = run(started(), [
+      sev(1, "tool_call", { step_id: "orch", tool_call_id: "orch:1", tool: "write_file", input: { path: "calc.py", content: "x" } }, "u1"),
+      sev(2, "tool_result", { step_id: "orch", tool_call_id: "orch:1", tool: "write_file", ok: true, preview: { kind: "text", text: "已新建 calc.py（1 字节）" } }, "u1"),
+      sev(3, "tool_call", { step_id: "orch", tool_call_id: "orch:2", tool: "exec_shell", input: shellReq }, "u1"),
+      sev(4, "tool_result", {
+        step_id: "orch", tool_call_id: "orch:2", tool: "exec_shell", ok: false,
+        preview: { kind: "text", text: "退出码 1\nstderr：\nFAILED (failures=1)" }, error: "退出码 1",
+        raw: { request: shellReq, response_ref: SHA },
+      }, "u1"),
+      sev(5, "tool_call", { step_id: "orch", tool_call_id: "orch:3", tool: "read_file", input: { path: "out/report.txt" } }, "u1"),
+      sev(6, "tool_call", { step_id: "orch", tool_call_id: "orch:4", tool: "list_dir", input: {} }, "u1"),
+      sev(7, "tool_call", { step_id: "orch", tool_call_id: "orch:5", tool: "mcp__calc__unit_convert", input: { value: 10, from: "km", to: "mi" } }, "u1"),
+      sev(8, "tool_result", {
+        step_id: "orch", tool_call_id: "orch:5", tool: "mcp__calc__unit_convert", ok: true,
+        preview: { kind: "text", text: "10 km = 6.21371192237 mi" },
+        raw: { request: { server: "calc", tool: "unit_convert", arguments: { value: 10, from: "km", to: "mi" } }, response_ref: SHA },
+      }, "u1"),
+    ]);
+    const [write, shell, read, list, mcp] = s.turns[0]!.steps;
+    expect(write).toMatchObject({ kind: "file", title: "写入文件 · calc.py", status: "done" });
+    expect(write!.raw).toBeUndefined();
+    expect(shell).toMatchObject({ kind: "shell", title: "运行命令", detail: "python3 -m unittest -v", status: "error", text: "退出码 1\nstderr：\nFAILED (failures=1)" });
+    expect(shell!.raw).toEqual({ request: shellReq, requestTruncated: false, responseRef: SHA });
+    expect(read).toMatchObject({ kind: "file", title: "读取文件 · out/report.txt", status: "running" });
+    expect(list).toMatchObject({ kind: "file", title: "列出目录 · /" });
+    expect(mcp).toMatchObject({ kind: "mcp", title: "外部工具 · calc/unit_convert", detail: '{"value":10,"from":"km","to":"mi"}', status: "done" });
+    expect(mcp!.raw?.responseRef).toBe(SHA);
+  });
+
   it("gives skill_read without a preceding tool call its own row, and thinking a row of its own", () => {
     const s = run(started(), [
       sev(1, "skill_read", { step_id: "orch", name: "deep-research", file: "report.md" }, "u1"),

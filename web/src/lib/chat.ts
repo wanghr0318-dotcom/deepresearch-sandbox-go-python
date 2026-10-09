@@ -9,7 +9,20 @@ import { ApiError } from "../api/client";
 import type { SessionEvent, Turn } from "../api/chat";
 import { userErrorMessage } from "./research";
 
-export type StepKind = "skill" | "thinking" | "ask" | "todo" | "search" | "fetch" | "source" | "subtopic" | "code" | "tool";
+export type StepKind =
+  | "skill"
+  | "thinking"
+  | "ask"
+  | "todo"
+  | "search"
+  | "fetch"
+  | "source"
+  | "subtopic"
+  | "code"
+  | "shell"
+  | "file"
+  | "mcp"
+  | "tool";
 
 export interface SearchItem {
   title: string;
@@ -307,8 +320,14 @@ function kindOfTool(tool: string): StepKind {
       return "subtopic";
     case "run_python":
       return "code";
+    case "exec_shell":
+      return "shell";
+    case "read_file":
+    case "write_file":
+    case "list_dir":
+      return "file";
     default:
-      return "tool";
+      return tool.startsWith(MCP_PREFIX) ? "mcp" : "tool";
   }
 }
 
@@ -345,12 +364,40 @@ function callTitle(t: TurnView, tool: string, input: Data): { title: string; det
     case "run_python":
       // 完整代码在 ⟨/⟩ 的请求中；行内只给第一行非空代码作提示
       return { title: "运行代码", detail: firstCodeLine(input.code) };
+    case "exec_shell":
+      // 工作区命令（设计 2026-10-10-shell-file-mcp）：完整命令在 ⟨/⟩ 的请求中
+      return { title: "运行命令", detail: firstCodeLine(input.command) };
+    case "read_file":
+      return { title: `读取文件 · ${str(input.path) || "?"}` };
+    case "write_file":
+      return { title: `写入文件 · ${str(input.path) || "?"}` };
+    case "list_dir":
+      return { title: `列出目录 · ${str(input.path) || "/"}` };
     default:
+      if (tool.startsWith(MCP_PREFIX)) {
+        const [server, name] = splitMcp(tool);
+        return { title: `外部工具 · ${server}/${name}`, detail: argsLine(input) };
+      }
       return { title: `调用工具：${tool}` };
   }
 }
 
 const CODE_LINE_MAX = 80;
+const MCP_PREFIX = "mcp__";
+
+// mcp__<server>__<tool> → [server, tool]（服务器名不含 "__"）
+function splitMcp(tool: string): [string, string] {
+  const rest = tool.slice(MCP_PREFIX.length);
+  const i = rest.indexOf("__");
+  return i < 0 ? [rest, ""] : [rest.slice(0, i), rest.slice(i + 2)];
+}
+
+function argsLine(input: Data): string | undefined {
+  const keys = Object.keys(input);
+  if (keys.length === 0) return undefined;
+  const s = JSON.stringify(input);
+  return s.length > CODE_LINE_MAX ? `${s.slice(0, CODE_LINE_MAX - 1)}…` : s;
+}
 
 function firstCodeLine(code: unknown): string | undefined {
   const line = str(code)
@@ -491,7 +538,7 @@ function applyToolResult(t: TurnView, d: Data, seq: number): TurnView {
     if (text) row.text = text;
   }
   // run_python 失败（非零退出等）时预览含退出码与 stderr 末尾，比 error 的首段更完整
-  const codeText = kind === "code" ? previewText(p) : undefined;
+  const codeText = kind === "code" || kind === "shell" ? previewText(p) : undefined;
   if (!ok) row.text = toolErrorText(codeText ?? optStr(d.error) ?? row.text ?? "调用失败");
   if (!ok && (kind === "fetch" || p.kind === "fetch") && (row.text ?? "").startsWith("页面被拦截")) {
     const site = siteOf(row.detail ?? "");

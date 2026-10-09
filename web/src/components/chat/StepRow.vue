@@ -36,8 +36,8 @@
           … 还有 {{ hidden }} 条（点击展开）
         </button>
       </template>
-      <div v-if="row.kind !== 'search' && row.detail" class="detail" :class="{ mono: row.kind === 'code' }">{{ row.detail }}</div>
-      <template v-if="row.kind === 'code' && row.text">
+      <div v-if="row.kind !== 'search' && row.detail" class="detail" :class="{ mono: isCode }">{{ row.detail }}</div>
+      <template v-if="isCode && row.text">
         <pre class="text mono" data-testid="code-output">{{ shownOutput }}</pre>
         <button v-if="hiddenLines > 0" class="more" type="button" data-action="more-lines" @click="showAll = true">
           … 还有 {{ hiddenLines }} 行（点击展开）
@@ -49,7 +49,7 @@
 </template>
 
 <script setup lang="ts">
-// 一个 Agent 步骤（设计 §7）：默认折叠；搜索展开后逐行显示标题、站点、摘要；运行代码展开后显示退出码与输出（前 12 行，可展开其余）；⟨/⟩ 只在有原始引用（经 Gateway 的调用）时出现。
+// 一个 Agent 步骤（设计 §7）：默认折叠；搜索展开后逐行显示标题、站点、摘要；运行代码与运行命令展开后显示退出码与输出（前 12 行，可展开其余）；⟨/⟩ 只在有原始引用（经 Gateway 的调用：含工作区命令与外部工具）时出现。
 // 只渲染面向用户的字段：从不显示行 id、子主题 id、原始响应的 sha。所有文本经插值（不使用 v-html）。
 import { computed, ref, watch } from "vue";
 import type { RawRef, StepKind, StepRow } from "../../lib/chat";
@@ -67,8 +67,14 @@ const ICONS: Record<StepKind, string> = {
   source: "📚",
   subtopic: "🧭",
   code: "💻",
+  shell: "⌨️",
+  file: "📄",
+  mcp: "🧩",
   tool: "🔧",
 };
+
+// 运行代码与运行命令（工作区）：等宽显示，输出默认前 12 行
+const isCode = computed(() => props.row.kind === "code" || props.row.kind === "shell");
 
 const FIRST_RESULTS = 5;
 const FIRST_LINES = 12; // 运行代码：输出默认显示前 12 行
