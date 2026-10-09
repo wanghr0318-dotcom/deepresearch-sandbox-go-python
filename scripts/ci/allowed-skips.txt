@@ -6,7 +6,6 @@
 # 设置 AGENTBOX_CACHE_BENCH_OUT 后运行；缓存的正确性由 E21–E25 与 I14/I15 用例覆盖，它们必须运行。
 github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/tests/e2e TestCacheBenefit
 
-<<<<<<< HEAD
 # 模型降级链的混沌测量（docs/evidence/2026-10-10-model-fallback.md）是测量而不是正确性用例：包含真实退避与超时（数秒）
 # 和墙钟断言，只在设置 AGENTBOX_CHAOS_RUNS 后运行；同样的行为由确定性的 TestRoute*、TestHedge* 覆盖，它们必须运行。
 github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call TestChaosPrimaryDown
@@ -14,14 +13,10 @@ github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/cal
 github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call TestChaosPrimaryHangs
 github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call TestChaosAllDown
 github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call TestChaosHedge
-=======
-# Kubernetes provider 对真实集群的一致性与启动延迟测试（S3）：需要一个集群与推送好的 worker 镜像，只在设置
+
+# Kubernetes provider 对真实集群的一致性、启动延迟与突发测试（S3）：需要一个集群与推送好的 worker 镜像，只在设置
 # AGENTBOX_K8S_TEST_KUBECONFIG 与 AGENTBOX_K8S_TEST_IMAGE 后运行（scripts/demo-k8s.sh 的 kind 环境）；同一套契约
 # 用例在 fake clientset 上的 TestConformanceOnFakeCluster 必须运行。
 github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/k8s TestConformanceOnRealCluster
 github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/k8s TestStartLatencyOnRealCluster
-<<<<<<< HEAD
->>>>>>> b1d089c (test(k8s): fix data race in TestExecSignalStatusAndTerminate; allow opt-in real-cluster skips)
-=======
 github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/k8s TestBurstOnRealCluster
->>>>>>> 8cc034a (test(k8s): opt-in burst measurement (N concurrent Creates vs pool of 2); evidence caveats)
