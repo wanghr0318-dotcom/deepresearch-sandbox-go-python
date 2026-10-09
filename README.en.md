@@ -43,6 +43,7 @@ Browser (Vue 3) / CLI ── REST + SSE ──► Go control plane
 | **Sessions** | Each chat session is one long-lived sandbox process. It is frozen after 10 idle minutes (cgroup freezer), evicted after 1 hour, and restored on the next message from its last committed session checkpoint. |
 | **Agent** | A tool-calling agent with progressive-disclosure skills (`read_skill`), `ask_user`, a todo list, `web_search`, `web_fetch` and `run_python`. Each turn gets 30 search and fetch calls, enforced by the Gateway rather than the model. |
 | **Parallel sub-runs** | 2–4 sub-topics run concurrently inside one turn under a two-level ledger (task and sub-run). They can be cancelled, and they resume after stop or crash without re-running finished sub-topics. |
+| **Model fallback** | A logical model can be served by an ordered chain of OpenAI-compatible providers: retryable failures fail over to the next provider immediately, and every provider attempt is a separately priced try in the journal. Per-provider circuit breakers; when all are open the Gateway answers `503 model_degraded` at once; optional hedged requests. Replay and fingerprints are unaffected. |
 | **Exec sandbox** | Model-written Python runs in a fresh, network-less environment per call, with separate UIDs, CPU and wall quotas and output collection. |
 | **Product** | Accounts (PBKDF2, `HttpOnly` sessions, rate-limited login), per-user isolation (other users' data always returns 404), server-side redaction of costs, models and internal IDs, a CSP and sanitized Markdown rendering. |
 
@@ -61,6 +62,7 @@ All numbers come from recorded runs. The evidence files say exactly what each ru
   - web lint, typecheck and tests;
   - lint and a complexity report.
 - **Real acceptance** on a 4 vCPU / 8 GiB Linux VM (Tencent Cloud, Shanghai) with real models (Moonshot `kimi-k3` lead, `kimi-k2.6` workers) and Google results via Serper: [chat assistant](docs/evidence/2026-10-06-m4-chat-acceptance.md), [exec sandbox](docs/evidence/2026-10-06-m4-exec-hardening.md), [accounts](docs/evidence/2026-10-06-m3-accounts.md), [backup and restore](docs/evidence/2026-10-06-backup-restore.md).
+- **Model fallback** ([record](docs/evidence/2026-10-10-model-fallback.md), fake upstream, zero cost): with the primary answering 503, a call without fallback fails after 3.7–5.1 s (3 tries plus backoff); with fallback it completes on the backup in about 51 ms (same as a healthy provider); with every breaker open the Gateway answers `model_degraded` in about 40 µs.
 - **Serial vs. parallel research** ([record](docs/evidence/2026-10-06-m4-subrun-comparison.md)). Small sample, N = 4 per mode:
 
   | | Serial | Parallel |

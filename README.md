@@ -43,6 +43,7 @@
 | **会话** | 每个对话是一个长期运行的沙箱进程：空闲 10 分钟冻结（cgroup freezer），1 小时后驱逐，下一条消息从最后提交的会话 checkpoint 恢复。 |
 | **Agent** | 工具调用式 Agent：渐进披露的 skill（`read_skill`）、`ask_user`、待办清单、`web_search`、`web_fetch`、`run_python`。每轮 30 次搜索与抓取，由 Gateway 强制，不靠模型自觉。 |
 | **并行 sub-run** | 同一轮内 2–4 个子主题并发执行，采用两层账本（task 与 sub-run）；可以取消，停止或崩溃后继续时，已完成的子主题不会重跑。 |
+| **模型降级链** | 一个逻辑模型可由按顺序排列的多个 OpenAI 兼容供应商提供：可重试的失败立即转下一个供应商，每次尝试都是 journal 中独立计价的 try；每个供应商一个熔断器，全部熔断时立即返回 `503 model_degraded`；可选对冲请求。重放与指纹不受影响。 |
 | **exec 沙箱** | 模型写的 Python 每次在全新、无网络的环境中运行，有独立 UID、CPU 与墙钟配额，并收集输出文件。 |
 | **产品层** | 账号（PBKDF2、`HttpOnly` 会话、登录限速）；用户隔离（他人的数据一律 404）；费用、模型与内部 ID 在服务端脱敏；CSP 与 Markdown 安全渲染。 |
 
@@ -61,6 +62,7 @@
   - Web 的 lint、类型检查与测试；
   - lint 与复杂度报告。
 - **真实验收**：在 4 vCPU / 8 GiB 的 Linux 云主机（腾讯云上海）上，使用真实模型（Moonshot：`kimi-k3` 主导、`kimi-k2.6` 执行）与经 Serper 的 Google 搜索结果。记录：[对话助手](docs/evidence/2026-10-06-m4-chat-acceptance.md)、[exec 沙箱](docs/evidence/2026-10-06-m4-exec-hardening.md)、[账号](docs/evidence/2026-10-06-m3-accounts.md)、[备份与恢复](docs/evidence/2026-10-06-backup-restore.md)。
+- **模型降级链**（[记录](docs/evidence/2026-10-10-model-fallback.md)，fake upstream、零费用）：主供应商持续 503 时，无降级链的调用 3.7–5.1 s 后失败（3 次 try 加退避），有降级链时约 51 ms 由后备供应商完成（与健康供应商相同）；全部熔断时约 40 µs 返回 `model_degraded`。
 - **串行与并行研究对比**（[记录](docs/evidence/2026-10-06-m4-subrun-comparison.md)）。小样本，每组 N = 4：
 
   | | 串行 | 并行 |
