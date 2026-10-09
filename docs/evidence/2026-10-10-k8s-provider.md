@@ -74,7 +74,9 @@ are being refilled while cold Pods start, and the kubelet starts them at the sam
 - **Warm is the best case.** Every warm sample waited for a ready warm Pod before starting, so the pool
   was never exhausted. When more Creates arrive at once than the pool holds, the extra ones are cold
   starts. They are counted as `path=cold`; `TestBurstOnRealCluster` measures that case: N concurrent
-  Creates against a pool of 2.
+  Creates against a pool of 2. Measured on kind with N = 6: 2 Creates claimed warm Pods (P50 11 ms) and 4
+  started cold (P50 2989 ms, P95 3017 ms). Overall P50 was 2985 ms: concurrent cold starts on one node are
+  slower than the sequential cold starts above.
 - **Cold does not include an image pull.** The image was already on the node, so the cold numbers are
   scheduling, container start and readiness only. A first start on a node without the image adds the
   pull time.
