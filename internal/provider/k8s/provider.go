@@ -263,7 +263,7 @@ func (p *Provider) Create(ctx context.Context, spec provider.EnvSpec) (provider.
 	}
 	if !ready(pod) {
 		if pod, err = p.waitPod(ctx, pod.Name, func(po *corev1.Pod) (bool, error) {
-			if terminal(po) {
+			if stopped(po) {
 				return false, fmt.Errorf("k8s: pod %s ended before becoming ready (%s)", po.Name, po.Status.Reason)
 			}
 			return ready(po), nil
@@ -389,7 +389,7 @@ func (p *Provider) StartExec(ctx context.Context, envID string, spec provider.Ex
 }
 
 // Stop closes the gate and kills the Pod's containers by setting activeDeadlineSeconds; success means the
-// Pod is gone or terminal (contract §3: the authoritative check).
+// Pod is gone, terminal, or all its containers have terminated (contract §3: the authoritative check).
 func (p *Provider) Stop(ctx context.Context, envID string) error {
 	if st := p.state(envID); st != nil {
 		st.gate.close()
@@ -409,19 +409,30 @@ func (p *Provider) Stop(ctx context.Context, envID string) error {
 		ctx, cancel = context.WithTimeout(ctx, p.opt.StopTimeout)
 		defer cancel()
 	}
-	if !terminal(ours) {
+	if !stopped(ours) {
 		if ours.Spec.NodeName == "" {
 			// Not scheduled: no containers exist yet. Delete it so it can never start.
 			if err := p.deletePod(ctx, ours); err != nil {
 				return err
 			}
-		} else if ours.Spec.ActiveDeadlineSeconds == nil || *ours.Spec.ActiveDeadlineSeconds > 1 {
-			patch := []byte(`{"spec":{"activeDeadlineSeconds":1}}`)
-			if _, err := p.pods().Patch(ctx, ours.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("k8s: stop pod %s: %w", ours.Name, err)
+		} else {
+			if ours.Spec.ActiveDeadlineSeconds == nil || *ours.Spec.ActiveDeadlineSeconds > 1 {
+				patch := []byte(`{"spec":{"activeDeadlineSeconds":1}}`)
+				if _, err := p.pods().Patch(ctx, ours.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil && !apierrors.IsNotFound(err) {
+					return fmt.Errorf("k8s: stop pod %s: %w", ours.Name, err)
+				}
+			}
+			// Fast path: the kubelet acts on the deadline at its next sync (seconds); asking PID 1 to shut down
+			// ends the container at once. Best effort — the deadline is the authoritative kill.
+			if ready(ours) {
+				go func(name string) {
+					sctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
+					defer cancel()
+					_, _ = p.helper(sctx, name, "shutdown")
+				}(ours.Name)
 			}
 		}
-		_, err := p.waitPod(ctx, ours.Name, func(po *corev1.Pod) (bool, error) { return terminal(po), nil })
+		_, err := p.waitPod(ctx, ours.Name, func(po *corev1.Pod) (bool, error) { return stopped(po), nil })
 		if err != nil && !errors.Is(err, provider.ErrNotFound) {
 			return fmt.Errorf("%w: pod %s: %v", provider.ErrStopUnconfirmed, ours.Name, err)
 		}
@@ -456,7 +467,7 @@ func (p *Provider) Destroy(ctx context.Context, envID string) error {
 		return fmt.Errorf("%w: pod labelled for %s", provider.ErrForeign, envID)
 	}
 	if ours != nil {
-		if !terminal(ours) && ours.Spec.NodeName != "" {
+		if !stopped(ours) && ours.Spec.NodeName != "" {
 			return provider.ErrNotStopped
 		}
 		if _, has := ctx.Deadline(); !has {

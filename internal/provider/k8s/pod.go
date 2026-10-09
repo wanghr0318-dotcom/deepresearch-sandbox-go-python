@@ -228,9 +228,27 @@ func ready(pod *corev1.Pod) bool {
 	return false
 }
 
-// running reports whether processes may exist: the Pod is bound to a node and not terminal.
+// stopped reports that no process of the Pod can exist: the Pod is terminal, or every container has
+// terminated (restartPolicy Never: they never restart; the kubelet updates the phase a sync later).
+func stopped(pod *corev1.Pod) bool {
+	if terminal(pod) {
+		return true
+	}
+	cs := pod.Status.ContainerStatuses
+	if len(cs) == 0 || len(cs) < len(pod.Spec.Containers) {
+		return false
+	}
+	for _, c := range cs {
+		if c.State.Terminated == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// running reports whether processes may exist: the Pod is bound to a node and not stopped.
 func running(pod *corev1.Pod) bool {
-	return !terminal(pod) && pod.Spec.NodeName != ""
+	return !stopped(pod) && pod.Spec.NodeName != ""
 }
 
 func oomKilled(pod *corev1.Pod) bool {

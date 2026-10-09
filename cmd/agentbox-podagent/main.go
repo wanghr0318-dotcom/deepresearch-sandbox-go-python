@@ -11,6 +11,7 @@
 //	agentbox-podagent freeze|thaw [--timeout-ms N]           SIGSTOP/SIGCONT every process except PID 1, confirm
 //	agentbox-podagent procs                                  print the container's pids (JSON)
 //	agentbox-podagent diag                                   print cpu usage and oom kills of the container cgroup
+//	agentbox-podagent shutdown                               SIGTERM PID 1: the container ends (fast path of Stop)
 //
 // The provider reaches it through the pods/exec API. exec writes one line "ABX-STARTED <pid>" (or
 // "ABX-START-ERR <reason>") on stdout before relaying the workload's stdout, so the provider learns that the

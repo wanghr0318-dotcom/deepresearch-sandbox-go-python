@@ -65,18 +65,18 @@ func newTestProvider(t *testing.T, client kubernetes.Interface, ex Executor, mod
 
 // harness builds the conformance harness around a provider constructor; echo/sleep are programs that the
 // target (fake helper or real image) understands.
-func harness(newProv func(t *testing.T) *Provider, install string, echo, sleep []string) providertest.Harness {
+func harness(newProv func(t *testing.T) *Provider, install func() string, echo, sleep []string) providertest.Harness {
 	return providertest.Harness{
 		New:        func(t *testing.T) provider.Provider { return newProv(t) },
-		Spec:       specFor(install),
+		Spec:       func(envID string) provider.EnvSpec { return specFor(install())(envID) },
 		Echo:       provider.ExecSpec{ExecID: "echo-1", Argv: echo},
 		EchoOutput: "hello",
 		EchoCode:   3,
 		Sleep:      provider.ExecSpec{ExecID: "sleep-1", Argv: sleep},
 		Residue: func(t *testing.T, pp provider.Provider, envID string) {
 			p := pp.(*Provider)
-			s := specFor(install)(envID)
-			o := owner{InstallID: install, EnvID: envID, SpecHash: provider.SpecHash(s), Kind: s.Kind}
+			s := specFor(install())(envID)
+			o := owner{InstallID: install(), EnvID: envID, SpecHash: provider.SpecHash(s), Kind: s.Kind}
 			pod, err := p.createPod(context.Background(), profileOf(s.Limits), &o, "")
 			if err != nil {
 				t.Fatal(err)
@@ -121,7 +121,7 @@ func TestConformanceOnFakeCluster(t *testing.T) {
 	providertest.Run(t, harness(func(t *testing.T) *Provider {
 		c := newFakeCluster(t, 0)
 		return newTestProvider(t, c.client, c.exec, func(o *Options) { o.InstallID = "inst-a" })
-	}, "inst-a", []string{"echo", "hello", "3"}, []string{"sleep"}))
+	}, func() string { return "inst-a" }, []string{"echo", "hello", "3"}, []string{"sleep"}))
 }
 
 func TestNewRequiresPinnedImage(t *testing.T) {

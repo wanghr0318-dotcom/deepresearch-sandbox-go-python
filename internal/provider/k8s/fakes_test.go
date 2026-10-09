@@ -202,6 +202,8 @@ func (f *fakeExec) Stream(ctx context.Context, ns, pod string, cmd []string, std
 		return json.NewEncoder(stdout).Encode(pids)
 	case "diag":
 		return json.NewEncoder(stdout).Encode(podapi.Diag{CPUUsageUsec: 4242})
+	case "shutdown":
+		return nil // the fake kubelet acts on activeDeadlineSeconds
 	}
 	return fmt.Errorf("fake: unknown subcommand %q", cmd[1])
 }

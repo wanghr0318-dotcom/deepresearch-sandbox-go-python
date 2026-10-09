@@ -70,7 +70,7 @@ func (pl *pool) reconcile(ctx context.Context) {
 	alive := 0
 	for i := range pods {
 		pod := &pods[i]
-		if pod.Labels[LabelPool] != pl.key || terminal(pod) || pod.DeletionTimestamp != nil {
+		if pod.Labels[LabelPool] != pl.key || stopped(pod) || pod.DeletionTimestamp != nil {
 			if pod.DeletionTimestamp == nil {
 				if err := pl.p.deletePod(ctx, pod); err == nil && pl.p.slots.enabled() {
 					_ = pl.p.slots.remove(pod.Name, "")
