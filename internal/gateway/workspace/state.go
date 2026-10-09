@@ -18,7 +18,7 @@ import (
 const (
 	StateActive  = "active"
 	StateExpired = "expired" // idle timeout: manifest dropped, tombstone kept until the task ends
-	StateLost    = "lost"    // state file unreadable/inconsistent or a file blob missing after a restart
+	StateLost    = "lost"    // state file unparsable/inconsistent or a file blob missing after a restart
 )
 
 // maxApplied is how many applied exec call ids a workspace remembers for idempotent replay.
@@ -31,9 +31,11 @@ type entry struct {
 	Exec   bool   `json:"exec,omitempty"`
 }
 
-// applied records an exec call that advanced the head: its combined response blob and the journaled exec result blob.
+// applied records an exec call that advanced the head: the request it answered (sha256 of the command and timeout),
+// its combined response blob and the journaled exec result blob.
 type applied struct {
 	CallID         string `json:"call_id"`
+	RequestSHA256  string `json:"request_sha256"`
 	ResponseSHA256 string `json:"response_sha256"`
 	ResultSHA256   string `json:"result_sha256"`
 }
@@ -49,6 +51,9 @@ type state struct {
 	UsedAt    time.Time        `json:"used_at"`
 	Ops       int64            `json:"ops"`
 	Applied   []applied        `json:"applied,omitempty"`
+	// WriteOps and WrittenBytes meter write_file (per task, never reset): the blobs it creates are permanent.
+	WriteOps     int64 `json:"write_ops,omitempty"`
+	WrittenBytes int64 `json:"written_bytes,omitempty"`
 }
 
 // version is sha256(JCS(files)) — the content identity of the manifest.
@@ -104,17 +109,19 @@ func fileName(taskID string) string {
 	return hex.EncodeToString(sum[:16]) + ".json"
 }
 
-// errCorrupt marks a state file that exists but cannot be trusted.
+// errCorrupt marks a state file that exists but cannot be trusted (unparsable, inconsistent). Transient read errors
+// are returned as they are and do not make a workspace lost.
 var errCorrupt = errors.New("workspace: corrupt state")
 
-// readState loads a state file. Missing → (nil, nil). Unreadable or inconsistent → errCorrupt (wrapped).
+// readState loads a state file. Missing → (nil, nil). Unparsable or inconsistent → errCorrupt (wrapped); an I/O error
+// reading it → that error.
 func readState(path, taskID string) (*state, error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errCorrupt, err)
+		return nil, fmt.Errorf("workspace: read state: %w", err)
 	}
 	var s state
 	if err := json.Unmarshal(b, &s); err != nil {

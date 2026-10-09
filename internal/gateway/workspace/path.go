@@ -10,25 +10,36 @@ import (
 const (
 	MaxPathBytes    = 512
 	MaxPathSegments = 32
+	MaxSegmentBytes = 255 // NAME_MAX: a longer segment cannot be staged into the exec environment
 )
 
-// ValidPath reports whether p is an acceptable workspace file path: relative, canonical (path.Clean leaves it
-// unchanged, so no "a//b", "./a", trailing "/"), no ".." segment, no NUL, no backslash, valid UTF-8, at most
-// MaxPathBytes bytes and MaxPathSegments segments. The root itself ("" or ".") is not a file path.
+// reservedDir is reserved by the exec staging layout (/in/.agentbox holds the command); workspace files never use it.
+const reservedDir = ".agentbox"
+
+// ValidPath reports whether p is an acceptable workspace file path. It matches what exec staging can stage (so a
+// workspace can always be run): relative, canonical (path.Clean leaves it unchanged, so no "a//b", "./a", trailing
+// "/"), no "." or ".." segment, no NUL, no backslash, no control characters, valid UTF-8, at most MaxPathBytes bytes,
+// MaxPathSegments segments and MaxSegmentBytes bytes per segment, and not under the reserved ".agentbox" directory.
+// The root itself ("" or ".") is not a file path.
 //
 // Paths are only ever used as keys of the manifest and joined under /in/ws inside an exec environment; they are never
-// resolved against a host directory, so this check is about canonical names, not about filesystem safety.
+// resolved against a host directory, so this check is about stageable canonical names, not about filesystem safety.
 func ValidPath(p string) bool {
-	if p == "" || p == "." || len(p) > MaxPathBytes || !utf8.ValidString(p) || strings.ContainsAny(p, "\x00\\") ||
+	if p == "" || p == "." || len(p) > MaxPathBytes || !utf8.ValidString(p) || strings.ContainsRune(p, '\\') ||
 		strings.HasPrefix(p, "/") || path.Clean(p) != p {
 		return false
 	}
+	for _, r := range p {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
 	segs := strings.Split(p, "/")
-	if len(segs) > MaxPathSegments {
+	if len(segs) > MaxPathSegments || segs[0] == reservedDir {
 		return false
 	}
 	for _, s := range segs {
-		if s == ".." || s == "." || s == "" {
+		if s == ".." || s == "." || s == "" || len(s) > MaxSegmentBytes {
 			return false
 		}
 	}

@@ -169,3 +169,29 @@ func TestShellStagingFailureIsExecEnvUnavailable(t *testing.T) {
 		t.Fatalf("%d environments still held", n)
 	}
 }
+
+// The wrapper's staging marker at the start of stdout is stripped and reported as workspace_staged; without it the
+// command's output is untouched and workspace_staged is false. /v1/exec results never carry the member.
+func TestShellStagedMarker(t *testing.T) {
+	h := newExecHarness(t, nil, execScript{stdout: string(StagedMarker) + "ok\n"}, execScript{stdout: "no marker\n"},
+		execScript{stdout: string(StagedMarker)})
+	for _, tc := range []struct {
+		id, stdout string
+		staged     bool
+	}{{"m1", "ok\n", true}, {"m2", "no marker\n", false}} {
+		var v struct {
+			Stdout string `json:"stdout"`
+			Staged *bool  `json:"workspace_staged"`
+		}
+		if err := json.Unmarshal(h.shell(t, sinv(tc.id, "true")).Body, &v); err != nil {
+			t.Fatal(err)
+		}
+		if v.Stdout != tc.stdout || v.Staged == nil || *v.Staged != tc.staged {
+			t.Fatalf("%s: stdout %q staged %v", tc.id, v.Stdout, v.Staged)
+		}
+	}
+	r := h.exec(t, xinv("x1", execBody("print(1)", "")))
+	if strings.Contains(string(r.Body), "workspace_staged") {
+		t.Fatalf("/v1/exec result mentions workspace_staged: %s", r.Body)
+	}
+}

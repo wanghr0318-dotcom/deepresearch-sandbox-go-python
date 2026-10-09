@@ -51,7 +51,13 @@ const shellWrapper = `if [ -d /in/ws ]; then
   cp -R --preserve=mode /in/ws/. /out/ && chmod -R u+w /out || { echo "agentbox: workspace staging failed" >&2; exit 125; }
 fi
 cd /out || exit 125
+printf '\000agentbox:staged\n'
 exec /bin/bash --noprofile --norc /in/.agentbox/cmd.sh`
+
+// StagedMarker is what the wrapper writes to stdout after the workspace was copied completely and before the command
+// starts: positionally unforgeable (the command can only write after it), so its presence at the very start of stdout
+// is the wrapper's positive "staged OK" signal. ExecShell strips it and reports workspace_staged.
+var StagedMarker = []byte("\x00agentbox:staged\n")
 
 // ShellArgv is the fixed argv of a workspace command.
 func ShellArgv() []string {

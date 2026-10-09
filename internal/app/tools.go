@@ -84,14 +84,18 @@ func (s *server) assembleWorkspaces(blobs blob.Store) error {
 	}
 	m, err := workspace.New(workspace.Config{Dir: workspacesDir(s.d.DataDir), Exec: s.calls, Access: s.calls, Blobs: blobs,
 		Tasks: taskTerminal{s: s.store}, IdleTimeout: s.cfg.WorkspaceIdleTimeout, MaxFiles: workspace.DefaultMaxFiles,
-		MaxBytes: s.cfg.Exec.OutBytes, Logger: s.log})
+		MaxBytes: workspaceMaxBytes(s.cfg.Exec.OutBytes), Logger: s.log})
 	if err != nil {
 		return fmt.Errorf("app: 工作区: %w", err)
 	}
 	s.workspaces = m
-	s.log.Info("工作区工具已启用", "idle_timeout", s.cfg.WorkspaceIdleTimeout.String(), "max_bytes", s.cfg.Exec.OutBytes)
+	s.log.Info("工作区工具已启用", "idle_timeout", s.cfg.WorkspaceIdleTimeout.String(), "max_bytes", workspaceMaxBytes(s.cfg.Exec.OutBytes))
 	return nil
 }
+
+// workspaceMaxBytes keeps staging headroom in the /out tmpfs: a full workspace always fits when it is copied in, and the
+// command gets the rest (at least out − workspace − headroom).
+func workspaceMaxBytes(out int64) int64 { return max(out-workspace.StagingHeadroom, out/2) }
 
 // runWorkspaceSweep 在执行开始后运行工作区清扫（终态任务销毁、空闲过期；启动时先扫一次，覆盖上一进程留下的工作区）。
 func (s *server) runWorkspaceSweep() {

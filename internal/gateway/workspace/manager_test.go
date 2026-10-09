@@ -87,6 +87,8 @@ type fakeExec struct {
 	res   *call.Result // non-nil: returned as is (rejection)
 	gate  chan struct{}
 	seen  map[string]call.Result // journal replay by call id
+	// unstaged: the wrapper did not signal a complete staging (workspace_staged false)
+	unstaged bool
 }
 
 func (f *fakeExec) ExecShell(_ context.Context, in call.ShellInvoke) (call.Result, error) {
@@ -125,7 +127,7 @@ func (f *fakeExec) ExecShell(_ context.Context, in call.ShellInvoke) (call.Resul
 		Reason string `json:"reason"`
 	}
 	body := map[string]any{"status": status, "exit": map[string]int{"code": 0, "signal": 0}, "stdout": "ran " + in.Command,
-		"outputs": []o{}, "skipped_outputs": []s{}}
+		"outputs": []o{}, "skipped_outputs": []s{}, "workspace_staged": !f.unstaged}
 	var outs []o
 	for p, c := range out {
 		ref, _ := f.blobs.Put(context.Background(), strings.NewReader(c))

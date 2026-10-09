@@ -970,6 +970,8 @@ type execResult struct {
 	WallMs            int64             `json:"wall_ms"`
 	Limits            execLimitsJSON    `json:"limits"`
 	ImageDigest       string            `json:"image_digest"`
+	// WorkspaceStaged is only present in the shell variant: the wrapper's staging marker was the start of stdout.
+	WorkspaceStaged *bool `json:"workspace_staged,omitempty"`
 }
 
 type execExit struct {
@@ -1049,6 +1051,13 @@ func (c *Coordinator) collectExec(r *execRun, outcome ExecOutcome, exit *provide
 	}
 	if diag != nil {
 		res.Diag = &execDiagJSON{OOMKillDelta: diag.OOMKillDelta, OOMObserved: diag.OOMObserved, CPUUsageUsec: diag.CPUUsageUsec}
+	}
+	if r.j.req.shell != nil {
+		staged := bytes.HasPrefix(stdout.data, StagedMarker)
+		if staged {
+			stdout.data = stdout.data[len(StagedMarker):]
+		}
+		res.WorkspaceStaged = &staged
 	}
 	res.StdoutTruncated, res.StderrTruncated = stdout.truncated, stderr.truncated
 	res.Stdout, res.StdoutInvalidUTF8 = decodeStream(stdout)
