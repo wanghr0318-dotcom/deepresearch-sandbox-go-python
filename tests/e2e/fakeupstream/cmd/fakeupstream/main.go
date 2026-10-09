@@ -7,6 +7,8 @@
 // 向标准输出打印一行 `url=<根地址> model_base_url=<根地址>/v1 hostport=<127.0.0.1:端口>`，然后运行到收到
 // SIGTERM 或 SIGINT；退出前打印各类请求计数。
 //
+//   - -eval-suite FILE：读取 agentbox eval 的 suite（internal/eval），为每个编码任务安装 [stage:code] 的回复
+//     （suite 中的 fake_reply）：评测的零成本模式。
 //   - -hold-first-chat：第一次 chat 请求（研究的计划阶段）挂起，直到进程收到 SIGUSR1——演练脚本据此在 Worker
 //     运行中完成沙箱进程的 G3 检查后再放行，不依赖时间。
 //   - -latency chat=300ms,search=80ms：各类别正常回复前的固定延迟（可观测性演示：trace 与延迟直方图有可读的数字）。
@@ -23,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/eval"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/tests/e2e/fakeupstream"
 )
 
@@ -36,6 +39,7 @@ func main() {
 	hold := flag.Bool("hold-first-chat", false, "第一次 chat 请求挂起，直到收到 SIGUSR1")
 	latency := flag.String("latency", "", "各类别的固定延迟，逗号分隔的 kind=duration（kind 为 chat、search、fetch）")
 	inject := flag.String("inject", "", "注入的错误回复，逗号分隔的 kind:N:status（第 N 次该类请求以 status 回复）")
+	suitePath := flag.String("eval-suite", "", "agentbox eval 的 suite 文件：编码任务的 fake_reply 作为 [stage:code] 回复")
 	flag.Parse()
 
 	fu := fakeupstream.New()
@@ -43,6 +47,21 @@ func main() {
 	if err := configure(fu, *latency, *inject); err != nil {
 		fmt.Fprintln(os.Stderr, "fakeupstream:", err)
 		os.Exit(2)
+	}
+	if *suitePath != "" {
+		suite, err := eval.LoadSuite(*suitePath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		n := 0
+		for _, t := range suite.Tasks {
+			if t.Kind == eval.KindCoding && t.FakeReply != "" {
+				fu.SetCodeReply(t.ID, t.FakeReply)
+				n++
+			}
+		}
+		fmt.Fprintf(os.Stderr, "fakeupstream: %d scripted code replies from %s\n", n, *suitePath)
 	}
 	if *hold {
 		fu.Inject(fakeupstream.Chat, 1, fakeupstream.Action{Hang: true})
@@ -64,9 +83,10 @@ func main() {
 		}
 		break
 	}
-	fmt.Printf("counts chat=%d search=%d fetch=%d plan=%d summarize=%d report=%d\n",
+	fmt.Printf("counts chat=%d search=%d fetch=%d plan=%d summarize=%d report=%d code=%d\n",
 		fu.Count(fakeupstream.Chat), fu.Count(fakeupstream.Search), fu.Count(fakeupstream.Fetch),
-		fu.StageCount(fakeupstream.StagePlan), fu.StageCount(fakeupstream.StageSummarize), fu.StageCount(fakeupstream.StageReport))
+		fu.StageCount(fakeupstream.StagePlan), fu.StageCount(fakeupstream.StageSummarize), fu.StageCount(fakeupstream.StageReport),
+		fu.StageCount(fakeupstream.StageCode))
 	fu.Close()
 }
 
