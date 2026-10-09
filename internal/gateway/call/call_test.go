@@ -2452,6 +2452,7 @@ type execScript struct {
 	createErr      error         // Create 的返回
 	createGate     chan struct{} // 非 nil：Create 阻塞至关闭
 	outputs        map[string]string
+	execOutputs    map[string]bool // 以 0700 写出的输出（shell 变体读取可执行位）
 	skipped        []provider.SkippedOutput
 }
 
@@ -2703,7 +2704,11 @@ func (f *fakeEnvs) OpenOutputs(_ context.Context, envID string, max int) ([]prov
 	var out []provider.OutputFile
 	for i, p := range paths {
 		name := filepath.Join(dir, fmt.Sprint(i))
-		if err := os.WriteFile(name, []byte(e.sc.outputs[p]), 0o600); err != nil {
+		mode := os.FileMode(0o600)
+		if e.sc.execOutputs[p] {
+			mode = 0o700
+		}
+		if err := os.WriteFile(name, []byte(e.sc.outputs[p]), mode); err != nil {
 			return nil, nil, err
 		}
 		fh, err := os.Open(name)
