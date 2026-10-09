@@ -1,0 +1,60 @@
+# sum by (kind, status) (agentbox_tasks_finished_total)
+  {kind=task,status=paused} 1
+  {kind=task,status=succeeded} 2
+  {kind=task,status=failed} 1
+  {kind=turn,status=succeeded} 1
+  {kind=turn,status=paused} 1
+# sum by (kind, outcome_class) (agentbox_attempts_finished_total)
+  {kind=task,outcome_class=paused} 1
+  {kind=task,outcome_class=succeeded} 2
+  {kind=task,outcome_class=worker_error} 1
+  {kind=turn,outcome_class=succeeded} 1
+  {kind=turn,outcome_class=paused} 1
+# histogram_quantile(0.5, sum by (le, kind) (agentbox_attempt_ready_seconds_bucket))
+  {kind=task} 0.175
+  {kind=turn} 0.025
+# histogram_quantile(0.95, sum by (le, kind) (agentbox_task_start_seconds_bucket))
+  {kind=task} 0.45
+  {kind=turn} 0.475
+# sum by (kind, desired) (agentbox_stop_seconds_sum) / sum by (kind, desired) (agentbox_stop_seconds_count)
+  {desired=pause,kind=task} 0.6638
+  {desired=pause,kind=turn} 1.054
+# sum by (kind, status, outcome) (agentbox_upstream_tries_total)
+  {kind=chat,outcome=ok,status=200} 10
+  {kind=chat,outcome=retryable,status=503} 1
+  {kind=fetch,outcome=ok,status=200} 12
+  {kind=search,outcome=ok,status=200} 4
+# histogram_quantile(0.95, sum by (le, kind) (agentbox_upstream_try_duration_seconds_bucket))
+  {kind=fetch} 0.0975
+  {kind=search} 0.0975
+  {kind=chat} 0.4862
+# sum by (kind, result) (agentbox_gateway_calls_total)
+  {kind=chat,result=completed} 10
+  {kind=fetch,result=completed} 12
+  {kind=search,result=completed} 4
+  {kind=chat,result=budget_insufficient_for_request} 1
+# sum by (kind, model) (agentbox_cost_micro_usd_total)
+  {kind=chat,model=fake-model} 1.052e+04
+# sum by (kind) (agentbox_tool_calls_per_task_sum) / sum by (kind) (agentbox_tool_calls_per_task_count)
+  {kind=task} 4
+  {kind=turn} 0
+# agentbox_sandbox_envs
+  {__name__=agentbox_sandbox_envs,kind=exec} 0
+  {__name__=agentbox_sandbox_envs,kind=session} 1
+  {__name__=agentbox_sandbox_envs,kind=task} 0
+# agentbox_sandbox_cleanup_backlog
+  {__name__=agentbox_sandbox_cleanup_backlog} 0
+# agentbox_run_slots_in_use
+  {__name__=agentbox_run_slots_in_use} 0
+# sum by (route, code) (agentbox_http_requests_total)
+  {code=200,route=/status} 1
+  {code=200,route=/tasks/{id}} 55
+  {code=201,route=/tasks} 3
+  {code=200,route=/tasks/{id}/inspect} 6
+  {code=200,route=/tasks/{id}/pause} 1
+  {code=200,route=/tasks/{id}/resume} 1
+  {code=200,route=/sessions/{id}/turns} 21
+  {code=201,route=/auth/register} 1
+  {code=201,route=/sessions} 1
+  {code=202,route=/sessions/{id}/messages} 2
+  {code=202,route=/turns/{id}/stop} 1
