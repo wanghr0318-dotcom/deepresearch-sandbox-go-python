@@ -40,6 +40,8 @@
 
 **产物路径**：相对、非空、无 NUL、≤ 4096 字节、不含空、`.` 或 `..` 分量。JSON Schema 只能按字符计长，不表达 4096 字节上限，该上限由编解码器检查（`path_invalid`）。**sha256**：64 个小写十六进制字符。
 
+**traceparent**（`init` 与 `task_start` 的可选字段）：W3C Trace Context 版本 00 的 `traceparent`，标识宿主一侧的 `worker.run` span。Worker 可把它原样作为 Gateway 请求的 `traceparent` 头，使自己发起的调用加入同一条 trace；Gateway 只接受 trace-id 属于本 attempt 的值。格式规则与共享向量见 `fixtures/v1/traceparent.json`（Go 的 `internal/obs.ParseTraceparent` 与 Python 的 `agentbox_worker.tracecontext` 都按它测试）。宿主未启用追踪时不发送该字段。
+
 ## 大小上限（UTF-8 字节）
 
 单条 Worker 事件 1 MiB；`init` 1 MiB；其他宿主控制消息 16 KiB；inline state 256 KiB（按紧凑 JSON 计，空白不计）；每个 checkpoint 的 refs 1024 个。

@@ -46,6 +46,7 @@
 | **模型降级链** | 一个逻辑模型可由按顺序排列的多个 OpenAI 兼容供应商提供：可重试的失败立即转下一个供应商，每次尝试都是 journal 中独立计价的 try；每个供应商一个熔断器，全部熔断时立即返回 `503 model_degraded`；可选对冲请求。重放与指纹不受影响。 |
 | **exec 沙箱** | 模型写的 Python 每次在全新、无网络的环境中运行，有独立 UID、CPU 与墙钟配额，并收集输出文件。 |
 | **产品层** | 账号（PBKDF2、`HttpOnly` 会话、登录限速）；用户隔离（他人的数据一律 404）；费用、模型与内部 ID 在服务端脱敏；CSP 与 Markdown 安全渲染。 |
+| **可观测性** | OpenTelemetry 追踪：一次用户操作一条 trace，从 API 请求经任务 actor、attempt、Worker 启动与握手、checkpoint，**进入沙箱**（W3C `traceparent` 经协议交给 Worker，Python SDK 只用标准库转发）再回到 Gateway 的每个模型、搜索、抓取与 exec 调用及其每次重试；Prometheus 指标（结果、启动与停止延迟、上游延迟与错误、费用、工具调用、沙箱与槽位）；JSON 日志带 `trace_id`。默认关闭；`deploy/observability` 提供 Collector、Tempo、Prometheus、Loki、Grafana 本地栈（[设计](docs/design/2026-10-10-observability-design.md)、[演示记录](docs/evidence/2026-10-10-observability.md)）。 |
 
 ## 证据
 
@@ -116,6 +117,7 @@ CI=true go test -count=1 ./internal/persistence/postgres/ ./tests/e2e/...
 | `internal/gateway/{edge,call,upstream,cache}` | Gateway：每 attempt 的 socket、调用 journal 与账本、供应商 adapter、Redis 缓存 |
 | `internal/persistence/postgres`、`blob`、`recovery`、`reconcile`、`invariants` | 存储、内容寻址的 blob、启动恢复、不变量检查 |
 | `internal/api`、`account` | REST/SSE API（[OpenAPI](api/openapi.yaml)）、账号 |
+| `internal/obs`、`telemetry`、`deploy/observability` | 可观测性：只依赖标准库的埋点接口、OpenTelemetry 与 Prometheus 实现、本地观测栈 |
 | `protocol/` | 版本化的 Go ↔ Python Worker 协议与共享 fixtures |
 | `worker/` | Python Worker SDK、`chatagent`、工具、`deep-research` skill |
 | `web/` | Vue 3 + TypeScript 的对话界面与运维工作台 |

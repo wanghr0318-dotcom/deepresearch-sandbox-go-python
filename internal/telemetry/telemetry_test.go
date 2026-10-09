@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
@@ -174,3 +175,28 @@ func TestMetricsEndpoint(t *testing.T) {
 		}
 	}
 }
+
+// BenchmarkSpanOn is the per-call cost with tracing and metrics on (OTel SDK span exported to a discarding
+// in-memory exporter in batches, Prometheus counter): compare with obs.BenchmarkOffPath.
+func BenchmarkSpanOn(b *testing.B) {
+	tel, err := telemetry.Setup(context.Background(), telemetry.Config{SpanExporter: discard{}, MetricsListen: "127.0.0.1:0"})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = tel.Shutdown(context.Background()) }()
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		c, sp := obs.Start(ctx, "gateway.call", obs.Str("task.id", "t"), obs.Int("try.no", 1))
+		sp.SetAttrs(obs.Str("call.result", "completed"))
+		sp.End()
+		obs.M().GatewayCall("chat", "completed")
+		_ = obs.Traceparent(c)
+	}
+}
+
+type discard struct{}
+
+func (discard) ExportSpans(context.Context, []sdktrace.ReadOnlySpan) error { return nil }
+func (discard) Shutdown(context.Context) error                             { return nil }

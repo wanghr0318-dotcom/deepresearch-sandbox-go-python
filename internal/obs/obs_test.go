@@ -158,3 +158,17 @@ func TestCarry(t *testing.T) {
 		t.Errorf("child parent = %q, want %q", s[1].ParentID, s[0].SpanID)
 	}
 }
+
+// BenchmarkOffPath is the per-call cost of instrumentation when observability is off (the default): a span with
+// attributes, a metric event and a traceparent lookup.
+func BenchmarkOffPath(b *testing.B) {
+	ctx := context.Background()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		c, sp := obs.Start(ctx, "gateway.call", obs.Str("task.id", "t"), obs.Int("try.no", 1))
+		sp.SetAttrs(obs.Str("call.result", "completed"))
+		sp.End()
+		obs.M().GatewayCall("chat", "completed")
+		_ = obs.Traceparent(c)
+	}
+}
