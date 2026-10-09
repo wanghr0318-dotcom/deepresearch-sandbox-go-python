@@ -107,6 +107,15 @@ POST /sessions/{id}/messages  13.0 ms
 | `agentbox_sandbox_envs` / `agentbox_sandbox_cleanup_backlog` | session 1 (idle incarnation), task 0, exec 0 / 0 |
 | `sum by (route, code) (agentbox_http_requests_total)` | route label is the pattern, e.g. `/tasks/{id}` 55, `/sessions/{id}/turns` 21 |
 
+This run predates review fix round 1, and three of the rows above reflect the old semantics:
+
+- At the time, `tasks_finished_total` also counted paused runs. It now counts only terminal statuses, and pauses
+  go to `task_runs_ended_total`.
+- `stop_seconds` started when the actor observed the stop. It now starts when the API accepted the request, which
+  adds the actor's notification delay (milliseconds).
+- `tool_calls_per_task` was observed per run. It now covers a task's whole life and is observed at its terminal
+  status.
+
 A cold sandbox (attempt-ready p50 175 ms) and a warm session incarnation (25 ms) differ by about 7× in start
 latency. This is the number that motivates a warm pool.
 
@@ -114,8 +123,21 @@ latency. This is the number that motivates a warm pool.
 
 `{job="agentbox"}` held 2 556 lines from the run. `{job="agentbox"} |= "8e3fa409b4d97d93b82d112f5aa25cbf"` (task A's
 trace) returned 14 lines: the Gateway try log lines and the API access log line. Each carries the `trace_id` and
-`span_id` of the span that was active, so Grafana's "TraceID" derived field opens the trace in Tempo. Going the
-other way, Tempo's "logs for this span" opens the Loki query.
+`span_id` of the span that was active. Grafana is provisioned so that the "TraceID" derived field on a log line
+opens the trace in Tempo, and Tempo's trace-to-logs link opens the matching Loki query. These links come from the
+provisioned configuration; they were **not** clicked through in a browser (see "How this was verified").
+
+## How this was verified
+
+- **Traces:** fetched from Tempo's HTTP API (`/api/search` with TraceQL on `span.task.id`, then `/api/traces/<id>`)
+  and rendered with `scripts/dev/span-tree.py`. The demo's last step scans the exported JSON for secrets.
+- **Metrics:** instant queries against Prometheus's HTTP API (`/api/v1/query`); the output is in `promql.txt`.
+- **Logs:** Loki's HTTP API (`/loki/api/v1/query_range`), counting lines that contain task A's trace id.
+- **Dashboard:** 23 of the 24 queries of the provisioned "Agentbox overview" dashboard were run through Grafana's
+  `/api/ds/query` and returned data. Two gauge panels were empty after the server had stopped, which is expected.
+  The traces table is not covered: Grafana runs TraceQL search in the browser, and its backend rejects that query
+  type. Its TraceQL was checked directly against Tempo instead.
+- **Not done:** no panel, trace view, or log↔trace link was viewed in a browser, and no screenshots were taken.
 
 ## Overhead when off
 

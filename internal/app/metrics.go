@@ -31,26 +31,38 @@ func (s *server) registerGauges() {
 		return
 	}
 	var (
-		mu      sync.Mutex
-		at      time.Time
-		running = map[string]int64{}
-		backlog int64
+		mu         sync.Mutex
+		at         time.Time
+		refreshing bool
+		running    = map[string]int64{}
+		backlog    int64
 	)
 	es, _ := s.store.(envStatser)
+	// envs returns the cached values; at most one scrape at a time refreshes them, without holding mu during the
+	// database query (concurrent scrapes get the previous values).
 	envs := func() (map[string]int64, int64) {
 		mu.Lock()
-		defer mu.Unlock()
-		if es != nil && time.Since(at) >= envStatsTTL {
-			at = time.Now()
+		stale := es != nil && !refreshing && time.Since(at) >= envStatsTTL
+		if stale {
+			refreshing = true
+		}
+		mu.Unlock()
+		if stale {
 			ctx, cancel := context.WithTimeout(context.Background(), envStatsTimeout)
 			r, b, err := es.EnvironmentStats(ctx)
 			cancel()
+			mu.Lock()
+			refreshing, at = false, time.Now()
 			if err == nil {
 				running, backlog = r, b
-			} else {
+			}
+			mu.Unlock()
+			if err != nil {
 				s.log.Debug("metrics: environment stats unavailable, keeping previous values", "error", err.Error())
 			}
 		}
+		mu.Lock()
+		defer mu.Unlock()
 		out := make(map[string]int64, len(running))
 		for k, v := range running {
 			out[k] = v

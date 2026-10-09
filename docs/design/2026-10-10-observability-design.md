@@ -14,7 +14,9 @@ Status: implemented on branch `s1-observability`.
 3. **Log correlation**: JSON logs written while a span is active carry `trace_id` / `span_id`, so Grafana can
    jump from a log line to its trace and back.
 4. **Off by default**: with no `--otlp-endpoint` and no `--metrics-listen` the server behaves exactly as before.
-   No exporter, no listener, no extra allocations on hot paths beyond a nil-interface check.
+   No exporter, no listener, no submit/stop registry entries, no request-context wrapping in the API; instrumented
+   call sites cost a nil check plus the attribute slice built at the call site (~30 ns, 2 small allocations,
+   measured).
 5. **A reproducible local stack** (`deploy/observability/`) and a demo script that drives real tasks and turns
    (with a stop and a failure) through the fake upstream, at zero model cost.
 
@@ -64,15 +66,15 @@ Status: implemented on branch `s1-observability`.
 | `HTTP <METHOD> <route>` | `api.Handler.ServeHTTP` | new root | `http.method`, `http.route` (pattern, not path), `http.status_code` |
 | `task` / `turn` (run span) | task actor, one per *run*: first effect of the run → the verdict that stops it running (paused, awaiting_input, terminal; fault retries stay in the run) | the API request that started the run — create, resume, continue or answer (submit registry), else new root | `task.id`, `session.id`, `task.kind`, `task.run`, `task.status` |
 | `attempt` | task actor, attempt committed → verdict committed | task span | `attempt.id`, `attempt.no`, `env.id`, `outcome.class`, `attempt.status` |
-| `admission.acquire` | actor slot request | task span | `queued_ms` |
+| `admission.acquire` | actor slot request (starts the run) | run span | — (its duration is the queueing time) |
 | `env.create` / `env.stop` / `session.handoff` | actor async effects | attempt span | `env.id`, `stopped`, `recorded` |
-| `worker.run` | `runner.Run` / `Incarnation.RunTask` | attempt span | `mode`, `kill.reason`, `outcome.class` |
+| `worker.run` | `runner.Run` / `Incarnation.RunTask` | attempt span | `worker.mode`, `task.id`, `attempt.id`, `attempt.no`, `env.id`, `outcome.class`, `kill.reason`, `control` |
 | `worker.start` | `StartExec` | worker.run | — |
 | `worker.handshake` | init/task_start sent → ready/task_accepted | worker.run | — |
 | `checkpoint.commit` | `processor.commitCheckpoint` | worker.run | `checkpoint.status` |
 | `worker.finalize` | process exit / proposal → outcome classified | worker.run | `outcome.class` |
 | `gateway.call` | `call.Coordinator.Invoke` / `Exec` | worker-sent `traceparent` (validated) or the bound attempt | `gateway.kind`, `gateway.provider`, `gateway.model`, `call.id`, `call.result` (`completed`, `replayed`, `cache_hit`, `coalesced`, or the stable rejection code), `subrun.id` |
-| `gateway.try` | each upstream try in `execute` | gateway.call | `try.no`, `http.status_code`, `try.outcome`, `backoff_ms` event |
+| `gateway.try` | each upstream try in `execute` | gateway.call | `try.no`, `http.status_code`, `try.outcome` (backoff is the gap between sibling tries) |
 | `session.<op>` | session actor ops (start, quiesce, freeze, thaw, release, destroy) | none (session-scoped root) | `session.id`, `incarnation.id`, `env.id` |
 
 **Propagation into the sandbox.** Protocol v1 already reserves an optional string `traceparent` on `init` and
@@ -81,10 +83,12 @@ the `worker.run` span context. The Python SDK (`agentbox_worker.tracecontext`, s
 the W3C rules (version `00`, 32-hex trace-id and 16-hex parent-id not all zero, 2-hex flags; anything else is
 dropped) and the Gateway client sends it as the `traceparent` header on every request (including sub-run views).
 
-**Untrusted header handling.** The worker is untrusted. The edge accepts a `traceparent` header only if it
-parses and its trace-id equals the trace-id of the attempt bound to that socket; otherwise the header is ignored
-and the call span is parented to the bound attempt context. A worker therefore cannot attach its spans to other
-users' traces or forge new traces.
+**Untrusted header handling.** The worker is untrusted, so its `traceparent` header only *selects* a parent and is
+never adopted as is. The runner records the traceparent it handed to the attempt's worker (`obs.ExpectWorker`).
+The edge uses the host's recorded value — with the host's sampling flags — only when the header parses, its
+trace-id equals the bound attempt's trace and its parent-id equals that worker.run span; otherwise the header is
+ignored and the call is parented to the bound attempt span. A worker therefore cannot attach spans to other traces,
+invent parents, or change the sampling decision.
 
 **Async boundaries.** Gateway calls continue in the coordinator's own context after the request returns (journal
 semantics); the span context is carried over explicitly (`obs.Carry`) so the call and its tries stay in the trace.
@@ -95,7 +99,16 @@ the run span becomes a new root — a deliberate best-effort limit.
 **One user action = one trace.** A paused task can wait for days; keeping one span open across the pause would
 produce unbounded spans that never export. Each run of a task therefore gets its own run span and trace, rooted at
 the request that caused it (POST /tasks, POST /tasks/{id}/resume, turn continue/answer). Effects that complete
-after the verdict (the session handoff of a turn) stay under the ended attempt span.
+after the verdict (the session handoff of a turn) stay under the ended attempt span. Every committed status that
+stops the task running ends the run — a verdict, ApplyControl (queued → paused / cancelled without an attempt) and a
+turn failed while queued — and drops submissions noted before it (stale). Effects that do not start a run (stopping
+an attempt handed over by recovery) never open one. `task.run` counts runs within one actor lifetime (it restarts at
+1 after a server restart).
+
+**Spans under ended parents.** Some work legitimately outlives its parent span: the session handoff after the
+verdict, and Gateway tries of a call whose caller left (the call continues to its deadline, journal semantics). The
+`gateway.call` span then ends with `call.result=detached`; the eventual settlement is recorded as a
+`gateway.detached_settlement` child carrying the final result. Tempo shows such children past the parent's end.
 
 ## 5. Metrics
 
@@ -104,22 +117,23 @@ All names are prefixed `agentbox_`. Labels are bounded enumerations only.
 | Metric | Type | Labels | Source |
 |---|---|---|---|
 | `http_requests_total`, `http_request_duration_seconds` | counter, histogram | `route` (registered pattern or `other`), `method`, `code` | API |
-| `tasks_finished_total` | counter | `kind` (task/turn), `status` (succeeded/failed/cancelled/paused/awaiting_input…) | actor verdict |
+| `tasks_finished_total` | counter | `kind` (task/turn), `status` (succeeded/failed/cancelled) | committed terminal status (verdict, ApplyControl, failed queued turn) |
+| `task_runs_ended_total` | counter | `kind`, `status` (paused — incl. awaiting_input — or terminal) | end of each run |
 | `attempts_finished_total` | counter | `kind`, `outcome_class` (closed set from runner.Classify) | actor |
 | `attempt_ready_seconds` | histogram | `kind` | attempt created → worker ready |
 | `task_start_seconds` | histogram | `kind` | API submit → first worker ready (submit→ready) |
-| `stop_seconds` | histogram | `kind`, `desired` (pause/cancel) | actor observes stop → stop verdict committed (stop→paused) |
+| `stop_seconds` | histogram | `kind`, `desired` (pause/cancel) | API accepted the pause/cancel/stop → paused/cancelled committed (actor observation time if the request was accepted before this process started) |
 | `gateway_calls_total` | counter | `kind`, `result` | call coordinator |
 | `upstream_tries_total`, `upstream_try_duration_seconds` | counter, histogram | `kind`, `provider`, `model`, `status`, `outcome` | each upstream try |
 | `cost_micro_usd_total` | counter | `kind`, `provider`, `model` | actual cost of `ok` settlements |
-| `tool_calls_per_task` | histogram | `kind` | search/fetch/exec calls counted per task, observed at verdict |
+| `tool_calls_per_task` | histogram | `kind` | search/fetch/exec calls of a task over all its runs (replays excluded), observed at its terminal status |
 | `sandbox_envs` | gauge | `kind` (task/session/exec) | DB: environments not yet stopped (cached 5 s) |
 | `sandbox_cleanup_backlog` | gauge | — | DB: stopped, cleanup not done |
 | `run_slots_in_use`, `run_slots_capacity`, `admission_queued`, `memory_reserved_bytes` | gauge | — | admission snapshot |
 | `exec_slots_in_use`, `exec_slots_capacity`, `exec_queued` | gauge | — | exec gate snapshot |
 
 `model` comes from the server's declared allowlist (requests outside it are rejected before metrics); `provider`
-from the configured adapters; `status` is the HTTP status class of the try; `result` is a closed set of
+from the configured adapters; `status` is the numeric HTTP status of the try (bounded in practice: the codes upstreams return, plus 0 for transport failures); `result` is a closed set of
 Gateway codes.
 
 ## 6. Attribute allowlist (security)

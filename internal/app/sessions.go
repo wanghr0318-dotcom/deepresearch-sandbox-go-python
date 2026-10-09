@@ -635,7 +635,11 @@ func (n notifyingSessions) CreateTurn(ctx context.Context, req api.CreateTurnReq
 func (n notifyingSessions) TurnControl(ctx context.Context, req api.TurnControlRequest) (api.ControlResult, error) {
 	r, err := n.Sessions.TurnControl(ctx, req)
 	if err == nil {
-		if req.Action != "stop" && !r.Replayed {
+		switch {
+		case r.Replayed:
+		case req.Action == "stop":
+			obs.NoteStop(r.TaskID) // 停止延迟自接受停止请求起计
+		default:
 			obs.NoteSubmit(ctx, r.TaskID) // continue/finish/answer 开始 turn 的新一次运行
 		}
 		n.submit(r.TaskID)

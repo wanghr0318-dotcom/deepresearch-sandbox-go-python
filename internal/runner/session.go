@@ -789,6 +789,7 @@ func (inc *Incarnation) RunTask(ctx context.Context, a SessionAttempt, controls 
 	ctx, span := obs.Start(ctx, "worker.run", runAttrs("session", a.Attempt)...)
 	defer func() { endRun(span, out) }()
 	a.Init.Traceparent = obs.Traceparent(ctx) // task_start.traceparent（见 Runner.Run）
+	defer obs.ExpectWorker(a.AttemptID, a.Init.Traceparent)()
 	return inc.runTask(ctx, a, controls)
 }
 

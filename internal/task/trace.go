@@ -60,9 +60,7 @@ func (t *actorTrace) begin(base context.Context, taskID string, s State) {
 		t.kind = "turn"
 	}
 	t.attempts, t.ended = map[string]*attemptTrace{}, map[string]context.Context{}
-	if s.Desired == "pause" || s.Desired == "cancel" {
-		t.stopDesired, t.stopAt = s.Desired, time.Now()
-	}
+	t.controlChanged(s.Desired) // a stop already requested when the actor (re)loads the task
 }
 
 // ensureRun starts the run span if none is open.
@@ -110,12 +108,22 @@ func (t *actorTrace) end(status string) {
 	}
 }
 
-// taskCtx returns base carrying the run span (starting it if needed).
-func (t *actorTrace) taskCtx(base context.Context) context.Context {
+// runCtx returns base carrying the run span, starting the run if none is open (the slot request is the first
+// effect of a run).
+func (t *actorTrace) runCtx(base context.Context) context.Context {
 	if !t.on {
 		return base
 	}
 	t.ensureRun()
+	return obs.Carry(base, t.ctx)
+}
+
+// openCtx returns base carrying the open run span, or base unchanged: effects that do not start a run (a stop of an
+// attempt handed over by recovery) must not consume a submission or open a run.
+func (t *actorTrace) openCtx(base context.Context) context.Context {
+	if t.span == nil {
+		return base
+	}
 	return obs.Carry(base, t.ctx)
 }
 
@@ -127,7 +135,7 @@ func (t *actorTrace) attemptCtx(base context.Context, attemptID string) context.
 	if ctx := t.ended[attemptID]; ctx != nil {
 		return obs.Carry(base, ctx)
 	}
-	return t.taskCtx(base)
+	return t.openCtx(base)
 }
 
 func (t *actorTrace) attemptCreated(na NewAttempt) {
@@ -174,7 +182,12 @@ func (t *actorTrace) controlChanged(desired string) {
 	}
 	switch {
 	case (desired == "pause" || desired == "cancel") && t.stopDesired == "":
+		// Stop latency starts when the API accepted the stop (obs.NoteStop); without it (a stop accepted before this
+		// process started), when the actor observes it.
 		t.stopDesired, t.stopAt = desired, time.Now()
+		if at, ok := obs.TakeStop(t.taskID); ok {
+			t.stopAt = at
+		}
 		if t.span != nil {
 			t.span.Event("stop_requested", obs.Str("desired", desired))
 		}
@@ -183,8 +196,7 @@ func (t *actorTrace) controlChanged(desired string) {
 	}
 }
 
-// verdict ends the attempt span with the committed verdict and records verdict metrics. A verdict that puts the
-// task back to queued (fault retry) continues the run; any other verdict ends it.
+// verdict ends the attempt span with the committed verdict, then records the resulting task status.
 func (t *actorTrace) verdict(v Verdict) {
 	if !t.on {
 		return
@@ -199,20 +211,34 @@ func (t *actorTrace) verdict(v Verdict) {
 		t.ended[v.AttemptID] = at.ctx
 		delete(t.attempts, v.AttemptID)
 	}
-	if v.TaskStatus == "queued" || v.TaskStatus == "" {
-		return
-	}
-	m := obs.M()
-	m.TaskFinished(t.taskID, t.kind, v.TaskStatus)
-	if t.stopDesired != "" && (v.TaskStatus == "paused" || v.TaskStatus == "cancelled") {
-		m.StopCompleted(t.kind, t.stopDesired, time.Since(t.stopAt))
-		t.stopDesired, t.stopAt = "", time.Time{}
-	}
 	fail := ""
 	if v.TaskStatus == "failed" {
 		fail = v.OutcomeClass
 	}
-	t.endRun(v.TaskStatus, fail)
+	t.statusCommitted(v.TaskStatus, fail)
+}
+
+// statusCommitted records a committed task status from any path — a verdict, ApplyControl (queued → paused or
+// cancelled without an attempt) or a turn failed while queued. A status that stops the task running (paused, incl.
+// awaiting_input, or terminal) ends the run: run span, task_runs_ended_total, stop latency; a terminal status also
+// counts tasks_finished_total and observes the task's tool calls. Other statuses (queued for a fault retry,
+// pausing, cancelling) continue the run.
+func (t *actorTrace) statusCommitted(status, failCode string) {
+	if !t.on || (status != "paused" && !IsTerminal(status)) {
+		return
+	}
+	m := obs.M()
+	m.RunEnded(t.kind, status)
+	if IsTerminal(status) {
+		m.TaskFinished(t.taskID, t.kind, status)
+	}
+	if t.stopDesired != "" && (status == "paused" || status == "cancelled") {
+		m.StopCompleted(t.kind, t.stopDesired, time.Since(t.stopAt))
+		t.stopDesired, t.stopAt = "", time.Time{}
+	}
+	// A submission noted before this point belonged to the run that just ended (or arrived while it was ending).
+	obs.DropSubmitBefore(t.taskID, time.Now())
+	t.endRun(status, failCode)
 }
 
 // benignClass: outcomes that are not errors on a span.

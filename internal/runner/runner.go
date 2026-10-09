@@ -204,6 +204,7 @@ func (r *Runner) Run(ctx context.Context, a Attempt, controls <-chan Control) (o
 	// init.traceparent（协议 v1 的可选字段）：沙箱内 Worker SDK 把它作为 Gateway 请求的 traceparent 头，使 Worker
 	// 发起的调用加入同一 trace。tracing 关闭时为空，init 与此前完全相同。
 	a.Init.Traceparent = obs.Traceparent(ctx)
+	defer obs.ExpectWorker(a.AttemptID, a.Init.Traceparent)() // edge 只接受指向这个 span 的 traceparent 头
 	fail := func(err error) Outcome {
 		in := ClassifyInput{StartErr: err}
 		if ctx.Err() != nil {

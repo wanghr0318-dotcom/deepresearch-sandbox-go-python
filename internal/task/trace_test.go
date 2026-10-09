@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
@@ -72,11 +73,15 @@ func TestActorTraceAndMetrics(t *testing.T) {
 	for _, e := range []string{
 		"AttemptReady kind=task", "TaskStarted kind=task", "StopCompleted kind=task desired=pause",
 		"AttemptFinished kind=task class=paused", "AttemptFinished kind=task class=succeeded",
-		"TaskFinished task=t1 kind=task status=paused", "TaskFinished task=t1 kind=task status=succeeded",
+		"RunEnded kind=task status=paused", "RunEnded kind=task status=succeeded",
+		"TaskFinished task=t1 kind=task status=succeeded",
 	} {
 		if !rec.Has(e) {
 			t.Errorf("missing %q in %v", e, rec.Events())
 		}
+	}
+	if rec.Has("TaskFinished task=t1 kind=task status=paused") {
+		t.Error("a pause is not a finished task")
 	}
 	n := 0
 	for _, e := range rec.Events() {
@@ -118,5 +123,77 @@ func TestActorTraceTurnHandoffStaysInTrace(t *testing.T) {
 	}
 	if handoffs[0].ParentID != attempts[0].SpanID || handoffs[0].TraceID != runs[0].TraceID {
 		t.Errorf("handoff %+v not under attempt %s", handoffs[0], attempts[0].SpanID)
+	}
+}
+
+// A queued task cancelled before any attempt (ApplyControl queued → cancelled, no verdict) is counted as finished,
+// its run ends, and the stop latency starts at the accepted request (obs.NoteStop).
+func TestActorTraceApplyControlEndsRun(t *testing.T) {
+	tr, rec := obstest.Install(t)
+	ts := queuedTask("t1")
+	ts.Desired, ts.ControlVersion = "cancel", 2 // cancel accepted, not yet applied
+	h := newActorHarness(t, ts)
+	obs.NoteStop("t1")
+	h.spawn("t1")
+	h.waitDone()
+	if st := h.st.task("t1").Status; st != "cancelled" {
+		t.Fatalf("status %s", st)
+	}
+	for _, e := range []string{"RunEnded kind=task status=cancelled", "TaskFinished task=t1 kind=task status=cancelled",
+		"StopCompleted kind=task desired=cancel"} {
+		if !rec.Has(e) {
+			t.Errorf("missing %q in %v", e, rec.Events())
+		}
+	}
+	for _, s := range tr.Spans() {
+		if !s.Ended {
+			t.Errorf("span %s left open", s.Name)
+		}
+	}
+	if _, ok := obs.TakeStop("t1"); ok {
+		t.Error("stop stamp not consumed")
+	}
+}
+
+// A turn failed while queued (session unavailable; FailTurn, no attempt) ends its run and counts as failed.
+func TestActorTraceFailTurnEndsRun(t *testing.T) {
+	tr, rec := obstest.Install(t)
+	h := newActorHarness(t, turnTask("t1"))
+	h.sess.grantErr = []error{fmt.Errorf("session s1: %w", ErrSessionUnavailable)}
+	h.spawn("t1")
+	h.waitDone()
+	if !rec.Has("TaskFinished task=t1 kind=turn status=failed") || !rec.Has("RunEnded kind=turn status=failed") {
+		t.Errorf("events %v", rec.Events())
+	}
+	runs := tr.Named("turn")
+	if len(runs) != 1 || !runs[0].Ended || runs[0].Failed != ReasonSessionUnavailable {
+		t.Errorf("run spans %+v", runs)
+	}
+}
+
+// Submissions noted before a run ended are dropped with it: a later run does not adopt a stale parent.
+func TestActorTraceDropsStaleSubmission(t *testing.T) {
+	tr, _ := obstest.Install(t)
+	h := newActorHarness(t, queuedTask("t1"))
+	a := h.spawn("t1")
+	r := h.nextRun()
+	r.ready()
+	stale, sp := obs.Start(context.Background(), "stale")
+	obs.NoteSubmit(stale, "t1") // e.g. a resume replay racing with the running task
+	sp.End()
+	h.st.setControl("t1", "pause")
+	a.Notify()
+	_ = r.control()
+	r.finish(Outcome{Class: ClassPaused, ProposalKind: "paused"})
+	h.waitFor("paused", func() bool { return h.st.task("t1").Status == "paused" && h.log.count("release:1") == 1 })
+	h.st.setControl("t1", "run")
+	a.Notify()
+	r2 := h.nextRun()
+	r2.ready()
+	r2.finish(success())
+	h.waitDone()
+	runs := tr.Named("task")
+	if len(runs) != 2 || runs[1].ParentID != "" {
+		t.Errorf("second run adopted a stale submission: %+v", runs)
 	}
 }

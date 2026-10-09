@@ -576,18 +576,23 @@ func newTarget(bindCtx context.Context, e *Edge, attemptID, taskID, envID string
 // HeaderTraceparent 是 W3C Trace Context 头。Worker SDK 把宿主经 init/task_start 交给它的 traceparent 原样带上。
 const HeaderTraceparent = "traceparent"
 
-// callCtx 是一次计费调用或 exec 交给 Calls 的上下文：Worker 是不可信的，它发来的 traceparent 只在格式合法且
-// trace-id 等于本 attempt 的 trace 时作为父 span（使调用挂在 Worker 报告的 span 下）；否则忽略，调用挂在绑定的
-// attempt 下。Worker 因此不能把 span 写进其他 trace 或伪造新的 trace。
+// callCtx 是一次计费调用或 exec 交给 Calls 的上下文。Worker 是不可信的：它发来的 traceparent 只用于选择父 span，
+// 从不被原样采用——只有当它格式合法、trace-id 等于本 attempt 的 trace、且 parent-id 正是宿主经 init / task_start
+// 交给本 attempt 的 worker.run span（obs.ExpectWorker）时，调用以宿主自己记录的那个 traceparent（宿主的采样标志）
+// 为父；其余情况忽略该头，调用挂在绑定的 attempt span 下。Worker 因此不能把 span 写进其他 trace、伪造父 span，
+// 也不能改变采样决定。
 func (t *target) callCtx(r *http.Request) context.Context {
 	tp := r.Header.Get(HeaderTraceparent)
 	if tp == "" || t.traceID == "" {
 		return t.ctx
 	}
-	if tc, ok := obs.ParseTraceparent(tp); !ok || tc.TraceID != t.traceID {
+	expected := obs.ExpectedWorker(t.attemptID)
+	got, ok := obs.ParseTraceparent(tp)
+	want, known := obs.ParseTraceparent(expected)
+	if !ok || !known || got.TraceID != t.traceID || want.TraceID != t.traceID || got.ParentID != want.ParentID {
 		return t.ctx
 	}
-	return obs.WithRemoteParent(t.ctx, tp)
+	return obs.WithRemoteParent(t.ctx, expected)
 }
 
 // enter 登记一个请求。detached 时 ok=false 且 tooMany=false。

@@ -610,6 +610,7 @@ func (c *Coordinator) invoke(ctx context.Context, span obs.Span, in Invoke) (Res
 	case o := <-done:
 		return o.res, o.err
 	case <-ctx.Done():
+		traceDetached(ctx, string(in.Kind), func() (Result, error) { o := <-done; return o.res, o.err })
 		return Result{}, ctx.Err() // 调用在后台继续至期限并结算，供同 ID 重放
 	}
 }

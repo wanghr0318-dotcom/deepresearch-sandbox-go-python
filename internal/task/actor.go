@@ -564,7 +564,7 @@ func (a *Actor) exec(eff Effect) {
 		// 已达累计运行时限的 queued 任务（重启记账或调低配置之后）同样走正常路径：startWorker 以已取消
 		// 的 ctx 启动执行，runner 分类为 task_deadline_exceeded，经现有判决路径结束（代价是创建一次环境）。
 		req := SlotRequest{TaskID: a.taskID, Limits: a.limits, SessionID: a.s.SessionID}
-		tctx := a.tr.taskCtx(context.Background())
+		tctx := a.tr.runCtx(context.Background())
 		a.async(func(ctx context.Context) any {
 			_, span := obs.Start(obs.Carry(ctx, tctx), "admission.acquire")
 			g, err := a.d.Admission.Acquire(ctx, req)
@@ -1032,6 +1032,10 @@ func (a *Actor) committed(op *storeOp, r storeDone) {
 		a.attemptNo[na.AttemptID] = na.AttemptNo
 		a.tr.attemptCreated(na)
 		a.apply(AttemptCreated{AttemptID: na.AttemptID, EnvID: na.EnvID, Status: r.attempt.Status})
+	case opApplyControl:
+		a.tr.statusCommitted(op.control.Status, "")
+	case opFailTurn:
+		a.tr.statusCommitted("failed", op.reason)
 	case opFinalize:
 		a.tr.verdict(op.verdict)
 		a.apply(VerdictCommitted{Verdict: op.verdict, CommittedSessionCheckpointID: r.attempt.CommittedSessionCheckpointID})

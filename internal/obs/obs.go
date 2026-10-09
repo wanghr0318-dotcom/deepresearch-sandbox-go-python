@@ -63,8 +63,11 @@ type Tracer interface {
 type Recorder interface {
 	// APIRequest is one HTTP API request; route is the registered pattern or "other".
 	APIRequest(route, method string, status int, d time.Duration)
-	// TaskFinished is a terminal verdict of a task (kind "task") or session turn (kind "turn").
+	// TaskFinished is a terminal status of a task (kind "task") or session turn (kind "turn"): succeeded, failed or
+	// cancelled. The tool calls counted for taskID are observed and forgotten here.
 	TaskFinished(taskID, kind, status string)
+	// RunEnded is the end of one run of a task/turn: paused (incl. awaiting_input) or a terminal status.
+	RunEnded(kind, status string)
 	// AttemptFinished is the classified outcome of one attempt.
 	AttemptFinished(kind, outcomeClass string)
 	// AttemptReady is the time from attempt creation to the worker being ready.
@@ -185,6 +188,7 @@ type nop struct{}
 func (nop) APIRequest(string, string, int, time.Duration)                  {}
 func (nop) TaskFinished(string, string, string)                            {}
 func (nop) BreakerTransition(string, string, string)                       {}
+func (nop) RunEnded(string, string)                                        {}
 func (nop) AttemptFinished(string, string)                                 {}
 func (nop) AttemptReady(string, time.Duration)                             {}
 func (nop) TaskStarted(string, time.Duration)                              {}

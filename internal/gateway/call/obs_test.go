@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
@@ -111,5 +112,28 @@ func TestCallResultCacheHitAndRejection(t *testing.T) {
 	}
 	if n != 2 { // the hit and the rejected request; not the replay
 		t.Errorf("tool calls = %d, events %v", n, rec.Events())
+	}
+}
+
+// A caller that leaves before the result gets call.result=detached; the call keeps running and its eventual
+// settlement is recorded as gateway.detached_settlement under the call.
+func TestDetachedSettlementRecorded(t *testing.T) {
+	tr, _ := obstest.Install(t)
+	gate := make(chan struct{})
+	ad := newAdapter("p", step{body: `{"ok":1}`, gate: gate, hold: true})
+	h := newHarness(t, testLimits(), ad)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { waitEntered(t, ad); cancel(); time.Sleep(20 * time.Millisecond); close(gate) }()
+	if _, err := h.c.Invoke(ctx, inv("c1", chatBody)); err == nil {
+		t.Fatal("expected the caller's context error")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(tr.Named("gateway.detached_settlement")) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	call, settle := tr.Named("gateway.call"), tr.Named("gateway.detached_settlement")
+	if len(call) != 1 || call[0].Attrs["call.result"] != ResultDetached || len(settle) != 1 ||
+		settle[0].ParentID != call[0].SpanID || settle[0].Attrs["call.result"] != ResultCompleted {
+		t.Fatalf("call %+v settle %+v", call, settle)
 	}
 }

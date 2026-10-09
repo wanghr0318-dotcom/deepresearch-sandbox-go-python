@@ -337,6 +337,22 @@ func (h *Handler) isAPIPath(p string) bool {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	sw := &statusWriter{ResponseWriter: w}
+	ctx := r.Context()
+	if !obs.Enabled() {
+		h.serve(sw, r) // 可观测性关闭：不分配路由信息、不包装 ctx，与此前完全相同
+	} else {
+		ctx = h.serveObserved(sw, r, start)
+	}
+	status := sw.status()
+	if h.cfg.Logger != nil {
+		// 只记录方法、路径与状态：token 不会出现在路径中，请求头与查询串不记录。
+		h.cfg.Logger.InfoContext(ctx, "api request", "method", r.Method, "path", r.URL.Path,
+			"status", status, "duration_ms", time.Since(start).Milliseconds())
+	}
+}
+
+// serveObserved 在可观测性开启时处理请求：span 与指标以路由模式命名；返回带 span 的 ctx（访问日志据此带 trace_id）。
+func (h *Handler) serveObserved(sw *statusWriter, r *http.Request, start time.Time) context.Context {
 	ri := &routeInfo{route: routeOther}
 	method := metricMethod(r.Method)
 	ctx, span := obs.Start(context.WithValue(r.Context(), routeKey{}, ri), "HTTP "+method)
@@ -349,11 +365,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	span.End()
 	obs.M().APIRequest(ri.route, method, status, time.Since(start))
-	if h.cfg.Logger != nil {
-		// 只记录方法、路径与状态：token 不会出现在路径中，请求头与查询串不记录。
-		h.cfg.Logger.InfoContext(ctx, "api request", "method", r.Method, "path", r.URL.Path,
-			"status", status, "duration_ms", time.Since(start).Milliseconds())
-	}
+	return ctx
 }
 
 // 路由标签的取值：注册的路由模式、未匹配的 other、静态文件的 static（有界，不含实际路径中的 ID）。

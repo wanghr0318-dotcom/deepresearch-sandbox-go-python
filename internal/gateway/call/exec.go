@@ -415,6 +415,7 @@ func (c *Coordinator) execCall(ctx context.Context, in ExecInvoke) (Result, erro
 	case o := <-done:
 		return o.res, o.err
 	case <-ctx.Done():
+		traceDetached(ctx, kindExec, func() (Result, error) { o := <-done; return o.res, o.err })
 		return Result{}, ctx.Err()
 	}
 }

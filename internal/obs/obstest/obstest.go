@@ -216,6 +216,9 @@ func (r *Recorder) APIRequest(route, method string, status int, _ time.Duration)
 func (r *Recorder) TaskFinished(taskID, kind, status string) {
 	r.add("TaskFinished task=%s kind=%s status=%s", taskID, kind, status)
 }
+func (r *Recorder) RunEnded(kind, status string) {
+	r.add("RunEnded kind=%s status=%s", kind, status)
+}
 func (r *Recorder) AttemptFinished(kind, class string) {
 	r.add("AttemptFinished kind=%s class=%s", kind, class)
 }

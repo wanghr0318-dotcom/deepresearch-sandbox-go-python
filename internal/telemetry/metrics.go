@@ -30,6 +30,7 @@ type metrics struct {
 	httpReqs     *prometheus.CounterVec
 	httpDur      *prometheus.HistogramVec
 	tasks        *prometheus.CounterVec
+	runs         *prometheus.CounterVec
 	attempts     *prometheus.CounterVec
 	attemptReady *prometheus.HistogramVec
 	taskStart    *prometheus.HistogramVec
@@ -55,7 +56,9 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		httpDur: prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "http_request_duration_seconds",
 			Help: "API request duration (SSE streams count until they end).", Buckets: latencyBuckets}, []string{"route", "method"}),
 		tasks: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "tasks_finished_total",
-			Help: "Terminal verdicts of tasks (kind=task) and session turns (kind=turn)."}, []string{"kind", "status"}),
+			Help: "Tasks (kind=task) and session turns (kind=turn) reaching a terminal status: succeeded, failed, cancelled."}, []string{"kind", "status"}),
+		runs: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "task_runs_ended_total",
+			Help: "Runs of tasks/turns ending: paused (incl. awaiting_input) or a terminal status."}, []string{"kind", "status"}),
 		attempts: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "attempts_finished_total",
 			Help: "Classified attempt outcomes."}, []string{"kind", "outcome_class"}),
 		attemptReady: prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "attempt_ready_seconds",
@@ -75,11 +78,11 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 		breakers: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "breaker_transitions_total",
 			Help: "Circuit breaker state changes of model routes (to: closed, open, half_open)."}, []string{"kind", "route", "to"}),
 		tools: prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "tool_calls_per_task",
-			Help: "search/fetch/exec calls per task or turn, observed at the terminal verdict.", Buckets: toolBuckets}, []string{"kind"}),
+			Help: "search/fetch/exec calls per task or turn over all its runs, observed at its terminal status.", Buckets: toolBuckets}, []string{"kind"}),
 		toolCount: map[string]int{},
 		gauges:    &gaugeCollector{},
 	}
-	reg.MustRegister(m.httpReqs, m.httpDur, m.tasks, m.attempts, m.attemptReady, m.taskStart, m.stop, m.calls,
+	reg.MustRegister(m.httpReqs, m.httpDur, m.tasks, m.runs, m.attempts, m.attemptReady, m.taskStart, m.stop, m.calls,
 		m.tries, m.tryDur, m.cost, m.breakers, m.tools, m.gauges)
 	return m
 }
@@ -99,6 +102,8 @@ func (m *metrics) TaskFinished(taskID, kind, status string) {
 	m.mu.Unlock()
 	m.tools.WithLabelValues(kind).Observe(float64(n))
 }
+
+func (m *metrics) RunEnded(kind, status string) { m.runs.WithLabelValues(kind, status).Inc() }
 
 func (m *metrics) AttemptFinished(kind, class string) { m.attempts.WithLabelValues(kind, class).Inc() }
 

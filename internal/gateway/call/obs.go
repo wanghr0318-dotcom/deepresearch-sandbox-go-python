@@ -130,3 +130,20 @@ func endLeg(j *job, rs *routeSet, r legResult, lost bool) {
 	}
 	obs.M().UpstreamTry(string(j.in.Kind), legProvider(j, r.leg), j.model, outcome, status, r.latency)
 }
+
+// traceDetached records how a call whose caller left (call.result=detached) eventually settled: the call continues
+// in the background until its deadline (journal semantics), so its tries end after the gateway.call span. A short
+// gateway.detached_settlement span under the call carries the final result. Only when tracing is on (wait consumes
+// the call's single result).
+func traceDetached(ctx context.Context, kind string, wait func() (Result, error)) {
+	if !obs.Tracing() {
+		return
+	}
+	ctx = context.WithoutCancel(ctx)
+	go func() {
+		res, err := wait()
+		_, span := obs.Start(ctx, "gateway.detached_settlement", obs.Str("gateway.kind", kind),
+			obs.Str("call.result", callResult(res, err)))
+		span.End()
+	}()
+}

@@ -301,7 +301,9 @@ func runServer(args []string, stderr io.Writer) int {
 		return 1
 	}
 	defer closeLog()
-	deps.Logger = logger
+	if *logFile != "" {
+		deps.Logger = logger // 未设置 --log-file 时保持 app 的默认 logger（stderr 上的 JSON，同样带 trace_id）
+	}
 	if w := telemetry.MetricsWarning(tel.MetricsListen); w != "" {
 		fmt.Fprintln(stderr, w)
 	}
