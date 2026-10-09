@@ -28,7 +28,8 @@ const usage = `usage:
   agentbox eval run --suite FILE [--addr URL] [--data-dir DIR] [--out DIR] [--run-id ID]
                     [--agent model|reference] [--model NAME] [--tasks a,b] [--concurrency N]
                     [--repeat N] [--seed N] [--timeout D] [--min-success R]
-                    [--judge-model M --judge-base-url URL [--judge-budget-usd X] [--judge-price IN:OUT]]
+                    [--judge-model M --judge-base-url URL --judge-price IN:OUT
+                     [--judge-budget-usd X] [--judge-max-calls N] [--judge-required]]
   agentbox eval report RUN_DIR
   agentbox eval compare RUN_A RUN_B [--json]
 token: $AGENTBOX_TOKEN or <data-dir>/api.token; judge key: $AGENTBOX_JUDGE_API_KEY or $AGENTBOX_MODEL_API_KEY`
@@ -72,6 +73,8 @@ type runFlags struct {
 	minSuccess                                            float64
 	judgeModel, judgeURL, judgePrice                      string
 	judgeBudget                                           float64
+	judgeMaxCalls                                         int
+	judgeRequired                                         bool
 }
 
 func parseRunFlags(args []string, stderr io.Writer) (*runFlags, error) {
@@ -94,7 +97,9 @@ func parseRunFlags(args []string, stderr io.Writer) (*runFlags, error) {
 	fs.StringVar(&f.judgeModel, "judge-model", "", "enable the LLM judge with this model (off by default)")
 	fs.StringVar(&f.judgeURL, "judge-base-url", "", "OpenAI-compatible base URL of the judge (…/v1)")
 	fs.Float64Var(&f.judgeBudget, "judge-budget-usd", 0.20, "hard budget for all judge calls of the run")
-	fs.StringVar(&f.judgePrice, "judge-price", "", "judge price IN:OUT in micro-USD per million tokens")
+	fs.StringVar(&f.judgePrice, "judge-price", "", "judge price IN:OUT in micro-USD per million tokens (required with --judge-model)")
+	fs.IntVar(&f.judgeMaxCalls, "judge-max-calls", 50, "hard limit on judge calls for the run")
+	fs.BoolVar(&f.judgeRequired, "judge-required", false, "a judgement that cannot be made (budget, call limit, error) fails the task")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -115,14 +120,18 @@ func parseRunFlags(args []string, stderr io.Writer) (*runFlags, error) {
 		return nil, errors.New("--judge-model needs --judge-base-url")
 	case f.judgeBudget < 0 || f.judgeBudget > 5:
 		return nil, errors.New("--judge-budget-usd must be within [0, 5]")
+	case f.judgeMaxCalls < 1 || f.judgeMaxCalls > 1000:
+		return nil, errors.New("--judge-max-calls must be 1–1000")
+	case f.judgeModel != "" && f.judgePrice == "":
+		return nil, errors.New("--judge-model needs --judge-price IN:OUT (without prices the budget could not bind)")
+	case f.judgeRequired && f.judgeModel == "":
+		return nil, errors.New("--judge-required needs --judge-model")
 	}
 	return f, nil
 }
 
+// parsePrice parses the judge price IN:OUT; both must be positive so that every call costs budget.
 func parsePrice(s string) (in, out int64, err error) {
-	if s == "" {
-		return 0, 0, nil
-	}
 	a, b, ok := strings.Cut(s, ":")
 	if ok {
 		in, err = strconv.ParseInt(a, 10, 64)
@@ -130,8 +139,8 @@ func parsePrice(s string) (in, out int64, err error) {
 	if ok && err == nil {
 		out, err = strconv.ParseInt(b, 10, 64)
 	}
-	if !ok || err != nil || in < 0 || out < 0 {
-		return 0, 0, fmt.Errorf("--judge-price %q must be IN:OUT (non-negative integers)", s)
+	if !ok || err != nil || in <= 0 || out <= 0 {
+		return 0, 0, fmt.Errorf("--judge-price %q must be IN:OUT (positive integers)", s)
 	}
 	return in, out, nil
 }
@@ -189,7 +198,8 @@ func cmdRun(args []string, stdout, stderr io.Writer, getenv func(string) string)
 			key = getenv(envModelKey)
 		}
 		o.Judge = &Judge{BaseURL: f.judgeURL, Model: f.judgeModel, APIKey: key,
-			PriceInMicroPerMTok: in, PriceOutMicroPerMTok: out, BudgetMicro: int64(f.judgeBudget * 1e6)}
+			PriceInMicroPerMTok: in, PriceOutMicroPerMTok: out, BudgetMicro: int64(f.judgeBudget * 1e6),
+			MaxCalls: f.judgeMaxCalls, Required: f.judgeRequired}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -236,7 +236,8 @@ func RenderMarkdown(s *Summary) string {
 	fmt.Fprintf(&b, "- Agent: %s; concurrency %d; wall %s\n\n", s.Agent, s.Concurrency, secs(s.WallMs))
 	b.WriteString("| Metric | Value |\n|---|---|\n")
 	fmt.Fprintf(&b, "| Runs | %d (pass %d, fail %d, error %d) |\n", s.Runs, s.Passed, s.Failed, s.Errors)
-	fmt.Fprintf(&b, "| Success rate | %s |\n", pct(s.SuccessRate))
+	lo, hi := Wilson(s.Passed, s.Runs)
+	fmt.Fprintf(&b, "| Success rate | %s (95%% CI %s–%s, N = %d) |\n", pct(s.SuccessRate), pct(lo), pct(hi), s.Runs)
 	fmt.Fprintf(&b, "| Latency P50 / P95 / max | %s / %s / %s |\n", secs(s.LatencyMs.P50), secs(s.LatencyMs.P95), secs(s.LatencyMs.Max))
 	fmt.Fprintf(&b, "| Cost (ledger) | %s |\n", usd(s.CostMicro))
 	fmt.Fprintf(&b, "| Model / tool / exec calls | %d / %d / %d |\n", s.ModelCalls, s.ToolCalls, s.ExecCalls)
@@ -245,7 +246,8 @@ func RenderMarkdown(s *Summary) string {
 		fmt.Fprintf(&b, "| Citations locatable | %d / %d (%s) |\n", s.Citations.Locatable, s.Citations.Cited, pct(s.Citations.Ratio))
 	}
 	if s.Judge != nil {
-		fmt.Fprintf(&b, "| Judge (%s) | %d calls, %d skipped, %s of %s |\n", s.Judge.Model, s.Judge.Calls, s.Judge.Skipped, usd(s.Judge.SpentMicro), usd(s.Judge.Budget))
+		fmt.Fprintf(&b, "| Judge (%s) | %d calls, %d errors, %d skipped, %s of %s, max %d calls |\n", s.Judge.Model,
+			s.Judge.Calls, s.Judge.Errors, s.Judge.Skipped, usd(s.Judge.SpentMicro), usd(s.Judge.Budget), s.Judge.MaxCalls)
 	}
 	b.WriteString("\n## By kind\n\n| Kind | Runs | Success | P50 | P95 | Cost |\n|---|---|---|---|---|---|\n")
 	for _, k := range sortedAggKeys(s.ByKind) {

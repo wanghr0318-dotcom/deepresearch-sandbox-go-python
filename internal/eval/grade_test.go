@@ -63,7 +63,7 @@ func TestGradeCoding(t *testing.T) {
 }
 
 func TestAnalyzeCitations(t *testing.T) {
-	report := "# T\n\n结论 [1][2]，又见 [2] 与 [4]。\n\n## 证据\n\n" +
+	report := "# T\n\n结论 [1][2]，又见 [2] 与 [4]（数据截至 [2024]）。\n\n## 证据\n\n" +
 		"- [1] A — http://a — sha256:" + sha1 + "\n" +
 		"- [2] B — http://b — sha256:" + sha2 + "\n" +
 		"- [3] C — http://c — sha256:" + strings.Repeat("3", 64) + "\n"
@@ -153,5 +153,52 @@ func TestJudge(t *testing.T) {
 	g := j.Grade(context.Background(), task, strings.Repeat("long ", 2000))
 	if !g.Skipped || n.Load() != before || j.Stats().Skipped != 1 {
 		t.Fatalf("budget not enforced: %+v", g)
+	}
+	if st := j.Stats(); st.Errors != 1 {
+		t.Fatalf("the malformed reply must count as an error: %+v", st)
+	}
+}
+
+// okJudgeServer always answers score 0.9 with fixed usage and counts its calls.
+func okJudgeServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	var n atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]string{"content": `{"score": 0.9, "reason": "ok"}`}}},
+			"usage":   map[string]int{"prompt_tokens": 10, "completion_tokens": 10},
+		})
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &n
+}
+
+// TestJudgeCallLimitAndRequired: the call limit binds even when prices would allow more; with Required a
+// judgement that cannot be made fails the task instead of being skipped; errors are counted.
+func TestJudgeCallLimitAndRequired(t *testing.T) {
+	srv, n := okJudgeServer(t)
+	task := &Task{ID: "x", Kind: KindCoding, Prompt: "p", Judge: &JudgeSpec{Rubric: "r"}}
+	j := &Judge{BaseURL: srv.URL, Model: "m", PriceInMicroPerMTok: 1, PriceOutMicroPerMTok: 1, BudgetMicro: 1 << 40, MaxCalls: 2}
+	for i := range 2 {
+		if g := j.Grade(context.Background(), task, "a"); !g.Pass {
+			t.Fatalf("call %d: %+v", i, g)
+		}
+	}
+	if g := j.Grade(context.Background(), task, "a"); !g.Skipped || n.Load() != 2 || !strings.Contains(g.Detail, "call limit") {
+		t.Fatalf("call limit not enforced: %+v (calls %d)", g, n.Load())
+	}
+	if st := j.Stats(); st.Calls != 2 || st.Skipped != 1 || st.MaxCalls != 2 {
+		t.Fatalf("stats %+v", st)
+	}
+
+	req := &Judge{BaseURL: srv.URL, Model: "m", PriceInMicroPerMTok: 1, PriceOutMicroPerMTok: 1, BudgetMicro: 1 << 40, MaxCalls: 1, Required: true}
+	_ = req.Grade(context.Background(), task, "a")
+	g := req.Grade(context.Background(), task, "a")
+	if g.Skipped || g.Pass || g.Category != "judge_unavailable" || Decide([]Grade{g}).Category != "judge_unavailable" {
+		t.Fatalf("required judge: %+v", g)
+	}
+	down := &Judge{BaseURL: "http://127.0.0.1:1", Model: "m", PriceInMicroPerMTok: 1, PriceOutMicroPerMTok: 1, BudgetMicro: 1 << 40, Required: true}
+	if g := down.Grade(context.Background(), task, "a"); g.Category != "judge_unavailable" || down.Stats().Errors != 1 {
+		t.Fatalf("unreachable required judge: %+v %+v", g, down.Stats())
 	}
 }
