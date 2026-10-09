@@ -35,6 +35,7 @@ func TestConsumersDoNotDependOnPostgres(t *testing.T) {
 		"internal/api", "internal/task", "internal/session", "internal/runner", "internal/resource",
 		"internal/ownership", "internal/persistence", "internal/datadir", "internal/blob",
 		"internal/gateway/call", "internal/gateway/edge", "internal/gateway/upstream", "internal/gateway/cache",
+		"internal/gateway/workspace", "internal/gateway/mcp",
 	} {
 		forbid(t, pkg, forbidden)
 	}
@@ -74,6 +75,12 @@ func TestGatewayLayering(t *testing.T) {
 		}
 	}
 	forbidDirect(t, "internal/gateway/edge", []string{module + "/internal/persistence"})
+	// 工作区与 MCP（2026-10-10 设计）：workspace 只经 call 的窄接口执行命令，不碰 persistence、provider 与 edge；
+	// mcp 是上游 adapter，与 upstream 同样不记账：不依赖 persistence、call 与 edge。
+	forbidDirect(t, "internal/gateway/workspace", []string{module + "/internal/persistence", module + "/internal/provider/local",
+		module + "/internal/resource", module + "/internal/gateway/edge"})
+	forbid(t, "internal/gateway/mcp", []string{module + "/internal/persistence", module + "/internal/gateway/call",
+		module + "/internal/gateway/edge"})
 	forbid(t, "internal/task", []string{module + "/internal/gateway"})
 }
 
