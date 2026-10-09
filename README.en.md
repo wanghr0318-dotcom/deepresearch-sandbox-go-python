@@ -46,6 +46,7 @@ Browser (Vue 3) / CLI ── REST + SSE ──► Go control plane
 | **Model fallback** | A logical model can be served by an ordered chain of OpenAI-compatible providers: retryable failures fail over to the next provider immediately, and every provider attempt is a separately priced try in the journal. Per-provider circuit breakers; when all are open the Gateway answers `503 model_degraded` at once; optional hedged requests. Replay and fingerprints are unaffected. |
 | **Exec sandbox** | Model-written Python runs in a fresh, network-less environment per call, with separate UIDs, CPU and wall quotas and output collection. |
 | **Product** | Accounts (PBKDF2, `HttpOnly` sessions, rate-limited login), per-user isolation (other users' data always returns 404), server-side redaction of costs, models and internal IDs, a CSP and sanitized Markdown rendering. |
+| **Observability** | OpenTelemetry tracing with one trace per user action: API request → task actor → attempt → worker start, handshake and checkpoints → **into the sandbox** (the W3C `traceparent` is handed to the worker over the protocol; the stdlib-only Python SDK forwards it) → every model, search, fetch and exec call and each retry at the Gateway. Prometheus metrics (outcomes, start and stop latency, upstream latency and errors, cost, tool calls, sandboxes and slots); JSON logs carry `trace_id`. Off by default; `deploy/observability` runs Collector, Tempo, Prometheus, Loki and Grafana locally ([design](docs/design/2026-10-10-observability-design.md), [demo run](docs/evidence/2026-10-10-observability.md)). |
 
 ## Evidence
 
@@ -116,6 +117,7 @@ CI=true go test -count=1 ./internal/persistence/postgres/ ./tests/e2e/...
 | `internal/gateway/{edge,call,upstream,cache}` | Gateway: per-attempt socket, call journal and ledger, provider adapters, Redis cache |
 | `internal/persistence/postgres`, `blob`, `recovery`, `reconcile`, `invariants` | Storage, content-addressed blobs, startup recovery, invariant checker |
 | `internal/api`, `account` | REST/SSE API ([OpenAPI](api/openapi.yaml)), accounts |
+| `internal/obs`, `telemetry`, `deploy/observability` | Observability: stdlib-only instrumentation facade, OpenTelemetry and Prometheus implementation, local stack |
 | `protocol/` | Versioned Go ↔ Python worker protocol and shared fixtures |
 | `worker/` | Python worker SDK, `chatagent`, tools, the `deep-research` skill |
 | `web/` | Vue 3 + TypeScript chat UI and operator workbench |

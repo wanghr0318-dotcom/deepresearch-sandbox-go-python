@@ -1,0 +1,27 @@
+// Tails the agentbox server's JSON log file(s) (server --log-file) and pushes them to Loki.
+// Only "level" becomes a label (bounded); trace_id/span_id/task_id stay in the log line (Grafana links trace_id
+// to Tempo with a derived field) — IDs are never labels.
+local.file_match "agentbox" {
+  path_targets = [{"__path__" = "/var/log/agentbox/*.log", "job" = "agentbox"}]
+}
+
+loki.source.file "agentbox" {
+  targets    = local.file_match.agentbox.targets
+  forward_to = [loki.process.agentbox.receiver]
+}
+
+loki.process "agentbox" {
+  stage.json {
+    expressions = { level = "level" }
+  }
+  stage.labels {
+    values = { level = "" }
+  }
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

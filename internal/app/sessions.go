@@ -26,6 +26,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/blob"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/edge"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/protocol"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/resource"
@@ -621,6 +622,9 @@ func (n notifyingSessions) submit(taskID string) {
 func (n notifyingSessions) CreateTurn(ctx context.Context, req api.CreateTurnRequest) (api.CreateTurnResult, error) {
 	r, err := n.Sessions.CreateTurn(ctx, req)
 	if err == nil {
+		if !r.Replayed {
+			obs.NoteSubmit(ctx, r.TurnID)
+		}
 		n.submit(r.SupersededTurnID)
 		n.submit(r.TurnID)
 		n.notifySession(req.SessionID)
@@ -631,6 +635,13 @@ func (n notifyingSessions) CreateTurn(ctx context.Context, req api.CreateTurnReq
 func (n notifyingSessions) TurnControl(ctx context.Context, req api.TurnControlRequest) (api.ControlResult, error) {
 	r, err := n.Sessions.TurnControl(ctx, req)
 	if err == nil {
+		switch {
+		case r.Replayed:
+		case req.Action == "stop":
+			obs.NoteStop(r.TaskID) // 停止延迟自接受停止请求起计
+		default:
+			obs.NoteSubmit(ctx, r.TaskID) // continue/finish/answer 开始 turn 的新一次运行
+		}
 		n.submit(r.TaskID)
 		if sid, _, err := n.Sessions.TurnSession(ctx, r.TaskID); err == nil {
 			n.notifySession(sid)

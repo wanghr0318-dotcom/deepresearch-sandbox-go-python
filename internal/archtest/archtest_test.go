@@ -142,6 +142,56 @@ func TestSubrunIsPureLogic(t *testing.T) {
 	})
 }
 
+// TestObsIsStdlibOnly: the observability facade (internal/obs) and its test doubles depend only on the standard
+// library, so every domain package (including gateway/call, which must stay free of third-party modules) can use
+// it. OpenTelemetry and Prometheus are confined to internal/telemetry and cmd/agentbox (wiring), see
+// TestTelemetryDepsConfined.
+func TestObsIsStdlibOnly(t *testing.T) {
+	for _, pkg := range []string{"internal/obs", "internal/obs/obstest"} {
+		for _, d := range deps(t, pkg) {
+			if strings.HasPrefix(d, module+"/") || d == module {
+				if d != module+"/internal/obs" && d != module+"/"+pkg {
+					t.Errorf("%s depends on module package %s (must be a leaf facade)", pkg, d)
+				}
+				continue
+			}
+			if first, _, _ := strings.Cut(d, "/"); strings.Contains(first, ".") {
+				t.Errorf("%s depends on non-stdlib package %s", pkg, d)
+			}
+		}
+	}
+}
+
+// TestTelemetryDepsConfined: only internal/telemetry and cmd/agentbox may (transitively) depend on the
+// OpenTelemetry SDK or the Prometheus client; domain packages instrument through internal/obs.
+func TestTelemetryDepsConfined(t *testing.T) {
+	cmd := exec.Command("go", "list", "-deps=false", "-f", "{{.ImportPath}} {{join .Deps \" \"}}", "./...")
+	cmd.Dir = "../.."
+	cmd.Env = append(cmd.Environ(), "GOOS=linux")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go list ./...: %v", err)
+	}
+	allowed := map[string]bool{module + "/internal/telemetry": true, module + "/cmd/agentbox": true}
+	checked := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 || allowed[f[0]] {
+			continue
+		}
+		checked++
+		for _, d := range f[1:] {
+			if strings.HasPrefix(d, "go.opentelemetry.io/") || strings.HasPrefix(d, "github.com/prometheus/") {
+				t.Errorf("%s depends on %s: instrument through internal/obs instead", f[0], d)
+				break
+			}
+		}
+	}
+	if checked < 20 {
+		t.Fatalf("only %d packages checked: the check itself is broken", checked)
+	}
+}
+
 // TestProtocolIsStdlibOnly：规则 3——protocol 只依赖标准库。
 func TestProtocolIsStdlibOnly(t *testing.T) {
 	for _, d := range deps(t, "internal/protocol") {

@@ -35,6 +35,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/edge"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/ownership"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
@@ -542,7 +543,8 @@ func (d Deps) withDefaults() Deps {
 		d.Listen = func(addr string) (net.Listener, error) { return net.Listen("tcp", addr) }
 	}
 	if d.Logger == nil {
-		d.Logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
+		// obs.LogHandler 只在 ctx 带有活动 span 时加 trace_id/span_id：可观测性关闭时输出与此前相同。
+		d.Logger = slog.New(obs.LogHandler(slog.NewJSONHandler(os.Stderr, nil)))
 	}
 	return d
 }
@@ -792,6 +794,7 @@ func (s *server) assemble() error {
 		},
 		SessionPauseGrace: s.cfg.SessionPauseGrace,
 	}
+	s.registerGauges()
 	return nil
 }
 
@@ -1414,6 +1417,9 @@ func (n notifyingStore) submit(taskID string) {
 func (n notifyingStore) CreateTask(ctx context.Context, req api.CreateTaskRequest) (api.CreateTaskResult, error) {
 	r, err := n.Store.CreateTask(ctx, req)
 	if err == nil {
+		if !r.Replayed {
+			obs.NoteSubmit(ctx, r.TaskID) // 先于通知：actor 加载任务时取走（trace 父 span 与提交时间）
+		}
 		n.submit(r.TaskID)
 	}
 	return r, err
@@ -1422,6 +1428,13 @@ func (n notifyingStore) CreateTask(ctx context.Context, req api.CreateTaskReques
 func (n notifyingStore) AcceptControl(ctx context.Context, req api.ControlRequest) (api.ControlResult, error) {
 	r, err := n.Store.AcceptControl(ctx, req)
 	if err == nil {
+		switch {
+		case r.Replayed:
+		case req.Desired == "run":
+			obs.NoteSubmit(ctx, r.TaskID) // resume 开始新的一次运行：其 trace 以本请求为根
+		default:
+			obs.NoteStop(r.TaskID) // 停止延迟自接受停止请求起计
+		}
 		n.submit(r.TaskID)
 	}
 	return r, err
@@ -1436,6 +1449,9 @@ type notifyingAccounts struct {
 func (a notifyingAccounts) CreateResearch(ctx context.Context, userID int64, req api.CreateTaskRequest) (api.CreateTaskResult, error) {
 	r, err := a.Accounts.CreateResearch(ctx, userID, req)
 	if err == nil {
+		if !r.Replayed {
+			obs.NoteSubmit(ctx, r.TaskID)
+		}
 		a.n.submit(r.TaskID)
 	}
 	return r, err

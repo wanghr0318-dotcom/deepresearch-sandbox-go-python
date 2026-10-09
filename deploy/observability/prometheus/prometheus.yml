@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+scrape_configs:
+  - job_name: agentbox
+    # Targets come from targets/agentbox.json (the demo script writes it). Default: the server's
+    # --metrics-listen 127.0.0.1:9464 reached via host.docker.internal (Docker Desktop / WSL2 mirrored
+    # networking). On native Linux run the server with --metrics-listen <docker bridge gateway>:9464.
+    file_sd_configs:
+      - files: [/etc/prometheus/targets/*.json]
+        refresh_interval: 5s

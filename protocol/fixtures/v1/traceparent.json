@@ -1,0 +1,23 @@
+{
+  "description": "W3C traceparent (version 00) vectors shared by internal/obs (Go) and agentbox_worker.tracecontext (Python). valid: accepted with the given ids/flags; invalid: dropped.",
+  "valid": [
+    {"value": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "parent_id": "00f067aa0ba902b7", "sampled": true},
+    {"value": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00", "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "parent_id": "00f067aa0ba902b7", "sampled": false},
+    {"value": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-03", "trace_id": "0af7651916cd43dd8448eb211c80319c", "parent_id": "b7ad6b7169203331", "sampled": true}
+  ],
+  "invalid": [
+    "",
+    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+    "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+    "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+    "00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01",
+    "00-4bf92f3577b34da6a3ce929d0e0e473g-00f067aa0ba902b7-01",
+    "00_4bf92f3577b34da6a3ce929d0e0e4736_00f067aa0ba902b7_01",
+    " 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1",
+    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0x"
+  ]
+}

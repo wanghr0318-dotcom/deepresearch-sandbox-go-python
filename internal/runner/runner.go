@@ -16,6 +16,7 @@ import (
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/blob"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/faultinject"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/protocol"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
@@ -197,7 +198,13 @@ func New(store Store, blobs blob.Store, starter Starter, diag func(ctx context.C
 // Run 启动 Worker、发送 init 并处理其事件，直到进程退出且 stdout 结束、全部已接收事件处理完毕。
 // 启动前失败（init 不合法、out_dir 无法打开、StartExec 失败）时填写 ExitErr 与分类。返回的
 // Outcome 总已由 Classify 分类。
-func (r *Runner) Run(ctx context.Context, a Attempt, controls <-chan Control) Outcome {
+func (r *Runner) Run(ctx context.Context, a Attempt, controls <-chan Control) (out Outcome) {
+	ctx, span := obs.Start(ctx, "worker.run", runAttrs("task", a)...)
+	defer func() { endRun(span, out) }()
+	// init.traceparent（协议 v1 的可选字段）：沙箱内 Worker SDK 把它作为 Gateway 请求的 traceparent 头，使 Worker
+	// 发起的调用加入同一 trace。tracing 关闭时为空，init 与此前完全相同。
+	a.Init.Traceparent = obs.Traceparent(ctx)
+	defer obs.ExpectWorker(a.AttemptID, a.Init.Traceparent)() // edge 只接受指向这个 span 的 traceparent 头
 	fail := func(err error) Outcome {
 		in := ClassifyInput{StartErr: err}
 		if ctx.Err() != nil {
@@ -219,10 +226,14 @@ func (r *Runner) Run(ctx context.Context, a Attempt, controls <-chan Control) Ou
 		return fail(fmt.Errorf("runner: 打开 out_dir: %w", err))
 	}
 	defer func() { _ = dir.Close() }()
-	h, err := r.starter.StartExec(ctx, a.EnvID, a.Exec)
+	sctx, sspan := obs.Start(ctx, "worker.start")
+	h, err := r.starter.StartExec(sctx, a.EnvID, a.Exec)
 	if err != nil {
+		sspan.Fail("start_failed")
+		sspan.End()
 		return fail(err)
 	}
+	sspan.End()
 	faultinject.Point(faultinject.WorkerStarted)
 	at := &attemptRun{processor: newProcessor(r, a.TaskID, a.AttemptID, a.Init.Resume, dir), a: a, h: h,
 		stdin: h.Stdin(), stderr: &tailBuffer{max: r.opt.StderrTail},
@@ -386,6 +397,25 @@ func (at *attemptRun) run(ctx context.Context, initLine []byte, controls <-chan 
 		st, err := at.h.Wait()
 		exited <- exitResult{st, err}
 	}()
+	// worker.handshake：init 写出 → 合法的 ready 处理完毕（或执行结束时仍未就绪）。
+	_, handshake := obs.Start(ctx, "worker.handshake")
+	handshakeOpen := true
+	endHandshake := func(code string) {
+		if handshakeOpen {
+			handshakeOpen = false
+			if code != "" {
+				handshake.Fail(code)
+			}
+			handshake.End()
+		}
+	}
+	defer endHandshake("not_ready")
+	var finalize obs.Span
+	defer func() {
+		if finalize != nil {
+			finalize.End()
+		}
+	}()
 	if ok, partial := at.sendLine(initLine); !ok {
 		at.closeStdin() // 未送达：Worker 等不到 init，由 T_ready 终止
 		if partial {
@@ -431,6 +461,8 @@ func (at *attemptRun) run(ctx context.Context, initLine []byte, controls <-chan 
 			}
 		case e := <-exited:
 			exit = &e
+			// worker.finalize：进程退出 → 已接收事件处理完毕、结果分类（屏障 A/B）。
+			_, finalize = obs.Start(ctx, "worker.finalize")
 			at.killMu.Lock()
 			at.exitSeen = true
 			at.killMu.Unlock()
@@ -454,6 +486,7 @@ func (at *attemptRun) run(ctx context.Context, initLine []byte, controls <-chan 
 		case <-ready:
 			ready = nil
 			readyT.stop()
+			endHandshake("")
 		case <-finishing:
 			finishing = nil
 			readyT.stop()
@@ -792,7 +825,19 @@ func hostHeader(typ string) protocol.HostHeader {
 
 // ---- checkpoint ----
 
+// commitCheckpoint 提交一个 checkpoint（span checkpoint.commit，属性只有 checkpoint.id 与结果状态）。
 func (at *processor) commitCheckpoint(ctx context.Context, m *protocol.Checkpoint) *protocol.CheckpointResult {
+	ctx, span := obs.Start(ctx, "checkpoint.commit", obs.Str("checkpoint.id", m.CheckpointID))
+	res := at.commitCheckpointTx(ctx, m)
+	span.SetAttrs(obs.Str("checkpoint.status", res.Status))
+	if res.Status != protocol.CheckpointCommitted {
+		span.Fail(res.Status)
+	}
+	span.End()
+	return res
+}
+
+func (at *processor) commitCheckpointTx(ctx context.Context, m *protocol.Checkpoint) *protocol.CheckpointResult {
 	res := &protocol.CheckpointResult{HostHeader: hostHeader(protocol.TypeCheckpointResult), CheckpointID: m.CheckpointID, Scope: m.Scope}
 	if at.unresolved != "" && at.unresolved != m.CheckpointID {
 		res.Status, res.Code = protocol.CheckpointRejected, codeCommitInFlight

@@ -9,6 +9,8 @@
 //
 //   - -hold-first-chat：第一次 chat 请求（研究的计划阶段）挂起，直到进程收到 SIGUSR1——演练脚本据此在 Worker
 //     运行中完成沙箱进程的 G3 检查后再放行，不依赖时间。
+//   - -latency chat=300ms,search=80ms：各类别正常回复前的固定延迟（可观测性演示：trace 与延迟直方图有可读的数字）。
+//   - -inject chat:3:503,search:2:429：第 N 次该类请求以给定状态回复（演示 Gateway 的重试与上游错误指标）。
 package main
 
 import (
@@ -16,6 +18,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,10 +34,16 @@ var researchTasks = []fakeupstream.ResearchTask{
 
 func main() {
 	hold := flag.Bool("hold-first-chat", false, "第一次 chat 请求挂起，直到收到 SIGUSR1")
+	latency := flag.String("latency", "", "各类别的固定延迟，逗号分隔的 kind=duration（kind 为 chat、search、fetch）")
+	inject := flag.String("inject", "", "注入的错误回复，逗号分隔的 kind:N:status（第 N 次该类请求以 status 回复）")
 	flag.Parse()
 
 	fu := fakeupstream.New()
 	fu.SetResearch(researchTasks)
+	if err := configure(fu, *latency, *inject); err != nil {
+		fmt.Fprintln(os.Stderr, "fakeupstream:", err)
+		os.Exit(2)
+	}
 	if *hold {
 		fu.Inject(fakeupstream.Chat, 1, fakeupstream.Action{Hang: true})
 	}
@@ -58,4 +68,38 @@ func main() {
 		fu.Count(fakeupstream.Chat), fu.Count(fakeupstream.Search), fu.Count(fakeupstream.Fetch),
 		fu.StageCount(fakeupstream.StagePlan), fu.StageCount(fakeupstream.StageSummarize), fu.StageCount(fakeupstream.StageReport))
 	fu.Close()
+}
+
+// configure 应用 -latency 与 -inject。
+func configure(fu *fakeupstream.Server, latency, inject string) error {
+	kinds := map[string]fakeupstream.Kind{"chat": fakeupstream.Chat, "search": fakeupstream.Search, "fetch": fakeupstream.Fetch}
+	for _, item := range strings.Split(latency, ",") {
+		if item = strings.TrimSpace(item); item == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(item, "=")
+		d, err := time.ParseDuration(v)
+		if kind, known := kinds[k]; ok && known && err == nil && d >= 0 {
+			fu.SetLatency(kind, d)
+			continue
+		}
+		return fmt.Errorf("-latency %q: 须为 kind=duration（kind 为 chat、search、fetch）", item)
+	}
+	for _, item := range strings.Split(inject, ",") {
+		if item = strings.TrimSpace(item); item == "" {
+			continue
+		}
+		parts := strings.Split(item, ":")
+		if len(parts) == 3 {
+			kind, known := kinds[parts[0]]
+			n, nerr := strconv.Atoi(parts[1])
+			status, serr := strconv.Atoi(parts[2])
+			if known && nerr == nil && serr == nil && n >= 1 && status >= 400 && status <= 599 {
+				fu.Inject(kind, n, fakeupstream.Action{Status: status})
+				continue
+			}
+		}
+		return fmt.Errorf("-inject %q: 须为 kind:N:status（N ≥ 1，status 为 4xx/5xx）", item)
+	}
+	return nil
 }

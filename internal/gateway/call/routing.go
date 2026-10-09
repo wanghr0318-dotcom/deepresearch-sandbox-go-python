@@ -16,6 +16,7 @@ import (
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/breaker"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 )
 
 // CodeModelDegraded 是降级模式的错误码：提供该模型的全部供应商的熔断器都处于打开状态（503，可重试）。
@@ -84,6 +85,7 @@ func (c *Coordinator) newRouteSet(a upstream.Adapter) *routeSet {
 		rs.breakers = append(rs.breakers, breaker.New(breaker.Config{
 			FailureThreshold: c.routing.BreakerFailures, OpenDuration: c.routing.BreakerOpen, Now: c.breakerClock(),
 			OnTransition: func(from, to breaker.State) {
+				obs.M().BreakerTransition(string(kind), name, to.String())
 				c.log.Warn("gateway: breaker", "endpoint", endpointOf(kind), "route", name, "from", from.String(), "to", to.String())
 			},
 		}))

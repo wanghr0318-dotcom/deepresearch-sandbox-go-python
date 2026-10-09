@@ -50,6 +50,7 @@ from agentbox_worker.protocol import (
     valid_artifact_path,
 )
 from agentbox_worker.subruns import SubrunManager, parse_resumed
+from agentbox_worker.tracecontext import valid_traceparent
 from agentbox_worker.transport import StdioTransport, Transport
 
 if TYPE_CHECKING:
@@ -279,6 +280,8 @@ class TaskContext:
         self.attempt_id: str = init["attempt_id"]
         self.attempt_no: int = init["attempt_no"]
         self.config: Any = init.get("config")
+        # 宿主给出的 W3C traceparent（init / task_start 的可选字段）；不合法或缺省为 None
+        self.traceparent: str | None = valid_traceparent(init.get("traceparent"))
         self.out_dir = Path(init["out_dir"])
         self.resume, self._call_ids = _resume_info(init.get("resume"))
         limits = init.get("budget_limits")
@@ -315,7 +318,9 @@ class TaskContext:
         """
         if self._gateway is None:
             path = os.environ.get(GATEWAY_SOCKET_ENV) or DEFAULT_SOCKET_PATH
-            self._gateway = GatewayClient(path, call_ids=self._call_ids)
+            self._gateway = GatewayClient(
+                path, call_ids=self._call_ids, traceparent=self.traceparent
+            )
         return self._gateway
 
     @property

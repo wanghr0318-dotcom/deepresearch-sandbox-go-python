@@ -311,3 +311,25 @@ sudo -E ./bin/agentbox server ... --model-fallback-file /etc/agentbox/model-fall
 ```bash
 AGENTBOX_CHAOS_RUNS=5 go test ./internal/gateway/call -run TestChaos -v
 ```
+### 可观测性（追踪、指标与日志）
+
+默认全部关闭，行为与未启用时相同。设计与属性白名单见[可观测性设计](design/2026-10-10-observability-design.md)，一次完整演示的记录见[演示记录](evidence/2026-10-10-observability.md)。
+
+server 标志：
+
+- **`--otlp-endpoint`**：OTLP/HTTP 导出地址（例如 `http://127.0.0.1:4318`）；为空时不追踪。**`--trace-sample-ratio`**（默认 1）：新 trace 的采样比例。
+- **`--metrics-listen`**：Prometheus `/metrics` 的监听地址（例如 `127.0.0.1:9464`）。与 API 分开监听、无鉴权，只供运维的 Prometheus 抓取，不得暴露给用户；非 loopback 地址启动时打印警告。
+- **`--log-file`**：JSON 日志另外追加写入的文件（0600），供日志采集器读取；带活动 span 的日志行有 `trace_id`、`span_id`。
+
+追踪模型：一次用户操作（`POST /tasks`、resume、会话消息、continue/answer）一条 trace。API 请求 → 运行（`task`/`turn`）→ `attempt` → `env.create`、`worker.run`（`worker.start`、`worker.handshake`、`checkpoint.commit`、`worker.finalize`）、`env.stop` / `session.handoff`；Worker 的每个 Gateway 调用是 `worker.run` 下的 `gateway.call`，每次上游 try 是其下的 `gateway.try`。宿主经协议 `init` / `task_start` 的 `traceparent` 字段把 `worker.run` 交给 Worker，Python SDK（`agentbox_worker.tracecontext`，只用标准库）在每个 Gateway 请求上带 `traceparent` 头；Gateway 只接受属于本 attempt 的 trace 的值，其他值忽略。span 与指标标签只含 ID、数字与有限枚举，不含提示词、查询、URL、Key 或自由文本错误信息。
+
+本地观测栈与演示（以 root 在 WSL2 或 Linux 中运行；fake upstream，不访问外网、没有模型费用）：
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d --wait              # PostgreSQL
+sudo bash scripts/demo-observability.sh                               # 启动观测栈、运行任务与会话 turn、取回证据
+# Grafana 看板 http://127.0.0.1:3000/d/agentbox-overview；Prometheus http://127.0.0.1:9090；Tempo API http://127.0.0.1:3200
+docker compose -f deploy/observability/docker-compose.yml down        # 停止观测栈（加 -v 删除数据）
+```
+
+手动接入已有的 server：先 `cp deploy/observability/prometheus/targets/agentbox.json.example deploy/observability/prometheus/targets/agentbox.json`（WSL2 / Docker Desktop 经 `host.docker.internal:9464` 抓取；原生 Linux 上把 server 的 `--metrics-listen` 设为 docker 网桥网关地址并相应修改该文件），再以 `AGENTBOX_LOG_DIR=<日志目录> docker compose -f deploy/observability/docker-compose.yml up -d --wait` 启动观测栈，server 加 `--otlp-endpoint http://127.0.0.1:4318 --metrics-listen 127.0.0.1:9464 --log-file <日志目录>/agentbox.log`。

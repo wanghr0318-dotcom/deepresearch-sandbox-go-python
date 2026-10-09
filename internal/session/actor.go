@@ -529,8 +529,9 @@ func (a *Actor) result(m any) {
 
 // ---- 操作 ----
 
-func (a *Actor) runOp(ctx context.Context, eff Effect, handle IncarnationHandle, handleID string, mem *Grant) opResult {
-	var r opResult
+func (a *Actor) runOp(ctx context.Context, eff Effect, handle IncarnationHandle, handleID string, mem *Grant) (r opResult) {
+	ctx, span := opSpan(ctx, a.id, eff)
+	defer func() { endOpSpan(span, r.done) }()
 	switch f := eff.(type) {
 	case DoTransition:
 		r.done = OpDone{Op: OpTransition, To: f.T.To}
