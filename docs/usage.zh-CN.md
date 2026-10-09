@@ -220,6 +220,36 @@ exec 的真实沙箱端到端测试（PostgreSQL 与上文相同；以 root、`C
 CI=true CGO_ENABLED=0 go test -count=1 -p 1 -run 'TestRealExec|TestRealE3[5-8]' ./tests/e2e/   # 以 root 运行
 ```
 
+### 工作区工具与 MCP（可选，默认关闭）
+
+设计见 [2026-10-10-shell-file-mcp-design.md](design/2026-10-10-shell-file-mcp-design.md)。两项都关闭时 turn spec、端点与 Agent 的工具与之前完全相同。
+
+- **`--workspace-tools`**（需要 exec，即 `--exec-slots` > 0）：对话 Agent 多出 `write_file`、`read_file`、`list_dir`、`exec_shell` 四个工具，Gateway 多出 `POST /v1/workspace/{exec,read,write,list}`。每个 turn 一个工作区：文件清单由 Gateway 持有（内容在 BlobStore，状态文件在 `<data>/tool-workspaces/`），文件操作只按清单查找、不碰宿主路径；`exec_shell` 的每条命令在一个全新的 exec 环境中运行（工作区文件只读暂存到 `/in/ws`，由固定的包装脚本复制到 `/out` 后执行 `bash`，结束后 `/out` 中的普通文件成为新版本），与 `run_python` 同样无网络、独立 UID、seccomp、按 exec 配额记账（不计入每轮 30 次工具额度）。进程不在命令之间保留；符号链接、特殊文件与超出 256 个的文件不保留（结果中列出）。路径只能是工作区内的相对路径（`..`、绝对路径、`a//b` 为 400 `invalid_path`）。限额：至多 256 个文件、总大小不超过 `--exec-out-bytes`、单次写入 1 MiB、单次读取 2000 行 / 256 KiB。生命周期：第一次使用时建立；turn 结束（终态）后由清扫器销毁；空闲超过 `--workspace-idle-timeout`（默认 2 h）后过期（之后的操作为 410 `workspace_expired`）；server 重启后从状态文件恢复，状态文件不可信或文件 blob 缺失时标记丢失（410 `workspace_lost`）。同一 call id 重发的 `exec_shell` 返回已记录的结果，不会再次执行。
+- **`--mcp-config <文件>`**：Gateway 作为 MCP 客户端连接运维配置的服务器，Agent 的工具清单中多出允许的工具（名称 `mcp__<server>__<tool>`），调用经 `POST /v1/mcp/call` 以上游类别 `mcp` 记入调用 journal（同一 call id 重放、调用期限、撤销即取消），每次计入每轮工具额度（与搜索、抓取合计）。沙箱不连接 MCP 服务器、看不到其凭据；stdio 服务器只得到配置中的 `env`、`env_from`（启动时从宿主环境变量读取）与 `PATH`，HTTP 服务器的凭据头取自 `headers_from_env`。MCP 服务器与模型、搜索上游同属运维信任的基础设施（stdio 服务器作为 server 的子进程在宿主上运行，不在沙箱中）。配置示例（演示服务器只允许 `calculate` 与 `unit_convert`，`echo_env` 不在清单中，Agent 看不到、调用被拒绝 403 `mcp_tool_not_allowed`）：
+
+```json
+{"servers": [
+  {"name": "calc", "transport": "stdio", "command": ["/usr/local/bin/agentbox", "mcp-demo-server"],
+   "allowed_tools": ["calculate", "unit_convert"], "timeout_ms": 10000},
+  {"name": "docs", "transport": "http", "url": "https://mcp.internal.example/mcp",
+   "headers_from_env": {"Authorization": "DOCS_MCP_AUTH"}, "allowed_tools": ["search_docs"]}
+]}
+```
+
+```bash
+# 在下文"对话式助手"的启动命令上追加两个标志（mcp.json 中 command 写 agentbox 二进制的绝对路径）
+sudo -E ./bin/agentbox server --data-dir /var/lib/agentbox --web-dir web/dist \
+  --model-base-url https://api.moonshot.cn/v1 --model-name kimi-k2.6 --models kimi-k2.6,kimi-k3 \
+  --search-provider serper --session-worker-argv python3,-m,chatagent \
+  --workspace-tools --mcp-config /etc/agentbox/mcp.json
+```
+
+真实沙箱中的演示轮次（真实的对话 Agent、真实 exec 环境、stdio 演示 MCP 服务器；模型为脚本化的 fake upstream；以 root、`CGO_ENABLED=0` 运行）：
+
+```bash
+CI=true CGO_ENABLED=0 go test -count=1 -p 1 -v -run 'TestRealWorkspaceShellMCPDemo' ./tests/e2e/   # 以 root 运行
+```
+
 ### 对话式助手
 
 启用会话后（`--session-worker-argv python3,-m,chatagent`），登录后打开站点根路径即是对话式研究助手：左栏是会话列表，中间是对话，右侧面板有"进度 / 来源 / 报告"三个标签，默认收起，由对话标题栏的"进度"按钮或报告卡片打开、× 收起。宽屏下三栏之间的分隔线可拖动（或聚焦后用 ←/→ 每次 16 px），宽度记在本浏览器；窄屏（≤ 900 px）为单列，会话列表与面板以抽屉打开。
