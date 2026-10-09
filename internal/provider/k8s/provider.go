@@ -74,9 +74,9 @@ type Provider struct {
 }
 
 type envState struct {
-	kind provider.EnvKind
-	pod  string
-	gate *gate
+	kind   provider.EnvKind
+	pod    string
+	gate   *gate
 	ws     string // host workspace path bound to the Pod's slot
 	limits provider.Limits
 }

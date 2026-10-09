@@ -25,9 +25,9 @@ type slots struct {
 	uid                int // owner of the slot directories and the Gateway socket link; <0 skips chown
 }
 
-func (s slots) enabled() bool              { return s.hostRoot != "" }
-func (s slots) hostDir(pod string) string  { return filepath.Join(s.hostRoot, pod) }
-func (s slots) nodeDir(pod string) string  { return filepath.ToSlash(filepath.Join(s.nodeRoot, pod)) }
+func (s slots) enabled() bool               { return s.hostRoot != "" }
+func (s slots) hostDir(pod string) string   { return filepath.Join(s.hostRoot, pod) }
+func (s slots) nodeDir(pod string) string   { return filepath.ToSlash(filepath.Join(s.nodeRoot, pod)) }
 func (s slots) workspace(pod string) string { return filepath.Join(s.hostDir(pod), slotWorkspace) }
 
 func (s slots) chown(p string) error {

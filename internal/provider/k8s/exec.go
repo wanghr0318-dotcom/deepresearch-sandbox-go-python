@@ -115,9 +115,9 @@ type execHandle struct {
 	err    error
 }
 
-func (h *execHandle) Stdin() io.WriteCloser  { return h.stdinW }
-func (h *execHandle) Stdout() io.ReadCloser  { return h.stdout }
-func (h *execHandle) Stderr() io.ReadCloser  { return h.stderr }
+func (h *execHandle) Stdin() io.WriteCloser { return h.stdinW }
+func (h *execHandle) Stdout() io.ReadCloser { return h.stdout }
+func (h *execHandle) Stderr() io.ReadCloser { return h.stderr }
 func (h *execHandle) Wait() (provider.ExitStatus, error) {
 	<-h.done
 	return h.status, h.err
