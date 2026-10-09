@@ -339,6 +339,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/server-info": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Build and non-secret configuration of the server (operator only; served in every mode)
+         * @description Used by `agentbox eval` to pin the evaluated server in a run manifest. Contains the build (module
+         *     version, VCS revision, Go version), `config_version`, the default and declared models, the search
+         *     provider, the task worker command, whether sessions and exec are enabled and the exec template
+         *     digest. Never contains keys, tokens, prices or URLs. With accounts enabled a user gets 403.
+         */
+        get: operations["getServerInfo"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sessions": {
         parameters: {
             query?: never;
@@ -658,6 +681,32 @@ export interface components {
         Error: {
             code: string;
             message: string;
+        };
+        ServerInfo: {
+            /** @description module_version, go, vcs.revision, vcs.time, vcs.modified (absent fields are omitted) */
+            build: {
+                [key: string]: string;
+            } | null;
+            config_version: string;
+            /** @description Rootfs template of task environments */
+            template?: string;
+            worker_argv?: string[];
+            session_worker_argv?: string[];
+            models?: {
+                default?: string;
+                declared?: string[];
+                user_orchestrator?: string;
+                user_worker?: string;
+            };
+            search_provider?: string;
+            accounts?: boolean;
+            sessions?: boolean;
+            worker_subruns?: boolean;
+            exec?: {
+                enabled?: boolean;
+                slots?: number;
+                image_digest?: string;
+            };
         };
         Status: {
             /** @enum {string} */
@@ -2172,6 +2221,28 @@ export interface operations {
             404: components["responses"]["NotFound"];
             500: components["responses"]["Internal"];
             503: components["responses"]["Unavailable"];
+        };
+    };
+    getServerInfo: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Server info */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ServerInfo"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
         };
     };
     listSessions: {

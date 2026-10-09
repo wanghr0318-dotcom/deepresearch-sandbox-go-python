@@ -488,8 +488,8 @@ func TestHandlersMatchOpenAPI(t *testing.T) {
 			t.Errorf("处理器实现了 %s，openapi.yaml 未声明", k)
 		}
 	}
-	if n := len(spec) - len(sessionOperations); n != 17 {
-		t.Errorf("openapi.yaml 解析出 %d 个非会话操作，期望 17（M1 范围加产物最新版本下载，加账号的 5 个操作）", n)
+	if n := len(spec) - len(sessionOperations); n != 18 {
+		t.Errorf("openapi.yaml 解析出 %d 个非会话操作，期望 18（M1 范围加产物最新版本下载，加账号的 5 个操作，加评测用的 server-info）", n)
 	}
 	for _, op := range sessionOperations {
 		if _, ok := impl[op]; !ok {

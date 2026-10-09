@@ -108,6 +108,9 @@ type Config struct {
 	TurnSpec func(text string, deepResearch bool) (spec, limits json.RawMessage, err error)
 	// NewSessionID 生成会话 ID（测试注入）；nil 时为 128 位随机十六进制。
 	NewSessionID func() string
+	// ServerInfo 可选：GET /server-info（运维专用）中构建信息之外的非机密配置（模型、搜索供应商、Worker 命令、
+	// exec 模板摘要等），供评测的 run manifest 固定被评测的服务端。不得含 Key、token 或价格。
+	ServerInfo func() map[string]any
 }
 
 // Handler 实现 api/openapi.yaml 描述的 REST 与 SSE 接口。
@@ -162,6 +165,7 @@ var routes = []route{
 	{"GET", "/tasks/{id}/artifacts/{artifact_id}", accessRead, audienceTask, blobStatuses, (*Handler).getArtifact},
 	{"GET", "/tasks/{id}/artifacts/{artifact_id}/versions/{v}", accessRead, audienceTask, blobStatuses, (*Handler).getArtifact},
 	{"GET", "/tasks/{id}/inspect", accessDiagnostic, audienceAdmin, readStatuses, (*Handler).inspect},
+	{"GET", "/server-info", accessDiagnostic, audienceAdmin, []int{200, 401, 403}, (*Handler).serverInfo},
 }
 
 // New 校验访问配置并构造处理器。

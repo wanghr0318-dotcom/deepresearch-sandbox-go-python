@@ -1324,7 +1324,7 @@ func (s *server) startAPI() error {
 		Logger: s.log, ConfigVersion: s.cfg.ConfigVersion, MaxFaultRetries: s.cfg.MaxFaultRetries,
 		EffectiveLimits: s.cfg.effectiveLimits, CacheMetrics: s.cacheMetrics,
 		Accounts: accounts, ResearchSpec: s.cfg.researchSpec, SecureCookies: tlsCfg != nil,
-		Sessions: sessions, TurnSpec: s.cfg.turnSpec,
+		Sessions: sessions, TurnSpec: s.cfg.turnSpec, ServerInfo: s.serverInfo,
 	})
 	if err != nil {
 		_ = ln.Close()

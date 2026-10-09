@@ -453,6 +453,23 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/Unavailable'}
+  /server-info:
+    get:
+      operationId: getServerInfo
+      summary: Build and non-secret configuration of the server (operator only; served in every mode)
+      description: |
+        Used by `agentbox eval` to pin the evaluated server in a run manifest. Contains the build (module
+        version, VCS revision, Go version), `config_version`, the default and declared models, the search
+        provider, the task worker command, whether sessions and exec are enabled and the exec template
+        digest. Never contains keys, tokens, prices or URLs. With accounts enabled a user gets 403.
+      responses:
+        '200':
+          description: Server info
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ServerInfo'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /sessions:
     post:
       operationId: createSession
@@ -1031,6 +1048,36 @@ components:
       properties:
         code: {type: string}
         message: {type: string}
+    ServerInfo:
+      type: object
+      required: [build, config_version]
+      properties:
+        build:
+          type: object
+          nullable: true
+          additionalProperties: {type: string}
+          description: module_version, go, vcs.revision, vcs.time, vcs.modified (absent fields are omitted)
+        config_version: {type: string}
+        template: {type: string, description: Rootfs template of task environments}
+        worker_argv: {type: array, items: {type: string}}
+        session_worker_argv: {type: array, items: {type: string}}
+        models:
+          type: object
+          properties:
+            default: {type: string}
+            declared: {type: array, items: {type: string}}
+            user_orchestrator: {type: string}
+            user_worker: {type: string}
+        search_provider: {type: string}
+        accounts: {type: boolean}
+        sessions: {type: boolean}
+        worker_subruns: {type: boolean}
+        exec:
+          type: object
+          properties:
+            enabled: {type: boolean}
+            slots: {type: integer}
+            image_digest: {type: string}
     Status:
       type: object
       required: [mode]
