@@ -1,0 +1,42 @@
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 5s
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      # trace → logs: open the Loki lines of the same trace (the JSON log line carries trace_id).
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: -5m
+        spanEndTimeShift: 5m
+        customQuery: true
+        query: '{job="agentbox"} |= "$${__trace.traceId}"'
+      serviceMap:
+        datasourceUid: prometheus
+      nodeGraph:
+        enabled: true
+      search:
+        hide: false
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # log → trace: a "TraceID" link on every line that has a trace_id field.
+      derivedFields:
+        - name: TraceID
+          matcherRegex: '"trace_id":"([0-9a-f]{32})"'
+          url: '$${__value.raw}'
+          datasourceUid: tempo
+          urlDisplayLabel: Open trace in Tempo

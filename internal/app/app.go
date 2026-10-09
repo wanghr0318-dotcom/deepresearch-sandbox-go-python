@@ -1428,6 +1428,9 @@ func (n notifyingStore) CreateTask(ctx context.Context, req api.CreateTaskReques
 func (n notifyingStore) AcceptControl(ctx context.Context, req api.ControlRequest) (api.ControlResult, error) {
 	r, err := n.Store.AcceptControl(ctx, req)
 	if err == nil {
+		if req.Desired == "run" && !r.Replayed {
+			obs.NoteSubmit(ctx, r.TaskID) // resume 开始新的一次运行：其 trace 以本请求为根
+		}
 		n.submit(r.TaskID)
 	}
 	return r, err

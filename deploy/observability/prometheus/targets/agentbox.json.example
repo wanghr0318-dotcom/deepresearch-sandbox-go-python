@@ -1,0 +1,1 @@
+[{"targets": ["host.docker.internal:9464"], "labels": {"service": "agentbox"}}]

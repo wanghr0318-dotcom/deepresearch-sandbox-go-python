@@ -1033,7 +1033,7 @@ func (a *Actor) committed(op *storeOp, r storeDone) {
 		a.tr.attemptCreated(na)
 		a.apply(AttemptCreated{AttemptID: na.AttemptID, EnvID: na.EnvID, Status: r.attempt.Status})
 	case opFinalize:
-		a.tr.verdict(a.taskID, op.verdict)
+		a.tr.verdict(op.verdict)
 		a.apply(VerdictCommitted{Verdict: op.verdict, CommittedSessionCheckpointID: r.attempt.CommittedSessionCheckpointID})
 	case opAccountRunTime:
 		if r.runTimeMs != nil && a.rt.openAt == nil {

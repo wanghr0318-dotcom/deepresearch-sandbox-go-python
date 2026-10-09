@@ -8,8 +8,9 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs/obstest"
 )
 
-// One trace per task: the API span that submitted it → task span → attempt spans → (env.create, worker run,
-// env.stop); metrics for ready latency, submit→ready, stop latency, attempt outcomes and verdicts.
+// One trace per run: the API request that started the run (create, resume) → run span ("task") → attempt
+// spans → (env.create, worker run, env.stop). A pause ends the run; the resume starts a new run under the resume
+// request. Metrics: ready latency, submit→ready per run, stop latency, attempt outcomes and verdicts.
 func TestActorTraceAndMetrics(t *testing.T) {
 	tr, rec := obstest.Install(t)
 	apiCtx, apiSpan := obs.Start(context.Background(), "POST /tasks")
@@ -27,6 +28,11 @@ func TestActorTraceAndMetrics(t *testing.T) {
 	}
 	r.finish(Outcome{Class: ClassPaused, ProposalKind: "paused"})
 	h.waitFor("paused", func() bool { return h.st.task("t1").Status == "paused" && h.log.count("release:1") == 1 })
+	h.waitFor("run span ended", func() bool { s := tr.Named("task"); return len(s) == 1 && s[0].Ended })
+
+	resumeCtx, resumeSpan := obs.Start(context.Background(), "POST /tasks/{id}/resume")
+	obs.NoteSubmit(resumeCtx, "t1")
+	resumeSpan.End()
 	h.st.setControl("t1", "run")
 	a.Notify()
 	r2 := h.nextRun()
@@ -34,27 +40,23 @@ func TestActorTraceAndMetrics(t *testing.T) {
 	r2.finish(success())
 	h.waitDone()
 
-	api := tr.Named("POST /tasks")[0]
-	tasks := tr.Named("task")
-	if len(tasks) != 1 || tasks[0].TraceID != api.TraceID || tasks[0].ParentID != api.SpanID || !tasks[0].Ended {
-		t.Fatalf("task span %+v not a child of the API span %+v", tasks, api)
+	api, resume := tr.Named("POST /tasks")[0], tr.Named("POST /tasks/{id}/resume")[0]
+	runs := tr.Named("task")
+	if len(runs) != 2 {
+		t.Fatalf("run spans: %d", len(runs))
 	}
-	if tasks[0].Attrs["task.status"] != "succeeded" || tasks[0].Attrs["task.id"] != "t1" {
-		t.Errorf("task attrs %v", tasks[0].Attrs)
+	if runs[0].ParentID != api.SpanID || runs[0].TraceID != api.TraceID || runs[0].Attrs["task.status"] != "paused" ||
+		runs[0].Attrs["task.run"] != int64(1) {
+		t.Errorf("first run %+v (api %s)", runs[0], api.SpanID)
+	}
+	if runs[1].ParentID != resume.SpanID || runs[1].TraceID != resume.TraceID || runs[1].Attrs["task.status"] != "succeeded" ||
+		runs[1].Attrs["task.run"] != int64(2) || !runs[1].Ended {
+		t.Errorf("second run %+v (resume %s)", runs[1], resume.SpanID)
 	}
 	attempts := tr.Named("attempt")
-	if len(attempts) != 2 {
-		t.Fatalf("attempt spans: %d", len(attempts))
+	if len(attempts) != 2 || attempts[0].ParentID != runs[0].SpanID || attempts[1].ParentID != runs[1].SpanID {
+		t.Fatalf("attempt spans %+v", attempts)
 	}
-	for i, at := range attempts {
-		if at.ParentID != tasks[0].SpanID || !at.Ended {
-			t.Errorf("attempt %d: %+v", i, at)
-		}
-	}
-	if attempts[0].Attrs["task.status"] != "paused" || attempts[1].Attrs["task.status"] != "succeeded" {
-		t.Errorf("attempt verdicts %v / %v", attempts[0].Attrs, attempts[1].Attrs)
-	}
-	// The runner received the attempt span as parent (worker.run is a child of it).
 	for i, run := range []*fkRun{r, r2} {
 		tc, ok := obs.ParseTraceparent(run.traceparent)
 		if !ok || tc.ParentID != attempts[i].SpanID {
@@ -63,14 +65,8 @@ func TestActorTraceAndMetrics(t *testing.T) {
 	}
 	for _, name := range []string{"admission.acquire", "env.create", "env.stop"} {
 		spans := tr.Named(name)
-		if len(spans) != 2 {
-			t.Errorf("%s spans: %d", name, len(spans))
-			continue
-		}
-		for _, s := range spans {
-			if s.TraceID != api.TraceID || !s.Ended {
-				t.Errorf("%s outside the task trace or not ended: %+v", name, s)
-			}
+		if len(spans) != 2 || spans[0].TraceID != api.TraceID || spans[1].TraceID != resume.TraceID || !spans[0].Ended || !spans[1].Ended {
+			t.Errorf("%s spans %+v", name, spans)
 		}
 	}
 	for _, e := range []string{
@@ -88,8 +84,8 @@ func TestActorTraceAndMetrics(t *testing.T) {
 			n++
 		}
 	}
-	if n != 1 {
-		t.Errorf("TaskStarted recorded %d times (submit→ready is the first ready only)", n)
+	if n != 2 {
+		t.Errorf("TaskStarted recorded %d times, want once per run", n)
 	}
 }
 
