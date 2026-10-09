@@ -197,8 +197,10 @@ func TestExecSignalStatusAndTerminate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go func() { _, _ = io.Copy(io.Discard, h.Stdout()) }()
-	go func() { _, _ = io.Copy(io.Discard, h.Stderr()) }()
+	go func(out, errs io.Reader) {
+		go func() { _, _ = io.Copy(io.Discard, errs) }()
+		_, _ = io.Copy(io.Discard, out)
+	}(h.Stdout(), h.Stderr())
 	if err := h.Terminate(100 * time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
