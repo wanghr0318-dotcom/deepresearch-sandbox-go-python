@@ -144,7 +144,7 @@ jobs:
           [ "$test_exit" -eq 0 ] && [ "$judge_exit" -eq 0 ]
       - name: 上传测试记录
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-integration-test-json
           path: test.json
