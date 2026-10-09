@@ -28,8 +28,10 @@ import (
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/blob"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/mcp"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/workspace"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/subrun"
 )
 
@@ -50,6 +52,20 @@ type Calls interface {
 	ExecQuota(ctx context.Context, taskID string) (call.ExecQuota, bool, error)
 }
 
+// Workspace 处理 /v1/workspace/*（*workspace.Manager；设计 2026-10-10-shell-file-mcp）。read/write/list 的访问检查与
+// 工作区状态由 Manager 负责；exec 经 call.Coordinator.ExecShell 记账（按 exec）。
+type Workspace interface {
+	Exec(ctx context.Context, r workspace.Request) (call.Result, error)
+	Read(ctx context.Context, r workspace.Request) (call.Result, error)
+	Write(ctx context.Context, r workspace.Request) (call.Result, error)
+	List(ctx context.Context, r workspace.Request) (call.Result, error)
+}
+
+// MCPTools 列出允许的 MCP 工具（*mcp.Hub）；工具调用经 Calls.Invoke（kind mcp）。
+type MCPTools interface {
+	Tools(ctx context.Context) []mcp.Tool
+}
+
 // Attempts 把 attempt 映射到它所属的任务与环境（由 Task 5 以 task.Store.LookupAttempt 实现）。
 type Attempts interface {
 	Lookup(ctx context.Context, attemptID string) (taskID, envID string, err error)
@@ -62,6 +78,10 @@ type Config struct {
 	MaxActive int          // 每 attempt 活跃请求上限，默认 32
 	MaxBody   int64        // 请求体上限（字节），默认 4 MiB
 	Logger    *slog.Logger // nil 时不输出
+	// Workspace 为 nil 时 /v1/workspace/* 为 404 endpoint_not_configured（--workspace-tools 关闭）。
+	Workspace Workspace
+	// MCP 为 nil 时 GET /v1/mcp/tools 为 404；POST /v1/mcp/call 在没有 mcp adapter 时由 Calls 返回 404。
+	MCP MCPTools
 }
 
 // 默认值（§19）。
@@ -124,7 +144,12 @@ var billable = map[string]upstream.Kind{
 	"/v1/chat/completions": upstream.KindChat,
 	"/v1/search":           upstream.KindSearch,
 	"/v1/fetch":            upstream.KindFetch,
+	// MCP tools/call（经 Gateway；未配置时 Calls 返回 404 endpoint_not_configured）。
+	"/v1/mcp/call": mcp.KindMCP,
 }
+
+// workspaceOps 是 /v1/workspace/ 下不需要 call id 的文件操作。
+var workspaceOps = map[string]bool{"/v1/workspace/read": true, "/v1/workspace/write": true, "/v1/workspace/list": true}
 
 // Edge 管理每个 attempt / incarnation 的 listener 与连接集合。并发安全。
 type Edge struct {
@@ -662,6 +687,24 @@ func (t *target) serveHTTP(w http.ResponseWriter, r *http.Request, tc *trackedCo
 			return
 		}
 		t.invoke(w, r, tc, billable[path], subrunID)
+	case path == "/v1/workspace/exec":
+		if r.Method != http.MethodPost {
+			t.methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		t.workspaceExec(w, r, tc, subrunID)
+	case workspaceOps[path]:
+		if r.Method != http.MethodPost {
+			t.methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		t.workspaceFile(w, r, strings.TrimPrefix(path, "/v1/workspace/"), subrunID)
+	case path == "/v1/mcp/tools":
+		if r.Method != http.MethodGet {
+			t.methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		t.mcpTools(w, r, subrunID)
 	case path == "/v1/budget":
 		if r.Method != http.MethodGet {
 			t.methodNotAllowed(w, http.MethodGet)
@@ -815,6 +858,85 @@ func (t *target) access(w http.ResponseWriter, r *http.Request, subrunID string)
 		return false
 	}
 	return true
+}
+
+// notConfigured 写出 404 endpoint_not_configured（功能未启用）。
+func (t *target) notConfigured(w http.ResponseWriter) {
+	t.writeError(w, http.StatusNotFound, call.CodeEndpointNotConfigured, "端点未启用")
+}
+
+// workspaceExec 处理 POST /v1/workspace/exec：头与请求体规则同 /v1/exec（call id、Retry、sub-run 前缀、4 MiB）；
+// 以 target 的上下文调用：Worker 断开不影响命令与工作区的推进，同一 call id 重发得到同一结果。
+func (t *target) workspaceExec(w http.ResponseWriter, r *http.Request, tc *trackedConn, subrunID string) {
+	if t.e.cfg.Workspace == nil {
+		t.notConfigured(w)
+		return
+	}
+	callID, body, ok := t.callRequest(w, r, subrunID)
+	if !ok {
+		return
+	}
+	if r.Header.Get(HeaderCache) != "" || r.Header.Get(HeaderSupersedes) != "" {
+		t.writeError(w, http.StatusBadRequest, CodeInvalidRequest, "workspace exec 不接受 X-Agentbox-Cache 与 X-Agentbox-Supersedes")
+		return
+	}
+	in := workspace.Request{TaskID: t.taskID, AttemptID: t.attemptID, SubrunID: subrunID, CallID: callID, Body: body,
+		Retry: strings.EqualFold(strings.TrimSpace(r.Header.Get(HeaderRetry)), "true")}
+	stop := detached(r, tc)
+	defer stop()
+	res, err := t.e.cfg.Workspace.Exec(t.ctx, in)
+	if err != nil {
+		t.internalError(w, "workspace_exec", err, "call_id", callID)
+		return
+	}
+	t.writeResult(w, callID, res)
+}
+
+// workspaceFile 处理 read / write / list（不计费、无 call id；请求体 ≤ MaxBody）。
+func (t *target) workspaceFile(w http.ResponseWriter, r *http.Request, op, subrunID string) {
+	if t.e.cfg.Workspace == nil {
+		t.notConfigured(w)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, t.e.cfg.MaxBody))
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			t.writeError(w, http.StatusRequestEntityTooLarge, CodeRequestTooLarge, "请求体超过上限")
+			return
+		}
+		t.writeError(w, http.StatusBadRequest, CodeInvalidRequest, "读取请求体失败")
+		return
+	}
+	in := workspace.Request{TaskID: t.taskID, AttemptID: t.attemptID, SubrunID: subrunID, Body: body}
+	var res call.Result
+	switch op {
+	case "read":
+		res, err = t.e.cfg.Workspace.Read(r.Context(), in)
+	case "write":
+		res, err = t.e.cfg.Workspace.Write(r.Context(), in)
+	default:
+		res, err = t.e.cfg.Workspace.List(r.Context(), in)
+	}
+	if err != nil {
+		t.internalError(w, "workspace_"+op, err)
+		return
+	}
+	t.writeResult(w, "", res)
+}
+
+// mcpTools 处理 GET /v1/mcp/tools：访问检查后返回允许的工具（服务器列表在 Hub 中缓存）。
+func (t *target) mcpTools(w http.ResponseWriter, r *http.Request, subrunID string) {
+	if t.e.cfg.MCP == nil {
+		t.notConfigured(w)
+		return
+	}
+	if !t.access(w, r, subrunID) {
+		return
+	}
+	t.writeJSON(w, http.StatusOK, struct {
+		Tools []mcp.Tool `json:"tools"`
+	}{t.e.cfg.MCP.Tools(r.Context())})
 }
 
 // budgetBody 是 GET /v1/budget 的响应（微美元整数；available 可为负）。

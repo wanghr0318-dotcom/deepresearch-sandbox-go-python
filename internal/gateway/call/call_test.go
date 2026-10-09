@@ -152,7 +152,7 @@ func (s *fakeStore) BeginCall(_ context.Context, r BeginCallRequest) (BeginCallR
 	}
 	now := time.Now()
 	b := s.budget(r.TaskID)
-	tool := r.Endpoint == "/v1/search" || r.Endpoint == "/v1/fetch"
+	tool := r.Endpoint == "/v1/search" || r.Endpoint == "/v1/fetch" || r.Endpoint == "/v1/mcp"
 	tb := func() *ToolBudget { // 与 postgres 相同：搜索与抓取在有上限时带额度，新登记时计数
 		if !tool {
 			return nil
