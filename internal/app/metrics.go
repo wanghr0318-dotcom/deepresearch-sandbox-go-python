@@ -93,6 +93,23 @@ func (s *server) registerGauges() {
 			}
 			g = append(g, obs.Gauge{Name: "sandbox_cleanup_backlog", Help: "Stopped environments whose cleanup is not done.", Value: float64(b)})
 		}
+		if s.calls != nil {
+			for _, rs := range s.calls.RouteStates() {
+				g = append(g, obs.Gauge{Name: "breaker_state", Help: "Circuit breaker state of each model route: 0 closed, 1 half_open, 2 open.",
+					Labels: map[string]string{"kind": string(rs.Kind), "route": rs.Route}, Value: breakerValue(rs.State)})
+			}
+		}
 		return g
 	})
+}
+
+// breakerValue maps a breaker state to the breaker_state gauge value.
+func breakerValue(state string) float64 {
+	switch state {
+	case "open":
+		return 2
+	case "half_open":
+		return 1
+	}
+	return 0
 }

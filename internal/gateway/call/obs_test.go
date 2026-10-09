@@ -16,6 +16,8 @@ var allowedAttrs = map[string]bool{
 	"gateway.kind": true, "task.id": true, "attempt.id": true, "call.id": true, "subrun.id": true,
 	"gateway.provider": true, "gateway.model": true, "budget.estimate_micro": true, "cost.actual_micro": true,
 	"call.result": true, "http.status_code": true, "try.no": true, "try.outcome": true,
+	// model fallback chain (routes are configured provider names; skips are "name:reason" with closed reasons)
+	"gateway.route": true, "route": true, "route_skipped": true, "hedge": true, "breaker": true, "breaker_after": true,
 }
 
 // A call retried once: one gateway.call span (child of the caller's span) with two gateway.try children, the
@@ -135,5 +137,60 @@ func TestDetachedSettlementRecorded(t *testing.T) {
 	if len(call) != 1 || call[0].Attrs["call.result"] != ResultDetached || len(settle) != 1 ||
 		settle[0].ParentID != call[0].SpanID || settle[0].Attrs["call.result"] != ResultCompleted {
 		t.Fatalf("call %+v settle %+v", call, settle)
+	}
+}
+
+// Hedged try: one gateway.try span per leg, started inside the leg, as siblings under gateway.call; the losing leg
+// ends as hedge_lost (not failed); route/hedge/breaker attributes; metrics labelled with the leg's route; the call
+// span carries the winning leg's route; breaker transitions are counted.
+func TestHedgeLegSpans(t *testing.T) {
+	tr, rec := obstest.Install(t)
+	fr := newRoutes("primary", "backup")
+	fr.legs[0].script = []step{{hang: true, sent: true}, {hang: true, sent: true}}
+	fr.legs[1].script = []step{{body: `{"answer":"hedge-b"}`, usage: upstream.Usage{InputTokens: 1, OutputTokens: 1}}}
+	h := newRouteHarness(t, routeLimits(), RoutingConfig{HedgeDelay: 20 * time.Millisecond, BreakerFailures: 2}, fr)
+	if r := h.invoke(t, inv("c1", chatBody)); r.Status != 200 {
+		t.Fatalf("%+v", r)
+	}
+	calls, tries := tr.Named("gateway.call"), tr.Named("gateway.try")
+	if len(calls) != 1 || len(tries) != 2 {
+		t.Fatalf("calls %d tries %d", len(calls), len(tries))
+	}
+	byRoute := map[string]obstest.Span{}
+	for _, s := range tries {
+		if s.ParentID != calls[0].SpanID || !s.Ended {
+			t.Errorf("leg %+v is not an ended child of gateway.call", s)
+		}
+		byRoute[s.Attrs["route"].(string)] = s
+	}
+	p, b := byRoute["primary"], byRoute["backup"]
+	if p.Attrs["try.outcome"] != TryHedgeLost || p.Failed != "" || p.Attrs["hedge"] != false {
+		t.Errorf("primary leg %+v", p)
+	}
+	if b.Attrs["try.outcome"] != "ok" || b.Attrs["hedge"] != true || b.Attrs["breaker"] != "closed" {
+		t.Errorf("backup leg %+v", b)
+	}
+	if calls[0].Attrs["gateway.route"] != "backup" || calls[0].Attrs["hedge"] != true {
+		t.Errorf("call attrs %v", calls[0].Attrs)
+	}
+	for _, e := range []string{
+		"UpstreamTry kind=chat provider=primary model=m1 outcome=hedge_lost status=502",
+		"UpstreamTry kind=chat provider=backup model=m1 outcome=ok status=200",
+		"Cost kind=chat provider=backup model=m1 micro=6",
+	} {
+		if !rec.Has(e) {
+			t.Errorf("missing %q in %v", e, rec.Events())
+		}
+	}
+	for _, s := range append(calls, tries...) {
+		for k := range s.Attrs {
+			if !allowedAttrs[k] {
+				t.Errorf("span %s has non-allowlisted attribute %s", s.Name, k)
+			}
+		}
+	}
+	h.invoke(t, inv("c2", chatBody)) // second slow failure opens the primary's breaker
+	if !rec.Has("BreakerTransition kind=chat route=primary to=open") {
+		t.Errorf("breaker transition not recorded: %v", rec.Events())
 	}
 }

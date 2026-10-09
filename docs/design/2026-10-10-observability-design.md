@@ -74,7 +74,7 @@ Status: implemented on branch `s1-observability`.
 | `checkpoint.commit` | `processor.commitCheckpoint` | worker.run | `checkpoint.status` |
 | `worker.finalize` | process exit / proposal → outcome classified | worker.run | `outcome.class` |
 | `gateway.call` | `call.Coordinator.Invoke` / `Exec` | worker-sent `traceparent` (validated) or the bound attempt | `gateway.kind`, `gateway.provider`, `gateway.model`, `call.id`, `call.result` (`completed`, `replayed`, `cache_hit`, `coalesced`, or the stable rejection code), `subrun.id` |
-| `gateway.try` | each upstream try in `execute` | gateway.call | `try.no`, `http.status_code`, `try.outcome` (backoff is the gap between sibling tries) |
+| `gateway.try` | each upstream try — one per leg, started inside the leg right before `Coordinator.do` (hedge legs are siblings) | gateway.call | `try.no`, `http.status_code`, `try.outcome` (ok, retryable, fatal, unknown, `hedge_lost`, `aborted` — the last two are not failures); routed kinds add `route`, `route_skipped`, `hedge`, `breaker` (at start) and `breaker_after`. Backoff is the gap between sibling tries. The `gateway.call` span carries the winning leg's `gateway.route` and `hedge`. |
 | `session.<op>` | session actor ops (start, quiesce, freeze, thaw, release, destroy) | none (session-scoped root) | `session.id`, `incarnation.id`, `env.id` |
 
 **Propagation into the sandbox.** Protocol v1 already reserves an optional string `traceparent` on `init` and
@@ -123,9 +123,11 @@ All names are prefixed `agentbox_`. Labels are bounded enumerations only.
 | `attempt_ready_seconds` | histogram | `kind` | attempt created → worker ready |
 | `task_start_seconds` | histogram | `kind` | API submit → first worker ready (submit→ready) |
 | `stop_seconds` | histogram | `kind`, `desired` (pause/cancel) | API accepted the pause/cancel/stop → paused/cancelled committed (actor observation time if the request was accepted before this process started) |
-| `gateway_calls_total` | counter | `kind`, `result` | call coordinator |
-| `upstream_tries_total`, `upstream_try_duration_seconds` | counter, histogram | `kind`, `provider`, `model`, `status`, `outcome` | each upstream try |
-| `cost_micro_usd_total` | counter | `kind`, `provider`, `model` | actual cost of `ok` settlements |
+| `gateway_calls_total` | counter | `kind`, `result` (completed, replayed, cache_hit, coalesced, detached, or a stable Gateway code such as `model_degraded`, `tries_exhausted`, `budget_insufficient_for_request`) | call coordinator |
+| `upstream_tries_total`, `upstream_try_duration_seconds` | counter, histogram | `kind`, `provider` (route), `model`, `status`, `outcome` (incl. `hedge_lost`, `aborted`) | each upstream try / hedge leg |
+| `cost_micro_usd_total` | counter | `kind`, `provider` (the leg's route), `model` | actual cost of `ok` settlements, priced per route (`costOn`), including hedge legs that were not the result |
+| `breaker_transitions_total` | counter | `kind`, `route`, `to` | circuit breaker state changes of model routes |
+| `breaker_state` | gauge | `kind`, `route` | scrape-time breaker state (0 closed, 1 half_open, 2 open) |
 | `tool_calls_per_task` | histogram | `kind` | search/fetch/exec calls of a task over all its runs (replays excluded), observed at its terminal status |
 | `sandbox_envs` | gauge | `kind` (task/session/exec) | DB: environments not yet stopped (cached 5 s) |
 | `sandbox_cleanup_backlog` | gauge | — | DB: stopped, cleanup not done |
