@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/faultinject"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 )
 
@@ -293,6 +294,8 @@ type Actor struct {
 	accountAttempt string
 	// grantCancel 撤回在途的会话授予申请（WithdrawSessionGrant）。
 	grantCancel context.CancelFunc
+	// tr 是可观测性状态（trace.go）：任务与 attempt 的 span、延迟指标。可观测性关闭时不产生任何效果。
+	tr actorTrace
 }
 
 // runTime 是累计运行时间（§14.4）：base 是已结束区间的累计（毫秒），openAt 非 nil 时当前 attempt 的
@@ -347,6 +350,7 @@ func (a *Actor) Err() error {
 
 func (a *Actor) main() {
 	defer close(a.done)
+	defer func() { a.tr.end(a.s.TaskStatus) }()
 	defer func() {
 		a.cancel()
 		if a.timerStop != nil {
@@ -362,6 +366,7 @@ func (a *Actor) main() {
 	if !a.load() {
 		return
 	}
+	a.tr.begin(a.ctx, a.taskID, a.s)
 	a.housekeepAt = a.d.Clock.Now().Add(RunTimePersistInterval)
 	a.apply(Tick{})
 	for a.fatal == nil && !a.finished() {
@@ -559,8 +564,14 @@ func (a *Actor) exec(eff Effect) {
 		// 已达累计运行时限的 queued 任务（重启记账或调低配置之后）同样走正常路径：startWorker 以已取消
 		// 的 ctx 启动执行，runner 分类为 task_deadline_exceeded，经现有判决路径结束（代价是创建一次环境）。
 		req := SlotRequest{TaskID: a.taskID, Limits: a.limits, SessionID: a.s.SessionID}
+		tctx := a.tr.taskCtx(context.Background())
 		a.async(func(ctx context.Context) any {
+			_, span := obs.Start(obs.Carry(ctx, tctx), "admission.acquire")
 			g, err := a.d.Admission.Acquire(ctx, req)
+			if err != nil {
+				span.Fail("not_granted")
+			}
+			span.End()
 			return grantResult{g: g, err: err}
 		})
 	case ReleaseSlot:
@@ -584,15 +595,24 @@ func (a *Actor) exec(eff Effect) {
 		a.enqueue(&storeOp{kind: opCreateAttempt, attempt: na})
 	case CreateEnvironment:
 		spec := EnvSpec{TaskID: a.taskID, AttemptID: f.AttemptID, EnvID: f.EnvID, Spec: a.spec, Limits: a.limits}
+		actx := a.tr.attemptCtx(context.Background(), f.AttemptID)
 		a.async(func(ctx context.Context) any {
+			// 只取 attempt 的 span（Bind 把它交给 Gateway 入口，Worker 的调用因此挂在本 attempt 下），取消仍随 ctx。
+			ctx = obs.Carry(ctx, actx)
 			// Gateway 入口先于环境建立：socket 须在 init 挂载它时已存在（§9.1）。绑定失败交给适配器分类。
 			if spec.GatewaySocket, spec.BindErr = a.d.Access.Bind(ctx, f.AttemptID, f.EnvID); spec.BindErr != nil {
 				spec.BindErr = fmt.Errorf("task: 绑定 attempt %s 的 Gateway 入口: %w", f.AttemptID, spec.BindErr)
 			}
-			o, err := a.d.Env.CreateEnv(ctx, spec)
+			ectx, span := obs.Start(ctx, "env.create", obs.Str("env.id", f.EnvID))
+			o, err := a.d.Env.CreateEnv(ectx, spec)
 			if err == nil {
 				o = nil
+			} else if o != nil {
+				span.Fail(o.Class)
+			} else {
+				span.Fail("create_failed")
 			}
+			span.End()
 			return EnvCreated{AttemptID: f.AttemptID, EnvID: f.EnvID, Err: err, Outcome: o}
 		})
 	case StartWorker:
@@ -638,6 +658,7 @@ func (a *Actor) startWorker(f StartWorker) {
 	// Run 的 ctx 可单独以 context.DeadlineExceeded 取消（累计运行时限，§14.4）；结果仍经 actor 的 ctx 投递。
 	runCtx, cancelRun := context.WithCancelCause(a.ctx)
 	a.runCancel[f.AttemptID] = cancelRun
+	runCtx = a.tr.attemptCtx(runCtx, f.AttemptID) // worker.run 是 attempt span 的子 span（取消语义不变）
 	if a.rt.attemptID == f.AttemptID && a.overLimit(a.d.Clock.Now()) {
 		a.stopRunForLimit(f.AttemptID)
 	}
@@ -675,7 +696,22 @@ func (a *Actor) stopEnv(f StopEnvironment) {
 		return
 	}
 	sessionID := a.s.SessionID
-	a.async(func(ctx context.Context) any {
+	name := "env.stop"
+	if f.Session != nil {
+		name = "session.handoff"
+	}
+	sctx := a.tr.attemptCtx(context.Background(), f.AttemptID)
+	a.async(func(ctx context.Context) (res any) {
+		ctx, span := obs.Start(obs.Carry(ctx, sctx), name, obs.Str("env.id", f.EnvID))
+		defer func() {
+			if r, ok := res.(stopDone); ok {
+				span.SetAttrs(obs.Bool("stopped", r.report.Stopped), obs.Bool("recorded", r.report.Recorded))
+				if r.err != nil {
+					span.Fail("stop_unconfirmed")
+				}
+			}
+			span.End()
+		}()
 		r := stopDone{attemptID: f.AttemptID, envID: f.EnvID, reason: reason}
 		if revoke {
 			rctx, cancel := context.WithTimeout(ctx, revokeTimeout)
@@ -771,6 +807,9 @@ func (a *Actor) handle(m any) {
 		a.inflight--
 		a.handleResult(m.v)
 	case Event: // OnReady 发来的 WorkerStarted
+		if ws, ok := m.(WorkerStarted); ok {
+			a.tr.ready(ws.AttemptID)
+		}
 		a.apply(m)
 	}
 }
@@ -797,11 +836,13 @@ func (a *Actor) handleResult(v any) {
 		delete(a.controls, r.AttemptID)
 		delete(a.runCancel, r.AttemptID)
 		r.Outcome = a.capRetry(r.Outcome)
+		a.tr.attemptFinished(r.AttemptID, r.Outcome)
 		a.apply(r)
 	case controlResult:
 		a.controlReading = false
 		switch {
 		case r.err == nil:
+			a.tr.controlChanged(r.cs.Desired)
 			a.apply(ControlChanged{Desired: r.cs.Desired, ControlVersion: r.cs.ControlVersion})
 		case errors.Is(r.err, persistence.ErrOwnershipLost):
 			a.die(r.err)
@@ -989,8 +1030,10 @@ func (a *Actor) committed(op *storeOp, r storeDone) {
 		na := op.attempt
 		a.attemptsTotal = max(a.attemptsTotal, na.AttemptNo)
 		a.attemptNo[na.AttemptID] = na.AttemptNo
+		a.tr.attemptCreated(na)
 		a.apply(AttemptCreated{AttemptID: na.AttemptID, EnvID: na.EnvID, Status: r.attempt.Status})
 	case opFinalize:
+		a.tr.verdict(a.taskID, op.verdict)
 		a.apply(VerdictCommitted{Verdict: op.verdict, CommittedSessionCheckpointID: r.attempt.CommittedSessionCheckpointID})
 	case opAccountRunTime:
 		if r.runTimeMs != nil && a.rt.openAt == nil {

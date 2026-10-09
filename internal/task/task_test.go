@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 )
 
@@ -1345,11 +1346,14 @@ type fkRun struct {
 	controls <-chan Control
 	result   chan Outcome
 	cause    chan error // Run 的 ctx 被取消时的 cause
+	// traceparent 是 Run 的 ctx 中的 span（可观测性测试；关闭时为空）
+	traceparent string
 }
 
 func (r *fkRunner) Run(ctx context.Context, spec RunSpec, controls <-chan Control) Outcome {
 	r.log.add("run:%s", spec.AttemptID)
-	h := &fkRun{spec: spec, controls: controls, result: make(chan Outcome, 1), cause: make(chan error, 1)}
+	h := &fkRun{spec: spec, controls: controls, result: make(chan Outcome, 1), cause: make(chan error, 1),
+		traceparent: obs.Traceparent(ctx)}
 	select {
 	case r.runs <- h:
 	case <-ctx.Done():
