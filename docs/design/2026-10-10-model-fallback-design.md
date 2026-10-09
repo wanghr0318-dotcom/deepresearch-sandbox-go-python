@@ -90,7 +90,7 @@ it (an empty map means "serves every declared model under the same name"). `DoOn
 field of the resolved body with the provider's model name; the rest of the body is identical, so the logical
 request — and its fingerprint — does not depend on the route.
 
-In chain mode the adapter also treats a 2xx response without a non-empty `choices` array as
+In chain mode the adapter — **including the primary route** — also treats a 2xx response without a non-empty `choices` array as
 `unknown / upstream_bad_response` (the provider may have billed it, so it is charged like any other unknown),
 which makes "empty response" fail over. In single-provider mode this check is off so behaviour is unchanged.
 
@@ -111,8 +111,8 @@ For each iteration of the existing try loop (deadline, cancellation, pause, `Max
    per-provider semaphore key (`openai_compat/<route>`).
 4. **Do.** `DoOn(route)` under a per-try timeout (`--model-try-timeout`, default off). A timeout after the
    request was sent is `unknown` (as today); before it was sent it is `retryable`.
-5. **Report to the breaker.** ok and fatal → success (the provider answered); retryable and unknown →
-   failure; cancellation by the Coordinator (task cancel, deadline, shutdown, hedge loser) → abort (no
+5. **Report to the breaker.** ok and request-rejecting fatal (e.g. 400) → success (the provider answered);
+   retryable, unknown and provider-side fatal (401/403/404, egress blocked, invalid URL) → failure; cancellation by the Coordinator (task cancel, deadline, shutdown, hedge loser) → abort (no
    verdict, releases a half-open probe slot).
 6. **Settle** exactly as before; cost uses `PricingOn(route, model)`.
 7. **Next.** On retryable/unknown, mark the route `tried`. If another route is ready, the next try starts
@@ -136,7 +136,11 @@ behaves exactly as before rather than turning into fast `model_degraded` errors)
 
 When enabled, if the primary leg has not finished after the delay and another route is ready, the Coordinator
 reserves a **second, concurrent try** for that route (`ReserveTry{Hedge: true}`) and sends the same logical
-request there. The first `ok` (or `fatal`) is decisive; the other leg is cancelled.
+request there. Decisive results are an `ok` from either leg or a `fatal` from the **first** leg; a `fatal`
+from the hedge leg is not decisive (a wrong backup key, model name or base URL must not cancel a slow but
+healthy primary) — the Coordinator keeps waiting for the first leg. On a decisive result the other leg is
+cancelled; if it nevertheless answers `ok` before the cancellation takes effect, that `ok` is preferred over a
+first-leg `fatal`.
 
 Why this is safe for the journal:
 
@@ -145,11 +149,19 @@ Why this is safe for the journal:
   explicit hedge request for a *different provider* while exactly one try is held. The ReserveTry
   idempotency rule (lost COMMIT, E11b) now also matches on provider, so a hedge request is never mistaken for
   a retry of the primary's reservation and vice versa.
-- **The decisive leg is settled last.** The loser is cancelled, waited for, and settled first (released if
-  the request had not been sent, `unknown` if it had), then the winner is settled. So the call's final state
-  is always the winner's (`completed` or `failed`), never overwritten by a late loser. A crash between the
-  two settlements leaves both reservations held; the startup ledger conversion charges both as unknown and
-  the call becomes `unknown` → the next request makes a new try, exactly as for a single crashed try.
+- **Only the final leg decides the call.** Every other leg is settled first with a *charge-only* (`Sibling`)
+  settlement: its reservation, the ledger and its try row are settled normally (released if the request had
+  not been sent, `unknown` with the full estimate if it had, the actual cost if it had already answered `ok`;
+  an `ok` loser's blob is stored for provenance), `calls.cost_charged` and `possible_external_duplicate` are
+  updated, but `calls.state`, `result_ref`, `upstream_request_id` and `fail_reason` are not touched. The final
+  leg is then settled normally. So two `ok` legs never both write `result_ref`, and a `fatal` leg never marks
+  the call failed when the other leg succeeds. A crash between the two settlements leaves the final leg's
+  reservation held: the startup ledger conversion charges it as unknown and the call becomes `unknown` →
+  retryable, never a stray `failed`. A try cancelled because the other leg won keeps its own error code and
+  is marked `hedge_lost`.
+- **A slow first leg counts as a failure.** If the leg that triggered the hedge loses after running longer
+  than the hedge delay, its breaker records a failure (a cancelled hedge leg is only an abort), so a
+  persistently hanging primary is eventually skipped instead of being hedged around forever.
 - **Cost is accounted conservatively.** A loser that was already sent is charged its full estimate to the
   `unknown` bucket (the provider may bill tokens generated before the cancel arrived), and the call is marked
   `possible_external_duplicate`. Hedging therefore trades money for tail latency: in the worst case a hedged
@@ -167,6 +179,7 @@ Per try (`call_tries`, `inspect` JSON `calls[].tries[]`, CLI `inspect` "MODEL CA
 | `provider` | route name that ran the try (`primary`, `backup`, …); empty in single-provider mode |
 | `skipped` | providers passed over before this try, `name:reason`, reasons `circuit_open`, `tried`, `model_not_served` |
 | `hedge` | true for the second leg of a hedged pair |
+| `hedge_lost` | true for a leg cancelled because the other leg of the pair produced the decisive result (its `error` keeps its own code) |
 
 The serving provider of a completed call is the `provider` of its `ok` try. Log attributes on the existing
 `gateway: try` line: `route`, `route_skipped`, `hedge`, `breaker`; new lines `gateway: breaker` (state

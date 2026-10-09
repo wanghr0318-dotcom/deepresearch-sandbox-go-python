@@ -286,13 +286,15 @@ sudo -E ./bin/agentbox server ... --model-fallback-file /etc/agentbox/model-fall
 | `--model-fallback-file` | 空 | 后备供应商列表（JSON，见上）。为空时没有降级链。 |
 | `--model-breaker-failures` | 3 | 供应商连续失败（retryable 或 unknown）多少次后熔断：之后直接跳过它，不花 try。 |
 | `--model-breaker-open` | 30s | 熔断打开时长；届满后下一次调用向它放行一个半开试探，成功则恢复，失败则再打开。 |
-| `--model-try-timeout` | 0（不设） | 每次模型 try 的超时。不设时挂起的供应商会占满整个 `--model-call-deadline`，无法转到下一个；推理模型的长输出可能需要几十秒，取值应高于正常 p99。超时时请求已发出，按 unknown 结算（估算计入 unknown）。 |
-| `--model-hedge-delay` | 0（关闭） | 对冲：try 发出这么久仍未结束时，向下一个就绪的供应商并发发出同一请求，先成功者胜出，另一方被取消。落败方已发出时按估算全额计入 unknown，最坏情况约两倍费用；建议设在主供应商 p95 附近。 |
+| `--model-try-timeout` | 0（不设） | 每次模型 try 的超时（需要 `--model-fallback-file`）。不设时挂起的供应商会占满整个 `--model-call-deadline`，无法转到下一个；推理模型的长输出可能需要几十秒，取值应高于正常 p99。超时时请求已发出，按 unknown 结算（估算计入 unknown）。 |
+| `--model-hedge-delay` | 0（关闭） | 对冲（需要 `--model-fallback-file`）：try 发出这么久仍未结束时，向下一个就绪的供应商并发发出同一请求，先成功者胜出，另一方被取消。落败方已发出时按估算全额计入 unknown，最坏情况约两倍费用；建议设在主供应商 p95 附近。 |
 
 行为：
 
-- 可重试的失败（连不上、429、5xx、每 try 超时、2xx 但没有 `choices`）之后**立即**换下一个供应商，不退避；本轮所有供应商都失败才按 `--model-call-deadline` 内的指数退避重来。一次逻辑调用的 try 总数仍受上限 3 约束（跨供应商累计）。
-- 400/401/403 等明确拒绝（fatal）不换供应商：请求本身不被接受，换供应商也一样；鉴权失败应修配置，而不是被掩盖。
+- 可重试的失败（连不上、429、5xx、每 try 超时、2xx 但没有 `choices`——链模式下主供应商也按此判定）之后**立即**换下一个供应商，不退避；本轮所有供应商都失败才按 `--model-call-deadline` 内的指数退避重来。一次逻辑调用的 try 总数仍受上限 3 约束（跨供应商累计）。
+- 400/401/403/404 等明确拒绝（fatal）不换供应商：请求本身不被接受，换供应商也一样；鉴权失败应修配置，而不是被掩盖。其中 401/403/404 与出站防护拒绝计入该供应商的熔断。
+- 后备供应商的地址在启动时按出站防护检查：私有地址与 localhost 须在 `--upstream-allow-private` 中，否则拒绝启动。
+- 对冲：任一腿的 ok 或第一条腿的 fatal 才是决定性结果；对冲腿的 fatal（例如后备 Key 配错）不取消第一条腿。只有最终结果决定调用的状态与结果，其余的腿只记账（`hedge_lost` 标记被取消的一方，`error` 保留它自己的错误码）；触发对冲后落败的第一条腿计为一次熔断失败。
 - 所有提供该模型的供应商都处于熔断时，调用立即以 `503 model_degraded` 失败（不预留、不访问上游）。Worker 把它当作暂时性错误；对话界面显示"模型服务暂时不可用"。
 - 指纹只含逻辑模型，与哪个供应商执行无关；已完成调用的重放直接返回 journal 中的结果，不访问任何供应商，也不受熔断状态影响。
 
@@ -302,9 +304,9 @@ sudo -E ./bin/agentbox server ... --model-fallback-file /etc/agentbox/model-fall
 ./bin/agentbox task inspect <task_id> --format text   # "MODEL CALL" 表：TRY、PROVIDER、LATENCY、OUTCOME、HEDGE、SKIPPED
 ```
 
-`GET /tasks/{id}/inspect` 的 `calls[].tries[]` 带 `provider`、`skipped`（`name:reason`，原因为 `circuit_open`、`tried`、`model_not_served`）与 `hedge`；单供应商配置下这三项省略。Gateway 日志的 `gateway: try` 行另带 `route`、`route_skipped`、`hedge`、`breaker`；熔断状态变化记为 `gateway: breaker`（`route`、`from`、`to`），降级记为 `gateway: degraded`。
+`GET /tasks/{id}/inspect` 的 `calls[].tries[]` 带 `provider`、`skipped`（`name:reason`，原因为 `circuit_open`、`tried`、`model_not_served`）、`hedge` 与 `hedge_lost`；单供应商配置下这些字段省略。Gateway 日志的 `gateway: try` 行另带 `route`、`route_skipped`、`hedge`、`breaker`；熔断状态变化记为 `gateway: breaker`（`route`、`from`、`to`），降级记为 `gateway: degraded`。
 
-混沌测试（fake upstream，零费用；测量有无降级链时一次模型调用的延迟，结果见[证据](evidence/2026-10-10-model-fallback.md)）：
+混沌测试（fake upstream，零费用；测量有无降级链时一次模型调用的延迟，结果见[证据](evidence/2026-10-10-model-fallback.md)；只在设置 `AGENTBOX_CHAOS_RUNS` 时运行，平时由确定性的 `TestRoute*`/`TestHedge*` 覆盖）：
 
 ```bash
 AGENTBOX_CHAOS_RUNS=5 go test ./internal/gateway/call -run TestChaos -v
