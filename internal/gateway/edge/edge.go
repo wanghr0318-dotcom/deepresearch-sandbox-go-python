@@ -29,6 +29,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/blob"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/subrun"
 )
 
@@ -262,7 +263,7 @@ func (e *Edge) Bind(ctx context.Context, attemptID, envID string) (string, error
 	}
 	b := newBinding(e, "attempt_id", attemptID, gotEnv, path, ln)
 	// 独立 task：入口固定绑定这一个 attempt，直到撤销。
-	if err := b.ln.attach(newTarget(e, attemptID, taskID, gotEnv)); err != nil {
+	if err := b.ln.attach(newTarget(ctx, e, attemptID, taskID, gotEnv)); err != nil {
 		return "", errors.Join(err, ln.Close(), os.Remove(path))
 	}
 	e.bindings[attemptID] = b
@@ -320,7 +321,7 @@ func (e *Edge) Attach(ctx context.Context, incarnationID, attemptID string) erro
 	if envID != b.envID {
 		return fmt.Errorf("edge: attempt %s 属于环境 %s，不是 incarnation %s 的环境 %s", attemptID, envID, incarnationID, b.envID)
 	}
-	t := newTarget(e, attemptID, taskID, envID)
+	t := newTarget(ctx, e, attemptID, taskID, envID)
 	if err := b.ln.attach(t); err != nil {
 		t.cancel()
 		if errors.Is(err, net.ErrClosed) {
@@ -549,9 +550,11 @@ type target struct {
 
 	// ctx 是交给 Calls.Invoke 的上下文：它只在撤销、Detach 或关闭时结束，与 Worker 的请求上下文分离——
 	// Worker 断开连接或取消 HTTP 请求不会取消 Invoke（§9.1 表第一行；协调器的后台 try 本来也不随
-	// Invoke 的 ctx 取消，这里在 edge 一侧显式保证）。
+	// Invoke 的 ctx 取消，这里在 edge 一侧显式保证）。ctx 带着 Bind/Attach 调用方的 span（attempt 的 trace）。
 	ctx    context.Context
 	cancel context.CancelFunc
+	// traceID 是绑定的 attempt 所在 trace（tracing 关闭时为空）：Worker 的 traceparent 头只在 trace-id 与它相同时采用。
+	traceID string
 
 	conns int // 已接受且未关闭的连接数，由 limitListener.mu 保护
 
@@ -561,10 +564,30 @@ type target struct {
 	idle     chan struct{} // detached 且 active 降为 0 时关闭
 }
 
-func newTarget(e *Edge, attemptID, taskID, envID string) *target {
+// newTarget 的 bindCtx 是 Bind/Attach 的调用方上下文：只取其中的 span（attempt 的 trace），不继承取消。
+func newTarget(bindCtx context.Context, e *Edge, attemptID, taskID, envID string) *target {
 	t := &target{e: e, attemptID: attemptID, taskID: taskID, envID: envID, idle: make(chan struct{})}
 	t.ctx, t.cancel = context.WithCancel(context.Background())
+	t.ctx = obs.Carry(t.ctx, bindCtx)
+	t.traceID, _ = obs.IDs(bindCtx)
 	return t
+}
+
+// HeaderTraceparent 是 W3C Trace Context 头。Worker SDK 把宿主经 init/task_start 交给它的 traceparent 原样带上。
+const HeaderTraceparent = "traceparent"
+
+// callCtx 是一次计费调用或 exec 交给 Calls 的上下文：Worker 是不可信的，它发来的 traceparent 只在格式合法且
+// trace-id 等于本 attempt 的 trace 时作为父 span（使调用挂在 Worker 报告的 span 下）；否则忽略，调用挂在绑定的
+// attempt 下。Worker 因此不能把 span 写进其他 trace 或伪造新的 trace。
+func (t *target) callCtx(r *http.Request) context.Context {
+	tp := r.Header.Get(HeaderTraceparent)
+	if tp == "" || t.traceID == "" {
+		return t.ctx
+	}
+	if tc, ok := obs.ParseTraceparent(tp); !ok || tc.TraceID != t.traceID {
+		return t.ctx
+	}
+	return obs.WithRemoteParent(t.ctx, tp)
 }
 
 // enter 登记一个请求。detached 时 ok=false 且 tooMany=false。
@@ -706,7 +729,7 @@ func (t *target) exec(w http.ResponseWriter, r *http.Request, tc *trackedConn, s
 	}
 	stop := detached(r, tc)
 	defer stop()
-	res, err := t.e.calls.Exec(t.ctx, in)
+	res, err := t.e.calls.Exec(t.callCtx(r), in)
 	if err != nil {
 		t.internalError(w, "exec", err, "call_id", callID)
 		return
@@ -740,7 +763,7 @@ func (t *target) invoke(w http.ResponseWriter, r *http.Request, tc *trackedConn,
 	stop := detached(r, tc)
 	defer stop()
 	// 以 target 的上下文而非 r.Context() 调用：Worker 断开不取消 Invoke（见 target.ctx）。
-	res, err := t.e.calls.Invoke(t.ctx, in)
+	res, err := t.e.calls.Invoke(t.callCtx(r), in)
 	if err != nil {
 		t.internalError(w, "invoke", err, "call_id", callID)
 		return
