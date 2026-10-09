@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/protocol"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
@@ -162,6 +163,9 @@ type sessionRun struct {
 	// handleMu 在处理器处理属于本 attempt 的一行期间持有：RunTask 在无提议时返回前取得它再设置 returned，
 	// 之后的行必然看到 returned（不会有"已返回却又记录了提议"的竞争）。顺序：handleMu → inc.mu。
 	handleMu sync.Mutex
+	// handshake 是 worker.handshake span（只由 RunTask 的 goroutine 结束，见 endHandshake）。
+	handshake     obs.Span
+	handshakeDone bool
 
 	// 处理器 → RunTask/Release 的通知。
 	accepted chan struct{}
@@ -781,7 +785,10 @@ func hasDirective(d json.RawMessage) bool { return stateOrNil(d) != nil }
 //
 // 进程退出 → 按退出原因分类；Store 故障达阈值或 ctx 结束 → 终止 incarnation。同一时刻至多一个
 // RunTask，且上一个 attempt 释放成功之前不能开始下一个（ErrIncarnationBusy）。
-func (inc *Incarnation) RunTask(ctx context.Context, a SessionAttempt, controls <-chan Control) Outcome {
+func (inc *Incarnation) RunTask(ctx context.Context, a SessionAttempt, controls <-chan Control) (out Outcome) {
+	ctx, span := obs.Start(ctx, "worker.run", runAttrs("session", a.Attempt)...)
+	defer func() { endRun(span, out) }()
+	a.Init.Traceparent = obs.Traceparent(ctx) // task_start.traceparent（见 Runner.Run）
 	fail := func(err error) Outcome {
 		in := ClassifyInput{StartErr: err}
 		if ctx.Err() != nil {
@@ -825,7 +832,7 @@ func (inc *Incarnation) RunTask(ctx context.Context, a SessionAttempt, controls 
 	if err != nil {
 		return fail(fmt.Errorf("runner: 打开 out_dir: %w", err))
 	}
-	pctx, abandon := context.WithCancel(context.Background())
+	pctx, abandon := context.WithCancel(obs.Carry(context.Background(), ctx)) // 只带 span，不继承取消
 	att := &sessionRun{processor: newProcessor(inc.r, a.TaskID, a.AttemptID, a.Init.Resume, dir), inc: inc, a: a,
 		abandon: abandon, accepted: make(chan struct{}), proposed: make(chan struct{}), released: make(chan struct{})}
 	att.session, att.pctx = true, pctx
@@ -838,6 +845,9 @@ func (inc *Incarnation) RunTask(ctx context.Context, a SessionAttempt, controls 
 	inc.mu.Lock()
 	inc.att = att
 	inc.mu.Unlock()
+	// worker.handshake：task_start 写出 → task_accepted（或 RunTask 结束时仍未接受）。只由本 goroutine（wait）结束。
+	_, att.handshake = obs.Start(ctx, "worker.handshake")
+	defer att.endHandshake("not_accepted")
 	ok, partial, err := inc.sendHost(ts)
 	if err != nil { // 阶段不允许（例如已 session_close）：不写出
 		inc.mu.Lock()
@@ -872,6 +882,7 @@ func (inc *Incarnation) wait(ctx context.Context, att *sessionRun, controls <-ch
 		case <-accepted:
 			accepted = nil
 			acceptT.stop()
+			att.endHandshake("")
 		case <-acceptT.c:
 			acceptT.stop()
 			inc.kill(KillReadyTimeout)
