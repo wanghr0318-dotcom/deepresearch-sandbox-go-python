@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -166,4 +167,67 @@ func waitFile(t *testing.T, p string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("%s did not appear", p)
+}
+
+// pgrp reads the process group from /proc/<pid>/stat (0 if unreadable).
+func pgrp(pid int) int {
+	b, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return 0
+	}
+	s := string(b)
+	f := strings.Fields(s[strings.LastIndexByte(s, ')')+1:])
+	if len(f) < 3 {
+		return 0
+	}
+	g, _ := strconv.Atoi(f[2])
+	return g
+}
+
+// TestFreezeCatchesForkingProcesses: a shell forking continuously must end up entirely stopped — children
+// forked between a /proc listing and the parent's SIGSTOP are caught by the re-listing passes.
+func TestFreezeCatchesForkingProcesses(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "while :; do sleep 2 & sleep 0.005; done")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pg := cmd.Process.Pid
+	t.Cleanup(func() {
+		_ = syscall.Kill(-pg, syscall.SIGKILL)
+		_ = syscall.Kill(-pg, syscall.SIGCONT)
+		_ = cmd.Wait()
+	})
+	old := inScope
+	inScope = func(pid int) bool { return pgrp(pid) == pg }
+	t.Cleanup(func() { inScope = old })
+	time.Sleep(200 * time.Millisecond) // let it fork a few dozen children
+	if code := run([]string{"freeze", "--timeout-ms", "5000"}, nil, &bytes.Buffer{}, os.Stderr); code != 0 {
+		t.Fatalf("freeze = %d", code)
+	}
+	check := func() (int, int) {
+		pids, err := others()
+		if err != nil {
+			t.Fatal(err)
+		}
+		running := 0
+		for _, p := range pids {
+			if st := procState(p); st != "" && st != "T" && st != "t" && st != "Z" {
+				running++
+			}
+		}
+		return len(pids), running
+	}
+	n1, r1 := check()
+	time.Sleep(100 * time.Millisecond)
+	n2, r2 := check()
+	if r1 != 0 || r2 != 0 || n2 > n1 || n1 == 0 {
+		t.Fatalf("after freeze: %d procs (%d running), 100 ms later %d procs (%d running)", n1, r1, n2, r2)
+	}
+	if code := run([]string{"thaw"}, nil, &bytes.Buffer{}, os.Stderr); code != 0 {
+		t.Fatalf("thaw = %d", code)
+	}
+	if _, r := check(); r == 0 {
+		t.Fatal("thaw did not resume the processes")
+	}
 }

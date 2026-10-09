@@ -16,6 +16,13 @@
 // The provider reaches it through the pods/exec API. exec writes one line "ABX-STARTED <pid>" (or
 // "ABX-START-ERR <reason>") on stdout before relaying the workload's stdout, so the provider learns that the
 // workload is running before any workload output.
+//
+// Trust boundary: the helper runs with the same uid and in the same PID namespace as the untrusted workload,
+// so the workload can tamper with everything the helper produces inside the Pod — pid and status files in
+// /run/agentbox-exec, the ack line timing, freeze/procs/diag answers — and can signal or kill
+// helper processes. The provider therefore treats helper output only as advisory, for the workload's own
+// attempt (e.g. its exit status), and relies on API-server facts for every safety decision: container state
+// and exit (Stop, Destroy, OOMKilled), activeDeadlineSeconds for killing, Pod deletion for cleanup.
 package main
 
 import (

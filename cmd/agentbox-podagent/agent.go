@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,6 +37,10 @@ func envOr(k, def string) string {
 	}
 	return def
 }
+
+// inScope limits the processes the helper acts on; inside a Pod it is every process of the PID namespace
+// (tests narrow it to one process group).
+var inScope = func(int) bool { return true }
 
 var validID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
 
@@ -291,7 +296,7 @@ func others() ([]int, error) {
 	var pids []int
 	for _, e := range ents {
 		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == 1 || pid == self {
+		if err != nil || pid == 1 || pid == self || !inScope(pid) {
 			continue
 		}
 		pids = append(pids, pid)
@@ -314,8 +319,10 @@ func procState(pid int) string {
 	return s[i+2 : i+3]
 }
 
-// runSignalAll sends sig to every other process. With confirm it waits until each one is stopped
-// (state T/t) or gone, up to --timeout-ms (default 5000).
+// runSignalAll sends sig to every other process (thaw). With confirm (freeze) it keeps re-listing and
+// stopping until two consecutive passes see the same set of processes, all stopped (T/t) or exited: a stopped
+// process cannot fork, so a child forked between a listing and its parent's stop shows up in the next pass.
+// Bounded by --timeout-ms (default 5000).
 func runSignalAll(args []string, sig syscall.Signal, confirm bool) error {
 	fs := flag.NewFlagSet("signal", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -323,31 +330,38 @@ func runSignalAll(args []string, sig syscall.Signal, confirm bool) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	pids, err := others()
-	if err != nil {
-		return err
-	}
-	for _, p := range pids {
-		_ = syscall.Kill(p, sig)
-	}
 	if !confirm {
+		pids, err := others()
+		if err != nil {
+			return err
+		}
+		for _, p := range pids {
+			_ = syscall.Kill(p, sig)
+		}
 		return nil
 	}
 	deadline := time.Now().Add(time.Duration(*timeout) * time.Millisecond)
+	var prev []int
 	for {
+		pids, err := others()
+		if err != nil {
+			return err
+		}
 		pending := 0
 		for _, p := range pids {
 			if st := procState(p); st != "" && st != "T" && st != "t" && st != "Z" && st != "X" {
+				_ = syscall.Kill(p, sig)
 				pending++
 			}
 		}
-		if pending == 0 {
+		if pending == 0 && slices.Equal(pids, prev) {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("%d processes not stopped", pending)
+			return fmt.Errorf("%d of %d processes not stopped", pending, len(pids))
 		}
-		time.Sleep(10 * time.Millisecond)
+		prev = pids
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
