@@ -40,6 +40,8 @@ type Span interface {
 	Event(name string, attrs ...Attr)
 	// Fail marks the span as failed with a stable error code (never a free-text message).
 	Fail(code string)
+	// Rename replaces the span name (e.g. once the HTTP route is known).
+	Rename(name string)
 	End()
 }
 
@@ -173,6 +175,7 @@ type noSpan struct{}
 func (noSpan) SetAttrs(...Attr)      {}
 func (noSpan) Event(string, ...Attr) {}
 func (noSpan) Fail(string)           {}
+func (noSpan) Rename(string)         {}
 func (noSpan) End()                  {}
 
 type nop struct{}

@@ -25,6 +25,7 @@ import (
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/account"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 )
 
@@ -252,6 +253,7 @@ func New(cfg Config) (*Handler, error) {
 		seg, _, _ := strings.Cut(strings.TrimPrefix(rt.path, "/"), "/")
 		h.prefixes[seg] = true
 		h.mux.HandleFunc(rt.method+" "+rt.path, func(w http.ResponseWriter, r *http.Request) {
+			setRoute(r, rt.path)
 			if h.cfg.Accounts != nil {
 				var ok bool
 				if r, ok = h.authorize(w, r, rt.audience); !ok {
@@ -328,15 +330,56 @@ func (h *Handler) isAPIPath(p string) bool {
 
 // ServeHTTP 依次校验 Host、Origin 与 token，再分派到操作。访问日志只记录方法、路径、状态与耗时：
 // 不记录任何请求头（包括 Authorization 与 Cookie）与查询串。
+//
+// 可观测性（启用时）：每个请求一个 span "<METHOD> <route>"（route 为注册的路由模式而非实际路径，未匹配为 other，
+// 静态文件为 static），并记录 agentbox_http_requests_total / _duration_seconds。不接受客户端的 traceparent：
+// 每个 API 请求开始一条新的 trace。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	sw := &statusWriter{ResponseWriter: w}
-	h.serve(sw, r)
+	ri := &routeInfo{route: routeOther}
+	method := metricMethod(r.Method)
+	ctx, span := obs.Start(context.WithValue(r.Context(), routeKey{}, ri), "HTTP "+method)
+	h.serve(sw, r.WithContext(ctx))
+	status := sw.status()
+	span.Rename(method + " " + ri.route)
+	span.SetAttrs(obs.Str("http.method", method), obs.Str("http.route", ri.route), obs.Int("http.status_code", int64(status)))
+	if status >= 500 {
+		span.Fail("http_" + strconv.Itoa(status))
+	}
+	span.End()
+	obs.M().APIRequest(ri.route, method, status, time.Since(start))
 	if h.cfg.Logger != nil {
 		// 只记录方法、路径与状态：token 不会出现在路径中，请求头与查询串不记录。
-		h.cfg.Logger.Info("api request", "method", r.Method, "path", r.URL.Path,
-			"status", sw.status(), "duration_ms", time.Since(start).Milliseconds())
+		h.cfg.Logger.InfoContext(ctx, "api request", "method", r.Method, "path", r.URL.Path,
+			"status", status, "duration_ms", time.Since(start).Milliseconds())
 	}
+}
+
+// 路由标签的取值：注册的路由模式、未匹配的 other、静态文件的 static（有界，不含实际路径中的 ID）。
+const (
+	routeOther  = "other"
+	routeStatic = "static"
+)
+
+// routeInfo 由路由处理函数填写匹配到的路由模式（ServeHTTP 据此命名 span 与指标标签）。
+type routeInfo struct{ route string }
+
+type routeKey struct{}
+
+func setRoute(r *http.Request, route string) {
+	if ri, ok := r.Context().Value(routeKey{}).(*routeInfo); ok {
+		ri.route = route
+	}
+}
+
+// metricMethod 把方法归一为有界集合（客户端可发送任意方法名）。
+func metricMethod(m string) string {
+	switch m {
+	case http.MethodGet, http.MethodPost, http.MethodHead, http.MethodOptions, http.MethodPut, http.MethodDelete, http.MethodPatch:
+		return m
+	}
+	return "OTHER"
 }
 
 func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
@@ -348,6 +391,7 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.cfg.WebDir != "" && !h.isAPIPath(r.URL.Path) {
+		setRoute(r, routeStatic)
 		h.serveStatic(w, r)
 		return
 	}

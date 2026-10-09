@@ -69,6 +69,12 @@ func (l live) Fail(code string) {
 	l.s.Failed = code
 }
 
+func (l live) Rename(name string) {
+	l.t.mu.Lock()
+	defer l.t.mu.Unlock()
+	l.s.Name = name
+}
+
 func (l live) End() {
 	l.t.mu.Lock()
 	defer l.t.mu.Unlock()

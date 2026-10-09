@@ -35,6 +35,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/edge"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/ownership"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
@@ -1414,6 +1415,9 @@ func (n notifyingStore) submit(taskID string) {
 func (n notifyingStore) CreateTask(ctx context.Context, req api.CreateTaskRequest) (api.CreateTaskResult, error) {
 	r, err := n.Store.CreateTask(ctx, req)
 	if err == nil {
+		if !r.Replayed {
+			obs.NoteSubmit(ctx, r.TaskID) // 先于通知：actor 加载任务时取走（trace 父 span 与提交时间）
+		}
 		n.submit(r.TaskID)
 	}
 	return r, err
@@ -1436,6 +1440,9 @@ type notifyingAccounts struct {
 func (a notifyingAccounts) CreateResearch(ctx context.Context, userID int64, req api.CreateTaskRequest) (api.CreateTaskResult, error) {
 	r, err := a.Accounts.CreateResearch(ctx, userID, req)
 	if err == nil {
+		if !r.Replayed {
+			obs.NoteSubmit(ctx, r.TaskID)
+		}
 		a.n.submit(r.TaskID)
 	}
 	return r, err

@@ -90,4 +90,6 @@ func (s span) Fail(code string) {
 	s.s.SetStatus(codes.Error, code)
 }
 
+func (s span) Rename(name string) { s.s.SetName(name) }
+
 func (s span) End() { s.s.End() }

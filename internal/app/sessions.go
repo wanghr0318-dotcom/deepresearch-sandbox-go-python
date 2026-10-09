@@ -26,6 +26,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/blob"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/edge"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/protocol"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/resource"
@@ -621,6 +622,9 @@ func (n notifyingSessions) submit(taskID string) {
 func (n notifyingSessions) CreateTurn(ctx context.Context, req api.CreateTurnRequest) (api.CreateTurnResult, error) {
 	r, err := n.Sessions.CreateTurn(ctx, req)
 	if err == nil {
+		if !r.Replayed {
+			obs.NoteSubmit(ctx, r.TurnID)
+		}
 		n.submit(r.SupersededTurnID)
 		n.submit(r.TurnID)
 		n.notifySession(req.SessionID)
