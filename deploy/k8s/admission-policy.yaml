@@ -1,0 +1,75 @@
+# ValidatingAdmissionPolicy for the sandbox namespace (docs/design/2026-10-10-k8s-provider-design.md §2.4).
+#
+# The node-local slot volumes are hostPath, which Pod Security "baseline" forbids, so the namespace cannot
+# enforce PSS. Without this policy the server's ServiceAccount (pods: create) could mount any host path or
+# run privileged Pods. The policy applies to every Pod in agentbox-sandbox — not only to Pods carrying the
+# agentbox.io/managed label, which a compromised server could simply omit — and requires:
+#   - hostPath volumes only below the slot directory as seen by the node (edit SLOT_PREFIX below if your
+#     --k8s-node-shared-dir differs from /var/lib/agentbox-k8s/data/k8s-slots), no "..";
+#   - no host network/PID/IPC, no hostPort, no ServiceAccount token, no init or ephemeral containers;
+#   - runAsNonRoot, non-zero runAsUser, RuntimeDefault seccomp;
+#   - every container: no privilege escalation, not privileged, read-only root, capabilities drop ALL and
+#     add none.
+# Requires Kubernetes 1.30+ (admissionregistration.k8s.io/v1).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: agentbox-sandbox-pods
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  variables:
+    - name: slotPrefix
+      expression: "'/var/lib/agentbox-k8s/data/k8s-slots/'" # SLOT_PREFIX
+  validations:
+    - expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath) ||
+        (v.hostPath.path.startsWith(variables.slotPrefix) && !v.hostPath.path.contains('..')))
+      message: "hostPath volumes are only allowed below the agentbox slot directory"
+    - expression: >-
+        !(has(object.spec.hostNetwork) && object.spec.hostNetwork) &&
+        !(has(object.spec.hostPID) && object.spec.hostPID) &&
+        !(has(object.spec.hostIPC) && object.spec.hostIPC)
+      message: "host namespaces are not allowed"
+    - expression: "has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false"
+      message: "automountServiceAccountToken must be false"
+    - expression: >-
+        (!has(object.spec.initContainers) || size(object.spec.initContainers) == 0) &&
+        (!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0)
+      message: "init and ephemeral containers are not allowed"
+    - expression: >-
+        has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) &&
+        object.spec.securityContext.runAsNonRoot &&
+        (!has(object.spec.securityContext.runAsUser) || object.spec.securityContext.runAsUser != 0) &&
+        has(object.spec.securityContext.seccompProfile) &&
+        object.spec.securityContext.seccompProfile.type == 'RuntimeDefault'
+      message: "pod securityContext must set runAsNonRoot, a non-root runAsUser and RuntimeDefault seccomp"
+    - expression: >-
+        object.spec.containers.all(c,
+          (!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0)) &&
+          has(c.securityContext) &&
+          has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false &&
+          (!has(c.securityContext.privileged) || c.securityContext.privileged == false) &&
+          (!has(c.securityContext.runAsUser) || c.securityContext.runAsUser != 0) &&
+          has(c.securityContext.readOnlyRootFilesystem) && c.securityContext.readOnlyRootFilesystem &&
+          has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) &&
+          c.securityContext.capabilities.drop.exists(d, d == 'ALL') &&
+          (!has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0))
+      message: "containers must be unprivileged: no escalation, read-only root, drop ALL capabilities, no hostPort"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: agentbox-sandbox-pods
+spec:
+  policyName: agentbox-sandbox-pods
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: agentbox-sandbox

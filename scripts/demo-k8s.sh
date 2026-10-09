@@ -133,6 +133,7 @@ ok "server 镜像 $SERVER_IMG"
 step "命名空间 $NS、RBAC 与 ServiceAccount kubeconfig；清空上次的数据与 Pod"
 docker rm -f "$SRV" "$FU" "$PG" >/dev/null 2>&1 || true
 K apply -f - <"$REPO/deploy/k8s/sandbox.yaml" | sed 's/^/         /'
+K apply -f - <"$REPO/deploy/k8s/admission-policy.yaml" | sed 's/^/         /'
 K -n "$NS" delete pods -l agentbox.io/managed=true --grace-period=0 --wait=true >/dev/null 2>&1 || true
 TOKEN=$(K -n "$NS" create token agentbox-server --duration=4h)
 CA=$(docker exec "$NODE" base64 -w0 /etc/kubernetes/pki/ca.crt)
@@ -148,6 +149,28 @@ ok "运维 token：$DATA/api.token（0600，不打印）"
 ok "kubeconfig（ServiceAccount $NS/agentbox-server 的短期 token，只能管理本命名空间的 Pod 与 NetworkPolicy）"
 [ "$(K auth can-i create pods --as "system:serviceaccount:$NS:agentbox-server" -n default)" = no ] || fail "ServiceAccount 不应能在其他命名空间创建 Pod"
 ok "kubectl auth can-i create pods -n default（以 ServiceAccount 身份）= no"
+# 准入策略：以 ServiceAccount 身份创建一个挂载宿主根目录的 Pod，必须被 ValidatingAdmissionPolicy 拒绝（策略生效
+# 需要数秒，重试至多 30 s）。
+evil_pod() {
+  K -n "$NS" create --dry-run=server --as "system:serviceaccount:$NS:agentbox-server" -f - <<'Y'
+apiVersion: v1
+kind: Pod
+metadata: {name: admission-probe, labels: {agentbox.io/managed: "true"}}
+spec:
+  automountServiceAccountToken: false
+  securityContext: {runAsNonRoot: true, runAsUser: 10001, seccompProfile: {type: RuntimeDefault}}
+  containers:
+    - name: s
+      image: registry.invalid/none
+      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      volumeMounts: [{name: host, mountPath: /host}]
+  volumes: [{name: host, hostPath: {path: /}}]
+Y
+}
+evil_rejected() { evil_pod 2>&1 | tee "$LOGDIR/admission.txt" | grep -q 'ValidatingAdmissionPolicy'; }
+wait_for "准入策略拒绝挂载宿主根目录的 Pod" 30 evil_rejected
+sed 's/^/         /' "$LOGDIR/admission.txt"
+ok "ValidatingAdmissionPolicy agentbox-sandbox-pods 生效：ServiceAccount 不能创建挂载槽位目录以外 hostPath 的 Pod"
 
 step "PostgreSQL 与 fake upstream"
 docker run -d --name "$PG" --network kind -e POSTGRES_USER=agentbox -e POSTGRES_PASSWORD=agentbox -e POSTGRES_DB=agentbox postgres:16-alpine >/dev/null

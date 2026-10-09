@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"k8s.io/klog/v2"
+
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/k8s"
 )
@@ -49,6 +51,13 @@ func prepareK8s(f k8sFlags, dataDir string, defaultMemory int64, stderr io.Write
 	if f.image == "" {
 		return nil, errors.New("--provider k8s 需要 --k8s-image")
 	}
+	// 槽位目录与 Gateway socket 的硬链接须 chown 到沙箱 UID（10001），只有 root 能做到；否则 Worker 无法
+	// 写 workspace、连接 socket。
+	if os.Geteuid() != 0 {
+		return nil, errors.New("--provider k8s 需要以 root 运行（槽位目录与 Gateway socket 须 chown 到沙箱 UID 10001）")
+	}
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	klog.SetSlogLogger(logger) // client-go 的日志（例如 exec 流的错误）进入同一 JSON 日志
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	ref, err := k8s.PinImage(ctx, f.image, f.strict, splitList(f.plainHTTP), nil)
@@ -68,7 +77,7 @@ func prepareK8s(f k8sFlags, dataDir string, defaultMemory int64, stderr io.Write
 		p, err := k8s.New(context.Background(), k8s.Options{Client: client, Executor: ex, Namespace: f.namespace,
 			InstallID: installID, Image: ref.Pinned(), RuntimeClass: f.runtimeClass, SlotHostDir: shared,
 			SlotNodeDir: f.nodeSharedDir, WarmPool: f.warmPool, WarmProfile: k8sWarmProfile(defaultMemory),
-			EnsureNetworkPolicy: true, Logger: slog.New(slog.NewJSONHandler(os.Stderr, nil))})
+			EnsureNetworkPolicy: true, Logger: logger})
 		if err != nil {
 			return nil, err
 		}

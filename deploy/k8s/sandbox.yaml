@@ -4,7 +4,9 @@
 #
 # Pod Security Standards: the sandbox Pod spec meets "restricted" except for the two hostPath volumes of the
 # node-local slot directory (workspace and Gateway socket), which "baseline" forbids; the namespace is
-# therefore not labelled for enforcement. See the design doc §2.2 for the multi-node alternative.
+# therefore not labelled for enforcement. Instead, admission-policy.yaml (ValidatingAdmissionPolicy) constrains
+# every Pod in this namespace — hostPath only below the slot directory, restricted securityContext — so the
+# ServiceAccount's pods:create cannot be used to mount arbitrary host paths. See the design doc §2.2 and §2.4.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -24,13 +26,13 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["create", "get"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
-    verbs: ["get", "create"]
+    verbs: ["create"] # the provider only creates the deny-all policy (AlreadyExists is fine)
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

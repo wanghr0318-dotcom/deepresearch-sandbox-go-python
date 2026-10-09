@@ -70,11 +70,22 @@ process — only one process per container. The exec API reuses kube-apiserver a
 inbound network access to the Pod, so it is the simplest correct option.
 
 `Freeze`/`Thaw`/`Procs`/`ResourceDiag` are also helper subcommands: `freeze` sends SIGSTOP to every
-process in the container except PID 1 and confirms state `T` in `/proc/<pid>/stat`; `thaw` sends
+process in the container except PID 1, re-lists `/proc` and stops newly forked processes, and succeeds only
+when two consecutive passes see the same set of processes, all in state `T` (a stopped process cannot fork,
+so a child forked between a listing and its parent's stop is caught by the next pass); `thaw` sends
 SIGCONT; `procs` lists the container's pids; `diag` reads `cpu.stat` and `memory.events` of the
 container's own cgroup (cgroup namespace). An OOM that kills the container (kubelet sets
 `memory.oom.group`) is reported from the container status (`OOMKilled`). Pids are container-namespace
 pids, which is all `Procs` is used for (baseline comparison).
+
+**Trust boundary.** The helper runs with the same UID and in the same PID namespace as the untrusted
+workload. Everything it produces inside the Pod — pid and status files in `/run/agentbox-exec`, the ack
+line, `freeze`/`procs`/`diag` answers — can be tampered with by the workload, which can also signal or kill
+helper processes. Helper output is therefore advisory and only affects the workload's own attempt (its
+reported exit status, CPU accounting, whether a freeze is confirmed). Every safety decision relies on
+API-server facts: container state and exit for `Stop`/`Destroy`, `OOMKilled` from the container status,
+`activeDeadlineSeconds` for killing, Pod deletion (verified NotFound) for cleanup. A workload that defeats
+`freeze` gains only CPU time in its own Pod; it cannot escape `Stop`.
 
 ### 2.2 Workspace and Gateway socket: node-local shared hostPath ("slots")
 
@@ -84,7 +95,7 @@ control plane and the Pod. The provider requires a data directory that is the **
 server and the node (on kind: an `extraMounts` entry; the server runs in a container that bind-mounts the
 same docker-host path).
 
-Every Pod gets a slot directory `<data>/k8s/slots/<pod>/{workspace,run}` mounted as hostPath at
+Every Pod gets a slot directory `<data>/k8s-slots/<pod>/{workspace,run}` mounted as hostPath at
 `/workspace` and `/run/agentbox`. Because a warm Pod's volumes are fixed before its environment is known,
 the environment is bound to the slot at claim time:
 
@@ -94,10 +105,16 @@ the environment is bound to the slot at claim time:
 - **Workspace**: the app created `<data>/workspaces/<id>` (a plain directory, or a symlink left by a
   previous environment). Its entries are moved (same-filesystem `rename`) into `slot/workspace`, and the
   workspace path is atomically replaced by a symlink to the slot. The host side keeps using the same path;
-  the next environment for the same task/session moves the entries on. `Destroy` never deletes a
-  workspace slot that a workspace symlink points to.
+  the next environment for the same task/session moves the entries on. A host-only back-reference file
+  (`<slot>/workspace.ref`, not mounted into the Pod) records the workspace path. `Destroy` keeps a slot's
+  workspace while that path is still a symlink to it; a periodic slot GC (every minute, slots older than
+  10 min) removes slots whose Pod is gone and whose workspace path no longer points at them — e.g. after
+  a session is closed and its workspace directory (with the symlink) is deleted. The Pod annotation
+  `agentbox.io/workspace-sha256` carries only a hash of the host path.
 - **Session restore files** (`Mounts.RestoreDir`): hard-linked into `slot/run/restore/`; the provider
-  removes them on `Stop`.
+  removes them on `Stop`. Semantics differ from the local provider's read-only bind of the directory: a
+  file the host deletes from `RestoreDir` stays visible in the Pod (the hard link keeps the inode) until
+  `Stop`, and the Pod sees the files present at `Create` time, not files added later.
 
 Trade-off: this is single-node. On a multi-node cluster the same contract would be met by a RWX volume for
 workspaces and a socket proxy for the Gateway (an in-pod Unix listener that forwards over an authenticated
@@ -150,10 +167,27 @@ exec environments, which this provider does not create, so it returns `ErrNotFou
   `capabilities.drop: [ALL]`, `privileged: false`.
 - Resources: `requests = limits`: memory = `Limits.MemoryMax`, cpu = `CPUQuotaUs/100000` cores. `/tmp` is a
   memory-backed `emptyDir` with `sizeLimit = TmpBytes` (counts against the memory limit, like the local
-  tmpfs). `PidsMax` has no per-Pod field; it is the kubelet's `podPidsLimit` (set in the kind config).
-  `NoFile` is applied by the helper.
+  tmpfs). `PidsMax` has no per-Pod field; it is the kubelet's `podPidsLimit`. **Deployment
+  prerequisite:** set `podPidsLimit` on the sandbox nodes (`deploy/k8s/kind-config.yaml` sets 512);
+  without it a fork bomb is bounded only by the node. `NoFile` is applied by the helper.
 - NetworkPolicy `agentbox-sandbox-deny-all` (created at startup) selects `agentbox.io/managed=true` with
   `policyTypes: [Ingress, Egress]` and no rules.
+- **Admission policy** (`deploy/k8s/admission-policy.yaml`, a ValidatingAdmissionPolicy bound to the
+  namespace). The hostPath slot volumes rule out Pod Security "baseline", so the namespace cannot enforce
+  PSS, and `pods: create` alone would let the server's ServiceAccount mount any host path or run privileged
+  Pods. The policy applies to *every* Pod in the namespace (not only labelled ones). It requires:
+  - hostPath only below the slot prefix, and no `..`;
+  - no host namespaces, no hostPort, no ServiceAccount token, no init or ephemeral containers;
+  - `runAsNonRoot` with a non-zero UID and `RuntimeDefault` seccomp;
+  - per container: no privilege escalation, not privileged, read-only root, drop `ALL` and add nothing.
+
+  `scripts/demo-k8s.sh` applies it and checks that a violating Pod is rejected. RBAC is limited to
+  Pods (no `deletecollection`), `pods/exec`, and `create` on NetworkPolicies.
+
+  **Residual risk:** a compromised control plane holding the ServiceAccount token can still create
+  compliant Pods with any image, mount *another* environment's slot (the prefix is shared), and exec into
+  any sandbox Pod in the namespace. Closing that would need per-environment admission (for example a
+  policy parameter binding slot paths to Pod names) or a node-side volume plugin.
 
 ### 2.5 Image pinning
 
@@ -176,7 +210,12 @@ exec environments, which this provider does not create, so it returns `ErrNotFou
   annotation, env label and `state=assigned` under the listed `resourceVersion`; on conflict try the next.
 - A background loop keeps `N` warm Pods (counting pending ones), deletes warm Pods of other pool keys
   (e.g. after an image change) and failed warm Pods, and refills immediately after each claim. Warm Pods
-  are single-use: a Pod is destroyed with its environment, never returned to the pool.
+  are single-use: a Pod is destroyed with its environment, never returned to the pool. A warm Pod that is
+  not Ready after `WarmReadyTimeout` (default 3 min: Pending, ImagePullBackOff, unschedulable) is logged
+  with its waiting reason and replaced.
+- Resource accounting: warm Pods hold their requests (memory, CPU) on the node while idle; they are **not**
+  counted in the server's admission capacity (`--memory-bytes`, run slots), which only counts assigned
+  environments. Size the node for `run slots + pool size` Pods of the pool profile.
 - Metrics: every `Create` records `path=warm|cold` and the latency to "ready for StartExec";
   `Provider.Stats()` returns P50/P95 per path, and the server logs each start.
 
