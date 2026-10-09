@@ -14,6 +14,7 @@ import (
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 )
 
@@ -93,7 +94,16 @@ type shellReq struct {
 // ExecShell runs a workspace command (see the comment at the top of this file). Rejections and failures are returned
 // as Result.Status/Code with a nil error, as for Exec; a non-nil error is an internal failure or ctx ending (the
 // command continues in the background and settles, so the same call id replays it).
-func (c *Coordinator) ExecShell(ctx context.Context, in ShellInvoke) (Result, error) {
+func (c *Coordinator) ExecShell(ctx context.Context, in ShellInvoke) (res Result, err error) {
+	ctx, span := obs.Start(ctx, "gateway.call", callAttrs(kindExecShell, in.TaskID, in.AttemptID, in.CallID, in.SubrunID)...)
+	defer func() { endCall(span, kindExecShell, in.TaskID, res, err) }()
+	return c.shellCall(ctx, in)
+}
+
+// kindExecShell is the observability kind of workspace commands (gateway.kind, metric kind label).
+const kindExecShell = "exec_shell"
+
+func (c *Coordinator) shellCall(ctx context.Context, in ShellInvoke) (Result, error) {
 	if in.TaskID == "" || in.AttemptID == "" || in.CallID == "" {
 		return Result{}, fmt.Errorf("%w: ExecShell 缺少 task_id、attempt_id 或 call_id", persistence.ErrInvalid)
 	}

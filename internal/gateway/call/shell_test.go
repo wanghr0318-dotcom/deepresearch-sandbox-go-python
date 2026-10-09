@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs/obstest"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
@@ -193,5 +194,25 @@ func TestShellStagedMarker(t *testing.T) {
 	r := h.exec(t, xinv("x1", execBody("print(1)", "")))
 	if strings.Contains(string(r.Body), "workspace_staged") {
 		t.Fatalf("/v1/exec result mentions workspace_staged: %s", r.Body)
+	}
+}
+
+// Workspace commands are traced and counted like exec, under their own kind (S1 observability).
+func TestShellObservability(t *testing.T) {
+	tr, rec := obstest.Install(t)
+	h := newExecHarness(t, nil, execScript{stdout: string(StagedMarker) + "ok\n"})
+	parseExecResult(t, h.shell(t, sinv("o1", "true")))
+	spans := tr.Named("gateway.call")
+	if len(spans) != 1 || spans[0].Attrs["gateway.kind"] != kindExecShell || spans[0].Attrs["call.result"] != ResultCompleted {
+		t.Fatalf("spans %+v", spans)
+	}
+	found := false
+	for _, e := range rec.Events() {
+		if strings.Contains(e, "kind=exec_shell") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no exec_shell metric: %v", rec.Events())
 	}
 }

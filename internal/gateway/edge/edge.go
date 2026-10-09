@@ -30,8 +30,8 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/mcp"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
-	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/workspace"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/subrun"
 )
 
@@ -884,7 +884,7 @@ func (t *target) workspaceExec(w http.ResponseWriter, r *http.Request, tc *track
 		Retry: strings.EqualFold(strings.TrimSpace(r.Header.Get(HeaderRetry)), "true")}
 	stop := detached(r, tc)
 	defer stop()
-	res, err := t.e.cfg.Workspace.Exec(t.ctx, in)
+	res, err := t.e.cfg.Workspace.Exec(t.callCtx(r), in) // trace parent from the worker; cancellation is the target's
 	if err != nil {
 		t.internalError(w, "workspace_exec", err, "call_id", callID)
 		return
