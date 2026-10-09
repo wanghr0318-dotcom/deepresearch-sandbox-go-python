@@ -95,13 +95,33 @@ func TestWarmClaimFallsBackOnConflict(t *testing.T) {
 	}
 }
 
-// TestTwoClaimersNeverShareAPod: concurrent Creates against a pool of two each get their own Pod.
+// TestTwoClaimersNeverShareAPod: concurrent Creates against a pool of two each get their own Pod. A barrier
+// in the update path holds both claimers' first Update until both have arrived, so both carry the same
+// (listed) resourceVersion for the same oldest Pod: exactly one wins, the other gets a Conflict and claims
+// the next Pod.
 func TestTwoClaimersNeverShareAPod(t *testing.T) {
 	fastPool(t)
 	c := newFakeCluster(t, 0)
 	enforceRV(c.client)
 	p := newTestProvider(t, c.client, c.exec, func(o *Options) { o.WarmPool = 2; o.WarmProfile = testLimits() })
 	readyWarm(t, p, 2)
+	// Barrier: the first claim attempt of each claimer waits until both have listed and chosen a Pod.
+	var arrived atomic.Int32
+	both := make(chan struct{})
+	var firstTarget sync.Map
+	p.pool.beforeClaim = func(pod string) {
+		n := arrived.Add(1)
+		firstTarget.Store(n, pod)
+		switch {
+		case n == 2:
+			close(both)
+		case n < 2:
+			select {
+			case <-both:
+			case <-time.After(5 * time.Second):
+			}
+		}
+	}
 	var wg sync.WaitGroup
 	errs := make([]error, 2)
 	for i := range errs {
@@ -121,6 +141,15 @@ func TestTwoClaimersNeverShareAPod(t *testing.T) {
 	if a == b {
 		t.Fatalf("both environments bound to %s", a)
 	}
+	t1, _ := firstTarget.Load(int32(1))
+	t2, _ := firstTarget.Load(int32(2))
+	if t1 != t2 || arrived.Load() != 3 {
+		t.Fatalf("both first claims should target the same Pod (%v, %v) and the loser retry once (%d attempts)", t1, t2, arrived.Load())
+	}
+	if s := p.Stats(); s["warm"].Count != 2 || s["cold"].Count != 0 {
+		t.Fatalf("both claims should be warm: %+v", s)
+	}
+
 	for _, name := range []string{a, b} {
 		pod, _ := c.client.CoreV1().Pods(testNS).Get(context.Background(), name, metav1.GetOptions{})
 		if o, ok := parseOwner(pod); !ok || pod.Labels[LabelEnv] != labelValue(o.EnvID) {
@@ -135,6 +164,9 @@ func TestStuckWarmPodIsReplaced(t *testing.T) {
 	fastPool(t)
 	c := newFakeCluster(t, time.Hour) // the fake kubelet never starts them
 	enforceRV(c.client)
+	oldBase := warmBackoffBase
+	warmBackoffBase = time.Millisecond
+	t.Cleanup(func() { warmBackoffBase = oldBase })
 	p := newTestProvider(t, c.client, c.exec, func(o *Options) {
 		o.WarmPool = 1
 		o.WarmProfile = testLimits()
@@ -155,4 +187,42 @@ func TestStuckWarmPodIsReplaced(t *testing.T) {
 	if pods, _ := p.pool.warmPods(context.Background()); len(pods) > 1 {
 		t.Fatalf("pool grew beyond its size: %d", len(pods))
 	}
+	if p.WarmStuck() < 2 {
+		t.Fatalf("WarmStuck = %d", p.WarmStuck())
+	}
+}
+
+// TestStuckWarmPodsBackOff: after a stuck warm Pod is replaced, creation waits warmBackoffBase·2^(n-1), so a
+// permanently failing image does not churn Pods every WarmReadyTimeout.
+func TestStuckWarmPodsBackOff(t *testing.T) {
+	fastPool(t)
+	c := newFakeCluster(t, time.Hour)
+	enforceRV(c.client)
+	oldBase := warmBackoffBase
+	warmBackoffBase = time.Second
+	t.Cleanup(func() { warmBackoffBase = oldBase })
+	p := newTestProvider(t, c.client, c.exec, func(o *Options) {
+		o.WarmPool = 1
+		o.WarmProfile = testLimits()
+		o.WarmReadyTimeout = 50 * time.Millisecond
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for p.WarmStuck() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if p.WarmStuck() == 0 {
+		t.Fatal("no stuck replacement")
+	}
+	time.Sleep(500 * time.Millisecond) // well inside the 1 s backoff
+	if pods, _ := p.pool.warmPods(context.Background()); len(pods) != 0 || p.WarmStuck() != 1 {
+		t.Fatalf("during backoff: %d warm pods, %d stuck replacements", len(pods), p.WarmStuck())
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if pods, _ := p.pool.warmPods(context.Background()); len(pods) == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("pool did not recreate after the backoff")
 }

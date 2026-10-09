@@ -117,34 +117,50 @@ func (s slots) swingWorkspace(pod, ws string) error {
 	default:
 		return fmt.Errorf("k8s: workspace %s is neither a directory nor a symlink", ws)
 	}
+	// The back-reference is written before any entry moves: if the process dies mid-swing, referenced()
+	// keeps this slot (non-empty workspace, workspace path still present) instead of letting gc delete data.
+	if err := os.WriteFile(filepath.Join(s.hostDir(pod), workspaceRef), []byte(ws), 0o600); err != nil {
+		return fmt.Errorf("k8s: workspace back-reference: %w", err)
+	}
+	var moved []string
+	rollback := func(cause error) error {
+		for i := len(moved) - 1; i >= 0; i-- {
+			if err := os.Rename(filepath.Join(target, moved[i]), filepath.Join(src, moved[i])); err != nil {
+				return fmt.Errorf("%w (rollback of %s failed: %v; data is in %s)", cause, moved[i], err, target)
+			}
+		}
+		return cause
+	}
 	if ents, err := os.ReadDir(src); err == nil {
 		for _, e := range ents {
 			if err := os.Rename(filepath.Join(src, e.Name()), filepath.Join(target, e.Name())); err != nil {
-				return fmt.Errorf("k8s: move workspace entry %s: %w", e.Name(), err)
+				return rollback(fmt.Errorf("k8s: move workspace entry %s: %w", e.Name(), err))
 			}
+			moved = append(moved, e.Name())
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("k8s: read workspace: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(s.hostDir(pod), workspaceRef), []byte(ws), 0o600); err != nil {
-		return fmt.Errorf("k8s: workspace back-reference: %w", err)
-	}
 	if src == ws {
 		if err := os.Remove(ws); err != nil {
-			return fmt.Errorf("k8s: replace workspace directory: %w", err)
+			return rollback(fmt.Errorf("k8s: replace workspace directory: %w", err))
 		}
 		if err := os.Symlink(target, ws); err != nil {
-			return fmt.Errorf("k8s: workspace symlink: %w", err)
+			if merr := os.Mkdir(ws, 0o700); merr != nil {
+				return fmt.Errorf("k8s: workspace symlink: %w (and recreating %s: %v; data is in %s)", err, ws, merr, target)
+			}
+			return rollback(fmt.Errorf("k8s: workspace symlink: %w", err))
 		}
 		return nil
 	}
 	tmp := ws + ".swing-" + pod
 	_ = os.Remove(tmp)
 	if err := os.Symlink(target, tmp); err != nil {
-		return fmt.Errorf("k8s: workspace symlink: %w", err)
+		return rollback(fmt.Errorf("k8s: workspace symlink: %w", err))
 	}
 	if err := os.Rename(tmp, ws); err != nil {
-		return fmt.Errorf("k8s: workspace symlink: %w", err)
+		_ = os.Remove(tmp)
+		return rollback(fmt.Errorf("k8s: workspace symlink: %w", err))
 	}
 	// The previous slot's workspace is now empty; drop it, its back-reference and its slot directory if
 	// nothing else is left.
@@ -156,15 +172,25 @@ func (s slots) swingWorkspace(pod, ws string) error {
 	return nil
 }
 
-// referenced reports whether the slot's workspace still holds a workspace's data: its back-reference names a
-// path that is a symlink to this slot.
+// referenced reports whether the slot's workspace may still hold a workspace's data: its back-reference names
+// a path that still exists and either is a symlink to this slot, or the slot's workspace is not empty (an
+// interrupted swing: some entries were moved here but the workspace path was not switched yet). Only when
+// the workspace path is gone (e.g. a closed session deleted it), or the slot is empty and unreferenced, may
+// the slot be deleted.
 func (s slots) referenced(pod string) bool {
-	ws, err := os.ReadFile(filepath.Join(s.hostDir(pod), workspaceRef))
+	b, err := os.ReadFile(filepath.Join(s.hostDir(pod), workspaceRef))
 	if err != nil {
 		return false
 	}
-	dst, err := os.Readlink(string(ws))
-	return err == nil && dst == s.workspace(pod)
+	ws := string(b)
+	if _, err := os.Lstat(ws); err != nil {
+		return false
+	}
+	if dst, err := os.Readlink(ws); err == nil && dst == s.workspace(pod) {
+		return true
+	}
+	ents, err := os.ReadDir(s.workspace(pod))
+	return err == nil && len(ents) > 0
 }
 
 // unbindRun removes the Gateway socket link and restore links of a stopped Pod.

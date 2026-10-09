@@ -208,6 +208,17 @@ func (p *Provider) Image() string { return p.opt.Image }
 // Stats returns the start-latency summary per path ("warm", "cold").
 func (p *Provider) Stats() map[string]LatencySummary { return p.stats.summary() }
 
+// WarmStuck returns how many warm Pods were replaced because they never became Ready (a metric for a
+// permanently failing image or an unschedulable pool profile).
+func (p *Provider) WarmStuck() int {
+	if p.pool == nil {
+		return 0
+	}
+	p.pool.mu.Lock()
+	defer p.pool.mu.Unlock()
+	return p.pool.stuckTotal
+}
+
 func (p *Provider) pods() podClient { return p.client.CoreV1().Pods(p.opt.Namespace) }
 
 type podClient = interface {

@@ -5,7 +5,7 @@
 # Pod Security Standards: the sandbox Pod spec meets "restricted" except for the two hostPath volumes of the
 # node-local slot directory (workspace and Gateway socket), which "baseline" forbids; the namespace is
 # therefore not labelled for enforcement. Instead, admission-policy.yaml (ValidatingAdmissionPolicy) constrains
-# every Pod in this namespace — hostPath only below the slot directory, restricted securityContext — so the
+# every Pod in this namespace — hostPath only of the exact slot form, emptyDir otherwise, restricted securityContext — so the
 # ServiceAccount's pods:create cannot be used to mount arbitrary host paths. See the design doc §2.2 and §2.4.
 apiVersion: v1
 kind: Namespace

@@ -22,10 +22,25 @@ type pool struct {
 
 	mu       sync.Mutex
 	creating int
+	// stuckStreak counts consecutive stuck replacements (reset when a warm Pod becomes Ready); while it is
+	// positive, creation waits until holdUntil (exponential backoff), so a permanently failing image or an
+	// unschedulable profile does not churn Pods every WarmReadyTimeout.
+	stuckStreak int
+	holdUntil   time.Time
+	stuckTotal  int
+
+	// beforeClaim is a test hook: called with the Pod name just before the claiming Update.
+	beforeClaim func(pod string)
 }
 
 // poolInterval is how often the pool reconciles without being kicked (dead warm Pods, foreign keys).
 var poolInterval = 2 * time.Second
+
+// warmBackoffBase and warmBackoffMax bound the creation backoff after stuck warm Pods.
+var (
+	warmBackoffBase = 10 * time.Second
+	warmBackoffMax  = 30 * time.Minute
+)
 
 func (pl *pool) run(ctx context.Context) {
 	t := time.NewTicker(poolInterval)
@@ -76,10 +91,26 @@ func (pl *pool) reconcile(ctx context.Context) {
 		stuck := !ready(pod) && !pod.CreationTimestamp.IsZero() && time.Since(pod.CreationTimestamp.Time) > pl.p.opt.WarmReadyTimeout
 		if pod.Labels[LabelPool] == pl.key && !stopped(pod) && !stuck {
 			alive++
+			if ready(pod) {
+				pl.mu.Lock()
+				pl.stuckStreak = 0
+				pl.mu.Unlock()
+			}
 			continue
 		}
 		if stuck {
-			pl.p.log.Warn("k8s: warm pod not ready, replacing", "pod", pod.Name, "phase", pod.Status.Phase, "reason", waitingReason(pod))
+			pl.mu.Lock()
+			pl.stuckStreak++
+			pl.stuckTotal++
+			wait := warmBackoffBase << min(pl.stuckStreak-1, 20)
+			if wait > warmBackoffMax || wait <= 0 {
+				wait = warmBackoffMax
+			}
+			pl.holdUntil = time.Now().Add(wait)
+			streak := pl.stuckStreak
+			pl.mu.Unlock()
+			pl.p.log.Warn("k8s: warm pod not ready, replacing", "pod", pod.Name, "phase", pod.Status.Phase,
+				"reason", waitingReason(pod), "stuck_streak", streak, "next_create_in", wait.String())
 		}
 		// Other pool key (image or profile changed), dead, or stuck: replace it.
 		if err := pl.p.deletePod(ctx, pod); err == nil && pl.p.slots.enabled() {
@@ -88,6 +119,9 @@ func (pl *pool) reconcile(ctx context.Context) {
 	}
 	pl.mu.Lock()
 	missing := pl.size - alive - pl.creating
+	if time.Now().Before(pl.holdUntil) {
+		missing = 0 // backing off after stuck warm Pods
+	}
 	if missing > 0 {
 		pl.creating += missing
 	}
@@ -125,7 +159,13 @@ func (pl *pool) claim(ctx context.Context, o owner, ws string) *corev1.Pod {
 	if err != nil {
 		return nil
 	}
-	sort.Slice(pods, func(i, j int) bool { return pods[i].CreationTimestamp.Before(&pods[j].CreationTimestamp) })
+	// Oldest first; ties (timestamps have second resolution) broken by name so every claimer sees one order.
+	sort.Slice(pods, func(i, j int) bool {
+		if !pods[i].CreationTimestamp.Equal(&pods[j].CreationTimestamp) {
+			return pods[i].CreationTimestamp.Before(&pods[j].CreationTimestamp)
+		}
+		return pods[i].Name < pods[j].Name
+	})
 	for i := range pods {
 		pod := pods[i].DeepCopy()
 		if pod.Labels[LabelPool] != pl.key || !ready(pod) {
@@ -139,6 +179,9 @@ func (pl *pool) claim(ctx context.Context, o owner, ws string) *corev1.Pod {
 		pod.Annotations[AnnoOwner] = o.encode()
 		if ws != "" {
 			pod.Annotations[AnnoWorkspace] = pathHash(ws)
+		}
+		if pl.beforeClaim != nil {
+			pl.beforeClaim(pod.Name)
 		}
 		updated, err := pl.p.pods().Update(ctx, pod, metav1.UpdateOptions{})
 		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {

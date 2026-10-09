@@ -149,28 +149,48 @@ ok "运维 token：$DATA/api.token（0600，不打印）"
 ok "kubeconfig（ServiceAccount $NS/agentbox-server 的短期 token，只能管理本命名空间的 Pod 与 NetworkPolicy）"
 [ "$(K auth can-i create pods --as "system:serviceaccount:$NS:agentbox-server" -n default)" = no ] || fail "ServiceAccount 不应能在其他命名空间创建 Pod"
 ok "kubectl auth can-i create pods -n default（以 ServiceAccount 身份）= no"
-# 准入策略：以 ServiceAccount 身份创建一个挂载宿主根目录的 Pod，必须被 ValidatingAdmissionPolicy 拒绝（策略生效
-# 需要数秒，重试至多 30 s）。
-evil_pod() {
-  K -n "$NS" create --dry-run=server --as "system:serviceaccount:$NS:agentbox-server" -f - <<'Y'
-apiVersion: v1
-kind: Pod
-metadata: {name: admission-probe, labels: {agentbox.io/managed: "true"}}
-spec:
-  automountServiceAccountToken: false
-  securityContext: {runAsNonRoot: true, runAsUser: 10001, seccompProfile: {type: RuntimeDefault}}
-  containers:
-    - name: s
-      image: registry.invalid/none
-      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
-      volumeMounts: [{name: host, mountPath: /host}]
-  volumes: [{name: host, hostPath: {path: /}}]
-Y
+# 准入策略：以 ServiceAccount 身份（--dry-run=server，经过准入但不创建）提交探测 Pod。合规的 Pod（与 provider
+# 创建的形状相同）必须被接受；下列每一种违规都必须被 ValidatingAdmissionPolicy 拒绝（策略生效需要数秒，第一个
+# 探测重试至多 30 s）。
+# probe_pod <volume JSON> <容器 securityContext 覆盖 JSON>：输出探测 Pod 的 JSON。
+probe_pod() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+vol, extra = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+sc = {"allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True, "capabilities": {"drop": ["ALL"]}}
+sc.update(extra)
+print(json.dumps({"apiVersion": "v1", "kind": "Pod",
+  "metadata": {"name": "admission-probe", "labels": {"agentbox.io/managed": "true"}},
+  "spec": {"automountServiceAccountToken": False,
+    "securityContext": {"runAsNonRoot": True, "runAsUser": 10001, "seccompProfile": {"type": "RuntimeDefault"}},
+    "containers": [{"name": "s", "image": "registry.invalid/none", "securityContext": sc,
+                    "volumeMounts": [{"name": "v", "mountPath": "/v"}]}],
+    "volumes": [dict(vol, name="v")]}}))
+PY
 }
-evil_rejected() { evil_pod >"$LOGDIR/admission.txt" 2>&1 && return 1; grep -q 'ValidatingAdmissionPolicy' "$LOGDIR/admission.txt"; }
-wait_for "准入策略拒绝挂载宿主根目录的 Pod" 30 evil_rejected
-sed 's/^/         /' "$LOGDIR/admission.txt"
-ok "ValidatingAdmissionPolicy agentbox-sandbox-pods 生效：ServiceAccount 不能创建挂载槽位目录以外 hostPath 的 Pod"
+probe() { # probe <描述> <volume JSON> <securityContext 覆盖 JSON>；输出 admitted 或拒绝原因
+  local out
+  if out=$(probe_pod "$2" "$3" | K -n "$NS" create --dry-run=server --as "system:serviceaccount:$NS:agentbox-server" -f - 2>&1); then
+    printf '%-44s admitted\n' "$1"
+  else
+    printf '%-44s DENIED: %s\n' "$1" "$(echo "$out" | sed -n 's/.*denied request: //p' | head -n 1)"
+  fi
+}
+SLOT_OK='{"hostPath":{"path":"/var/lib/agentbox-k8s/data/k8s-slots/abx-0123456789ab/workspace","type":"Directory"}}'
+root_denied() { probe "hostPath /" '{"hostPath":{"path":"/"}}' '{}' | grep -q DENIED; }
+wait_for "准入策略生效（拒绝 hostPath /）" 30 root_denied
+{
+  probe "compliant (provider shape)" "$SLOT_OK" '{}'
+  probe "hostPath /" '{"hostPath":{"path":"/"}}' '{}'
+  probe "hostPath below a slot (symlink-shaped)" '{"hostPath":{"path":"/var/lib/agentbox-k8s/data/k8s-slots/abx-0123456789ab/workspace/x"}}' '{}'
+  probe "container runAsNonRoot: false" "$SLOT_OK" '{"runAsNonRoot":false}'
+  probe "container seccomp Unconfined" "$SLOT_OK" '{"seccompProfile":{"type":"Unconfined"}}'
+  probe "projected ServiceAccount token volume" '{"projected":{"sources":[{"serviceAccountToken":{"path":"token"}}]}}' '{}'
+} | tee "$LOGDIR/admission.txt" | sed 's/^/         /'
+[ "$(grep -c 'admitted$' "$LOGDIR/admission.txt")" = 1 ] && grep -q '^compliant.*admitted$' "$LOGDIR/admission.txt" ||
+  fail "合规的探测 Pod 应被接受，其余应被拒绝"
+[ "$(grep -c DENIED "$LOGDIR/admission.txt")" = 5 ] || fail "有违规的探测 Pod 未被拒绝"
+ok "ValidatingAdmissionPolicy agentbox-sandbox-pods：合规形状被接受，5 种违规（宿主根、符号链接形路径、容器级 runAsNonRoot/seccomp 覆盖、projected token）均被拒绝"
 
 step "PostgreSQL 与 fake upstream"
 docker run -d --name "$PG" --network kind -e POSTGRES_USER=agentbox -e POSTGRES_PASSWORD=agentbox -e POSTGRES_DB=agentbox postgres:16-alpine >/dev/null

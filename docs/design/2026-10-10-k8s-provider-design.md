@@ -176,18 +176,38 @@ exec environments, which this provider does not create, so it returns `ErrNotFou
   namespace). The hostPath slot volumes rule out Pod Security "baseline", so the namespace cannot enforce
   PSS, and `pods: create` alone would let the server's ServiceAccount mount any host path or run privileged
   Pods. The policy applies to *every* Pod in the namespace (not only labelled ones). It requires:
-  - hostPath only below the slot prefix, and no `..`;
-  - no host namespaces, no hostPort, no ServiceAccount token, no init or ephemeral containers;
-  - `runAsNonRoot` with a non-zero UID and `RuntimeDefault` seccomp;
-  - per container: no privilege escalation, not privileged, read-only root, drop `ALL` and add nothing.
+  - volumes: only `emptyDir` and `hostPath` (no projected/secret/configMap/serviceAccountToken/PVC);
+  - hostPath exactly `<slot dir>/abx-<12 hex>/(workspace|run)`, matched as a regular expression. The slot
+    directory and these two subdirectories are created by the server (root; the slot directory is 0700), so
+    a sandbox cannot turn them into symlinks. A deeper path such as `…/workspace/x` is refused: the sandbox
+    could make it a symlink to `/`, and the kubelet would follow it;
+  - no host namespaces, no hostPort, no ServiceAccount token, only the `default` ServiceAccount, no init or
+    ephemeral containers;
+  - `runAsNonRoot` with a non-zero UID and `RuntimeDefault` seccomp on the Pod;
+  - per container: no privilege escalation, not privileged, read-only root, drop `ALL` and add nothing, and
+    no container-level override (`runAsNonRoot: false`, `runAsUser: 0`, a seccomp profile other than
+    `RuntimeDefault`).
 
-  `scripts/demo-k8s.sh` applies it and checks that a violating Pod is rejected. RBAC is limited to
-  Pods (no `deletecollection`), `pods/exec`, and `create` on NetworkPolicies.
+  `scripts/demo-k8s.sh` applies the policy and submits probe Pods as the ServiceAccount, using
+  `--dry-run=server`. The provider-shaped Pod must be admitted. Five probes must be denied: `hostPath: /`,
+  a symlink-shaped path below a slot, container `runAsNonRoot: false`, container seccomp `Unconfined`, and a
+  projected ServiceAccount-token volume. RBAC is limited to Pods (no `deletecollection`), `pods/exec`, and
+  `create` on NetworkPolicies.
 
-  **Residual risk:** a compromised control plane holding the ServiceAccount token can still create
-  compliant Pods with any image, mount *another* environment's slot (the prefix is shared), and exec into
-  any sandbox Pod in the namespace. Closing that would need per-environment admission (for example a
-  policy parameter binding slot paths to Pod names) or a node-side volume plugin.
+  **What the policy protects, and what it does not.** It protects against a **leaked ServiceAccount token**:
+  whoever holds the token can no longer get a privileged Pod, a host mount outside the slot layout, or a
+  token-bearing Pod. Within the policy, the worst case for a token holder is still significant:
+  - run compliant Pods with **any image**;
+  - mount **another environment's slot** (`workspace`/`run` of any `abx-…` Pod), which means reading and
+    writing that environment's workspace and connecting to its Gateway socket, i.e. spending its budget;
+  - **exec into any sandbox Pod** in the namespace.
+
+  Closing those gaps needs per-environment admission, for example a policy parameter or a mutating webhook
+  that binds each slot path to the Pod name it was created for. That is the next step; an image allowlist
+  is a cheaper partial measure. The policy is **irrelevant against a compromised server process** in the
+  documented deployment: the server runs as root on the node with the slot directory and the data
+  directory, so it already holds every workspace, socket and the database credentials without going
+  through the API. The policy narrows what a stolen token can do; it does not contain the control plane.
 
 ### 2.5 Image pinning
 

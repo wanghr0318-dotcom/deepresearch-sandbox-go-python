@@ -105,6 +105,22 @@ The server itself uses a ServiceAccount token from `deploy/k8s/sandbox.yaml`. Th
 `pods/exec` and NetworkPolicies in `agentbox-sandbox`. As that identity,
 `kubectl auth can-i create pods -n default` returns `no`.
 
+**Admission policy** (`deploy/k8s/admission-policy.yaml`, kind 1.34, demo step 4). These are probe Pods submitted
+as the server's ServiceAccount with `--dry-run=server`:
+
+```
+compliant (provider shape)              admitted
+hostPath /                              DENIED: only emptyDir volumes and hostPath volumes of the form <slot dir>/abx-<12 hex>/(workspace|run) are allowed
+hostPath below a slot (symlink-shaped)  DENIED: (same rule)
+container runAsNonRoot: false           DENIED: containers must be unprivileged: … no runAsNonRoot/runAsUser/seccomp override
+container seccomp Unconfined            DENIED: (same rule)
+projected ServiceAccount token volume   DENIED: only emptyDir volumes and hostPath volumes … are allowed
+```
+
+With the policy active, the server's real Pods (warm and cold) were admitted, and all 11 demo steps passed. The
+policy protects against a leaked token. It does not protect against a compromised server process that runs as
+root on the node; see design §2.4.
+
 Known gap, observed during design experiments: kindnet's NetworkPolicy implementation does not filter
 traffic to host-network endpoints. A sandbox Pod could still open a TCP connection to the API server's node
 address. It has no ServiceAccount token, so only anonymous discovery endpoints answer. With Calico or
