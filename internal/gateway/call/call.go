@@ -59,6 +59,9 @@ const (
 // ReasonCancel 是取消类离开原因（task_control.desired = cancel 生效时的撤销）：只有它取消在途 try（§9.1 表）。
 const ReasonCancel = "cancel"
 
+// errNoSlot 是不等待的槽位获取（对冲）在槽位已满时的错误。
+var errNoSlot = errors.New("call: 没有空闲的在途槽位")
+
 // ErrClosed 表示 Coordinator 已关闭。
 var ErrClosed = errors.New("call: coordinator 已关闭")
 
@@ -173,6 +176,8 @@ type Config struct {
 	Cache CacheSource
 	// Exec 装配 POST /v1/exec（§10，exec.go）；nil 表示关闭（404 endpoint_not_configured）。
 	Exec *ExecConfig
+	// Routing 配置模型降级链（routing.go）：只对实现 upstream.Router 且路由多于一条的 adapter 生效。
+	Routing RoutingConfig
 }
 
 // Invoke 是一次 Worker 请求。
@@ -216,6 +221,8 @@ type Coordinator struct {
 	cache        CacheSource
 	exec         *ExecConfig // 已取默认值；nil 表示未配置 exec
 	execInputMax int64       // exec 输入累计上限（MaxExecInputBytes；测试可调小）
+	routing      RoutingConfig
+	routes       map[upstream.Kind]*routeSet // 多路由的类别（模型降级链）；单供应商的类别不在其中
 
 	root context.Context
 	stop context.CancelFunc
@@ -319,6 +326,13 @@ func New(cfg Config) (*Coordinator, error) {
 	if c.storeTimeout <= 0 {
 		c.storeTimeout = 30 * time.Second
 	}
+	c.routing = cfg.Routing.withDefaults()
+	c.routes = map[upstream.Kind]*routeSet{}
+	for k, a := range c.adapters {
+		if rs := c.newRouteSet(a); rs != nil {
+			c.routes[k] = rs
+		}
+	}
 	c.root, c.stop = context.WithCancel(context.Background())
 	return c, nil
 }
@@ -375,7 +389,7 @@ func statusFor(code string) int {
 		return 400
 	case CodeEndpointNotConfigured:
 		return 404
-	case CodeStoreUnavailable, CodeGatewayShutdown, CodeExecEnvUnavailable:
+	case CodeStoreUnavailable, CodeGatewayShutdown, CodeExecEnvUnavailable, CodeModelDegraded:
 		return 503
 	}
 	return 502 // 含 exec_start_failed、exec_unknown
@@ -392,7 +406,7 @@ func retryableReason(reason string) bool {
 	case upstream.CodeUpstreamRateLimited, upstream.CodeUpstreamUnavailable, upstream.CodeUpstreamUnreachable,
 		persistence.CodeBudgetExhausted, persistence.CodeBudgetInsufficient, persistence.CodeSubrunBudgetExhausted,
 		persistence.CodeAccessRevoked, persistence.CodeNotCurrentAttempt, persistence.CodeCancelRequested,
-		CodeStoreUnavailable, CodeGatewayShutdown,
+		CodeStoreUnavailable, CodeGatewayShutdown, CodeModelDegraded,
 		CodeExecCancelled, CodeExecQueueTimeout, CodeExecEnvUnavailable, CodeExecStartFailed,
 		CodeExecQuotaExhausted, CodeExecCPUExhausted:
 		return true
@@ -983,30 +997,51 @@ func (c *Coordinator) giveUp(j *job, state CallState, code string) (Result, erro
 }
 
 // execute 是 try 循环（§9.5、§9.7）。期限来自持久化的 deadline_at（等待槽位、退避与全部 try 都计入）。
+// 多路由的 adapter（模型降级链，routing.go）每次 try 先选路由：可重试或 unknown 的失败之后立即换下一个就绪的
+// 路由，本轮全部失败才退避；没有任何路由放行时以 model_degraded 失败（不预留）。单供应商与之前完全相同。
 func (c *Coordinator) execute(j *job, rec CallRecord) (Result, error) {
 	in := j.in
 	deadline := rec.DeadlineAt
 	ctx, cancel := context.WithDeadline(j.ctx, deadline)
 	defer cancel()
 	state := rec.State
-	provider := j.ad.Provider()
+	rs := c.routes[in.Kind]
+	tried := map[int]bool{} // 本轮已失败的路由
+	var lastCode string
+	var lastRetryAfter time.Duration
 	for n := 1; ; n++ {
 		if code := c.stopCode(ctx, deadline); code != "" {
 			return c.giveUp(j, state, code)
 		}
-		release, err := c.acquire(ctx, in.TaskID, in.SubrunID, provider)
+		l := leg{route: -1, est: j.est}
+		if rs != nil {
+			p := rs.pick(j, tried)
+			switch {
+			case p.ok:
+				l = p.leg
+			case p.anyTried:
+				// 本轮剩余的路由在失败之后、选择之前打开了：本轮结束，退避后开始新一轮。
+				tried = map[int]bool{}
+				if r, stop, err := c.waitBackoff(ctx, j, deadline, state, n, lastRetryAfter, lastCode); stop {
+					return r, err
+				}
+				continue
+			default:
+				c.log.Warn("gateway: degraded", "task_id", in.TaskID, "attempt_id", in.AttemptID, "call_id", in.CallID,
+					"endpoint", endpointOf(in.Kind), "model", j.model, "routes", rs.states(), "route_skipped", p.leg.skipped)
+				return c.giveUp(j, state, CodeModelDegraded)
+			}
+		}
+		release, err := c.acquire(ctx, in.TaskID, in.SubrunID, j.semKey(l), false)
 		if err != nil {
+			rs.release(l)
 			return c.giveUp(j, state, c.stopCode(ctx, deadline))
 		}
 		// 2. Tx2：复查访问、期限、累计次数与预算（两层）后预留；提交之后才发起上游请求（第一个原子提交点）。
-		sctx, scancel := c.opCtx()
-		try, err := c.store.ReserveTry(sctx, ReserveTryRequest{
-			TaskID: in.TaskID, CallID: in.CallID, AttemptID: in.AttemptID, EnvID: in.EnvID,
-			EstimateMicro: j.est, MaxTries: c.limits.MaxTries, SubrunID: in.SubrunID,
-		})
-		scancel()
+		try, err := c.reserve(j, l)
 		if err != nil {
 			release()
+			rs.release(l)
 			var rej *persistence.RejectedError
 			if errors.As(err, &rej) {
 				if rej.Code == persistence.CodeCallInProgress {
@@ -1019,30 +1054,23 @@ func (c *Coordinator) execute(j *job, rec CallRecord) (Result, error) {
 			}
 			return Result{}, err
 		}
-		// 3. 上游 try：使用 Coordinator 自有上下文（期限 = deadline_at；adapter 的客户端另有自身超时）。
-		start := c.now()
-		resp, uerr := j.ad.Do(ctx, j.resolved)
-		faultinject.Point(faultinject.CallInFlight)
-		latency := c.now().Sub(start)
-		release()
+		// 3. 上游 try：使用 Coordinator 自有上下文（期限 = deadline_at；adapter 的客户端另有自身超时）。启用对冲时
+		// 可能另有一条并发的腿；除最终结果之外的腿已在 runTry 中结算。
+		fr, legsTried := c.runTry(ctx, j, rs, l, try, release, tried)
 		outcome, status, code := upstream.OutcomeOK, 200, ""
-		if uerr != nil {
-			outcome, status, code = uerr.Outcome, uerr.Status, uerr.Code
+		if fr.uerr != nil {
+			outcome, status, code = fr.uerr.Outcome, fr.uerr.Status, fr.uerr.Code
 		}
-		c.log.Info("gateway: try", "task_id", in.TaskID, "attempt_id", in.AttemptID, "call_id", in.CallID,
-			"try_no", try.TryNo, "endpoint", endpointOf(in.Kind), "provider", provider, "status", status,
-			"latency_ms", latency.Milliseconds(), "outcome", string(outcome), "code", code)
-
 		switch outcome {
 		case upstream.OutcomeOK:
-			return c.complete(j, try, resp, latency)
+			return c.complete(j, fr.try, fr.resp, fr.latency, c.costOn(j, rs, fr.leg, fr.resp.Usage))
 		case upstream.OutcomeFatal:
-			if _, err := c.settle(Settlement{Try: try, Outcome: "fatal", LatencyMs: latency.Milliseconds(), Error: code}); err != nil {
+			if _, err := c.settle(Settlement{Try: fr.try, Outcome: "fatal", LatencyMs: fr.latency.Milliseconds(), Error: code}); err != nil {
 				return Result{}, err
 			}
 			return Result{Status: status, Code: code}, nil
 		case upstream.OutcomeRetryable:
-			r, err := c.settle(Settlement{Try: try, Outcome: "retryable", LatencyMs: latency.Milliseconds(), Error: code})
+			r, err := c.settle(Settlement{Try: fr.try, Outcome: "retryable", LatencyMs: fr.latency.Milliseconds(), Error: code})
 			if err != nil {
 				return Result{}, err
 			}
@@ -1050,11 +1078,11 @@ func (c *Coordinator) execute(j *job, rec CallRecord) (Result, error) {
 			if sc := c.stopCode(ctx, deadline); sc != "" {
 				return c.giveUp(j, state, sc)
 			}
-			if try.TryNo >= c.limits.MaxTries {
+			if max(r.TriesUsed, fr.try.TryNo) >= c.limits.MaxTries {
 				return c.giveUp(j, state, persistence.CodeTriesExhausted)
 			}
 		default: // unknown：已发出、无法确认（含取消或到期时已发出的请求，记 possible_external_duplicate）
-			r, err := c.settle(Settlement{Try: try, Outcome: "unknown", LatencyMs: latency.Milliseconds(), Error: code})
+			r, err := c.settle(Settlement{Try: fr.try, Outcome: "unknown", LatencyMs: fr.latency.Milliseconds(), Error: code})
 			if err != nil {
 				return Result{}, err
 			}
@@ -1062,31 +1090,119 @@ func (c *Coordinator) execute(j *job, rec CallRecord) (Result, error) {
 			if sc := c.stopCode(ctx, deadline); sc != "" {
 				return c.giveUp(j, state, sc)
 			}
-			if try.TryNo >= c.limits.MaxTries {
+			if max(r.TriesUsed, fr.try.TryNo) >= c.limits.MaxTries {
 				return Result{Status: status, Code: code}, nil
 			}
 		}
+		lastCode, lastRetryAfter = code, fr.resp.RetryAfter
 		// 暂停（desired = pause）不撤销访问，刚结束的 try 照常结算（§9.1）；但不再为本调用自动新建 try：以该 try 的
 		// 原因（可重试类别）结束，Worker 尽快到达提交边界写 checkpoint，继续后可带 X-Agentbox-Retry 在上限内重试。
 		if c.pauseRequested(in) {
 			return c.giveUp(j, state, code)
 		}
+		// 降级链：本轮还有就绪的路由时立即换路由（不退避）；否则本轮结束、退避后开始新一轮。
+		if rs != nil {
+			for _, rt := range legsTried {
+				tried[rt] = true
+			}
+			if rs.ready(j.model, tried) {
+				continue
+			}
+			tried = map[int]bool{}
+		}
 		// 4. 退避：基数翻倍、上限、抖动；遵从 Retry-After；不超过剩余期限（会超过则不再新建 try）。
-		wait := c.backoff(n, resp.RetryAfter)
-		if !c.now().Add(wait).Before(deadline) {
-			return c.giveUp(j, state, persistence.CodeCallDeadlineExceeded)
-		}
-		t := time.NewTimer(wait)
-		select {
-		case <-t.C:
-		case <-ctx.Done():
-			t.Stop()
-			return c.giveUp(j, state, c.stopCode(ctx, deadline))
-		}
-		if c.pauseRequested(in) { // 退避期间到达的暂停
-			return c.giveUp(j, state, code)
+		if r, stop, err := c.waitBackoff(ctx, j, deadline, state, n, fr.resp.RetryAfter, code); stop {
+			return r, err
 		}
 	}
+}
+
+// waitBackoff 是第 n 次 try 之后的退避：会超过期限则以 call_deadline_exceeded 结束；等待被取消则按 stopCode 结束；
+// 退避期间到达的暂停以上一 try 的原因 code 结束。stop 为 false 时继续下一次 try。
+func (c *Coordinator) waitBackoff(ctx context.Context, j *job, deadline time.Time, state CallState, n int,
+	retryAfter time.Duration, code string) (Result, bool, error) {
+	wait := c.backoff(n, retryAfter)
+	if !c.now().Add(wait).Before(deadline) {
+		r, err := c.giveUp(j, state, persistence.CodeCallDeadlineExceeded)
+		return r, true, err
+	}
+	t := time.NewTimer(wait)
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+		t.Stop()
+		r, err := c.giveUp(j, state, c.stopCode(ctx, deadline))
+		return r, true, err
+	}
+	if c.pauseRequested(j.in) { // 退避期间到达的暂停
+		r, err := c.giveUp(j, state, code)
+		return r, true, err
+	}
+	return Result{}, false, nil
+}
+
+// reserve 是一次 try 的 Tx2（ReserveTry）：估算、provider、跳过的路由与对冲标记来自 leg。
+func (c *Coordinator) reserve(j *job, l leg) (Try, error) {
+	in := j.in
+	sctx, scancel := c.opCtx()
+	defer scancel()
+	return c.store.ReserveTry(sctx, ReserveTryRequest{
+		TaskID: in.TaskID, CallID: in.CallID, AttemptID: in.AttemptID, EnvID: in.EnvID,
+		EstimateMicro: l.est, MaxTries: c.limits.MaxTries, SubrunID: in.SubrunID,
+		Provider: l.provider, Skipped: l.skipped, Hedge: l.hedge,
+	})
+}
+
+// legResult 是一条腿（一次 try）的上游结果。aborted 表示结果源于 Coordinator 自己的取消。
+type legResult struct {
+	leg     leg
+	try     Try
+	resp    upstream.Response
+	uerr    *upstream.Error
+	latency time.Duration
+	aborted bool
+}
+
+func (r legResult) outcome() upstream.Outcome {
+	if r.uerr == nil {
+		return upstream.OutcomeOK
+	}
+	return r.uerr.Outcome
+}
+
+// runTry 发出已预留的 try 并返回最终结果（由调用方结算）与本次用过的路由。启用对冲（多路由且 HedgeDelay > 0）时
+// 交给 runHedged。release 在上游请求结束后释放在途槽位。
+func (c *Coordinator) runTry(ctx context.Context, j *job, rs *routeSet, l leg, try Try, release func(),
+	tried map[int]bool) (legResult, []int) {
+	if rs != nil && c.routing.HedgeDelay > 0 {
+		return c.runHedged(ctx, j, rs, l, try, release, tried)
+	}
+	start := c.now()
+	resp, uerr, aborted := c.do(ctx, j, rs, l)
+	faultinject.Point(faultinject.CallInFlight)
+	r := legResult{leg: l, try: try, resp: resp, uerr: uerr, latency: c.now().Sub(start), aborted: aborted}
+	release()
+	rs.report(l, r.outcome(), aborted)
+	c.logTry(j, rs, r)
+	return r, []int{l.route}
+}
+
+// logTry 写 "gateway: try" 日志行（不含请求与响应正文）。按路由执行时另带 route、route_skipped、hedge 与该路由
+// 熔断器的当前状态 breaker（属性名稳定，供指标与追踪使用）。
+func (c *Coordinator) logTry(j *job, rs *routeSet, r legResult) {
+	in := j.in
+	status, code := 200, ""
+	if r.uerr != nil {
+		status, code = r.uerr.Status, r.uerr.Code
+	}
+	attrs := []any{"task_id", in.TaskID, "attempt_id", in.AttemptID, "call_id", in.CallID,
+		"try_no", r.try.TryNo, "endpoint", endpointOf(in.Kind), "provider", j.ad.Provider(), "status", status,
+		"latency_ms", r.latency.Milliseconds(), "outcome", string(r.outcome()), "code", code}
+	if rs != nil && r.leg.route >= 0 {
+		attrs = append(attrs, "route", r.leg.provider, "route_skipped", r.leg.skipped, "hedge", r.leg.hedge,
+			"breaker", rs.breakers[r.leg.route].State().String())
+	}
+	c.log.Info("gateway: try", attrs...)
 }
 
 // pauseRequested 报告调用所属任务是否已请求暂停（task_control.desired = pause）：try 循环据此不再自动新建 try。
@@ -1104,7 +1220,8 @@ func (c *Coordinator) pauseRequested(in Invoke) bool {
 
 // complete 是第二个原子提交点：先完整保存结果 blob，再在单个事务中结算、completed 与 scope_blobs。
 // blob 保存失败时不能 completed：结果没有落地，try 按 unknown 结算（全额估算转 unknown，§9.6），不再重试。
-func (c *Coordinator) complete(j *job, try Try, resp upstream.Response, latency time.Duration) (Result, error) {
+// actual 是按执行该 try 的供应商价格计算的实际费用（costOn）。
+func (c *Coordinator) complete(j *job, try Try, resp upstream.Response, latency time.Duration, actual int64) (Result, error) {
 	ctx, cancel := c.opCtx()
 	ref, err := c.blobs.Put(ctx, bytes.NewReader(resp.Body))
 	cancel()
@@ -1117,7 +1234,7 @@ func (c *Coordinator) complete(j *job, try Try, resp upstream.Response, latency 
 		return Result{}, fmt.Errorf("call: 保存调用 %s 的结果 blob: %w", j.in.CallID, err)
 	}
 	rec, err := c.settle(Settlement{
-		Try: try, Outcome: "ok", ActualMicro: c.cost(j.in.Kind, j.model, resp.Usage, j.est), LatencyMs: latency.Milliseconds(),
+		Try: try, Outcome: "ok", ActualMicro: actual, LatencyMs: latency.Milliseconds(),
 		UpstreamRequestID: resp.UpstreamRequestID, ResultSHA256: ref.SHA256, ResultSize: ref.Size,
 	})
 	if err != nil {
@@ -1206,8 +1323,9 @@ func mulCeil(a, b, div int64) (int64, bool) {
 
 // acquire 等待在途槽位（§9.7）：sub-run 调用先取每 sub-run 槽位，再取每任务、每 provider 槽位（固定顺序，
 // 避免持有 task 槽位等待 sub-run 槽位，也避免交叉等待）；root 调用（subrunID 为空）没有 sub-run 槽位。释放顺序
-// 与获取相反。等待受 ctx（期限、取消）约束；不承诺公平性。
-func (c *Coordinator) acquire(ctx context.Context, taskID, subrunID, provider string) (func(), error) {
+// 与获取相反。等待受 ctx（期限、取消）约束；不承诺公平性。nowait 时不等待：任一槽位已满即返回 errNoSlot
+// （对冲请求只在有空闲槽位时发出）。
+func (c *Coordinator) acquire(ctx context.Context, taskID, subrunID, provider string, nowait bool) (func(), error) {
 	type slot struct {
 		m   map[string]*semaphore
 		key string
@@ -1231,6 +1349,15 @@ func (c *Coordinator) acquire(ctx context.Context, taskID, subrunID, provider st
 		}
 	}
 	for i, o := range order {
+		if nowait {
+			select {
+			case o.s.ch <- struct{}{}:
+			default:
+				releaseN(i)
+				return nil, errNoSlot
+			}
+			continue
+		}
 		select {
 		case o.s.ch <- struct{}{}:
 		case <-ctx.Done():

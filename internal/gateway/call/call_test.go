@@ -207,11 +207,20 @@ func (s *fakeStore) ReserveTry(_ context.Context, r ReserveTryRequest) (Try, err
 	if ts := s.tries[k]; len(ts) > 0 {
 		last := ts[len(ts)-1]
 		if last.rstate == "held" {
-			if last.rec.AttemptID == r.AttemptID && last.rec.EnvID == r.EnvID && last.amount == r.EstimateMicro {
+			if last.rec.AttemptID == r.AttemptID && last.rec.EnvID == r.EnvID && last.amount == r.EstimateMicro &&
+				last.rec.Provider == r.Provider {
 				return Try{TaskID: r.TaskID, CallID: r.CallID, TryNo: last.rec.TryNo, ReservationID: last.rec.ReservationID,
 					AttemptID: last.rec.AttemptID}, nil
 			}
-			return Try{}, rejected(persistence.CodeCallInProgress)
+			held := 0
+			for _, t := range ts {
+				if t.rstate == "held" {
+					held++
+				}
+			}
+			if !r.Hedge || r.Provider == last.rec.Provider || held != 1 { // 对冲规则同 postgres.hedgeAllowed
+				return Try{}, rejected(persistence.CodeCallInProgress)
+			}
 		}
 	}
 	if code := admit(s.facts(r.TaskID, r.AttemptID, r.SubrunID)); code != "" {
@@ -237,7 +246,8 @@ func (s *fakeStore) ReserveTry(_ context.Context, r ReserveTryRequest) (Try, err
 	s.nRes++
 	tryNo := rec.TriesUsed + 1
 	ft := &fakeTry{rec: TryRecord{TryNo: tryNo, AttemptID: r.AttemptID, EnvID: r.EnvID, State: "in_flight",
-		ReservationID: fmt.Sprintf("rsv-%d", s.nRes)}, amount: r.EstimateMicro, rstate: "held"}
+		ReservationID: fmt.Sprintf("rsv-%d", s.nRes), Provider: r.Provider, Skipped: r.Skipped, Hedge: r.Hedge},
+		amount: r.EstimateMicro, rstate: "held"}
 	s.tries[k] = append(s.tries[k], ft)
 	b.ReservedMicro += r.EstimateMicro
 	rec.State, rec.TriesUsed, rec.ResolvingSince = StateInFlight, tryNo, nil
@@ -480,6 +490,7 @@ type fakeAdapter struct {
 
 	mu       sync.Mutex
 	script   []step
+	down     bool // 为真时每次 try 返回 503 upstream_unavailable（不消耗脚本）
 	calls    int
 	inflight int
 	maxIn    int
@@ -524,7 +535,9 @@ func ctxOutcome(sent bool) *upstream.Error {
 func (a *fakeAdapter) Do(ctx context.Context, _ []byte) (upstream.Response, *upstream.Error) {
 	a.mu.Lock()
 	s := step{body: `{"answer":"ok"}`}
-	if a.calls < len(a.script) {
+	if a.down {
+		s = step{err: unavailable()}
+	} else if a.calls < len(a.script) {
 		s = a.script[a.calls]
 	}
 	a.calls++
