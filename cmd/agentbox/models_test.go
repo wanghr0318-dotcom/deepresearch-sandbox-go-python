@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -468,5 +469,69 @@ func TestExecFlags(t *testing.T) {
 	stderr.Reset()
 	if code := runServer([]string{"--data-dir", t.TempDir(), "--database-url", "postgres://x", "--exec-per-task", "9"}, &stderr); code != 2 {
 		t.Errorf("--exec-per-task 9：退出码 %d（%s），期望 2", code, stderr.String())
+	}
+}
+
+// TestModelFallbackFile：--model-fallback-file 的解析与校验：Key 只来自 key_env 指定的环境变量（未设置为错误，错误
+// 文本不含 Key），price 必填，未知字段拒绝；空路径没有后备供应商。
+func TestModelFallbackFile(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	env := map[string]string{"AGENTBOX_MODEL_BACKUP_API_KEY": "sk-secret-backup"}
+	getenv := func(k string) string { return env[k] }
+	if fbs, err := modelFallbacks("", getenv); err != nil || fbs != nil {
+		t.Fatalf("empty path: %v %v", fbs, err)
+	}
+	ok := write("ok.json", `{"providers":[{"name":"backup","base_url":"https://b.example/v1","key_env":"AGENTBOX_MODEL_BACKUP_API_KEY",
+		"models":{"kimi-k3":"vendor-k3"},"price":{"in":1000000,"out":4000000},"model_prices":{"kimi-k3":{"in":2000000,"out":8000000}}},
+		{"name":"local","base_url":"http://127.0.0.1:9000/v1","price":{"in":0,"out":0}}]}`)
+	fbs, err := modelFallbacks(ok, getenv)
+	if err != nil || len(fbs) != 2 {
+		t.Fatalf("%+v %v", fbs, err)
+	}
+	if fbs[0].APIKey != "sk-secret-backup" || fbs[0].Models["kimi-k3"] != "vendor-k3" || fbs[0].Pricing.OutputMicroPerMTok != 4_000_000 ||
+		fbs[0].PricingByModel["kimi-k3"].InputMicroPerMTok != 2_000_000 || fbs[1].APIKey != "" {
+		t.Fatalf("parsed %+v", fbs)
+	}
+	for _, c := range []struct{ body, want string }{
+		{`{"providers":[]}`, "没有列出"},
+		{`{"providers":[{"name":"b","base_url":"https://b"}]}`, "price"},
+		{`{"providers":[{"name":"b","base_url":"https://b","price":{"in":1}}]}`, "in 与 out"},
+		{`{"providers":[{"name":"b","base_url":"https://b","price":{"in":1,"out":1},"key_env":"AGENTBOX_UNSET"}]}`, "AGENTBOX_UNSET"},
+		{`{"providers":[{"name":"b","base_url":"https://b","price":{"in":1,"out":1},"key_env":"bad name"}]}`, "环境变量名"},
+		{`{"providers":[{"name":"b","base_url":"https://b","price":{"in":1,"out":1},"api_key":"x"}]}`, "unknown field"},
+	} {
+		_, err := modelFallbacks(write("bad.json", c.body), getenv)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: want error containing %q, got %v", c.body, c.want, err)
+		}
+		if err != nil && strings.Contains(err.Error(), "sk-secret") {
+			t.Errorf("error leaks the key: %v", err)
+		}
+	}
+	if _, err := modelFallbacks(filepath.Join(dir, "missing.json"), getenv); err == nil {
+		t.Error("missing file accepted")
+	}
+}
+
+// TestModelRoutingFlags：熔断阈值 ≥ 1、打开时长 > 0、每 try 超时与对冲延迟 ≥ 0。
+func TestModelRoutingFlags(t *testing.T) {
+	r, err := modelRouting(3, 30*time.Second, 0, 0)
+	if err != nil || r.BreakerFailures != 3 || r.BreakerOpen != 30*time.Second || r.HedgeDelay != 0 {
+		t.Fatalf("%+v %v", r, err)
+	}
+	for _, c := range []struct {
+		f            int
+		open, tt, hd time.Duration
+	}{{0, time.Second, 0, 0}, {1, 0, 0, 0}, {1, time.Second, -1, 0}, {1, time.Second, 0, -1}} {
+		if _, err := modelRouting(c.f, c.open, c.tt, c.hd); err == nil {
+			t.Errorf("%+v accepted", c)
+		}
 	}
 }
