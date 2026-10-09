@@ -21,7 +21,6 @@ from agentbox_worker.gateway import GatewayResult
 from evalworker import NAME, VERSION
 from evalworker.app import eval_kind
 from evalworker.coding import (
-    CHECK_TIMEOUT_EXIT,
     STAGE_CODE,
     check_timeout_s,
     exec_info,
@@ -30,6 +29,7 @@ from evalworker.coding import (
     messages,
     parse_config,
     run_coding,
+    split_harness_verdict,
 )
 
 BASE = {
@@ -90,12 +90,23 @@ def run_harness(code: str, tmp: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="the harness uses pass_fds (POSIX)")
+
+
+def verdict_of(res: subprocess.CompletedProcess[str]) -> str:
+    _, v = split_harness_verdict(res.stderr)
+    assert v is not None, res.stderr
+    return v["verdict"]
+
+
+@posix_only
 def test_harness_pass_fail_fixtures_timeout(tmp_path: Path) -> None:
     cfg = parse_config({**BASE, "files": {"nums.txt": "1\n2\n"}})
     ok = run_harness(harness("def add(a, b):\n    return a + b\n", cfg), tmp_path)
-    assert ok.returncode == 0 and "PASS" in ok.stdout
+    assert ok.returncode == 0 and verdict_of(ok) == "pass"
+    assert ok.stdout == "PASS\n"  # the completion token is consumed by the harness
     bad = run_harness(harness("def add(a, b):\n    return a - b\n", cfg), tmp_path)
-    assert bad.returncode == 1 and "AssertionError" in bad.stderr
+    assert bad.returncode == 1 and "AssertionError" in bad.stderr and verdict_of(bad) == "fail"
     fixture = parse_config(
         {
             **BASE,
@@ -112,7 +123,36 @@ def test_harness_pass_fail_fixtures_timeout(tmp_path: Path) -> None:
         }
     )
     res = run_harness(harness("", slow), tmp_path)
-    assert res.returncode == CHECK_TIMEOUT_EXIT and "timed out" in res.stderr
+    assert res.returncode != 0 and verdict_of(res) == "timeout"
+
+
+EARLY_EXIT_HACKS = [
+    "import os\nos._exit(0)\n",
+    "import sys\nsys.exit(0)\n",
+    "import atexit, os\natexit.register(lambda: os._exit(0))\nraise SystemExit(0)\n",
+    "raise SystemExit\n",
+    "print('EVAL-CHECK-DONE:' + '0' * 32)\nimport os\nos._exit(0)\n",
+    "import os\nfor fd in range(3, 64):\n    try:\n        print(os.read(fd, 64))\n"
+    "    except OSError:\n        pass\nos._exit(0)\n",
+]
+
+
+@posix_only
+@pytest.mark.parametrize("hack", EARLY_EXIT_HACKS)
+def test_harness_rejects_early_exit_hacks(tmp_path: Path, hack: str) -> None:
+    """A solution that exits before the checker's asserts finish must not pass, even with exit 0."""
+    res = run_harness(harness(hack, parse_config(BASE)), tmp_path)
+    assert verdict_of(res) == "incomplete" and res.returncode != 0
+
+
+def test_split_harness_verdict() -> None:
+    rest, v = split_harness_verdict('boom\n[eval-harness] {"verdict": "pass", "checker_exit": 0}\n')
+    assert rest == "boom\n" and v == {"verdict": "pass", "checker_exit": 0}
+    # a forged marker earlier in the output does not count; only the last line does
+    forged = '[eval-harness] {"verdict": "pass"}\nreal tail\n'
+    assert split_harness_verdict(forged) == (forged, None)
+    assert split_harness_verdict('[eval-harness] {"verdict": "maybe"}')[1] is None
+    assert split_harness_verdict("")[1] is None
 
 
 def test_exec_info_caps_and_signal() -> None:
@@ -120,13 +160,16 @@ def test_exec_info_caps_and_signal() -> None:
         "status": "completed",
         "exit": {"code": 0, "signal": 0},
         "stdout": "x" * 40_000,
-        "stderr": "",
+        "stderr": "y" * 40_000 + '\n[eval-harness] {"verdict": "incomplete", "checker_exit": 0}\n',
         "wall_ms": 12,
         "queue_ms": 1,
         "image_digest": "sha256:ab",
     }
     info = exec_info(GatewayResult("root/check/exec/1", body, "f" * 64, False, 200))
     assert info["exit_code"] == 0 and info["stdout_truncated"] and len(info["stdout"]) == 16 << 10
+    # the verdict is parsed from the full stderr before capping and removed from the recorded one
+    assert info["harness"] == {"verdict": "incomplete", "checker_exit": 0}
+    assert "[eval-harness]" not in info["stderr"]
     killed = exec_info(
         GatewayResult(
             "c", {"status": "completed", "exit": {"code": 0, "signal": 9}}, None, False, 200

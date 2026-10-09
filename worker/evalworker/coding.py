@@ -27,7 +27,6 @@ SOLUTION_ARTIFACT = "solution"
 OUTPUT_CAP = 16 << 10  # bytes of checker stdout/stderr kept in the artifact
 DEFAULT_MAX_TOKENS = 8192
 DEFAULT_CHECK_TIMEOUT_S = 50  # exec default wall is 60 s
-CHECK_TIMEOUT_EXIT = 124
 
 SYSTEM_PROMPT = (
     STAGE_CODE + " You are a careful Python coding agent. Write the complete contents of a Python "
@@ -121,38 +120,90 @@ def check_timeout_s(wall_ms: int | None) -> int:
     return max(1, wall_ms // 1000 - 3)
 
 
-_HARNESS = """\
-import json, os, subprocess, sys, tempfile
+# The exec harness. Passing needs a completion token that the checker prints after its last
+# statement: the harness creates a random nonce and hands it to the checker through an inherited
+# pipe (never argv or env); the checker's first line reads and closes that pipe before the solution
+# is imported. A solution that exits early (os._exit(0), sys.exit(0), atexit tricks) therefore
+# never produces the token, and the check is "incomplete", not passed. Limit: checker and solution
+# share a process, so a solution that deliberately inspects the checker's memory could still forge
+# the token; full isolation would need separate processes. The verdict is reported out of band as
+# the last stderr line "[eval-harness] {json}"; checker output is capped before it is forwarded so
+# that line is never cut by the exec output limit.
+_HARNESS = r"""import json, os, secrets, subprocess, sys, tempfile
 FILES = json.loads({files!r})
+CHECK = json.loads({check!r})
+CAP = {cap}
 work = tempfile.mkdtemp(prefix="eval-")
 for name, content in FILES.items():
     with open(os.path.join(work, name), "w", encoding="utf-8") as f:
         f.write(content)
+nonce = secrets.token_hex(16)
+token = "EVAL-CHECK-DONE:" + nonce
+r, w = os.pipe()
+os.write(w, nonce.encode())
+os.close(w)
+prelude = ("import os as _eval_os; _eval_done = (lambda t: lambda: "
+           "print('EVAL-CHECK-DONE:' + t, flush=True))"
+           "(_eval_os.read(%d, 64).decode()); _eval_os.close(%d)\n" % (r, r))
+with open(os.path.join(work, "check.py"), "w", encoding="utf-8") as f:
+    f.write(prelude + CHECK + "\n_eval_done()\n")
+def cap(b):
+    return (b or b"")[:CAP].decode("utf-8", "replace")
+verdict, rc = "fail", 1
 try:
     p = subprocess.run([sys.executable, "-E", "-s", "-B", "check.py"], cwd=work,
-                       capture_output=True, timeout={timeout})
+                       capture_output=True, timeout={timeout}, pass_fds=(r,))
+    out, err = cap(p.stdout), cap(p.stderr)
+    rc = p.returncode if p.returncode >= 0 else 128 - p.returncode
+    lines = out.rstrip("\n").split("\n")
+    done = lines[-1] == token
+    if done:
+        out = "\n".join(lines[:-1]) + ("\n" if len(lines) > 1 else "")
+    verdict = "pass" if rc == 0 and done else ("incomplete" if rc == 0 else "fail")
 except subprocess.TimeoutExpired as e:
-    sys.stdout.write((e.stdout or b"").decode("utf-8", "replace"))
-    sys.stderr.write((e.stderr or b"").decode("utf-8", "replace"))
-    sys.stderr.write("\\n[eval-harness] checker timed out after {timeout} s\\n")
-    sys.exit({timeout_exit})
-sys.stdout.write(p.stdout.decode("utf-8", "replace"))
-sys.stderr.write(p.stderr.decode("utf-8", "replace"))
-sys.exit(p.returncode if p.returncode >= 0 else 128 - p.returncode)
+    out, err, verdict = cap(e.stdout), cap(e.stderr), "timeout"
+sys.stdout.write(out)
+sys.stderr.write(err)
+sys.stderr.write("\n[eval-harness] " + json.dumps({{"verdict": verdict, "checker_exit": rc,
+                                                    "timeout_s": {timeout}}}) + "\n")
+sys.exit(0 if verdict == "pass" else (rc or 1))
 """
+
+HARNESS_MARKER = "[eval-harness] "
 
 
 def harness(solution: str, cfg: CodingConfig) -> str:
-    """Python code for /v1/exec: writes solution.py, check.py and the fixtures into a scratch
-    directory, runs the checker with a timeout and exits with its exit code."""
+    """Python code for /v1/exec: writes solution.py and the fixtures into a scratch directory, wraps
+    the checker with the completion-token prelude/epilogue, runs it with a timeout and reports the
+    verdict out of band (see _HARNESS)."""
     files = dict(cfg.files)
     files["solution.py"] = solution
-    files["check.py"] = cfg.check
     return _HARNESS.format(
         files=json.dumps(files, ensure_ascii=False, sort_keys=True),
+        check=json.dumps(cfg.check, ensure_ascii=False),
+        cap=OUTPUT_CAP * 4,
         timeout=check_timeout_s(cfg.wall_ms),
-        timeout_exit=CHECK_TIMEOUT_EXIT,
     )
+
+
+def split_harness_verdict(stderr: str) -> tuple[str, dict[str, Any] | None]:
+    """Removes the harness's last "[eval-harness] {json}" stderr line; returns (rest, verdict)."""
+    text = stderr.rstrip("\n")
+    head, _, last = text.rpartition("\n")
+    if not last.startswith(HARNESS_MARKER):
+        return stderr, None
+    try:
+        verdict = json.loads(last[len(HARNESS_MARKER) :])
+    except ValueError:
+        return stderr, None
+    if not isinstance(verdict, dict) or verdict.get("verdict") not in (
+        "pass",
+        "fail",
+        "incomplete",
+        "timeout",
+    ):
+        return stderr, None
+    return head.rstrip("\n") + ("\n" if head else ""), verdict
 
 
 def _cap(text: Any) -> tuple[str, bool]:
@@ -168,7 +219,9 @@ def exec_info(res: GatewayResult) -> dict[str, Any]:
     """The checker run as recorded in the eval artifact (from the exec result body)."""
     body = res.body if isinstance(res.body, dict) else {}
     out, out_cut = _cap(body.get("stdout"))
-    err, _ = _cap(body.get("stderr"))
+    raw_err = body.get("stderr") if isinstance(body.get("stderr"), str) else ""
+    rest, verdict = split_harness_verdict(raw_err)
+    err, _ = _cap(rest)
     info: dict[str, Any] = {
         "call_id": res.call_id,
         "status": body.get("status", "unknown"),
@@ -179,6 +232,8 @@ def exec_info(res: GatewayResult) -> dict[str, Any]:
         "queue_ms": body.get("queue_ms", 0),
         "image_digest": body.get("image_digest", ""),
     }
+    if verdict is not None:
+        info["harness"] = verdict
     exit_ = body.get("exit")
     if isinstance(exit_, dict):
         if exit_.get("signal"):

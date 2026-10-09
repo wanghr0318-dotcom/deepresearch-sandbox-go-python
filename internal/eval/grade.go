@@ -48,20 +48,27 @@ type CodingArtifact struct {
 
 // ExecInfo is the checker run in the exec sandbox.
 type ExecInfo struct {
-	CallID          string `json:"call_id,omitempty"`
-	Status          string `json:"status"` // completed | timed_out | cancelled | unknown
-	ExitCode        *int   `json:"exit_code,omitempty"`
-	Signal          int    `json:"signal,omitempty"`
-	Stdout          string `json:"stdout"`
-	Stderr          string `json:"stderr"`
-	StdoutTruncated bool   `json:"stdout_truncated,omitempty"`
-	WallMs          int64  `json:"wall_ms,omitempty"`
-	QueueMs         int64  `json:"queue_ms,omitempty"`
-	ImageDigest     string `json:"image_digest,omitempty"`
+	CallID          string          `json:"call_id,omitempty"`
+	Status          string          `json:"status"` // completed | timed_out | cancelled | unknown
+	ExitCode        *int            `json:"exit_code,omitempty"`
+	Signal          int             `json:"signal,omitempty"`
+	Stdout          string          `json:"stdout"`
+	Stderr          string          `json:"stderr"`
+	StdoutTruncated bool            `json:"stdout_truncated,omitempty"`
+	WallMs          int64           `json:"wall_ms,omitempty"`
+	QueueMs         int64           `json:"queue_ms,omitempty"`
+	ImageDigest     string          `json:"image_digest,omitempty"`
+	Harness         *HarnessVerdict `json:"harness,omitempty"`
 }
 
-// checkTimeoutExit is the eval harness's exit code when the checker exceeds its timeout inside the exec.
-const checkTimeoutExit = 124
+// HarnessVerdict is the exec harness's out-of-band verdict (its last stderr line, parsed by the worker).
+// pass needs both checker exit 0 and the completion token the checker prints after its last statement,
+// so a solution that exits early (os._exit(0), sys.exit(0)) is "incomplete", never "pass".
+type HarnessVerdict struct {
+	Verdict     string `json:"verdict"` // pass | fail | incomplete | timeout
+	CheckerExit int    `json:"checker_exit"`
+	TimeoutS    int    `json:"timeout_s,omitempty"`
+}
 
 // gradeStatus is the task_status grader common to all kinds.
 func gradeStatus(status, reason string) Grade {
@@ -92,31 +99,42 @@ func GradeCoding(t *Task, status, reason string, art *CodingArtifact) []Grade {
 		gs = append(gs, Grade{Grader: "exit_code", Detail: detail, Category: "no_check_result"})
 		return gs
 	}
-	ex := art.Exec
 	want := 0
 	if t.Expect.ExitCode != nil {
 		want = *t.Expect.ExitCode
 	}
-	ec := Grade{Grader: "exit_code"}
-	switch {
-	case ex.Status == "timed_out":
-		ec.Detail, ec.Category = "checker timed out", "exec_timeout"
-	case ex.Status != "completed":
-		ec.Detail, ec.Category = "exec "+ex.Status, "exec_"+ex.Status
-	case ex.ExitCode == nil:
-		ec.Detail, ec.Category = fmt.Sprintf("killed by signal %d", ex.Signal), "exec_signal"
-	case *ex.ExitCode == checkTimeoutExit && want != checkTimeoutExit:
-		ec.Detail, ec.Category = "checker timed out inside the exec (harness exit 124)", "check_timeout"
-	case *ex.ExitCode != want:
-		ec.Detail, ec.Category = fmt.Sprintf("exit code %d, want %d", *ex.ExitCode, want), "wrong_exit_code"
-	default:
-		ec.Pass, ec.Score, ec.Detail = true, 1, fmt.Sprintf("exit code %d", want)
-	}
-	gs = append(gs, ec)
-	if g, ok := gradeStdout(t.Expect, ex.Stdout); ok {
+	gs = append(gs, gradeCheck(art.Exec, want))
+	if g, ok := gradeStdout(t.Expect, art.Exec.Stdout); ok {
 		gs = append(gs, g)
 	}
 	return gs
+}
+
+// gradeCheck judges the checker run: the exec outcome first, then the harness verdict.
+func gradeCheck(ex *ExecInfo, want int) Grade {
+	g := Grade{Grader: "exit_code"}
+	h := ex.Harness
+	switch {
+	case ex.Status == "timed_out":
+		g.Detail, g.Category = "exec wall limit reached", "exec_timeout"
+	case ex.Status != "completed":
+		g.Detail, g.Category = "exec "+ex.Status, "exec_"+ex.Status
+	case ex.ExitCode == nil:
+		g.Detail, g.Category = fmt.Sprintf("killed by signal %d", ex.Signal), "exec_signal"
+	case h == nil:
+		g.Detail, g.Category = "no harness verdict", "no_check_result"
+	case h.Verdict == "timeout":
+		g.Detail, g.Category = fmt.Sprintf("checker timed out after %d s", h.TimeoutS), "check_timeout"
+	case h.Verdict == "incomplete":
+		g.Detail, g.Category = "checker exited 0 without its completion token (early exit)", "check_incomplete"
+	case want == 0 && h.Verdict == "pass":
+		g.Pass, g.Score, g.Detail = true, 1, "checker passed"
+	case want != 0 && h.Verdict == "fail" && h.CheckerExit == want:
+		g.Pass, g.Score, g.Detail = true, 1, fmt.Sprintf("checker exit %d as expected", want)
+	default:
+		g.Detail, g.Category = fmt.Sprintf("checker exit %d, want %d", h.CheckerExit, want), "wrong_exit_code"
+	}
+	return g
 }
 
 // gradeStdout applies the stdout expectations; ok is false when none is configured.

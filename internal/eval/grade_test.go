@@ -19,9 +19,14 @@ func codingTask(e Expect) *Task {
 func researchTask(e Expect) *Task { return &Task{ID: "r", Kind: KindResearch, Topic: "t", Expect: e} }
 
 func TestGradeCoding(t *testing.T) {
-	art := func(status string, exit *int, stdout string) *CodingArtifact {
-		return &CodingArtifact{Exec: &ExecInfo{Status: status, ExitCode: exit, Stdout: stdout, Signal: 9}}
+	art := func(status string, exit *int, stdout string, verdict string, checkerExit int) *CodingArtifact {
+		ex := &ExecInfo{Status: status, ExitCode: exit, Stdout: stdout, Signal: 9}
+		if verdict != "" {
+			ex.Harness = &HarnessVerdict{Verdict: verdict, CheckerExit: checkerExit, TimeoutS: 9}
+		}
+		return &CodingArtifact{Exec: ex}
 	}
+	ok := func(stdout string) *CodingArtifact { return art("completed", intp(0), stdout, "pass", 0) }
 	cases := []struct {
 		name   string
 		task   *Task
@@ -29,19 +34,21 @@ func TestGradeCoding(t *testing.T) {
 		art    *CodingArtifact
 		want   Outcome
 	}{
-		{"pass", codingTask(Expect{}), "succeeded", art("completed", intp(0), ""), Outcome{Verdict: VerdictPass}},
-		{"exit", codingTask(Expect{}), "succeeded", art("completed", intp(1), ""), Outcome{VerdictFail, "wrong_exit_code"}},
-		{"expected nonzero", codingTask(Expect{ExitCode: intp(3)}), "succeeded", art("completed", intp(3), ""), Outcome{Verdict: VerdictPass}},
-		{"timeout", codingTask(Expect{}), "succeeded", art("timed_out", nil, ""), Outcome{VerdictFail, "exec_timeout"}},
-		{"check timeout", codingTask(Expect{}), "succeeded", art("completed", intp(124), ""), Outcome{VerdictFail, "check_timeout"}},
-		{"signal", codingTask(Expect{}), "succeeded", art("completed", nil, ""), Outcome{VerdictFail, "exec_signal"}},
-		{"unknown", codingTask(Expect{}), "succeeded", art("unknown", nil, ""), Outcome{VerdictFail, "exec_unknown"}},
+		{"pass", codingTask(Expect{}), "succeeded", ok(""), Outcome{Verdict: VerdictPass}},
+		{"checker failed", codingTask(Expect{}), "succeeded", art("completed", intp(1), "", "fail", 1), Outcome{VerdictFail, "wrong_exit_code"}},
+		{"expected nonzero", codingTask(Expect{ExitCode: intp(3)}), "succeeded", art("completed", intp(3), "", "fail", 3), Outcome{Verdict: VerdictPass}},
+		{"exec timeout", codingTask(Expect{}), "succeeded", art("timed_out", nil, "", "", 0), Outcome{VerdictFail, "exec_timeout"}},
+		{"check timeout", codingTask(Expect{}), "succeeded", art("completed", intp(1), "", "timeout", 1), Outcome{VerdictFail, "check_timeout"}},
+		{"early exit", codingTask(Expect{}), "succeeded", art("completed", intp(1), "", "incomplete", 0), Outcome{VerdictFail, "check_incomplete"}},
+		{"exit 0 without verdict", codingTask(Expect{}), "succeeded", art("completed", intp(0), "", "", 0), Outcome{VerdictFail, "no_check_result"}},
+		{"signal", codingTask(Expect{}), "succeeded", art("completed", nil, "", "", 0), Outcome{VerdictFail, "exec_signal"}},
+		{"unknown", codingTask(Expect{}), "succeeded", art("unknown", nil, "", "", 0), Outcome{VerdictFail, "exec_unknown"}},
 		{"no artifact", codingTask(Expect{}), "succeeded", nil, Outcome{VerdictFail, "no_check_result"}},
 		{"task failed", codingTask(Expect{}), "failed", nil, Outcome{VerdictFail, "task_failed"}},
-		{"equals", codingTask(Expect{StdoutEquals: strp("42")}), "succeeded", art("completed", intp(0), " 42\n"), Outcome{Verdict: VerdictPass}},
-		{"equals miss", codingTask(Expect{StdoutEquals: strp("42")}), "succeeded", art("completed", intp(0), "41"), Outcome{VerdictFail, "wrong_output"}},
-		{"contains", codingTask(Expect{StdoutContains: []string{"a", "b"}}), "succeeded", art("completed", intp(0), "b a"), Outcome{Verdict: VerdictPass}},
-		{"regex miss", codingTask(Expect{StdoutRegex: `^\d+$`}), "succeeded", art("completed", intp(0), "x"), Outcome{VerdictFail, "wrong_output"}},
+		{"equals", codingTask(Expect{StdoutEquals: strp("42")}), "succeeded", ok(" 42\n"), Outcome{Verdict: VerdictPass}},
+		{"equals miss", codingTask(Expect{StdoutEquals: strp("42")}), "succeeded", ok("41"), Outcome{VerdictFail, "wrong_output"}},
+		{"contains", codingTask(Expect{StdoutContains: []string{"a", "b"}}), "succeeded", ok("b a"), Outcome{Verdict: VerdictPass}},
+		{"regex miss", codingTask(Expect{StdoutRegex: `^\d+$`}), "succeeded", ok("x"), Outcome{VerdictFail, "wrong_output"}},
 	}
 	for _, c := range cases {
 		got := Decide(GradeCoding(c.task, c.status, "", c.art))
