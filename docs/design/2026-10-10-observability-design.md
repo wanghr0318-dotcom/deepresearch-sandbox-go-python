@@ -1,0 +1,163 @@
+# Observability: tracing, metrics and log correlation (2026-10-10)
+
+Status: implemented on branch `s1-observability`.
+
+## 1. Goals
+
+1. **One trace per task / turn**, from the API request that created it, through the task actor's attempts
+   (admission, environment, worker start, handshake, checkpoints, finalize), into the sandbox, and back out
+   through every Gateway call the worker makes (model / search / fetch / exec, including each upstream try,
+   retries, cache hits, coalescing and budget rejections).
+2. **Prometheus metrics** an operator can alert on: task/turn outcomes, attempt start latency, stop latency,
+   upstream latency and errors by provider/model/status, tool calls per turn, cost in micro-USD, sandbox
+   environment counts, cleanup backlog, run/exec slot usage, API request rate/latency.
+3. **Log correlation**: JSON logs written while a span is active carry `trace_id` / `span_id`, so Grafana can
+   jump from a log line to its trace and back.
+4. **Off by default**: with no `--otlp-endpoint` and no `--metrics-listen` the server behaves exactly as before.
+   No exporter, no listener, no extra allocations on hot paths beyond a nil-interface check.
+5. **A reproducible local stack** (`deploy/observability/`) and a demo script that drives real tasks and turns
+   (with a stop and a failure) through the fake upstream, at zero model cost.
+
+## 2. Non-goals
+
+- No OpenTelemetry dependency inside the sandbox. The Python worker SDK stays stdlib-only; it does not export
+  spans, it only forwards the W3C `traceparent` it was given.
+- No OTel metrics pipeline (metrics are Prometheus pull); no OTel logs pipeline (logs are shipped from the log
+  file by Alloy into Loki).
+- No accepting of `traceparent` from API clients (end users are untrusted; every API request starts a new
+  trace). This can be added behind a flag later.
+- No per-task or per-user metric labels (cardinality); per-task drill-down is what traces are for.
+
+## 3. Architecture
+
+```
+            cmd/agentbox (flags)                      internal/telemetry (OTel SDK + OTLP/HTTP, Prometheus)
+                   │ telemetry.Setup(cfg) ───────────────────────────────┐
+                   ▼                                                     │ implements
+   internal/api ─ internal/app ─ internal/task ─ internal/runner         ▼
+        │              │               │              │           internal/obs  (stdlib-only facade:
+        └──────────────┴───────────────┴──────────────┴── import ──  Start/Span/Traceparent/Recorder)
+   internal/gateway/edge ─ internal/gateway/call ─ internal/session ─────┘
+```
+
+- `internal/obs` is a **stdlib-only facade**: `Start(ctx, name, attrs...)`, `Span{SetAttrs, Event, Fail, End}`,
+  `Traceparent(ctx)`, `WithRemoteParent(ctx, tp)`, `Carry(dst, src)`, `IDs(ctx)`, a W3C `traceparent` parser,
+  a `Recorder` interface for metric events, a bounded submit registry, and an `slog.Handler` wrapper. The
+  default implementation is a no-op. Domain packages (task, session, runner, gateway/call, gateway/edge, api)
+  import only `obs`. This keeps existing architecture rules intact: `gateway/call` must not depend on any
+  third-party module, `task`/`session` must not import `net/http` (the OTel propagation package does).
+  A new archtest rule pins `obs` to the standard library and forbids OTel/Prometheus imports anywhere except
+  `internal/telemetry` and `cmd/agentbox`.
+- `internal/telemetry` implements `obs` with the OpenTelemetry Go SDK (batch span processor, OTLP/HTTP
+  exporter, parent-based ratio sampler, W3C TraceContext) and `prometheus/client_golang` (own registry, Go and
+  process collectors, `/metrics` on a separate listener). `Setup` installs the implementation with
+  `obs.Set` and returns a shutdown function that flushes spans.
+- `cmd/agentbox server` gets three flags: `--otlp-endpoint` (e.g. `http://127.0.0.1:4318`; empty = tracing off),
+  `--trace-sample-ratio` (default 1), `--metrics-listen` (e.g. `127.0.0.1:9464`; empty = metrics off; a
+  non-loopback address prints a warning – the endpoint has no authentication and must never be exposed to users).
+  `--log-file` (optional) additionally appends the JSON log to a file so a shipper can read it.
+
+## 4. Trace model
+
+| Span | Where | Parent | Key attributes |
+|---|---|---|---|
+| `HTTP <METHOD> <route>` | `api.Handler.ServeHTTP` | new root | `http.method`, `http.route` (pattern, not path), `http.status_code` |
+| `task` / `turn` | task actor, from load to exit | API span that created it (via submit registry), else new root | `task.id`, `session.id`, `task.kind`, `task.status` (final) |
+| `attempt` | task actor, attempt committed → verdict committed | task span | `attempt.id`, `attempt.no`, `env.id`, `outcome.class`, `attempt.status` |
+| `admission.acquire` | actor slot request | task span | `queued_ms` |
+| `env.create` / `env.stop` / `session.handoff` | actor async effects | attempt span | `env.id`, `stopped`, `recorded` |
+| `worker.run` | `runner.Run` / `Incarnation.RunTask` | attempt span | `mode`, `kill.reason`, `outcome.class` |
+| `worker.start` | `StartExec` | worker.run | — |
+| `worker.handshake` | init/task_start sent → ready/task_accepted | worker.run | — |
+| `checkpoint.commit` | `processor.commitCheckpoint` | worker.run | `checkpoint.status` |
+| `worker.finalize` | process exit / proposal → outcome classified | worker.run | `outcome.class` |
+| `gateway.call` | `call.Coordinator.Invoke` / `Exec` | worker-sent `traceparent` (validated) or the bound attempt | `gateway.kind`, `gateway.provider`, `gateway.model`, `call.id`, `call.result` (`completed`, `replayed`, `cache_hit`, `coalesced`, or the stable rejection code), `subrun.id` |
+| `gateway.try` | each upstream try in `execute` | gateway.call | `try.no`, `http.status_code`, `try.outcome`, `backoff_ms` event |
+| `session.<op>` | session actor ops (start, quiesce, freeze, thaw, release, destroy) | none (session-scoped root) | `session.id`, `incarnation.id`, `env.id` |
+
+**Propagation into the sandbox.** Protocol v1 already reserves an optional string `traceparent` on `init` and
+`task_start` (unknown-field rules make it backward-compatible; old workers ignore it). The runner fills it with
+the `worker.run` span context. The Python SDK (`agentbox_worker.tracecontext`, stdlib only) validates it with
+the W3C rules (version `00`, 32-hex trace-id and 16-hex parent-id not all zero, 2-hex flags; anything else is
+dropped) and the Gateway client sends it as the `traceparent` header on every request (including sub-run views).
+
+**Untrusted header handling.** The worker is untrusted. The edge accepts a `traceparent` header only if it
+parses and its trace-id equals the trace-id of the attempt bound to that socket; otherwise the header is ignored
+and the call span is parented to the bound attempt context. A worker therefore cannot attach its spans to other
+users' traces or forge new traces.
+
+**Async boundaries.** Gateway calls continue in the coordinator's own context after the request returns (journal
+semantics); the span context is carried over explicitly (`obs.Carry`) so the call and its tries stay in the trace.
+The task actor runs asynchronously after the API request; the API records `traceparent` + submit time for the
+task id in a bounded in-memory registry (≤ 4096 entries, 1 h TTL). After a restart the registry is empty and
+the task span becomes a new root — a deliberate best-effort limit.
+
+## 5. Metrics
+
+All names are prefixed `agentbox_`. Labels are bounded enumerations only.
+
+| Metric | Type | Labels | Source |
+|---|---|---|---|
+| `http_requests_total`, `http_request_duration_seconds` | counter, histogram | `route` (registered pattern or `other`), `method`, `code` | API |
+| `tasks_finished_total` | counter | `kind` (task/turn), `status` (succeeded/failed/cancelled/paused/awaiting_input…) | actor verdict |
+| `attempts_finished_total` | counter | `kind`, `outcome_class` (closed set from runner.Classify) | actor |
+| `attempt_ready_seconds` | histogram | `kind` | attempt created → worker ready |
+| `task_start_seconds` | histogram | `kind` | API submit → first worker ready (submit→ready) |
+| `stop_seconds` | histogram | `kind`, `desired` (pause/cancel) | actor observes stop → stop verdict committed (stop→paused) |
+| `gateway_calls_total` | counter | `kind`, `result` | call coordinator |
+| `upstream_tries_total`, `upstream_try_duration_seconds` | counter, histogram | `kind`, `provider`, `model`, `status`, `outcome` | each upstream try |
+| `cost_micro_usd_total` | counter | `kind`, `provider`, `model` | actual cost of `ok` settlements |
+| `tool_calls_per_task` | histogram | `kind` | search/fetch/exec calls counted per task, observed at verdict |
+| `sandbox_envs` | gauge | `kind` (task/session/exec) | DB: environments not yet stopped (cached 5 s) |
+| `sandbox_cleanup_backlog` | gauge | — | DB: stopped, cleanup not done |
+| `run_slots_in_use`, `run_slots_capacity`, `admission_queued`, `memory_reserved_bytes` | gauge | — | admission snapshot |
+| `exec_slots_in_use`, `exec_slots_capacity`, `exec_queued` | gauge | — | exec gate snapshot |
+
+`model` comes from the server's declared allowlist (requests outside it are rejected before metrics); `provider`
+from the configured adapters; `status` is the HTTP status class of the try; `result` is a closed set of
+Gateway codes.
+
+## 6. Attribute allowlist (security)
+
+Allowed in spans, metric labels and correlated logs: opaque IDs (`task.id`, `attempt.id`, `env.id`,
+`session.id`, `incarnation.id`, `subrun.id`, `call.id`, `checkpoint.id`), numbers (`attempt.no`, `try.no`,
+durations, sizes, cost), closed enumerations (status, outcome class, kill reason, Gateway codes, HTTP method,
+route pattern, kind, provider, declared model name).
+
+Never recorded: prompts, model output, search queries, fetch URLs, worker stdout/stderr, checkpoint state,
+API tokens / cookies / provider keys, request paths with user-supplied segments (the route *pattern* is used),
+free-text error messages (only stable error codes). A unit test asserts that a span recorded for a real Gateway
+call contains only allowlisted attribute keys.
+
+## 7. Failure handling
+
+- Exporter unreachable: the batch processor drops spans after its queue fills; requests are never blocked. Setup
+  does not fail if the collector is down.
+- Shutdown flushes with a 5 s timeout.
+- `/metrics` listener failure at startup is a startup error (operator asked for it explicitly).
+- DB-backed gauges use a 5 s cache and a 2 s query timeout; on error the previous value is kept and the error
+  is logged at debug level.
+
+## 8. Testing
+
+- `obs`: traceparent parser vectors (W3C spec examples, invalid versions, all-zero IDs, uppercase), no-op
+  behaviour, registry bounds/TTL, log handler adds IDs only when a span is active.
+- `telemetry`: in-memory span exporter; parent/child relationships across `Carry` and `WithRemoteParent`;
+  Prometheus registry gather assertions; attribute allowlist test.
+- `edge`: header accepted only when trace-id matches; mismatched/garbage header ignored.
+- `call`: with a recording tracer, a retried call yields one `gateway.call` with two `gateway.try` children;
+  a cache hit records `call.result=cache_hit`; metrics recorder receives try/cost events.
+- `runner`: init / task_start carry the `worker.run` traceparent when tracing is on, and omit it when off
+  (default behaviour unchanged, existing fixtures pass).
+- Python: `tracecontext` vectors identical to Go's; GatewayClient sends the header when given a valid value,
+  never otherwise; sub-run view inherits it.
+- Archtest: `obs` is stdlib-only; OTel/Prometheus only in `telemetry` and `cmd/agentbox`.
+- End to end: `scripts/demo-observability.sh` against the compose stack; evidence in
+  `docs/evidence/2026-10-10-observability.md` (trace JSON exported from Tempo, PromQL results).
+
+## 9. Demonstration
+
+`scripts/demo-observability.sh` starts `deploy/observability/docker-compose.yml` (OTel Collector → Tempo,
+Prometheus scraping the server, Loki + Alloy tailing the server log, Grafana with provisioned datasources and an
+"Agentbox overview" dashboard), runs the server with the fake upstream and tracing + metrics on, drives tasks
+(success, a stopped one, a failing one) and prints the Grafana URL, a trace id to open, and PromQL results.
