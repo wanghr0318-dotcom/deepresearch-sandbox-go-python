@@ -20,13 +20,13 @@ import (
 
 // Labels and annotations (design §2.3).
 const (
-	LabelManaged  = "agentbox.io/managed"
-	LabelInstall  = "agentbox.io/install"
-	LabelPool     = "agentbox.io/pool"
-	LabelState    = "agentbox.io/state"
-	LabelEnv      = "agentbox.io/env"
-	AnnoOwner     = "agentbox.io/owner"
-	AnnoImage     = "agentbox.io/image"
+	LabelManaged = "agentbox.io/managed"
+	LabelInstall = "agentbox.io/install"
+	LabelPool    = "agentbox.io/pool"
+	LabelState   = "agentbox.io/state"
+	LabelEnv     = "agentbox.io/env"
+	AnnoOwner    = "agentbox.io/owner"
+	AnnoImage    = "agentbox.io/image"
 	// AnnoWorkspace carries a hash of the host workspace path (the path itself is not published to the API).
 	AnnoWorkspace = "agentbox.io/workspace-sha256"
 
