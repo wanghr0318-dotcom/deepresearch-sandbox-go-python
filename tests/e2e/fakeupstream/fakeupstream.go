@@ -130,6 +130,8 @@ type Server struct {
 	latency map[Kind]time.Duration
 	// always 是各类别没有按序号注入故障的请求所用的动作（SetAlways；模型降级链的混沌测试用：供应商持续故障）。
 	always map[Kind]Action
+	// chatHook 非 nil 时先于阶段标记决定 chat 回复（SetChatHook）：返回非 nil 的 assistant message 即为回复。
+	chatHook func(body []byte) json.RawMessage
 }
 
 type page struct {
@@ -195,6 +197,14 @@ func (s *Server) SetStageReply(stage, content string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.stages[stage] = content
+}
+
+// SetChatHook 设置 chat 的脚本：hook 收到请求体，返回 assistant message（可含 tool_calls，finish_reason 随之为
+// tool_calls）或 nil（按阶段标记与占位文本回复）。工作区与 MCP 的演示轮次（2026-10-10）用它驱动真实的对话 Agent。
+func (s *Server) SetChatHook(hook func(body []byte) json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.chatHook = hook
 }
 
 // SetPage 设置抓取目标 path（以 / 开头）的内容。
@@ -523,6 +533,27 @@ func (s *Server) chat(w http.ResponseWriter, rec *Request, body []byte) {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request"))
 		s.setOutcome(rec, OutcomeStatus)
 		return
+	}
+	s.mu.Lock()
+	hook := s.chatHook
+	s.mu.Unlock()
+	if hook != nil {
+		if msg := hook(body); msg != nil {
+			finish := "stop"
+			var m struct {
+				ToolCalls []json.RawMessage `json:"tool_calls"`
+			}
+			if json.Unmarshal(msg, &m) == nil && len(m.ToolCalls) > 0 {
+				finish = "tool_calls"
+			}
+			prompt := int64(len(body)+3) / 4
+			completion := int64(len(msg)+3) / 4
+			writeJSON(w, http.StatusOK, map[string]any{"id": fmt.Sprintf("chatcmpl-fake-%d", rec.Seq), "object": "chat.completion",
+				"model": req.Model, "choices": []map[string]any{{"index": 0, "message": msg, "finish_reason": finish}},
+				"usage": ChatUsage{PromptTokens: prompt, CompletionTokens: completion, TotalTokens: prompt + completion}})
+			s.setOutcome(rec, OutcomeOK)
+			return
+		}
 	}
 	sum := sha256.Sum256(body)
 	content := "fake 回复 " + hex.EncodeToString(sum[:4])

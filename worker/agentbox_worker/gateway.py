@@ -239,8 +239,9 @@ def _error_from(status: int, data: bytes) -> GatewayError:
         message = data[:512].decode("utf-8", "replace")
     if status == 402:
         return BudgetExhausted(status, code, message)
-    # input_not_authorized（exec 的输入 blob 不在任务 scope 内）是请求参数问题，不是访问撤销
-    if status == 403 and code != "input_not_authorized":
+    # input_not_authorized（exec 的输入 blob 不在任务 scope 内）与 mcp_tool_not_allowed
+    # （MCP 工具不在服务端允许的清单中）是请求参数问题，不是访问撤销
+    if status == 403 and code not in ("input_not_authorized", "mcp_tool_not_allowed"):
         return AccessRevoked(status, code, message)
     if status == 504:
         return CallDeadlineExceeded(status, code, message)

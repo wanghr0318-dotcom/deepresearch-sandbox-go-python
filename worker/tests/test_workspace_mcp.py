@@ -415,3 +415,11 @@ def test_gateway_client_workspace_and_mcp_endpoints(fake_gateway: FakeGateway):
         "tool": "calculate",
         "arguments": {"expression": "1"},
     }
+
+
+def test_mcp_tool_not_allowed_is_not_access_revoked(fake_gateway: FakeGateway):
+    fake_gateway.interceptor = lambda req: error_reply(403, "mcp_tool_not_allowed")
+    gw = GatewayClient(fake_gateway.socket_path, call_ids=CallIds(), timeout_s=5)
+    with pytest.raises(GatewayError) as e:
+        gw.mcp_call("orch", "calc", "echo_env", {"name": "HOME"})
+    assert e.value.code == "mcp_tool_not_allowed" and not isinstance(e.value, AccessRevoked)
