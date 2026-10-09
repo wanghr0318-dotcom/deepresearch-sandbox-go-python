@@ -399,7 +399,7 @@ docker compose -f deploy/observability/docker-compose.yml down        # 停止�
 
 - **任务**：`coding`（编码/终端任务：沙箱内的 `evalworker` 取得解答——模型经 Gateway 写出，或 `--agent reference` 用 suite 的参考解——再经 `/v1/exec` 在独立 exec 沙箱中运行 suite 的检查器）与 `research`（交给 `deepresearch`，与产品相同的研究 Agent）。server 须以 `--worker-argv python3,-m,evalworker` 启动（`evalworker` 安装到 `/opt/agentbox`：`scripts/dev/install-worker.sh`）。
 - **输出**：`<out>/<run-id>/` 下的 `manifest.json`（suite 哈希、seed、并发、`GET /server-info` 给出的服务端构建与模型、Worker 版本、exec 模板摘要）、`trajectories.jsonl`（每个任务一行：事件流、Gateway 调用 journal、attempt、账本、结果与评分；不含提示词与请求/响应正文）、`summary.json` 与 `report.md`（成功率、延迟 P50/P95、费用、工具调用、失败类别）。
-- **评分**：任务状态、检查器退出码、stdout 匹配；研究报告的引用可定位率（每个 `[n]` 对应的证据 sha256 须是本任务一次已完成 `fetch` 调用的结果 blob）与必含词；可选的 LLM judge（默认关闭，`--judge-model`、`--judge-base-url`、`--judge-budget-usd` 硬预算，Key 只读环境变量 `AGENTBOX_JUDGE_API_KEY` 或 `AGENTBOX_MODEL_API_KEY`）。
+- **评分**：任务状态、检查器判定（退出码为 0 且打印了 harness 经管道交给它的随机完成令牌才算通过：解答在导入时 `os._exit(0)`/`sys.exit(0)` 之类的提前退出判为 `check_incomplete`；检查器超时为 `check_timeout`）、stdout 匹配；研究报告的引用可定位率（每个 `[n]` 对应的证据 sha256 须是本任务一次已完成 `fetch` 调用的结果 blob）与必含词；可选的 LLM judge（默认关闭；`--judge-model`、`--judge-base-url` 与必填的 `--judge-price IN:OUT`，`--judge-budget-usd` 硬预算与 `--judge-max-calls` 硬调用上限，`--judge-required` 使无法评判的任务失败；Key 只读环境变量 `AGENTBOX_JUDGE_API_KEY` 或 `AGENTBOX_MODEL_API_KEY`，不写入任何结果文件）。`compare` 给出两边的样本数 N 与成功率的 Wilson 95% 区间，N < 30 或每任务只重复 1 次时给出警告。
 - **零成本**：`fakeupstream -eval-suite <suite>` 按 suite 的 `fake_reply` 回答编码任务，研究为固定脚本；费用是按配置单价折算的模拟值。
 
 ```bash

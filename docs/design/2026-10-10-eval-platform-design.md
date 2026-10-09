@@ -63,7 +63,7 @@ Packages:
 | Package | Responsibility | Depends on |
 |---|---|---|
 | `internal/eval` | suite parsing and hashing, REST client, runner, trajectory records, graders, LLM judge, report, compare | stdlib, `internal/jcs`, `gopkg.in/yaml.v3` — **no** server internals (archtest) |
-| `cmd/agentbox` (`eval.go`) | `agentbox eval run|report|compare` flags, token loading, exit codes | `internal/eval` |
+| `internal/eval` (`cmd.go`), `cmd/agentbox/main.go` | `agentbox eval run|report|compare`: flags, token loading, exit codes (`main.go` only dispatches to `eval.Main`) | `internal/eval` |
 | `internal/api`, `internal/app` | new operator-only `GET /server-info` (manifest hook) | — |
 | `worker/evalworker` | eval worker: dispatches `coding` tasks to the coding harness and everything else to `deepresearch` | `agentbox_worker`, `deepresearch` |
 | `tests/e2e/fakeupstream` | `[stage:code]` replies scripted per eval task (`SetCodeReply`, `-eval-suite`) | `internal/eval` (test-only binary) |
@@ -73,8 +73,10 @@ Packages:
 Operator-only (Bearer; with accounts enabled the audience is admin; available in every mode). Returns
 build info (`runtime/debug.ReadBuildInfo`: module version, `vcs.revision`, `vcs.time`, `vcs.modified`, Go
 version), `config_version`, task template, worker argv, the default model and declared model list, search
-provider, whether sessions/exec are enabled and the exec template digest. No secrets, keys, URLs with
-credentials or prices. The route is additive; default behaviour of all existing endpoints is unchanged.
+provider, whether sessions/exec are enabled, the exec template digest and an `upstream_fingerprint` (first
+16 hex digits of the sha256 of the model/search upstream configuration: addresses, models, prices,
+max_tokens cap), so two runs against different upstreams or prices are told apart without exposing the
+addresses. No secrets, keys, URLs or prices in clear. The route is additive; default behaviour of all existing endpoints is unchanged.
 
 ### 3.2 Eval worker (`python3 -m evalworker`)
 
@@ -91,10 +93,28 @@ Coding harness, per task:
    extracts the first fenced code block (or the whole reply). `agent: reference` uses the suite's
    reference solution without a model call (harness validation, like a "gold patch" run).
 2. **Check** (step `check`): one `/v1/exec` call whose code is a small harness that writes the solution
-   and the task's fixture files into a scratch directory, runs the suite's checker (`python3 -I check.py`)
-   with a timeout, forwards its stdout/stderr and exits with its exit code.
+   and the task's fixture files into a scratch directory and runs the suite's checker
+   (`python3 -E -s -B check.py`, so the checker can import `solution` from its directory) with a timeout.
 3. **Report**: writes the output artifacts `solution` (the code) and `eval` (JSON: agent, exec status,
-   exit code/signal, stdout/stderr (capped 16 KiB each), wall/queue ms, exec image digest).
+   exit code/signal, stdout/stderr (capped 16 KiB each), wall/queue ms, exec image digest, and the
+   harness verdict).
+
+**Completion token (reward-hack defence).** The checker imports the solution in its own process, so an
+exit code alone is forgeable: a solution containing `os._exit(0)` or `sys.exit(0)` at import would end
+the checker with status 0 before any assert ran. The harness therefore requires a positive signal the
+solution does not have: it generates a random nonce, passes it to the checker through an inherited pipe
+(not argv or environment), and wraps the checker so that its first line reads and closes that pipe before
+anything else runs, and its last line prints `EVAL-CHECK-DONE:<nonce>`. The verdict is `pass` only for
+exit 0 **and** that token as the last stdout line; exit 0 without it is `incomplete` (category
+`check_incomplete`), a checker timeout is `timeout`, otherwise `fail`. The verdict is reported out of
+band as the harness's last stderr line `[eval-harness] {json}` (checker output is capped before it is
+forwarded so this line is never truncated; only the last such line counts, so a forged one printed by
+the solution is ignored). The demo suite contains two hacks (`clamp`: `os._exit(0)`, `median`:
+`sys.exit(0)`) with no stdout expectation that must — and do — fail. **Limit:** checker and solution
+share a process, so a solution that deliberately inspects the checker's memory (frames, `gc`) could
+still find and print the token; full isolation would run the solution in a separate process and talk
+to it over a pipe, which the current checker style (plain `from solution import f`) does not do.
+Checkers must not call `sys.exit(0)` themselves on success (it would skip the token).
 
 Judgement is not done in the worker: the CLI grades from the `eval` artifact, so a trajectory can be
 re-graded offline.
@@ -134,7 +154,9 @@ canonical JSON of the parsed suite (format-independent: the same suite in YAML a
 
 - Work items = tasks × repetitions; order shuffled with `--seed` (default 1) so runs are reproducible and
   interleaving is controlled. `--concurrency N` workers.
-- Each item: `POST /tasks` with `request_id = eval-<run_id>-<task>-<rep>` (idempotent on CLI retry),
+- Each item: `POST /tasks` with `request_id = eval-<nonce>-<hash(run_id, task, rep)>` (≤ 54 bytes; the
+  64-bit random `nonce` is generated per run and recorded in the manifest), so client retries within a run
+  are idempotent while a rerun with the same `--run-id` never replays an earlier run's tasks;
   spec = `{eval: {...}}` (coding) or `{topic, ..., eval: {...}}` (research), `limits` from the suite
   (task overrides defaults). The CLI flag `--agent model|reference` and `--model` (passed as
   `config.eval.model` / `orchestrator_model`/`worker_model`) select the agent under test.
@@ -143,8 +165,8 @@ canonical JSON of the parsed suite (format-independent: the same suite in YAML a
   (`POST /tasks/{id}/cancel`) and records `timeout`.
 - Then `inspect`, `result` and the needed artifacts are fetched; graders run; one JSONL line is appended
   (mutex-serialised) to `trajectories.jsonl`.
-- Infra errors (HTTP 5xx, connection refused) are retried with backoff by the client; persistent ones mark
-  the item `infra_error` without aborting the run.
+- Infra errors (HTTP 502/503/504, connection errors) are retried with backoff by the client; persistent
+  ones mark the item `infra_error` without aborting the run. After an interrupt no new item is submitted.
 
 ## 6. Trajectory record (`trajectories.jsonl`, schema `agentbox.eval.trajectory/v1`)
 
@@ -164,31 +186,43 @@ One JSON object per line:
 | `result` | pinned result (summary, outputs) |
 | `artifacts` | the `eval` artifact JSON (coding) or the report text (research, capped 64 KiB) |
 
-No request/response bodies, prompts or credentials are recorded (the inspect API never returns them; the
-token is never written).
+No request/response bodies, prompts or credentials are recorded. This exclusion **relies on the operator
+inspect API and event stream**, which by design (OpenAPI `Call`, spec §15.4) carry metadata only; the
+evaluator adds the eval artifact (checker output) and the report, which are task outputs. The operator
+token and the judge key are never written: tests assert neither appears in any run file
+(`TestRunEndToEndAgainstFakeServer`, `TestMainJudgeKeyNeverRecorded`), and the recorded server address
+has userinfo stripped.
 
 ## 7. Graders and failure categories
 
 | Grader | Applies to | Pass when |
 |---|---|---|
 | `task_status` | all | task `succeeded` |
-| `exit_code` | coding | exec `completed` and exit code = `expect.exit_code` (default 0) |
+| `exit_code` | coding | exec `completed` and harness verdict `pass` (checker exit 0 **and** completion token, §3.2); with a non-zero `expect.exit_code`, verdict `fail` with that checker exit |
 | `stdout` | coding | `stdout_equals` (trimmed) / every `stdout_contains` / `stdout_regex` hold |
 | `citations` | research | ≥ `min_citations` citations and locatable ratio ≥ `min_locatable_ratio` (default 1.0) |
 | `must_mention` | research | report contains every term |
 | `llm_judge` | any task with `judge`, only with `--judge-model` | judge score ≥ threshold |
 
 Outcome = `pass` if every applicable grader passes. Category of the first failing check, in order:
-`timeout`, `infra_error` (API failure, exec unavailable), `task_failed:<status_reason>`, `exec_timeout`,
-`exec_<status>`, `wrong_exit_code`, `wrong_output`, `no_citations`, `unlocatable_citations`,
-`missing_terms`, `judge_below_threshold`.
+`timeout`, `infra_error` (API failure, exec unavailable), `task_failed:<status_reason>`, `exec_timeout`
+(exec wall), `exec_<status>`, `exec_signal`, `no_check_result`, `check_timeout` (checker timeout inside
+the harness), `check_incomplete` (exit 0 without the completion token), `wrong_exit_code`,
+`wrong_output`, `no_report`, `no_citations`, `unlocatable_citations`, `missing_terms`,
+`judge_below_threshold`, `judge_unavailable`.
+
+Citation numbers are 1–3 digits (`[2024]` in a sentence is not a citation).
 
 **LLM judge.** OpenAI-compatible `POST <base>/chat/completions` from the CLI (outside the sandbox),
 key from `AGENTBOX_JUDGE_API_KEY` or `AGENTBOX_MODEL_API_KEY` (environment only; never logged).
 Prompt = rubric + task + answer (report or solution, capped), reply must be JSON `{"score":0..1,"reason":…}`.
-Budget: `--judge-budget-usd` (default 0.20) with configured prices; before each call the worst-case cost
-(prompt estimate + max_tokens) is reserved; when it does not fit, remaining judgements are `skipped`
-(not failed). Judge spend is reported separately in the summary.
+Budget: `--judge-price IN:OUT` is **required** with `--judge-model` (positive micro-USD per million tokens),
+so every call costs budget; `--judge-budget-usd` (default 0.20) is the total. Before each call the
+worst-case cost (prompt estimate + max_tokens) is reserved; independently `--judge-max-calls` (default 50)
+is a hard call limit. A judgement that cannot be made (budget, call limit, transport or format error) is
+`skipped`, or with `--judge-required` a failure (`judge_unavailable`). Calls, errors, skips and spend are
+in `summary.json` and `report.md`; the manifest records the judge model, endpoint host, prices, budget,
+call limit and whether it is required (never the key).
 
 ## 8. Cost control and replay
 
@@ -210,14 +244,17 @@ Budget: `--judge-budget-usd` (default 0.20) with configured prices; before each 
 style `passes/runs`), latency P50/P95/max (nearest-rank), cost total/mean, tool/model/exec calls, attempts,
 failure categories, judge spend. `report.md` renders the same with a per-task table.
 
-`compare A B`: manifest differences (suite hash mismatch is a warning), metric deltas (B − A, relative),
-per-task status changes (fixed / regressed / unchanged). Output Markdown to stdout, `--json` for machines.
-Exit code 0 (comparison is informational).
+`compare A B`: manifest differences (suite hash mismatch is a warning; also server info including the
+upstream fingerprint, judge configuration and eval CLI build), the sample size N of each side with the
+Wilson 95% interval of the success rate and a warning when a side has one repetition per task or
+N < 30, metric deltas (B − A, relative; extra Gateway tries are per run), per-task status changes (fixed /
+regressed / unchanged …). Output Markdown to stdout, `--json` for machines. Exit code 0 (informational).
 
 ## 10. Failure handling
 
 - Server unreachable at start → exit 1 before submitting anything.
-- `/server-info` missing (older server) → manifest records `server_info: unavailable`, run continues.
+- `/server-info` missing (older server) → manifest `server.note` records `server-info unavailable: …`,
+  run continues.
 - A task that cannot be created (400) → item `error/infra_error` with the API error code.
 - Ctrl-C → the runner cancels in-flight server tasks it created, writes partial outputs and exits 130.
 
@@ -238,6 +275,7 @@ Exit code 0 (comparison is informational).
 ## 12. Demonstration
 
 `sudo bash scripts/demo-eval.sh` starts PostgreSQL-backed server with `evalworker` and the fake upstream,
-runs the demo suite (10 coding + 3 research) twice — `--agent reference` (harness validation: all coding
-tasks must pass) and `--agent model` (the fake model, whose scripted answers include deliberate bugs) — and
-prints the compare table. Zero model cost.
+runs the demo suite (12 coding + 3 research) three times — `--agent reference` (harness validation: all
+coding tasks must pass), `--agent model` (the fake model, whose scripted answers include deliberate bugs
+and two reward hacks that must be `check_incomplete`) at concurrency 4 and at 1 — and prints the compare
+tables. Zero model cost.

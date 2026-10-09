@@ -68,7 +68,7 @@
 - **真实验收**：在 4 vCPU / 8 GiB 的 Linux 云主机（腾讯云上海）上，使用真实模型（Moonshot：`kimi-k3` 主导、`kimi-k2.6` 执行）与经 Serper 的 Google 搜索结果。记录：[对话助手](docs/evidence/2026-10-06-m4-chat-acceptance.md)、[exec 沙箱](docs/evidence/2026-10-06-m4-exec-hardening.md)、[账号](docs/evidence/2026-10-06-m3-accounts.md)、[备份与恢复](docs/evidence/2026-10-06-backup-restore.md)。
 - **模型降级链**（[记录](docs/evidence/2026-10-10-model-fallback.md)，fake upstream、零费用）：主供应商持续 503 时，无降级链的调用 3.7–5.1 s 后失败（3 次 try 加退避），有降级链时约 51 ms 由后备供应商完成（与健康供应商相同）；全部熔断时约 40 µs 返回 `model_degraded`。
 - **Kubernetes provider**（[记录](docs/evidence/2026-10-10-k8s-provider.md)，kind 单节点，每组 20 次）：环境就绪 P50 冷启动 978 ms、预热池 11 ms；到 Python 首行输出 1051 ms / 78 ms；契约一致性测试在 fake clientset（CI）与 kind 上均 11/11 通过；`scripts/demo-k8s.sh` 演示 Gateway、取消与 server 崩溃恢复。
-- **评测平台**（[记录](docs/evidence/2026-10-10-eval-platform.md)，fake upstream、零模型费用）：真实沙箱中 13 个任务的参考解 13/13 通过；fake 模型 9/13，4 个故意错误的回答分别归类为 `wrong_exit_code`×3 与 `check_timeout`×1；并发 1 → 4 墙钟 18.3 s → 12.2 s。
+- **评测平台**（[记录](docs/evidence/2026-10-10-eval-platform.md)，fake upstream、零模型费用）：真实沙箱中 15 个任务的参考解 15/15 通过；fake 模型 9/15，6 个故意错误的回答分别归类为 `wrong_exit_code`×3、`check_timeout`×1，以及两个在导入时 `exit 0` 的奖励作弊 `check_incomplete`×2（检查器须打印随机完成令牌才算通过）；并发 1 → 4 墙钟 18.9 s → 10.5 s。
 - **串行与并行研究对比**（[记录](docs/evidence/2026-10-06-m4-subrun-comparison.md)）。小样本，每组 N = 4：
 
   | | 串行 | 并行 |
