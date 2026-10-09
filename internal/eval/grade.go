@@ -60,6 +60,9 @@ type ExecInfo struct {
 	ImageDigest     string `json:"image_digest,omitempty"`
 }
 
+// checkTimeoutExit is the eval harness's exit code when the checker exceeds its timeout inside the exec.
+const checkTimeoutExit = 124
+
 // gradeStatus is the task_status grader common to all kinds.
 func gradeStatus(status, reason string) Grade {
 	g := Grade{Grader: "task_status", Pass: status == "succeeded", Detail: status}
@@ -102,6 +105,8 @@ func GradeCoding(t *Task, status, reason string, art *CodingArtifact) []Grade {
 		ec.Detail, ec.Category = "exec "+ex.Status, "exec_"+ex.Status
 	case ex.ExitCode == nil:
 		ec.Detail, ec.Category = fmt.Sprintf("killed by signal %d", ex.Signal), "exec_signal"
+	case *ex.ExitCode == checkTimeoutExit && want != checkTimeoutExit:
+		ec.Detail, ec.Category = "checker timed out inside the exec (harness exit 124)", "check_timeout"
 	case *ex.ExitCode != want:
 		ec.Detail, ec.Category = fmt.Sprintf("exit code %d, want %d", *ex.ExitCode, want), "wrong_exit_code"
 	default:

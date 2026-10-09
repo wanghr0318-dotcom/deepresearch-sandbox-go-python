@@ -33,6 +33,7 @@ func TestGradeCoding(t *testing.T) {
 		{"exit", codingTask(Expect{}), "succeeded", art("completed", intp(1), ""), Outcome{VerdictFail, "wrong_exit_code"}},
 		{"expected nonzero", codingTask(Expect{ExitCode: intp(3)}), "succeeded", art("completed", intp(3), ""), Outcome{Verdict: VerdictPass}},
 		{"timeout", codingTask(Expect{}), "succeeded", art("timed_out", nil, ""), Outcome{VerdictFail, "exec_timeout"}},
+		{"check timeout", codingTask(Expect{}), "succeeded", art("completed", intp(124), ""), Outcome{VerdictFail, "check_timeout"}},
 		{"signal", codingTask(Expect{}), "succeeded", art("completed", nil, ""), Outcome{VerdictFail, "exec_signal"}},
 		{"unknown", codingTask(Expect{}), "succeeded", art("unknown", nil, ""), Outcome{VerdictFail, "exec_unknown"}},
 		{"no artifact", codingTask(Expect{}), "succeeded", nil, Outcome{VerdictFail, "no_check_result"}},

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 把 Worker 包安装到沙箱默认模板包含的目录（默认 /opt/agentbox，rootfs.WorkerDir）：
 #   agentbox_worker（SDK 与工具）、deepresearch（task 模式研究 Worker）、chatagent（会话 Worker）、
-#   skills（chatagent 经 read_skill 按需加载；与包目录同级）。sim_worker 存在时一并安装（演示与测试用）。
+#   skills（chatagent 经 read_skill 按需加载；与包目录同级）。sim_worker、evalworker（agentbox eval 的评测 Worker）
+#   存在时一并安装（演示、测试与评测用）。
 # 用法：sudo bash scripts/dev/install-worker.sh [目标目录]
 # 只复制源码（去掉 __pycache__），目录 0755、文件 0644；安装后校验入口与 skills/deep-research/SKILL.md。
 set -euo pipefail
@@ -19,6 +20,7 @@ done
 
 PKGS=(agentbox_worker deepresearch chatagent skills)
 [ -d "$SRC/sim_worker" ] && PKGS+=(sim_worker)
+[ -d "$SRC/evalworker" ] && PKGS+=(evalworker)
 
 install -d -m 0755 "$DEST"
 for d in "${PKGS[@]}"; do
