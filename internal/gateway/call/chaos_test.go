@@ -242,11 +242,12 @@ func TestChaosHedge(t *testing.T) {
 	var rows []sample
 	plain := chaosHarness(t, chaosAdapter(a.ModelBaseURL(), b.ModelBaseURL()), Limits{}, RoutingConfig{})
 	rows = append(rows, measure(t, "slow primary (1 s), no hedging", max(chaosRuns(), 1), plain, 200, ""))
-	hedged := chaosHarness(t, chaosAdapter(a.ModelBaseURL(), b.ModelBaseURL()), Limits{}, RoutingConfig{HedgeDelay: 200 * time.Millisecond})
+	hedged := chaosHarness(t, chaosAdapter(a.ModelBaseURL(), b.ModelBaseURL()), Limits{}, RoutingConfig{HedgeDelay: 200 * time.Millisecond,
+		BreakerFailures: 1000}) // a slow first leg is a breaker failure; keep the primary closed to measure hedging itself
 	rows = append(rows, measure(t, "slow primary (1 s), hedge delay 200 ms", max(chaosRuns(), 1), hedged, 200, ""))
 	logTable(t, rows)
 	_, tries := hedged.call(t, "t1", fmt.Sprintf("chaos-%d", chaosSeq))
-	if got := providers(tries); got != "primary/unknown backup1/ok[primary:tried]+hedge" {
+	if got := providers(tries); got != "primary/unknown+lost backup1/ok[primary:tried]+hedge" {
 		t.Fatalf("hedged tries %s", got)
 	}
 	bud := hedged.budget(t, "t1")
