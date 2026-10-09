@@ -167,7 +167,7 @@ spec:
   volumes: [{name: host, hostPath: {path: /}}]
 Y
 }
-evil_rejected() { evil_pod 2>&1 | tee "$LOGDIR/admission.txt" | grep -q 'ValidatingAdmissionPolicy'; }
+evil_rejected() { evil_pod >"$LOGDIR/admission.txt" 2>&1 && return 1; grep -q 'ValidatingAdmissionPolicy' "$LOGDIR/admission.txt"; }
 wait_for "准入策略拒绝挂载宿主根目录的 Pod" 30 evil_rejected
 sed 's/^/         /' "$LOGDIR/admission.txt"
 ok "ValidatingAdmissionPolicy agentbox-sandbox-pods 生效：ServiceAccount 不能创建挂载槽位目录以外 hostPath 的 Pod"
