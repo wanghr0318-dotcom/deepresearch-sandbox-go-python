@@ -454,6 +454,7 @@ type inspectView struct {
 			Provider      string     `json:"provider"`
 			Skipped       string     `json:"skipped"`
 			Hedge         bool       `json:"hedge"`
+			HedgeLost     bool       `json:"hedge_lost"`
 			State         string     `json:"state"`
 			Outcome       string     `json:"outcome"`
 			Error         string     `json:"error"`
@@ -607,6 +608,9 @@ func writeRouteTries(buf *bytes.Buffer, in inspectView) error {
 			}
 			if t.Error != "" {
 				outcome += " (" + t.Error + ")"
+			}
+			if t.HedgeLost {
+				outcome += " lost"
 			}
 			hedge, skipped := "-", "-"
 			if t.Hedge {

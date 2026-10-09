@@ -7094,7 +7094,7 @@ func TestMigration0009(t *testing.T) {
 }
 
 // undo0011 把库还原为只应用了 0010 的形状（模型降级链的 try 审计列）。
-const undo0011 = `ALTER TABLE call_tries DROP COLUMN provider, DROP COLUMN skipped, DROP COLUMN hedge;
+const undo0011 = `ALTER TABLE call_tries DROP COLUMN provider, DROP COLUMN skipped, DROP COLUMN hedge, DROP COLUMN hedge_lost;
 	DELETE FROM schema_migrations WHERE version >= 11;
 `
 

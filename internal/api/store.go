@@ -162,9 +162,9 @@ type TryView struct {
 	CPUUsec               *int64
 	ExecStartedAt         *time.Time
 	// 模型降级链（docs/design/2026-10-10-model-fallback-design.md）：执行该 try 的路由名、此前跳过的路由
-	// （"name:reason,..."）与是否为对冲 try。单供应商配置下为空与 false。
+	// （"name:reason,..."）、是否为对冲 try，以及是否因对冲的另一条腿胜出而被取消。单供应商配置下为空与 false。
 	Provider, Skipped string
-	Hedge             bool
+	Hedge, HedgeLost  bool
 }
 
 // AttemptView 是一个 attempt 及其环境的诊断视图。

@@ -956,9 +956,10 @@ type tryJSON struct {
 	CPUUsec       *int64     `json:"cpu_usec,omitempty"`
 	ExecStartedAt *time.Time `json:"exec_started_at,omitempty"`
 	// 模型降级链：执行该 try 的供应商路由、此前跳过的路由（"name:reason,..."）与对冲标记；单供应商配置下省略。
-	Provider string `json:"provider,omitempty"`
-	Skipped  string `json:"skipped,omitempty"`
-	Hedge    bool   `json:"hedge,omitempty"`
+	Provider  string `json:"provider,omitempty"`
+	Skipped   string `json:"skipped,omitempty"`
+	Hedge     bool   `json:"hedge,omitempty"`
+	HedgeLost bool   `json:"hedge_lost,omitempty"`
 }
 
 type callJSON struct {
@@ -1019,7 +1020,7 @@ func (h *Handler) inspect(w http.ResponseWriter, r *http.Request) {
 			cj.Tries = append(cj.Tries, tryJSON{TryNo: t.TryNo, AttemptID: t.AttemptID, EnvID: t.EnvID, State: t.State,
 				Outcome: t.Outcome, LatencyMs: t.LatencyMs, CostMicro: t.CostMicro, Error: t.Error,
 				QueueMs: t.QueueMs, WallMs: t.WallMs, CPUUsec: t.CPUUsec, ExecStartedAt: t.ExecStartedAt,
-				Provider: t.Provider, Skipped: t.Skipped, Hedge: t.Hedge})
+				Provider: t.Provider, Skipped: t.Skipped, Hedge: t.Hedge, HedgeLost: t.HedgeLost})
 		}
 		out.Calls = append(out.Calls, cj)
 	}

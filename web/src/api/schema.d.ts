@@ -820,6 +820,8 @@ export interface components {
             skipped?: string;
             /** @description Model provider chain only — true for the second */
             hedge?: boolean;
+            /** @description Model provider chain only — this try was cancelled because the other leg of a hedged pair produced the decisive result (error keeps the try's own code) */
+            hedge_lost?: boolean;
         };
         /** @description A Gateway logical call (journal entry). Metadata only — no request or response bodies, prompts or credentials. */
         Call: {

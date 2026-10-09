@@ -584,6 +584,7 @@ func (s *Store) SettleTry(ctx context.Context, st call.Settlement) (call.CallRec
 		}
 		var newRes, callState string
 		var spent, unknown, cost int64
+		ref := st.ResultSHA256 // 成为 result_ref 的结果（Sibling 结算不改变调用的结局）
 		switch st.Outcome {
 		case "ok":
 			if err := recordResultBlob(ctx, tx, t.TaskID, st.ResultSHA256, st.ResultSize, fmt.Sprintf("%s#%d", t.CallID, t.TryNo)); err != nil {
@@ -609,25 +610,30 @@ func (s *Store) SettleTry(ctx context.Context, st call.Settlement) (call.CallRec
 		if _, err := tx.Exec(ctx, "UPDATE reservations SET state = $2 WHERE reservation_id = $1", rid, newRes); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE call_tries SET state = 'settled', outcome = $4, latency_ms = $5, cost_micro = $6, error = $7
-			WHERE task_id = $1 AND call_id = $2 AND try_no = $3`, t.TaskID, t.CallID, t.TryNo, st.Outcome, st.LatencyMs, cost, st.Error); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE call_tries SET state = 'settled', outcome = $4, latency_ms = $5, cost_micro = $6, error = $7,
+				hedge_lost = $8
+			WHERE task_id = $1 AND call_id = $2 AND try_no = $3`, t.TaskID, t.CallID, t.TryNo, st.Outcome, st.LatencyMs, cost, st.Error,
+			st.HedgeLost); err != nil {
 			return err
 		}
-		failReason := ""
+		failReason, reqID := "", st.UpstreamRequestID
 		if st.Outcome == "fatal" {
 			failReason = st.Error
 			if failReason == "" {
 				failReason = "fatal"
 			}
 		}
+		if st.Sibling { // 只记账：调用的状态与结局由最终的一条腿决定
+			callState, ref, failReason, reqID = string(rec.State), "", "", ""
+		}
 		out, err = scanCall(tx.QueryRow(ctx, `UPDATE calls SET state = $3,
-				result_ref = CASE WHEN $3 = 'completed' THEN $4 ELSE result_ref END,
+				result_ref = CASE WHEN $3 = 'completed' AND $4 <> '' THEN $4 ELSE result_ref END,
 				cost_charged = cost_charged + $5,
 				upstream_request_id = CASE WHEN $6 <> '' THEN $6 ELSE upstream_request_id END,
 				possible_external_duplicate = possible_external_duplicate OR $7,
 				fail_reason = CASE WHEN $8 <> '' THEN $8 ELSE fail_reason END
 			WHERE task_id = $1 AND call_id = $2 RETURNING `+callColumns,
-			t.TaskID, t.CallID, callState, st.ResultSHA256, spent, st.UpstreamRequestID, st.Outcome == "unknown", failReason))
+			t.TaskID, t.CallID, callState, ref, spent, reqID, st.Outcome == "unknown", failReason))
 		return err
 	})
 	return out, err
@@ -763,7 +769,7 @@ func (s *Store) LoadCall(ctx context.Context, taskID, callID string) (call.CallR
 		tries = nil
 		rows, err := q.Query(ctx, `WITH c AS (SELECT `+callColumns+` FROM calls WHERE task_id = $1 AND call_id = $2)
 			SELECT c.*, t.try_no, t.attempt_id, COALESCE(t.env_id, ''), t.state, t.outcome, t.latency_ms, t.cost_micro,
-				t.reservation_id, t.error, t.provider, t.skipped, t.hedge
+				t.reservation_id, t.error, t.provider, t.skipped, t.hedge, t.hedge_lost
 			FROM c LEFT JOIN call_tries t ON t.task_id = $1 AND t.call_id = $2 ORDER BY t.try_no`, taskID, callID)
 		if err != nil {
 			return err
@@ -778,11 +784,11 @@ func (s *Store) LoadCall(ctx context.Context, taskID, callID string) (call.CallR
 			var tr call.TryRecord
 			var attempt, env, tstate, outcome, rid, terr, provider, skipped *string
 			var latency, cost *int64
-			var hedge *bool
+			var hedge, hedgeLost *bool
 			if err := rows.Scan(&r.TaskID, &r.CallID, &r.Fingerprint, &r.Endpoint, &state, &r.Source, &r.ResultRef, &r.TriesUsed,
 				&r.CreatedAt, &r.DeadlineAt, &r.CostCharged, &r.FirstAttemptID, &r.UpstreamRequestID, &r.SupersedesCallID,
 				&r.SupersedeReason, &r.PossibleExternalDuplicate, &r.FailReason, &r.ResolvingSince, &r.Model, &r.SubrunID,
-				&tryNo, &attempt, &env, &tstate, &outcome, &latency, &cost, &rid, &terr, &provider, &skipped, &hedge); err != nil {
+				&tryNo, &attempt, &env, &tstate, &outcome, &latency, &cost, &rid, &terr, &provider, &skipped, &hedge, &hedgeLost); err != nil {
 				return err
 			}
 			r.State = call.CallState(state)
@@ -792,7 +798,7 @@ func (s *Store) LoadCall(ctx context.Context, taskID, callID string) (call.CallR
 			}
 			tr = call.TryRecord{TryNo: *tryNo, AttemptID: *attempt, EnvID: *env, State: *tstate, Outcome: *outcome,
 				LatencyMs: *latency, CostMicro: *cost, ReservationID: *rid, Error: *terr, Provider: *provider, Skipped: *skipped,
-				Hedge: *hedge}
+				Hedge: *hedge, HedgeLost: *hedgeLost}
 			tries = append(tries, tr)
 		}
 		if err := rows.Err(); err != nil {

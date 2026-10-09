@@ -479,7 +479,8 @@ func TestInspectTextRouteTries(t *testing.T) {
 			{"try_no":1,"state":"settled","outcome":"retryable","error":"upstream_unavailable","latency_ms":3,"provider":"primary"},
 			{"try_no":2,"state":"settled","outcome":"ok","latency_ms":120,"provider":"backup","skipped":"primary:tried"}]},
 		{"call_id":"root/s1/chat/2","endpoint":"/v1/chat/completions","tries":[
-			{"try_no":1,"state":"settled","outcome":"ok","latency_ms":80,"provider":"backup","skipped":"primary:circuit_open","hedge":true}]},
+			{"try_no":1,"state":"settled","outcome":"ok","latency_ms":80,"provider":"backup","skipped":"primary:circuit_open","hedge":true},
+			{"try_no":2,"state":"settled","outcome":"unknown","error":"upstream_unconfirmed","latency_ms":300,"provider":"primary","hedge_lost":true}]},
 		{"call_id":"root/s1/search/1","endpoint":"/v1/search","tries":[{"try_no":1,"state":"settled","outcome":"ok"}]}]}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, err := fmt.Fprint(w, body); err != nil {
@@ -502,6 +503,7 @@ func TestInspectTextRouteTries(t *testing.T) {
 		"root/s1/chat/1 1 primary 3ms retryable (upstream_unavailable) - -",
 		"root/s1/chat/1 2 backup 120ms ok - primary:tried",
 		"root/s1/chat/2 1 backup 80ms ok hedge primary:circuit_open",
+		"root/s1/chat/2 2 primary 300ms unknown (upstream_unconfirmed) lost - -",
 	}
 	if strings.Join(rows, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("路由行\n%s\n期望\n%s\n完整输出：\n%s", strings.Join(rows, "\n"), strings.Join(want, "\n"), res.stdout)

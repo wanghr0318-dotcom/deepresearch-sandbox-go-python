@@ -1174,6 +1174,7 @@ components:
         provider: {type: string, description: "Model provider chain only — the provider route that ran this try (primary, backup, …); omitted with a single provider"}
         skipped: {type: string, description: "Model provider chain only — providers passed over before this try as name:reason (circuit_open, tried, model_not_served), comma-separated"}
         hedge: {type: boolean, description: Model provider chain only — true for the second, concurrent leg of a hedged request}
+        hedge_lost: {type: boolean, description: "Model provider chain only — this try was cancelled because the other leg of a hedged pair produced the decisive result (error keeps the try's own code)"}
     Call:
       type: object
       description: A Gateway logical call (journal entry). Metadata only — no request or response bodies, prompts or credentials.

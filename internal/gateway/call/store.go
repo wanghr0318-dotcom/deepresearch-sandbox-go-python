@@ -135,6 +135,12 @@ type Settlement struct {
 	ResultSHA256      string
 	ResultSize        int64
 	Error             string
+	// Sibling 是只记账的结算（对冲中不是最终结果的一条腿，hedge.go）：预留、账本、try 行与 calls.cost_charged、
+	// possible_external_duplicate 照常，但不改变 calls.state、result_ref、upstream_request_id 与 fail_reason——调用的
+	// 结局只由最终的一条腿决定。ok 的 Sibling 结算仍须给出已保存的结果 blob（登记来源，不成为 result_ref）。
+	Sibling bool
+	// HedgeLost 记录这条腿因另一条腿得出决定性结果而被取消（call_tries.hedge_lost；Error 保留它自己的错误码）。
+	HedgeLost bool
 }
 
 // CacheCompletion 是不经上游 try 完成调用的 Tx2 输入：结果 blob 已存在且已由 Gateway 校验内容哈希（§11.5）。
@@ -203,4 +209,5 @@ type TryRecord struct {
 	Error                string
 	Provider, Skipped    string // 模型降级链的审计元数据（单供应商时为空）
 	Hedge                bool   // 对冲 try
+	HedgeLost            bool   // 对冲中落败而被取消的 try
 }
