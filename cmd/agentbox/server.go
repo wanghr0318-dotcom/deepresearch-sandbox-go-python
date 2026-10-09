@@ -2,7 +2,7 @@
 
 package main
 
-// 本文件是 `agentbox server`：解析参数，构造具体实现（PostgreSQL Store、advisory lock、provider/local），
+// 本文件是 `agentbox server`：解析参数，构造具体实现（PostgreSQL Store、advisory lock、provider/local 或 provider/k8s），
 // 调用 app.Run（代码组织规则 5：具体实现只在 cmd/agentbox 装配）。
 
 import (
@@ -147,6 +147,9 @@ func runServer(args []string, stderr io.Writer) int {
 	fs.Float64Var(&tel.SampleRatio, "trace-sample-ratio", 1, "新 trace 的采样比例 (0, 1]（父 span 已采样的子 span 跟随父 span）")
 	fs.StringVar(&tel.MetricsListen, "metrics-listen", "", "Prometheus /metrics 的监听地址（只供运维，例如 127.0.0.1:9464；无鉴权，不得暴露给用户）；为空时不提供指标")
 	logFile := fs.String("log-file", "", "结构化日志另外追加写入的文件（0600；例如供 Loki 的采集器读取）；为空时只写 stderr")
+	providerName := fs.String("provider", "local", "环境 provider：local（本机 namespace/cgroup 沙箱，默认）| k8s（每个环境一个 Kubernetes Pod，见 --k8s-*；需要 --exec-slots 0）")
+	var kf k8sFlags
+	kf.register(fs)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -232,16 +235,42 @@ func runServer(args []string, stderr io.Writer) int {
 	for _, w := range hostcheck.Check().Warnings {
 		fmt.Fprintln(stderr, "warning: hostcheck:", w)
 	}
-	// 在取得任何锁、连接数据库之前确认能够安全执行任务。
-	starter, execDigest, err := prepareIsolation(execCfg.Enabled())
-	if err != nil {
-		fmt.Fprintln(stderr, "agentbox server: 拒绝启动:", err)
-		return 1
-	}
 	dir, err := filepath.Abs(*dataDir)
 	if err != nil {
 		fmt.Fprintln(stderr, "agentbox server:", err)
 		return 1
+	}
+	// 在取得任何锁、连接数据库之前确认能够安全执行任务。
+	var (
+		starter     local.EnvStarter
+		execDigest  string
+		newProvider func(string) (provider.Provider, error)
+	)
+	switch *providerName {
+	case "local":
+		if starter, execDigest, err = prepareIsolation(execCfg.Enabled()); err != nil {
+			fmt.Fprintln(stderr, "agentbox server: 拒绝启动:", err)
+			return 1
+		}
+		newProvider = func(installID string) (provider.Provider, error) {
+			p, err := local.New(local.Options{DataDir: dir, CgroupRoot: *cgroupRoot, InstallID: installID, Starter: starter})
+			if err != nil {
+				return nil, err
+			}
+			return p, nil
+		}
+	case "k8s":
+		if execCfg.Enabled() {
+			fmt.Fprintln(stderr, "agentbox server: --provider k8s 不支持 exec 环境，须同时设置 --exec-slots 0")
+			return 2
+		}
+		if newProvider, err = prepareK8s(kf, dir, *defaultMemory, stderr); err != nil {
+			fmt.Fprintln(stderr, "agentbox server: 拒绝启动:", err)
+			return 1
+		}
+	default:
+		fmt.Fprintf(stderr, "agentbox server: --provider 须为 local 或 k8s，得到 %q\n", *providerName)
+		return 2
 	}
 	cfg := app.Config{
 		Listen:                *listen,
@@ -307,13 +336,7 @@ func runServer(args []string, stderr io.Writer) int {
 			}
 			return s, nil
 		},
-		NewProvider: func(installID string) (provider.Provider, error) {
-			p, err := local.New(local.Options{DataDir: dir, CgroupRoot: *cgroupRoot, InstallID: installID, Starter: starter})
-			if err != nil {
-				return nil, err
-			}
-			return p, nil
-		},
+		NewProvider: newProvider,
 	}
 	logger, closeLog, err := serverLogger(*logFile, stderr)
 	if err != nil {
