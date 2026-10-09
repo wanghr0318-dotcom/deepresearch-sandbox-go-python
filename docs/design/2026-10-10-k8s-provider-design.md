@@ -1,6 +1,6 @@
 # Design: Kubernetes provider, OCI worker image, warm pool
 
-> Status: implemented on branch `s3-k8s-provider`. Contract: `docs/design/2026-10-05-provider-contract.md`.
+> Status: implemented on branch `s3-k8s-provider`; measurements in `docs/evidence/2026-10-10-k8s-provider.md`. Contract: `docs/design/2026-10-05-provider-contract.md`.
 > The local provider (`internal/provider/local`) stays the default; nothing changes unless the server is
 > started with `--provider k8s`.
 
@@ -125,15 +125,15 @@ claim the same warm Pod). Mapping of the contract:
 |---|---|---|
 | env dir + owner.json | `<data>/envs/<id>/owner.json` | Pod labels + `agentbox.io/owner` annotation |
 | init ready | control conn open | Pod `Ready` + in-process state (gate open) |
-| `Stop` authoritative check | cgroup absent or `populated 0` | Pod absent or phase `Succeeded`/`Failed` |
-| kill | `cgroup.kill` | patch `spec.activeDeadlineSeconds=1` → kubelet kills all containers, Pod object stays |
+| `Stop` authoritative check | cgroup absent or `populated 0` | Pod absent, phase `Succeeded`/`Failed`, or every container `terminated` (restartPolicy Never; the phase follows ~2 s later) |
+| kill | `cgroup.kill` | patch `spec.activeDeadlineSeconds=1` → kubelet kills all containers, Pod object stays; plus a best-effort `podagent shutdown` exec (SIGTERM to PID 1) that ends the container in ~0.3 s |
 | `Destroy` layers | mounts → cgroup → dir | Pod deleted (verified NotFound) → slot `run/` removed |
 | `Scan` | dirs, mounts, cgroups, listeners | all `agentbox.io/managed` Pods in the namespace; warm Pods of this install are pool capacity, not environments, and are not reported |
 | execution gate | in-process | identical (copied semantics) |
 
 `Stop` uses `activeDeadlineSeconds` rather than an exec-based kill because it only needs the API server and
 the kubelet — it works when the helper, the container or the exec path is wedged. PID 1 (`podagent init`)
-SIGKILLs every process in the container on SIGTERM so termination is fast.
+SIGKILLs every process in the container on SIGTERM so termination is fast. The kubelet only acts on the deadline at its next pod sync (3–5 s on kind), so `Stop` also execs `podagent shutdown` as a fast path; with it, Stop completes in about 1 s on kind.
 
 Idempotency and residue follow the contract: a bound Pod of this install that is not ready in this
 process (interrupted create, previous server process, stopped) is `ErrIncomplete`; a different

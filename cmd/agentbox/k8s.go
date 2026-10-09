@@ -11,6 +11,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -66,7 +68,7 @@ func prepareK8s(f k8sFlags, dataDir string, defaultMemory int64, stderr io.Write
 		p, err := k8s.New(context.Background(), k8s.Options{Client: client, Executor: ex, Namespace: f.namespace,
 			InstallID: installID, Image: ref.Pinned(), RuntimeClass: f.runtimeClass, SlotHostDir: shared,
 			SlotNodeDir: f.nodeSharedDir, WarmPool: f.warmPool, WarmProfile: k8sWarmProfile(defaultMemory),
-			EnsureNetworkPolicy: true})
+			EnsureNetworkPolicy: true, Logger: slog.New(slog.NewJSONHandler(os.Stderr, nil))})
 		if err != nil {
 			return nil, err
 		}

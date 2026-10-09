@@ -154,7 +154,7 @@ func (p *Provider) startExec(ctx context.Context, pod string, nofile, fsize uint
 		// the workload exits, the Pod is stopped, or the provider is closed.
 		err := p.exec.Stream(p.ctx, p.opt.Namespace, pod, cmd, stdinR, aw, errW)
 		h.status, h.err = p.exitStatus(pod, spec.ExecID, err)
-		_ = stdinR.Close()
+		_ = stdinW.Close() // remotecommand's stdin copy then sees EOF instead of a closed-pipe error
 		outW.Close()
 		errW.Close()
 		close(h.done)

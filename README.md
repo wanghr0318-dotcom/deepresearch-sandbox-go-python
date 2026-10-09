@@ -46,6 +46,7 @@
 | **模型降级链** | 一个逻辑模型可由按顺序排列的多个 OpenAI 兼容供应商提供：可重试的失败立即转下一个供应商，每次尝试都是 journal 中独立计价的 try；每个供应商一个熔断器，全部熔断时立即返回 `503 model_degraded`；可选对冲请求。重放与指纹不受影响。 |
 | **exec 沙箱** | 模型写的 Python 每次在全新、无网络的环境中运行，有独立 UID、CPU 与墙钟配额，并收集输出文件。 |
 | **工作区工具与 MCP（可选）** | `--workspace-tools`：每轮一个工作区，`write_file` / `read_file` / `list_dir` 与 `exec_shell`（每条命令一个全新的 exec 沙箱，文件在命令之间保留，按 exec 配额记账，路径只能是工作区内的相对路径，符号链接不会保留）。`--mcp-config`：Gateway 作为 MCP 客户端（stdio 或 streamable HTTP）连接运维配置的服务器，只暴露允许清单中的工具，调用记入 journal 并计入每轮工具额度；沙箱不接触 MCP 服务器与其凭据。[设计](docs/design/2026-10-10-shell-file-mcp-design.md)、[记录](docs/evidence/2026-10-10-shell-file-mcp.md)。 |
+| **Kubernetes provider（可选）** | `--provider k8s` 把每个环境放进一个 Pod：经 pods/exec 运行镜像内的 helper 作为控制通道，非 root、只读根、丢弃全部 capability、无 ServiceAccount token、deny-all NetworkPolicy；worker 镜像按 digest 固定；预热池让环境就绪从约 1 s 降到约 10 ms。与本地 provider 通过同一套契约一致性测试。 |
 | **产品层** | 账号（PBKDF2、`HttpOnly` 会话、登录限速）；用户隔离（他人的数据一律 404）；费用、模型与内部 ID 在服务端脱敏；CSP 与 Markdown 安全渲染。 |
 | **可观测性** | OpenTelemetry 追踪：一次用户操作一条 trace，从 API 请求经任务 actor、attempt、Worker 启动与握手、checkpoint，**进入沙箱**（W3C `traceparent` 经协议交给 Worker，Python SDK 只用标准库转发）再回到 Gateway 的每个模型、搜索、抓取与 exec 调用及其每次重试；Prometheus 指标（结果、启动与停止延迟、上游延迟与错误、费用、工具调用、沙箱与槽位）；JSON 日志带 `trace_id`。默认关闭；`deploy/observability` 提供 Collector、Tempo、Prometheus、Loki、Grafana 本地栈（[设计](docs/design/2026-10-10-observability-design.md)、[演示记录](docs/evidence/2026-10-10-observability.md)）。 |
 
@@ -65,6 +66,7 @@
   - lint 与复杂度报告。
 - **真实验收**：在 4 vCPU / 8 GiB 的 Linux 云主机（腾讯云上海）上，使用真实模型（Moonshot：`kimi-k3` 主导、`kimi-k2.6` 执行）与经 Serper 的 Google 搜索结果。记录：[对话助手](docs/evidence/2026-10-06-m4-chat-acceptance.md)、[exec 沙箱](docs/evidence/2026-10-06-m4-exec-hardening.md)、[账号](docs/evidence/2026-10-06-m3-accounts.md)、[备份与恢复](docs/evidence/2026-10-06-backup-restore.md)。
 - **模型降级链**（[记录](docs/evidence/2026-10-10-model-fallback.md)，fake upstream、零费用）：主供应商持续 503 时，无降级链的调用 3.7–5.1 s 后失败（3 次 try 加退避），有降级链时约 51 ms 由后备供应商完成（与健康供应商相同）；全部熔断时约 40 µs 返回 `model_degraded`。
+- **Kubernetes provider**（[记录](docs/evidence/2026-10-10-k8s-provider.md)，kind 单节点，每组 20 次）：环境就绪 P50 冷启动 978 ms、预热池 11 ms；到 Python 首行输出 1051 ms / 78 ms；契约一致性测试在 fake clientset（CI）与 kind 上均 11/11 通过；`scripts/demo-k8s.sh` 演示 Gateway、取消与 server 崩溃恢复。
 - **串行与并行研究对比**（[记录](docs/evidence/2026-10-06-m4-subrun-comparison.md)）。小样本，每组 N = 4：
 
   | | 串行 | 并行 |
@@ -114,6 +116,7 @@ CI=true go test -count=1 ./internal/persistence/postgres/ ./tests/e2e/...
 |---|---|
 | `cmd/agentbox` | 单一二进制：`server`、`doctor`、`task …`、`user …`、`verify-invariants` |
 | `internal/sandbox`、`provider/local`、`cgroup`、`rootfs`、`hostcheck` | 沙箱启动器、init、环境生命周期、宿主自检 |
+| `internal/provider/k8s`、`cmd/agentbox-podagent`、`deploy/k8s` | Kubernetes provider（每环境一个 Pod、镜像 digest 固定、预热池）、镜像内 helper、worker 镜像与 kind 配置 |
 | `internal/task`、`runner`、`session`、`subrun`、`admission`、`resource` | 控制面：actor、attempt、会话、sub-run、准入 |
 | `internal/gateway/{edge,call,upstream,cache}` | Gateway：每 attempt 的 socket、调用 journal 与账本、供应商 adapter、Redis 缓存 |
 | `internal/gateway/{workspace,mcp}`、`internal/mcpdemo` | 工作区（清单、生命周期、文件操作）、MCP 客户端与 adapter、演示 MCP 服务器（`agentbox mcp-demo-server`） |
@@ -131,7 +134,7 @@ CI=true go test -count=1 ./internal/persistence/postgres/ ./tests/e2e/...
 以下边界在设计中写明，不加掩饰：
 
 - **容器级隔离，共享宿主内核。** 权限边界测试是回归测试，不是无逃逸证明；不应依赖它隔离恶意的多租户代码。
-- **单执行主机。** 没有跨主机故障接管。
+- **单执行主机。** 没有跨主机故障接管；Kubernetes provider 的 workspace 与 Gateway socket 经节点本地目录共享，目前也只支持单节点。
 - **不保证 exactly-once。** 外部调用不保证 exactly-once；结果未知时按保守方式计费，预算可能略有超出。
 - **Workspace 不回滚。** workspace 不随 checkpoint 回滚。
 
