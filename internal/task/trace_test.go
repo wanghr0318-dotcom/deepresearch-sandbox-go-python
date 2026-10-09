@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs/obstest"
@@ -126,8 +127,8 @@ func TestActorTraceTurnHandoffStaysInTrace(t *testing.T) {
 	}
 }
 
-// A queued task cancelled before any attempt (ApplyControl queued → cancelled, no verdict) is counted as finished,
-// its run ends, and the stop latency starts at the accepted request (obs.NoteStop).
+// A queued task cancelled before any attempt (ApplyControl queued → cancelled, no verdict, no run opened) is
+// counted as finished, leaves no span open, and the stop latency starts at the accepted request (obs.NoteStop).
 func TestActorTraceApplyControlEndsRun(t *testing.T) {
 	tr, rec := obstest.Install(t)
 	ts := queuedTask("t1")
@@ -139,7 +140,7 @@ func TestActorTraceApplyControlEndsRun(t *testing.T) {
 	if st := h.st.task("t1").Status; st != "cancelled" {
 		t.Fatalf("status %s", st)
 	}
-	for _, e := range []string{"RunEnded kind=task status=cancelled", "TaskFinished task=t1 kind=task status=cancelled",
+	for _, e := range []string{"TaskFinished task=t1 kind=task status=cancelled",
 		"StopCompleted kind=task desired=cancel"} {
 		if !rec.Has(e) {
 			t.Errorf("missing %q in %v", e, rec.Events())
@@ -195,5 +196,50 @@ func TestActorTraceDropsStaleSubmission(t *testing.T) {
 	runs := tr.Named("task")
 	if len(runs) != 2 || runs[1].ParentID != "" {
 		t.Errorf("second run adopted a stale submission: %+v", runs)
+	}
+}
+
+// A paused task cancelled via ApplyControl (no run open) counts as finished but not as a second run end.
+func TestActorTracePausedCancelNoSecondRunEnd(t *testing.T) {
+	_, rec := obstest.Install(t)
+	ts := queuedTask("t1")
+	ts.Status, ts.Desired, ts.ControlVersion = "paused", "cancel", 2
+	h := newActorHarness(t, ts)
+	h.spawn("t1")
+	h.waitDone()
+	if st := h.st.task("t1").Status; st != "cancelled" {
+		t.Fatalf("status %s", st)
+	}
+	if !rec.Has("TaskFinished task=t1 kind=task status=cancelled") {
+		t.Errorf("events %v", rec.Events())
+	}
+	for _, e := range rec.Events() {
+		if e == "RunEnded kind=task status=cancelled" {
+			t.Errorf("run end counted without an open run: %v", rec.Events())
+		}
+	}
+}
+
+// The stale-submission cutoff is when the ending store write was issued: a resume accepted while the write was in
+// flight survives and parents the next run.
+func TestStatusCommittedKeepsSubmissionAcceptedDuringWrite(t *testing.T) {
+	obstest.Install(t)
+	tr := &actorTrace{}
+	tr.begin(context.Background(), "t-cut", State{TaskID: "t-cut"})
+	tr.ensureRun()
+	issued := time.Now()
+	time.Sleep(2 * time.Millisecond)
+	ctx, sp := obs.Start(context.Background(), "POST /tasks/{id}/resume")
+	obs.NoteSubmit(ctx, "t-cut") // accepted after the paused write was issued
+	sp.End()
+	tr.statusCommitted("paused", "", issued)
+	if _, _, ok := obs.TakeSubmit("t-cut"); !ok {
+		t.Fatal("a submission accepted after the write was issued was dropped")
+	}
+	obs.NoteSubmit(ctx, "t-cut")
+	tr.ensureRun()
+	tr.statusCommitted("paused", "", time.Now()) // noted before this write: stale
+	if _, _, ok := obs.TakeSubmit("t-cut"); ok {
+		t.Fatal("a stale submission survived the run end")
 	}
 }

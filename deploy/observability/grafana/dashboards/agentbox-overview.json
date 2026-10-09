@@ -137,7 +137,7 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "Paused / cancelled",
+      "title": "Paused runs + cancelled tasks",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -156,7 +156,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(agentbox_tasks_finished_total{status=~\"paused|cancelled\"}[$__range])) or vector(0)",
+          "expr": "(sum(increase(agentbox_task_runs_ended_total{status=\"paused\"}[$__range])) or vector(0)) + (sum(increase(agentbox_tasks_finished_total{status=\"cancelled\"}[$__range])) or vector(0))",
           "instant": true
         }
       ],

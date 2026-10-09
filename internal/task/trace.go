@@ -197,7 +197,7 @@ func (t *actorTrace) controlChanged(desired string) {
 }
 
 // verdict ends the attempt span with the committed verdict, then records the resulting task status.
-func (t *actorTrace) verdict(v Verdict) {
+func (t *actorTrace) verdict(v Verdict, issuedAt time.Time) {
 	if !t.on {
 		return
 	}
@@ -215,20 +215,24 @@ func (t *actorTrace) verdict(v Verdict) {
 	if v.TaskStatus == "failed" {
 		fail = v.OutcomeClass
 	}
-	t.statusCommitted(v.TaskStatus, fail)
+	t.statusCommitted(v.TaskStatus, fail, issuedAt)
 }
 
 // statusCommitted records a committed task status from any path — a verdict, ApplyControl (queued → paused or
 // cancelled without an attempt) or a turn failed while queued. A status that stops the task running (paused, incl.
 // awaiting_input, or terminal) ends the run: run span, task_runs_ended_total, stop latency; a terminal status also
 // counts tasks_finished_total and observes the task's tool calls. Other statuses (queued for a fault retry,
-// pausing, cancelling) continue the run.
-func (t *actorTrace) statusCommitted(status, failCode string) {
+// pausing, cancelling) continue the run. task_runs_ended_total counts only when a run is open (a paused task
+// cancelled by ApplyControl has no run to end). issuedAt is when the store write was issued: submissions noted
+// before it belonged to the ending run; one accepted while the write was in flight (a resume) is kept.
+func (t *actorTrace) statusCommitted(status, failCode string, issuedAt time.Time) {
 	if !t.on || (status != "paused" && !IsTerminal(status)) {
 		return
 	}
 	m := obs.M()
-	m.RunEnded(t.kind, status)
+	if t.span != nil {
+		m.RunEnded(t.kind, status)
+	}
 	if IsTerminal(status) {
 		m.TaskFinished(t.taskID, t.kind, status)
 	}
@@ -236,8 +240,7 @@ func (t *actorTrace) statusCommitted(status, failCode string) {
 		m.StopCompleted(t.kind, t.stopDesired, time.Since(t.stopAt))
 		t.stopDesired, t.stopAt = "", time.Time{}
 	}
-	// A submission noted before this point belonged to the run that just ended (or arrived while it was ending).
-	obs.DropSubmitBefore(t.taskID, time.Now())
+	obs.DropSubmitBefore(t.taskID, issuedAt)
 	t.endRun(status, failCode)
 }
 

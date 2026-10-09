@@ -938,6 +938,7 @@ type storeOp struct {
 	totalMs   int64
 	stoppedAt time.Time
 	started   bool
+	issuedAt  time.Time // 最近一次开始执行该写入的时间（只供可观测性）
 }
 
 type storeDone struct {
@@ -956,7 +957,7 @@ func (a *Actor) pumpStore() {
 		return
 	}
 	op := a.storeQ[0]
-	op.started, a.storeBusy = true, true
+	op.started, a.storeBusy, op.issuedAt = true, true, time.Now() // issuedAt：可观测性（trace.go statusCommitted）
 	cp, taskID := *op, a.taskID
 	a.async(func(ctx context.Context) any {
 		var r storeDone
@@ -1033,11 +1034,11 @@ func (a *Actor) committed(op *storeOp, r storeDone) {
 		a.tr.attemptCreated(na)
 		a.apply(AttemptCreated{AttemptID: na.AttemptID, EnvID: na.EnvID, Status: r.attempt.Status})
 	case opApplyControl:
-		a.tr.statusCommitted(op.control.Status, "")
+		a.tr.statusCommitted(op.control.Status, "", op.issuedAt)
 	case opFailTurn:
-		a.tr.statusCommitted("failed", op.reason)
+		a.tr.statusCommitted("failed", op.reason, op.issuedAt)
 	case opFinalize:
-		a.tr.verdict(op.verdict)
+		a.tr.verdict(op.verdict, op.issuedAt)
 		a.apply(VerdictCommitted{Verdict: op.verdict, CommittedSessionCheckpointID: r.attempt.CommittedSessionCheckpointID})
 	case opAccountRunTime:
 		if r.runTimeMs != nil && a.rt.openAt == nil {

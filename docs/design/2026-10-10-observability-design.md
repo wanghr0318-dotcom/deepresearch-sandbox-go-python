@@ -4,7 +4,7 @@ Status: implemented on branch `s1-observability`.
 
 ## 1. Goals
 
-1. **One trace per task / turn**, from the API request that created it, through the task actor's attempts
+1. **One trace per run (user action)** — each run of a task/turn, from the API request that started it (create, resume, continue, answer), through the task actor's attempts
    (admission, environment, worker start, handshake, checkpoints, finalize), into the sandbox, and back out
    through every Gateway call the worker makes (model / search / fetch / exec, including each upstream try,
    retries, cache hits, coalescing and budget rejections).
