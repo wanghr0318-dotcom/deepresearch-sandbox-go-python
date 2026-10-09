@@ -107,6 +107,7 @@ func TestParseSuiteRejects(t *testing.T) {
 		"research topic":  `{"name":"x","tasks":[{"id":"a","kind":"research"}]}`,
 		"research check":  `{"name":"x","tasks":[{"id":"a","kind":"research","topic":"t","check":"c"}]}`,
 		"bad file":        `{"name":"x","tasks":[{"id":"a","kind":"coding","prompt":"p","check":"c","files":{"../x":"1"}}]}`,
+		"harness file":    `{"name":"x","tasks":[{"id":"a","kind":"coding","prompt":"p","check":"c","files":{"_eval_codec.py":"1"}}]}`,
 		"reserved file":   `{"name":"x","tasks":[{"id":"a","kind":"coding","prompt":"p","check":"c","files":{"solution.py":"1"}}]}`,
 		"bad regex":       `{"name":"x","tasks":[{"id":"a","kind":"coding","prompt":"p","check":"c","expect":{"stdout_regex":"("}}]}`,
 		"bad timeout":     `{"name":"x","tasks":[{"id":"a","kind":"coding","prompt":"p","check":"c","timeout":"soon"}]}`,

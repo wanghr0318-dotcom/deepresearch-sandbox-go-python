@@ -227,7 +227,8 @@ func (t *Task) validate() error {
 			return errors.New("coding tasks cannot set topic or research")
 		}
 		for name := range t.Files {
-			if !filePattern.MatchString(name) || name == "solution.py" || name == "check.py" || strings.HasPrefix(name, ".") {
+			if !filePattern.MatchString(name) || name == "solution.py" || name == "check.py" || strings.HasPrefix(name, ".") ||
+				strings.HasPrefix(name, "_eval") {
 				return fmt.Errorf("invalid fixture file name %q", name)
 			}
 		}

@@ -48,7 +48,7 @@ func codingArt(exit int, stdout string) []byte {
 	}
 	b, _ := json.Marshal(CodingArtifact{Schema: "agentbox.eval.coding/v1", Agent: "reference",
 		Exec: &ExecInfo{Status: "completed", ExitCode: &exit, Stdout: stdout, ImageDigest: "sha256:abcdef0123456789",
-			Harness: &HarnessVerdict{Verdict: verdict, CheckerExit: exit}}})
+			Harness: &HarnessVerdict{Verdict: verdict, CheckerExit: exit, Completed: exit == 0}}})
 	return b
 }
 

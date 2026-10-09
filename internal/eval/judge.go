@@ -13,7 +13,7 @@ import (
 	"sync"
 )
 
-// / Judge is the optional LLM-judge grader: an OpenAI-compatible chat endpoint called from the CLI (outside the
+// Judge is the optional LLM-judge grader: an OpenAI-compatible chat endpoint called from the CLI (outside the
 // sandbox) with a hard budget and a hard call limit. Off unless configured (--judge-model).
 type Judge struct {
 	BaseURL string // e.g. https://api.moonshot.cn/v1 (POST <BaseURL>/chat/completions)

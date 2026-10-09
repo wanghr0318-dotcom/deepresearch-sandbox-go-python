@@ -93,17 +93,21 @@ def run_harness(code: str, tmp: Path) -> subprocess.CompletedProcess[str]:
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="the harness uses pass_fds (POSIX)")
 
 
-def verdict_of(res: subprocess.CompletedProcess[str]) -> str:
+def verdict(res: subprocess.CompletedProcess[str]) -> dict[str, Any]:
     _, v = split_harness_verdict(res.stderr)
     assert v is not None, res.stderr
-    return v["verdict"]
+    return v
+
+
+def verdict_of(res: subprocess.CompletedProcess[str]) -> str:
+    return verdict(res)["verdict"]
 
 
 @posix_only
 def test_harness_pass_fail_fixtures_timeout(tmp_path: Path) -> None:
     cfg = parse_config({**BASE, "files": {"nums.txt": "1\n2\n"}})
     ok = run_harness(harness("def add(a, b):\n    return a + b\n", cfg), tmp_path)
-    assert ok.returncode == 0 and verdict_of(ok) == "pass"
+    assert ok.returncode == 0 and verdict_of(ok) == "pass", ok.stderr
     assert ok.stdout == "PASS\n"  # the completion token is consumed by the harness
     bad = run_harness(harness("def add(a, b):\n    return a - b\n", cfg), tmp_path)
     assert bad.returncode == 1 and "AssertionError" in bad.stderr and verdict_of(bad) == "fail"
@@ -126,23 +130,153 @@ def test_harness_pass_fail_fixtures_timeout(tmp_path: Path) -> None:
     assert res.returncode != 0 and verdict_of(res) == "timeout"
 
 
-EARLY_EXIT_HACKS = [
-    "import os\nos._exit(0)\n",
-    "import sys\nsys.exit(0)\n",
-    "import atexit, os\natexit.register(lambda: os._exit(0))\nraise SystemExit(0)\n",
-    "raise SystemExit\n",
-    "print('EVAL-CHECK-DONE:' + '0' * 32)\nimport os\nos._exit(0)\n",
-    "import os\nfor fd in range(3, 64):\n    try:\n        print(os.read(fd, 64))\n"
-    "    except OSError:\n        pass\nos._exit(0)\n",
-]
+RICH_SOLUTION = """
+def pairs(text):
+    return [(w, len(w)) for w in text.split()]
+
+def index(words):
+    return {w: {"len": len(w), "upper": w.upper(), "chars": set(w)} for w in words}
+
+def blob(n):
+    return bytes(range(n)), frozenset({1, 2}), {(1, 2): None}
+
+def boom(kind):
+    if kind == "value":
+        raise ValueError("bad value")
+    if kind == "custom":
+        class Oops(Exception):
+            pass
+        raise Oops("custom failure")
+    raise SystemExit(0)
+
+CONSTANT = [1, 2, 3]
+"""
+
+RICH_CHECK = """
+from solution import pairs, index, blob, boom, CONSTANT
+import solution
+assert pairs("ab c") == [("ab", 2), ("c", 1)]
+assert index(["hi"]) == {"hi": {"len": 2, "upper": "HI", "chars": {"h", "i"}}}
+assert blob(3) == (b"\\x00\\x01\\x02", frozenset({1, 2}), {(1, 2): None})
+assert CONSTANT == [1, 2, 3]
+try:
+    boom("value")
+    raise AssertionError("no exception")
+except ValueError as e:
+    assert "bad value" in str(e)
+try:
+    boom("custom")
+    raise AssertionError("no exception")
+except Exception as e:
+    assert type(e).__name__ == "RemoteError" and "custom failure" in str(e)
+try:
+    boom("exit")  # a SystemExit raised by the solution must not become the checker's exit
+    raise AssertionError("no exception")
+except SystemExit:
+    raise AssertionError("SystemExit crossed the boundary")
+except Exception as e:
+    assert "SystemExit" in str(e)
+try:
+    from solution import missing  # noqa: F401
+    raise AssertionError("missing name imported")
+except ImportError:
+    pass
+print("PASS")
+"""
 
 
 @posix_only
-@pytest.mark.parametrize("hack", EARLY_EXIT_HACKS)
-def test_harness_rejects_early_exit_hacks(tmp_path: Path, hack: str) -> None:
-    """A solution that exits before the checker's asserts finish must not pass, even with exit 0."""
-    res = run_harness(harness(hack, parse_config(BASE)), tmp_path)
-    assert verdict_of(res) == "incomplete" and res.returncode != 0
+def test_harness_proxy_round_trips_values_and_exceptions(tmp_path: Path) -> None:
+    cfg = parse_config({**BASE, "check": RICH_CHECK})
+    res = run_harness(harness(RICH_SOLUTION, cfg), tmp_path)
+    assert verdict_of(res) == "pass", res.stderr
+    assert res.stdout == "PASS\n"
+
+
+@posix_only
+def test_harness_script_solution_runs_real_code(tmp_path: Path) -> None:
+    check = (
+        "import subprocess, sys\n"
+        "p = subprocess.run([sys.executable, 'solution.py', 'x'], capture_output=True, text=True)\n"
+        "assert p.stdout.strip() == 'args=x data=42', (p.stdout, p.stderr)\n"
+    )
+    cfg = parse_config({**BASE, "check": check, "files": {"data.txt": "42"}})
+    sol = "import sys\nprint('args=' + sys.argv[1] + ' data=' + open('data.txt').read())\n"
+    res = run_harness(harness(sol, cfg), tmp_path)
+    assert verdict_of(res) == "pass", res.stderr
+
+
+@posix_only
+def test_harness_nonzero_exit_expectation_is_token_protected(tmp_path: Path) -> None:
+    cfg = parse_config({**BASE, "check": "from solution import add\nimport sys\nsys.exit(3)\n"})
+    res = run_harness(harness("def add(a, b):\n    return a + b\n", cfg), tmp_path)
+    v = verdict(res)
+    assert v["verdict"] == "fail" and v["checker_exit"] == 3 and v["completed"] is True
+    # the solution cannot make the checker exit with any code: os._exit(3) only ends its own process
+    res = run_harness(harness("import os\nos._exit(3)\n", cfg), tmp_path)
+    v = verdict(res)
+    assert v["completed"] is False and v["checker_exit"] == 1
+
+
+FORGE_HACKS = {
+    "os._exit": "import os\nos._exit(0)\n",
+    "sys.exit": "import sys\nsys.exit(0)\n",
+    "atexit": "import atexit, os\natexit.register(lambda: os._exit(0))\nraise SystemExit(0)\n",
+    "bare SystemExit": "raise SystemExit\n",
+    "fake token": "print('EVAL-CHECK-DONE:' + '0' * 32)\nimport os\nos._exit(0)\n",
+    "fd scan": "import os\nfor fd in range(3, 64):\n    try:\n        print(os.read(fd, 64))\n"
+    "    except OSError:\n        pass\nos._exit(0)\n",
+    # the reviewer's forgeries: call the token holder through __main__, or read its closure
+    "__main__._eval_done": "import __main__ as m, os\nm._eval_done()\nos._exit(0)\n",
+    "closure": "import __main__ as m, os\n"
+    "print('EVAL-CHECK-DONE:' + m._eval_done.__closure__[0].cell_contents)\nos._exit(0)\n",
+    "__main__ token": "import __main__ as m, os\nprint('EVAL-CHECK-DONE:' + m._eval_token)\n"
+    "os._exit(0)\n",
+    "kill parent": "import os, signal\nos.kill(os.getppid(), signal.SIGKILL)\n",
+}
+
+
+@posix_only
+@pytest.mark.parametrize("name", sorted(FORGE_HACKS))
+def test_harness_rejects_forgeries(tmp_path: Path, name: str) -> None:
+    """A solution must not be able to pass a check whose asserts did not all run."""
+    cfg = parse_config({**BASE, "wall_ms": 6000})  # a hack that blocks (fd scan) times out quickly
+    res = run_harness(harness(FORGE_HACKS[name], cfg), tmp_path)
+    assert verdict_of(res) in ("incomplete", "fail", "timeout"), (name, res.stdout, res.stderr)
+    assert res.returncode != 0
+
+
+PROC_MEM_PROBE = """
+import os
+for pid in (os.getppid(), int(open('/proc/%d/stat' % os.getppid()).read().split()[3])):
+    # a non-dumpable process's /proc files are owned by root, not by the shared uid
+    print('SAMEOWNER' if os.stat('/proc/%d/mem' % pid).st_uid == os.getuid() else 'ROOTOWNED', pid)
+    for what in ('mem', 'environ', 'fd'):
+        path = '/proc/%d/%s' % (pid, what)
+        try:
+            if what == 'fd':
+                os.listdir(path)
+            else:
+                open(path, 'rb').read(1)
+            print('READABLE', path)
+        except OSError as e:
+            print('DENIED', path, type(e).__name__)
+
+def add(a, b):
+    return a + b
+"""
+
+
+@posix_only
+def test_solution_cannot_read_checker_or_harness_memory(tmp_path: Path) -> None:
+    """The checker (parent of the solution process) and the harness (its grandparent) are
+    non-dumpable: /proc/<pid>/mem, environ and fd are not accessible to the same-uid solution."""
+    res = run_harness(harness(PROC_MEM_PROBE, parse_config(BASE)), tmp_path)
+    assert verdict_of(res) == "pass", res.stderr
+    assert "READABLE" not in res.stdout, res.stdout
+    assert res.stdout.count("DENIED") == 6, res.stdout
+    # PR_SET_DUMPABLE 0 took effect in both (independent of the Yama ptrace scope)
+    assert res.stdout.count("ROOTOWNED") == 2 and "SAMEOWNER" not in res.stdout, res.stdout
 
 
 def test_split_harness_verdict() -> None:

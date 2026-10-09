@@ -62,11 +62,13 @@ type ExecInfo struct {
 }
 
 // HarnessVerdict is the exec harness's out-of-band verdict (its last stderr line, parsed by the worker).
-// pass needs both checker exit 0 and the completion token the checker prints after its last statement,
-// so a solution that exits early (os._exit(0), sys.exit(0)) is "incomplete", never "pass".
+// pass needs both checker exit 0 and the completion token the checker prints after its last statement;
+// the solution runs in a separate process and cannot print or end the checker, so early exits are
+// "incomplete" or "fail", never "pass". A non-zero expected exit also requires the token.
 type HarnessVerdict struct {
 	Verdict     string `json:"verdict"` // pass | fail | incomplete | timeout
 	CheckerExit int    `json:"checker_exit"`
+	Completed   bool   `json:"completed"` // the checker printed its completion token (ran to the end)
 	TimeoutS    int    `json:"timeout_s,omitempty"`
 }
 
@@ -127,9 +129,9 @@ func gradeCheck(ex *ExecInfo, want int) Grade {
 		g.Detail, g.Category = fmt.Sprintf("checker timed out after %d s", h.TimeoutS), "check_timeout"
 	case h.Verdict == "incomplete":
 		g.Detail, g.Category = "checker exited 0 without its completion token (early exit)", "check_incomplete"
-	case want == 0 && h.Verdict == "pass":
+	case want == 0 && h.Verdict == "pass" && h.Completed:
 		g.Pass, g.Score, g.Detail = true, 1, "checker passed"
-	case want != 0 && h.Verdict == "fail" && h.CheckerExit == want:
+	case want != 0 && h.Verdict == "fail" && h.Completed && h.CheckerExit == want:
 		g.Pass, g.Score, g.Detail = true, 1, fmt.Sprintf("checker exit %d as expected", want)
 	default:
 		g.Detail, g.Category = fmt.Sprintf("checker exit %d, want %d", h.CheckerExit, want), "wrong_exit_code"

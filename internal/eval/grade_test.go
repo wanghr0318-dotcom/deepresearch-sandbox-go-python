@@ -22,7 +22,8 @@ func TestGradeCoding(t *testing.T) {
 	art := func(status string, exit *int, stdout string, verdict string, checkerExit int) *CodingArtifact {
 		ex := &ExecInfo{Status: status, ExitCode: exit, Stdout: stdout, Signal: 9}
 		if verdict != "" {
-			ex.Harness = &HarnessVerdict{Verdict: verdict, CheckerExit: checkerExit, TimeoutS: 9}
+			ex.Harness = &HarnessVerdict{Verdict: verdict, CheckerExit: checkerExit, TimeoutS: 9,
+				Completed: verdict == "pass" || (verdict == "fail" && checkerExit == 3)}
 		}
 		return &CodingArtifact{Exec: ex}
 	}
@@ -37,6 +38,7 @@ func TestGradeCoding(t *testing.T) {
 		{"pass", codingTask(Expect{}), "succeeded", ok(""), Outcome{Verdict: VerdictPass}},
 		{"checker failed", codingTask(Expect{}), "succeeded", art("completed", intp(1), "", "fail", 1), Outcome{VerdictFail, "wrong_exit_code"}},
 		{"expected nonzero", codingTask(Expect{ExitCode: intp(3)}), "succeeded", art("completed", intp(3), "", "fail", 3), Outcome{Verdict: VerdictPass}},
+		{"expected nonzero without token", codingTask(Expect{ExitCode: intp(4)}), "succeeded", art("completed", intp(4), "", "fail", 4), Outcome{VerdictFail, "wrong_exit_code"}},
 		{"exec timeout", codingTask(Expect{}), "succeeded", art("timed_out", nil, "", "", 0), Outcome{VerdictFail, "exec_timeout"}},
 		{"check timeout", codingTask(Expect{}), "succeeded", art("completed", intp(1), "", "timeout", 1), Outcome{VerdictFail, "check_timeout"}},
 		{"early exit", codingTask(Expect{}), "succeeded", art("completed", intp(1), "", "incomplete", 0), Outcome{VerdictFail, "check_incomplete"}},

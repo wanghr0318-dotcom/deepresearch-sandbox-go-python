@@ -71,8 +71,12 @@ stream, which carry metadata only; the token and the judge key are asserted abse
   A real-model run was not possible from this host (WSL2 has no outbound internet); on a host with a model
   key the same command is `agentbox eval run --suite eval/suites/demo.yaml --agent model` against a server
   configured with the real `--model-base-url`. The LLM judge was exercised only against a test endpoint.
-- **The completion token stops early-exit hacks, not a determined adversary:** the solution runs in the
-  checker's process and could in principle read the token from memory (see design §3.2).
+- **Reward-hack defence as measured here was the first version** (token only, solution in the
+  checker's process). Review showed that version forgeable from inside the process
+  (`__main__._eval_done()`); fix round 2 moved the solution into a separate, unprivileged process
+  behind a JSON proxy and made the checker and harness non-dumpable (design §3.2). Those forgeries
+  are covered by unit tests run on Linux; the real-sandbox run with the new harness is recorded
+  below once it has been repeated.
 - **Research latency is not realistic:** the fake upstream answers instantly and uses one fixed research
   script for every topic; real research takes minutes (see the
   [sub-run comparison](2026-10-06-m4-subrun-comparison.md)).

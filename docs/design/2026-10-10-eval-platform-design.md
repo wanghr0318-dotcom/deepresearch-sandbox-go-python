@@ -99,22 +99,47 @@ Coding harness, per task:
    exit code/signal, stdout/stderr (capped 16 KiB each), wall/queue ms, exec image digest, and the
    harness verdict).
 
-**Completion token (reward-hack defence).** The checker imports the solution in its own process, so an
-exit code alone is forgeable: a solution containing `os._exit(0)` or `sys.exit(0)` at import would end
-the checker with status 0 before any assert ran. The harness therefore requires a positive signal the
-solution does not have: it generates a random nonce, passes it to the checker through an inherited pipe
-(not argv or environment), and wraps the checker so that its first line reads and closes that pipe before
-anything else runs, and its last line prints `EVAL-CHECK-DONE:<nonce>`. The verdict is `pass` only for
-exit 0 **and** that token as the last stdout line; exit 0 without it is `incomplete` (category
-`check_incomplete`), a checker timeout is `timeout`, otherwise `fail`. The verdict is reported out of
-band as the harness's last stderr line `[eval-harness] {json}` (checker output is capped before it is
-forwarded so this line is never truncated; only the last such line counts, so a forged one printed by
-the solution is ignored). The demo suite contains two hacks (`clamp`: `os._exit(0)`, `median`:
-`sys.exit(0)`) with no stdout expectation that must — and do — fail. **Limit:** checker and solution
-share a process, so a solution that deliberately inspects the checker's memory (frames, `gc`) could
-still find and print the token; full isolation would run the solution in a separate process and talk
-to it over a pipe, which the current checker style (plain `from solution import f`) does not do.
-Checkers must not call `sys.exit(0)` themselves on success (it would skip the token).
+**Reward-hack defence: completion token + process separation.** An exit code alone is forgeable: if
+the checker imports the solution in its own interpreter, a solution with `os._exit(0)` or `sys.exit(0)`
+at import ends the checker with status 0 before any assert ran. Two mechanisms close this:
+
+1. *Completion token.* The harness generates a random nonce and passes it to the checker through an
+   inherited pipe (not argv or environment). The generated `check.py` starts with a prelude that marks
+   the process non-dumpable (`prctl(PR_SET_DUMPABLE, 0)`), reads the nonce and closes the pipe; the
+   suite's check code then runs inside a wrapper (`exec` of the source, `SystemExit` caught) that prints
+   `EVAL-CHECK-DONE:<nonce>` after the last statement and exits with the check's own exit code. The
+   verdict is `pass` only for exit 0 **and** the token as the last stdout line (looked for in the
+   uncapped output); exit 0 without it is `incomplete` (`check_incomplete`); a non-zero expected exit
+   code also requires the token (`completed: true`); a checker timeout is `timeout`; otherwise `fail`.
+   The verdict is reported out of band as the harness's last stderr line `[eval-harness] {json}`
+   (output is capped before forwarding so this line is never cut; only the last line counts).
+2. *Process separation* (fix round 2, after a reviewer forged the token in-process via
+   `__main__._eval_done()` and via the closure cell). The solution never runs in the checker's
+   interpreter. `solution.py` beside `check.py` is a generated proxy: importing it starts a child process
+   that imports the real solution from `_eval_impl/`; attribute reads and calls are forwarded over two
+   pipes as tagged JSON (None, bool, int, float, str, list, tuple, dict, set, frozenset, bytes — no
+   pickle). Builtin `Exception` subclasses raised by the solution are re-raised as the same type, others
+   as `RemoteError`; `SystemExit`/`KeyboardInterrupt` never cross as such. Run as a script
+   (`python solution.py`), the proxy `exec`s the real solution, which is then a separate process anyway.
+   The child gets neither the nonce nor any descriptor to it (the prelude has closed the pipe before the
+   proxy is imported; `close_fds`), and the checker and the harness are non-dumpable, so the same-uid
+   child cannot open their `/proc/<pid>/mem`, `environ` or `fd` (verified by a test that also checks the
+   files became root-owned, i.e. that `PR_SET_DUMPABLE 0` took effect independently of the Yama ptrace
+   scope); in the exec sandbox seccomp additionally denies `ptrace` and the only capability is `KILL`.
+   Tests: `os._exit(0)`, `sys.exit(0)`, `atexit`, bare `SystemExit`, a fake token, an fd scan,
+   `__main__._eval_done()`, the closure-cell read, `__main__._eval_token`, killing the parent — all end
+   `incomplete`/`fail`/`timeout`; correct solutions returning lists, tuples, dicts, sets and bytes and
+   raising exceptions that the checker catches still pass.
+
+   **Limits.** Values that cannot be serialised (callables, generators, custom objects) cannot be
+   returned to the checker, and checkers cannot pass callables (e.g. a `key=` function) to the solution;
+   suites must use plain data. A solution can still waste the time budget or print to stdout (it
+   shares the checker's stdout so its prints keep their place before the token). A process with
+   `CAP_SYS_PTRACE` or a kernel bug would defeat the memory isolation; the exec sandbox grants neither
+   capability nor ptrace.
+
+The demo suite contains two reward hacks (`clamp`: `os._exit(0)`, `median`: `sys.exit(0)`) with no stdout
+expectation; both must — and do — fail as `check_incomplete`.
 
 Judgement is not done in the worker: the CLI grades from the `eval` artifact, so a trajectory can be
 re-graded offline.
@@ -237,6 +262,11 @@ call limit and whether it is required (never the key).
   model answer, the checker run and the cost are not repeated (`trajectory.calls[].tries` shows replays as
   a single try). Across separate eval runs nothing is replayed: a rerun against a real model may differ,
   which is exactly why the manifest pins the models and the suite.
+
+Note: `models_used` in the manifest is the *requested* (logical) model resolved by the Gateway; with
+the model fallback chain the provider that actually served each try is in the trajectory
+(`calls[].tries[].provider`), in `providers_used`, and the chain configuration is covered by
+`upstream_fingerprint`.
 
 ## 9. Reports and compare
 
