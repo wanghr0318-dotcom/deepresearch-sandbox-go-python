@@ -4,6 +4,8 @@
 > Command: `sudo AGENTBOX_DEMO_PREBUILT=1 bash scripts/demo-eval.sh` (binaries cross-built from commit
 > `9d5bd9c` so the manifest carries the VCS revision). All 13 steps passed. This is the second recorded
 > run, after review fix round 1 (completion-token harness, two reward-hack tasks, compare statistics).
+> Re-run after rebasing onto the model-fallback merge (binaries from `485a361`): identical outcomes and
+> categories, wall clock 18.9 s (concurrency 1) and 10.5 s (concurrency 4).
 
 ## Setup
 
