@@ -423,3 +423,31 @@ def test_mcp_tool_not_allowed_is_not_access_revoked(fake_gateway: FakeGateway):
     with pytest.raises(GatewayError) as e:
         gw.mcp_call("orch", "calc", "echo_env", {"name": "HOME"})
     assert e.value.code == "mcp_tool_not_allowed" and not isinstance(e.value, AccessRevoked)
+
+
+def test_write_file_delete_and_unknown_total():
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def op(o: str, body: dict[str, Any]) -> dict[str, Any]:
+        calls.append((o, dict(body)))
+        if body.get("delete"):
+            return {"path": body["path"], "deleted": ["d/a", "d/b"], "workspace": {"files": 0}}
+        return {
+            "path": "big.txt",
+            "content": "x\n",
+            "start_line": 1,
+            "end_line": 1,
+            "total_lines": None,
+            "truncated": True,
+            "binary": False,
+        }
+
+    gw = ScriptedGateway(workspace=op)
+    res = WriteFile().run({"path": "d", "delete": True}, tool_ctx(gw))
+    assert res.ok and "已删除 2 个文件" in res.content
+    assert calls[-1] == ("write", {"path": "d", "delete": True})
+    res = ReadFile().run({"path": "big.txt"}, tool_ctx(gw))
+    assert "文件更长" in res.content and "未读完" in res.content
+    reg = ToolRegistry([WriteFile()])
+    res = reg.dispatch("write_file", json.dumps({"path": "a"}), tool_ctx(gw))
+    assert not res.ok and "content" in res.content

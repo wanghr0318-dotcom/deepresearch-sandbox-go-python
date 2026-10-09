@@ -32,8 +32,17 @@ MAX_LIST_ENTRIES = 300
 # 工作区与 exec 的错误码 → 给模型的说明
 _ERRORS = {
     "invalid_path": (
-        "路径不合法：只能用工作区内的相对路径（如 src/app.py），不能含 ..、不能以 / 开头"
+        "路径不合法：只能用工作区内的相对路径（如 src/app.py），不能含 ..、不能以 / 开头，"
+        "不能用 .agentbox 目录、控制字符或超过 255 字节的文件名"
     ),
+    "workspace_write_quota": (
+        "本轮写入文件的次数或总量已达上限，请改用 exec_shell 在工作区内生成文件"
+    ),
+    "workspace_staging_failed": (
+        "工作区未能完整放入执行环境（可能空间不足），工作区保持不变；请删除大文件后再试"
+    ),
+    "workspace_destroyed": "本轮已结束，工作区已被清理",
+    "mcp_arguments_too_large": "参数过大",
     "not_found": "文件或目录不存在",
     "is_directory": "这是一个目录，请用 list_dir",
     "not_a_directory": "这是一个文件，请用 read_file",
@@ -197,7 +206,8 @@ class ReadFile:
                 content=text, preview={"kind": "text", "text": text}, raw=_inline(req, body)
             )
         first, last, total = body.get("start_line"), body.get("end_line"), body.get("total_lines")
-        head = f"{body.get('path')}（第 {first}–{last} 行，共 {total} 行）"
+        total_text = f"共 {total} 行" if total is not None else "文件更长"
+        head = f"{body.get('path')}（第 {first}–{last} 行，{total_text}）"
         if body.get("truncated"):
             head += "；未读完，可用 start_line 继续"
         content = str(body.get("content", ""))
@@ -213,7 +223,8 @@ class WriteFile:
     name = "write_file"
     description = (
         "在本轮工作区中写入（新建或覆盖）一个文本文件，路径为相对路径，上级目录自动建立；"
-        "内容至多 1 MiB。executable=true 时设为可执行。"
+        "内容至多 1 MiB。executable=true 时设为可执行。delete=true 时删除该文件或整个目录"
+        "（不给 content）。"
     )
     parameters: dict[str, Any] = {
         "type": "object",
@@ -221,13 +232,18 @@ class WriteFile:
             "path": {"type": "string", "minLength": 1, "maxLength": 512},
             "content": {"type": "string", "maxLength": 1048576},
             "executable": {"type": "boolean"},
+            "delete": {"type": "boolean"},
         },
-        "required": ["path", "content"],
+        "required": ["path"],
         "additionalProperties": False,
     }
     counts_budget = False
 
     def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        if args.get("delete"):
+            return self._delete(args, ctx)
+        if "content" not in args:
+            raise ToolArgsError("写入时须给出 content（删除请用 delete=true）")
         req = {k: args[k] for k in ("path", "content", "executable") if k in args}
         try:
             body = _gw(ctx).workspace("write", req)
@@ -239,6 +255,18 @@ class WriteFile:
         shown["content_bytes"] = len(args["content"].encode("utf-8"))
         return ToolResult(
             content=text, preview={"kind": "text", "text": text}, raw=_inline(shown, body)
+        )
+
+    def _delete(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        req = {"path": args["path"], "delete": True}
+        try:
+            body = _gw(ctx).workspace("write", req)
+        except GatewayError as exc:
+            return _error(exc, f"删除 {args['path']} ")
+        gone = [str(p) for p in body.get("deleted") or []]
+        text = f"已删除 {len(gone)} 个文件：" + "、".join(gone[:50]) + f"。{_workspace_line(body)}"
+        return ToolResult(
+            content=text, preview={"kind": "text", "text": text}, raw=_inline(req, body)
         )
 
 

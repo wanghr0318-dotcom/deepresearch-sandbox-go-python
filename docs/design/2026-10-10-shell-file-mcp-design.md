@@ -51,7 +51,9 @@ Why this instead of a long-lived sandbox per workspace:
 - **Bounded cost.** Disk is bounded by the `/out` tmpfs (`--exec-out-bytes`, default 64 MiB, also `RLIMIT_FSIZE`), memory by `--exec-memory-max`, and nothing is held between commands except blobs.
 - Cost: one environment creation per command (measured in the evidence, §9) and no process state between commands. Coding-agent harnesses that use a stateless Bash tool (each command in a fresh shell, files persist) show this is the right trade-off for an agent workload.
 
-Symlinks, FIFOs and devices created by a command are **not** carried into the next version (collection skips them and the response lists them as `skipped`); empty directories are not represented. This is what makes the file API escape-proof (§5).
+Symlinks, FIFOs and devices created by a command are **not** carried into the next version (collection skips them and the response lists them as `skipped`); empty directories are not represented. Files whose names are not valid workspace paths (under the reserved `.agentbox/`, with control characters, …) are skipped with reason `invalid_path`, so the next command can always be staged. This is what makes the file API escape-proof (§5).
+
+**Staging signal.** The wrapper writes a fixed marker (`\0agentbox:staged\n`) to stdout after the copy succeeded and before it `exec`s the command. The marker is positionally unforgeable — the command can only write after it — so its presence at the very start of stdout is the wrapper's positive "staged OK" signal; `ExecShell` strips it and reports `workspace_staged`. The Manager applies the `/out` snapshot **only** when it is present; otherwise (copy failed, e.g. `/out` full, or the wall limit hit during staging) the head is unchanged and the call returns `503 workspace_staging_failed` (the exec call itself is journaled and counted). To make a full workspace always fit, workspace bytes are capped at `--exec-out-bytes` − 1 MiB (256 files × 4 KiB block rounding); the command gets whatever is left of the `/out` tmpfs.
 
 ### 3.2 Where the head lives (lifecycle and crash recovery)
 
@@ -72,11 +74,16 @@ Symlinks, FIFOs and devices created by a command are **not** carried into the ne
 | task terminal (succeeded / failed / cancelled), checked by the sweeper every 30 s and once at startup | state file deleted (**destroyed**) |
 | no operation for `--workspace-idle-timeout` (default 2 h; longer than the session evict-after so that a paused or `awaiting_input` turn keeps its workspace) | manifest dropped, state `expired` kept as a tombstone |
 | server crash / restart | state file is read lazily on next access → **recovered**; unreadable or inconsistent file, or a manifest blob missing from the BlobStore → state `lost` |
-| operation on an `expired` / `lost` workspace | `410 workspace_lost` with the reason; the worker tells the model that the files are gone |
+| operation on an `expired` / `lost` workspace | `410 workspace_expired` / `410 workspace_lost`; the worker tells the model that the files are gone |
+| request that was waiting for the workspace while the sweeper destroyed it | `410 workspace_destroyed` (tombstone; it does not recreate the workspace) |
+| any accepted operation, reads included | refreshes the idle clock |
+| state file or blob store unreadable (I/O error) | the request fails (500); the workspace is **not** marked lost — only unparsable/inconsistent state or a missing blob is |
 
 Idempotency across crashes: the worker re-sends an in-flight `exec_shell` with the same call id after a restart. If the head was already advanced by that call (`applied` contains the id), the Manager returns the stored response without running anything; otherwise the call goes to the coordinator, which replays from the journal or re-runs it (the input manifest is unchanged, so the fingerprint matches). Operations on one workspace are serialized by a per-task mutex; the Manager waits for an `exec_shell` to settle even if the HTTP client disconnected, so a result is never lost between "exec completed" and "head advanced".
 
-The blobs referenced by a workspace are ordinary Gateway blobs (exec outputs are authorized to the task scope by `SettleExec`, as for `/v1/exec`); destroying a workspace drops only the manifest.
+The blobs referenced by a workspace are ordinary Gateway blobs (exec outputs are authorized to the task scope by `SettleExec`, as for `/v1/exec`); destroying a workspace drops only the manifest. **The BlobStore is never garbage-collected**, so `write_file` (permanent host-disk writes) is metered per task: at most 2000 write operations and 256 MiB written (`429 workspace_write_quota`; counters in the state file). Exec outputs are bounded by the exec quota.
+
+An applied call id replays only for the same request (sha256 of command and timeout stored with it); a different request under that id is `409 fingerprint_mismatch`.
 
 ### 3.3 Accounting
 
@@ -99,7 +106,7 @@ Operator config (`--mcp-config /etc/agentbox/mcp.json`; absent = MCP off):
 
 - `name`: `[a-z0-9_]{1,32}`; tools are exposed to the agent as `mcp__<server>__<tool>`. `allowed_tools` is required and non-empty: tools not listed are never shown and calls to them are rejected (`403 mcp_tool_not_allowed`) before anything is sent.
 - Credentials stay on the host: stdio servers get only `env` plus `env_from` (values read from the server's own environment at start), HTTP servers get `headers_from_env`. None of it enters the journal, the fingerprint, error texts or events.
-- **stdio**: the Gateway starts the process (argv as given, no shell), speaks newline-delimited JSON-RPC 2.0, performs `initialize` + `notifications/initialized`, and serializes requests per server. A dead process is restarted on the next request; stderr is logged (truncated).
+- **stdio**: the Gateway starts the process (argv as given, no shell), speaks newline-delimited JSON-RPC 2.0, performs `initialize` + `notifications/initialized`, and serializes requests per server (one call at a time; a slow call delays the next). A dead process, or one whose call timed out, is killed with its whole process group (own group via `Setpgid`, `Pdeathsig SIGKILL` so it dies with the Gateway) and restarted on the next request; since calls are serialized, that kill aborts no other call. Working directory: `dir` from the config or a fresh empty temp directory (removed on close); optional `uid`/`gid` (Linux). Stderr is logged (truncated). **The server runs on the host as that user — root by default — with arguments chosen by the model: allowlist only tools that are safe with hostile arguments.**
 - **Streamable HTTP**: `POST` JSON-RPC with `Accept: application/json, text/event-stream`; accepts a JSON body or an SSE stream (first response with the matching id); keeps `Mcp-Session-Id` from `initialize`; no redirects; response cap 1 MiB.
 - **`GET /v1/mcp/tools`** returns `{"tools":[{"name":"mcp__calc__calculate","server":"calc","tool":"calculate","description":…,"input_schema":…}]}`: the allowlisted intersection of each server's `tools/list`, fetched once per server and cached until the server process is restarted. A server that fails to list is omitted (and logged).
 - **`POST /v1/mcp/call`** `{"server","tool","arguments"}` with `X-Agentbox-Call-Id`: goes through `call.Coordinator.Invoke` as upstream kind `mcp` (adapter in `internal/gateway/mcp`). This gives the call journal (`calls`/`call_tries`, result blob, `inspect`), idempotent replay by call id, the call deadline, cancellation on attempt revocation, the tool budget and the per-attempt concurrency limits for free. Outcome mapping: transport failure before the request is written → `retryable`; after it was written without a response → `unknown` (not retried automatically: `tools/call` is not idempotent); JSON-RPC error → `fatal` (`502 mcp_error`); a tool result with `isError: true` is a successful call whose content tells the model what went wrong. The response is `{"server","tool","is_error","content":[…],"structured_content":…}` (text content capped at 256 KiB for the model).
@@ -119,13 +126,13 @@ Operator config (`--mcp-config /etc/agentbox/mcp.json`; absent = MCP off):
 | Endpoint | Body | Response |
 |---|---|---|
 | `POST /v1/workspace/exec` (call id required) | `{"command": str ≤ 64 KiB, "timeout_ms"?: int}` | `{"status","exit","stdout",…(exec result fields)…,"changes":{"added","modified","deleted"},"skipped":[…],"workspace":{"version","files","bytes"}}` |
-| `POST /v1/workspace/read` | `{"path", "start_line"? ≥ 1, "max_lines"? ≤ 2000}` | `{"path","content","start_line","end_line","total_lines","truncated","size","sha256"}` |
-| `POST /v1/workspace/write` | `{"path", "content" ≤ 1 MiB UTF-8, "executable"?: bool}` | `{"path","size","sha256","created","workspace":{…}}` |
+| `POST /v1/workspace/read` | `{"path", "start_line"? ≥ 1, "max_lines"? ≤ 2000}` | `{"path","content","start_line","end_line","total_lines" (null unless the end was reached),"truncated","binary","size","sha256"}` — streamed: only the window is read and checked for binary content |
+| `POST /v1/workspace/write` | `{"path", "content" ≤ 1 MiB UTF-8, "executable"?: bool}` or `{"path", "delete": true}` (a file, or every file under a directory; any existing manifest key can be deleted) | `{"path","size","sha256","created","workspace":{…}}` / `{"path","deleted":[…],"workspace":{…}}` |
 | `POST /v1/workspace/list` | `{"path"?: "" = root, "recursive"?: bool}` | `{"path","entries":[{"name","type":"file|dir","size"}],"workspace":{…}}` |
 | `GET /v1/mcp/tools` | — | see §3.4 |
 | `POST /v1/mcp/call` (call id required) | `{"server","tool","arguments": object}` | see §3.4 |
 
-All workspace endpoints are `404 endpoint_not_configured` when `--workspace-tools` is off (and when exec is off); MCP endpoints when `--mcp-config` is absent. Read/write/list do the §9.2 access check (revoked attempt → 403) before touching the workspace.
+All workspace endpoints are `404 endpoint_not_configured` when `--workspace-tools` is off (and when exec is off); MCP endpoints when `--mcp-config` is absent (`/v1/mcp/call` validates its headers — call id, sub-run prefix — first, then answers `404 endpoint_not_configured` because no `mcp` adapter is registered). MCP `arguments` are capped at 64 KiB (`413 mcp_arguments_too_large`). HTTP answers from an MCP server: 4xx → fatal `upstream_rejected` (408/429 → retryable), 5xx → unknown. Read/write/list do the §9.2 access check (revoked attempt → 403) before touching the workspace.
 
 ### 4.2 Go
 
@@ -139,9 +146,9 @@ All workspace endpoints are `404 endpoint_not_configured` when `--workspace-tool
 | Limit | Value |
 |---|---|
 | files per workspace | 256 (= `/out` collection cap); `write_file` beyond it → `409 workspace_full` |
-| bytes per workspace | `--exec-out-bytes` (default 64 MiB) |
-| path | relative, `path.Clean`-stable, ≤ 512 bytes, ≤ 32 segments, no `..`, no NUL, no leading `/`, no `\` |
-| `write_file` content | ≤ 1 MiB |
+| bytes per workspace | `--exec-out-bytes` − 1 MiB staging headroom (default 63 MiB) |
+| path | relative, `path.Clean`-stable, ≤ 512 bytes, ≤ 32 segments, ≤ 255 bytes per segment, no `.`/`..`, no NUL or other control characters, no leading `/`, no `\`, not under the reserved `.agentbox/` (exactly what exec staging can stage) |
+| `write_file` content | ≤ 1 MiB; per task ≤ 2000 writes and ≤ 256 MiB written |
 | `read_file` | ≤ 2000 lines and ≤ 256 KiB per call |
 | `exec_shell` command | ≤ 64 KiB; `timeout_ms` capped by `--exec-wall-max` (default from exec) |
 | MCP result for the model | text ≤ 256 KiB; transport response ≤ 1 MiB; per-call timeout `timeout_ms` (default 30 s, ≤ 120 s) |

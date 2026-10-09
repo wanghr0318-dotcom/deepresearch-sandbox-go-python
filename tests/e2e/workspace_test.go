@@ -49,7 +49,11 @@ if __name__ == "__main__":
 const wsEscape = `ln -s /etc/passwd leak; ln -s / root-link
 python3 -c "import socket; socket.create_connection(('1.1.1.1', 80), 3)" >/dev/null 2>&1 && echo NET-OK || echo NET-BLOCKED
 cat /proc/self/status | grep -E '^(Uid|Seccomp):'
-echo whoami=$(id -u)`
+echo whoami=$(id -u)
+ln /etc/passwd hardlink 2>/dev/null && echo HARDLINK-OK || echo HARDLINK-BLOCKED
+mknod devnode c 1 3 2>/dev/null && echo MKNOD-OK || echo MKNOD-BLOCKED
+mkfifo fifo && echo FIFO-MADE
+mkdir -p .agentbox && echo x > .agentbox/evil && echo RESERVED-MADE`
 
 type wsStep struct {
 	tool string
@@ -178,8 +182,19 @@ func TestRealWorkspaceShellMCPDemo(t *testing.T) {
 	t.Logf("test output read back:\n%s", testOut)
 	t.Logf("escape command output:\n%s", escape)
 	t.Logf("escape reads: %q / %q; list_dir: %q", results[5].Error, results[6].Error, results[7].Preview.Text)
-	if !strings.Contains(escape, "NET-BLOCKED") || strings.Contains(escape, "NET-OK") || strings.Contains(escape, "whoami=0") {
+	for _, want := range []string{"NET-BLOCKED", "Seccomp:\t2", "HARDLINK-BLOCKED", "MKNOD-BLOCKED"} {
+		if !strings.Contains(escape, want) {
+			t.Fatalf("escape command output lacks %q: %q", want, escape)
+		}
+	}
+	if strings.Contains(escape, "NET-OK") || strings.Contains(escape, "whoami=0") || strings.Contains(escape, "-OK\n") {
 		t.Fatalf("escape command output: %q", escape)
+	}
+	// Symlinks, the FIFO and the reserved .agentbox directory never become workspace files.
+	for _, banned := range []string{"leak", "root-link", "fifo", "hardlink", "devnode", ".agentbox"} {
+		if strings.Contains(results[7].Preview.Text, banned) {
+			t.Fatalf("list_dir shows %q: %q", banned, results[7].Preview.Text)
+		}
 	}
 	if !strings.Contains(results[5].Error, "invalid_path") || !strings.Contains(results[6].Error, "not_found") {
 		t.Fatalf("escape reads: %q / %q", results[5].Error, results[6].Error)
