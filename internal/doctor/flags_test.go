@@ -45,7 +45,7 @@ func TestParseFlagsRoundTrip(t *testing.T) {
 func TestValidateAllowlist(t *testing.T) {
 	cases := []struct {
 		flag, value, want string
-		bad              bool
+		bad               bool
 	}{
 		{"--model-try-timeout", "5s", "5s", false},
 		{"--model-try-timeout", "0", "0s", false},

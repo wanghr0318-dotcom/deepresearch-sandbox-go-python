@@ -575,7 +575,7 @@ func ruleBackoff(a *analysis) *Finding {
 	}
 	ev.LatencyMs["backoff_est_total"] = total
 	f := &Finding{Severity: severity(a, "retry_backoff"), Title: "Retries and backoff dominate wall time",
-		Summary: fmt.Sprintf("in %d failed/slow tasks the Gateway's retry backoff is ≈%.0f%% of their latency.", ev.Counts["tasks"], share(total, lat)*100),
+		Summary:  fmt.Sprintf("in %d failed/slow tasks the Gateway's retry backoff is ≈%.0f%% of their latency.", ev.Counts["tasks"], share(total, lat)*100),
 		Evidence: ev}
 	f.Proposals = append(f.Proposals, Proposal{Kind: KindAdvisory,
 		Text: "a fallback provider turns retries into immediate failovers (no backoff between providers); fix the failing upstream first"})
@@ -614,7 +614,7 @@ func ruleHedge(a *analysis) *Finding {
 		return nil
 	}
 	f := &Finding{Severity: SevWarning, Title: "Hedged requests rarely win",
-		Summary: fmt.Sprintf("%d hedge legs, %d won (%.0f%%); lost legs that were already sent are charged as unknown.", legs, ev.Counts["hedge_wins"], share(ev.Counts["hedge_wins"], legs)*100),
+		Summary:  fmt.Sprintf("%d hedge legs, %d won (%.0f%%); lost legs that were already sent are charged as unknown.", legs, ev.Counts["hedge_wins"], share(ev.Counts["hedge_wins"], legs)*100),
 		Evidence: ev}
 	cur, curText := current(a.cfg, "model-hedge-delay")
 	if cur > 0 {
@@ -692,7 +692,7 @@ func (a *analysis) latencyRule(id string, xs []int64, p95Limit int64, part func(
 		return nil
 	}
 	f := &Finding{Severity: severity(a, id), Title: title,
-		Summary: fmt.Sprintf("%s: p50 %d ms, p95 %d ms, max %d ms over %d samples.", what, pct(xs, 50), pct(xs, 95), pct(xs, 100), len(xs)),
+		Summary:  fmt.Sprintf("%s: p50 %d ms, p95 %d ms, max %d ms over %d samples.", what, pct(xs, 50), pct(xs, 95), pct(xs, 100), len(xs)),
 		Evidence: ev}
 	f.Proposals = append(f.Proposals, Proposal{Kind: KindAdvisory, Text: advice})
 	return f
