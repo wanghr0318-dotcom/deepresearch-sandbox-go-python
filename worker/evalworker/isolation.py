@@ -1,18 +1,19 @@
 """Isolation between the checker and the solution under test (sources run in the exec sandbox).
 
-Layout made by the harness: the checker's directory holds check.py, the fixtures, the proxy
-`solution.py` and `_eval_codec.py`; a separate solution directory holds the real `solution.py`, a
-copy of the fixtures, `_eval_server.py` and the codec. The checker runs with `python -I` (no
-writable directory on sys.path) and loads the codec and the proxy explicitly by path.
+Layout made by the harness: the checker's directory holds only check.py, the proxy `solution.py`
+and `_eval_codec.py` (the fixtures live in the checker's memory); a solution directory under a
+separate parent holds the real `solution.py`, the fixtures, `_eval_server.py` and the codec. The
+checker runs with `python -I` (no writable directory on sys.path) and loads the codec and the
+proxy explicitly by path.
 
 The proxy starts a child process in the solution directory that imports the real solution; every
 attribute read or call is forwarded over a pair of pipes as tagged JSON (no pickle; only None,
 bool, int, float, str, list, tuple, dict, set, frozenset and bytes cross). Exceptions come back
 as the same builtin type when it is an `Exception` subclass, otherwise as `RemoteError`; a
-`SystemExit` raised by
-the solution never becomes a `SystemExit` in the checker. The child's stdout and stderr go to a log
-file in its own directory, so it holds none of the checker's pipes. Run as a script
-(`python solution.py`), the proxy execs the real solution in its place.
+`SystemExit` raised by the solution never becomes a `SystemExit` in the checker. The child's
+stdout and stderr go to a log file in its own directory, so it holds none of the checker's pipes.
+Run as a script (`python solution.py`), the proxy changes to the solution directory and execs the
+real solution in its place.
 
 The child never sees the completion token: the checker's prelude reads and closes the token pipe
 before the proxy is loaded, the token is not in argv or the environment, and the checker and the
@@ -155,7 +156,8 @@ import subprocess
 import sys
 
 _sol = __EVAL_SOL_DIR__
-if __name__ == "__main__":  # run as a script: become the real solution (cwd stays the checker's)
+if __name__ == "__main__":  # run as a script: become the real solution, in its own directory
+    os.chdir(_sol)  # (the fixtures exist on disk only there)
     os.execv(sys.executable, [sys.executable, "-E", "-s", "-B", os.path.join(_sol, "solution.py")]
              + sys.argv[1:])
 

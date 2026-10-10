@@ -73,7 +73,7 @@ type HarnessVerdict struct {
 	// Isolation facts reported by the harness (fix round 3).
 	Nondumpable     bool     `json:"nondumpable"`
 	SyspathWritable []string `json:"syspath_writable,omitempty"`
-	FixturesIntact  bool     `json:"fixtures_intact"`
+	WorkdirClean    bool     `json:"workdir_clean"` // the checker's directory held only its own unchanged files
 	PipesHeld       bool     `json:"pipes_held,omitempty"`
 }
 
@@ -133,7 +133,7 @@ func gradeCheck(ex *ExecInfo, want int) Grade {
 	case h.Verdict == "unsafe":
 		g.Detail, g.Category = "harness isolation not established (non-dumpable failed or writable sys.path)", "harness_unsafe"
 	case h.Verdict == "tampered":
-		g.Detail, g.Category = "fixture files were modified during the check", "fixtures_tampered"
+		g.Detail, g.Category = "the checker's directory was modified during the check (stray, changed or linked files)", "fixtures_tampered"
 	case h.Verdict == "timeout":
 		g.Detail, g.Category = fmt.Sprintf("checker timed out after %d s", h.TimeoutS), "check_timeout"
 	case h.Verdict == "incomplete":

@@ -125,18 +125,23 @@ def check_timeout_s(wall_ms: int | None) -> int:
 #
 # Passing needs a completion token that only the checker can print. The harness generates a random
 # nonce and hands it to the checker through an inherited pipe (never argv or env). The checker runs
-# with `python -I` (no writable directory on sys.path); its prelude marks it non-dumpable (failure
-# => exit 97, reported "unsafe"), reads and closes the token pipe, snapshots the fixtures, and loads
-# the codec and the proxy `solution` by path. The check code runs inside a wrapper that serves
-# fixture reads from the snapshot (`open`) and prints the token after the last statement (also when
-# the check calls sys.exit(n), so non-zero exit expectations are token-protected). The solution runs
-# in a child process in its own directory (see isolation). After the run the harness verifies the
-# fixtures in the checker's directory are unchanged. Verdicts: "unsafe" (non-dumpable failed or a
-# sys.path directory is writable), "timeout", "tampered", "pass" (exit 0 + token as the last stdout
-# line, found in the uncapped output), "incomplete" (exit 0 without it), otherwise "fail". It is
-# reported out of band as the last stderr line "[eval-harness] {json}"; output is capped before
-# forwarding.
-_HARNESS = r"""import ctypes, hashlib, json, os, secrets, signal, subprocess, sys, tempfile
+# with `python -I` (no writable directory on sys.path) in a directory that holds only check.py, the
+# proxy `solution.py` and the codec; the fixtures are not on disk there at all. Its prelude marks it
+# non-dumpable (failure => exit 97, "unsafe"), reads and closes the token pipe, records hashes of
+# its
+# three files, loads the codec and the proxy by path, and replaces builtins.open and io.open (which
+# pathlib uses) process-wide with a hook that serves the fixture names from an in-memory snapshot;
+# any other read of a fixture path finds no file. The check code runs inside a wrapper; after its
+# last
+# statement the checker lists its own directory, and any extra entry, symlink or changed file means
+# no token (exit 98, "tampered"); otherwise it prints the token and exits with the check's exit code
+# (sys.exit(n) inside the check included). The solution runs in a child process in its own directory
+# under a separate parent (see isolation). Verdicts: "unsafe" (non-dumpable failed or a sys.path
+# directory is writable), "timeout", "tampered", "pass" (exit 0 + token as the last stdout line,
+# found
+# in the uncapped output), "incomplete" (exit 0 without it), otherwise "fail". It is reported out of
+# band as the last stderr line "[eval-harness] {json}"; output is capped before forwarding.
+_HARNESS = r"""import ctypes, json, os, secrets, shutil, signal, subprocess, sys, tempfile
 try:
     nondumpable = ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0  # PR_SET_DUMPABLE 0
 except Exception:
@@ -150,10 +155,25 @@ CODEC = json.loads({codec!r})
 CAP = {cap}
 TIMEOUT = {timeout}
 REQUIRE_RO_PATH = {require_ro_path}
-# The checker runs with -I like this harness: no directory on its sys.path may be writable by us.
-writable = [d for d in sys.path if d and os.path.isdir(d) and os.access(d, os.W_OK)]
-work = tempfile.mkdtemp(prefix="eval-")
-sol = tempfile.mkdtemp(prefix="eval-sol-")
+
+
+def nearest_existing(d):
+    while d and not os.path.exists(d):
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return d
+
+
+# The checker runs with -I like this harness: no directory on its sys.path (or, for entries that do
+# not exist, their nearest existing parent) may be writable by us.
+writable = sorted({{p for p in (nearest_existing(d) for d in sys.path if d)
+                   if p and os.path.isdir(p) and os.access(p, os.W_OK)}})
+# Separate, unpredictable parents for the checker and the solution (defence in depth).
+work_parent, sol_parent = tempfile.mkdtemp(prefix="eval-"), tempfile.mkdtemp(prefix="eval-")
+work = tempfile.mkdtemp(dir=work_parent)
+sol = tempfile.mkdtemp(dir=sol_parent)
 
 
 def write(path, text):
@@ -161,9 +181,9 @@ def write(path, text):
         f.write(text)
 
 
+for name, content in FIXTURES.items():  # fixtures exist on disk only in the solution's directory
+    write(os.path.join(sol, name), content)
 for d in (work, sol):
-    for name, content in FIXTURES.items():
-        write(os.path.join(d, name), content)
     write(os.path.join(d, "_eval_codec.py"), CODEC)
 write(os.path.join(sol, "solution.py"), SOLUTION)
 write(os.path.join(sol, "_eval_server.py"), SERVER)
@@ -174,8 +194,9 @@ r, w = os.pipe()
 os.write(w, nonce.encode())
 os.close(w)
 prelude = (
-    "import ctypes as _eval_ct, importlib.util as _eval_iu, io as _eval_io, os as _eval_os\n"
-    "import sys as _eval_sys\n"
+    "import builtins as _eval_b, ctypes as _eval_ct, hashlib as _eval_h\n"
+    "import importlib.util as _eval_iu\n"
+    "import io as _eval_io, json as _eval_json, os as _eval_os, sys as _eval_sys\n"
     "try:\n"
     "    _eval_ok = _eval_ct.CDLL(None).prctl(4, 0, 0, 0, 0) == 0\n"
     "except Exception:\n"
@@ -185,39 +206,55 @@ prelude = (
     "_eval_token = _eval_os.read(%d, 64).decode()\n"
     "_eval_os.close(%d)\n"
     "_eval_dir = %r\n"
-    "_eval_fix = {{}}\n"
-    "for _n in %r:\n"
-    "    with open(_eval_os.path.join(_eval_dir, _n), 'rb') as _f:\n"
-    "        _eval_fix[_eval_os.path.join(_eval_dir, _n)] = _f.read()\n"
-    "def _eval_open(file, mode='r', *args, **kwargs):\n"
-    "    try:\n"
-    "        p = _eval_os.path.abspath(_eval_os.fsdecode(file))\n"
-    "    except TypeError:\n"
-    "        p = None\n"
-    "    if p in _eval_fix and not any(c in mode for c in 'wax+'):\n"
-    "        data = _eval_io.BytesIO(_eval_fix[p])\n"
-    "        if 'b' in mode:\n"
-    "            return data\n"
-    "        enc = kwargs.get('encoding') or (args[1] if len(args) > 1 else None) or 'utf-8'\n"
-    "        return _eval_io.TextIOWrapper(data, encoding=enc, newline=kwargs.get('newline'))\n"
-    "    return open(file, mode, *args, **kwargs)\n"
+    "_eval_real_open = _eval_io.open\n"
+    "def _eval_sha(n):\n"
+    "    with _eval_real_open(_eval_os.path.join(_eval_dir, n), 'rb') as f:\n"
+    "        return _eval_h.sha256(f.read()).hexdigest()\n"
+    "_eval_files = {{n: _eval_sha(n) for n in ('_eval_codec.py', 'check.py', 'solution.py')}}\n"
+    "_eval_fix = {{_eval_os.path.join(_eval_dir, n): c.encode('utf-8')\n"
+    "             for n, c in _eval_json.loads(%r).items()}}\n"
+    "def _eval_open(file, mode='r', buffering=-1, encoding=None, errors=None, newline=None,\n"
+    "               closefd=True, opener=None):\n"
+    "    if not isinstance(file, int):\n"
+    "        try:\n"
+    "            p = _eval_os.path.abspath(_eval_os.fsdecode(file))\n"
+    "        except TypeError:\n"
+    "            p = None\n"
+    "        if p in _eval_fix:\n"
+    "            if any(c in mode for c in 'wax+'):\n"
+    "                raise PermissionError('fixture %%s is read-only' %% p)\n"
+    "            data = _eval_io.BytesIO(_eval_fix[p])\n"
+    "            if 'b' in mode:\n"
+    "                return data\n"
+    "            return _eval_io.TextIOWrapper(data, encoding=encoding or 'utf-8', errors=errors,\n"
+    "                                          newline=newline)\n"
+    "    return _eval_real_open(file, mode, buffering, encoding, errors, newline, closefd,\n"
+    "                           opener)\n"
     "def _eval_load(name, path):\n"
     "    spec = _eval_iu.spec_from_file_location(name, path)\n"
     "    mod = _eval_iu.module_from_spec(spec)\n"
     "    _eval_sys.modules[name] = mod\n"
     "    spec.loader.exec_module(mod)\n"
     "_eval_load('_eval_codec', _eval_os.path.join(_eval_dir, '_eval_codec.py'))\n"
+    "_eval_b.open = _eval_io.open = _eval_open\n"
     "_eval_load('solution', _eval_os.path.join(_eval_dir, 'solution.py'))\n"
-    % (r, r, work, sorted(FIXTURES)))
+    % (r, r, work, json.dumps(FIXTURES)))
 wrapper = (
     "_eval_code = 0\n"
     "try:\n"
     "    exec(compile(%r, 'check.py', 'exec'),\n"
-    "         {{'__name__': '__main__', '__builtins__': __builtins__, 'open': _eval_open}})\n"
+    "         {{'__name__': '__main__', '__builtins__': _eval_b}})\n"
     "except SystemExit as _eval_e:\n"
     "    _c = _eval_e.code\n"
     "    _eval_code = _c if isinstance(_c, int) else (0 if _c is None else 1)\n"
     "_eval_sys.stdout.flush()\n"
+    "def _eval_clean():\n"
+    "    if sorted(_eval_os.listdir(_eval_dir)) != sorted(_eval_files):\n"
+    "        return False\n"
+    "    return all(not _eval_os.path.islink(_eval_os.path.join(_eval_dir, n)) and\n"
+    "               _eval_sha(n) == h for n, h in _eval_files.items())\n"
+    "if not _eval_clean():\n"
+    "    _eval_os._exit(98)\n"
     "print('EVAL-CHECK-DONE:' + _eval_token, flush=True)\n"
     "_eval_sys.exit(_eval_code)\n" % CHECK)
 write(os.path.join(work, "check.py"), prelude + wrapper)
@@ -243,18 +280,16 @@ try:
 except OSError:
     pass
 rc = p.returncode if p.returncode is not None and p.returncode >= 0 else 128 - (p.returncode or -9)
-intact = all(open(os.path.join(work, n), "rb").read() == c.encode("utf-8")
-             if os.path.isfile(os.path.join(work, n)) and not os.path.islink(os.path.join(work, n))
-             else False for n, c in FIXTURES.items())
 lines = out.rstrip(b"\n").split(b"\n")
 done = lines[-1] == token
 if done:
     out = b"\n".join(lines[:-1]) + (b"\n" if len(lines) > 1 else b"")
+clean = not (rc == 98 and not done)
 if not nondumpable or (rc == 97 and not done) or (REQUIRE_RO_PATH and writable):
     verdict = "unsafe"
 elif timed_out:
     verdict = "timeout"
-elif not intact:
+elif not clean:
     verdict = "tampered"
 elif rc == 0:
     verdict = "pass" if done else "incomplete"
@@ -269,9 +304,11 @@ try:
         sys.stderr.write("\n[solution process output]\n" + child.decode("utf-8", "replace"))
 except OSError:
     pass
+for d in (work_parent, sol_parent):
+    shutil.rmtree(d, ignore_errors=True)
 result = {{"verdict": verdict, "checker_exit": rc, "completed": done, "timeout_s": TIMEOUT,
           "nondumpable": nondumpable and rc != 97, "syspath_writable": writable,
-          "fixtures_intact": intact, "pipes_held": held}}
+          "workdir_clean": clean, "pipes_held": held}}
 sys.stderr.write("\n[eval-harness] " + json.dumps(result) + "\n")
 sys.exit(0 if verdict == "pass" else (rc or 1))
 """

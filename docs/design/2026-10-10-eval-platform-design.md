@@ -145,20 +145,35 @@ at import ends the checker with status 0 before any assert ran. Two mechanisms c
    explicitly by path (`importlib.util.spec_from_file_location`, `sys.modules["solution"]`) before the
    child exists. The harness (also `-I`, same interpreter) checks that no directory on that `sys.path`
    is writable by the sandbox uid; otherwise the verdict is `unsafe` (`harness_unsafe`) — in the exec
-   sandbox the interpreter tree is the read-only template. (b) Fixtures: the prelude snapshots the
-   fixture bytes before the child starts and the check code's `open` serves reads of fixture paths from
-   that snapshot; after the run the harness compares the fixture files with the originals and any
-   change (including a replacement by a symlink) is `tampered` (`fixtures_tampered`), so reads that
-   bypass `open` (e.g. `pathlib`) are still covered. (c) Defence in depth: the child runs in its own
-   directory (a copy of the fixtures and the real `solution.py`) with `-I`, and its stdout/stderr go to a
-   log file there (forwarded to the harness's stderr), so it holds none of the checker's pipes. (d)
+   sandbox the interpreter tree is the read-only template. (b) Fixtures (round 4, after a reviewer forged a fixture
+   read through `pathlib` and restored it in an `atexit` handler before the post-run comparison): the
+   fixtures are **not written to the checker's directory at all**; they are embedded in `check.py` and
+   served from memory by a hook installed process-wide on `builtins.open` and `io.open` (which `pathlib`
+   uses), so every hooked read sees the original bytes and any other read of a fixture path finds no
+   file. Before printing the token the checker lists its own directory: anything beyond its three
+   files (`check.py`, the proxy, the codec), a symlink, or a changed hash of those files means no token
+   (exit 98, verdict `tampered`, category `fixtures_tampered`). (c) Defence in depth: the checker's and
+   the solution's directories are created under two separate random parents; the child runs in its own
+   directory (the real `solution.py` and the fixtures) with `-I`, script-mode solutions run there too,
+   and the child's stdout/stderr go to a log file there (forwarded to the harness's stderr), so it holds
+   none of the checker's pipes. Both trees are removed at the end of the harness. (d)
    Fail closed: if `PR_SET_DUMPABLE 0` fails in the harness or the checker (exit 97) the verdict is
-   `unsafe`; the verdict JSON records `nondumpable`, `syspath_writable`, `fixtures_intact` and
+   `unsafe`; the verdict JSON records `nondumpable`, `syspath_writable`, `workdir_clean` and
    `pipes_held`. A descendant that escapes the process group (`setsid`) and keeps the checker's output
    pipes open no longer blocks the harness: after the kill, collecting output is bounded (5 s) and the
    verdict is `timeout` with `pipes_held: true`. Regression tests cover both planted-module paths (a
    later `import random`; a failing assert going through the traceback machinery), fixture tampering
-   via `open` and via `pathlib`, the escaped descendant, and the `unsafe` path.
+   via `open` and via `pathlib`, the escaped descendant, and the `unsafe` path; round 4 adds a
+   restoring forger against `open`, `io.open`, `Path.read_text` and `Path.read_bytes` readers, a stray
+   file in the checker's directory, and an unhooked `os.open` read of a fixture (fails: no file).
+
+   **Residual limit (honest).** The checker and the solution still share a uid and the scratch
+   filesystem. Reads in the checker that bypass the hook — `os.open`/`os.read`, `mmap`, C extensions,
+   or a subprocess the check starts — of files the solution planted are not protected (for fixture
+   names they find nothing, which fails closed; a check that deliberately reads other files the
+   solution could reach is out of scope). Closing this fully needs uid or mount separation between
+   checker and solution in the exec layer (e.g. a second user namespace mapping or a read-only bind
+   of the checker's directory for the solution), which the exec sandbox does not provide today.
 
 The demo suite contains two reward hacks (`clamp`: `os._exit(0)`, `median`: `sys.exit(0)`) with no stdout
 expectation; both must — and do — fail as `check_incomplete`.

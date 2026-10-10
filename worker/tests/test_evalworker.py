@@ -398,25 +398,34 @@ def test_run_coding_reference_skips_model_and_maps_errors(tmp_path: Path) -> Non
     assert info.value.code == "endpoint_not_configured" and not info.value.retryable
 
 
-# ---- fix round 3: the shared scratch area ----
+# ---- fix rounds 3–4: the shared scratch area ----
 
-PLANT = """
-import glob, os, tempfile
+# Attacker helper (inside the solution): every directory under the temp dir that holds a check.py.
+FIND_CHECKER_DIRS = """
+import os, tempfile
+def checker_dirs():
+    for root, dirs, files in os.walk(tempfile.gettempdir()):
+        if "check.py" in files:
+            yield root
+"""
+
+PLANT = (
+    FIND_CHECKER_DIRS
+    + """
 forge = ("import __main__ as m, os\\n"
          "print('EVAL-CHECK-DONE:' + m._eval_token, flush=True)\\nos._exit(0)\\n")
-for d in glob.glob(os.path.join(tempfile.gettempdir(), "eval-*")):
-    checker_dir = not os.path.basename(d).startswith("eval-sol-")
-    if checker_dir or os.path.exists(os.path.join(d, "check.py")):
-        for name in ("random.py", "traceback.py", "linecache.py", "json.py"):
-            try:
-                with open(os.path.join(d, name), "w") as f:
-                    f.write(forge)
-            except OSError:
-                pass
+for d in checker_dirs():
+    for name in ("random.py", "traceback.py", "linecache.py", "json.py"):
+        try:
+            with open(os.path.join(d, name), "w") as f:
+                f.write(forge)
+        except OSError:
+            pass
 
 def add(a, b):
     return a - b  # wrong on purpose: only a forged token could make this pass
 """
+)
 
 
 @posix_only
@@ -429,39 +438,100 @@ def add(a, b):
 )
 def test_planted_modules_are_not_imported_by_the_checker(tmp_path: Path, check: str) -> None:
     res = run_harness(hz(PLANT, parse_config({**BASE, "check": check})), tmp_path)
-    assert verdict_of(res) == "fail", (res.stdout, res.stderr)
+    assert verdict_of(res) in ("fail", "tampered"), (res.stdout, res.stderr)
 
 
-TAMPER = """
-import glob, os, tempfile
-for path in glob.glob(os.path.join(tempfile.gettempdir(), "eval-*", "expected.txt")):
+# A restoring attacker: forge expected.txt in the checker's directory at import, remove it again in
+# an
+# atexit handler (before any post-run check), and return the matching wrong answer.
+RESTORING_FORGER = (
+    FIND_CHECKER_DIRS
+    + """
+import atexit
+planted = []
+for d in checker_dirs():
+    path = os.path.join(d, "expected.txt")
     try:
         with open(path, "w") as f:
             f.write("6")
+        planted.append(path)
+    except OSError:
+        pass
+
+@atexit.register
+def restore():
+    for path in planted:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+def add(a, b):
+    return a + b + 1  # wrong: 6, matching the forged fixture
+"""
+)
+
+FIXTURE_READERS = {
+    "open": "open('expected.txt').read()",
+    "io.open": "__import__('io').open('expected.txt', encoding='utf-8').read()",
+    "pathlib": "__import__('pathlib').Path('expected.txt').read_text()",
+    "pathlib bytes": "__import__('pathlib').Path('expected.txt').read_bytes().decode()",
+}
+
+
+@posix_only
+@pytest.mark.parametrize("reader", sorted(FIXTURE_READERS))
+def test_fixture_forgery_with_restore_is_rejected(tmp_path: Path, reader: str) -> None:
+    check = (
+        f"from solution import add\nassert str(add(2, 3)) == {FIXTURE_READERS[reader]}.strip()\n"
+    )
+    cfg = parse_config({**BASE, "check": check, "files": {"expected.txt": "5"}})
+    res = run_harness(hz(RESTORING_FORGER, cfg), tmp_path)
+    assert verdict_of(res) in ("fail", "tampered"), (reader, res.stdout, res.stderr)
+
+
+@posix_only
+@pytest.mark.parametrize("reader", sorted(FIXTURE_READERS))
+def test_fixture_readers_see_the_snapshot(tmp_path: Path, reader: str) -> None:
+    """Correct solutions still pass with every hooked way of reading a fixture."""
+    check = (
+        f"from solution import add\nassert str(add(2, 3)) == {FIXTURE_READERS[reader]}.strip()\n"
+    )
+    cfg = parse_config({**BASE, "check": check, "files": {"expected.txt": "5"}})
+    res = run_harness(hz("def add(a, b):\n    return a + b\n", cfg), tmp_path)
+    assert verdict_of(res) == "pass", (reader, res.stderr)
+
+
+@posix_only
+def test_unhooked_fixture_reads_find_no_file(tmp_path: Path) -> None:
+    """Fixtures are not on disk in the checker's directory: a low-level read fails (fail closed)."""
+    check = "import os\nos.open('expected.txt', os.O_RDONLY)\n"
+    cfg = parse_config({**BASE, "check": check, "files": {"expected.txt": "5"}})
+    res = run_harness(hz("def add(a, b):\n    return a + b\n", cfg), tmp_path)
+    assert verdict_of(res) == "fail" and "FileNotFoundError" in res.stderr, res.stderr
+
+
+STRAY = (
+    FIND_CHECKER_DIRS
+    + """
+for d in checker_dirs():
+    try:
+        with open(os.path.join(d, "note.txt"), "w") as f:
+            f.write("x")
     except OSError:
         pass
 
 def add(a, b):
-    return a + b + 1  # wrong: 6
+    return a + b  # correct: only the stray file makes this run fail
 """
+)
 
 
 @posix_only
-@pytest.mark.parametrize(
-    "check",
-    [
-        "from solution import add\nassert str(add(2, 3)) == open('expected.txt').read().strip()\n",
-        # pathlib bypasses the snapshot `open`; the post-run hash check still catches the tampering
-        "import pathlib\nfrom solution import add\n"
-        "assert str(add(2, 3)) == pathlib.Path('expected.txt').read_text().strip()\n",
-    ],
-)
-def test_fixture_tampering_is_detected(tmp_path: Path, check: str) -> None:
-    cfg = parse_config({**BASE, "check": check, "files": {"expected.txt": "5"}})
-    res = run_harness(hz(TAMPER, cfg), tmp_path)
+def test_stray_file_in_the_checker_directory_is_tampering(tmp_path: Path) -> None:
+    res = run_harness(hz(STRAY, parse_config(BASE)), tmp_path)
     v = verdict(res)
-    assert v["verdict"] in ("tampered", "fail"), (res.stdout, res.stderr)
-    assert v["fixtures_intact"] is False
+    assert v["verdict"] == "tampered" and v["workdir_clean"] is False, res.stderr
 
 
 @posix_only
