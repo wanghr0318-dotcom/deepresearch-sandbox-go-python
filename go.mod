@@ -2,6 +2,8 @@ module github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python
 
 go 1.25.0
 
+toolchain go1.27.2
+
 require (
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/prometheus/client_golang v1.23.2
