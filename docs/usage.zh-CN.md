@@ -391,3 +391,28 @@ docker compose -f deploy/observability/docker-compose.yml down        # 停止�
 ```
 
 手动接入已有的 server：先 `cp deploy/observability/prometheus/targets/agentbox.json.example deploy/observability/prometheus/targets/agentbox.json`（WSL2 / Docker Desktop 经 `host.docker.internal:9464` 抓取；原生 Linux 上把 server 的 `--metrics-listen` 设为 docker 网桥网关地址并相应修改该文件），再以 `AGENTBOX_LOG_DIR=<日志目录> docker compose -f deploy/observability/docker-compose.yml up -d --wait` 启动观测栈，server 加 `--otlp-endpoint http://127.0.0.1:4318 --metrics-listen 127.0.0.1:9464 --log-file <日志目录>/agentbox.log`。
+
+### 评测平台（agentbox eval）
+
+`agentbox eval` 是运维工具：按 suite（`eval/suites/*.yaml|json`）经运维 REST API 批量运行任务，记录轨迹、评分并生成报告，两次运行可对比。设计见 [评测平台设计](design/2026-10-10-eval-platform-design.md)；一次实际运行见 [评测平台演示记录](evidence/2026-10-10-eval-platform.md)。
+
+- **任务**：`coding`（编码/终端任务：沙箱内的 `evalworker` 取得解答——模型经 Gateway 写出，或 `--agent reference` 用 suite 的参考解——再经 `/v1/exec` 在独立 exec 沙箱中运行 suite 的检查器）与 `research`（交给 `deepresearch`，与产品相同的研究 Agent）。server 须以 `--worker-argv python3,-m,evalworker` 启动（`evalworker` 安装到 `/opt/agentbox`：`scripts/dev/install-worker.sh`）。
+- **输出**：`<out>/<run-id>/` 下的 `manifest.json`（suite 哈希、seed、并发、`GET /server-info` 给出的服务端构建与模型、Worker 版本、exec 模板摘要）、`trajectories.jsonl`（每个任务一行：事件流、Gateway 调用 journal、attempt、账本、结果与评分；不含提示词与请求/响应正文）、`summary.json` 与 `report.md`（成功率、延迟 P50/P95、费用、工具调用、失败类别）。
+- **评分**：任务状态、检查器判定（退出码为 0 且打印了 harness 经管道交给它的随机完成令牌才算通过：解答不在检查器进程内运行：`solution` 是代理模块，调用经管道以 JSON 转发给单独的子进程，检查器与 harness 设为不可 dump，解答读不到令牌；解答的提前退出只结束它自己的进程，判为失败；检查器以 `python -I` 运行、夹具读运行前的快照并在运行后校验（被改动即 `fixtures_tampered`），隔离条件不满足时判为 `harness_unsafe`；因此检查器与解答之间只能传递普通数据（数字、字符串、列表、元组、字典、集合、bytes），不能传函数；检查器超时为 `check_timeout`）、stdout 匹配；研究报告的引用可定位率（每个 `[n]` 对应的证据 sha256 须是本任务一次已完成 `fetch` 调用的结果 blob）与必含词；可选的 LLM judge（默认关闭；`--judge-model`、`--judge-base-url` 与必填的 `--judge-price IN:OUT`，`--judge-budget-usd` 硬预算与 `--judge-max-calls` 硬调用上限，`--judge-required` 使无法评判的任务失败；Key 只读环境变量 `AGENTBOX_JUDGE_API_KEY` 或 `AGENTBOX_MODEL_API_KEY`，不写入任何结果文件）。`compare` 给出两边的样本数 N 与成功率的 Wilson 95% 区间，N < 30 或每任务只重复 1 次时给出警告。
+- **零成本**：`fakeupstream -eval-suite <suite>` 按 suite 的 `fake_reply` 回答编码任务，研究为固定脚本；费用是按配置单价折算的模拟值。
+
+```bash
+export AGENTBOX_TOKEN=$(sudo cat /var/lib/agentbox/api.token)     # 或 --data-dir
+./bin/agentbox eval run --suite eval/suites/demo.yaml --agent reference --concurrency 4 --out eval-runs
+./bin/agentbox eval run --suite eval/suites/demo.yaml --agent model --concurrency 4 --out eval-runs --min-success 0.5
+./bin/agentbox eval compare eval-runs/<run-A> eval-runs/<run-B>      # 指标、逐任务与失败类别的变化；--json 机器可读
+./bin/agentbox eval report eval-runs/<run-A>                          # 由 trajectories.jsonl 重新生成 summary 与 report
+```
+
+一键演示（root；全新数据目录与数据库，真实沙箱 + fake upstream，零模型费用；依次运行参考解、fake 模型并发 4 与并发 1，并输出两份对比）：
+
+```bash
+sudo bash scripts/demo-eval.sh
+```
+
+**重放与确定性**：同一任务内，每个 Gateway 调用有确定的 call id 与指纹；Worker 崩溃或 server 重启后，恢复的 attempt 重发同一调用时直接得到 journal 中保存的结果，不再调用上游（模型回答、检查器运行与费用都不重复）。不同的评测运行之间不重放：真实模型的两次运行可能不同，因此 manifest 固定 suite、模型与服务端构建，用 fake upstream 得到可重复的结果。

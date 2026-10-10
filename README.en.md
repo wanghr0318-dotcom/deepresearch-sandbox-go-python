@@ -47,6 +47,7 @@ Browser (Vue 3) / CLI ── REST + SSE ──► Go control plane
 | **Model fallback** | A logical model can be served by an ordered chain of OpenAI-compatible providers: retryable failures fail over to the next provider immediately, and every provider attempt is a separately priced try in the journal. Per-provider circuit breakers; when all are open the Gateway answers `503 model_degraded` at once; optional hedged requests. Replay and fingerprints are unaffected. |
 | **Exec sandbox** | Model-written Python runs in a fresh, network-less environment per call, with separate UIDs, CPU and wall quotas and output collection. |
 | **Kubernetes provider (optional)** | `--provider k8s` runs each environment in one Pod: the control channel is an in-image helper reached through pods/exec; non-root, read-only root, all capabilities dropped, no ServiceAccount token, deny-all NetworkPolicy; the worker image is pinned by digest; a warm pool cuts environment start from ~1 s to ~10 ms. It passes the same contract conformance suite as the local provider. |
+| **Evaluation platform** | `agentbox eval` runs a suite (YAML/JSON) of coding/terminal tasks (checkers run in the exec sandbox) and research questions through the operator API, with concurrency, repetitions and a seed; a manifest pins the suite hash, server build, models, worker version and exec digest; trajectories (events, call journal, ledger) are exported as JSONL; deterministic graders (exit code, output, locatable citations) plus an optional budgeted LLM judge; reports and `eval compare`. Runs against the fake upstream at zero cost. |
 | **Product** | Accounts (PBKDF2, `HttpOnly` sessions, rate-limited login), per-user isolation (other users' data always returns 404), server-side redaction of costs, models and internal IDs, a CSP and sanitized Markdown rendering. |
 | **Observability** | OpenTelemetry tracing with one trace per user action: API request → task actor → attempt → worker start, handshake and checkpoints → **into the sandbox** (the W3C `traceparent` is handed to the worker over the protocol; the stdlib-only Python SDK forwards it) → every model, search, fetch and exec call and each retry at the Gateway. Prometheus metrics (outcomes, start and stop latency, upstream latency and errors, cost, tool calls, sandboxes and slots); JSON logs carry `trace_id`. Off by default; `deploy/observability` runs Collector, Tempo, Prometheus, Loki and Grafana locally ([design](docs/design/2026-10-10-observability-design.md), [demo run](docs/evidence/2026-10-10-observability.md)). |
 
@@ -67,6 +68,7 @@ All numbers come from recorded runs. The evidence files say exactly what each ru
 - **Real acceptance** on a 4 vCPU / 8 GiB Linux VM (Tencent Cloud, Shanghai) with real models (Moonshot `kimi-k3` lead, `kimi-k2.6` workers) and Google results via Serper: [chat assistant](docs/evidence/2026-10-06-m4-chat-acceptance.md), [exec sandbox](docs/evidence/2026-10-06-m4-exec-hardening.md), [accounts](docs/evidence/2026-10-06-m3-accounts.md), [backup and restore](docs/evidence/2026-10-06-backup-restore.md).
 - **Model fallback** ([record](docs/evidence/2026-10-10-model-fallback.md), fake upstream, zero cost): with the primary answering 503, a call without fallback fails after 3.7–5.1 s (3 tries plus backoff); with fallback it completes on the backup in about 51 ms (same as a healthy provider); with every breaker open the Gateway answers `model_degraded` in about 40 µs.
 - **Kubernetes provider** ([record](docs/evidence/2026-10-10-k8s-provider.md), single-node kind, 20 runs per path): environment ready P50 978 ms cold vs. 11 ms from the warm pool; first Python output 1051 ms vs. 78 ms; the conformance suite passes 11/11 on a fake clientset (CI) and on kind; `scripts/demo-k8s.sh` shows the Gateway path, cancel and server crash recovery.
+- **Evaluation platform** ([record](docs/evidence/2026-10-10-eval-platform.md), fake upstream, no model spend): in the real sandbox the reference solutions pass 15/15; the fake model passes 9/15 and all 6 deliberately wrong answers fail (`wrong_exit_code`×5, `check_timeout`×1), including two reward hacks that `exit 0` at import — the solution runs in a separate process and a check passes only if the checker prints a random completion token; concurrency 1 → 4 cuts wall clock 18.5 s → 10.5 s.
 - **Serial vs. parallel research** ([record](docs/evidence/2026-10-06-m4-subrun-comparison.md)). Small sample, N = 4 per mode:
 
   | | Serial | Parallel |
@@ -114,7 +116,8 @@ CI=true go test -count=1 ./internal/persistence/postgres/ ./tests/e2e/...
 
 | Path | Contents |
 |---|---|
-| `cmd/agentbox` | Single binary: `server`, `doctor`, `task …`, `user …`, `verify-invariants` |
+| `cmd/agentbox` | Single binary: `server`, `doctor`, `task …`, `user …`, `eval …`, `verify-invariants` |
+| `internal/eval`, `eval/suites` | Evaluation platform: suites, runner, trajectories, graders, reports and compare (an operator-API client only); demo suite |
 | `internal/sandbox`, `provider/local`, `cgroup`, `rootfs`, `hostcheck` | Sandbox launcher, init, environment lifecycle, host self-check |
 | `internal/provider/k8s`, `cmd/agentbox-podagent`, `deploy/k8s` | Kubernetes provider (one Pod per environment, digest-pinned image, warm pool), in-image helper, worker image and kind config |
 | `internal/task`, `runner`, `session`, `subrun`, `admission`, `resource` | Control plane: actors, attempts, sessions, sub-runs, admission |
@@ -124,7 +127,7 @@ CI=true go test -count=1 ./internal/persistence/postgres/ ./tests/e2e/...
 | `internal/api`, `account` | REST/SSE API ([OpenAPI](api/openapi.yaml)), accounts |
 | `internal/obs`, `telemetry`, `deploy/observability` | Observability: stdlib-only instrumentation facade, OpenTelemetry and Prometheus implementation, local stack |
 | `protocol/` | Versioned Go ↔ Python worker protocol and shared fixtures |
-| `worker/` | Python worker SDK, `chatagent`, tools, the `deep-research` skill |
+| `worker/` | Python worker SDK, `chatagent`, tools, the `deep-research` skill, the eval worker `evalworker` |
 | `web/` | Vue 3 + TypeScript chat UI and operator workbench |
 | `tests/e2e` | End-to-end tests (process provider and real sandbox) |
 | `docs/` | [Design](docs/design/), [evidence](docs/evidence/), [usage](docs/usage.zh-CN.md) |

@@ -47,6 +47,7 @@
 | **exec 沙箱** | 模型写的 Python 每次在全新、无网络的环境中运行，有独立 UID、CPU 与墙钟配额，并收集输出文件。 |
 | **工作区工具与 MCP（可选）** | `--workspace-tools`：每轮一个工作区，`write_file` / `read_file` / `list_dir` 与 `exec_shell`（每条命令一个全新的 exec 沙箱，文件在命令之间保留，按 exec 配额记账，路径只能是工作区内的相对路径，符号链接不会保留）。`--mcp-config`：Gateway 作为 MCP 客户端（stdio 或 streamable HTTP）连接运维配置的服务器，只暴露允许清单中的工具，调用记入 journal 并计入每轮工具额度；沙箱不接触 MCP 服务器与其凭据。[设计](docs/design/2026-10-10-shell-file-mcp-design.md)、[记录](docs/evidence/2026-10-10-shell-file-mcp.md)。 |
 | **Kubernetes provider（可选）** | `--provider k8s` 把每个环境放进一个 Pod：经 pods/exec 运行镜像内的 helper 作为控制通道，非 root、只读根、丢弃全部 capability、无 ServiceAccount token、deny-all NetworkPolicy；worker 镜像按 digest 固定；预热池让环境就绪从约 1 s 降到约 10 ms。与本地 provider 通过同一套契约一致性测试。 |
+| **评测平台** | `agentbox eval`：按 suite（YAML/JSON）经运维 API 批量运行编码/终端任务（检查器在 exec 沙箱中运行）与研究问题，可设并发、重复与 seed；manifest 固定 suite 哈希、服务端构建、模型、Worker 版本与 exec 摘要；导出轨迹 JSONL（事件、调用 journal、账本）；确定性评分（退出码、输出、引用可定位）与可选的有预算 LLM judge；报告与 `eval compare`。可对 fake upstream 零成本运行。 |
 | **产品层** | 账号（PBKDF2、`HttpOnly` 会话、登录限速）；用户隔离（他人的数据一律 404）；费用、模型与内部 ID 在服务端脱敏；CSP 与 Markdown 安全渲染。 |
 | **可观测性** | OpenTelemetry 追踪：一次用户操作一条 trace，从 API 请求经任务 actor、attempt、Worker 启动与握手、checkpoint，**进入沙箱**（W3C `traceparent` 经协议交给 Worker，Python SDK 只用标准库转发）再回到 Gateway 的每个模型、搜索、抓取与 exec 调用及其每次重试；Prometheus 指标（结果、启动与停止延迟、上游延迟与错误、费用、工具调用、沙箱与槽位）；JSON 日志带 `trace_id`。默认关闭；`deploy/observability` 提供 Collector、Tempo、Prometheus、Loki、Grafana 本地栈（[设计](docs/design/2026-10-10-observability-design.md)、[演示记录](docs/evidence/2026-10-10-observability.md)）。 |
 
@@ -67,6 +68,7 @@
 - **真实验收**：在 4 vCPU / 8 GiB 的 Linux 云主机（腾讯云上海）上，使用真实模型（Moonshot：`kimi-k3` 主导、`kimi-k2.6` 执行）与经 Serper 的 Google 搜索结果。记录：[对话助手](docs/evidence/2026-10-06-m4-chat-acceptance.md)、[exec 沙箱](docs/evidence/2026-10-06-m4-exec-hardening.md)、[账号](docs/evidence/2026-10-06-m3-accounts.md)、[备份与恢复](docs/evidence/2026-10-06-backup-restore.md)。
 - **模型降级链**（[记录](docs/evidence/2026-10-10-model-fallback.md)，fake upstream、零费用）：主供应商持续 503 时，无降级链的调用 3.7–5.1 s 后失败（3 次 try 加退避），有降级链时约 51 ms 由后备供应商完成（与健康供应商相同）；全部熔断时约 40 µs 返回 `model_degraded`。
 - **Kubernetes provider**（[记录](docs/evidence/2026-10-10-k8s-provider.md)，kind 单节点，每组 20 次）：环境就绪 P50 冷启动 978 ms、预热池 11 ms；到 Python 首行输出 1051 ms / 78 ms；契约一致性测试在 fake clientset（CI）与 kind 上均 11/11 通过；`scripts/demo-k8s.sh` 演示 Gateway、取消与 server 崩溃恢复。
+- **评测平台**（[记录](docs/evidence/2026-10-10-eval-platform.md)，fake upstream、零模型费用）：真实沙箱中 15 个任务的参考解 15/15 通过；fake 模型 9/15，6 个故意错误的回答全部失败（`wrong_exit_code`×5、`check_timeout`×1），其中两个在导入时 `exit 0` 的奖励作弊也失败——解答在独立进程中运行，检查器须打印随机完成令牌才算通过；并发 1 → 4 墙钟 18.5 s → 10.5 s。
 - **串行与并行研究对比**（[记录](docs/evidence/2026-10-06-m4-subrun-comparison.md)）。小样本，每组 N = 4：
 
   | | 串行 | 并行 |
@@ -114,7 +116,8 @@ CI=true go test -count=1 ./internal/persistence/postgres/ ./tests/e2e/...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/agentbox` | 单一二进制：`server`、`doctor`、`task …`、`user …`、`verify-invariants` |
+| `cmd/agentbox` | 单一二进制：`server`、`doctor`、`task …`、`user …`、`eval …`、`verify-invariants` |
+| `internal/eval`、`eval/suites` | 评测平台：suite、runner、轨迹、评分、报告与对比（只是运维 API 的客户端）；演示 suite |
 | `internal/sandbox`、`provider/local`、`cgroup`、`rootfs`、`hostcheck` | 沙箱启动器、init、环境生命周期、宿主自检 |
 | `internal/provider/k8s`、`cmd/agentbox-podagent`、`deploy/k8s` | Kubernetes provider（每环境一个 Pod、镜像 digest 固定、预热池）、镜像内 helper、worker 镜像与 kind 配置 |
 | `internal/task`、`runner`、`session`、`subrun`、`admission`、`resource` | 控制面：actor、attempt、会话、sub-run、准入 |
@@ -124,7 +127,7 @@ CI=true go test -count=1 ./internal/persistence/postgres/ ./tests/e2e/...
 | `internal/api`、`account` | REST/SSE API（[OpenAPI](api/openapi.yaml)）、账号 |
 | `internal/obs`、`telemetry`、`deploy/observability` | 可观测性：只依赖标准库的埋点接口、OpenTelemetry 与 Prometheus 实现、本地观测栈 |
 | `protocol/` | 版本化的 Go ↔ Python Worker 协议与共享 fixtures |
-| `worker/` | Python Worker SDK、`chatagent`、工具、`deep-research` skill |
+| `worker/` | Python Worker SDK、`chatagent`、工具、`deep-research` skill、评测 Worker `evalworker` |
 | `web/` | Vue 3 + TypeScript 的对话界面与运维工作台 |
 | `tests/e2e` | 端到端测试（进程型 provider 与真实沙箱） |
 | `docs/` | [设计](docs/design/)、[证据](docs/evidence/)、[使用参考](docs/usage.zh-CN.md) |

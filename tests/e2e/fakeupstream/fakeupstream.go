@@ -61,6 +61,9 @@ const (
 	StagePlan      = "[stage:plan]"
 	StageSummarize = "[stage:summarize]"
 	StageReport    = "[stage:report]"
+	// StageCode 是评测 Worker（worker/evalworker）编码任务的阶段标记；用户消息以 "[eval-task:<id>]" 开头，
+	// 按 SetCodeReply 为该任务设置的回复作答（没有设置时为占位文本）。
+	StageCode = "[stage:code]"
 )
 
 // Action 是注入到某次请求的动作。零值表示正常回复。
@@ -121,6 +124,7 @@ type Server struct {
 	reqs     []*Request
 	faults   map[Kind]map[int]Action
 	stages   map[string]string
+	code     map[string]string // 评测任务 ID → [stage:code] 的回复（SetCodeReply）
 	pages    map[string]page
 	released chan struct{} // Release 时关闭，随后换新
 	hanging  int
@@ -146,6 +150,7 @@ func New() *Server {
 		counts:   map[Kind]int{},
 		faults:   map[Kind]map[int]Action{},
 		pages:    map[string]page{},
+		code:     map[string]string{},
 		latency:  map[Kind]time.Duration{},
 		always:   map[Kind]Action{},
 		released: make(chan struct{}),
@@ -205,6 +210,13 @@ func (s *Server) SetChatHook(hook func(body []byte) json.RawMessage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.chatHook = hook
+}
+
+// SetCodeReply 设置评测任务 taskID 的 [stage:code] 回复（agentbox eval 的零成本模式：suite 中的 fake_reply）。
+func (s *Server) SetCodeReply(taskID, reply string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.code[taskID] = reply
 }
 
 // SetPage 设置抓取目标 path（以 / 开头）的内容。
@@ -442,7 +454,7 @@ func stageOf(body []byte) string {
 	if err := json.Unmarshal(body, &req); err != nil || len(req.Messages) == 0 || req.Messages[0].Role != "system" {
 		return ""
 	}
-	for _, st := range []string{StagePlan, StageSummarize, StageReport} {
+	for _, st := range []string{StagePlan, StageSummarize, StageReport, StageCode} {
 		if strings.HasPrefix(req.Messages[0].Content, st) {
 			return st
 		}
@@ -563,6 +575,13 @@ func (s *Server) chat(w http.ResponseWriter, rec *Request, body []byte) {
 			content = reply
 		}
 	}
+	if rec.Stage == StageCode && len(req.Messages) > 1 {
+		if id, ok := evalTaskID(req.Messages[1].Content); ok {
+			if reply, ok := s.code[id]; ok {
+				content = reply
+			}
+		}
+	}
 	s.mu.Unlock()
 	prompt := int64(len(body)+3) / 4
 	completion := int64(len(content)+3) / 4
@@ -573,6 +592,16 @@ func (s *Server) chat(w http.ResponseWriter, rec *Request, body []byte) {
 		Usage:   ChatUsage{PromptTokens: prompt, CompletionTokens: completion, TotalTokens: prompt + completion},
 	})
 	s.setOutcome(rec, OutcomeOK)
+}
+
+// evalTaskID 取评测 Worker 用户消息开头的 "[eval-task:<id>]" 中的 id。
+func evalTaskID(content string) (string, bool) {
+	rest, ok := strings.CutPrefix(content, "[eval-task:")
+	if !ok {
+		return "", false
+	}
+	id, _, ok := strings.Cut(rest, "]")
+	return id, ok && id != ""
 }
 
 // SearchResult 是 tavily 兼容的一条结果（同时给出 snippet，与 Gateway 返回给 Worker 的字段同名）。

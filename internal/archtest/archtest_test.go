@@ -368,3 +368,16 @@ func forbid(t *testing.T, pkg string, forbidden []string) {
 		}
 	}
 }
+
+// TestEvalIsAPIClientOnly：评测平台（internal/eval，S2）只是运维 REST API 的客户端：它评测的是运维看到的服务，
+// 除 internal/jcs（suite 哈希）外不依赖本模块的任何包，也不依赖数据库驱动。
+func TestEvalIsAPIClientOnly(t *testing.T) {
+	for _, d := range deps(t, "internal/eval") {
+		if strings.HasPrefix(d, module+"/") && d != module+"/internal/eval" && d != module+"/internal/jcs" {
+			t.Errorf("internal/eval 依赖了 %s", d)
+		}
+		if strings.HasPrefix(d, "github.com/jackc/pgx") {
+			t.Errorf("internal/eval 依赖了 %s", d)
+		}
+	}
+}
