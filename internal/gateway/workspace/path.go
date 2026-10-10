@@ -3,6 +3,7 @@ package workspace
 import (
 	"path"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -18,7 +19,8 @@ const reservedDir = ".agentbox"
 
 // ValidPath reports whether p is an acceptable workspace file path. It matches what exec staging can stage (so a
 // workspace can always be run): relative, canonical (path.Clean leaves it unchanged, so no "a//b", "./a", trailing
-// "/"), no "." or ".." segment, no NUL, no backslash, no control characters, valid UTF-8, at most MaxPathBytes bytes,
+// "/"), no "." or ".." segment, no NUL, no backslash, no Unicode control (Cc, including C1) or format (Cf)
+// characters (bidi overrides and isolates, zero-width characters, BOM, soft hyphen), valid UTF-8, at most MaxPathBytes bytes,
 // MaxPathSegments segments and MaxSegmentBytes bytes per segment, and not under the reserved ".agentbox" directory.
 // The root itself ("" or ".") is not a file path.
 //
@@ -30,7 +32,7 @@ func ValidPath(p string) bool {
 		return false
 	}
 	for _, r := range p {
-		if r < 0x20 || r == 0x7f {
+		if unicode.In(r, unicode.Cc, unicode.Cf) {
 			return false
 		}
 	}

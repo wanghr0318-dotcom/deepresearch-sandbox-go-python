@@ -149,6 +149,12 @@ func shellInvoke(r Request, q execReq, st *state) call.ShellInvoke {
 // applySnapshot builds the next state from the collected /out (completed or timed_out; other statuses keep the files)
 // and the changes against the current head. Outputs that are not valid workspace paths (".agentbox/…", control
 // characters, …) are moved to x.Skipped with reason invalid_path.
+//
+// MaxBytes is not enforced here: the snapshot is what the command left in /out, which the exec environment already
+// bounds (the /out tmpfs is --exec-out-bytes, at least MaxBytes + StagingHeadroom; at most MaxFiles outputs are
+// collected). A command can therefore leave a workspace above MaxBytes (by at most --exec-out-bytes − MaxBytes);
+// it is kept as it is — the response's "workspace.bytes" shows the size — and write_file answers workspace_full
+// while its result would exceed MaxBytes. Dropping outputs instead would silently lose the command's results.
 func (m *Manager) applySnapshot(st *state, x *execResult) (*state, changes) {
 	next := st.clone()
 	ch := changes{Added: []string{}, Modified: []string{}, Deleted: []string{}}

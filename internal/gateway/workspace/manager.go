@@ -126,7 +126,13 @@ type ws struct {
 	mu   sync.Mutex
 	st   *state // nil until loaded
 	gone bool   // destroyed by Sweep: requests that waited on mu must not recreate it
+	// savedUse is the UsedAt last written to the state file: reads refresh UsedAt in memory and persist it at most
+	// once per usedAtPersistEvery, so a restart does not make a workspace that is only read look idle.
+	savedUse time.Time
 }
+
+// usedAtPersistEvery bounds how often an operation that changes nothing rewrites the state file for UsedAt.
+const usedAtPersistEvery = time.Minute
 
 // New validates the config, creates Dir (0700) and returns a Manager.
 func New(cfg Config) (*Manager, error) {
@@ -212,7 +218,7 @@ func (m *Manager) load(taskID string, w *ws) (*state, error) {
 		}
 		m.log.Info("gateway: workspace created", "task_id", taskID)
 	}
-	w.st = st
+	w.st, w.savedUse = st, st.UsedAt
 	return st, nil
 }
 
@@ -239,7 +245,7 @@ func (m *Manager) commit(w *ws, next *state) error {
 	if err := writeState(m.cfg.Dir, next); err != nil {
 		return err
 	}
-	w.st = next
+	w.st, w.savedUse = next, next.UsedAt
 	return nil
 }
 
@@ -281,7 +287,16 @@ func (m *Manager) begin(ctx context.Context, r Request) (*ws, *state, func(), ca
 		w.mu.Unlock()
 		return nil, nil, nil, fail(http.StatusGone, CodeWorkspaceLost), nil
 	}
-	st.UsedAt = m.cfg.Now() // in memory; persisted with the next change (Sweep reads the in-memory state)
+	// In memory (Sweep reads the in-memory state); persisted with the next change, or here at most once per
+	// usedAtPersistEvery. A failed write only logs: the operation itself does not depend on it.
+	st.UsedAt = m.cfg.Now()
+	if st.UsedAt.Sub(w.savedUse) >= usedAtPersistEvery {
+		if err := writeState(m.cfg.Dir, st); err != nil {
+			m.log.Warn("gateway: workspace used_at write", "task_id", r.TaskID, "err", err)
+		} else {
+			w.savedUse = st.UsedAt
+		}
+	}
 	return w, st, w.mu.Unlock, call.Result{}, nil
 }
 

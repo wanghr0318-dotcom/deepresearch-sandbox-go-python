@@ -358,6 +358,14 @@ func TestHTTPStatusClassification(t *testing.T) {
 		uerr.Outcome != upstream.OutcomeFatal {
 		t.Fatalf("401 at initialize: %v", uerr)
 	}
+	// A 5xx at initialize: the tool call itself was never sent, so the call is retryable (not unknown).
+	srv5 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
+	defer srv5.Close()
+	h5 := newHub(t, httpCfg(srv5.URL, "calculate"))
+	if _, uerr := h5.Call(context.Background(), "web", "calculate", json.RawMessage(`{}`)); uerr == nil ||
+		uerr.Outcome != upstream.OutcomeRetryable || uerr.Code != upstream.CodeUpstreamUnreachable {
+		t.Fatalf("503 at initialize: %v", uerr)
+	}
 }
 
 func TestArgumentsCap(t *testing.T) {
@@ -373,6 +381,8 @@ func TestConfigDirUIDValidation(t *testing.T) {
 	for name, b := range map[string]string{
 		"relative dir": `{"servers":[{"name":"a","transport":"stdio","command":["x"],"dir":"rel","allowed_tools":["t"]}]}`,
 		"http uid":     `{"servers":[{"name":"a","transport":"http","url":"https://x/","uid":1000,"allowed_tools":["t"]}]}`,
+		"uid only":     `{"servers":[{"name":"a","transport":"stdio","command":["x"],"uid":1000,"allowed_tools":["t"]}]}`,
+		"gid only":     `{"servers":[{"name":"a","transport":"stdio","command":["x"],"gid":1000,"allowed_tools":["t"]}]}`,
 	} {
 		if _, err := ParseConfig([]byte(b)); err == nil {
 			t.Errorf("%s accepted", name)
