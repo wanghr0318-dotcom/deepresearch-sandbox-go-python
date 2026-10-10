@@ -48,11 +48,12 @@ var rules = []rule{
 
 const maxExamples = 5
 
+// routeName is the provider route of a try as a safe label (the journal is data, not trusted text).
 func routeName(t eval.Try) string {
 	if t.Provider == "" {
 		return "default"
 	}
-	return t.Provider
+	return truncateText(SafeText(t.Provider), 64)
 }
 
 // okLatencies collects the latencies of ok tries of a call kind, per route and overall.
@@ -352,7 +353,7 @@ func providerFailure(c eval.Call) bool {
 // ---- fetch_deadline ----
 
 // deadlineCutoff returns the latency (ms) at which search/fetch tries are cut by the call deadline: from the config
-// when given (90 % of --call-deadline, or of its default), otherwise inferred when ≥ 3 unsuccessful tries cluster
+// when given (85 % of --call-deadline, or of its default), otherwise inferred when ≥ 3 unsuccessful tries cluster
 // within 15 % of the longest one (a deadline cuts every slow try at the same point). 0 = unknown.
 func (a *analysis) deadlineCutoff(kinds ...string) (cutoff int64, inferred bool) {
 	if a.cfg != nil {

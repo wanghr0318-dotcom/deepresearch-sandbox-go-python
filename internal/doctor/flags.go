@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // A server flags file holds `agentbox server` flags, one per line: `--name=value`, `--name value` or `--name`
@@ -72,7 +74,7 @@ func (f *Flags) Get(name string) (string, bool) {
 
 // Set replaces the value of every occurrence of the flag, or appends it after a comment line.
 func (f *Flags) Set(name, value, comment string) {
-	name = strings.TrimLeft(name, "-")
+	name, value = SafeText(strings.TrimLeft(name, "-")), SafeText(value)
 	found := false
 	for i := range f.lines {
 		if f.lines[i].name == name {
@@ -83,10 +85,24 @@ func (f *Flags) Set(name, value, comment string) {
 	if found {
 		return
 	}
-	if comment != "" {
+	if comment = SafeText(comment); comment != "" {
 		f.lines = append(f.lines, flagLine{raw: "# " + comment})
 	}
 	f.lines = append(f.lines, flagLine{name: name, value: value})
+}
+
+// SafeText flattens text that ends up in a generated file or report onto one line: control characters (newlines
+// included), Unicode line/paragraph separators and format characters (e.g. bidi overrides) become spaces and runs of
+// whitespace collapse. Model replies and journal fields pass through it before they reach experiment.flags,
+// proposal.patch or findings.md, so they can never start a new flag line or a new Markdown block.
+func SafeText(s string) string {
+	b := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.In(r, unicode.Zl, unicode.Zp) || r == utf8.RuneError {
+			return ' '
+		}
+		return r
+	}, s)
+	return strings.Join(strings.Fields(b), " ")
 }
 
 // Clone returns a deep copy.

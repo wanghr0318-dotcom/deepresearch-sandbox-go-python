@@ -117,14 +117,15 @@ func (ad *Advisor) Run(ctx context.Context, rep *Report, cfg *Flags) *AdvisorRep
 		ar.Error = "reply is not the requested JSON: " + err.Error()
 		return ar
 	}
-	ar.Summary = truncateText(strings.TrimSpace(out.Summary), 2000)
+	// Everything from the reply is untrusted text: flatten it before it can reach a file or a report.
+	ar.Summary = truncateText(SafeText(out.Summary), 2000)
 	for _, p := range out.Proposals {
-		flag := "--" + strings.TrimLeft(strings.TrimSpace(p.Flag), "-")
-		value := strings.TrimSpace(fmt.Sprint(p.Value))
-		pr := Proposal{Kind: KindApply, Flag: flag, To: value, Rule: "advisor", Source: "model", Reason: truncateText(p.Reason, 300)}
+		flag := "--" + strings.TrimLeft(truncateText(SafeText(p.Flag), 80), "-")
+		value := truncateText(SafeText(fmt.Sprint(p.Value)), 80)
+		pr := Proposal{Kind: KindApply, Flag: flag, To: value, Rule: "advisor", Source: "model", Reason: truncateText(SafeText(p.Reason), 300)}
 		norm, verr := Validate(flag, value)
 		if verr != nil {
-			pr.Reason = verr.Error()
+			pr.Reason = SafeText(verr.Error())
 			ar.Rejected = append(ar.Rejected, pr)
 			continue
 		}

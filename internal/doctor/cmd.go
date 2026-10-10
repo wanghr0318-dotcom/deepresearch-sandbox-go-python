@@ -194,6 +194,14 @@ func run(ctx context.Context, f *cliFlags, stdout, stderr io.Writer, getenv func
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return err
 	}
+	if cfgPath != "" {
+		// The input config is never modified: refuse an output directory whose files would overwrite it.
+		for _, name := range []string{"experiment.flags", "proposal.patch", "findings.json", "findings.md"} {
+			if samePath(filepath.Join(outDir, name), cfgPath) {
+				return fmt.Errorf("--out %s would overwrite the input config %s (%s); choose another directory", outDir, cfgPath, name)
+			}
+		}
+	}
 	js, err := json.MarshalIndent(rep, "", "  ")
 	if err != nil {
 		return err
@@ -218,6 +226,26 @@ func run(ctx context.Context, f *cliFlags, stdout, stderr io.Writer, getenv func
 	}
 	fmt.Fprintf(stderr, "doctor-traces: wrote %s to %s\n", strings.Join(sortedKeys(files), ", "), outDir)
 	return nil
+}
+
+// samePath reports whether two paths name the same file (cleaned absolute paths, symlinks resolved, or the same
+// file by os.SameFile when both exist).
+func samePath(a, b string) bool {
+	norm := func(p string) string {
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			p = r
+		}
+		return filepath.Clean(p)
+	}
+	if norm(a) == norm(b) {
+		return true
+	}
+	fa, errA := os.Stat(a)
+	fb, errB := os.Stat(b)
+	return errA == nil && errB == nil && os.SameFile(fa, fb)
 }
 
 func serverClient(f *cliFlags, getenv func(string) string) (*eval.Client, error) {
