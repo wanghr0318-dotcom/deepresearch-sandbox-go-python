@@ -266,6 +266,33 @@ func (c *Client) Status(ctx context.Context) error {
 	return c.getJSON(ctx, "/status", &v)
 }
 
+// TaskPage is one page of GET /tasks (newest first).
+type TaskPage struct {
+	Tasks []TaskView `json:"tasks"`
+	Next  string     `json:"next,omitempty"`
+}
+
+// ListTasks returns one page of GET /tasks (newest first); after is the previous page's Next cursor ("" for the
+// first page) and limit the page size (1–200; 0 = server default).
+func (c *Client) ListTasks(ctx context.Context, after string, limit int) (*TaskPage, error) {
+	q := url.Values{}
+	if after != "" {
+		q.Set("after", after)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	p := "/tasks"
+	if len(q) > 0 {
+		p += "?" + q.Encode()
+	}
+	var page TaskPage
+	if err := c.getJSON(ctx, p, &page); err != nil {
+		return nil, err
+	}
+	return &page, nil
+}
+
 // CreateTask posts a task; requestID makes the creation idempotent across client retries.
 func (c *Client) CreateTask(ctx context.Context, requestID string, spec, limits json.RawMessage) (string, error) {
 	body := map[string]json.RawMessage{"spec": spec}

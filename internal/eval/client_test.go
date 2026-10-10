@@ -1,6 +1,9 @@
 package eval
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -40,5 +43,34 @@ func TestSSEParser(t *testing.T) {
 	}
 	if _, ok := frames[3].event(); ok {
 		t.Fatal("invalid JSON accepted")
+	}
+}
+
+func TestListTasksPages(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/tasks" || r.Header.Get("Authorization") != "Bearer tok" {
+			http.Error(w, "bad", 400)
+			return
+		}
+		switch r.URL.Query().Get("after") {
+		case "":
+			if r.URL.Query().Get("limit") != "2" {
+				http.Error(w, "limit", 400)
+				return
+			}
+			_, _ = w.Write([]byte(`{"tasks":[{"task_id":"t3","status":"failed"},{"task_id":"t2","status":"succeeded"}],"next":"c2"}`))
+		case "c2":
+			_, _ = w.Write([]byte(`{"tasks":[{"task_id":"t1","status":"succeeded"}]}`))
+		}
+	}))
+	defer srv.Close()
+	c := &Client{Base: srv.URL, Token: "tok"}
+	p1, err := c.ListTasks(context.Background(), "", 2)
+	if err != nil || len(p1.Tasks) != 2 || p1.Next != "c2" || p1.Tasks[0].TaskID != "t3" || p1.Tasks[0].Status != "failed" {
+		t.Fatalf("page 1 %+v %v", p1, err)
+	}
+	p2, err := c.ListTasks(context.Background(), p1.Next, 2)
+	if err != nil || len(p2.Tasks) != 1 || p2.Next != "" {
+		t.Fatalf("page 2 %+v %v", p2, err)
 	}
 }
