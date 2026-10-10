@@ -420,6 +420,18 @@ func TestSingleProviderUnchanged(t *testing.T) {
 
 // ---- hedging ----
 
+// afterLeg closes gate once, right after the first result of a leg of the given kind (hedge or first leg) has
+// been delivered to the hedge's result channel. Results are read in delivery order, so a leg gated this way is
+// collected after that leg — without sleeps.
+func afterLeg(h routeHarness, hedge bool, gate chan struct{}) {
+	var once sync.Once
+	h.c.legDone = func(_ int, isHedge bool) {
+		if isHedge == hedge {
+			once.Do(func() { close(gate) })
+		}
+	}
+}
+
 // Hedging is off by default: a slow primary is simply waited for.
 func TestHedgeOffByDefault(t *testing.T) {
 	fr := newRoutes("primary", "backup")
@@ -506,12 +518,8 @@ func TestHedgeBothOK(t *testing.T) {
 	gate := make(chan struct{})
 	fr.legs[0].script = []step{{gate: gate, hold: true, body: `{"answer":"late-a"}`, usage: upstream.Usage{InputTokens: 1, OutputTokens: 1}}}
 	fr.legs[1].script = []step{{body: `{"answer":"fast-b"}`, usage: upstream.Usage{InputTokens: 1, OutputTokens: 1}}}
-	h := newRouteHarness(t, routeLimits(), RoutingConfig{HedgeDelay: 10 * time.Millisecond}, fr)
-	go func() {
-		<-fr.legs[1].entered
-		time.Sleep(10 * time.Millisecond)
-		close(gate) // A ignores the cancellation and answers ok
-	}()
+	h := newRouteHarness(t, routeLimits(), RoutingConfig{HedgeDelay: 10 * time.Millisecond, BreakerFailures: 1}, fr)
+	afterLeg(h, true, gate) // A answers ok only after B's ok was delivered (A ignores the cancellation)
 	r := h.invoke(t, inv("c1", chatBody))
 	if string(r.Body) != `{"answer":"fast-b"}` {
 		t.Fatalf("%+v", r)
@@ -527,6 +535,10 @@ func TestHedgeBothOK(t *testing.T) {
 	if b := h.budget(t, "t1"); b.SpentMicro != 9 || b.ReservedMicro != 0 || rec.CostCharged != 9 {
 		t.Fatalf("budget %+v cost_charged %d", b, rec.CostCharged)
 	}
+	// The losing primary answered ok: it is healthy, so it is not a slow failure (BreakerFailures 1 would open it).
+	if got := states(h.c); got != "primary:closed,backup:closed" {
+		t.Fatalf("breakers %s", got)
+	}
 }
 
 // A fatal answer from the hedge (backup) leg — e.g. a wrong backup key — is not decisive: the slow but healthy
@@ -538,11 +550,7 @@ func TestHedgeFatalFromHedgeLegNotDecisive(t *testing.T) {
 	fr.legs[0].script = []step{{gate: gate, body: `{"answer":"a"}`}}
 	fr.legs[1].script = []step{{err: &upstream.Error{Outcome: upstream.OutcomeFatal, Status: 401, Code: upstream.CodeUpstreamRejected}}}
 	h := newRouteHarness(t, routeLimits(), RoutingConfig{HedgeDelay: 10 * time.Millisecond, BreakerFailures: 1}, fr)
-	go func() {
-		<-fr.legs[1].entered
-		time.Sleep(20 * time.Millisecond)
-		close(gate)
-	}()
+	afterLeg(h, true, gate) // A answers after B's fatal was delivered
 	r := h.invoke(t, inv("c1", chatBody))
 	if r.Status != 200 || string(r.Body) != `{"answer":"a"}` {
 		t.Fatalf("%+v", r)
@@ -567,11 +575,10 @@ func TestHedgeFatalFirstThenOK(t *testing.T) {
 	fr.legs[0].script = []step{{gate: gateA, err: &upstream.Error{Outcome: upstream.OutcomeFatal, Status: 400, Code: upstream.CodeUpstreamRejected}}}
 	fr.legs[1].script = []step{{gate: gateB, hold: true, body: `{"answer":"b"}`}}
 	h := newRouteHarness(t, routeLimits(), RoutingConfig{HedgeDelay: 10 * time.Millisecond}, fr)
+	afterLeg(h, false, gateB) // B answers ok (ignoring its cancellation) only after A's fatal was delivered
 	go func() {
 		<-fr.legs[1].entered
 		close(gateA)
-		time.Sleep(20 * time.Millisecond)
-		close(gateB)
 	}()
 	r := h.invoke(t, inv("c1", chatBody))
 	if r.Status != 200 || string(r.Body) != `{"answer":"b"}` {
@@ -593,17 +600,40 @@ func TestHedgeBothFail(t *testing.T) {
 	fr.legs[0].script = []step{{gate: gate, err: unavailable()}, {body: `{"answer":"round2"}`}}
 	fr.legs[1].script = []step{{err: unavailable()}}
 	h := newRouteHarness(t, shortBackoff(), RoutingConfig{HedgeDelay: 10 * time.Millisecond}, fr)
-	go func() {
-		<-fr.legs[1].entered
-		time.Sleep(10 * time.Millisecond)
-		close(gate)
-	}()
+	afterLeg(h, true, gate) // A fails after B's failure was delivered
 	r := h.invoke(t, inv("c1", chatBody))
 	if string(r.Body) != `{"answer":"round2"}` {
 		t.Fatalf("%+v", r)
 	}
 	_, tries := h.call(t, "t1", "c1")
 	if got := providers(tries); got != "primary/retryable backup/retryable[primary:tried]+hedge primary/ok" {
+		t.Fatalf("tries %s", got)
+	}
+}
+
+// The first leg fails retryably and the hedge (backup) leg then fails with a provider fault (wrong backup key):
+// the backup's misconfiguration must not end the call as fatal. The first leg's retryable result is final, so the
+// call backs off and is served by the primary in the next round.
+func TestHedgeFirstLegRetryableBeatsBackupProviderFault(t *testing.T) {
+	fr := newRoutes("primary", "backup")
+	gateA, gateB := make(chan struct{}), make(chan struct{})
+	fr.legs[0].script = []step{{gate: gateA, err: unavailable()}, {body: `{"answer":"round2"}`}}
+	fr.legs[1].script = []step{{gate: gateB, hold: true, err: &upstream.Error{Outcome: upstream.OutcomeFatal, Status: 401, Code: upstream.CodeUpstreamRejected}}}
+	h := newRouteHarness(t, shortBackoff(), RoutingConfig{HedgeDelay: 10 * time.Millisecond}, fr)
+	afterLeg(h, false, gateB) // B's 401 arrives after A's retryable failure was delivered
+	go func() {
+		<-fr.legs[1].entered
+		close(gateA)
+	}()
+	r := h.invoke(t, inv("c1", chatBody))
+	if r.Status != 200 || string(r.Body) != `{"answer":"round2"}` {
+		t.Fatalf("%+v", r)
+	}
+	rec, tries := h.call(t, "t1", "c1")
+	if rec.State != StateCompleted {
+		t.Fatalf("journal %+v", rec)
+	}
+	if got := providers(tries); got != "primary/retryable backup/fatal[primary:tried]+hedge primary/ok" {
 		t.Fatalf("tries %s", got)
 	}
 }

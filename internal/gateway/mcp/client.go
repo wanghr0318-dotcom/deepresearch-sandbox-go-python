@@ -578,8 +578,14 @@ func (c *client) ensureInit(ctx context.Context) error {
 		"clientInfo": map[string]any{"name": "agentbox-gateway", "version": "1"}}
 	if _, err := c.tr.request(ctx, c.id(), "initialize", params); err != nil {
 		var hse *httpStatusError
-		if errors.As(err, &hse) {
+		if errors.As(err, &hse) && hse.Status < 500 {
 			return err // the server refused the session (e.g. 401): classified by status
+		}
+		// A 5xx (or any other failure) at initialize: the server may be broken, but the tool call itself was
+		// never sent, so the call is retryable rather than unknown. The status error is not wrapped (%v): classify
+		// would otherwise treat it as a 5xx answer to the call (unknown).
+		if hse != nil {
+			return notSent(fmt.Errorf("initialize: %v", err))
 		}
 		return notSent(fmt.Errorf("initialize: %w", err)) // nothing of the actual request was sent yet
 	}

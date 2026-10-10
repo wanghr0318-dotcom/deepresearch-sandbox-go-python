@@ -76,6 +76,9 @@ func (c *Coordinator) startLeg(ctx context.Context, j *job, rs *routeSet, h *hed
 		release()
 		lcancel(nil)
 		h.results <- r
+		if c.legDone != nil {
+			c.legDone(try.TryNo, l.hedge)
+		}
 	}()
 }
 
@@ -115,7 +118,9 @@ func decisive(r legResult) bool {
 	return false
 }
 
-// chooseFinal 选最终结果：有 ok 取第一个 ok；否则有第一条腿的 fatal 取它；否则取最后结束的一条腿。
+// chooseFinal 选最终结果：有 ok 取第一个 ok；否则有第一条腿的 fatal 取它；否则取最后结束的一条腿——但最后结束的
+// 是对冲腿的供应商类 fatal（后备供应商的 Key、模型名或地址配错）而第一条腿是 retryable 时取第一条腿：后备供应商
+// 配错不应让本可换供应商重试的调用以 fatal 结束。
 func chooseFinal(done []legResult) legResult {
 	for _, r := range done {
 		if r.outcome() == upstream.OutcomeOK {
@@ -127,16 +132,25 @@ func chooseFinal(done []legResult) legResult {
 			return r
 		}
 	}
-	return done[len(done)-1]
+	last := done[len(done)-1]
+	if last.leg.hedge && last.outcome() == upstream.OutcomeFatal && providerFault(last.uerr) {
+		for _, r := range done {
+			if !r.leg.hedge && r.outcome() == upstream.OutcomeRetryable {
+				return r
+			}
+		}
+	}
+	return last
 }
 
-// finishLegs 向熔断器报告每条腿、写日志，并以 Sibling 结算最终结果之外的腿。触发对冲的第一条腿落败时（它已运行
-// 超过 HedgeDelay 仍无结果），按失败报告（慢失败），使持续挂起或很慢的主供应商也能被熔断；对冲腿落败只是中止。
+// finishLegs 向熔断器报告每条腿、写日志，并以 Sibling 结算最终结果之外的腿。触发对冲的第一条腿落败、且自己没有
+// 得出 ok 时（它已运行超过 HedgeDelay 仍无结果），按失败报告（慢失败），使持续挂起或很慢的主供应商也能被熔断；
+// 落败但在取消生效前已回答 ok 的第一条腿是健康的，照常报告成功；对冲腿落败只是中止。
 func (c *Coordinator) finishLegs(j *job, rs *routeSet, h *hedgeRun, done []legResult, final legResult, cancelled map[int]bool) {
 	for _, r := range done {
 		isFinal := r.try.TryNo == final.try.TryNo
 		lost := !isFinal && cancelled[r.try.TryNo]
-		if lost && h.hedged && !r.leg.hedge {
+		if lost && h.hedged && !r.leg.hedge && r.outcome() != upstream.OutcomeOK {
 			rs.breakers[r.leg.route].Failure()
 		} else {
 			rs.report(r.leg, r.uerr, r.aborted)

@@ -31,7 +31,7 @@ import { ref } from "vue";
 import type { User } from "../api/client";
 import { validateLogin } from "../api/session";
 import BrandMark from "../components/BrandMark.vue";
-import { userErrorMessage } from "../lib/research";
+import { userErrorMessage } from "../lib/userErrors";
 import { registerHref } from "../lib/router";
 import { useUserServices } from "../lib/userServices";
 

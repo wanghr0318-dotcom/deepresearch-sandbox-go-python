@@ -3,6 +3,7 @@ package k8s
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -240,4 +241,93 @@ func (s slots) gc(live map[string]bool, minAge time.Duration) ([]string, error) 
 		removed = append(removed, name)
 	}
 	return removed, nil
+}
+
+// recoverSwings merges back the entries of interrupted swings (the process died after moving some workspace
+// entries into a new slot but before switching the workspace path to it). It runs at startup, before any
+// environment is created. A slot needs it when its back-reference names a workspace path that still exists and
+// points elsewhere (a directory, or a symlink to another slot), and its own workspace is not empty: those
+// entries are moved back to where the workspace path resolves. An entry whose name already exists there is
+// left in the slot and logged (the slot stays referenced, so gc keeps it). A first swing (workspace path a
+// directory) that died between removing the directory and creating the symlink left the workspace path missing
+// while its parent exists: the symlink to the slot is recreated (recreateWorkspaceLink). A missing parent means
+// the workspace was deleted on purpose (a closed session removes its whole directory): gc decides. Returns the
+// number of repairs (entries moved back plus symlinks recreated).
+func (s slots) recoverSwings(log *slog.Logger) int {
+	ents, err := os.ReadDir(s.hostRoot)
+	if err != nil {
+		return 0
+	}
+	moved := 0
+	for _, e := range ents {
+		if e.IsDir() {
+			moved += s.recoverSwing(e.Name(), log)
+		}
+	}
+	return moved
+}
+
+func (s slots) recoverSwing(pod string, log *slog.Logger) int {
+	b, err := os.ReadFile(filepath.Join(s.hostDir(pod), workspaceRef))
+	if err != nil {
+		return 0
+	}
+	ws, own := string(b), s.workspace(pod)
+	fi, err := os.Lstat(ws)
+	if errors.Is(err, os.ErrNotExist) {
+		return s.recreateWorkspaceLink(pod, ws, log)
+	}
+	if err != nil {
+		return 0
+	}
+	dest := ws
+	if fi.Mode()&os.ModeSymlink != 0 {
+		if dest, err = os.Readlink(ws); err != nil || dest == own {
+			return 0 // complete swing: the workspace lives in this slot
+		}
+		if di, err := os.Stat(dest); err != nil || !di.IsDir() {
+			log.Warn("k8s: interrupted swing: workspace target is not a directory", "slot", pod, "workspace", ws, "target", dest)
+			return 0
+		}
+	} else if !fi.IsDir() {
+		return 0
+	}
+	items, err := os.ReadDir(own)
+	if err != nil || len(items) == 0 {
+		return 0
+	}
+	moved := 0
+	for _, it := range items {
+		dst := filepath.Join(dest, it.Name())
+		if _, err := os.Lstat(dst); err == nil {
+			log.Warn("k8s: interrupted swing: entry exists in the workspace, left in the slot", "slot", pod, "entry", it.Name(), "workspace", ws)
+			continue
+		}
+		if err := os.Rename(filepath.Join(own, it.Name()), dst); err != nil {
+			log.Warn("k8s: interrupted swing: move back", "slot", pod, "entry", it.Name(), "err", err)
+			continue
+		}
+		moved++
+	}
+	log.Info("k8s: merged back an interrupted workspace swing", "slot", pod, "workspace", ws, "entries", moved)
+	return moved
+}
+
+// recreateWorkspaceLink repairs the window of a first swing between os.Remove(ws) and os.Symlink(target, ws): the
+// back-reference names ws, ws is missing but its parent directory exists, so ws becomes the symlink to this slot's
+// workspace again (where all entries already are). Returns 1 when the symlink was recreated.
+func (s slots) recreateWorkspaceLink(pod, ws string, log *slog.Logger) int {
+	if pi, err := os.Stat(filepath.Dir(ws)); err != nil || !pi.IsDir() {
+		return 0 // the workspace (and its directory) was deleted: gc decides
+	}
+	own := s.workspace(pod)
+	if oi, err := os.Stat(own); err != nil || !oi.IsDir() {
+		return 0
+	}
+	if err := os.Symlink(own, ws); err != nil {
+		log.Warn("k8s: interrupted swing: recreate workspace symlink", "slot", pod, "workspace", ws, "err", err)
+		return 0
+	}
+	log.Info("k8s: recreated the workspace symlink of an interrupted swing", "slot", pod, "workspace", ws)
+	return 1
 }

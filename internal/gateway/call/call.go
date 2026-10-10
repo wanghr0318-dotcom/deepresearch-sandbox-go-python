@@ -226,6 +226,9 @@ type Coordinator struct {
 	execInputMax int64       // exec 输入累计上限（MaxExecInputBytes；测试可调小）
 	routing      RoutingConfig
 	routes       map[upstream.Kind]*routeSet // 多路由的类别（模型降级链）；单供应商的类别不在其中
+	// legDone 只供测试：对冲中一条腿的结果送入结果通道之后调用（生产中为 nil）。结果通道按送入顺序被读取，
+	// 测试据此让后一条腿在前一条腿的结果送达之后才返回，而不靠 sleep。
+	legDone func(tryNo int, hedge bool)
 
 	root context.Context
 	stop context.CancelFunc

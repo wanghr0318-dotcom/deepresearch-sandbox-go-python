@@ -11,11 +11,17 @@
 #     and the kubelet would follow) is refused. Edit SLOT_PATTERN if --k8s-node-shared-dir differs from
 #     /var/lib/agentbox-k8s/data/k8s-slots (regex-quote the directory);
 #   - no host network/PID/IPC, no hostPort, no ServiceAccount token, default ServiceAccount only, no init or
-#     ephemeral containers;
+#     ephemeral containers (the policy also matches the pods/ephemeralcontainers subresource, through which
+#     ephemeral containers are added to a running Pod);
 #   - Pod: runAsNonRoot, non-zero runAsUser, RuntimeDefault seccomp;
 #   - every container: no privilege escalation, not privileged, read-only root, capabilities drop ALL and add
 #     none, and no container-level override of runAsNonRoot (false), runAsUser (0) or seccomp (other than
-#     RuntimeDefault).
+#     RuntimeDefault);
+#   - the remaining Pod Security "restricted" fields, on the Pod and on every container: AppArmor only
+#     RuntimeDefault or Localhost (field or legacy annotation), procMount Default, SELinux type only one of the
+#     container types and no SELinux user/role, no Windows HostProcess, and no sysctls at all (stricter than
+#     PSS, which allows a "safe" set; the provider sets none). hostUsers is not constrained: a user-namespaced
+#     Pod (hostUsers: false) gets no relaxation here — every rule above still applies to it.
 # Requires Kubernetes 1.30+ (admissionregistration.k8s.io/v1).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -28,14 +34,17 @@ spec:
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE"]
-        resources: ["pods"]
+        resources: ["pods", "pods/ephemeralcontainers"]
   variables:
     - name: slotPattern
       expression: "'^/var/lib/agentbox-k8s/data/k8s-slots/abx-[0-9a-f]{12}/(workspace|run)$'" # SLOT_PATTERN
     - name: containers
       expression: >-
         object.spec.containers +
-        (has(object.spec.initContainers) ? object.spec.initContainers : [])
+        (has(object.spec.initContainers) ? object.spec.initContainers : []) +
+        (has(object.spec.ephemeralContainers) ? object.spec.ephemeralContainers : [])
+    - name: seLinuxTypes
+      expression: "['', 'container_t', 'container_init_t', 'container_kvm_t', 'container_engine_t']"
   validations:
     - expression: >-
         !has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) ||
@@ -75,6 +84,37 @@ spec:
           c.securityContext.capabilities.drop.exists(d, d == 'ALL') &&
           (!has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0))
       message: "containers must be unprivileged: no escalation, read-only root, drop ALL, no hostPort, and no runAsNonRoot/runAsUser/seccomp override"
+    - expression: >-
+        !has(object.spec.securityContext) || (
+          (!has(object.spec.securityContext.sysctls) || size(object.spec.securityContext.sysctls) == 0) &&
+          (!has(object.spec.securityContext.appArmorProfile) ||
+            object.spec.securityContext.appArmorProfile.type in ['RuntimeDefault', 'Localhost']) &&
+          (!has(object.spec.securityContext.seLinuxOptions) || (
+            (!has(object.spec.securityContext.seLinuxOptions.type) ||
+              object.spec.securityContext.seLinuxOptions.type in variables.seLinuxTypes) &&
+            (!has(object.spec.securityContext.seLinuxOptions.user) || object.spec.securityContext.seLinuxOptions.user == '') &&
+            (!has(object.spec.securityContext.seLinuxOptions.role) || object.spec.securityContext.seLinuxOptions.role == ''))) &&
+          (!has(object.spec.securityContext.windowsOptions) ||
+            !has(object.spec.securityContext.windowsOptions.hostProcess) ||
+            !object.spec.securityContext.windowsOptions.hostProcess))
+      message: "pod securityContext: no sysctls, AppArmor RuntimeDefault/Localhost only, SELinux container types only (no user/role), no Windows HostProcess"
+    - expression: >-
+        !has(object.metadata.annotations) || object.metadata.annotations.all(k,
+          !k.startsWith('container.apparmor.security.beta.kubernetes.io/') ||
+          object.metadata.annotations[k] == 'runtime/default' || object.metadata.annotations[k].startsWith('localhost/'))
+      message: "AppArmor annotations may only select runtime/default or localhost/<profile>"
+    - expression: >-
+        variables.containers.all(c, !has(c.securityContext) || (
+          (!has(c.securityContext.procMount) || c.securityContext.procMount == 'Default') &&
+          (!has(c.securityContext.appArmorProfile) ||
+            c.securityContext.appArmorProfile.type in ['RuntimeDefault', 'Localhost']) &&
+          (!has(c.securityContext.seLinuxOptions) || (
+            (!has(c.securityContext.seLinuxOptions.type) || c.securityContext.seLinuxOptions.type in variables.seLinuxTypes) &&
+            (!has(c.securityContext.seLinuxOptions.user) || c.securityContext.seLinuxOptions.user == '') &&
+            (!has(c.securityContext.seLinuxOptions.role) || c.securityContext.seLinuxOptions.role == ''))) &&
+          (!has(c.securityContext.windowsOptions) || !has(c.securityContext.windowsOptions.hostProcess) ||
+            !c.securityContext.windowsOptions.hostProcess)))
+      message: "containers: procMount Default, AppArmor RuntimeDefault/Localhost only, SELinux container types only (no user/role), no Windows HostProcess"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

@@ -56,7 +56,7 @@ type ServerConfig struct {
 	AllowedTools   []string          `json:"allowed_tools"`
 	TimeoutMs      int64             `json:"timeout_ms,omitempty"`
 	// stdio only: working directory (absolute; default a fresh empty temp directory) and the uid/gid to run as
-	// (default: the server's own user). Linux only.
+	// (both or neither; default: the server's own user). Linux only.
 	Dir string  `json:"dir,omitempty"`
 	UID *uint32 `json:"uid,omitempty"`
 	GID *uint32 `json:"gid,omitempty"`
@@ -148,6 +148,10 @@ func (s ServerConfig) validateStdio() error {
 	}
 	if s.Dir != "" && !filepath.IsAbs(s.Dir) {
 		return errors.New("dir must be absolute")
+	}
+	if (s.UID == nil) != (s.GID == nil) {
+		// Only one of them would keep the Gateway's own uid or gid (often root's group) for the server.
+		return errors.New("uid and gid must be set together")
 	}
 	for k := range s.Env {
 		if !envPattern.MatchString(k) {

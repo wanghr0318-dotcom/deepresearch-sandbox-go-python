@@ -229,6 +229,8 @@ func (m ModelConfig) validateFallbacks(allowPrivate []string) error {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("app: 后备供应商 %s 的地址须为 http(s) URL", fb.Name)
 		}
+		// 静态检查（协议、userinfo、端口、IP 字面量）；主机名不在启动时解析，其地址在每次 try 拨号时检查
+		// （docs/design/2026-10-10-model-fallback-design.md §5）。
 		if err := egress.CheckURL(u); err != nil {
 			return fmt.Errorf("app: 后备供应商 %s 的地址不能通过出站防护（私有地址须在 --upstream-allow-private 中）: %w", fb.Name, err)
 		}

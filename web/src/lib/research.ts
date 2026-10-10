@@ -1,7 +1,7 @@
 // DeepResearch 助手页的展示逻辑：状态文案、阶段进度、证据计数、列表标题与用户可见的错误文案。
 // 用户只看到主题、状态、阶段进度、证据数量与报告；从不展示费用、模型、预算或调用明细。
 
-import { ApiError, NetworkError } from "../api/client";
+import { ApiError } from "../api/client";
 import type { Task, TaskEvent } from "../api/client";
 import { TERMINAL_EVENT } from "../api/sse";
 
@@ -136,36 +136,6 @@ export function formatCreated(ts: string | undefined | null, now: Date = new Dat
   const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
   const md = `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`;
   return d.getFullYear() === now.getFullYear() ? md : `${d.getFullYear()}年${md}`;
-}
-
-// ---- 用户可见的错误文案（不暴露错误码、预算或内部细节） ----
-
-const USER_MESSAGES: Record<string, string> = {
-  user_task_running: "已有研究在进行中，请等它完成后再开始新的研究",
-  rate_limited: "尝试过于频繁，请稍后再试",
-  invalid_credentials: "用户名或密码错误",
-  username_taken: "用户名已被使用",
-  invalid_username: "用户名需为 3–32 位字母、数字、下划线、点或连字符",
-  invalid_password: "密码须为 8–16 位，且至少包含数字、大写字母、小写字母中的两种",
-  invalid_topic: "主题不能为空，且不超过 500 个字符",
-  task_not_found: "找不到这项研究",
-  unauthorized: "登录已过期，请重新登录",
-  task_ended: "这项研究已经结束了",
-  cancel_pending: "已在取消中",
-  diagnostic_mode: "服务正在维护，请稍后再试",
-  ownership_lost: "服务正在维护，请稍后再试",
-};
-
-export function userErrorMessage(e: unknown): string {
-  if (e instanceof ApiError) {
-    const msg = USER_MESSAGES[e.code];
-    if (msg) return msg;
-    if (e.status === 401) return USER_MESSAGES.unauthorized!;
-    if (e.status >= 500) return "服务暂时不可用，请稍后再试";
-    return "请求未能完成，请稍后再试";
-  }
-  if (e instanceof NetworkError) return "无法连接服务，请检查网络后重试";
-  return "出了点问题，请稍后再试";
 }
 
 export function isUnauthorized(e: unknown): boolean {

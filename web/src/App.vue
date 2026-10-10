@@ -39,8 +39,9 @@ import { onMounted, ref, watch } from "vue";
 import AdminApp from "./AdminApp.vue";
 import type { User } from "./api/client";
 import BrandMark from "./components/BrandMark.vue";
-import { userErrorMessage } from "./lib/research";
+import { userErrorMessage } from "./lib/userErrors";
 import { homeHref, isAdminRoute, legacyHref, loginHref, navigate, needsSession, useHashRoute } from "./lib/router";
+import { clearReportCache } from "./lib/useReport";
 import { useUserServices } from "./lib/userServices";
 import AssistantView from "./views/AssistantView.vue";
 import ChatView from "./views/ChatView.vue";
@@ -78,12 +79,14 @@ async function checkSession(): Promise<void> {
 }
 
 function signedIn(u: User): void {
+  clearReportCache();
   user.value = u;
   connError.value = "";
   navigate(homeHref());
 }
 
 function signedOut(): void {
+  clearReportCache(); // 已加载的报告不留给下一个登录的用户
   user.value = null;
   navigate(loginHref());
 }

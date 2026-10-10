@@ -24,7 +24,7 @@ func (m *Manager) Sweep(ctx context.Context) error {
 		switch {
 		case strings.HasPrefix(name, ".tmp-"):
 			// A crashed writer's leftover; a fresh one may belong to a write in progress (rename pending).
-			if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > time.Minute {
+			if fi, err := e.Info(); err == nil && m.cfg.Now().Sub(fi.ModTime()) > time.Minute {
 				_ = os.Remove(filepath.Join(m.cfg.Dir, name))
 			}
 		case strings.HasSuffix(name, ".json"):
@@ -41,7 +41,7 @@ func (m *Manager) sweepOne(ctx context.Context, full string) {
 		// Unreadable without a task id: nothing can address it any more except its task, and the next access marks
 		// it lost (or reports the I/O error). Remove it only when it is also older than the idle timeout.
 		if errors.Is(err, errCorrupt) {
-			if fi, serr := os.Stat(full); serr == nil && time.Since(fi.ModTime()) > m.cfg.IdleTimeout {
+			if fi, serr := os.Stat(full); serr == nil && m.cfg.Now().Sub(fi.ModTime()) > m.cfg.IdleTimeout {
 				_ = os.Remove(full)
 			}
 		}

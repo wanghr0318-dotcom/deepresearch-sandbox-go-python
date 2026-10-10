@@ -138,6 +138,7 @@ func New(ctx context.Context, opt Options) (*Provider, error) {
 		if err := os.MkdirAll(opt.SlotHostDir, 0o711); err != nil {
 			return nil, fmt.Errorf("k8s: slot directory: %w", err)
 		}
+		p.slots.recoverSwings(p.log) // before any Create: no swing of this process is in progress
 	}
 	if opt.EnsureNetworkPolicy {
 		np := denyAllPolicy(opt.Namespace)

@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ChatApiLike } from "../../api/chat";
 import type { Question, RawRef, StepRow as StepRowData, StopInfo, TurnView as TurnViewData } from "../../lib/chat";
 import { applyEvent, emptyChat } from "../../lib/chat";
+import { clearReportCache } from "../../lib/useReport";
 import { userServicesKey } from "../../lib/userServices";
 import type { UserServices } from "../../lib/userServices";
 import { fakeChat, fakeSessionStream, sev } from "./chatkit";
@@ -748,6 +749,41 @@ describe("TurnView shows the report in the chat with a report card", () => {
     const card = w.get("[data-testid=report-card]");
     expect(card.text()).not.toContain("部分");
     expect(card.text()).not.toContain("已达工具额度");
+  });
+
+  it("downloads a report once for the in-chat body and the side panel (shared, failures retried)", async () => {
+    const downloadArtifact = dl("# 标题\n\n正文");
+    const chat = fakeChat({ downloadArtifact });
+    const turn = blankTurn({ status: "succeeded", route: "research", report: reportOf() });
+    const tv = mountWith(TurnView, { turn, busy: false }, { chat });
+    const sp = mountWith(SidePanel, { turn, tab: "report" }, { chat });
+    await flushPromises();
+    expect(tv.get("[data-testid=report-body]").text()).toContain("正文");
+    expect(sp.get("[data-testid=report]").text()).toContain("正文");
+    expect(downloadArtifact).toHaveBeenCalledTimes(1);
+
+    // 失败不缓存：下一个使用者重新下载。
+    let fail = true;
+    const flaky = vi.fn(async () => {
+      if (fail) throw new Error("x");
+      return { blob: new Blob(["# 重试"]), contentType: "text/markdown", etag: "", contentDisposition: "" };
+    });
+    const chat2 = fakeChat({ downloadArtifact: flaky });
+    const first = mountWith(SidePanel, { turn, tab: "report" }, { chat: chat2 });
+    await flushPromises();
+    expect(first.text()).toContain("报告加载失败");
+    fail = false;
+    const second = mountWith(SidePanel, { turn, tab: "report" }, { chat: chat2 });
+    await flushPromises();
+    expect(second.get("[data-testid=report]").text()).toContain("重试");
+    expect(flaky).toHaveBeenCalledTimes(2);
+
+    // 退出登录清空缓存：之后再打开同一份报告重新下载。
+    clearReportCache();
+    const third = mountWith(SidePanel, { turn, tab: "report" }, { chat });
+    await flushPromises();
+    expect(third.get("[data-testid=report]").text()).toContain("正文");
+    expect(downloadArtifact).toHaveBeenCalledTimes(2);
   });
 
   it("sanitizes the in-chat report like the side panel (no script, handlers or javascript: links)", async () => {

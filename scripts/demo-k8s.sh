@@ -152,25 +152,29 @@ ok "kubectl auth can-i create pods -n default（以 ServiceAccount 身份）= no
 # 准入策略：以 ServiceAccount 身份（--dry-run=server，经过准入但不创建）提交探测 Pod。合规的 Pod（与 provider
 # 创建的形状相同）必须被接受；下列每一种违规都必须被 ValidatingAdmissionPolicy 拒绝（策略生效需要数秒，第一个
 # 探测重试至多 30 s）。
-# probe_pod <volume JSON> <容器 securityContext 覆盖 JSON>：输出探测 Pod 的 JSON。
+# probe_pod <volume JSON> <容器 securityContext 覆盖 JSON> [Pod 覆盖 JSON]：输出探测 Pod 的 JSON。Pod 覆盖可含
+# "securityContext"（并入 Pod 级 securityContext）、"annotations" 与 "hostUsers"。
 probe_pod() {
-  python3 - "$1" "$2" <<'PY'
+  python3 - "$1" "$2" "${3:-null}" <<'PY'
 import json, sys
-vol, extra = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+vol, extra, pod = json.loads(sys.argv[1]), json.loads(sys.argv[2]), json.loads(sys.argv[3]) or {}
 sc = {"allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True, "capabilities": {"drop": ["ALL"]}}
 sc.update(extra)
+psc = {"runAsNonRoot": True, "runAsUser": 10001, "seccompProfile": {"type": "RuntimeDefault"}}
+psc.update(pod.get("securityContext", {}))
 print(json.dumps({"apiVersion": "v1", "kind": "Pod",
-  "metadata": {"name": "admission-probe", "labels": {"agentbox.io/managed": "true"}},
+  "metadata": {"name": "admission-probe", "labels": {"agentbox.io/managed": "true"},
+               "annotations": pod.get("annotations", {})},
   "spec": {"automountServiceAccountToken": False,
-    "securityContext": {"runAsNonRoot": True, "runAsUser": 10001, "seccompProfile": {"type": "RuntimeDefault"}},
+    "securityContext": psc, **({"hostUsers": pod["hostUsers"]} if "hostUsers" in pod else {}),
     "containers": [{"name": "s", "image": "registry.invalid/none", "securityContext": sc,
                     "volumeMounts": [{"name": "v", "mountPath": "/v"}]}],
     "volumes": [dict(vol, name="v")]}}))
 PY
 }
-probe() { # probe <描述> <volume JSON> <securityContext 覆盖 JSON>；输出 admitted 或拒绝原因
+probe() { # probe <描述> <volume JSON> <securityContext 覆盖 JSON> [Pod 覆盖 JSON]；输出 admitted 或拒绝原因
   local out
-  if out=$(probe_pod "$2" "$3" | K -n "$NS" create --dry-run=server --as "system:serviceaccount:$NS:agentbox-server" -f - 2>&1); then
+  if out=$(probe_pod "$2" "$3" "${4:-null}" | K -n "$NS" create --dry-run=server --as "system:serviceaccount:$NS:agentbox-server" -f - 2>&1); then
     printf '%-44s admitted\n' "$1"
   else
     printf '%-44s DENIED: %s\n' "$1" "$(echo "$out" | sed -n 's/.*denied request: //p' | head -n 1)"
@@ -186,11 +190,19 @@ wait_for "准入策略生效（拒绝 hostPath /）" 30 root_denied
   probe "container runAsNonRoot: false" "$SLOT_OK" '{"runAsNonRoot":false}'
   probe "container seccomp Unconfined" "$SLOT_OK" '{"seccompProfile":{"type":"Unconfined"}}'
   probe "projected ServiceAccount token volume" '{"projected":{"sources":[{"serviceAccountToken":{"path":"token"}}]}}' '{}'
+  # Pod Security "restricted" 的其余字段（容器级与 Pod 级）。
+  probe "container procMount Unmasked (hostUsers: false)" "$SLOT_OK" '{"procMount":"Unmasked"}' '{"hostUsers":false}'
+  probe "container AppArmor Unconfined" "$SLOT_OK" '{"appArmorProfile":{"type":"Unconfined"}}'
+  probe "container SELinux type spc_t" "$SLOT_OK" '{"seLinuxOptions":{"type":"spc_t"}}'
+  probe "pod SELinux user" "$SLOT_OK" '{}' '{"securityContext":{"seLinuxOptions":{"user":"system_u"}}}'
+  probe "pod AppArmor Unconfined" "$SLOT_OK" '{}' '{"securityContext":{"appArmorProfile":{"type":"Unconfined"}}}'
+  probe "pod sysctl kernel.msgmax" "$SLOT_OK" '{}' '{"securityContext":{"sysctls":[{"name":"kernel.msgmax","value":"65536"}]}}'
+  probe "AppArmor annotation unconfined" "$SLOT_OK" '{}' '{"annotations":{"container.apparmor.security.beta.kubernetes.io/s":"unconfined"}}'
 } | tee "$LOGDIR/admission.txt" | sed 's/^/         /'
 [ "$(grep -c 'admitted$' "$LOGDIR/admission.txt")" = 1 ] && grep -q '^compliant.*admitted$' "$LOGDIR/admission.txt" ||
   fail "合规的探测 Pod 应被接受，其余应被拒绝"
-[ "$(grep -c DENIED "$LOGDIR/admission.txt")" = 5 ] || fail "有违规的探测 Pod 未被拒绝"
-ok "ValidatingAdmissionPolicy agentbox-sandbox-pods：合规形状被接受，5 种违规（宿主根、符号链接形路径、容器级 runAsNonRoot/seccomp 覆盖、projected token）均被拒绝"
+[ "$(grep -c DENIED "$LOGDIR/admission.txt")" = 12 ] || fail "有违规的探测 Pod 未被拒绝"
+ok "ValidatingAdmissionPolicy agentbox-sandbox-pods：合规形状被接受，12 种违规（宿主根、符号链接形路径、容器级 runAsNonRoot/seccomp 覆盖、projected token、procMount、AppArmor、SELinux、sysctl）均被拒绝"
 
 step "PostgreSQL 与 fake upstream"
 docker run -d --name "$PG" --network kind -e POSTGRES_USER=agentbox -e POSTGRES_PASSWORD=agentbox -e POSTGRES_DB=agentbox postgres:16-alpine >/dev/null
@@ -268,6 +280,13 @@ grep -q 'uid/gid         10001 10001' "$LOGDIR/probe.txt" || fail "Pod 不是以
 grep -q 'SA token        absent' "$LOGDIR/probe.txt" || fail "Pod 中有 ServiceAccount token"
 grep -q 'OPEN' "$LOGDIR/probe.txt" && fail "出站连接未被 NetworkPolicy 拒绝"
 grep -q 'CapEff' "$LOGDIR/probe.txt" || true
+# 临时容器经 pods/ephemeralcontainers 子资源加入运行中的 Pod（kubectl debug 的路径）：准入策略同样拒绝（以集群管理员
+# 身份 --dry-run=server 提交，RBAC 不是这里的屏障）。
+if out=$(K -n "$NS" patch pod "$POD_B" --subresource=ephemeralcontainers --type=strategic --dry-run=server -p   '{"spec":{"ephemeralContainers":[{"name":"dbg","image":"busybox","targetContainerName":"sandbox","securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}}}]}}' 2>&1); then
+  fail "临时容器未被准入策略拒绝"
+fi
+echo "$out" | grep -q 'denied request: init and ephemeral containers are not allowed' || fail "临时容器被拒绝，但不是准入策略：$out"
+ok "临时容器（pods/ephemeralcontainers 子资源）被准入策略拒绝"
 ok "uid 10001、只读根、无 SA token、无 capability、Gateway socket 可见、出站被 deny-all NetworkPolicy 拒绝"
 t0=$(date +%s.%N)
 ab task cancel "$TB" >/dev/null

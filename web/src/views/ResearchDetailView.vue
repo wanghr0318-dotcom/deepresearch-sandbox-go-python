@@ -103,8 +103,8 @@ import {
   reportFilename,
   reportTitle,
   statusLabel,
-  userErrorMessage,
 } from "../lib/research";
+import { userErrorMessage } from "../lib/userErrors";
 import type { StageState } from "../lib/research";
 import { legacyHref } from "../lib/router";
 import { mergeEvents } from "../lib/timeline";

@@ -40,7 +40,7 @@ import type { User } from "../api/client";
 import { validateRegistration } from "../api/session";
 import BrandMark from "../components/BrandMark.vue";
 import { passwordChecks } from "../lib/password";
-import { userErrorMessage } from "../lib/research";
+import { userErrorMessage } from "../lib/userErrors";
 import { loginHref } from "../lib/router";
 import { useUserServices } from "../lib/userServices";
 

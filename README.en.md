@@ -2,7 +2,7 @@
 
 **A chat-style DeepResearch assistant running on a self-built agent runtime.** Go owns execution and every security boundary. Python owns the research logic.
 
-[简体中文](README.md) · [Usage and operations reference (中文)](docs/usage.zh-CN.md) · [Design spec (中文)](docs/design/2026-10-03-v0.2-first-release-design.md)
+[简体中文](README.md) · [Usage and operations reference (中文)](docs/usage.zh-CN.md) · [Design spec (中文)](docs/design/2026-10-03-v0.2-first-release-design.md) · [Glossary (E/I codes, Plan N, §)](docs/glossary.md)
 
 A user asks a question in a chat UI. The agent either answers directly or starts a deep research turn:
 
@@ -80,7 +80,7 @@ All numbers come from recorded runs. The evidence files say exactly what each ru
 
 ## Quick start
 
-Requirements: Linux with cgroup v2 (or WSL2), Go 1.24+, Python 3.11+ with [uv](https://docs.astral.sh/uv/), Docker for PostgreSQL, and Node.js 24 for the web UI.
+Requirements: Linux with cgroup v2 (or WSL2), Go 1.25+, Python 3.11+ with [uv](https://docs.astral.sh/uv/), Docker for PostgreSQL, and Node.js 24 for the web UI.
 
 ```bash
 # Unit tests (no database; tests that need root are skipped)
@@ -130,7 +130,7 @@ CI=true go test -count=1 ./internal/persistence/postgres/ ./tests/e2e/...
 | `worker/` | Python worker SDK, `chatagent`, tools, the `deep-research` skill, the eval worker `evalworker` |
 | `web/` | Vue 3 + TypeScript chat UI and operator workbench |
 | `tests/e2e` | End-to-end tests (process provider and real sandbox) |
-| `docs/` | [Design](docs/design/), [evidence](docs/evidence/), [usage](docs/usage.zh-CN.md) |
+| `docs/` | [Design](docs/design/), [evidence](docs/evidence/), [usage](docs/usage.zh-CN.md), [glossary](docs/glossary.md) |
 
 ## Limits
 

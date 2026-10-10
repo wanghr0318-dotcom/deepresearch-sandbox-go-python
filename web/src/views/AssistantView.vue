@@ -67,7 +67,8 @@ import { ApiError, NetworkError, newRequestId } from "../api/client";
 import type { Task } from "../api/client";
 import { TOPIC_MAX, runeLength, validateTopic } from "../api/session";
 import StatusBadge from "../components/StatusBadge.vue";
-import { formatCreated, isActive, isUnauthorized, researchTitle, statusLabel, userErrorMessage } from "../lib/research";
+import { formatCreated, isActive, isUnauthorized, researchTitle, statusLabel } from "../lib/research";
+import { userErrorMessage } from "../lib/userErrors";
 import { navigate, researchHref } from "../lib/router";
 import { useUserServices } from "../lib/userServices";
 

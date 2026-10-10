@@ -39,7 +39,7 @@ var poolInterval = 2 * time.Second
 // warmBackoffBase and warmBackoffMax bound the creation backoff after stuck warm Pods.
 var (
 	warmBackoffBase = 10 * time.Second
-	warmBackoffMax  = 30 * time.Minute
+	warmBackoffMax  = 5 * time.Minute
 )
 
 func (pl *pool) run(ctx context.Context) {
