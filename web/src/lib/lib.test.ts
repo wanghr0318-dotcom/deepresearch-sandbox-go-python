@@ -18,7 +18,8 @@ import {
   taskHref,
   tasksHref,
 } from "./router";
-import { canCancel, countEvidence, deriveProgress, formatCreated, reportFilename, researchTitle, reportTitle, statusLabel, userErrorMessage } from "./research";
+import { canCancel, countEvidence, deriveProgress, formatCreated, reportFilename, researchTitle, reportTitle, statusLabel } from "./research";
+import { userErrorMessage } from "./userErrors";
 import { ROOT_LANE, lanes, mergeEvents } from "./timeline";
 
 describe("mergeEvents", () => {

@@ -1,0 +1,58 @@
+/* 报告正文（Markdown 经 marked + DOMPurify 渲染后的 HTML）的共用样式：对话中的报告全文（ReportBody）与右侧
+ * 面板的"报告"标签（SidePanel）都以 <style scoped src> 引入；字号与行高由各组件自己的 .report 规则决定。 */
+.report {
+  color: #1f2937;
+  word-break: break-word;
+}
+.report :deep(h1) {
+  font-size: 1.2rem;
+  margin: 0.4em 0 0.5em;
+}
+.report :deep(h2) {
+  font-size: 1.04rem;
+  margin: 1.2em 0 0.4em;
+  padding-bottom: 0.2em;
+  border-bottom: 1px solid #f3f4f6;
+}
+.report :deep(h3) {
+  font-size: 0.95rem;
+  margin: 1em 0 0.3em;
+}
+.report :deep(p),
+.report :deep(ul),
+.report :deep(ol) {
+  margin: 0.5em 0;
+}
+.report :deep(a) {
+  color: #6d28d9;
+  word-break: break-all;
+}
+.report :deep(pre) {
+  background: #f3f4f6;
+  padding: 8px 10px;
+  border-radius: 8px;
+  overflow: auto;
+}
+.report :deep(code) {
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 0.85em;
+}
+.report :deep(blockquote) {
+  margin: 0.6em 0;
+  padding: 2px 12px;
+  border-left: 3px solid #ddd6fe;
+  color: #4b5563;
+}
+.report :deep(table) {
+  border-collapse: collapse;
+  display: block;
+  overflow-x: auto;
+}
+.report :deep(th),
+.report :deep(td) {
+  border: 1px solid #e5e7eb;
+  padding: 4px 8px;
+}
+.report :deep(img) {
+  max-width: 100%;
+}

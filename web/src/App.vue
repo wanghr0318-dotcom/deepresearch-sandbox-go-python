@@ -39,7 +39,7 @@ import { onMounted, ref, watch } from "vue";
 import AdminApp from "./AdminApp.vue";
 import type { User } from "./api/client";
 import BrandMark from "./components/BrandMark.vue";
-import { userErrorMessage } from "./lib/research";
+import { userErrorMessage } from "./lib/userErrors";
 import { homeHref, isAdminRoute, legacyHref, loginHref, navigate, needsSession, useHashRoute } from "./lib/router";
 import { useUserServices } from "./lib/userServices";
 import AssistantView from "./views/AssistantView.vue";

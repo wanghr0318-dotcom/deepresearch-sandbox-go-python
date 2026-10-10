@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { sev, turn } from "../components/chat/chatkit";
 import { ApiError } from "../api/client";
-import { USER_ERRORS, activeResearchTurn, applyEvent, canContinueTurn, chatErrorMessage, emptyChat, isContinueCommand, recordAnswers, routeLabel, seedTurns, siteOf } from "./chat";
+import { activeResearchTurn, applyEvent, canContinueTurn, emptyChat, isContinueCommand, recordAnswers, routeLabel, seedTurns, siteOf } from "./chat";
+import { CHAT_ERRORS, chatErrorMessage } from "./userErrors";
 import type { ChatState } from "./chat";
 import type { SessionEvent } from "../api/chat";
 import { durationText, groupSteps, isStopping, isWritingReport, stoppingSeconds, turnFinished } from "./steps";
@@ -391,8 +392,8 @@ describe("applyEvent", () => {
   it("maps a failed turn to the user-facing copy and never exposes the raw code", () => {
     let s = applyEvent(started(), sev(1, "turn_status", { status: "failed", reason: "model_unavailable" }, "u1"));
     expect(s.turns[0]!.error).toBe("模型服务暂时不可用，请重试");
-    expect(USER_ERRORS.model_unavailable).toBe("模型服务暂时不可用，请重试");
-    expect(USER_ERRORS.model_degraded).toContain("所有供应商均不可用");
+    expect(CHAT_ERRORS.model_unavailable).toBe("模型服务暂时不可用，请重试");
+    expect(CHAT_ERRORS.model_degraded).toContain("所有供应商均不可用");
     s = applyEvent(started(), sev(1, "turn_status", { status: "failed", reason: "worker_crashed_xyz" }, "u1"));
     expect(s.turns[0]!.error).toBe("本轮未能完成，请重试");
     expect(s.turns[0]!.error).not.toContain("worker_crashed_xyz");
@@ -451,8 +452,8 @@ describe("seedTurns", () => {
 
 describe("chatErrorMessage", () => {
   it("maps session error codes to user copy", () => {
-    expect(chatErrorMessage(new ApiError(409, "turn_in_progress", ""))).toBe(USER_ERRORS.turn_in_progress);
-    expect(USER_ERRORS.turn_in_progress).toContain("先停止当前研究");
+    expect(chatErrorMessage(new ApiError(409, "turn_in_progress", ""))).toBe(CHAT_ERRORS.turn_in_progress);
+    expect(CHAT_ERRORS.turn_in_progress).toContain("先停止当前研究");
     expect(chatErrorMessage(new ApiError(503, "session_unavailable", ""))).toBe("会话暂时无法恢复");
     expect(chatErrorMessage(new ApiError(500, "boom", ""))).toBe("服务暂时不可用，请稍后再试");
   });

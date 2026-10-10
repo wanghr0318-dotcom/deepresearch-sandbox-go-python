@@ -5,9 +5,8 @@
 // - 原始请求/响应（⟨/⟩）只给经 Gateway 的调用（有 response_ref）；本地工具的步骤行只显示事件 data。
 // - 失败只显示面向用户的文案，从不显示原始错误码。
 
-import { ApiError } from "../api/client";
 import type { SessionEvent, Turn } from "../api/chat";
-import { userErrorMessage } from "./research";
+import { CHAT_ERRORS } from "./userErrors";
 
 export type StepKind =
   | "skill"
@@ -158,35 +157,7 @@ export interface ChatState {
   cursor: number;
 }
 
-/** 面向用户的错误文案（按错误码或失败原因）。 */
-export const USER_ERRORS: Record<string, string> = {
-  model_unavailable: "模型服务暂时不可用，请重试",
-  model_degraded: "模型服务暂时不可用（所有供应商均不可用），请稍后再试",
-  session_unavailable: "会话暂时无法恢复",
-  sessions_unavailable: "对话服务暂未开放，请稍后再试",
-  session_not_found: "找不到这个对话，可能已被删除",
-  session_closed: "这个对话正在删除",
-  turn_not_found: "找不到这一轮对话",
-  turn_in_progress: "当前研究还在进行，请先停止当前研究",
-  user_task_running: "你有另一项研究正在进行，请先停止它",
-  invalid_turn_state: "这一轮的状态已经变化，请刷新后再试",
-  not_restorable: "这项研究无法恢复",
-  invalid_text: "消息需为 1–4000 个字符",
-  invalid_title: "标题需为 1–80 个字符",
-  invalid_answers: "请回答每一个问题",
-  request_conflict: "请求冲突，请刷新后再试",
-};
-
 const FAILED_DEFAULT = "本轮未能完成，请重试";
-
-/** API 错误 → 面向用户的文案。 */
-export function chatErrorMessage(e: unknown): string {
-  if (e instanceof ApiError) {
-    const msg = USER_ERRORS[e.code];
-    if (msg) return msg;
-  }
-  return userErrorMessage(e);
-}
 
 /** 网址的站点名（去掉 www.）；无法解析时为空串。 */
 export function siteOf(url: string): string {
@@ -620,7 +591,7 @@ function applyTurnStatus(t: TurnView, d: Data, restored: Set<string>): TurnView 
   const reason = optStr(d.reason);
   const next: TurnView = { ...t, status, statusReason: reason };
   if (status === "failed") {
-    next.error = (reason && USER_ERRORS[reason]) || optStr(d.user_message) || FAILED_DEFAULT;
+    next.error = (reason && CHAT_ERRORS[reason]) || optStr(d.user_message) || FAILED_DEFAULT;
   } else {
     next.error = undefined;
   }
