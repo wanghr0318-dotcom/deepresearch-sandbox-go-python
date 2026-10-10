@@ -262,7 +262,7 @@ for k in ("latency_p50", "latency_p95", "wall_clock"):
     if k in m:
         print("         %s %.0f ms → %.0f ms" % (k, m[k]["a"], m[k]["b"]))
 if b[0] > a[1]:
-    print("         结论：区间不重叠，改进超出抽样噪声。")
+    print("         结论：区间不重叠（故障按确定性节奏注入时这只是保守核对；重复运行得到相同结果才是更强的证据）。")
 elif a[0] > b[1]:
     print("         结论：区间不重叠，B 更差（提议有害）。")
 else:
