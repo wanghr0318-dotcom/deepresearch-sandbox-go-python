@@ -11,6 +11,7 @@ import (
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/protocol"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/runner"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/task"
 )
@@ -23,46 +24,13 @@ var _ task.Store = (*Store)(nil)
 // 锁顺序：tasks → task_control → task_event_seq → subruns → attempts → attempt_access → environments。新建时同事务
 // 重新绑定 sub-run（rebindSubrunsTx，规格 §13.5），结果随 Attempt.Subruns 返回。
 func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Attempt, error) {
-	if a.TaskID == "" || a.AttemptID == "" || a.EnvID == "" || a.AttemptNo < 1 {
-		return task.Attempt{}, invalidf("CreateAttempt 缺少 task_id、attempt_id、env_id 或 attempt_no")
-	}
-	switch a.Retry {
-	case task.RetryNone, task.RetryFault, task.RetryOOM:
-	default:
-		return task.Attempt{}, invalidf("CreateAttempt 的重试类别 %q 未定义", a.Retry)
-	}
-	if (a.SessionID == "") != (a.IncarnationID == "") {
-		return task.Attempt{}, invalidf("CreateAttempt 的 session_id 与 incarnation_id 须同时提供")
+	if err := validateNewAttempt(a); err != nil {
+		return task.Attempt{}, err
 	}
 	var out task.Attempt
 	err := s.run(ctx, "CreateAttempt", a.AttemptID, func(ctx context.Context, tx pgx.Tx) error {
-		var turn *sessionTurn
-		if a.SessionID != "" { // 会话 turn：锁顺序从 sessions 开始（§8.1）
-			t, err := lockSessionTurn(ctx, tx, a.SessionID, a.IncarnationID)
-			if err != nil {
-				return err
-			}
-			turn = &t
-		}
-		var status, desired string
-		var taskSession *string
-		err := tx.QueryRow(ctx, "SELECT status, session_id FROM tasks WHERE task_id = $1 FOR UPDATE", a.TaskID).Scan(&status, &taskSession)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return notFoundf("任务 %s", a.TaskID)
-		}
+		l, err := lockForCreateAttempt(ctx, tx, a)
 		if err != nil {
-			return err
-		}
-		if (taskSession == nil && a.SessionID != "") || (taskSession != nil && *taskSession != a.SessionID) {
-			return invalidf("任务 %s 的会话与请求的会话 %q 不符", a.TaskID, a.SessionID)
-		}
-		if err := tx.QueryRow(ctx, "SELECT desired FROM task_control WHERE task_id = $1 FOR SHARE", a.TaskID).Scan(&desired); err != nil {
-			return err
-		}
-		if err := lockEventSeq(ctx, tx, a.TaskID); err != nil {
-			return err
-		}
-		if err := lockTaskSubrunsTx(ctx, tx, a.TaskID); err != nil {
 			return err
 		}
 		existing, err := selectAttempt(ctx, tx, a.AttemptID, true)
@@ -76,74 +44,23 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 		case !errors.Is(err, pgx.ErrNoRows):
 			return err
 		}
-		var taken string
-		err = tx.QueryRow(ctx, "SELECT attempt_id FROM attempts WHERE task_id = $1 AND attempt_no = $2", a.TaskID, a.AttemptNo).Scan(&taken)
-		if err == nil {
-			return conflictf("任务 %s 的第 %d 次 attempt 已是 %s", a.TaskID, a.AttemptNo, taken)
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		}
-		sessionEnv := ""
-		if turn != nil {
-			if a.EnvID != turn.incEnvID {
-				return invalidf("会话 turn 的 attempt 须在 incarnation %s 的环境 %s 中运行，得到 %s", a.IncarnationID, turn.incEnvID, a.EnvID)
-			}
-			sessionEnv = turn.incEnvID
-		} else {
-			var envTaken bool // 否则 INSERT 的 23505 会被当作可重试错误一直重试到期限
-			if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM environments WHERE env_id = $1)", a.EnvID).Scan(&envTaken); err != nil {
-				return err
-			}
-			if envTaken {
-				return conflictf("环境 %s 已存在", a.EnvID)
-			}
-		}
-		if err := admitAttempt(ctx, tx, a.TaskID, status, desired, sessionEnv); err != nil {
-			return err
-		}
-		if turn != nil {
-			if err := turn.admit(a.TaskID, a.IncarnationID); err != nil {
-				return err
-			}
-		}
-		if _, err := tx.Exec(ctx, "INSERT INTO attempts (attempt_id, task_id, attempt_no, env_id, status) VALUES ($1, $2, $3, $4, 'starting')",
-			a.AttemptID, a.TaskID, a.AttemptNo, a.EnvID); err != nil {
-			return err
-		}
-		// sub-run 在新 attempt 行插入之后重新绑定（bound_attempt_id 外键）；行锁已在上面按锁顺序取得（规格 §13.5）。
-		subruns, err := rebindSubrunsTx(ctx, tx, a.TaskID, a.AttemptID)
+		sessionEnv, err := checkNewAttemptIdentity(ctx, tx, a, l.turn)
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, "INSERT INTO attempt_access (attempt_id, task_id, state) VALUES ($1, $2, 'active')", a.AttemptID, a.TaskID); err != nil {
+		if err := admitAttempt(ctx, tx, a.TaskID, l.status, l.desired, sessionEnv); err != nil {
 			return err
 		}
-		if turn == nil { // 会话 turn 在 incarnation 的会话环境中运行，不另建任务环境
-			if _, err := tx.Exec(ctx, "INSERT INTO environments (env_id, kind, attempt_id, status) VALUES ($1, 'task', $2, 'creating')",
-				a.EnvID, a.AttemptID); err != nil {
+		if l.turn != nil {
+			if err := l.turn.admit(a.TaskID, a.IncarnationID); err != nil {
 				return err
 			}
 		}
-		// 重试计数只在新建 attempt 的同一事务中递增；重放走上面的身份分支，不重复递增（规格 §14.2）。
-		tag, err := tx.Exec(ctx, `UPDATE tasks SET current_attempt_id = $2, attempts_total = attempts_total + 1, status = 'running',
-			fault_retries_used = fault_retries_used + CASE WHEN $3 = 'fault' THEN 1 ELSE 0 END,
-			oom_retries_used = oom_retries_used + CASE WHEN $3 = 'oom' THEN 1 ELSE 0 END,
-			row_version = row_version + 1 WHERE task_id = $1 AND status = 'queued'`, a.TaskID, a.AttemptID, string(a.Retry))
+		subruns, err := insertAttemptRows(ctx, tx, a, l.turn)
 		if err != nil {
 			return err
 		}
-		if tag.RowsAffected() != 1 { // 持有任务行锁时不会发生；保留 CAS 作为最后一道检查
-			return rejectf(persistence.CodeNotRunnable, "任务 %s 已不在 queued", a.TaskID)
-		}
-		if turn != nil {
-			if err := turn.start(ctx, tx, a.TaskID, a.IncarnationID); err != nil {
-				return err
-			}
-		}
-		payload, _ := json.Marshal(map[string]any{"attempt_no": a.AttemptNo, "env_id": a.EnvID})
-		if _, err := appendHostEvent(ctx, tx, hostEvent{taskID: a.TaskID, key: "attempt_created:" + a.AttemptID,
-			attemptID: a.AttemptID, typ: "attempt_created", payload: payload}); err != nil {
+		if err := startTaskAttempt(ctx, tx, a, l.turn); err != nil {
 			return err
 		}
 		out = task.Attempt{AttemptID: a.AttemptID, TaskID: a.TaskID, AttemptNo: a.AttemptNo, EnvID: a.EnvID, Status: "starting"}
@@ -153,6 +70,135 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 		return nil
 	})
 	return out, err
+}
+
+// validateNewAttempt 检查 CreateAttempt 的参数（不访问数据库）。
+func validateNewAttempt(a task.NewAttempt) error {
+	if a.TaskID == "" || a.AttemptID == "" || a.EnvID == "" || a.AttemptNo < 1 {
+		return invalidf("CreateAttempt 缺少 task_id、attempt_id、env_id 或 attempt_no")
+	}
+	switch a.Retry {
+	case task.RetryNone, task.RetryFault, task.RetryOOM:
+	default:
+		return invalidf("CreateAttempt 的重试类别 %q 未定义", a.Retry)
+	}
+	if (a.SessionID == "") != (a.IncarnationID == "") {
+		return invalidf("CreateAttempt 的 session_id 与 incarnation_id 须同时提供")
+	}
+	return nil
+}
+
+// createLocks 是 CreateAttempt 按锁顺序取得的行与读到的状态。
+type createLocks struct {
+	turn            *sessionTurn // 会话 turn；普通任务为 nil
+	status, desired string
+}
+
+// lockForCreateAttempt 按锁顺序取得 CreateAttempt 需要的锁：会话 turn 从 sessions 开始（§8.1），然后 tasks →
+// task_control → task_event_seq → subruns；并核对任务所属的会话与请求一致。
+func lockForCreateAttempt(ctx context.Context, tx pgx.Tx, a task.NewAttempt) (createLocks, error) {
+	var l createLocks
+	if a.SessionID != "" { // 会话 turn：锁顺序从 sessions 开始（§8.1）
+		t, err := lockSessionTurn(ctx, tx, a.SessionID, a.IncarnationID)
+		if err != nil {
+			return l, err
+		}
+		l.turn = &t
+	}
+	var taskSession *string
+	err := tx.QueryRow(ctx, "SELECT status, session_id FROM tasks WHERE task_id = $1 FOR UPDATE", a.TaskID).Scan(&l.status, &taskSession)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return l, notFoundf("任务 %s", a.TaskID)
+	}
+	if err != nil {
+		return l, err
+	}
+	if (taskSession == nil && a.SessionID != "") || (taskSession != nil && *taskSession != a.SessionID) {
+		return l, invalidf("任务 %s 的会话与请求的会话 %q 不符", a.TaskID, a.SessionID)
+	}
+	if err := tx.QueryRow(ctx, "SELECT desired FROM task_control WHERE task_id = $1 FOR SHARE", a.TaskID).Scan(&l.desired); err != nil {
+		return l, err
+	}
+	if err := lockEventSeq(ctx, tx, a.TaskID); err != nil {
+		return l, err
+	}
+	if err := lockTaskSubrunsTx(ctx, tx, a.TaskID); err != nil {
+		return l, err
+	}
+	return l, nil
+}
+
+// checkNewAttemptIdentity 检查新 attempt 的序号与环境未被占用，返回会话 turn 的会话环境（普通任务为空）。
+func checkNewAttemptIdentity(ctx context.Context, tx pgx.Tx, a task.NewAttempt, turn *sessionTurn) (string, error) {
+	var taken string
+	err := tx.QueryRow(ctx, "SELECT attempt_id FROM attempts WHERE task_id = $1 AND attempt_no = $2", a.TaskID, a.AttemptNo).Scan(&taken)
+	if err == nil {
+		return "", conflictf("任务 %s 的第 %d 次 attempt 已是 %s", a.TaskID, a.AttemptNo, taken)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", err
+	}
+	if turn != nil {
+		if a.EnvID != turn.incEnvID {
+			return "", invalidf("会话 turn 的 attempt 须在 incarnation %s 的环境 %s 中运行，得到 %s", a.IncarnationID, turn.incEnvID, a.EnvID)
+		}
+		return turn.incEnvID, nil
+	}
+	var envTaken bool // 否则 INSERT 的 23505 会被当作可重试错误一直重试到期限
+	if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM environments WHERE env_id = $1)", a.EnvID).Scan(&envTaken); err != nil {
+		return "", err
+	}
+	if envTaken {
+		return "", conflictf("环境 %s 已存在", a.EnvID)
+	}
+	return "", nil
+}
+
+// insertAttemptRows 插入 attempt、重新绑定 sub-run、插入 attempt_access 与（普通任务的）任务环境记录。
+func insertAttemptRows(ctx context.Context, tx pgx.Tx, a task.NewAttempt, turn *sessionTurn) ([]protocol.ResumeSubrun, error) {
+	if _, err := tx.Exec(ctx, "INSERT INTO attempts (attempt_id, task_id, attempt_no, env_id, status) VALUES ($1, $2, $3, $4, 'starting')",
+		a.AttemptID, a.TaskID, a.AttemptNo, a.EnvID); err != nil {
+		return nil, err
+	}
+	// sub-run 在新 attempt 行插入之后重新绑定（bound_attempt_id 外键）；行锁已在上面按锁顺序取得（规格 §13.5）。
+	subruns, err := rebindSubrunsTx(ctx, tx, a.TaskID, a.AttemptID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, "INSERT INTO attempt_access (attempt_id, task_id, state) VALUES ($1, $2, 'active')", a.AttemptID, a.TaskID); err != nil {
+		return nil, err
+	}
+	if turn == nil { // 会话 turn 在 incarnation 的会话环境中运行，不另建任务环境
+		if _, err := tx.Exec(ctx, "INSERT INTO environments (env_id, kind, attempt_id, status) VALUES ($1, 'task', $2, 'creating')",
+			a.EnvID, a.AttemptID); err != nil {
+			return nil, err
+		}
+	}
+	return subruns, nil
+}
+
+// startTaskAttempt 把任务推进到 running（重试计数随之递增）、启动会话 turn，并追加 attempt_created。
+func startTaskAttempt(ctx context.Context, tx pgx.Tx, a task.NewAttempt, turn *sessionTurn) error {
+	// 重试计数只在新建 attempt 的同一事务中递增；重放走上面的身份分支，不重复递增（规格 §14.2）。
+	tag, err := tx.Exec(ctx, `UPDATE tasks SET current_attempt_id = $2, attempts_total = attempts_total + 1, status = 'running',
+			fault_retries_used = fault_retries_used + CASE WHEN $3 = 'fault' THEN 1 ELSE 0 END,
+			oom_retries_used = oom_retries_used + CASE WHEN $3 = 'oom' THEN 1 ELSE 0 END,
+			row_version = row_version + 1 WHERE task_id = $1 AND status = 'queued'`, a.TaskID, a.AttemptID, string(a.Retry))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 { // 持有任务行锁时不会发生；保留 CAS 作为最后一道检查
+		return rejectf(persistence.CodeNotRunnable, "任务 %s 已不在 queued", a.TaskID)
+	}
+	if turn != nil {
+		if err := turn.start(ctx, tx, a.TaskID, a.IncarnationID); err != nil {
+			return err
+		}
+	}
+	payload, _ := json.Marshal(map[string]any{"attempt_no": a.AttemptNo, "env_id": a.EnvID})
+	_, err = appendHostEvent(ctx, tx, hostEvent{taskID: a.TaskID, key: "attempt_created:" + a.AttemptID,
+		attemptID: a.AttemptID, typ: "attempt_created", payload: payload})
+	return err
 }
 
 // lockTaskSubrunsTx 按锁顺序（task_event_seq → subruns → attempts）以 FOR UPDATE 锁住任务的全部 sub-run 行（按
@@ -340,17 +386,8 @@ func verdictHash(v task.Verdict) ([]byte, error) {
 // 相符；attempt 必须处于 FromStatus。判决同时把 applied_control_version 推进到该控制版本。
 // 锁顺序：tasks → task_control → task_event_seq → subruns → attempts。
 func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attempt, error) {
-	if v.AttemptID == "" || v.TaskID == "" || v.ControlVersion < 1 || v.FromStatus == "" || v.AttemptStatus == "" ||
-		v.TaskStatus == "" || v.EventType == "" {
-		return task.Attempt{}, invalidf("FinalizeAttempt 缺少必填字段")
-	}
-	if v.NotBefore != nil && v.TaskStatus != "queued" {
-		return task.Attempt{}, invalidf("not_before 只用于回到 queued 的故障重试，任务状态为 %s", v.TaskStatus)
-	}
-	if ss := v.SessionState; ss != nil {
-		if v.TaskStatus != "succeeded" || ss.CheckpointID == "" || (len(ss.State) == 0) == (ss.StateRef == "") {
-			return task.Attempt{}, invalidf("session_state 只用于成功裁决，且须有 checkpoint_id 与恰好一个 state 或 state_ref")
-		}
+	if err := validateVerdict(v); err != nil {
+		return task.Attempt{}, err
 	}
 	hash, err := verdictHash(v)
 	if err != nil {
@@ -358,52 +395,8 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 	}
 	var out task.Attempt
 	err = s.run(ctx, "FinalizeAttempt", v.AttemptID, func(ctx context.Context, tx pgx.Tx) error {
-		sessionID, err := taskSessionID(ctx, tx, v.TaskID) // session_id 不变：先取会话再按锁顺序加锁
+		l, err := lockForVerdict(ctx, tx, v)
 		if err != nil {
-			return err
-		}
-		var turn *turnVerdict
-		if sessionID != "" {
-			tv, err := lockTurnVerdict(ctx, tx, sessionID, v.AttemptID)
-			if err != nil {
-				return err
-			}
-			turn = &tv
-		}
-		switch {
-		case turn == nil && v.SessionState != nil:
-			return invalidf("任务 %s 不属于会话，不能提交 session_state", v.TaskID)
-		case turn != nil && v.TaskStatus == "succeeded" && v.SessionState == nil:
-			return invalidf("会话 turn %s 的成功裁决须提交 session_state", v.TaskID)
-		}
-		var current, base *string
-		var status string
-		err = tx.QueryRow(ctx, "SELECT current_attempt_id, status, base_session_checkpoint_id FROM tasks WHERE task_id = $1 FOR UPDATE",
-			v.TaskID).Scan(&current, &status, &base)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return notFoundf("任务 %s", v.TaskID)
-		}
-		if err != nil {
-			return err
-		}
-		committed := ""
-		switch {
-		case turn == nil:
-		case v.SessionState != nil:
-			committed = v.SessionState.CheckpointID
-		case base != nil:
-			committed = *base
-		}
-		var desired string
-		var controlVersion int64
-		if err := tx.QueryRow(ctx, "SELECT desired, control_version FROM task_control WHERE task_id = $1 FOR SHARE",
-			v.TaskID).Scan(&desired, &controlVersion); err != nil {
-			return err
-		}
-		if err := lockEventSeq(ctx, tx, v.TaskID); err != nil {
-			return err
-		}
-		if err := lockTaskSubrunsTx(ctx, tx, v.TaskID); err != nil {
 			return err
 		}
 		a, err := selectAttempt(ctx, tx, v.AttemptID, true)
@@ -413,74 +406,166 @@ func (s *Store) FinalizeAttempt(ctx context.Context, v task.Verdict) (task.Attem
 		if err != nil {
 			return err
 		}
-		switch {
-		case a.TaskID != v.TaskID:
-			return conflictf("attempt %s 不属于任务 %s", v.AttemptID, v.TaskID)
-		case a.VerdictHash != nil && bytes.Equal(a.VerdictHash, hash):
-			a.CommittedSessionCheckpointID = committed
-			out = a
-			return nil
-		case a.VerdictHash != nil:
-			return conflictf("attempt %s 已有不同的判决", v.AttemptID)
-		case current == nil || *current != v.AttemptID:
-			return rejectf(persistence.CodeStaleAttempt, "attempt %s 不是任务 %s 的当前 attempt", v.AttemptID, v.TaskID)
-		case status != "running" && status != "pausing" && status != "cancelling":
-			return rejectf(persistence.CodeStaleAttempt, "任务 %s 处于 %s，不接受判决", v.TaskID, status)
-		case controlVersion != v.ControlVersion:
-			return rejectf(persistence.CodeControlChanged, "判决依据控制版本 %d，当前为 %d（desired = %s）",
-				v.ControlVersion, controlVersion, desired)
-		case !task.VerdictAllowedReason(desired, v.TaskStatus, v.TaskStatusReason):
-			return invalidf("desired = %s 时任务不能裁决为 %s（%s）", desired, v.TaskStatus, v.TaskStatusReason)
-		case a.Status != v.FromStatus:
-			return conflictf("attempt %s 处于 %s，不是 %s", v.AttemptID, a.Status, v.FromStatus)
+		replay, err := checkVerdict(a, v, hash, l)
+		if err != nil {
+			return err
 		}
-		if turn != nil {
-			if err := turn.apply(ctx, tx, v, base); err != nil {
+		if !replay {
+			if err := applyVerdict(ctx, tx, v, hash, l); err != nil {
 				return err
 			}
+			a.Status, a.OutcomeClass, a.VerdictHash = v.AttemptStatus, v.OutcomeClass, hash
 		}
-		if _, err := tx.Exec(ctx, `UPDATE attempts SET status = $2, outcome_class = $3, exit_code = $4, exit_signal = $5,
-			oom_kill_delta = $6, platform_killed = $7, verdict_hash = $8 WHERE attempt_id = $1`,
-			v.AttemptID, v.AttemptStatus, v.OutcomeClass, v.ExitCode, v.ExitSignal, v.OOMKillDelta, v.PlatformKilled, hash); err != nil {
-			return err
-		}
-		// 判决已按 controlVersion 裁决，一并推进 applied_control_version，actor 不再对已裁决的任务应用控制。
-		// 终态与暂停裁决清空续跑指令（tasks.resume_directive 只用于下一次 attempt 的 task_start）。
-		if _, err := tx.Exec(ctx, `UPDATE tasks SET status = $2, status_reason = $3, result_json = $4,
-			applied_control_version = GREATEST(applied_control_version, $5), not_before = $6, row_version = row_version + 1,
-			resume_directive = CASE WHEN $2 = 'queued' THEN resume_directive END
-			WHERE task_id = $1`, v.TaskID, v.TaskStatus, v.TaskStatusReason, nullJSON(v.Result), controlVersion, v.NotBefore); err != nil {
-			return err
-		}
-		// 最终裁决收尾仍未终态的 sub-run（§8.4）：cancelled → cancelled（task_cancel），succeeded → failed
-		// （not_completed_at_result），failed → failed（task_failed）；非终态裁决（回到 queued、paused）不改动，
-		// 留待恢复时重新绑定。
-		if err := closeOpenSubrunsTx(ctx, tx, v.TaskID, v.TaskStatus); err != nil {
-			return err
-		}
-		// 暂停裁决（停止、awaiting_input）暂停 sub-run 的 deadline 计时：记录剩余时间，继续时重新起算（规格 §13.5
-		// 执行中修订，M4 验收 2026-10-06）。故障重试（queued）不记录，恢复不重置。
-		if v.TaskStatus == "paused" {
-			if err := suspendSubrunDeadlinesTx(ctx, tx, v.TaskID); err != nil {
-				return err
-			}
-		}
-		// 会话 turn 的停止（paused/paused）没有得到 Worker 的停止卡时，在裁决之前补一张宿主停止卡（停止修复 F2）。
-		if turn != nil && v.TaskStatus == "paused" && v.TaskStatusReason == "paused" {
-			if err := appendFallbackStopCard(ctx, tx, v.TaskID, "turn_stopped_fallback:"+v.AttemptID, v.AttemptID); err != nil {
-				return err
-			}
-		}
-		if _, err := appendHostEvent(ctx, tx, hostEvent{taskID: v.TaskID, key: "attempt_finalized:" + v.AttemptID,
-			attemptID: v.AttemptID, typ: v.EventType, payload: []byte(v.EventPayload)}); err != nil {
-			return err
-		}
-		a.Status, a.OutcomeClass, a.VerdictHash = v.AttemptStatus, v.OutcomeClass, hash
-		a.CommittedSessionCheckpointID = committed
+		a.CommittedSessionCheckpointID = l.committed
 		out = a
 		return nil
 	})
 	return out, err
+}
+
+// validateVerdict 检查判决的必填字段与组合（不访问数据库）。
+func validateVerdict(v task.Verdict) error {
+	if v.AttemptID == "" || v.TaskID == "" || v.ControlVersion < 1 || v.FromStatus == "" || v.AttemptStatus == "" ||
+		v.TaskStatus == "" || v.EventType == "" {
+		return invalidf("FinalizeAttempt 缺少必填字段")
+	}
+	if v.NotBefore != nil && v.TaskStatus != "queued" {
+		return invalidf("not_before 只用于回到 queued 的故障重试，任务状态为 %s", v.TaskStatus)
+	}
+	if ss := v.SessionState; ss != nil {
+		if v.TaskStatus != "succeeded" || ss.CheckpointID == "" || (len(ss.State) == 0) == (ss.StateRef == "") {
+			return invalidf("session_state 只用于成功裁决，且须有 checkpoint_id 与恰好一个 state 或 state_ref")
+		}
+	}
+	return nil
+}
+
+// verdictLocks 是 FinalizeAttempt 按锁顺序取得的行与读到的状态。
+type verdictLocks struct {
+	turn           *turnVerdict // 会话 turn；普通任务为 nil
+	current, base  *string      // tasks.current_attempt_id、base_session_checkpoint_id
+	status         string
+	desired        string
+	controlVersion int64
+	committed      string // 裁决后会话已提交的 checkpoint（普通任务为空）
+}
+
+// lockForVerdict 按锁顺序取得 FinalizeAttempt 需要的锁（会话 turn 从会话开始，然后 tasks → task_control →
+// task_event_seq → subruns），并核对 session_state 与任务是否属于会话相符。
+func lockForVerdict(ctx context.Context, tx pgx.Tx, v task.Verdict) (verdictLocks, error) {
+	var l verdictLocks
+	sessionID, err := taskSessionID(ctx, tx, v.TaskID) // session_id 不变：先取会话再按锁顺序加锁
+	if err != nil {
+		return l, err
+	}
+	if sessionID != "" {
+		tv, err := lockTurnVerdict(ctx, tx, sessionID, v.AttemptID)
+		if err != nil {
+			return l, err
+		}
+		l.turn = &tv
+	}
+	switch {
+	case l.turn == nil && v.SessionState != nil:
+		return l, invalidf("任务 %s 不属于会话，不能提交 session_state", v.TaskID)
+	case l.turn != nil && v.TaskStatus == "succeeded" && v.SessionState == nil:
+		return l, invalidf("会话 turn %s 的成功裁决须提交 session_state", v.TaskID)
+	}
+	err = tx.QueryRow(ctx, "SELECT current_attempt_id, status, base_session_checkpoint_id FROM tasks WHERE task_id = $1 FOR UPDATE",
+		v.TaskID).Scan(&l.current, &l.status, &l.base)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return l, notFoundf("任务 %s", v.TaskID)
+	}
+	if err != nil {
+		return l, err
+	}
+	switch {
+	case l.turn == nil:
+	case v.SessionState != nil:
+		l.committed = v.SessionState.CheckpointID
+	case l.base != nil:
+		l.committed = *l.base
+	}
+	if err := tx.QueryRow(ctx, "SELECT desired, control_version FROM task_control WHERE task_id = $1 FOR SHARE",
+		v.TaskID).Scan(&l.desired, &l.controlVersion); err != nil {
+		return l, err
+	}
+	if err := lockEventSeq(ctx, tx, v.TaskID); err != nil {
+		return l, err
+	}
+	if err := lockTaskSubrunsTx(ctx, tx, v.TaskID); err != nil {
+		return l, err
+	}
+	return l, nil
+}
+
+// checkVerdict 核对判决与最新事实：同一判决的重放返回 replay；其余不符为冲突或拒绝（规格 §8.1）。
+func checkVerdict(a task.Attempt, v task.Verdict, hash []byte, l verdictLocks) (replay bool, err error) {
+	switch {
+	case a.TaskID != v.TaskID:
+		return false, conflictf("attempt %s 不属于任务 %s", v.AttemptID, v.TaskID)
+	case a.VerdictHash != nil && bytes.Equal(a.VerdictHash, hash):
+		return true, nil
+	case a.VerdictHash != nil:
+		return false, conflictf("attempt %s 已有不同的判决", v.AttemptID)
+	case l.current == nil || *l.current != v.AttemptID:
+		return false, rejectf(persistence.CodeStaleAttempt, "attempt %s 不是任务 %s 的当前 attempt", v.AttemptID, v.TaskID)
+	case l.status != "running" && l.status != "pausing" && l.status != "cancelling":
+		return false, rejectf(persistence.CodeStaleAttempt, "任务 %s 处于 %s，不接受判决", v.TaskID, l.status)
+	case l.controlVersion != v.ControlVersion:
+		return false, rejectf(persistence.CodeControlChanged, "判决依据控制版本 %d，当前为 %d（desired = %s）",
+			v.ControlVersion, l.controlVersion, l.desired)
+	case !task.VerdictAllowedReason(l.desired, v.TaskStatus, v.TaskStatusReason):
+		return false, invalidf("desired = %s 时任务不能裁决为 %s（%s）", l.desired, v.TaskStatus, v.TaskStatusReason)
+	case a.Status != v.FromStatus:
+		return false, conflictf("attempt %s 处于 %s，不是 %s", v.AttemptID, a.Status, v.FromStatus)
+	}
+	return false, nil
+}
+
+// applyVerdict 写入新判决：会话 turn 的结果、attempt 与任务状态、sub-run 收尾、暂停时的 sub-run 计时与兜底停止卡，
+// 以及终态 host 事件。
+func applyVerdict(ctx context.Context, tx pgx.Tx, v task.Verdict, hash []byte, l verdictLocks) error {
+	if l.turn != nil {
+		if err := l.turn.apply(ctx, tx, v, l.base); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE attempts SET status = $2, outcome_class = $3, exit_code = $4, exit_signal = $5,
+			oom_kill_delta = $6, platform_killed = $7, verdict_hash = $8 WHERE attempt_id = $1`,
+		v.AttemptID, v.AttemptStatus, v.OutcomeClass, v.ExitCode, v.ExitSignal, v.OOMKillDelta, v.PlatformKilled, hash); err != nil {
+		return err
+	}
+	// 判决已按 controlVersion 裁决，一并推进 applied_control_version，actor 不再对已裁决的任务应用控制。
+	// 终态与暂停裁决清空续跑指令（tasks.resume_directive 只用于下一次 attempt 的 task_start）。
+	if _, err := tx.Exec(ctx, `UPDATE tasks SET status = $2, status_reason = $3, result_json = $4,
+			applied_control_version = GREATEST(applied_control_version, $5), not_before = $6, row_version = row_version + 1,
+			resume_directive = CASE WHEN $2 = 'queued' THEN resume_directive END
+			WHERE task_id = $1`, v.TaskID, v.TaskStatus, v.TaskStatusReason, nullJSON(v.Result), l.controlVersion, v.NotBefore); err != nil {
+		return err
+	}
+	// 最终裁决收尾仍未终态的 sub-run（§8.4）：cancelled → cancelled（task_cancel），succeeded → failed
+	// （not_completed_at_result），failed → failed（task_failed）；非终态裁决（回到 queued、paused）不改动，
+	// 留待恢复时重新绑定。
+	if err := closeOpenSubrunsTx(ctx, tx, v.TaskID, v.TaskStatus); err != nil {
+		return err
+	}
+	// 暂停裁决（停止、awaiting_input）暂停 sub-run 的 deadline 计时：记录剩余时间，继续时重新起算（规格 §13.5
+	// 执行中修订，M4 验收 2026-10-06）。故障重试（queued）不记录，恢复不重置。
+	if v.TaskStatus == "paused" {
+		if err := suspendSubrunDeadlinesTx(ctx, tx, v.TaskID); err != nil {
+			return err
+		}
+	}
+	// 会话 turn 的停止（paused/paused）没有得到 Worker 的停止卡时，在裁决之前补一张宿主停止卡（停止修复 F2）。
+	if l.turn != nil && v.TaskStatus == "paused" && v.TaskStatusReason == "paused" {
+		if err := appendFallbackStopCard(ctx, tx, v.TaskID, "turn_stopped_fallback:"+v.AttemptID, v.AttemptID); err != nil {
+			return err
+		}
+	}
+	_, err := appendHostEvent(ctx, tx, hostEvent{taskID: v.TaskID, key: "attempt_finalized:" + v.AttemptID,
+		attemptID: v.AttemptID, typ: v.EventType, payload: []byte(v.EventPayload)})
+	return err
 }
 
 // appendFallbackStopCard 是宿主兜底停止卡（停止修复 F2）：会话 turn 的一次停止以暂停结束——暂停裁决（Worker 在 grace 内
