@@ -171,12 +171,19 @@ type initEnv struct {
 // 任一步失败则把 `init/<步骤>: <原因>` 写入就绪管道（init_err，不经控制 socket）并返回该错误，
 // 此时没有进入 Serve，不会运行任何 workload。
 func RunInit() error {
-	syscall.CloseOnExec(InitReadyFD)
+	// 就绪 fd 只有确为管道时才写入与关闭：被误用（直接执行 `agentbox init`）时 fd 4 可能是运行时自己打开的 fd
+	// （Go 1.25 起运行时在 main 之前打开 cgroup 的 cpu.max 并保持打开，占用最低的空闲 fd）。
+	readyOK := fdType(InitReadyFD) == syscall.S_IFIFO
+	if readyOK {
+		syscall.CloseOnExec(InitReadyFD)
+	}
 	env, err := establish()
 	if err != nil {
 		reason := "init/" + err.Error()
-		_, _ = syscall.Write(InitReadyFD, []byte(reason))
-		syscall.Close(InitReadyFD)
+		if readyOK {
+			_, _ = syscall.Write(InitReadyFD, []byte(reason))
+			syscall.Close(InitReadyFD)
+		}
 		return errors.New(reason)
 	}
 	if _, err := syscall.Write(InitReadyFD, []byte{InitReadyByte}); err != nil {
@@ -190,6 +197,11 @@ func RunInit() error {
 
 // establish 按规格 §4.6 的 init 段逐步建立环境。返回的错误都是 *stepErr。
 func establish() (initEnv, error) {
+	// 继承的 fd 必须是启动进程交来的类型（控制 socket、就绪管道与启动规格管道）；否则在第一步失败，
+	// 不把运行时或其他来源的 fd 当作控制连接或启动规格使用。
+	if err := checkInheritedFDs(); err != nil {
+		return initEnv{}, &stepErr{stepControlFD, err}
+	}
 	// 控制 socket 立即移到高位并带上 close-on-exec（ExtraFiles 继承时不带 FD_CLOEXEC）。
 	ctl, err := fcntl(InitControlFD, syscall.F_DUPFD_CLOEXEC, controlFDMin)
 	if err != nil {
@@ -249,6 +261,36 @@ func establish() (initEnv, error) {
 	}
 	ok = true
 	return initEnv{control: control, helperFD: helper, spec: spec.Init}, nil
+}
+
+// fdType 返回 fd 的文件类型（syscall.S_IFMT 位）；fd 无效时为 0。
+func fdType(fd int) uint32 {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return 0
+	}
+	return st.Mode & syscall.S_IFMT
+}
+
+// checkInheritedFDs 校验 init 继承的三个 fd 的类型：InitControlFD 为 socket，InitReadyFD 与 InitSpecFD 为管道。
+func checkInheritedFDs() error {
+	for _, c := range []struct {
+		fd   int
+		want uint32
+		name string
+	}{
+		{InitControlFD, syscall.S_IFSOCK, "控制 socket"},
+		{InitReadyFD, syscall.S_IFIFO, "就绪管道"},
+		{InitSpecFD, syscall.S_IFIFO, "启动规格管道"},
+	} {
+		if got := fdType(c.fd); got != c.want {
+			if got == 0 {
+				return fmt.Errorf("缺少继承的 fd %d（%s）", c.fd, c.name)
+			}
+			return fmt.Errorf("继承的 fd %d 不是%s（类型 %#o）", c.fd, c.name, got)
+		}
+	}
+	return nil
 }
 
 // readInitSpec 从 InitSpecFD 读取 LaunchSpec（读到 EOF 后关闭），校验其中的 InitSpec。

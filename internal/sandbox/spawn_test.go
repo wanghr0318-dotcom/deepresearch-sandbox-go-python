@@ -165,10 +165,9 @@ func TestLaunchRejectsUnsafeSpec(t *testing.T) {
 // `agentbox init` 执行它，证明这条 argv 分流确实通到了
 // runSandboxInit() -> sandbox.RunInit()。
 //
-// 不需要 root：直接执行时没有继承的控制 socket（fd 3）与启动规格（fd 5），RunInit 在最初的步骤就失败，不触及
-// 命名空间与挂载。失败的是哪一步取决于运行时：Go 1.25 起运行时在 main 之前打开 cgroup 的 cpu.max 并保持打开
-// （cgroup 感知的 GOMAXPROCS），在有 CPU 限额的 cgroup 中（例如 CI runner）它占用最低的空闲 fd，于是 fd 3
-// 存在、失败落在 init/spec。生产路径不受影响：fd 3–5 总是经 ExtraFiles 显式传入，运行时的 fd 落在其后。
+// 不需要 root：直接执行时没有启动进程交来的 fd，RunInit 在第一步（init/control_fd：继承 fd 的类型检查）就失败，
+// 不触及命名空间与挂载。即使运行时占用了低位 fd（Go 1.25 起运行时在 main 之前打开 cgroup 的 cpu.max 并保持
+// 打开），它们不是 socket/管道，同样在这一步失败。
 func TestMainDispatchesInitToRunInit(t *testing.T) {
 	repoRoot := repoRootDir(t)
 
@@ -189,9 +188,23 @@ func TestMainDispatchesInitToRunInit(t *testing.T) {
 	if exitErr.ExitCode() != 1 {
 		t.Fatalf("agentbox init 退出码 = %d, want 1\n输出:\n%s", exitErr.ExitCode(), out)
 	}
-	if !strings.Contains(string(out), "sandbox init: init/"+stepControlFD+": ") &&
-		!strings.Contains(string(out), "sandbox init: init/"+stepSpec+": ") {
-		t.Fatalf("输出未包含 init/%s 或 init/%s 的失败原因，实际输出:\n%s", stepControlFD, stepSpec, out)
+	if !strings.Contains(string(out), "sandbox init: init/"+stepControlFD+": ") {
+		t.Fatalf("输出未包含 init/%s 的失败原因，实际输出:\n%s", stepControlFD, out)
+	}
+
+	// fd 3–5 存在但类型不对（普通文件，模拟运行时或调用方占用的低位 fd）：同样在 init/control_fd 失败，
+	// 不把它们当作控制连接或启动规格使用。
+	reg, err := os.Open(binPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	cmd = exec.Command(binPath, InitArg)
+	cmd.ExtraFiles = []*os.File{reg, reg, reg}
+	out, err = cmd.CombinedOutput()
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 ||
+		!strings.Contains(string(out), "sandbox init: init/"+stepControlFD+": 继承的 fd 3 不是控制 socket") {
+		t.Fatalf("类型不对的继承 fd 应在 init/%s 失败，err=%v\n输出:\n%s", stepControlFD, err, out)
 	}
 
 	// sandbox-launch 分流：没有继承的 FD 时 RunLaunch 立即失败（不触及凭据与命名空间）。
