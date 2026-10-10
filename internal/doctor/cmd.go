@@ -37,7 +37,7 @@ const usage = `usage:
                          [--config FLAGS_FILE | --apply-to FLAGS_FILE] [--out DIR] [--json]
                          [--slow-factor 3] [--slow-ms 0]
                          [--tempo URL] [--prometheus URL] [--loki URL] [--loki-selector '{job="agentbox"}']
-                         [--advisor-model M --advisor-base-url URL --advisor-price IN:OUT [--advisor-budget-usd 0.05]]
+                         [--advisor-model M --advisor-base-url URL --advisor-price IN:OUT [--advisor-budget-usd 0.05] [--advisor-max-tokens 1024]]
 Reads failed and slow runs, classifies root causes with deterministic rules, and proposes allowlisted
 configuration changes (findings.json, findings.md, proposal.patch). --apply-to writes <out>/experiment.flags
 (a new file for an experiment run; the input is never modified).
@@ -52,6 +52,7 @@ type cliFlags struct {
 	tempo, prom, loki, lokiSel                               string
 	advModel, advURL, advPrice                               string
 	advBudget                                                float64
+	advMaxTokens                                             int
 }
 
 func parseFlags(args []string, stderr io.Writer) (*cliFlags, error) {
@@ -79,6 +80,7 @@ func parseFlags(args []string, stderr io.Writer) (*cliFlags, error) {
 	fs.StringVar(&f.advURL, "advisor-base-url", "", "OpenAI-compatible base URL of the advisor (…/v1)")
 	fs.StringVar(&f.advPrice, "advisor-price", "", "advisor price IN:OUT in micro-USD per million tokens (required with --advisor-model)")
 	fs.Float64Var(&f.advBudget, "advisor-budget-usd", 0.05, "hard budget for the advisor call")
+	fs.IntVar(&f.advMaxTokens, "advisor-max-tokens", 1024, "reply cap of the advisor call (also its worst-case output reservation)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -95,6 +97,8 @@ func parseFlags(args []string, stderr io.Writer) (*cliFlags, error) {
 		return nil, errors.New("--advisor-model needs --advisor-base-url and --advisor-price")
 	case f.advBudget <= 0 || f.advBudget > 1:
 		return nil, errors.New("--advisor-budget-usd must be within (0, 1]")
+	case f.advMaxTokens < 64 || f.advMaxTokens > 32768:
+		return nil, errors.New("--advisor-max-tokens must be within [64, 32768]")
 	}
 	return f, nil
 }
@@ -176,7 +180,7 @@ func run(ctx context.Context, f *cliFlags, stdout, stderr io.Writer, getenv func
 			key = getenv(envModelKey)
 		}
 		ad := &Advisor{BaseURL: f.advURL, Model: f.advModel, APIKey: key, PriceInMicroPerMTok: in, PriceOutMicroPerMTok: out,
-			BudgetMicro: int64(f.advBudget * 1e6)}
+			BudgetMicro: int64(f.advBudget * 1e6), MaxTokens: f.advMaxTokens}
 		ApplyAdvisor(rep, ad.Run(ctx, rep, cfg))
 	}
 	outDir := f.out

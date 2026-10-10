@@ -29,6 +29,8 @@ type Advisor struct {
 const advisorSystem = `You are an SRE assistant for a sandboxed agent runtime (Go control plane, Python workers, a Gateway that
 proxies model/search/fetch/exec calls with retries, a model fallback chain, circuit breakers and hedging).
 You receive the findings of a deterministic trace analysis: counts, latencies, error codes and ids only.
+A try cut by a timeout or deadline reports the latency at which it was cut, not the time the upstream needed;
+ok-try percentiles are per call kind as labelled (search and fetch are separate kinds).
 Write a short diagnosis (at most 8 sentences) for the operator and propose configuration changes.
 You may ONLY propose these server flags, with values inside the bounds:
 %s
@@ -89,7 +91,7 @@ func (ad *Advisor) Run(ctx context.Context, rep *Report, cfg *Flags) *AdvisorRep
 		return ar
 	}
 	body, _ := json.Marshal(map[string]any{
-		"model": ad.Model, "max_tokens": maxTokens, "temperature": 0,
+		"model": ad.Model, "max_tokens": maxTokens,
 		"messages": []map[string]string{{"role": "system", "content": system}, {"role": "user", "content": string(data)}},
 	})
 	ar.Called = true
@@ -162,6 +164,7 @@ func (ad *Advisor) post(ctx context.Context, body []byte) (string, tokenUsage, e
 			Message struct {
 				Content string `json:"content"`
 			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage struct {
 			PromptTokens     int64 `json:"prompt_tokens"`
@@ -171,10 +174,21 @@ func (ad *Advisor) post(ctx context.Context, body []byte) (string, tokenUsage, e
 	_ = json.Unmarshal(data, &r)
 	u = tokenUsage{r.Usage.PromptTokens, r.Usage.CompletionTokens}
 	if resp.StatusCode != http.StatusOK {
-		return "", u, fmt.Errorf("advisor HTTP %d", resp.StatusCode)
+		var e struct {
+			Error struct {
+				Type    string `json:"type"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(data, &e)
+		return "", u, fmt.Errorf("advisor HTTP %d %s %s", resp.StatusCode, e.Error.Type, truncateText(oneLine(e.Error.Message), 200))
 	}
 	if len(r.Choices) == 0 {
 		return "", u, errors.New("advisor reply has no choices")
+	}
+	if c := r.Choices[0]; strings.TrimSpace(c.Message.Content) == "" {
+		// Reasoning models spend output tokens before the answer: an empty answer cut at the limit needs a larger cap.
+		return "", u, fmt.Errorf("advisor reply is empty (finish_reason %q): raise --advisor-max-tokens", c.FinishReason)
 	}
 	return r.Choices[0].Message.Content, u, nil
 }

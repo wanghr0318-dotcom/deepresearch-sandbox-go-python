@@ -47,7 +47,9 @@ func TestTempoPromLoki(t *testing.T) {
 				["1","{\"level\":\"WARN\",\"msg\":\"gateway: breaker\",\"trace_id\":\"t1\"}"],
 				["2","{\"level\":\"WARN\",\"msg\":\"gateway: breaker\",\"trace_id\":\"t2\"}"],
 				["3","{\"level\":\"ERROR\",\"msg\":\"worker failed\"}"],
-				["4","not json"]]}]}}`))
+				["4","{\"level\":\"INFO\",\"msg\":\"gateway: try\",\"endpoint\":\"/v1/fetch\",\"provider\":\"http_get\",\"outcome\":\"unknown\",\"code\":\"upstream_unconfirmed\",\"trace_id\":\"t3\"}"],
+				["5","{\"level\":\"INFO\",\"msg\":\"gateway: try\",\"endpoint\":\"/v1/fetch\",\"outcome\":\"ok\"}"],
+				["6","not json"]]}]}}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -67,8 +69,9 @@ func TestTempoPromLoki(t *testing.T) {
 	if err != nil || len(rows) != 1 || rows[0].Labels["provider"] != "primary" || rows[0].Value != 3 {
 		t.Fatalf("prom %+v %v", rows, err)
 	}
-	logs, err := LokiWarnings(ctx, c, srv.URL, `{job="agentbox"}`, t0, t0.Add(time.Hour))
-	if err != nil || len(logs) != 2 || logs[0].Message != "gateway: breaker" || logs[0].Count != 2 || len(logs[0].TraceIDs) != 2 {
+	logs, truncated, err := LokiFailures(ctx, c, srv.URL, `{job="agentbox"}`, t0, t0.Add(time.Hour))
+	if err != nil || truncated || len(logs) != 3 || logs[0].Message != "gateway: breaker" || logs[0].Count != 2 || len(logs[0].TraceIDs) != 2 ||
+		logs[1].Message != "gateway: try /v1/fetch route=http_get outcome=unknown code=upstream_unconfirmed" || logs[1].TraceIDs[0] != "t3" {
 		t.Fatalf("loki %+v %v", logs, err)
 	}
 

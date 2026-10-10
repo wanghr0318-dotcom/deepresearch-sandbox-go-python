@@ -53,7 +53,8 @@ func Enrich(ctx context.Context, rep *Report, trs []*eval.Trajectory, o ObsConfi
 	}
 }
 
-// window is the time range covered by the trajectories, padded for scrape and export delays.
+// window is the time range covered by the trajectories, padded by 10 s for scrape and export delays (more would
+// pull in the next run when runs follow each other closely).
 func window(trs []*eval.Trajectory) (time.Time, time.Time) {
 	var from, to time.Time
 	for _, t := range trs {
@@ -72,7 +73,7 @@ func window(trs []*eval.Trajectory) (time.Time, time.Time) {
 		to = time.Now()
 		from = to.Add(-time.Hour)
 	}
-	return from.Add(-30 * time.Second), to.Add(30 * time.Second)
+	return from.Add(-10 * time.Second), to.Add(10 * time.Second)
 }
 
 func getJSON(ctx context.Context, c *http.Client, u string, out any) error {
@@ -306,39 +307,55 @@ func enrichPrometheus(ctx context.Context, or *ObsReport, o ObsConfig, from, to 
 
 // ---- Loki ----
 
-// LokiWarnings counts WARN/ERROR log lines in the window by message, with up to 3 trace ids each.
-func LokiWarnings(ctx context.Context, c *http.Client, base, selector string, from, to time.Time) ([]LogCount, error) {
+// LokiFailures reads the server log in the window and counts (a) WARN/ERROR lines by message and (b) Gateway tries
+// that did not succeed ("gateway: try" lines, which are INFO) by endpoint, route, outcome and code — each with up to
+// 3 trace ids, so a log line leads to its trace. truncated reports that the line limit was hit.
+func LokiFailures(ctx context.Context, c *http.Client, base, selector string, from, to time.Time) (out []LogCount, truncated bool, err error) {
+	const limit = 5000
 	q := url.Values{}
-	q.Set("query", selector+` |~ "\"level\":\"(WARN|ERROR)\""`)
+	q.Set("query", selector+` |~ "\"level\":\"(WARN|ERROR)\"|\"msg\":\"gateway: try\""`)
 	q.Set("start", strconv.FormatInt(from.UnixNano(), 10))
 	q.Set("end", strconv.FormatInt(to.UnixNano(), 10))
-	q.Set("limit", "5000")
+	q.Set("limit", strconv.Itoa(limit))
 	q.Set("direction", "forward")
 	var res struct {
-		Status string `json:"status"`
-		Data   struct {
+		Data struct {
 			Result []struct {
 				Values [][2]string `json:"values"`
 			} `json:"result"`
 		} `json:"data"`
 	}
 	if err := getJSON(ctx, c, strings.TrimRight(base, "/")+"/loki/api/v1/query_range?"+q.Encode(), &res); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	by := map[string]*LogCount{}
+	n := 0
 	for _, st := range res.Data.Result {
 		for _, v := range st.Values {
+			n++
 			var line struct {
-				Msg     string `json:"msg"`
-				TraceID string `json:"trace_id"`
+				Msg      string `json:"msg"`
+				TraceID  string `json:"trace_id"`
+				Endpoint string `json:"endpoint"`
+				Route    string `json:"route"`
+				Provider string `json:"provider"`
+				Outcome  string `json:"outcome"`
+				Code     string `json:"code"`
 			}
 			if json.Unmarshal([]byte(v[1]), &line) != nil || line.Msg == "" {
 				continue
 			}
-			lc := by[line.Msg]
+			key := line.Msg
+			if line.Msg == "gateway: try" {
+				if line.Outcome == "ok" {
+					continue
+				}
+				key = fmt.Sprintf("gateway: try %s route=%s outcome=%s code=%s", line.Endpoint, nz(line.Route, line.Provider), line.Outcome, nz(line.Code, "-"))
+			}
+			lc := by[key]
 			if lc == nil {
-				lc = &LogCount{Message: line.Msg}
-				by[line.Msg] = lc
+				lc = &LogCount{Message: key}
+				by[key] = lc
 			}
 			lc.Count++
 			if line.TraceID != "" && len(lc.TraceIDs) < 3 && !contains(lc.TraceIDs, line.TraceID) {
@@ -346,7 +363,6 @@ func LokiWarnings(ctx context.Context, c *http.Client, base, selector string, fr
 			}
 		}
 	}
-	var out []LogCount
 	for _, lc := range by {
 		out = append(out, *lc)
 	}
@@ -356,7 +372,7 @@ func LokiWarnings(ctx context.Context, c *http.Client, base, selector string, fr
 		}
 		return out[i].Message < out[j].Message
 	})
-	return out[:min(len(out), 15)], nil
+	return out[:min(len(out), 15)], n >= limit, nil
 }
 
 func enrichLoki(ctx context.Context, or *ObsReport, o ObsConfig, from, to time.Time) {
@@ -364,10 +380,16 @@ func enrichLoki(ctx context.Context, or *ObsReport, o ObsConfig, from, to time.T
 	if sel == "" {
 		sel = `{job="agentbox"}`
 	}
-	logs, err := LokiWarnings(ctx, o.client(), o.Loki, sel, from, to)
+	logs, truncated, err := LokiFailures(ctx, o.client(), o.Loki, sel, from, to)
 	if err != nil {
 		or.Notes = append(or.Notes, "loki: "+err.Error())
 		return
 	}
 	or.Logs = logs
+	if truncated {
+		or.Notes = append(or.Notes, "loki: line limit reached; log counts cover the start of the window only")
+	}
+	if len(logs) == 0 {
+		or.Notes = append(or.Notes, "loki: no WARN/ERROR lines and no failed Gateway tries in the window")
+	}
 }

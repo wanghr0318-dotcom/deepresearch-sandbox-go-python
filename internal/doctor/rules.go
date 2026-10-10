@@ -409,10 +409,15 @@ func ruleFetchDeadline(a *analysis) *Finding {
 	if ev.Counts["calls_deadline"] == 0 {
 		return nil
 	}
-	ev.LatencyMs["ok_p99"] = pct(okAll, 99)
+	for _, k := range []string{"search", "fetch"} {
+		_, xs := a.okLatencies(k)
+		ev.Counts["ok_tries."+k] = int64(len(xs))
+		if len(xs) > 0 {
+			ev.LatencyMs["ok_p99."+k] = pct(xs, 99)
+		}
+	}
 	ev.LatencyMs["cut_try_p50"] = pct(cut, 50)
 	ev.LatencyMs["cut_try_max"] = pct(cut, 100)
-	ev.Counts["ok_tries"] = int64(len(okAll))
 	cur, curText := current(a.cfg, "call-deadline")
 	if a.cfg == nil {
 		// Without the config the deadline is at least the longest cut try.
@@ -427,8 +432,8 @@ func ruleFetchDeadline(a *analysis) *Finding {
 		"a search/fetch call that hits its deadline settles unknown (upstream_unconfirmed) and the worker gets 504; if every fetch of a research task is cut, the task has no evidence")
 	to := clampMs(max(4*pct(okAll, 99), 10*cur), 10_000, 120_000)
 	f := &Finding{Severity: severity(a, "fetch_deadline"), Title: "Search/fetch calls hit the call deadline",
-		Summary: fmt.Sprintf("%d search/fetch calls were cut by the call deadline (cut tries p50 %d ms, max %d ms; %d ok search/fetch tries, p99 %d ms).",
-			ev.Counts["calls_deadline"], pct(cut, 50), pct(cut, 100), len(okAll), pct(okAll, 99)), Evidence: ev}
+		Summary: fmt.Sprintf("%d search/fetch calls were cut by the call deadline (cut tries p50 %d ms, max %d ms — the cut-off, not the time the target needs); ok fetch tries: %d.",
+			ev.Counts["calls_deadline"], pct(cut, 50), pct(cut, 100), ev.Counts["ok_tries.fetch"]), Evidence: ev}
 	if to > cur {
 		f.Proposals = append(f.Proposals, Proposal{Kind: KindApply, Flag: "--call-deadline", From: curText, To: formatMs(to),
 			Reason: fmt.Sprintf("max(4 × p99 of ok search/fetch tries, 10 × the current deadline), bounded to [10s, 2m]: %s", formatMs(to))})

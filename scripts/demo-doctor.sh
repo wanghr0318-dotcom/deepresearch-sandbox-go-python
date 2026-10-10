@@ -98,7 +98,7 @@ timeout 3 bash -c "</dev/tcp/$pghost/$pgport" 2>/dev/null || fail "PostgreSQL $p
 ok "PostgreSQL $pghost:$pgport 可达；$(python3 --version)"
 if curl -fsS "$AGENTBOX_ADDR/status" >/dev/null 2>&1; then fail "$LISTEN 上已有服务在运行"; fi
 if [ -n "$OBS" ]; then
-  curl -fsS http://127.0.0.1:3200/ready >/dev/null 2>&1 || fail "AGENTBOX_DOCTOR_OBS=1 但 Tempo（127.0.0.1:3200）未就绪：先启动 deploy/observability"
+  curl -fsS http://127.0.0.1:3200/api/status/buildinfo >/dev/null 2>&1 || fail "AGENTBOX_DOCTOR_OBS=1 但 Tempo（127.0.0.1:3200）未就绪：先启动 deploy/observability"
   mkdir -p "$OBS_LOG_DIR"
   ok "观测栈就绪；server 日志写入 $OBS_LOG_DIR"
 fi
@@ -240,6 +240,7 @@ if command -v patch >/dev/null 2>&1; then
 fi
 
 step "server B（experiment.flags）与运行 B：同一 suite、seed、重复与并发"
+[ -n "$OBS" ] && sleep 15 # 让 B 的指标与日志落在 A 的分析窗口（A 结束后 10 s）之外
 start_server "$CFG/doctor/experiment.flags" b
 B="doctor-$STAMP-after"
 run_eval "$B"

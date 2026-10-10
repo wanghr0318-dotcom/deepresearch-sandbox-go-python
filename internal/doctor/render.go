@@ -99,6 +99,9 @@ func RenderMarkdown(r *Report) string {
 		fmt.Fprintf(&b, "Trace ids found in Tempo: %d.\n\n", o.TraceIDs)
 		for _, m := range o.Metrics {
 			fmt.Fprintf(&b, "%s (`%s`):\n\n", m.Title, m.Query)
+			if len(m.Rows) == 0 {
+				b.WriteString("- (no non-zero series)\n")
+			}
 			for _, row := range m.Rows {
 				var ls []string
 				for _, k := range sortedKeys(row.Labels) {
@@ -108,8 +111,14 @@ func RenderMarkdown(r *Report) string {
 			}
 			b.WriteString("\n")
 		}
+		if len(o.Logs) > 0 {
+			b.WriteString("Server log (Loki), WARN/ERROR lines and failed Gateway tries:\n\n")
+		}
 		for _, l := range o.Logs {
-			fmt.Fprintf(&b, "- log `%s`: %d lines; trace ids %s\n", l.Message, l.Count, strings.Join(l.TraceIDs, ", "))
+			fmt.Fprintf(&b, "- `%s`: %d lines; trace ids %s\n", l.Message, l.Count, nz(strings.Join(l.TraceIDs, ", "), "-"))
+		}
+		if len(o.Logs) > 0 {
+			b.WriteString("\n")
 		}
 		for _, n := range o.Notes {
 			fmt.Fprintf(&b, "- note: %s\n", n)
