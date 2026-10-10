@@ -64,7 +64,10 @@ type ActorState struct {
 	Loaded   bool // Session 至少读取过一次
 	NeedLoad bool // 需要重新读取（通知、请求到达、读取失败后）
 	Busy     bool // 有在途操作（含读取）
-	Failures int  // 连续失败的操作（退避）
+	// Stale：在途操作期间收到了要求重读的事件。在途操作带回的读取结果可能早于该事件所报告的变化（例如 close
+	// 提交），不能据此清除 NeedLoad。
+	Stale    bool
+	Failures int // 连续失败的操作（退避）
 	RetryAt  *time.Time
 
 	// HandleInc 是本进程持有句柄的 incarnation（Workers.Start 返回）；空表示没有。
@@ -106,8 +109,9 @@ type LoadFailed struct {
 // Tick 表示时间推进（WakeAt 到期）。
 type Tick struct{}
 
-// Notified 表示会话事实可能已变化（新 turn、控制、wake、close 之后）：重新读取。
-type Notified struct{}
+// Notified 表示会话事实可能已变化（新 turn、控制、wake、close 之后）：重新读取。Periodic 是周期读取（ReloadInterval
+// 到期）：不报告具体变化，在途操作带回的读取结果即可满足，不记 Stale（否则读取慢于周期时会反复重读）。
+type Notified struct{ Periodic bool }
 
 // GrantRequested 是 task actor 的授予申请。
 type GrantRequested struct{ TaskID string }
@@ -285,13 +289,14 @@ func (d *decider) dispatch(e Event) error {
 		if !d.s.Busy {
 			return invalid("没有在途读取时收到读取结果")
 		}
-		d.s.Busy, d.s.NeedLoad, d.s.Failures, d.s.RetryAt = false, false, 0, nil
+		d.s.Busy, d.s.Failures, d.s.RetryAt = false, 0, nil
+		d.s.NeedLoad, d.s.Stale = d.s.Stale, false // 读取期间收到的通知：结果可能早于它，再读一次
 		return d.loaded(e.State)
 	case LoadFailed:
 		if !d.s.Busy {
 			return invalid("没有在途读取时收到读取失败")
 		}
-		d.s.Busy = false
+		d.s.Busy, d.s.Stale = false, false
 		if e.NotFound { // 会话不存在：视为已关闭
 			d.s.Loaded, d.s.NeedLoad = true, false
 			d.s.Session = State{SessionID: d.s.Session.SessionID, Status: StatusClosed}
@@ -302,7 +307,11 @@ func (d *decider) dispatch(e Event) error {
 	case Tick:
 		return nil
 	case Notified:
-		d.s.NeedLoad = true
+		if e.Periodic {
+			d.s.NeedLoad = true
+		} else {
+			d.needLoad()
+		}
 		return nil
 	case GrantRequested:
 		if e.TaskID == "" {
@@ -314,7 +323,7 @@ func (d *decider) dispatch(e Event) error {
 		if !slices.Contains(d.s.Waiters, e.TaskID) {
 			d.s.Waiters = append(d.s.Waiters, e.TaskID)
 		}
-		d.s.NeedLoad = true
+		d.needLoad()
 		return nil
 	case GrantWithdrawn:
 		d.s.Waiters = slices.DeleteFunc(d.s.Waiters, func(w string) bool { return w == e.TaskID })
@@ -330,14 +339,16 @@ func (d *decider) dispatch(e Event) error {
 			d.s.Granted = ""
 		}
 		d.s.Handoffs = append(d.s.Handoffs, e.Handoff)
-		d.s.NeedLoad = true
+		d.needLoad()
 		return nil
 	case PressureEvict:
-		d.s.EvictWanted, d.s.NeedLoad = true, true
+		d.s.EvictWanted = true
+		d.needLoad()
 		return nil
 	case IncarnationExited: // 先重新读取：会话可能已由 attempt 创建事务转为 running（此时等交还）
 		if e.IncarnationID != "" && e.IncarnationID == d.s.HandleInc {
-			d.s.Exited, d.s.NeedLoad = true, true
+			d.s.Exited = true
+			d.needLoad()
 		}
 		return nil
 	case OpDone:
@@ -369,12 +380,13 @@ func (d *decider) opDone(e OpDone) error {
 	if !d.s.Busy {
 		return invalid("没有在途操作时收到 %s 的结果", e.Op)
 	}
-	d.s.Busy = false
+	stale := d.s.Stale
+	d.s.Busy, d.s.Stale = false, false
 	if e.State != nil {
 		if err := d.loaded(*e.State); err != nil {
 			return err
 		}
-		d.s.NeedLoad = false
+		d.s.NeedLoad = stale // 操作期间收到的通知：带回的读取结果可能早于它，再读一次
 	} else {
 		d.s.NeedLoad = true
 	}
@@ -448,6 +460,14 @@ func (d *decider) opDone(e OpDone) error {
 		return invalid("操作 %q 未定义", e.Op)
 	}
 	return nil
+}
+
+// needLoad 要求重新读取会话事实；有在途操作时另记 Stale：在途操作带回的读取结果不能满足这次要求。
+func (d *decider) needLoad() {
+	d.s.NeedLoad = true
+	if d.s.Busy {
+		d.s.Stale = true
+	}
 }
 
 func (d *decider) backoff() {

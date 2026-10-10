@@ -406,7 +406,7 @@ func (a *Actor) fire() {
 	now := a.d.Clock.Now()
 	if !now.Before(a.reloadAt) {
 		a.reloadAt = now.Add(ReloadInterval)
-		a.apply(Notified{})
+		a.apply(Notified{Periodic: true})
 	}
 	due := false
 	a.wakes = slices.DeleteFunc(a.wakes, func(w time.Time) bool {
