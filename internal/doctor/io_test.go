@@ -114,7 +114,7 @@ func TestLoadServerWindow(t *testing.T) {
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer tok" {
-			http.Error(w, "no", 401)
+			http.Error(w, "no", http.StatusUnauthorized)
 			return
 		}
 		p := r.URL.Path

@@ -618,7 +618,7 @@ func ruleBackoff(a *analysis) *Finding {
 	ev := Evidence{Counts: map[string]int64{}, LatencyMs: map[string]int64{}}
 	var total, lat int64
 	for _, r := range a.recs {
-		if !(r.failed || r.slow) || r.bd.BackoffEstMs < 2000 || share(r.bd.BackoffEstMs, r.tr.LatencyMs) < 0.3 {
+		if !r.failed && !r.slow || r.bd.BackoffEstMs < 2000 || share(r.bd.BackoffEstMs, r.tr.LatencyMs) < 0.3 {
 			continue
 		}
 		ev.Counts["tasks"]++
