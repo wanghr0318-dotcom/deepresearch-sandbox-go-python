@@ -249,8 +249,10 @@ func ruleModelErrors(a *analysis) *Finding {
 	codes := map[string]int64{}
 	ev := Evidence{Counts: map[string]int64{}, Shares: map[string]float64{}}
 	var routesOrder []string
+	var failoverMs, slowLatency int64
 	for _, r := range a.recs {
 		failedCall := false
+		var errMs int64
 		for _, c := range r.tr.Calls {
 			if kindOf(c.Endpoint) != "chat" {
 				continue
@@ -265,6 +267,7 @@ func ruleModelErrors(a *analysis) *Finding {
 				}
 				tries[route]++
 				if t.Outcome == "retryable" || t.Outcome == "fatal" || t.Outcome == "unknown" {
+					errMs += t.LatencyMs
 					errs[route]++
 					codes[route+"."+nz(t.Error, t.Outcome)]++
 					if len(ev.Examples) < maxExamples && (r.failed || r.slow) {
@@ -277,9 +280,15 @@ func ruleModelErrors(a *analysis) *Finding {
 				failedCall = true
 			}
 		}
-		if failedCall {
-			a.mark(r, "model_upstream_errors")
+		// A failed call explains a failed task; failed tries that the call survived (failover, retry) explain a
+		// slow one.
+		if (failedCall || r.slow && errMs > 0) && a.mark(r, "model_upstream_errors") && r.slow {
+			failoverMs += errMs
+			slowLatency += r.tr.LatencyMs
 		}
+	}
+	if slowLatency > 0 {
+		ev.Shares["failed_try_time_of_slow_task_latency"] = share(failoverMs, slowLatency)
 	}
 	worst, worstShare := "", 0.0
 	fire := false
@@ -308,7 +317,8 @@ func ruleModelErrors(a *analysis) *Finding {
 			Text: "add a fallback provider (--model-fallback-file): with a single provider every retryable error costs a backoff (2 s, 4 s, …) instead of an immediate failover"})
 		return f
 	}
-	if worstShare > 0.5 {
+	switch {
+	case worstShare > 0.5:
 		cur, curText := current(a.cfg, "model-breaker-failures")
 		if cur > 2 {
 			f.Proposals = append(f.Proposals, Proposal{Kind: KindApply, Flag: "--model-breaker-failures", From: curText, To: "2",
@@ -318,6 +328,10 @@ func ruleModelErrors(a *analysis) *Finding {
 			f.Proposals = append(f.Proposals, Proposal{Kind: KindAdvisory,
 				Text: fmt.Sprintf("the first route (%s) is the least reliable: consider making a healthier provider the primary (chain order is not changed automatically)", worst)})
 		}
+	case worstShare >= 0.2 && worst == routesOrder[0]:
+		_, tt := current(a.cfg, "model-try-timeout")
+		f.Proposals = append(f.Proposals, Proposal{Kind: KindAdvisory,
+			Text: fmt.Sprintf("the first route (%s) still fails %.0f%% of tries and every failover first waits for the failed try (--model-try-timeout %s): a hedge (--model-hedge-delay near the primary's p95; up to two estimates per hedged call) or a healthier primary would remove that wait; measure it in another experiment", worst, worstShare*100, tt)})
 	}
 	return f
 }

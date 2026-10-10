@@ -325,3 +325,31 @@ func TestDoctorSuite(t *testing.T) {
 		t.Fatalf("tasks %d coding %d", len(s.Tasks), coding)
 	}
 }
+
+// TestFailoverExplainsSlowTasks: after a per-try timeout is set, a hung primary costs one timeout per failover;
+// those slow-but-passing tasks are attributed to the provider errors, with an advisory (never applied) next step.
+func TestFailoverExplainsSlowTasks(t *testing.T) {
+	var trs []*eval.Trajectory
+	for i := 1; i <= 8; i++ {
+		if i%4 == 0 {
+			trs = append(trs, newTask("add", i, 3200, true).call(epChat, "c", "completed", "",
+				eval.Try{Outcome: "unknown", Error: "upstream_unconfirmed", Provider: "primary", LatencyMs: 2000}, ok("backup", 400)).tr)
+			continue
+		}
+		trs = append(trs, newTask("add", i, 1000, true).call(epChat, "c", "completed", "", ok("primary", 200)).tr)
+	}
+	cfg, _ := ParseFlags([]byte("--model-try-timeout=2s\n"))
+	r := Analyze(Source{}, trs, Options{Config: cfg})
+	f := findRule(r, "model_upstream_errors")
+	if f == nil || f.Slow != 2 || f.Severity != SevWarning || r.Totals.Explained != 2 || f.Evidence.Shares["failed_try_time_of_slow_task_latency"] != 0.625 {
+		t.Fatalf("finding %+v totals %+v", f, r.Totals)
+	}
+	if len(f.Proposals) != 1 || f.Proposals[0].Kind != KindAdvisory || !strings.Contains(f.Proposals[0].Text, "--model-try-timeout 2s") {
+		t.Fatalf("proposals %+v", f.Proposals)
+	}
+	for _, p := range r.Proposals {
+		if p.Kind == KindApply {
+			t.Fatalf("applied proposal for a healthy-enough chain: %+v", p)
+		}
+	}
+}
