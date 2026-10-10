@@ -147,7 +147,7 @@ All workspace endpoints are `404 endpoint_not_configured` when `--workspace-tool
 |---|---|
 | files per workspace | 256 (= `/out` collection cap); `write_file` beyond it → `409 workspace_full` |
 | bytes per workspace | `--exec-out-bytes` − 1 MiB staging headroom (default 63 MiB); enforced on `write_file` (`409 workspace_full`). An `exec_shell` snapshot is kept even when it is larger (bounded by the `/out` tmpfs, `--exec-out-bytes`); `workspace.bytes` in the response shows the size |
-| path | relative, `path.Clean`-stable, ≤ 512 bytes, ≤ 32 segments, ≤ 255 bytes per segment, no `.`/`..`, no NUL or other Unicode control (Cc, including C1) or format (Cf) characters — bidi overrides and isolates, zero-width characters, BOM, soft hyphen — no leading `/`, no `\`, not under the reserved `.agentbox/` (exactly what exec staging can stage) |
+| path | relative, `path.Clean`-stable, ≤ 512 bytes, ≤ 32 segments, ≤ 255 bytes per segment, no `.`/`..`, no NUL or other Unicode control characters (Cc, including C1), none of the invisible format characters that make a name display differently (bidi controls, BOM, soft hyphen, zero-width space; zero-width joiners and emoji tag characters are allowed), no leading `/`, no `\`, not under the reserved `.agentbox/` (exactly what exec staging can stage); state files written by earlier versions are read with the earlier character rule, so an upgrade does not mark their workspaces lost |
 | `write_file` content | ≤ 1 MiB; per task ≤ 2000 writes and ≤ 256 MiB written |
 | `read_file` | ≤ 2000 lines and ≤ 256 KiB per call |
 | `exec_shell` command | ≤ 64 KiB; `timeout_ms` capped by `--exec-wall-max` (default from exec) |

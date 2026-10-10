@@ -221,11 +221,13 @@ func wantCode(t *testing.T, res call.Result, status int, code string) {
 // ---- tests ----
 
 func TestValidPath(t *testing.T) {
-	good := []string{"a", "a/b.txt", ".hidden", "dir/.git/config", "名字.txt", "a b"}
+	good := []string{"a", "a/b.txt", ".hidden", "dir/.git/config", "名字.txt", "a b",
+		// Zero-width (non-)joiners and tag characters (emoji sequences, some scripts) are allowed.
+		"\U0001F468\u200D\U0001F469.txt", "a\u200Cb", "\U0001F3F4\U000E0067\U000E0062\U000E007F.png"}
 	bad := []string{"", ".", "..", "../x", "a/../b", "/abs", "a//b", "./a", "a/", "a\\b", "a\x00b", "a/./b",
 		strings.Repeat("a", 513), strings.Repeat("a/", 32) + "a", "\xff",
 		// Unicode control (Cc, incl. C1) and format (Cf) characters: bidi overrides/isolates, zero-width, BOM.
-		"a\u0085b", "a\u202eb", "a\u2066b", "a\u200bb", "\ufeffa", "a\u00adb"}
+		"a\u0085b", "a\u202eb", "a\u2066b", "a\u200bb", "\ufeffa", "a\u00adb", "a\u200eb", "a\u061cb"}
 	for _, p := range good {
 		if !ValidPath(p) {
 			t.Errorf("ValidPath(%q) = false", p)
@@ -630,5 +632,29 @@ func TestSweepUsesConfiguredClock(t *testing.T) {
 	}
 	if _, err := os.Stat(tmp); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("old leftover kept: %v", err)
+	}
+}
+
+// A state file written by an earlier version may hold a path that the stricter ValidPath now rejects (e.g. a bidi
+// override): the workspace is still recovered, not marked lost.
+func TestLegacyPathInStateRecovered(t *testing.T) {
+	h := newH(t)
+	ref, err := h.blobs.Put(context.Background(), strings.NewReader("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "a" + string(rune(0x202E)) + "b"
+	files := map[string]entry{name: {SHA256: ref.SHA256, Size: ref.Size}}
+	st := &state{TaskID: "t1", State: StateActive, Files: files, Version: version(files),
+		CreatedAt: h.now, UsedAt: h.now}
+	if err := writeState(h.dir, st); err != nil {
+		t.Fatal(err)
+	}
+	if ValidPath(name) {
+		t.Fatal("test path should be rejected for new writes")
+	}
+	res, _ := do(t, h.newManager(t).List, req(`{}`))
+	if res.Status != 200 {
+		t.Fatalf("list %+v (legacy path made the workspace lost)", res)
 	}
 }

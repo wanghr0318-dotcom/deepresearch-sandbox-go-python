@@ -136,7 +136,7 @@ func readState(path, taskID string) (*state, error) {
 			s.Files = map[string]entry{}
 		}
 		for p, e := range s.Files {
-			if !ValidPath(p) || len(e.SHA256) != 64 || e.Size < 0 {
+			if !storedPath(p) || len(e.SHA256) != 64 || e.Size < 0 {
 				return nil, fmt.Errorf("%w: file %q", errCorrupt, p)
 			}
 		}
