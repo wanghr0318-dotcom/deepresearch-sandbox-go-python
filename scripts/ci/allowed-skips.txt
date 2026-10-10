@@ -13,3 +13,10 @@ github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/cal
 github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call TestChaosPrimaryHangs
 github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call TestChaosAllDown
 github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call TestChaosHedge
+
+# Kubernetes provider 对真实集群的一致性、启动延迟与突发测试（S3）：需要一个集群与推送好的 worker 镜像，只在设置
+# AGENTBOX_K8S_TEST_KUBECONFIG 与 AGENTBOX_K8S_TEST_IMAGE 后运行（scripts/demo-k8s.sh 的 kind 环境）；同一套契约
+# 用例在 fake clientset 上的 TestConformanceOnFakeCluster 必须运行。
+github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/k8s TestConformanceOnRealCluster
+github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/k8s TestStartLatencyOnRealCluster
+github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/k8s TestBurstOnRealCluster

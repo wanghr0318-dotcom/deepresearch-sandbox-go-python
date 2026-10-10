@@ -88,10 +88,10 @@ func TestGatewayLayering(t *testing.T) {
 // sandbox、cgroup、rootfs（代码组织 §2.1、Provider 契约第 1 节）；生产入口不导入只供测试的 provider/fake。
 func TestControlPlaneUsesProviderContractOnly(t *testing.T) {
 	lowLevel := []string{
-		module + "/internal/provider/local", module + "/internal/provider/fake",
+		module + "/internal/provider/local", module + "/internal/provider/fake", module + "/internal/provider/k8s",
 		module + "/internal/sandbox", module + "/internal/cgroup", module + "/internal/rootfs",
 	}
-	for _, pkg := range []string{"internal/api", "internal/task", "internal/runner", "internal/resource", "internal/provider"} {
+	for _, pkg := range []string{"internal/api", "internal/task", "internal/runner", "internal/resource", "internal/provider", "internal/app"} {
 		forbid(t, pkg, lowLevel)
 	}
 	forbid(t, "cmd/agentbox", []string{module + "/internal/provider/fake"})
@@ -110,7 +110,8 @@ func TestLowLevelDoesNotDependOnControlPlane(t *testing.T) {
 		module + "/internal/task", module + "/internal/session", module + "/internal/gateway",
 		module + "/internal/persistence", module + "/internal/runner", module + "/internal/api",
 	}
-	for _, pkg := range []string{"internal/sandbox", "internal/cgroup", "internal/rootfs", "internal/provider/local"} {
+	for _, pkg := range []string{"internal/sandbox", "internal/cgroup", "internal/rootfs", "internal/provider/local", "internal/provider/k8s",
+		"cmd/agentbox-podagent"} {
 		forbid(t, pkg, control)
 	}
 }

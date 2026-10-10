@@ -1,0 +1,19 @@
+# kind cluster for scripts/demo-k8s.sh. /var/lib/agentbox-k8s on the docker host is mounted at the same path in
+# the node, so the server container (which bind-mounts the same docker-host path) and the sandbox Pods'
+# hostPath volumes see one directory: the slot directory for workspaces and Gateway sockets.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.34.0
+    extraMounts:
+      - hostPath: /var/lib/agentbox-k8s
+        containerPath: /var/lib/agentbox-k8s
+    kubeadmConfigPatches:
+      - |
+        kind: KubeletConfiguration
+        podPidsLimit: 512
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry]
+      config_path = "/etc/containerd/certs.d"

@@ -1,0 +1,89 @@
+# ValidatingAdmissionPolicy for the sandbox namespace (docs/design/2026-10-10-k8s-provider-design.md §2.4).
+#
+# The node-local slot volumes are hostPath, which Pod Security "baseline" forbids, so the namespace cannot
+# enforce PSS. Without this policy the server's ServiceAccount (pods: create) could mount any host path or
+# run privileged Pods. The policy applies to every Pod in agentbox-sandbox — not only to Pods carrying the
+# agentbox.io/managed label, which a compromised server could simply omit — and requires:
+#   - volumes: only emptyDir and hostPath (no projected/secret/configMap/serviceAccountToken/PVC …);
+#   - hostPath: exactly <slot dir>/abx-<12 hex>/workspace or …/run. The slot directory and these two
+#     subdirectories are created by the server (root, the slot directory 0700), so a sandbox cannot replace
+#     them with symlinks; a deeper path such as …/workspace/x (which a sandbox could make a symlink to /,
+#     and the kubelet would follow) is refused. Edit SLOT_PATTERN if --k8s-node-shared-dir differs from
+#     /var/lib/agentbox-k8s/data/k8s-slots (regex-quote the directory);
+#   - no host network/PID/IPC, no hostPort, no ServiceAccount token, default ServiceAccount only, no init or
+#     ephemeral containers;
+#   - Pod: runAsNonRoot, non-zero runAsUser, RuntimeDefault seccomp;
+#   - every container: no privilege escalation, not privileged, read-only root, capabilities drop ALL and add
+#     none, and no container-level override of runAsNonRoot (false), runAsUser (0) or seccomp (other than
+#     RuntimeDefault).
+# Requires Kubernetes 1.30+ (admissionregistration.k8s.io/v1).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: agentbox-sandbox-pods
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  variables:
+    - name: slotPattern
+      expression: "'^/var/lib/agentbox-k8s/data/k8s-slots/abx-[0-9a-f]{12}/(workspace|run)$'" # SLOT_PATTERN
+    - name: containers
+      expression: >-
+        object.spec.containers +
+        (has(object.spec.initContainers) ? object.spec.initContainers : [])
+  validations:
+    - expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) ||
+        (has(v.hostPath) && v.hostPath.path.matches(variables.slotPattern)))
+      message: "only emptyDir volumes and hostPath volumes of the form <slot dir>/abx-<12 hex>/(workspace|run) are allowed"
+    - expression: >-
+        !(has(object.spec.hostNetwork) && object.spec.hostNetwork) &&
+        !(has(object.spec.hostPID) && object.spec.hostPID) &&
+        !(has(object.spec.hostIPC) && object.spec.hostIPC)
+      message: "host namespaces are not allowed"
+    - expression: >-
+        has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false &&
+        (!has(object.spec.serviceAccountName) || object.spec.serviceAccountName == 'default')
+      message: "automountServiceAccountToken must be false and only the default ServiceAccount may be used"
+    - expression: >-
+        (!has(object.spec.initContainers) || size(object.spec.initContainers) == 0) &&
+        (!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0)
+      message: "init and ephemeral containers are not allowed"
+    - expression: >-
+        has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) &&
+        object.spec.securityContext.runAsNonRoot &&
+        (!has(object.spec.securityContext.runAsUser) || object.spec.securityContext.runAsUser != 0) &&
+        has(object.spec.securityContext.seccompProfile) &&
+        object.spec.securityContext.seccompProfile.type == 'RuntimeDefault'
+      message: "pod securityContext must set runAsNonRoot, a non-root runAsUser and RuntimeDefault seccomp"
+    - expression: >-
+        variables.containers.all(c,
+          (!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0)) &&
+          has(c.securityContext) &&
+          has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false &&
+          (!has(c.securityContext.privileged) || c.securityContext.privileged == false) &&
+          (!has(c.securityContext.runAsUser) || c.securityContext.runAsUser != 0) &&
+          (!has(c.securityContext.runAsNonRoot) || c.securityContext.runAsNonRoot) &&
+          (!has(c.securityContext.seccompProfile) || c.securityContext.seccompProfile.type == 'RuntimeDefault') &&
+          has(c.securityContext.readOnlyRootFilesystem) && c.securityContext.readOnlyRootFilesystem &&
+          has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) &&
+          c.securityContext.capabilities.drop.exists(d, d == 'ALL') &&
+          (!has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0))
+      message: "containers must be unprivileged: no escalation, read-only root, drop ALL, no hostPort, and no runAsNonRoot/runAsUser/seccomp override"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: agentbox-sandbox-pods
+spec:
+  policyName: agentbox-sandbox-pods
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: agentbox-sandbox

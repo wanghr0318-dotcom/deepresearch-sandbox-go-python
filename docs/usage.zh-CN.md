@@ -340,6 +340,34 @@ sudo -E ./bin/agentbox server ... --model-fallback-file /etc/agentbox/model-fall
 
 ```bash
 AGENTBOX_CHAOS_RUNS=5 go test ./internal/gateway/call -run TestChaos -v
+### Kubernetes provider（`--provider k8s`，可选）
+
+默认的 `--provider local` 不变。`--provider k8s` 把每个环境放进一个 Kubernetes Pod（设计见 [k8s provider 设计](design/2026-10-10-k8s-provider-design.md)，测量见[证据](evidence/2026-10-10-k8s-provider.md)）：
+
+- **控制通道**：经 pods/exec 运行镜像内的 `agentbox-podagent exec`，它在 workload 启动后先在 stdout 写一行确认（对应本地 provider 的 `start_ack`），再转发 workload 输出；退出码与信号由它记录。`Stop` 把 Pod 的 `activeDeadlineSeconds` 设为 1（kubelet 杀死全部容器，Pod 对象保留到 `Destroy`），并经 `agentbox-podagent shutdown` 快速结束容器。
+- **隔离**：非 root（uid 10001）、只读根文件系统、丢弃全部 capability、`RuntimeDefault` seccomp、不挂载 ServiceAccount token、deny-all NetworkPolicy；`--k8s-runtime-class` 可指定 `runtimeClassName`（例如 gVisor）。Pod 的内存、CPU 由任务限额给出（requests = limits）；`pids.max` 由 kubelet 的 `podPidsLimit` 统一限制。
+- **workspace 与 Gateway socket**：经节点本地的槽位目录（hostPath）进入 Pod，因此 server 与节点须以同一路径看到 `--data-dir`（kind：`extraMounts`）。单节点设计；多节点需要 RWX 卷与 socket 代理（见设计 §2.2）。
+- **镜像固定**：`--k8s-image repo:tag` 在启动时经镜像仓库 API 解析为 digest，Pod 只引用 `repo@sha256:…`；`--k8s-image-strict` 拒绝 tag。
+- **预热池**：`--k8s-warm-pool N` 保持 N 个已启动、未分配的 Pod（按默认任务资源规格与镜像 digest）；资源规格相同的环境直接认领，之后异步补足。
+- **不支持**：exec 环境（须 `--exec-slots 0`）、`verify-invariants`（只检查本地 provider）。
+
+在 kind 上完整演示（构建镜像、推送到本地仓库、以最小权限的 ServiceAccount 运行 server、任务 A/B/C 与冷/热启动延迟）：
+
+```bash
+bash scripts/demo-k8s.sh        # 需要 docker、kind、go、python3、curl；集群与本地镜像仓库会保留
+```
+
+worker 镜像单独构建：
+
+```bash
+docker build -f deploy/k8s/worker.Dockerfile -t <registry>/agentbox-worker:<tag> .
+```
+
+provider 的契约一致性测试在 fake clientset 上随单元测试运行；对真实集群运行（含冷/热启动延迟测量）：
+
+```bash
+AGENTBOX_K8S_TEST_KUBECONFIG=<kubeconfig> AGENTBOX_K8S_TEST_IMAGE=<repo@sha256:…> \
+  go test -count=1 -v -run Real ./internal/provider/k8s/
 ```
 ### 可观测性（追踪、指标与日志）
 

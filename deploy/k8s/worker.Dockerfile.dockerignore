@@ -1,0 +1,12 @@
+*
+!go.mod
+!go.sum
+!cmd/agentbox-podagent
+!internal/provider/k8s/podapi
+!worker/agentbox_worker
+!worker/sim_worker
+!worker/deepresearch
+!worker/chatagent
+!worker/skills
+**/__pycache__
+**/*_test.go
