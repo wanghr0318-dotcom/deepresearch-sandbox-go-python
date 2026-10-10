@@ -427,7 +427,7 @@ sudo bash scripts/demo-eval.sh
 - **可修改的 flag（白名单与上下界）**：`--model-try-timeout`（1 s–2 m 或 0）、`--model-hedge-delay`（200 ms–60 s 或 0）、`--model-breaker-failures`（1–10）、`--model-breaker-open`（5 s–10 m）、`--call-deadline`（5 s–5 m）、`--model-call-deadline`（30 s–15 m）、`--turn-tool-budget`（1–1000）。其他建议（供应商顺序、run slots、suite 预算、skill 文本）只作为 advisory 写进报告与补丁注释。
 - **flags 文件**：每行一个 `--name=value`（`#` 注释），即 server 的命令行参数；`--config` 只读，`--apply-to` 另写 `<out>/experiment.flags`，输入文件不变。
 - **观测栈（可选）**：`--tempo http://127.0.0.1:3200 --prometheus http://127.0.0.1:9090 --loki http://127.0.0.1:3100`：按 `task.id` 在 Tempo 中找到 trace 并按 span 名汇总耗时、Prometheus 的 try/调用/熔断计数作为交叉核对、Loki 中 WARN/ERROR 日志按消息计数并附 trace ID。不可达时只记一条说明。
-- **可选的模型建议（默认关闭）**：`--advisor-model M --advisor-base-url URL --advisor-price IN:OUT [--advisor-budget-usd 0.05]`，Key 只读 `AGENTBOX_DOCTOR_API_KEY` 或 `AGENTBOX_MODEL_API_KEY`。一次调用，只发送诊断结果（ID、计数、延迟、错误码），最坏费用超出预算时不调用；模型的提议同样按白名单与上下界校验，与规则冲突时以规则为准。
+- **可选的模型建议（默认关闭）**：`--advisor-model M --advisor-base-url URL --advisor-price IN:OUT [--advisor-budget-usd 0.05]`，Key 只读 `AGENTBOX_DOCTOR_API_KEY` 或 `AGENTBOX_MODEL_API_KEY`。一次调用，只发送诊断结果（ID、计数、延迟、错误码），最坏费用超出预算时不调用；模型的提议同样按白名单与上下界校验，与规则冲突时以规则为准。模型的输入包含规则的提议，因此它的认同不是独立的佐证。回复中的文字在写入任何文件或报告前都被展平为单行，不能新增 flag 行。
 
 ```bash
 ./bin/agentbox doctor-traces --run eval-runs/<run> --config before.flags          # 报告 + proposal.patch

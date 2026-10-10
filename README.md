@@ -70,7 +70,7 @@
 - **模型降级链**（[记录](docs/evidence/2026-10-10-model-fallback.md)，fake upstream、零费用）：主供应商持续 503 时，无降级链的调用 3.7–5.1 s 后失败（3 次 try 加退避），有降级链时约 51 ms 由后备供应商完成（与健康供应商相同）；全部熔断时约 40 µs 返回 `model_degraded`。
 - **Kubernetes provider**（[记录](docs/evidence/2026-10-10-k8s-provider.md)，kind 单节点，每组 20 次）：环境就绪 P50 冷启动 978 ms、预热池 11 ms；到 Python 首行输出 1051 ms / 78 ms；契约一致性测试在 fake clientset（CI）与 kind 上均 11/11 通过；`scripts/demo-k8s.sh` 演示 Gateway、取消与 server 崩溃恢复。
 - **评测平台**（[记录](docs/evidence/2026-10-10-eval-platform.md)，fake upstream、零模型费用）：真实沙箱中 15 个任务的参考解 15/15 通过；fake 模型 9/15，6 个故意错误的回答全部失败（`wrong_exit_code`×5、`check_timeout`×1），其中两个在导入时 `exit 0` 的奖励作弊也失败——解答在独立进程中运行，检查器须打印随机完成令牌才算通过；并发 1 → 4 墙钟 18.5 s → 10.5 s。
-- **轨迹诊断闭环**（[记录](docs/evidence/2026-10-10-trace-doctor.md)，真实沙箱 + fake upstream、零模型费用，每次运行 N = 64）：故意错误配置的 server（主供应商每第 4 个 chat 挂起而没有每 try 超时；调用期限 1 s 短于 1.5 s 的抓取）成功率 56.2%（Wilson 95% [44.1%, 67.7%]）、P95 90.2 s；`doctor-traces` 只读轨迹就把 28 个失败全部归因到两条规则，提出 `--model-try-timeout 2s` 与 `--call-deadline 10s`；以它写出的实验配置重跑同一 suite：100%（[94.3%, 100%]）、P95 15.1 s，区间不重叠。
+- **轨迹诊断闭环**（[记录](docs/evidence/2026-10-10-trace-doctor.md)，真实沙箱 + fake upstream、零模型费用，每次运行 N = 64）：故意错误配置的 server（主供应商每第 4 个 chat 挂起而没有每 try 超时；调用期限 1 s 短于 1.5 s 的抓取）成功率 56.2%（Wilson 95% [44.1%, 67.7%]）、P95 90.2 s；`doctor-traces` 只读轨迹就把 28 个失败全部归因到两条规则，提出 `--model-try-timeout 2s` 与 `--call-deadline 10s`；以它写出的实验配置重跑同一 suite：100%（[94.3%, 100%]）、P95 15.1 s。故障按每第 4 个请求的确定性节奏注入，Wilson 区间只是保守的核对；更强的证据是脚本两次完整运行得到相同结果。
 - **串行与并行研究对比**（[记录](docs/evidence/2026-10-06-m4-subrun-comparison.md)）。小样本，每组 N = 4：
 
   | | 串行 | 并行 |

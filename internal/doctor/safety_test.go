@@ -19,11 +19,11 @@ import (
 func TestSafeText(t *testing.T) {
 	cases := map[string]string{
 		"ok\n--model-base-url=http://evil/v1": "ok --model-base-url=http://evil/v1",
-		"a\r\nb\tc\x00d":                       "a b c d",
-		"x y z\u0085w":               "x y z w",
-		"bidi‮evil":                       "bidi evil",
-		"  many   spaces  ":                    "many spaces",
-		"中文 理由":                                "中文 理由",
+		"a\r\nb\tc\x00d":                      "a b c d",
+		"x\u2028y\u2029z\u0085w":              "x y z w",
+		"bidi\u202eevil":                      "bidi evil",
+		"  many   spaces  ":                   "many spaces",
+		"中文 理由":                               "中文 理由",
 	}
 	for in, want := range cases {
 		if got := SafeText(in); got != want {

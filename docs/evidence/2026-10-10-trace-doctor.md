@@ -12,8 +12,9 @@
 - **Doctor**: 28 of 28 failures explained by two rules (16 `model_try_hang`, 12 `fetch_deadline`); it proposed
   `--model-try-timeout 0s → 2s` and `--call-deadline 1s → 10s`, written as `proposal.patch` and `experiment.flags`.
 - **After** (same suite, seed, repetitions and concurrency, server started from `experiment.flags`): 64/64 —
-  success 100 %, Wilson 95 % [94.3 %, 100 %]; P95 15.1 s; wall clock 42.2 s. The intervals do not overlap, so
-  the improvement is beyond sampling noise.
+  success 100 %, Wilson 95 % [94.3 %, 100 %]; P95 15.1 s; wall clock 42.2 s. The faults follow a deterministic
+  every-4th-request schedule, so the Wilson intervals (which do not overlap) are a conservative sanity check;
+  the stronger evidence is that two complete runs of the script gave the same totals.
 
 ## Setup
 
@@ -81,6 +82,9 @@ time the target needs); ok fetch tries: 0.
 - Proposal: --call-deadline: 1s → 10s (max(4 × p99 of ok search/fetch tries, 10 × the current deadline),
   bounded to [10s, 2m])
 ```
+
+The 10 s is a heuristic: no fetch succeeded, so the doctor could not measure how long the site takes; it
+used 10 × the current deadline (bounded). It happens to be well above the 1.5 s the fake site needs.
 
 Note what the journal actually records for a deadline cut: the call stays `unknown` with no fail reason and its
 try is `unknown / upstream_unconfirmed` at ≈ 990 ms. A first version of the rule looked for
@@ -176,7 +180,8 @@ Its summary:
 > while healthy model tries had a p99 of only 205 ms. All 144 fetch tries were truncated at about 990 ms with zero
 > successful fetch tries, showing the 1-second deadline is too short. […]
 
-It proposed the same two values (`--model-try-timeout 2s`, `--call-deadline 10s`); both passed the allowlist and
+Its input contains the rule proposals, so this agreement is a second reading of the same evidence, not
+independent corroboration. It proposed the same two values (`--model-try-timeout 2s`, `--call-deadline 10s`); both passed the allowlist and
 bounds, and since the rules already proposed those flags the rule values stand. Budget accounting at an assumed
 conservative price (4 / 16 USD per million input / output tokens): 0.039 USD for this call, 0.11 USD for the four
 calls made while developing the step (one HTTP 400, which went away once the request stopped sending `temperature: 0`; one reply cut at a

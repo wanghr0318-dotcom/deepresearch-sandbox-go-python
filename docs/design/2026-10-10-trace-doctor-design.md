@@ -159,7 +159,12 @@ doctor sends **one** chat request: a system prompt with the allowlist and bounds
 (ids, counts, latencies, codes — no user content). The reply must be JSON
 `{"summary": "...", "proposals": [{"flag": "...", "value": "...", "reason": "..."}]}`. Proposals outside the
 allowlist or bounds are dropped and listed as rejected; accepted ones are merged *after* the rule proposals
-(rules win on conflict) and labelled `source: model`. The worst-case cost (prompt estimate + `max_tokens`)
+(rules win on conflict) and labelled `source: model`. The model's input includes the rule proposals
+(`rule_proposals`), so its agreement with them is **not independent corroboration** — it is a second reading of
+the same evidence that can add flags the rules did not propose and explains them in prose. Every string taken
+from the reply (summary, flag, value, reason) is flattened to one line without control or format characters
+before it reaches `findings.md`, `proposal.patch` or `experiment.flags`; `Flags.Set` applies the same
+flattening to comments and values, so no reply can add a line to a flags file. The worst-case cost (prompt estimate + `max_tokens`)
 must fit `--advisor-budget-usd` (default 0.05) before the call is made; the actual cost from `usage` is
 reported. `--advisor-max-tokens` (default 1024) caps the reply; reasoning models spend output tokens before the
 answer, so an empty reply cut at the cap is reported as such. Any failure (budget, transport, format) leaves the deterministic report intact.
@@ -200,11 +205,13 @@ Every enrichment is best effort: an unreachable endpoint adds a note, never an e
 
 ## 9. Safety
 
-- Operator-only: the server source uses the operator token (`AGENTBOX_TOKEN` or `--token-file`), sent
+- Operator-only: the server source uses the operator token (`$AGENTBOX_TOKEN` or `<--data-dir>/api.token`), sent
   only in the `Authorization` header; it never appears in outputs (test).
 - The advisor key comes only from the environment and is never written (test asserts it is absent from
   every output file).
-- The doctor never writes the input config and never talks to the server except to read.
+- The doctor never writes the input config (it refuses an `--out` whose files would overwrite it) and never
+  talks to the server except to read. Journal fields (route names, codes) and log messages are flattened and
+  escaped before they are rendered.
 - Proposals are bounded by the allowlist; the model cannot introduce a flag (e.g. `--upstream-allow-private`)
   or an out-of-range value.
 
