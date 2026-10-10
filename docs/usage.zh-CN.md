@@ -4,7 +4,7 @@
 
 ## 环境与测试
 
-**依赖**：Linux（cgroup v2）或 Windows 下的 WSL2；Go 1.25+；Python 3.11+ 与 [uv](https://docs.astral.sh/uv/)；Docker（运行 PostgreSQL）。
+**依赖**：Linux（cgroup v2）或 Windows 下的 WSL2；Go 1.26+；Python 3.11+ 与 [uv](https://docs.astral.sh/uv/)；Docker（运行 PostgreSQL）。
 
 ```bash
 stat -fc %T /sys/fs/cgroup            # 应输出 cgroup2fs

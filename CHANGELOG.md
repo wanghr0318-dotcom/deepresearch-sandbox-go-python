@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Go 1.26 floor:** the module now targets Go 1.26 (`go 1.26.0`, toolchain still go1.27.2) so golang.org/x/net can move to v0.61.0, which fixes the 5 HTTP/2 advisories left in v0.3.0 (x/sys, x/text, x/sync and x/term moved with it). govulncheck now reports no reachable vulnerabilities in dependencies. Building from source needs Go 1.26 or newer; GODEBUG defaults follow Go 1.26 (set `GODEBUG` to restore an old default).
+
 ## v0.3.0 — 2026-10-11
 
 Agent-infrastructure release: observability, evaluation platform, Kubernetes provider, model fallback, workspace tools and MCP, trace doctor.

@@ -82,7 +82,7 @@ All numbers come from recorded runs. The evidence files say exactly what each ru
 
 ## Quick start
 
-Requirements: Linux with cgroup v2 (or WSL2), Go 1.25+, Python 3.11+ with [uv](https://docs.astral.sh/uv/), Docker for PostgreSQL, and Node.js 24 for the web UI.
+Requirements: Linux with cgroup v2 (or WSL2), Go 1.26+, Python 3.11+ with [uv](https://docs.astral.sh/uv/), Docker for PostgreSQL, and Node.js 24 for the web UI.
 
 ```bash
 # Unit tests (no database; tests that need root are skipped)
