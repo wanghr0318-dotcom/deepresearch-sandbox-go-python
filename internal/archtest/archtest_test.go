@@ -381,3 +381,20 @@ func TestEvalIsAPIClientOnly(t *testing.T) {
 		}
 	}
 }
+
+// TestDoctorUsesPublicSurfacesOnly：轨迹诊断（internal/doctor）只读评测文件与运维 REST API（经 internal/eval 的
+// 类型与客户端），以及观测栈的 HTTP 查询接口：除 internal/eval 与它允许的 internal/jcs 外不依赖本模块的任何包，
+// 也不依赖数据库驱动、OpenTelemetry 或 Prometheus 客户端库。
+func TestDoctorUsesPublicSurfacesOnly(t *testing.T) {
+	allowed := map[string]bool{module + "/internal/doctor": true, module + "/internal/eval": true, module + "/internal/jcs": true}
+	for _, d := range deps(t, "internal/doctor") {
+		if strings.HasPrefix(d, module+"/") && !allowed[d] {
+			t.Errorf("internal/doctor 依赖了 %s", d)
+		}
+		for _, banned := range []string{"github.com/jackc/pgx", "go.opentelemetry.io", "github.com/prometheus"} {
+			if strings.HasPrefix(d, banned) {
+				t.Errorf("internal/doctor 依赖了 %s", d)
+			}
+		}
+	}
+}
