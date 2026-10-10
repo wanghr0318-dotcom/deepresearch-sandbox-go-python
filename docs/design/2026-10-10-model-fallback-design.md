@@ -198,6 +198,14 @@ transitions: `route`, `from`, `to`) and `gateway: degraded` (`routes` with each 
 | all open | `503 model_degraded` in < 1 ms, no reservation |
 | crash after try on B was sent | startup conversion: try → unknown, call → unknown; next request with the same call id makes a new try (routing picks the healthy provider); later replays return the blob |
 | replay of a completed call | journal blob, no provider contacted, regardless of breaker state |
+| hedge: both legs answer ok (the loser before its cancellation took effect) | the first ok is the result; the losing first leg answered, so it is reported as a success to its breaker (not as a slow failure) |
+| hedge: first leg retryable, hedge leg then fatal with a provider fault (401/403/404, egress blocked) | the first leg's retryable result is final: the call backs off and retries instead of failing because the backup is misconfigured |
+
+**Startup check of fallback URLs is static.** `--model-fallback-file` base URLs are checked at startup with the
+egress guard's `CheckURL`: scheme, no userinfo, port 80/443 (or an allow-listed host) and IP-literal hosts. A
+host *name* is not resolved at startup; its addresses are checked when a try dials it. A fallback whose name
+resolves to a private address (or stops resolving) therefore starts fine and fails its first try with
+`egress_blocked` / a connect error — a provider fault that counts against that provider's breaker.
 
 ## 6. Testing
 
