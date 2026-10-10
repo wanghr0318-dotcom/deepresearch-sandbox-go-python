@@ -80,7 +80,7 @@
 
 ## 快速开始
 
-依赖：Linux（cgroup v2）或 WSL2、Go 1.24+、Python 3.11+ 与 [uv](https://docs.astral.sh/uv/)、Docker（运行 PostgreSQL）、Node.js 24（Web 界面）。
+依赖：Linux（cgroup v2）或 WSL2、Go 1.25+、Python 3.11+ 与 [uv](https://docs.astral.sh/uv/)、Docker（运行 PostgreSQL）、Node.js 24（Web 界面）。
 
 ```bash
 # 单元测试（不需要数据库；需要 root 的用例会跳过）

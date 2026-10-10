@@ -1,17 +1,34 @@
 # 正确性检查：CI 中必须通过（见 docs/design/2026-10-03-code-organization.md §9.1）。
+# golangci-lint v2 配置（由 v1 迁移，检查集与严格程度不变）：
+# v2 把 gosimple 并入 staticcheck；这里只启用 SA（staticcheck）与 S1（gosimple）两类，
+# 不引入 v1 未启用的 ST（stylecheck）与 QF（quickfix）。
+version: "2"
+
 run:
   timeout: 5m
   tests: true
 
 linters:
-  disable-all: true
+  default: none
   enable:
     - errcheck
     - govet
     - staticcheck
-    - gosimple
     - ineffassign
     - unused
+  settings:
+    staticcheck:
+      checks:
+        - "SA*"
+        - "S1*"
+  # 与 v1 的默认排除（exclude-use-default: true）等价。
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
 
 issues:
   max-issues-per-linter: 0

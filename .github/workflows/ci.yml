@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GOLANGCI_LINT_VERSION: v1.64.8
+  GOLANGCI_LINT_VERSION: v2.14.0
 
 jobs:
   # 正确性检查：任何失败都阻断。
@@ -61,7 +61,7 @@ jobs:
       - name: unit tests（非 root，-race；需要 root 的用例按设计跳过）
         run: go test -race -count=1 -timeout 20m ./...
       - name: golangci-lint（正确性）
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
           args: --config .golangci.yml
@@ -78,7 +78,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: golangci-lint（复杂度信号）
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
           only-new-issues: ${{ github.event_name == 'pull_request' }}

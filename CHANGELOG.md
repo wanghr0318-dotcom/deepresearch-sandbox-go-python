@@ -16,6 +16,8 @@
 - **继续 / continue after a stop** continues the stopped turn instead of starting a new one.
 - **Follow-up messages after a stop** always carry the stopped turn's question and progress as context.
 
+- **Dependency security:** the module now targets Go 1.25 (`go 1.25.0`); dependencies that govulncheck reported as reachable were raised to their minimum fixed versions (golang.org/x/net v0.58.0, x/text v0.41.0, OpenTelemetry v1.45.0, gRPC v1.83.1, pgx v5.9.2). The remaining x/net HTTP/2 advisories are fixed only in x/net v0.60.0, which requires Go 1.26. CI lint moved to golangci-lint v2 (same linters and thresholds).
+
 ## v0.2.0 — 2026-10-07
 
 First public release.
