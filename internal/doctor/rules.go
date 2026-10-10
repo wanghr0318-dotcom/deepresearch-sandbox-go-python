@@ -337,33 +337,68 @@ func providerFailure(c eval.Call) bool {
 
 // ---- fetch_deadline ----
 
+// deadlineCutoff returns the latency (ms) at which search/fetch tries are cut by the call deadline: from the config
+// when given (90 % of --call-deadline, or of its default), otherwise inferred when ≥ 3 unsuccessful tries cluster
+// within 15 % of the longest one (a deadline cuts every slow try at the same point). 0 = unknown.
+func (a *analysis) deadlineCutoff(kinds ...string) (cutoff int64, inferred bool) {
+	if a.cfg != nil {
+		cur, _ := current(a.cfg, "call-deadline")
+		return cur * 85 / 100, false
+	}
+	var xs []int64
+	for _, r := range a.recs {
+		for _, c := range r.tr.Calls {
+			if !contains(kinds, kindOf(c.Endpoint)) {
+				continue
+			}
+			for _, t := range c.Tries {
+				if t.Outcome == "unknown" || t.Outcome == "retryable" {
+					xs = append(xs, t.LatencyMs)
+				}
+			}
+		}
+	}
+	if len(xs) < 3 || pct(xs, 100) < 500 || pct(xs, 10) < pct(xs, 100)*85/100 {
+		return 0, false
+	}
+	return pct(xs, 10), true
+}
+
 func ruleFetchDeadline(a *analysis) *Finding {
 	_, okAll := a.okLatencies("search", "fetch")
+	cutoff, inferred := a.deadlineCutoff("search", "fetch")
 	ev := Evidence{Counts: map[string]int64{}, LatencyMs: map[string]int64{}}
 	var cut []int64
 	for _, r := range a.recs {
-		hit := false
+		hit := false // one example per task: the examples should span tasks
 		for _, c := range r.tr.Calls {
 			k := kindOf(c.Endpoint)
-			if k != "search" && k != "fetch" {
+			if k != "search" && k != "fetch" || c.State == "completed" {
 				continue
 			}
 			deadline := c.FailReason == codeCallDeadline
 			for _, t := range c.Tries {
-				if t.Error == codeCallDeadline {
-					deadline = true
+				if t.Outcome == "ok" {
+					continue
 				}
-				if t.Outcome != "ok" {
+				if t.Error == codeCallDeadline || (cutoff > 0 && t.LatencyMs >= cutoff) {
+					deadline = true
 					cut = append(cut, t.LatencyMs)
 				}
 			}
 			if deadline {
 				ev.Counts["calls_deadline."+k]++
 				ev.Counts["calls_deadline"]++
-				hit = true
-				if len(ev.Examples) < maxExamples {
-					ev.Examples = append(ev.Examples, example(r, c.CallID, fmt.Sprintf("%s call ended %s after %d tries", k, codeCallDeadline, len(c.Tries))))
+				if len(ev.Examples) < maxExamples && !hit {
+					note := fmt.Sprintf("%s call %s: %s", k, c.State, nz(c.FailReason, "no fail reason"))
+					if n := len(c.Tries); n > 0 {
+						last := c.Tries[n-1]
+						note = fmt.Sprintf("%s call %s: try %d %s %s after %d ms", k, c.State, last.TryNo,
+							nz(last.Outcome, last.State), nz(last.Error, c.FailReason), last.LatencyMs)
+					}
+					ev.Examples = append(ev.Examples, example(r, c.CallID, note))
 				}
+				hit = true
 			}
 		}
 		if hit {
@@ -375,20 +410,25 @@ func ruleFetchDeadline(a *analysis) *Finding {
 		return nil
 	}
 	ev.LatencyMs["ok_p99"] = pct(okAll, 99)
-	ev.LatencyMs["failed_try_max"] = pct(cut, 100)
+	ev.LatencyMs["cut_try_p50"] = pct(cut, 50)
+	ev.LatencyMs["cut_try_max"] = pct(cut, 100)
 	ev.Counts["ok_tries"] = int64(len(okAll))
 	cur, curText := current(a.cfg, "call-deadline")
 	if a.cfg == nil {
 		// Without the config the deadline is at least the longest cut try.
-		cur = max(int64(1000), pct(cut, 100))
-		curText = "unknown (≥ " + formatMs(cur) + " observed)"
+		cur = max(int64(1000), clampMs(pct(cut, 100), 0, 1<<40))
+		curText = "unknown (≈ " + formatMs(cur) + " inferred)"
 	}
+	how := "the tries were cut at ≈ 85–100 % of --call-deadline"
+	if inferred {
+		how = "the failed tries all stopped at the same latency, the signature of a deadline"
+	}
+	ev.Detail = append(ev.Detail, "--call-deadline is "+curText, how,
+		"a search/fetch call that hits its deadline settles unknown (upstream_unconfirmed) and the worker gets 504; if every fetch of a research task is cut, the task has no evidence")
 	to := clampMs(max(4*pct(okAll, 99), 10*cur), 10_000, 120_000)
 	f := &Finding{Severity: severity(a, "fetch_deadline"), Title: "Search/fetch calls hit the call deadline",
-		Summary: fmt.Sprintf("%d search/fetch calls ended %s (the slowest failed try ran %d ms; ok tries p99 %d ms over %d tries).",
-			ev.Counts["calls_deadline"], codeCallDeadline, pct(cut, 100), pct(okAll, 99), len(okAll)), Evidence: ev}
-	ev.Detail = append(ev.Detail, "--call-deadline is "+curText)
-	f.Evidence = ev
+		Summary: fmt.Sprintf("%d search/fetch calls were cut by the call deadline (cut tries p50 %d ms, max %d ms; %d ok search/fetch tries, p99 %d ms).",
+			ev.Counts["calls_deadline"], pct(cut, 50), pct(cut, 100), len(okAll), pct(okAll, 99)), Evidence: ev}
 	if to > cur {
 		f.Proposals = append(f.Proposals, Proposal{Kind: KindApply, Flag: "--call-deadline", From: curText, To: formatMs(to),
 			Reason: fmt.Sprintf("max(4 × p99 of ok search/fetch tries, 10 × the current deadline), bounded to [10s, 2m]: %s", formatMs(to))})

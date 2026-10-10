@@ -172,25 +172,49 @@ func TestModelHangSingleProviderIsAdvisory(t *testing.T) {
 }
 
 func TestFetchDeadlineRule(t *testing.T) {
+	// As observed on a real server: a fetch cut by the call deadline settles unknown/upstream_unconfirmed just
+	// below the deadline, and the call stays unknown without a fail reason.
+	cutTry := func(ms int64) eval.Try {
+		return eval.Try{Outcome: "unknown", LatencyMs: ms, Error: "upstream_unconfirmed"}
+	}
 	var trs []*eval.Trajectory
 	for i := 1; i <= 4; i++ {
 		trs = append(trs, newTask("solid", i, 6000, false).kind("research").
-			call(epFetch, "task-1/fetch/1", "failed", codeCallDeadline, eval.Try{Outcome: "unknown", LatencyMs: 1000, Error: codeCallDeadline}).tr)
+			call(epFetch, "task-1/fetch/1", "unknown", "", cutTry(985+int64(i))).
+			call(epFetch, "task-1/fetch/2", "unknown", "", cutTry(990)).tr)
 	}
-	trs = append(trs, newTask("solid", 5, 3000, true).kind("research").call(epFetch, "task-1/fetch/1", "completed", "", ok("", 1500)).tr)
+	trs = append(trs, newTask("solid", 5, 3000, true).kind("research").call(epFetch, "task-1/fetch/1", "completed", "", ok("", 900)).tr)
 	cfg, _ := ParseFlags([]byte("--call-deadline=1s\n"))
 	r := Analyze(Source{}, trs, Options{Config: cfg})
 	f := findRule(r, "fetch_deadline")
-	if f == nil || f.Failed != 4 || f.Evidence.Counts["calls_deadline.fetch"] != 4 {
+	if f == nil || f.Failed != 4 || f.Evidence.Counts["calls_deadline.fetch"] != 8 || f.Evidence.LatencyMs["cut_try_max"] != 990 {
 		t.Fatalf("finding %+v (%v)", f, ruleIDs(r))
 	}
 	if len(f.Proposals) != 1 || f.Proposals[0].To != "10s" || f.Proposals[0].From != "1s" {
 		t.Fatalf("proposals %+v", f.Proposals)
 	}
-	// Without the config the current deadline is inferred from the longest cut try.
+	// Without the config the deadline is inferred from the cluster of cut tries.
 	r = Analyze(Source{}, trs, Options{})
-	if p := findRule(r, "fetch_deadline").Proposals[0]; p.To != "10s" || !strings.Contains(p.From, "unknown") {
+	if p := findRule(r, "fetch_deadline").Proposals[0]; p.To != "10s" || !strings.Contains(p.From, "inferred") {
 		t.Fatalf("proposal without config %+v", p)
+	}
+	// With a generous configured deadline, the same short failures are not deadline cuts.
+	cfg, _ = ParseFlags([]byte("--call-deadline=2m\n"))
+	if f := findRule(Analyze(Source{}, trs, Options{Config: cfg}), "fetch_deadline"); f != nil {
+		t.Fatalf("fired with a 2m deadline: %+v", f)
+	}
+	// Scattered failure latencies are not a deadline signature.
+	var scattered []*eval.Trajectory
+	for i, ms := range []int64{100, 400, 990} {
+		scattered = append(scattered, newTask("s", i+1, 2000, false).call(epFetch, "f", "unknown", "", cutTry(ms)).tr)
+	}
+	if f := findRule(Analyze(Source{}, scattered, Options{}), "fetch_deadline"); f != nil {
+		t.Fatalf("fired on scattered failures: %+v", f)
+	}
+	// The explicit code is recognised too.
+	coded := []*eval.Trajectory{newTask("c", 1, 2000, false).call(epFetch, "f", "failed", codeCallDeadline).tr}
+	if f := findRule(Analyze(Source{}, coded, Options{}), "fetch_deadline"); f == nil || f.Failed != 1 {
+		t.Fatalf("coded deadline: %+v", f)
 	}
 }
 
@@ -278,5 +302,26 @@ func TestHealthyRunHasNoFindings(t *testing.T) {
 	}
 	if !strings.Contains(RenderMarkdown(r), "No rule fired.") {
 		t.Fatal("markdown")
+	}
+}
+
+// TestDoctorSuite: the demo suite parses, and every coding task has a scripted (correct) fake reply, so failures in
+// a zero-cost run are infrastructure failures.
+func TestDoctorSuite(t *testing.T) {
+	s, err := eval.LoadSuite("../../eval/suites/doctor.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	coding := 0
+	for _, task := range s.Tasks {
+		if task.Kind == eval.KindCoding {
+			coding++
+			if task.FakeReply == "" || task.Reference == "" {
+				t.Errorf("%s: needs fake_reply and reference", task.ID)
+			}
+		}
+	}
+	if coding != 6 || len(s.Tasks) != 8 {
+		t.Fatalf("tasks %d coding %d", len(s.Tasks), coding)
 	}
 }
