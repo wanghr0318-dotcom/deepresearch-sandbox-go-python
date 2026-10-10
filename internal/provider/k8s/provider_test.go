@@ -40,8 +40,13 @@ type fakeCluster struct {
 	kubelet *fakeKubelet
 }
 
-func newFakeCluster(t *testing.T, startDelay time.Duration) *fakeCluster {
+// newFakeCluster starts a fake clientset with a fake kubelet. setup functions (reactors) run before the
+// kubelet goroutine starts: PrependReactor is not safe while the clientset is in use.
+func newFakeCluster(t *testing.T, startDelay time.Duration, setup ...func(*fake.Clientset)) *fakeCluster {
 	c := fake.NewClientset()
+	for _, s := range setup {
+		s(c)
+	}
 	fe := newFakeExec(c, testNS)
 	return &fakeCluster{client: c, exec: fe, kubelet: startFakeKubelet(t, c, testNS, fe, startDelay)}
 }

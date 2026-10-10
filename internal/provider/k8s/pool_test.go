@@ -24,25 +24,34 @@ func enforceRV(c *fake.Clientset) {
 	var mu sync.Mutex
 	rv := map[string]int{}
 	gr := schema.GroupResource{Resource: "pods"}
+	gvr := corev1.SchemeGroupVersion.WithResource("pods")
+	// The reactors store a deep copy through the tracker themselves and never mutate the action's object
+	// (which the caller still owns).
 	c.PrependReactor("create", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
-		pod := a.(k8stesting.CreateAction).GetObject().(*corev1.Pod)
-		mu.Lock()
-		rv[pod.Name] = 1
-		mu.Unlock()
+		pod := a.(k8stesting.CreateAction).GetObject().(*corev1.Pod).DeepCopy()
 		pod.ResourceVersion, pod.CreationTimestamp = "1", metav1.Now()
-		return false, nil, nil
+		mu.Lock()
+		defer mu.Unlock()
+		if err := c.Tracker().Create(gvr, pod, a.GetNamespace()); err != nil {
+			return true, nil, err
+		}
+		rv[pod.Name] = 1
+		return true, pod.DeepCopy(), nil
 	})
 	c.PrependReactor("update", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
-		pod := a.(k8stesting.UpdateAction).GetObject().(*corev1.Pod)
+		pod := a.(k8stesting.UpdateAction).GetObject().(*corev1.Pod).DeepCopy()
 		mu.Lock()
 		defer mu.Unlock()
 		cur := rv[pod.Name]
 		if pod.ResourceVersion != strconv.Itoa(cur) {
 			return true, nil, apierrors.NewConflict(gr, pod.Name, nil)
 		}
-		rv[pod.Name] = cur + 1
 		pod.ResourceVersion = strconv.Itoa(cur + 1)
-		return false, nil, nil
+		if err := c.Tracker().Update(gvr, pod, a.GetNamespace()); err != nil {
+			return true, nil, err
+		}
+		rv[pod.Name] = cur + 1
+		return true, pod.DeepCopy(), nil
 	})
 }
 
@@ -76,17 +85,19 @@ func readyWarm(t *testing.T, p *Provider, n int) []corev1.Pod {
 // next warm Pod instead of failing or starting cold.
 func TestWarmClaimFallsBackOnConflict(t *testing.T) {
 	fastPool(t)
-	c := newFakeCluster(t, 0)
-	enforceRV(c.client)
+	var armed atomic.Bool
+	var conflicts atomic.Int32
+	c := newFakeCluster(t, 0, enforceRV, func(cs *fake.Clientset) {
+		cs.PrependReactor("update", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+			if armed.Load() && conflicts.Add(1) == 1 { // the first claim attempt loses the race
+				return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "pods"}, "x", nil)
+			}
+			return false, nil, nil
+		})
+	})
 	p := newTestProvider(t, c.client, c.exec, func(o *Options) { o.WarmPool = 2; o.WarmProfile = testLimits() })
 	readyWarm(t, p, 2)
-	var conflicts atomic.Int32
-	c.client.PrependReactor("update", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
-		if conflicts.Add(1) == 1 { // the first claim attempt loses the race
-			return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "pods"}, "x", nil)
-		}
-		return false, nil, nil
-	})
+	armed.Store(true)
 	if _, err := p.Create(context.Background(), specFor("inst-a")("env-c")); err != nil {
 		t.Fatal(err)
 	}
@@ -101,8 +112,7 @@ func TestWarmClaimFallsBackOnConflict(t *testing.T) {
 // the next Pod.
 func TestTwoClaimersNeverShareAPod(t *testing.T) {
 	fastPool(t)
-	c := newFakeCluster(t, 0)
-	enforceRV(c.client)
+	c := newFakeCluster(t, 0, enforceRV)
 	p := newTestProvider(t, c.client, c.exec, func(o *Options) { o.WarmPool = 2; o.WarmProfile = testLimits() })
 	readyWarm(t, p, 2)
 	// Barrier: the first claim attempt of each claimer waits until both have listed and chosen a Pod.
@@ -162,8 +172,7 @@ func TestTwoClaimersNeverShareAPod(t *testing.T) {
 // deleted and replaced after WarmReadyTimeout.
 func TestStuckWarmPodIsReplaced(t *testing.T) {
 	fastPool(t)
-	c := newFakeCluster(t, time.Hour) // the fake kubelet never starts them
-	enforceRV(c.client)
+	c := newFakeCluster(t, time.Hour, enforceRV) // the fake kubelet never starts them
 	oldBase := warmBackoffBase
 	warmBackoffBase = time.Millisecond
 	t.Cleanup(func() { warmBackoffBase = oldBase })
@@ -196,8 +205,7 @@ func TestStuckWarmPodIsReplaced(t *testing.T) {
 // permanently failing image does not churn Pods every WarmReadyTimeout.
 func TestStuckWarmPodsBackOff(t *testing.T) {
 	fastPool(t)
-	c := newFakeCluster(t, time.Hour)
-	enforceRV(c.client)
+	c := newFakeCluster(t, time.Hour, enforceRV)
 	oldBase := warmBackoffBase
 	warmBackoffBase = time.Second
 	t.Cleanup(func() { warmBackoffBase = oldBase })
