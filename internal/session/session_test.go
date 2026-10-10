@@ -278,6 +278,39 @@ func TestDecideRestoreFailureRepliesAfterEvictedCommitted(t *testing.T) {
 	}
 }
 
+// TestDecideNotifyDuringInFlightReadReloads：读取（或带读取结果的操作）在途时到达的通知不得被随后的读取结果吞掉——
+// 在途读取可能早于通知所报告的变化（例如 close 提交）；结果到达后必须再读一次，否则会话停留在旧事实上直到周期读取。
+func TestDecideNotifyDuringInFlightReadReloads(t *testing.T) {
+	busy := with(idleState(), func(s *ActorState) { s.Busy = true })
+	stale := idleState().Session // 在途读取看到的、close 提交之前的事实
+	for name, result := range map[string]Event{
+		"读取":       Loaded{State: stale},
+		"带读取的操作结果": OpDone{Op: OpTransition, To: StatusIdle, State: &stale},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if quiet := Decide(busy, result); strings.Contains(effectKinds(quiet.Effects), "Load") {
+				t.Fatalf("没有通知时不应重读：副作用 %s", effectKinds(quiet.Effects))
+			}
+			n := Decide(busy, Notified{})
+			if n.Err != nil || len(n.Effects) != 0 {
+				t.Fatalf("在途时的通知 = %v，副作用 %s", n.Err, effectKinds(n.Effects))
+			}
+			d := Decide(n.Next, result)
+			if d.Err != nil || effectKinds(d.Effects) != "Load" {
+				t.Fatalf("在途期间收到通知，结果到达后应重读：%v，副作用 %s", d.Err, effectKinds(d.Effects))
+			}
+			if again := Decide(d.Next, Loaded{State: stale}); strings.Contains(effectKinds(again.Effects), "Load") {
+				t.Fatalf("重读之后不应继续重读：副作用 %s", effectKinds(again.Effects))
+			}
+			// 周期读取不报告具体变化：在途结果即满足它（读取慢于周期时不致反复重读）。
+			p := Decide(busy, Notified{Periodic: true})
+			if pd := Decide(p.Next, result); strings.Contains(effectKinds(pd.Effects), "Load") {
+				t.Fatalf("周期读取不应在结果之后再读：副作用 %s", effectKinds(pd.Effects))
+			}
+		})
+	}
+}
+
 // TestDecideRejectsInvalid：非法组合返回错误且不改变状态。
 func TestDecideRejectsInvalid(t *testing.T) {
 	for name, tc := range map[string]struct {
