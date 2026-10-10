@@ -10,6 +10,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -93,13 +94,29 @@ def run_harness(code: str, tmp: Path) -> subprocess.CompletedProcess[str]:
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="the harness uses pass_fds (POSIX)")
 
 
+WRITABLE_PROBE = """
+import json, os, sys
+def nearest_existing(d):
+    while d and not os.path.exists(d):
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return d
+print(json.dumps(sorted({p for p in (nearest_existing(d) for d in sys.path if d)
+                         if p and os.path.isdir(p) and os.access(p, os.W_OK)})))
+"""
+
+
 def _isolated_path_writable() -> list[str]:
-    code = (
-        "import os, sys; print('\\n'.join(d for d in sys.path"
-        " if d and os.path.isdir(d) and os.access(d, os.W_OK)))"
-    )
-    out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True).stdout
-    return [line for line in out.splitlines() if line]
+    """The harness's own check (same algorithm, same interpreter, -I, a script in a temp dir)."""
+    with tempfile.TemporaryDirectory() as d:
+        script = Path(d) / "probe.py"
+        script.write_text(WRITABLE_PROBE, encoding="utf-8")
+        out = subprocess.run(
+            [sys.executable, "-I", "-B", str(script)], cwd=d, capture_output=True, text=True
+        ).stdout
+    return json.loads(out)
 
 
 WRITABLE_PATH = [] if sys.platform == "win32" else _isolated_path_writable()
