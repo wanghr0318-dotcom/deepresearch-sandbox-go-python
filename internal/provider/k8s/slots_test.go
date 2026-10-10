@@ -1,6 +1,7 @@
 package k8s
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -114,5 +115,48 @@ func TestInterruptedSwingMergedBack(t *testing.T) {
 	// p2 is where the workspace lives: never touched.
 	if n := s.recoverSwings(log); n != 0 {
 		t.Fatalf("second recovery moved %d entries", n)
+	}
+}
+
+// TestSwingRemovedDirectoryRecovered: the first swing died after removing the workspace directory and before creating
+// the symlink (all entries are in the slot). Startup recreates the symlink; a workspace whose parent directory was
+// deleted (closed session) is left alone and gc collects its slot.
+func TestSwingRemovedDirectoryRecovered(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	root := t.TempDir()
+	s := slots{hostRoot: filepath.Join(root, "slots"), nodeRoot: "/n", uid: -1}
+	_ = os.MkdirAll(s.hostRoot, 0o711)
+	ws := filepath.Join(root, "sessions", "s1", "workspace")
+	_ = os.MkdirAll(filepath.Dir(ws), 0o700)
+	if err := s.create("p1"); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(s.hostDir("p1"), workspaceRef), []byte(ws), 0o600)
+	_ = os.WriteFile(filepath.Join(s.workspace("p1"), "a.txt"), []byte("A"), 0o600)
+	if n := s.recoverSwings(log); n != 1 {
+		t.Fatalf("repairs %d, want 1", n)
+	}
+	if dst, err := os.Readlink(ws); err != nil || dst != s.workspace("p1") {
+		t.Fatalf("workspace symlink: %q %v", dst, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(ws, "a.txt")); err != nil || string(b) != "A" {
+		t.Fatalf("a.txt through the symlink: %q %v", b, err)
+	}
+	if n := s.recoverSwings(log); n != 0 {
+		t.Fatalf("second recovery made %d repairs", n)
+	}
+
+	// A closed session: its whole directory is gone. Nothing is recreated; gc removes the slot.
+	if err := os.RemoveAll(filepath.Join(root, "sessions", "s1")); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.recoverSwings(log); n != 0 {
+		t.Fatalf("recreated a deleted workspace (%d repairs)", n)
+	}
+	if _, err := os.Lstat(ws); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("workspace path exists again: %v", err)
+	}
+	if removed, _ := s.gc(map[string]bool{}, 0); len(removed) != 1 {
+		t.Fatalf("gc after session deletion: %v", removed)
 	}
 }

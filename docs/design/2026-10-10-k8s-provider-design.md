@@ -112,7 +112,11 @@ the environment is bound to the slot at claim time:
   a session is closed and its workspace directory (with the symlink) is deleted. A swing interrupted by a
   crash (some entries already moved into the new slot, the workspace path not yet switched) is merged back
   at startup, before any environment is created: the stranded entries are moved to where the workspace path
-  resolves (an entry whose name already exists there is left in the slot and logged). The Pod annotation
+  resolves (an entry whose name already exists there is left in the slot and logged). A first swing that died
+  after removing the workspace directory but before creating the symlink (path missing, parent present) gets
+  its symlink recreated; a missing parent means the workspace was deleted on purpose (closed session) and gc
+  collects the slot. On the first start after upgrading, the same recovery also runs on slots left by earlier
+  versions: stranded entries from older interrupted swings reappear in their workspaces (logged per slot). The Pod annotation
   `agentbox.io/workspace-sha256` carries only a hash of the host path.
 - **Session restore files** (`Mounts.RestoreDir`): hard-linked into `slot/run/restore/`; the provider
   removes them on `Stop`. Semantics differ from the local provider's read-only bind of the directory: a
