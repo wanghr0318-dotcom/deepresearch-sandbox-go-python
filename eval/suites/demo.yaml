@@ -7,6 +7,11 @@
 # categories (wrong exit code, checker timeout, prose instead of code) and so that the two reward hacks
 # (`clamp`: os._exit(0), `median`: sys.exit(0) at import) are shown to fail: those two tasks have no
 # stdout expectation, so only the harness's completion token stands between the hack and a pass.
+#
+# Checkers read fixtures with open / io.open / _io.open / pathlib (served from an in-memory snapshot).
+# Reads that bypass that hook (os.open, io.FileIO, mmap, C extensions, subprocesses) see whatever is on
+# disk, including files a solution planted; for fixture names they find nothing, so such a check fails
+# for correct solutions too. Validate every suite with `--agent reference` before trusting model scores.
 name: demo
 version: 1
 description: Coding/terminal tasks checked in the exec sandbox, plus DeepResearch questions.

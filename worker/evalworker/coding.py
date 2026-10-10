@@ -129,9 +129,12 @@ def check_timeout_s(wall_ms: int | None) -> int:
 # proxy `solution.py` and the codec; the fixtures are not on disk there at all. Its prelude marks it
 # non-dumpable (failure => exit 97, "unsafe"), reads and closes the token pipe, records hashes of
 # its
-# three files, loads the codec and the proxy by path, and replaces builtins.open and io.open (which
-# pathlib uses) process-wide with a hook that serves the fixture names from an in-memory snapshot;
-# any other read of a fixture path finds no file. The check code runs inside a wrapper; after its
+# three files, loads the codec and the proxy by path, and replaces builtins.open, io.open (which
+# pathlib uses) and _io.open process-wide with a hook that serves the fixture names from an
+# in-memory snapshot; any other read of a fixture path finds no file. Reads that bypass the hook
+# (os.open, io.FileIO, mmap, C extensions, subprocesses) see whatever is on disk, including files
+# the solution planted: such checks also fail for correct solutions, so validate every suite with
+# --agent reference before trusting model scores. The check code runs inside a wrapper; after its
 # last
 # statement the checker lists its own directory, and any extra entry, symlink or changed file means
 # no token (exit 98, "tampered"); otherwise it prints the token and exits with the check's exit code
@@ -196,6 +199,7 @@ os.close(w)
 prelude = (
     "import builtins as _eval_b, ctypes as _eval_ct, hashlib as _eval_h\n"
     "import importlib.util as _eval_iu\n"
+    "import _io as _eval_rio\n"
     "import io as _eval_io, json as _eval_json, os as _eval_os, sys as _eval_sys\n"
     "try:\n"
     "    _eval_ok = _eval_ct.CDLL(None).prctl(4, 0, 0, 0, 0) == 0\n"
@@ -236,7 +240,7 @@ prelude = (
     "    _eval_sys.modules[name] = mod\n"
     "    spec.loader.exec_module(mod)\n"
     "_eval_load('_eval_codec', _eval_os.path.join(_eval_dir, '_eval_codec.py'))\n"
-    "_eval_b.open = _eval_io.open = _eval_open\n"
+    "_eval_b.open = _eval_io.open = _eval_rio.open = _eval_open\n"
     "_eval_load('solution', _eval_os.path.join(_eval_dir, 'solution.py'))\n"
     % (r, r, work, json.dumps(FIXTURES)))
 wrapper = (

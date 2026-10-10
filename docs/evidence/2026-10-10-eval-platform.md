@@ -86,10 +86,11 @@ and event stream, which carry metadata only; the token and the judge key are ass
   configured with the real `--model-base-url`. The LLM judge was exercised only against a test endpoint.
 - **Isolation limits** (design §3.2): only plain data crosses the checker/solution boundary; a process
   with `CAP_SYS_PTRACE` or a kernel bug would defeat the memory isolation (the exec sandbox has neither
-  the capability nor ptrace); reads in the checker that bypass the `open` hook (`os.open`, `mmap`, C
-  extensions, subprocesses) of files the solution plants are not protected — fixture names are simply
-  absent from the checker's directory, which fails closed; full closure needs uid/mount separation in
-  the exec layer.
+  the capability nor ptrace); reads in the checker that bypass the `open` hook (`os.open`, `io.FileIO`,
+  `mmap`, C extensions, subprocesses) see whatever is on disk, including files the solution planted —
+  for fixture names they normally find no file, so such a check fails for correct solutions too: validate
+  every suite with `--agent reference` before trusting model scores; full closure needs uid/mount
+  separation in the exec layer.
 - **Research latency is not realistic:** the fake upstream answers instantly and uses one fixed research
   script for every topic; real research takes minutes (see the
   [sub-run comparison](2026-10-06-m4-subrun-comparison.md)).

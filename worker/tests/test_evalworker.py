@@ -491,6 +491,7 @@ def add(a, b):
 FIXTURE_READERS = {
     "open": "open('expected.txt').read()",
     "io.open": "__import__('io').open('expected.txt', encoding='utf-8').read()",
+    "_io.open": "__import__('_io').open('expected.txt', encoding='utf-8').read()",
     "pathlib": "__import__('pathlib').Path('expected.txt').read_text()",
     "pathlib bytes": "__import__('pathlib').Path('expected.txt').read_bytes().decode()",
 }
@@ -521,11 +522,16 @@ def test_fixture_readers_see_the_snapshot(tmp_path: Path, reader: str) -> None:
 
 @posix_only
 def test_unhooked_fixture_reads_find_no_file(tmp_path: Path) -> None:
-    """Fixtures are not on disk in the checker's directory: a low-level read fails (fail closed)."""
-    check = "import os\nos.open('expected.txt', os.O_RDONLY)\n"
-    cfg = parse_config({**BASE, "check": check, "files": {"expected.txt": "5"}})
-    res = run_harness(hz("def add(a, b):\n    return a + b\n", cfg), tmp_path)
-    assert verdict_of(res) == "fail" and "FileNotFoundError" in res.stderr, res.stderr
+    """Fixtures are not on disk in the checker's directory: an unhooked read finds no file, so a
+    suite whose checker reads fixtures that way fails for correct solutions too (caught by
+    --agent reference)."""
+    for check in (
+        "import os\nos.open('expected.txt', os.O_RDONLY)\n",
+        "import io\nio.FileIO('expected.txt').read()\n",
+    ):
+        cfg = parse_config({**BASE, "check": check, "files": {"expected.txt": "5"}})
+        res = run_harness(hz("def add(a, b):\n    return a + b\n", cfg), tmp_path)
+        assert verdict_of(res) == "fail" and "FileNotFoundError" in res.stderr, res.stderr
 
 
 STRAY = (
