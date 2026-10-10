@@ -40,3 +40,35 @@ func TestCodeReply(t *testing.T) {
 		t.Fatalf("StageCount = %d", s.StageCount(StageCode))
 	}
 }
+
+// TestSetEvery：序号为 k 的倍数的请求执行周期动作，其余正常；按序号注入的故障优先；k ≤ 0 取消。
+func TestSetEvery(t *testing.T) {
+	s := New()
+	defer s.Close()
+	s.SetEvery(Search, 3, Action{Status: http.StatusServiceUnavailable})
+	s.Inject(Search, 2, Action{Status: http.StatusTooManyRequests})
+	status := func() int {
+		resp, err := http.Post(s.URL()+"/search", "application/json", bytes.NewReader([]byte(`{"query":"q","max_results":1}`)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	var got []int
+	for range 7 {
+		got = append(got, status())
+	}
+	want := []int{200, 429, 503, 200, 200, 503, 200}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("statuses = %v, want %v", got, want)
+		}
+	}
+	s.SetEvery(Search, 0, Action{})
+	for range 3 {
+		if st := status(); st != 200 {
+			t.Fatalf("after SetEvery(0) status = %d", st)
+		}
+	}
+}
