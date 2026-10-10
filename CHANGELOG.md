@@ -18,6 +18,9 @@
 
 - **Dependency security:** the module now targets Go 1.25 (`go 1.25.0`); dependencies that govulncheck reported as reachable were raised to their minimum fixed versions (golang.org/x/net v0.58.0, x/text v0.41.0, OpenTelemetry v1.45.0, gRPC v1.83.1, pgx v5.9.2). The remaining x/net HTTP/2 advisories are fixed only in x/net v0.60.0, which requires Go 1.26. CI lint moved to golangci-lint v2 (same linters and thresholds).
 
+- **Review follow-ups (fallback, workspace tools, MCP, Kubernetes):** a hedge whose losing first leg also answered ok no longer counts as a slow failure for that provider's breaker, and a backup's provider fault (wrong key, model or address) no longer turns a retryable call fatal; an MCP server's 5xx to `initialize` is retryable; stdio MCP `uid`/`gid` must be given together; workspace paths reject Unicode control and format characters (bidi overrides, zero-width characters, BOM); a workspace that is only read keeps its idle clock across a restart; the Kubernetes admission policy also covers ephemeral containers (`pods/ephemeralcontainers`) and the remaining Pod Security "restricted" fields (AppArmor, procMount, SELinux, HostProcess, sysctls); a workspace swing interrupted by a crash is merged back at startup; the warm-pool creation backoff is capped at 5 min.
+- **Cleanup:** `docs/glossary.md` explains the internal references (§, I1–I16, E1–E49, Plan N); `agentbox server` start-up and the attempt create/finalize transactions are split into named steps; the long end-to-end test file is split by area; the web UI has one user-facing error module, shared report styles, and downloads a report once for the chat and the side panel.
+
 ## v0.2.0 — 2026-10-07
 
 First public release.
