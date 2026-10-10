@@ -109,7 +109,10 @@ the environment is bound to the slot at claim time:
   (`<slot>/workspace.ref`, not mounted into the Pod) records the workspace path. `Destroy` keeps a slot's
   workspace while that path is still a symlink to it; a periodic slot GC (every minute, slots older than
   10 min) removes slots whose Pod is gone and whose workspace path no longer points at them — e.g. after
-  a session is closed and its workspace directory (with the symlink) is deleted. The Pod annotation
+  a session is closed and its workspace directory (with the symlink) is deleted. A swing interrupted by a
+  crash (some entries already moved into the new slot, the workspace path not yet switched) is merged back
+  at startup, before any environment is created: the stranded entries are moved to where the workspace path
+  resolves (an entry whose name already exists there is left in the slot and logged). The Pod annotation
   `agentbox.io/workspace-sha256` carries only a hash of the host path.
 - **Session restore files** (`Mounts.RestoreDir`): hard-linked into `slot/run/restore/`; the provider
   removes them on `Stop`. Semantics differ from the local provider's read-only bind of the directory: a
@@ -182,16 +185,26 @@ exec environments, which this provider does not create, so it returns `ErrNotFou
     a sandbox cannot turn them into symlinks. A deeper path such as `…/workspace/x` is refused: the sandbox
     could make it a symlink to `/`, and the kubelet would follow it;
   - no host namespaces, no hostPort, no ServiceAccount token, only the `default` ServiceAccount, no init or
-    ephemeral containers;
+    ephemeral containers (the policy also matches the `pods/ephemeralcontainers` subresource, the path
+    `kubectl debug` uses to add a container to a running Pod);
   - `runAsNonRoot` with a non-zero UID and `RuntimeDefault` seccomp on the Pod;
   - per container: no privilege escalation, not privileged, read-only root, drop `ALL` and add nothing, and
     no container-level override (`runAsNonRoot: false`, `runAsUser: 0`, a seccomp profile other than
-    `RuntimeDefault`).
+    `RuntimeDefault`);
+  - the remaining Pod Security "restricted" fields, on the Pod and per container: AppArmor only
+    `RuntimeDefault`/`Localhost` (field or legacy annotation), `procMount: Default`, SELinux type only a
+    container type and no SELinux user/role, no Windows HostProcess, and no sysctls at all (stricter than
+    PSS's "safe" set; the provider sets none). `hostUsers` is not constrained: a user-namespaced Pod gets no
+    relaxation (PSS relaxes some checks for it), every rule still applies.
 
   `scripts/demo-k8s.sh` applies the policy and submits probe Pods as the ServiceAccount, using
-  `--dry-run=server`. The provider-shaped Pod must be admitted. Five probes must be denied: `hostPath: /`,
-  a symlink-shaped path below a slot, container `runAsNonRoot: false`, container seccomp `Unconfined`, and a
-  projected ServiceAccount-token volume. RBAC is limited to Pods (no `deletecollection`), `pods/exec`, and
+  `--dry-run=server`. The provider-shaped Pod must be admitted. Twelve probes must be denied: `hostPath: /`,
+  a symlink-shaped path below a slot, container `runAsNonRoot: false`, container seccomp `Unconfined`, a
+  projected ServiceAccount-token volume, container `procMount: Unmasked` (with `hostUsers: false`, which the
+  API requires for it), container AppArmor `Unconfined`, container SELinux type `spc_t`, a Pod SELinux user,
+  Pod AppArmor `Unconfined`, a Pod sysctl, and an `unconfined` AppArmor annotation. It also adds an ephemeral
+  container to a running sandbox Pod through the subresource (as cluster admin, `--dry-run=server`), which the
+  policy must deny. RBAC is limited to Pods (no `deletecollection`), `pods/exec`, and
   `create` on NetworkPolicies.
 
   **What the policy protects, and what it does not.** It protects against a **leaked ServiceAccount token**:
@@ -232,7 +245,9 @@ exec environments, which this provider does not create, so it returns `ErrNotFou
   (e.g. after an image change) and failed warm Pods, and refills immediately after each claim. Warm Pods
   are single-use: a Pod is destroyed with its environment, never returned to the pool. A warm Pod that is
   not Ready after `WarmReadyTimeout` (default 3 min: Pending, ImagePullBackOff, unschedulable) is logged
-  with its waiting reason and replaced.
+  with its waiting reason and replaced; after consecutive stuck warm Pods, creation backs off exponentially
+  (10 s, doubling, at most 5 min) so a broken image does not churn Pods, while a fixed one is picked up within
+  minutes.
 - Resource accounting: warm Pods hold their requests (memory, CPU) on the node while idle; they are **not**
   counted in the server's admission capacity (`--memory-bytes`, run slots), which only counts assigned
   environments. Size the node for `run slots + pool size` Pods of the pool profile.
