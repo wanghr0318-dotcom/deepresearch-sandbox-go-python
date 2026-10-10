@@ -74,7 +74,7 @@ func prepareIsolation(exec bool) (local.EnvStarter, string, error) {
 	return starter, digest, nil
 }
 
-// serverFlags holds the parsed `agentbox server` flags.
+// serverFlags 是解析后的 `agentbox server` 标志。
 type serverFlags struct {
 	dataDir             *string
 	dsn                 *string
@@ -131,7 +131,7 @@ type serverFlags struct {
 	kf                  k8sFlags
 }
 
-// newServerFlags registers every `agentbox server` flag on fs.
+// newServerFlags 在 fs 上注册 `agentbox server` 的全部标志。
 func newServerFlags(fs *flag.FlagSet) *serverFlags {
 	f := &serverFlags{}
 	f.dataDir = fs.String("data-dir", "", "数据目录（必填）")
@@ -237,18 +237,18 @@ func runServer(args []string, stderr io.Writer) int {
 	return f.serve(cfg, serverDeps(dir, *f.dsn, execDigest, newProvider), stderr)
 }
 
-// serverSettings is what settings derives from the flags before anything is acquired.
+// serverSettings 是 settings 在取得任何资源之前由标志推出的配置。
 type serverSettings struct {
 	gateway  call.Limits
 	model    app.ModelConfig
 	accounts bool
-	sess     app.Config // session and sub-run fields only (sessionFlags, subrunFlags)
+	sess     app.Config // 只含会话与 sub-run 字段（sessionFlags、subrunFlags）
 	exec     app.ExecConfig
 	mcp      *mcp.Config
 }
 
-// settings validates the flags and derives the configuration parts that need checking: exit code 2 on invalid
-// flags (in the order the flags are checked), 0 on success. Nothing is acquired or connected yet.
+// settings 校验标志并推出需要检查的配置部分：标志不合法时退出码 2（按检查顺序报告第一个错误），成功为 0。
+// 此时尚未取得任何锁、未连接数据库。
 func (f *serverFlags) settings(stderr io.Writer) (serverSettings, int) {
 	var st serverSettings
 	fail := func(err error) (serverSettings, int) {
@@ -310,8 +310,7 @@ func (f *serverFlags) settings(stderr io.Writer) (serverSettings, int) {
 	return st, 0
 }
 
-// modelSettings builds the model upstream configuration: declared models and prices, the key, the fallback
-// chain and routing.
+// modelSettings 构造模型上游配置：声明的模型与单价、Key、降级链与路由。
 func (f *serverFlags) modelSettings() (app.ModelConfig, error) {
 	model, err := modelConfig(modelFlags{BaseURL: *f.modelBaseURL, Name: *f.modelName, Models: *f.models,
 		Prices: f.modelPrices, PriceIn: *f.priceIn, PriceOut: *f.priceOut, MaxTokensCap: *f.maxTokensCap})
@@ -330,7 +329,7 @@ func (f *serverFlags) modelSettings() (app.ModelConfig, error) {
 	return model, nil
 }
 
-// printStartupWarnings writes warnings that do not stop the server.
+// printStartupWarnings 输出不阻止启动的警告。
 func printStartupWarnings(listen string, tls bool, stderr io.Writer) {
 	if w := plaintextListenWarning(listen, tls); w != "" {
 		fmt.Fprintln(stderr, w)
@@ -341,9 +340,8 @@ func printStartupWarnings(listen string, tls bool, stderr io.Writer) {
 	}
 }
 
-// provider checks that tasks can run safely with the selected provider — before any lock is taken or the
-// database is connected — and returns its constructor and the exec image digest (local provider with exec).
-// Exit code 1 refuses to start, 2 is an invalid flag combination.
+// provider 在取得任何锁、连接数据库之前确认所选 provider 能够安全执行任务，返回其构造函数与 exec 模板摘要
+// （local provider 且启用 exec 时）。退出码 1 为拒绝启动，2 为标志组合不合法。
 func (f *serverFlags) provider(dir string, execCfg app.ExecConfig, stderr io.Writer) (func(string) (provider.Provider, error), string, int) {
 	switch *f.providerName {
 	case "local":
@@ -377,7 +375,7 @@ func (f *serverFlags) provider(dir string, execCfg app.ExecConfig, stderr io.Wri
 	}
 }
 
-// appConfig assembles app.Config from the flags and the validated settings.
+// appConfig 由标志与已校验的配置组装 app.Config。
 func (f *serverFlags) appConfig(st serverSettings) app.Config {
 	return app.Config{
 		Listen:                *f.listen,
@@ -418,7 +416,7 @@ func (f *serverFlags) appConfig(st serverSettings) app.Config {
 	}
 }
 
-// serverDeps wires the concrete implementations: PostgreSQL ownership and store, and the provider.
+// serverDeps 装配具体实现：PostgreSQL 所有权与 Store、provider。
 func serverDeps(dir, dsn, execDigest string, newProvider func(string) (provider.Provider, error)) app.Deps {
 	return app.Deps{
 		DataDir:         dir,
@@ -445,7 +443,7 @@ func serverDeps(dir, dsn, execDigest string, newProvider func(string) (provider.
 	}
 }
 
-// serve sets up logging and telemetry, runs the server until SIGINT/SIGTERM and shuts telemetry down.
+// serve 建立日志与遥测，运行服务直到 SIGINT/SIGTERM，然后关闭遥测。
 func (f *serverFlags) serve(cfg app.Config, deps app.Deps, stderr io.Writer) int {
 	logger, closeLog, err := serverLogger(*f.logFile, stderr)
 	if err != nil {
