@@ -256,8 +256,10 @@ func toolBudgetUsed(tool bool, used int64) *int64 {
 	return &n
 }
 
-// isToolEndpoint 报告端点是否计入每 turn 的工具调用额度（搜索与抓取；模型调用不计）。
-func isToolEndpoint(endpoint string) bool { return endpoint == "/v1/search" || endpoint == "/v1/fetch" }
+// isToolEndpoint 报告端点是否计入每 turn 的工具调用额度（搜索、抓取与 MCP 工具调用；模型调用与 exec 不计）。
+func isToolEndpoint(endpoint string) bool {
+	return endpoint == "/v1/search" || endpoint == "/v1/fetch" || endpoint == "/v1/mcp"
+}
 
 // newReservationID 在事务前生成 reservation 身份（规格 §7.3）。
 func newReservationID() (string, error) {

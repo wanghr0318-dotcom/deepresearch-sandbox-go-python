@@ -7492,3 +7492,22 @@ func mustJSON(t *testing.T, v any) []byte {
 }
 
 // ==== 停止修复 F2 段结束 ====
+
+// TestToolBudgetCountsMCP：MCP 工具调用（/v1/mcp，2026-10-10 设计 §3.3）与搜索、抓取同样计入每 turn 的工具调用额度；
+// exec（含工作区命令）不计。
+func TestToolBudgetCountsMCP(t *testing.T) {
+	s := newStore(t, Options{})
+	two := int64(2)
+	toolTask(t, s, "t1", &two)
+	if res, err := toolCall(s, "t1", "m1", "/v1/mcp"); err != nil || res.ToolBudget == nil || res.ToolBudget.Used != 1 {
+		t.Fatalf("mcp 第 1 次 = %+v, %v", res, err)
+	}
+	if res, err := toolCall(s, "t1", "x1", "/v1/exec"); err != nil || res.ToolBudget != nil {
+		t.Fatalf("exec 不计数 = %+v, %v", res, err)
+	}
+	if res, err := toolCall(s, "t1", "s1", "/v1/search"); err != nil || res.ToolBudget.Used != 2 {
+		t.Fatalf("search = %+v, %v", res, err)
+	}
+	_, err := toolCall(s, "t1", "m2", "/v1/mcp")
+	expectRejected(t, err, persistence.CodeToolBudgetExhausted)
+}

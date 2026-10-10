@@ -34,7 +34,9 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/cache"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/edge"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/mcp"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/workspace"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/ownership"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
@@ -149,6 +151,16 @@ type Config struct {
 	// Exec 是独立 exec 沙箱（M4 Plan 15，规格 §10）的策略；Exec.Slots 为 0（零值）时不启用，/v1/exec 为 404。
 	// 启用时 Deps.ExecImageDigest 必填。
 	Exec ExecConfig
+
+	// 工作区工具与 MCP（设计 2026-10-10-shell-file-mcp；tools.go）。默认关闭，关闭时 turn spec 与端点均不变。
+	// WorkspaceTools 打开 /v1/workspace/* 与对话 Agent 的 exec_shell、read_file、write_file、list_dir（需要 exec）。
+	WorkspaceTools bool
+	// WorkspaceIdleTimeout 是工作区的空闲过期时限（--workspace-idle-timeout，默认 2 h）。
+	WorkspaceIdleTimeout time.Duration
+	// MCP 是 --mcp-config 的内容；nil 表示关闭（/v1/mcp/* 为 404）。
+	MCP *mcp.Config
+	// workspaceSweep 覆盖工作区清扫间隔（只供包内测试；0 取 30 s）。
+	workspaceSweep time.Duration
 }
 
 // ModelConfig 是模型上游的配置。APIKey 只从宿主环境变量 AGENTBOX_MODEL_API_KEY 加载，只交给 chat adapter
@@ -346,6 +358,9 @@ func (c Config) withDefaults() Config {
 		c.SessionEvictAfter = DefaultSessionEvictAfter
 	}
 	c.Exec = c.Exec.withDefaults()
+	if c.WorkspaceIdleTimeout == 0 {
+		c.WorkspaceIdleTimeout = DefaultWorkspaceIdleTimeout
+	}
 	if p := &c.Model.Pricing; p.Version == "" {
 		p.Version = configPricingVersion(*p)
 	}
@@ -435,6 +450,9 @@ func (c Config) validate() error {
 	}
 	if err := c.Exec.Validate(); err != nil {
 		return fmt.Errorf("app: %w", err)
+	}
+	if err := c.validateTools(); err != nil {
+		return err
 	}
 	return c.validateSessions()
 }
@@ -630,6 +648,9 @@ type server struct {
 	cache *cache.Source // Gateway 的共享缓存；nil 表示关闭
 	redis *cache.Redis
 
+	workspaces *workspace.Manager // --workspace-tools；nil 表示关闭
+	mcpHub     *mcp.Hub           // --mcp-config；nil 表示关闭
+
 	mode    atomic.Value // api.Mode
 	sched   atomic.Pointer[task.Scheduler]
 	fatalCh chan error
@@ -819,6 +840,11 @@ func (s *server) assembleGateway(blobs blob.Store) error {
 	}
 	dialer := upstream.NewDialer(upstream.DialerConfig{AllowPrivate: s.cfg.UpstreamAllowPrivate})
 	adapters, pricing, chatPricing := s.cfg.gatewayAdapters(dialer)
+	if ad, err := s.mcpAdapter(); err != nil {
+		return err
+	} else if ad != nil {
+		adapters = append(adapters, ad)
+	}
 	cfg := call.Config{Store: s.store, Adapters: adapters, Pricing: pricing, ChatPricing: chatPricing,
 		Blobs: blobs, Events: hostEvents{s: s.store}, Limits: s.cfg.Gateway, Logger: s.log, Routing: s.cfg.Model.Routing}
 	if n := len(s.cfg.Model.Fallbacks); n > 0 {
@@ -847,7 +873,17 @@ func (s *server) assembleGateway(blobs blob.Store) error {
 		return fmt.Errorf("app: Gateway 调用协调器: %w", err)
 	}
 	s.calls = calls
-	s.edge = edge.New(edge.Config{SocketDir: dir, Logger: s.log}, calls, attemptLookup{s: s.store})
+	if err := s.assembleWorkspaces(blobs); err != nil {
+		return err
+	}
+	ecfg := edge.Config{SocketDir: dir, Logger: s.log}
+	if s.workspaces != nil {
+		ecfg.Workspace = s.workspaces
+	}
+	if s.mcpHub != nil {
+		ecfg.MCP = s.mcpHub
+	}
+	s.edge = edge.New(ecfg, calls, attemptLookup{s: s.store})
 	return nil
 }
 
@@ -1047,6 +1083,7 @@ func (s *server) startExecution(r recovery.Report) error {
 		}
 	}()
 	s.step("cleanup_loop")
+	s.runWorkspaceSweep()
 
 	// §14.1 第 10 步：恢复完成（重启驱逐已结束全部遗留 incarnation）→ session Scheduler → task Scheduler → API。
 	if s.cfg.sessionsEnabled() {
@@ -1357,6 +1394,7 @@ func (s *server) shutdown(reason error) error {
 	if s.calls != nil {
 		waitOrTimeout(ctx, s.calls.Close, func() { s.log.Error("等待 Gateway 在途调用结算超时") })
 	}
+	s.closeTools()
 	// 共享缓存：在途调用结算之后不再有新的写入；等待已提交的异步写入（每个有上限）后关闭 Redis 连接。
 	if s.cache != nil {
 		waitOrTimeout(ctx, s.cache.Close, func() { s.log.Error("等待缓存异步写入超时") })

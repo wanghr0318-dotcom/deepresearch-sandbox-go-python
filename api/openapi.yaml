@@ -1684,7 +1684,7 @@ components:
       properties:
         step_id: {type: string}
         tool_call_id: {type: string, description: 'Pairs the call with its `tool_result`: a worker-assigned id `<step>:<n>` such as `orch:2` (a resumed attempt re-emits the same id), not the model''s tool-call id'}
-        tool: {type: string, description: 'web_search, web_fetch, read_source, read_skill, ask_user, todo_write, research_subtopic (later also run_python)'}
+        tool: {type: string, description: 'web_search, web_fetch, read_source, read_skill, ask_user, todo_write, research_subtopic, run_python; with --workspace-tools also exec_shell, read_file, write_file, list_dir; with --mcp-config mcp__<server>__<tool>'}
         input: {type: object, description: The tool arguments}
         subtopic_id: {type: string, description: The subtopic the call belongs to (absent for orchestrator calls)}
         raw: {$ref: '#/components/schemas/RawRef'}

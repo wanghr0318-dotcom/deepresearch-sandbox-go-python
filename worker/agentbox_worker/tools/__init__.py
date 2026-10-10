@@ -122,6 +122,12 @@ class ToolRegistry:
                 raise ValueError(f"工具重名：{tool.name}")
             self._tools[tool.name] = tool
 
+    def register(self, tool: Tool) -> None:
+        """追加一个工具（每轮开始时取得的 MCP 工具）；名称须唯一。"""
+        if tool.name in self._tools:
+            raise ValueError(f"工具重名：{tool.name}")
+        self._tools[tool.name] = tool
+
     def names(self) -> list[str]:
         return list(self._tools)
 
@@ -160,7 +166,12 @@ class ToolRegistry:
         except (ValueError, RecursionError) as exc:
             return _args_error(f"参数不是合法的 JSON：{exc}")
         try:
-            validate_args(tool.parameters, args)
+            if getattr(tool, "validate", True):
+                validate_args(tool.parameters, args)
+            elif not isinstance(
+                args, dict
+            ):  # 外部工具（MCP）：参数由其服务器校验，本地只要求是对象
+                raise ToolArgsError("参数须为 JSON 对象")
             return tool.run(args, ctx)
         except ToolArgsError as exc:
             return _args_error(str(exc))

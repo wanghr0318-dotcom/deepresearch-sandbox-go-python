@@ -182,11 +182,21 @@ type execInput struct {
 	Path   string `json:"path"`
 }
 
-// execParsed 是校验后的请求：inputs 按 path 排序，limits 为生效值（已截断）。
+// execParsed 是校验后的请求：inputs 按 path 排序，limits 为生效值（已截断）。shell 非 nil 时是工作区命令
+// （ExecShell，shell.go）：code 与 inputs 为空，暂存、argv 与指纹按 shell 变体。
 type execParsed struct {
 	code   string
 	inputs []execInput
 	limits ExecLimits
+	shell  *shellReq
+}
+
+// endpoint 是指纹与分歧事件中的端点（calls.endpoint 总是 ExecEndpoint：shell 调用按 exec 记账）。
+func (p execParsed) endpoint() string {
+	if p.shell != nil {
+		return ShellEndpoint
+	}
+	return ExecEndpoint
 }
 
 // fields 把 JSON 对象解析为成员表，并拒绝 allowed 之外的成员（大小写敏感）。
@@ -300,6 +310,9 @@ func (c *Coordinator) parseExec(body []byte) (execParsed, string) {
 // execFingerprint 是 §10.1 的指纹：sha256(JCS({endpoint, adapter_version, resolved: {language, code_sha256,
 // inputs（按 path 排序）, image_digest, limits（生效值）}}))。
 func execFingerprint(p execParsed, imageDigest string) (string, error) {
+	if p.shell != nil {
+		return shellFingerprint(p, imageDigest)
+	}
 	type limits struct {
 		WallMs      int64 `json:"wall_ms"`
 		MemoryBytes int64 `json:"memory_bytes"`
@@ -386,9 +399,14 @@ func (c *Coordinator) execCall(ctx context.Context, in ExecInvoke) (Result, erro
 	if err != nil {
 		return reject(upstream.CodeInvalidRequest), nil
 	}
+	return c.startExec(ctx, in, req, fp)
+}
+
+// startExec 认领调用并在后台运行（Exec 与 ExecShell 共用）；ctx 结束时返回 ctx 的错误，执行在后台继续并结算。
+func (c *Coordinator) startExec(ctx context.Context, in ExecInvoke, req execParsed, fp string) (Result, error) {
 	key := callKey{in.TaskID, in.CallID}
 	if !c.claim(key) {
-		return c.execContended(ctx, in, fp)
+		return c.execContended(ctx, in, req.endpoint(), fp)
 	}
 	j := &execJob{in: in, req: req, fp: fp}
 	j.ctx, j.cancel = context.WithCancelCause(c.root)
@@ -465,13 +483,13 @@ func (c *Coordinator) unregisterExec(j *execJob) {
 }
 
 // execContended 处理进程内已有执行者的同 ID exec：仍按 §9.2 检查访问；指纹不同报告分歧，否则 call_in_progress。
-func (c *Coordinator) execContended(ctx context.Context, in ExecInvoke, fp string) (Result, error) {
+func (c *Coordinator) execContended(ctx context.Context, in ExecInvoke, endpoint, fp string) (Result, error) {
 	if r, err := c.CheckAccess(ctx, in.TaskID, in.AttemptID, in.SubrunID); err != nil || r.Code != "" {
 		return r, err
 	}
 	rec, _, err := c.store.LoadCall(ctx, in.TaskID, in.CallID)
 	if err == nil && rec.Fingerprint != fp {
-		return c.diverge(in.TaskID, in.AttemptID, in.CallID, ExecEndpoint, rec.Fingerprint, fp), nil
+		return c.diverge(in.TaskID, in.AttemptID, in.CallID, endpoint, rec.Fingerprint, fp), nil
 	}
 	return reject(persistence.CodeCallInProgress), nil
 }
@@ -509,7 +527,7 @@ func (c *Coordinator) runExec(j *execJob) (Result, error) {
 	rec := res.Record
 	if res.Existing {
 		if rec.Fingerprint != j.fp {
-			return c.diverge(in.TaskID, in.AttemptID, in.CallID, ExecEndpoint, rec.Fingerprint, j.fp), nil
+			return c.diverge(in.TaskID, in.AttemptID, in.CallID, j.req.endpoint(), rec.Fingerprint, j.fp), nil
 		}
 		switch rec.State {
 		case StateCompleted:
@@ -528,7 +546,8 @@ func (c *Coordinator) runExec(j *execJob) (Result, error) {
 	}
 	state := rec.State
 
-	// 输入授权：每个 sha 须在 scope_blobs(task) 中；否则不排队、不预留、不建环境。
+	// 输入授权：每个 sha 须在 scope_blobs(task) 中；否则不排队、不预留、不建环境。shell 的文件来自 Gateway 自己
+	// 持有的工作区清单（不是 Worker 给出的 sha），不在这里检查，inputs 为空。
 	for _, inp := range j.req.inputs {
 		ctx, cancel := c.opCtx()
 		ok, err := c.store.BlobAuthorized(ctx, in.TaskID, inp.SHA256)
@@ -663,7 +682,11 @@ func (c *Coordinator) runExecTry(r *execRun) (Result, error) {
 		return c.abortExec(r, ExecCancelled, CodeExecCancelled, "cancelled before start", true, false)
 	}
 	ctx, cancel = c.envCtx()
-	h, err := x.Envs.Start(ctx, envID, provider.ExecSpec{ExecID: envID, Argv: ExecArgv(), Env: ExecEnviron(), Dir: "/out"})
+	argv, environ := ExecArgv(), ExecEnviron()
+	if j.req.shell != nil {
+		argv, environ = ShellArgv(), ShellEnviron()
+	}
+	h, err := x.Envs.Start(ctx, envID, provider.ExecSpec{ExecID: envID, Argv: argv, Env: environ, Dir: "/out"})
 	cancel()
 	if err != nil {
 		if errors.Is(err, provider.ErrStartFailed) {
@@ -947,6 +970,8 @@ type execResult struct {
 	WallMs            int64             `json:"wall_ms"`
 	Limits            execLimitsJSON    `json:"limits"`
 	ImageDigest       string            `json:"image_digest"`
+	// WorkspaceStaged is only present in the shell variant: the wrapper's staging marker was the start of stdout.
+	WorkspaceStaged *bool `json:"workspace_staged,omitempty"`
 }
 
 type execExit struct {
@@ -964,6 +989,8 @@ type execOutputJSON struct {
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
 	Size   int64  `json:"size"`
+	// Executable 只由 shell 变体填写（工作区保留可执行位）；/v1/exec 的结果中没有这个成员。
+	Executable bool `json:"executable,omitempty"`
 }
 
 type execSkippedJSON struct {
@@ -1010,7 +1037,11 @@ func (c *Coordinator) collectExec(r *execRun, outcome ExecOutcome, exit *provide
 			return nil, nil, fmt.Errorf("保存输出 %s: %w", f.Path, err)
 		}
 		outputs = append(outputs, ExecOutput{SHA256: ref.SHA256, Size: ref.Size})
-		res.Outputs = append(res.Outputs, execOutputJSON{Path: f.Path, SHA256: ref.SHA256, Size: ref.Size})
+		o := execOutputJSON{Path: f.Path, SHA256: ref.SHA256, Size: ref.Size}
+		if r.j.req.shell != nil {
+			o.Executable = executable(f.File)
+		}
+		res.Outputs = append(res.Outputs, o)
 	}
 	for _, s := range skipped {
 		res.SkippedOutputs = append(res.SkippedOutputs, execSkippedJSON{Path: s.Path, Reason: s.Reason})
@@ -1020,6 +1051,13 @@ func (c *Coordinator) collectExec(r *execRun, outcome ExecOutcome, exit *provide
 	}
 	if diag != nil {
 		res.Diag = &execDiagJSON{OOMKillDelta: diag.OOMKillDelta, OOMObserved: diag.OOMObserved, CPUUsageUsec: diag.CPUUsageUsec}
+	}
+	if r.j.req.shell != nil {
+		staged := bytes.HasPrefix(stdout.data, StagedMarker)
+		if staged {
+			stdout.data = stdout.data[len(StagedMarker):]
+		}
+		res.WorkspaceStaged = &staged
 	}
 	res.StdoutTruncated, res.StderrTruncated = stdout.truncated, stderr.truncated
 	res.Stdout, res.StdoutInvalidUTF8 = decodeStream(stdout)
@@ -1039,7 +1077,10 @@ var errInputsTooLarge = errors.New("call: exec 输入累计超过上限")
 // stageExec 把代码写入 /in/.agentbox/main.py，并按 inputs 从 BlobStore 复制（文件 0444、目录 0755，D2/D3）。
 // 返回失败时的错误码：累计超过上限 → inputs_too_large；其余 → exec_env_unavailable。
 func (c *Coordinator) stageExec(inDir string, req execParsed) (string, error) {
-	if _, err := writeStaged(inDir, execMainRel, strings.NewReader(req.code), -1); err != nil {
+	if req.shell != nil {
+		return c.stageShell(inDir, req.shell)
+	}
+	if _, err := writeStaged(inDir, execMainRel, strings.NewReader(req.code), -1, 0o444); err != nil {
 		return CodeExecEnvUnavailable, err
 	}
 	var total int64
@@ -1048,7 +1089,7 @@ func (c *Coordinator) stageExec(inDir string, req execParsed) (string, error) {
 		if err != nil {
 			return CodeExecEnvUnavailable, fmt.Errorf("打开输入 %s: %w", in.SHA256, err)
 		}
-		n, err := writeStaged(inDir, in.Path, rc, c.execInputMax-total)
+		n, err := writeStaged(inDir, in.Path, rc, c.execInputMax-total, 0o444)
 		if cerr := rc.Close(); cerr != nil && err == nil {
 			err = cerr
 		}
@@ -1063,8 +1104,9 @@ func (c *Coordinator) stageExec(inDir string, req execParsed) (string, error) {
 	return "", nil
 }
 
-// writeStaged 在 root 下建立 rel（上级目录 0755）并写入 r；limit ≥ 0 时超过即 errInputsTooLarge。
-func writeStaged(root, rel string, r io.Reader, limit int64) (int64, error) {
+// writeStaged 在 root 下建立 rel（上级目录 0755）并写入 r，文件权限为 mode（0444，或 shell 工作区的可执行文件
+// 0555）；limit ≥ 0 时超过即 errInputsTooLarge。
+func writeStaged(root, rel string, r io.Reader, limit int64, mode os.FileMode) (int64, error) {
 	cur := root
 	if dir := path.Dir(rel); dir != "." {
 		for _, seg := range strings.Split(dir, "/") {
@@ -1081,7 +1123,7 @@ func writeStaged(root, rel string, r io.Reader, limit int64) (int64, error) {
 	if err := os.Remove(dst); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return 0, err
 	}
-	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o444)
+	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return 0, err
 	}
@@ -1099,5 +1141,5 @@ func writeStaged(root, rel string, r io.Reader, limit int64) (int64, error) {
 	if limit >= 0 && n > limit {
 		return n, errInputsTooLarge
 	}
-	return n, os.Chmod(dst, 0o444)
+	return n, os.Chmod(dst, mode)
 }

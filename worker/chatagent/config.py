@@ -42,6 +42,9 @@ class TurnConfig:
     report_reserve_micro: int | None = None  # 缺省按 report_max_tokens × 编排输出单价 × 1.5
     orchestrator_output_micro_per_mtok: int = DEFAULT_ORCH_OUTPUT_PRICE
     worker_output_micro_per_mtok: int = DEFAULT_WORKER_OUTPUT_PRICE
+    # 服务端启用的工具（config.tools，设计 2026-10-10-shell-file-mcp）：缺省都关闭
+    workspace_tools: bool = False  # exec_shell、read_file、write_file、list_dir
+    mcp_tools: bool = False  # 服务端配置的 MCP 工具（每轮开始时经 Gateway 取得清单）
 
 
 _INT_RANGES: dict[str, tuple[int, int]] = {
@@ -90,7 +93,23 @@ def parse_turn_config(raw: Any) -> TurnConfig:
         assert name in known
         values[name] = v
     values.update(_research(raw.get("research")))
+    values.update(_tools(raw.get("tools")))
     return TurnConfig(**values)
+
+
+def _tools(raw: Any) -> dict[str, Any]:
+    """config.tools：{"workspace": bool, "mcp": bool}；缺省或 null → 都关闭。"""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise _invalid("config.tools 须为 JSON 对象")
+    out: dict[str, Any] = {}
+    for key, field_name in (("workspace", "workspace_tools"), ("mcp", "mcp_tools")):
+        v = raw.get(key, False)
+        if not isinstance(v, bool):
+            raise _invalid(f"config.tools.{key} 须为布尔值")
+        out[field_name] = v
+    return out
 
 
 def _research(raw: Any) -> dict[str, Any]:

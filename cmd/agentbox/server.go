@@ -23,6 +23,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/app"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/mcp"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/hostcheck"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence/postgres"
@@ -122,6 +123,9 @@ func runServer(args []string, stderr io.Writer) int {
 	sessionWorkerArgv := fs.String("session-worker-argv", "", "会话 incarnation 内启动 Worker 的命令（逗号分隔的 argv，例如 python3,-m,chatagent）；为空时不启用会话（会话端点 503 sessions_unavailable），非空时需要 --model-base-url")
 	workerSubruns := fs.Bool("worker-subruns", true, "在 init 中请求 sub-run 扩展（init.extensions = [\"subruns\"]；Worker 的 ready 须回 subruns: 1，否则以 extension_mismatch 拒绝）")
 	subrunCancelTimeout := fs.Duration("subrun-cancel-timeout", subrun.DefaultCancelTimeout, "宿主取消 sub-run 后等待其 subrun_end 的时限 T_subrun_cancel（须 > 0；超时终止整个 attempt，会话模式终止 incarnation）")
+	workspaceTools := fs.Bool("workspace-tools", false, "为对话 Agent 打开工作区工具 exec_shell、read_file、write_file、list_dir（/v1/workspace/*；每条命令在独立 exec 环境中运行、按 exec 配额记账；需要 --exec-slots > 0）")
+	workspaceIdle := fs.Duration("workspace-idle-timeout", app.DefaultWorkspaceIdleTimeout, "工作区空闲多久后过期（文件丢弃，之后的操作为 410 workspace_expired）；turn 结束时工作区总会被销毁")
+	mcpConfig := fs.String("mcp-config", "", "MCP 服务器配置文件（JSON：servers[]{name, transport stdio|http, command|url, allowed_tools, …}）；为空时不启用 MCP（/v1/mcp/* 为 404）")
 	var ex app.ExecConfig
 	fs.IntVar(&ex.Slots, "exec-slots", app.DefaultExecSlots, "全局并发 exec 数（/v1/exec 的独立沙箱）；0 关闭 exec（/v1/exec 为 404）。exec 内存总量 = 本值 × --exec-memory-max，不计入 --memory-bytes，须一并规划")
 	fs.IntVar(&ex.PerTask, "exec-per-task", app.DefaultExecPerTask, "每个任务的并发 exec 上限（不超过 --exec-slots）")
@@ -208,6 +212,19 @@ func runServer(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agentbox server:", err)
 		return 2
 	}
+	var mcpCfg *mcp.Config
+	if *mcpConfig != "" {
+		c, err := mcp.LoadConfig(*mcpConfig)
+		if err != nil {
+			fmt.Fprintln(stderr, "agentbox server:", err)
+			return 2
+		}
+		mcpCfg = &c
+	}
+	if *workspaceTools && !execCfg.Enabled() {
+		fmt.Fprintln(stderr, "agentbox server: --workspace-tools 需要 exec（--exec-slots > 0）")
+		return 2
+	}
 	if w := plaintextListenWarning(*listen, *tlsCert != ""); w != "" {
 		fmt.Fprintln(stderr, w)
 	}
@@ -259,6 +276,9 @@ func runServer(args []string, stderr io.Writer) int {
 		WorkerSubruns:         sess.WorkerSubruns,
 		Runner:                sess.Runner,
 		Exec:                  execCfg,
+		WorkspaceTools:        *workspaceTools,
+		WorkspaceIdleTimeout:  *workspaceIdle,
+		MCP:                   mcpCfg,
 	}
 	if _, err := os.Stat(filepath.Join(dir, api.TokenFile)); err == nil {
 		if cfg.APIToken, err = api.LoadToken(dir); err != nil {

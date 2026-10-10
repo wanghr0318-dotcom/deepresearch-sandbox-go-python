@@ -25,7 +25,8 @@ REQUEST_MAX_BYTES = 32 * 1024
 THINKING_MAX_CHARS = 600
 PREVIEW_MAX_CHARS = 600
 DELTA_MAX_CHARS = 400
-_GATEWAY_TOOLS = frozenset({"web_search", "web_fetch", "run_python"})
+_GATEWAY_TOOLS = frozenset({"web_search", "web_fetch", "run_python", "exec_shell"})
+MCP_PREFIX = "mcp__"  # MCP 工具（经 Gateway 的 /v1/mcp/call，带 raw）
 _TOOL_LABELS = {
     "web_search": "搜索",
     "web_fetch": "抓取",
@@ -35,7 +36,21 @@ _TOOL_LABELS = {
     "todo_write": "更新计划",
     "research_subtopic": "研究子主题",
     "run_python": "运行代码",
+    "exec_shell": "运行命令",
+    "read_file": "读取文件",
+    "write_file": "写入文件",
+    "list_dir": "列出目录",
 }
+
+
+def _is_gateway_tool(tool: str) -> bool:
+    return tool in _GATEWAY_TOOLS or tool.startswith(MCP_PREFIX)
+
+
+def _label(tool: str) -> str:
+    if tool.startswith(MCP_PREFIX):
+        return "外部工具"
+    return _TOOL_LABELS.get(tool, tool)
 
 
 def raw_ref(call_id: str, request: Any, response_ref: str | None) -> dict[str, Any]:
@@ -159,7 +174,7 @@ class Emitter:
         }
         if subtopic_id is not None:
             data["subtopic_id"] = subtopic_id
-        label = _TOOL_LABELS.get(tool, tool)
+        label = _label(tool)
         await self._send("tool_call", f"调用 {tool}（{label}）", data, step_id)
 
     async def tool_result(
@@ -185,10 +200,10 @@ class Emitter:
             text = preview.get("text") if isinstance(preview.get("text"), str) else ""
             data["error"] = (text or result.content.split("\n", 1)[0])[:PREVIEW_MAX_CHARS]
         raw = result.raw or {}
-        if tool in _GATEWAY_TOOLS and isinstance(raw.get("call_id"), str):
+        if _is_gateway_tool(tool) and isinstance(raw.get("call_id"), str):
             data["raw"] = raw_ref(
                 raw["call_id"],
-                _gateway_request(tool, args),
+                _gateway_request(tool, args, result),
                 result.blobs[0] if result.blobs else None,
             )
         status = "完成" if result.ok else "失败"
@@ -236,11 +251,28 @@ class Emitter:
         await self._send("turn_stopped", "研究已停止", data, None)
 
 
-def _gateway_request(tool: str, args: Any) -> dict[str, Any]:
-    """搜索、抓取与 exec 发给 Gateway 的请求体（与工具实现一致）。"""
+def _gateway_request(tool: str, args: Any, result: ToolResult | None = None) -> dict[str, Any]:
+    """搜索、抓取、exec、工作区命令与 MCP 调用发给 Gateway 的请求体（与工具实现一致）。"""
     args = args if isinstance(args, dict) else {}
     if tool == "run_python":
         return _exec_request(args)
+    if tool == "exec_shell":
+        timeout_s = args.get("timeout_s")
+        timeout_ms = timeout_s * 1000 if isinstance(timeout_s, int) and timeout_s > 0 else None
+        try:
+            return GatewayClient.workspace_exec_body(
+                str(args.get("command", "")), timeout_ms=timeout_ms
+            )
+        except (TypeError, ValueError):
+            return {"command": str(args.get("command", ""))}
+    if tool.startswith(MCP_PREFIX):
+        data = result.data if result is not None and isinstance(result.data, dict) else {}
+        server, _, name = tool[len(MCP_PREFIX) :].partition("__")
+        return {
+            "server": str(data.get("server") or server),
+            "tool": str(data.get("tool") or name),
+            "arguments": args,
+        }
     if tool == "web_search":
         return {
             "query": str(args.get("query", "")).strip(),

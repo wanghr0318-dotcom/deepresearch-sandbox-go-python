@@ -3226,7 +3226,7 @@ func copyWorker(src, dst string) error {
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
 	}
-	for _, pkg := range []string{"agentbox_worker", "sim_worker", "deepresearch"} {
+	for _, pkg := range []string{"agentbox_worker", "sim_worker", "deepresearch", "chatagent", "skills"} {
 		err := filepath.WalkDir(filepath.Join(src, pkg), func(p string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err

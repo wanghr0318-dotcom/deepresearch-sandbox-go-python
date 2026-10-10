@@ -21,16 +21,19 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from agentbox_worker.errors import BudgetExhausted, CallAbandoned, WorkerFailure
+from agentbox_worker.errors import BudgetExhausted, CallAbandoned, GatewayError, WorkerFailure
 from agentbox_worker.runtime import Paused, TaskContext
 from agentbox_worker.tools import GatewayLike, ToolContext, ToolRegistry, ToolResult
 from agentbox_worker.tools.ask_user import AskUser
+from agentbox_worker.tools.base import is_fatal
+from agentbox_worker.tools.mcp import mcp_tools, valid_descriptor
 from agentbox_worker.tools.run_python import RunPython
 from agentbox_worker.tools.skills import RESEARCH_SKILL, ReadSkill, SkillCatalog
 from agentbox_worker.tools.sources import ReadSource
 from agentbox_worker.tools.todo import TodoItem, TodoWrite
 from agentbox_worker.tools.web_fetch import WebFetch
 from agentbox_worker.tools.web_search import WebSearch, search_snippets
+from agentbox_worker.tools.workspace import WORKSPACE_TOOL_NAMES, workspace_tools
 from chatagent.config import TurnConfig
 from chatagent.events import Emitter
 from chatagent.model import ModelReply, assistant_message, call_model
@@ -69,6 +72,9 @@ FIXED_PLAN_ID = "fixed-plan"
 FIXED_RESEARCH_ID = "fixed-research"
 # run_python 在回答与研究两条路线都可用；子主题循环（sub_registry）只搜索与阅读
 _BASE_TOOLS = ("read_skill", "web_search", "web_fetch", "read_source", "run_python")
+# 一轮至多使用的 MCP 工具数（清单中多出的忽略）与单个工具描述的上限（JSON 字节）
+MAX_MCP_TOOLS = 32
+MAX_MCP_DESCRIPTOR_BYTES = 16 * 1024
 
 
 @dataclass(frozen=True)
@@ -159,6 +165,14 @@ class Agent:
                 ResearchSubtopic(state, parallel=self.subruns),
             ]
         )
+        # 工作区与 MCP 工具（config.tools，设计 2026-10-10-shell-file-mcp）：
+        # 只给编排循环，子主题不用
+        if cfg.workspace_tools:
+            for tool in workspace_tools():
+                self.registry.register(tool)
+        self._mcp_names: list[str] = []
+        if state.mcp_tools:
+            self._install_mcp(state.mcp_tools)
         self.sub_registry = ToolRegistry([WebSearch(), WebFetch(), ReadSource()])
         self._strategy: str | None = None
         # 停止时回退的锚点：(状态快照, call id 计数器)；_anchor_seq 为其提交序号（0 = 未提交的起点）
@@ -308,8 +322,36 @@ class Agent:
             if not reply.tool_calls:
                 return await self._final(reply.content)
 
+    def _install_mcp(self, descriptors: list[dict[str, Any]]) -> None:
+        for tool in mcp_tools(descriptors):
+            if self.registry.get(tool.name) is None:
+                self.registry.register(tool)
+                self._mcp_names.append(tool.name)
+
+    async def _fetch_mcp_tools(self) -> list[dict[str, Any]]:
+        """取得服务端允许的 MCP 工具清单（GET /v1/mcp/tools）。不可用时本轮没有 MCP 工具。"""
+        fetch = getattr(self.gw, "mcp_tools", None)
+        if fetch is None:
+            return []
+        try:
+            tools = await self.call(fetch)
+        except GatewayError as exc:
+            if is_fatal(exc):
+                raise
+            return []
+        out = [
+            t
+            for t in tools
+            if valid_descriptor(t)
+            and len(json.dumps(t, ensure_ascii=False).encode("utf-8")) <= MAX_MCP_DESCRIPTOR_BYTES
+        ]
+        return out[:MAX_MCP_TOOLS]
+
     async def _start(self) -> None:
         st, cfg = self.state, self.cfg
+        if cfg.mcp_tools and st.mcp_tools is None:
+            st.mcp_tools = await self._fetch_mcp_tools()
+            self._install_mcp(st.mcp_tools)
         system = orchestrator_system(self.skills, self.registry, self.memory, cfg, self.carry)
         st.messages = [
             {"role": "system", "content": system},
@@ -364,6 +406,9 @@ class Agent:
 
     def _available(self) -> list[str]:
         names = list(_BASE_TOOLS)
+        if self.cfg.workspace_tools:
+            names += WORKSPACE_TOOL_NAMES
+        names += self._mcp_names
         if self.state.flags.skill_read:
             names += ["ask_user", "todo_write"]
         if self.state.flags.planned:

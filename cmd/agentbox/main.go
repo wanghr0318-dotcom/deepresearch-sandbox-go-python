@@ -6,6 +6,7 @@ import (
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/cli"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/hostcheck"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/mcpdemo"
 )
 
 func main() {
@@ -68,6 +69,14 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "user" {
 		os.Exit(runUser(os.Args[2:], os.Stdout, os.Stderr))
 	}
-	fmt.Fprintln(os.Stderr, "用法: agentbox doctor | server ... | verify-invariants [--quiescent] ... | cache rotate-key --data-dir DIR | user list|disable|enable ... | task ... | status")
+	// 演示用 MCP 服务器（stdio；docs/design/2026-10-10-shell-file-mcp-design.md）：由 Gateway 按 --mcp-config 启动。
+	if len(os.Args) > 1 && os.Args[1] == "mcp-demo-server" {
+		if err := mcpdemo.ServeStdio(os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "mcp-demo-server:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	fmt.Fprintln(os.Stderr, "用法: agentbox doctor | server ... | verify-invariants [--quiescent] ... | cache rotate-key --data-dir DIR | user list|disable|enable ... | task ... | status | mcp-demo-server")
 	os.Exit(2)
 }
