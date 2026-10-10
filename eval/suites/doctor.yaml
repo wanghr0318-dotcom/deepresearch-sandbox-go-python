@@ -1,0 +1,166 @@
+# Suite for the trace-doctor closed loop (scripts/demo-doctor.sh, docs/design/2026-10-10-trace-doctor-design.md).
+#
+# Every fake_reply is a correct solution, so with a healthy server every task passes: failures in a run of
+# this suite come from the infrastructure (provider hangs, deadlines, budgets), which is what the doctor
+# diagnoses. Six small coding tasks (one model call + one checker run in the exec sandbox each) and two
+# research questions (plan, two searches, six fetches, summaries and a report through the Gateway).
+#
+# Checkers read no fixtures; still, validate the suite with `--agent reference` once (every task must pass).
+name: doctor
+version: 1
+description: Infrastructure-sensitive tasks whose answers are correct; failures are infrastructure failures.
+defaults:
+  timeout: 60s
+  wall_ms: 20000
+  limits: {budget_micro: 300000}
+tasks:
+  - id: add
+    kind: coding
+    tags: [python]
+    prompt: Write add(a, b) returning the sum of two integers.
+    reference: |
+      def add(a, b):
+          return a + b
+    check: |
+      from solution import add
+      assert add(2, 3) == 5
+      assert add(-1, 1) == 0
+      print("PASS")
+    fake_reply: |
+      ```python
+      def add(a, b):
+          return a + b
+      ```
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: reverse-words
+    kind: coding
+    tags: [python, text]
+    prompt: Write reverse_words(s) that returns the words of s in reverse order joined by single spaces.
+    reference: |
+      def reverse_words(s):
+          return " ".join(reversed(s.split()))
+    check: |
+      from solution import reverse_words
+      assert reverse_words("a b  c") == "c b a"
+      assert reverse_words("") == ""
+      print("PASS")
+    fake_reply: |
+      ```python
+      def reverse_words(s):
+          return " ".join(s.split()[::-1])
+      ```
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: is-prime
+    kind: coding
+    tags: [python, math]
+    prompt: Write is_prime(n) returning True when the integer n is prime.
+    reference: |
+      def is_prime(n):
+          if n < 2:
+              return False
+          i = 2
+          while i * i <= n:
+              if n % i == 0:
+                  return False
+              i += 1
+          return True
+    check: |
+      from solution import is_prime
+      assert [n for n in range(20) if is_prime(n)] == [2, 3, 5, 7, 11, 13, 17, 19]
+      assert is_prime(7919)
+      print("PASS")
+    fake_reply: |
+      ```python
+      def is_prime(n):
+          if n < 2:
+              return False
+          for d in range(2, int(n ** 0.5) + 1):
+              if n % d == 0:
+                  return False
+          return True
+      ```
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: dedupe
+    kind: coding
+    tags: [python, lists]
+    prompt: Write dedupe(xs) returning the items of xs without duplicates, keeping the first occurrence order.
+    reference: |
+      def dedupe(xs):
+          seen, out = set(), []
+          for x in xs:
+              if x not in seen:
+                  seen.add(x)
+                  out.append(x)
+          return out
+    check: |
+      from solution import dedupe
+      assert dedupe([3, 1, 3, 2, 1]) == [3, 1, 2]
+      assert dedupe([]) == []
+      print("PASS")
+    fake_reply: |
+      ```python
+      def dedupe(xs):
+          return list(dict.fromkeys(xs))
+      ```
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: count-vowels
+    kind: coding
+    tags: [python, text]
+    prompt: Write count_vowels(s) returning the number of vowels (a, e, i, o, u; any case) in s.
+    reference: |
+      def count_vowels(s):
+          return sum(1 for c in s.lower() if c in "aeiou")
+    check: |
+      from solution import count_vowels
+      assert count_vowels("Hello World") == 3
+      assert count_vowels("xyz") == 0
+      print("PASS")
+    fake_reply: |
+      ```python
+      def count_vowels(s):
+          return len([c for c in s if c.lower() in "aeiou"])
+      ```
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: flatten
+    kind: coding
+    tags: [python, lists]
+    prompt: Write flatten(xss) that flattens one level of nesting of a list of lists.
+    reference: |
+      def flatten(xss):
+          return [x for xs in xss for x in xs]
+    check: |
+      from solution import flatten
+      assert flatten([[1, 2], [], [3]]) == [1, 2, 3]
+      print("PASS")
+    fake_reply: |
+      ```python
+      def flatten(xss):
+          out = []
+          for xs in xss:
+              out.extend(xs)
+          return out
+      ```
+    expect: {exit_code: 0, stdout_contains: [PASS]}
+
+  - id: solid-state-battery
+    kind: research
+    tags: [research]
+    topic: 固态电池的技术路线与量产进展
+    timeout: 90s
+    research: {max_tasks: 2, max_results: 3, max_fetch: 3}
+    limits: {budget_micro: 1500000}
+    expect: {min_citations: 3, min_locatable_ratio: 1.0}
+
+  - id: sodium-ion-storage
+    kind: research
+    tags: [research]
+    topic: 钠离子电池在储能中的应用前景
+    timeout: 90s
+    research: {max_tasks: 2, max_results: 3, max_fetch: 3}
+    limits: {budget_micro: 1500000}
+    expect: {min_citations: 3, min_locatable_ratio: 1.0}

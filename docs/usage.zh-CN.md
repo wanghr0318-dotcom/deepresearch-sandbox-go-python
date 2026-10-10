@@ -399,6 +399,7 @@ docker compose -f deploy/observability/docker-compose.yml down        # 停止�
 - **任务**：`coding`（编码/终端任务：沙箱内的 `evalworker` 取得解答——模型经 Gateway 写出，或 `--agent reference` 用 suite 的参考解——再经 `/v1/exec` 在独立 exec 沙箱中运行 suite 的检查器）与 `research`（交给 `deepresearch`，与产品相同的研究 Agent）。server 须以 `--worker-argv python3,-m,evalworker` 启动（`evalworker` 安装到 `/opt/agentbox`：`scripts/dev/install-worker.sh`）。
 - **输出**：`<out>/<run-id>/` 下的 `manifest.json`（suite 哈希、seed、并发、`GET /server-info` 给出的服务端构建与模型、Worker 版本、exec 模板摘要）、`trajectories.jsonl`（每个任务一行：事件流、Gateway 调用 journal、attempt、账本、结果与评分；不含提示词与请求/响应正文）、`summary.json` 与 `report.md`（成功率、延迟 P50/P95、费用、工具调用、失败类别）。
 - **评分**：任务状态、检查器判定（退出码为 0 且打印了 harness 经管道交给它的随机完成令牌才算通过：解答不在检查器进程内运行：`solution` 是代理模块，调用经管道以 JSON 转发给单独的子进程，检查器与 harness 设为不可 dump，解答读不到令牌；解答的提前退出只结束它自己的进程，判为失败；检查器以 `python -I` 运行、夹具读运行前的快照并在运行后校验（被改动即 `fixtures_tampered`），隔离条件不满足时判为 `harness_unsafe`；因此检查器与解答之间只能传递普通数据（数字、字符串、列表、元组、字典、集合、bytes），不能传函数；检查器超时为 `check_timeout`）、stdout 匹配；研究报告的引用可定位率（每个 `[n]` 对应的证据 sha256 须是本任务一次已完成 `fetch` 调用的结果 blob）与必含词；可选的 LLM judge（默认关闭；`--judge-model`、`--judge-base-url` 与必填的 `--judge-price IN:OUT`，`--judge-budget-usd` 硬预算与 `--judge-max-calls` 硬调用上限，`--judge-required` 使无法评判的任务失败；Key 只读环境变量 `AGENTBOX_JUDGE_API_KEY` 或 `AGENTBOX_MODEL_API_KEY`，不写入任何结果文件）。`compare` 给出两边的样本数 N 与成功率的 Wilson 95% 区间，N < 30 或每任务只重复 1 次时给出警告。
+- **先用参考解验证 suite**：夹具只经检查器进程内挂钩的 `open`、`io.open`、`_io.open`（以及经它们的 `pathlib`）从内存快照读取；绕过挂钩的读取（`os.open`、`io.FileIO`、`mmap`、C 扩展、检查器启动的子进程）看到的是磁盘上的内容，其中可能有解答放置的文件。夹具名在检查器目录中不存在，因此这样写的检查对正确解答同样失败：每个 suite 先以 `--agent reference` 运行并确认全部通过，再相信模型的分数。
 - **零成本**：`fakeupstream -eval-suite <suite>` 按 suite 的 `fake_reply` 回答编码任务，研究为固定脚本；费用是按配置单价折算的模拟值。
 
 ```bash
@@ -416,3 +417,26 @@ sudo bash scripts/demo-eval.sh
 ```
 
 **重放与确定性**：同一任务内，每个 Gateway 调用有确定的 call id 与指纹；Worker 崩溃或 server 重启后，恢复的 attempt 重发同一调用时直接得到 journal 中保存的结果，不再调用上游（模型回答、检查器运行与费用都不重复）。不同的评测运行之间不重放：真实模型的两次运行可能不同，因此 manifest 固定 suite、模型与服务端构建，用 fake upstream 得到可重复的结果。
+
+### 轨迹诊断（agentbox doctor-traces）
+
+`agentbox doctor-traces` 是运维工具：读失败与慢的运行，用确定性规则给出根因（附证据：受影响的服务端任务 ID 与调用 ID、各供应商 try 的计数与延迟分位、延迟占比；观测栈在运行时还有 trace ID 与按 span 名汇总的耗时），并在白名单内提出配置修改。它不修改运行中的 server：提议写成补丁，`--apply-to` 另写一份实验用的 flags 文件。设计见 [轨迹诊断设计](design/2026-10-10-trace-doctor-design.md)；一次实际闭环见 [轨迹诊断演示记录](evidence/2026-10-10-trace-doctor.md)。
+
+- **来源**：`--run <eval 运行目录>`（`trajectories.jsonl` + `manifest.json`），或 `--server <地址> --since 1h`（经运维 API 读取时间窗口内创建的任务：`GET /tasks`、`inspect` 与事件流；token 取 `$AGENTBOX_TOKEN` 或 `--data-dir`）。
+- **规则**：模型 try 挂起而没有每 try 超时、熔断/降级、供应商错误、搜索/抓取被调用期限截断、抓取被拒、工具额度与费用预算耗尽、exec 超时、退避占主导、对冲浪费、沙箱启动慢、准入排队、停止慢。一个失败或慢的任务归因于第一条解释它的规则；没有规则能解释的任务列为 unexplained（例如答案错误不是基础设施问题）。
+- **可修改的 flag（白名单与上下界）**：`--model-try-timeout`（1 s–2 m 或 0）、`--model-hedge-delay`（200 ms–60 s 或 0）、`--model-breaker-failures`（1–10）、`--model-breaker-open`（5 s–10 m）、`--call-deadline`（5 s–5 m）、`--model-call-deadline`（30 s–15 m）、`--turn-tool-budget`（1–1000）。其他建议（供应商顺序、run slots、suite 预算、skill 文本）只作为 advisory 写进报告与补丁注释。
+- **flags 文件**：每行一个 `--name=value`（`#` 注释），即 server 的命令行参数；`--config` 只读，`--apply-to` 另写 `<out>/experiment.flags`，输入文件不变。
+- **观测栈（可选）**：`--tempo http://127.0.0.1:3200 --prometheus http://127.0.0.1:9090 --loki http://127.0.0.1:3100`：按 `task.id` 在 Tempo 中找到 trace 并按 span 名汇总耗时、Prometheus 的 try/调用/熔断计数作为交叉核对、Loki 中 WARN/ERROR 日志按消息计数并附 trace ID。不可达时只记一条说明。
+- **可选的模型建议（默认关闭）**：`--advisor-model M --advisor-base-url URL --advisor-price IN:OUT [--advisor-budget-usd 0.05]`，Key 只读 `AGENTBOX_DOCTOR_API_KEY` 或 `AGENTBOX_MODEL_API_KEY`。一次调用，只发送诊断结果（ID、计数、延迟、错误码），最坏费用超出预算时不调用；模型的提议同样按白名单与上下界校验，与规则冲突时以规则为准。模型的输入包含规则的提议，因此它的认同不是独立的佐证。回复中的文字在写入任何文件或报告前都被展平为单行，不能新增 flag 行。
+
+```bash
+./bin/agentbox doctor-traces --run eval-runs/<run> --config before.flags          # 报告 + proposal.patch
+./bin/agentbox doctor-traces --run eval-runs/<run> --apply-to before.flags --out doctor-out   # 另写 doctor-out/experiment.flags
+AGENTBOX_TOKEN=... ./bin/agentbox doctor-traces --server http://127.0.0.1:8080 --since 2h --tempo http://127.0.0.1:3200
+```
+
+一键闭环演示（root；全新数据目录与数据库，真实沙箱 + 两个 fake upstream，零模型费用；错误配置的 server 运行 suite → doctor 给出修改 → 以修改后的配置再运行 → `eval compare`，按 Wilson 区间判断改进是否超出噪声；`AGENTBOX_DOCTOR_OBS=1` 时同时导出到已运行的观测栈）：
+
+```bash
+sudo bash scripts/demo-doctor.sh
+```

@@ -134,8 +134,15 @@ type Server struct {
 	latency map[Kind]time.Duration
 	// always 是各类别没有按序号注入故障的请求所用的动作（SetAlways；模型降级链的混沌测试用：供应商持续故障）。
 	always map[Kind]Action
+	// every 是各类别的周期故障（SetEvery；trace doctor 演示用：每第 k 个请求挂起或报错，速率固定）。
+	every map[Kind]periodic
 	// chatHook 非 nil 时先于阶段标记决定 chat 回复（SetChatHook）：返回非 nil 的 assistant message 即为回复。
 	chatHook func(body []byte) json.RawMessage
+}
+
+type periodic struct {
+	k int
+	a Action
 }
 
 type page struct {
@@ -153,6 +160,7 @@ func New() *Server {
 		code:     map[string]string{},
 		latency:  map[Kind]time.Duration{},
 		always:   map[Kind]Action{},
+		every:    map[Kind]periodic{},
 		released: make(chan struct{}),
 		stages: map[string]string{
 			StagePlan:      `{"tasks":[{"title":"fake 任务","intent":"fake 意图","query":"fake 查询"}]}`,
@@ -239,6 +247,18 @@ func (s *Server) SetAlways(kind Kind, a Action) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.always[kind] = a
+}
+
+// SetEvery 让类别 kind 中序号为 k 的倍数且没有按序号注入故障的请求执行动作 a（k ≤ 0 取消）：故障速率固定为 1/k，
+// 与 SetAlways 同时设置时优先于它。
+func (s *Server) SetEvery(kind Kind, k int, a Action) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if k <= 0 {
+		delete(s.every, kind)
+		return
+	}
+	s.every[kind] = periodic{k: k, a: a}
 }
 
 // SetLatency 让类别 kind 的每个正常回复（不含注入的故障）在发出前等待 d（客户端离开时提前结束）。
@@ -394,6 +414,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	rec := &Request{Seq: s.seq, Kind: kind, N: s.counts[kind], Key: key, Path: r.URL.Path,
 		Authorization: r.Header.Get("Authorization"), Stage: stage, Body: string(body),
 		Action: s.faults[kind][s.counts[kind]], At: time.Now()}
+	if p, ok := s.every[kind]; rec.Action == (Action{}) && ok && rec.N%p.k == 0 {
+		rec.Action = p.a
+	}
 	if rec.Action == (Action{}) {
 		rec.Action = s.always[kind]
 	}

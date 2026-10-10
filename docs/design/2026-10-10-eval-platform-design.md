@@ -148,16 +148,17 @@ at import ends the checker with status 0 before any assert ran. Two mechanisms c
    sandbox the interpreter tree is the read-only template. (b) Fixtures (round 4, after a reviewer forged a fixture
    read through `pathlib` and restored it in an `atexit` handler before the post-run comparison): the
    fixtures are **not written to the checker's directory at all**; they are embedded in `check.py` and
-   served from memory by a hook installed process-wide on `builtins.open` and `io.open` (which `pathlib`
-   uses), so every hooked read sees the original bytes and any other read of a fixture path finds no
-   file. Before printing the token the checker lists its own directory: anything beyond its three
+   served from memory by a hook installed process-wide on `builtins.open`, `io.open` (which `pathlib`
+   uses) and `_io.open`, so every hooked read sees the original bytes and any other read of a fixture
+   path finds no file. Before printing the token the checker lists its own directory: anything beyond its three
    files (`check.py`, the proxy, the codec), a symlink, or a changed hash of those files means no token
-   (exit 98, verdict `tampered`, category `fixtures_tampered`). (c) Defence in depth: the checker's and
-   the solution's directories are created under two separate random parents; the child runs in its own
+   (exit 98, verdict `tampered`, category `fixtures_tampered`). (c) Housekeeping, not a defence: the checker's and
+   the solution's directories are created under two separate random parents (this keeps the layout tidy and
+   the paths unpredictable, but a same-uid solution can still list and reach both); the child runs in its own
    directory (the real `solution.py` and the fixtures) with `-I`, script-mode solutions run there too,
    and the child's stdout/stderr go to a log file there (forwarded to the harness's stderr), so it holds
    none of the checker's pipes. Both trees are removed at the end of the harness. (d)
-   Fail closed: if `PR_SET_DUMPABLE 0` fails in the harness or the checker (exit 97) the verdict is
+   Unsafe environment: if `PR_SET_DUMPABLE 0` fails in the harness or the checker (exit 97) the verdict is
    `unsafe`; the verdict JSON records `nondumpable`, `syspath_writable`, `workdir_clean` and
    `pipes_held`. A descendant that escapes the process group (`setsid`) and keeps the checker's output
    pipes open no longer blocks the harness: after the kill, collecting output is bounded (5 s) and the
@@ -165,13 +166,16 @@ at import ends the checker with status 0 before any assert ran. Two mechanisms c
    later `import random`; a failing assert going through the traceback machinery), fixture tampering
    via `open` and via `pathlib`, the escaped descendant, and the `unsafe` path; round 4 adds a
    restoring forger against `open`, `io.open`, `Path.read_text` and `Path.read_bytes` readers, a stray
-   file in the checker's directory, and an unhooked `os.open` read of a fixture (fails: no file).
+   file in the checker's directory, and unhooked `os.open` / `io.FileIO` reads of a fixture (fail: no
+   file); a later fix also hooks `_io.open` (with its own reader test).
 
    **Residual limit (honest).** The checker and the solution still share a uid and the scratch
-   filesystem. Reads in the checker that bypass the hook — `os.open`/`os.read`, `mmap`, C extensions,
-   or a subprocess the check starts — of files the solution planted are not protected (for fixture
-   names they find nothing, which fails closed; a check that deliberately reads other files the
-   solution could reach is out of scope). Closing this fully needs uid or mount separation between
+   filesystem. Reads in the checker that bypass the hook — `os.open`/`os.read`, `io.FileIO`, `mmap`,
+   C extensions, or a subprocess the check starts — see whatever is on disk, **including files the
+   solution planted**. For fixture names such a read normally finds no file, so a check written that way
+   also fails for correct solutions: validate every suite with `--agent reference` before trusting model
+   scores (a suite whose reference run does not pass 100 % has a checker problem, not a model problem).
+   A check that deliberately reads other files the solution could reach is out of scope. Closing this fully needs uid or mount separation between
    checker and solution in the exec layer (e.g. a second user namespace mapping or a read-only bind
    of the checker's directory for the solution), which the exec sandbox does not provide today.
 
