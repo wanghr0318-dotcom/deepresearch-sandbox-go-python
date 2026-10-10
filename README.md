@@ -2,7 +2,7 @@
 
 **运行在自研 Agent Runtime 上的对话式 DeepResearch 助手。** Go 负责执行与全部安全边界，Python 负责研究逻辑。
 
-[English](README.en.md) · [使用与运维参考](docs/usage.zh-CN.md) · [设计规格](docs/design/2026-10-03-v0.2-first-release-design.md)
+[English](README.en.md) · [使用与运维参考](docs/usage.zh-CN.md) · [设计规格](docs/design/2026-10-03-v0.2-first-release-design.md) · [术语表（E/I 编号、Plan、§）](docs/glossary.md)
 
 用户在对话界面中提问，Agent 直接回答，或开始一轮深度研究：
 
@@ -130,7 +130,7 @@ CI=true go test -count=1 ./internal/persistence/postgres/ ./tests/e2e/...
 | `worker/` | Python Worker SDK、`chatagent`、工具、`deep-research` skill、评测 Worker `evalworker` |
 | `web/` | Vue 3 + TypeScript 的对话界面与运维工作台 |
 | `tests/e2e` | 端到端测试（进程型 provider 与真实沙箱） |
-| `docs/` | [设计](docs/design/)、[证据](docs/evidence/)、[使用参考](docs/usage.zh-CN.md) |
+| `docs/` | [设计](docs/design/)、[证据](docs/evidence/)、[使用参考](docs/usage.zh-CN.md)、[术语表](docs/glossary.md) |
 
 ## 能力边界
 
