@@ -94,7 +94,7 @@ Coding harness, per task:
    reference solution without a model call (harness validation, like a "gold patch" run).
 2. **Check** (step `check`): one `/v1/exec` call whose code is a small harness that writes the solution
    and the task's fixture files into a scratch directory and runs the suite's checker
-   (`python3 -E -s -B check.py`, so the checker can import `solution` from its directory) with a timeout.
+   (`python3 -I -B check.py`; `solution` and the codec are loaded by path, see below) with a timeout.
 3. **Report**: writes the output artifacts `solution` (the code) and `eval` (JSON: agent, exec status,
    exit code/signal, stdout/stderr (capped 16 KiB each), wall/queue ms, exec image digest, and the
    harness verdict).
@@ -116,7 +116,7 @@ at import ends the checker with status 0 before any assert ran. Two mechanisms c
 2. *Process separation* (fix round 2, after a reviewer forged the token in-process via
    `__main__._eval_done()` and via the closure cell). The solution never runs in the checker's
    interpreter. `solution.py` beside `check.py` is a generated proxy: importing it starts a child process
-   that imports the real solution from `_eval_impl/`; attribute reads and calls are forwarded over two
+   that imports the real solution from a separate directory (item 3); attribute reads and calls are forwarded over two
    pipes as tagged JSON (None, bool, int, float, str, list, tuple, dict, set, frozenset, bytes — no
    pickle). Builtin `Exception` subclasses raised by the solution are re-raised as the same type, others
    as `RemoteError`; `SystemExit`/`KeyboardInterrupt` never cross as such. Run as a script
@@ -137,6 +137,28 @@ at import ends the checker with status 0 before any assert ran. Two mechanisms c
    shares the checker's stdout so its prints keep their place before the token). A process with
    `CAP_SYS_PTRACE` or a kernel bug would defeat the memory isolation; the exec sandbox grants neither
    capability nor ptrace.
+
+3. *Shared scratch area* (fix round 3, after a reviewer forged a pass by planting `random.py` /
+   `traceback.py` in the checker's directory and by rewriting a fixture the checker read). The checker
+   and the solution share a uid, so files are the remaining channel. (a) The checker runs with
+   `python -I`: no script directory and no user site on `sys.path`; the codec and the proxy are loaded
+   explicitly by path (`importlib.util.spec_from_file_location`, `sys.modules["solution"]`) before the
+   child exists. The harness (also `-I`, same interpreter) checks that no directory on that `sys.path`
+   is writable by the sandbox uid; otherwise the verdict is `unsafe` (`harness_unsafe`) — in the exec
+   sandbox the interpreter tree is the read-only template. (b) Fixtures: the prelude snapshots the
+   fixture bytes before the child starts and the check code's `open` serves reads of fixture paths from
+   that snapshot; after the run the harness compares the fixture files with the originals and any
+   change (including a replacement by a symlink) is `tampered` (`fixtures_tampered`), so reads that
+   bypass `open` (e.g. `pathlib`) are still covered. (c) Defence in depth: the child runs in its own
+   directory (a copy of the fixtures and the real `solution.py`) with `-I`, and its stdout/stderr go to a
+   log file there (forwarded to the harness's stderr), so it holds none of the checker's pipes. (d)
+   Fail closed: if `PR_SET_DUMPABLE 0` fails in the harness or the checker (exit 97) the verdict is
+   `unsafe`; the verdict JSON records `nondumpable`, `syspath_writable`, `fixtures_intact` and
+   `pipes_held`. A descendant that escapes the process group (`setsid`) and keeps the checker's output
+   pipes open no longer blocks the harness: after the kill, collecting output is bounded (5 s) and the
+   verdict is `timeout` with `pipes_held: true`. Regression tests cover both planted-module paths (a
+   later `import random`; a failing assert going through the traceback machinery), fixture tampering
+   via `open` and via `pathlib`, the escaped descendant, and the `unsafe` path.
 
 The demo suite contains two reward hacks (`clamp`: `os._exit(0)`, `median`: `sys.exit(0)`) with no stdout
 expectation; both must — and do — fail as `check_incomplete`.

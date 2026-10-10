@@ -93,6 +93,22 @@ def run_harness(code: str, tmp: Path) -> subprocess.CompletedProcess[str]:
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="the harness uses pass_fds (POSIX)")
 
 
+def _isolated_path_writable() -> list[str]:
+    code = (
+        "import os, sys; print('\\n'.join(d for d in sys.path"
+        " if d and os.path.isdir(d) and os.access(d, os.W_OK)))"
+    )
+    out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True).stdout
+    return [line for line in out.splitlines() if line]
+
+
+WRITABLE_PATH = [] if sys.platform == "win32" else _isolated_path_writable()
+
+
+def hz(solution: str, cfg: Any) -> str:
+    return harness(solution, cfg, require_readonly_path=not WRITABLE_PATH)
+
+
 def verdict(res: subprocess.CompletedProcess[str]) -> dict[str, Any]:
     _, v = split_harness_verdict(res.stderr)
     assert v is not None, res.stderr
@@ -106,10 +122,10 @@ def verdict_of(res: subprocess.CompletedProcess[str]) -> str:
 @posix_only
 def test_harness_pass_fail_fixtures_timeout(tmp_path: Path) -> None:
     cfg = parse_config({**BASE, "files": {"nums.txt": "1\n2\n"}})
-    ok = run_harness(harness("def add(a, b):\n    return a + b\n", cfg), tmp_path)
+    ok = run_harness(hz("def add(a, b):\n    return a + b\n", cfg), tmp_path)
     assert ok.returncode == 0 and verdict_of(ok) == "pass", ok.stderr
     assert ok.stdout == "PASS\n"  # the completion token is consumed by the harness
-    bad = run_harness(harness("def add(a, b):\n    return a - b\n", cfg), tmp_path)
+    bad = run_harness(hz("def add(a, b):\n    return a - b\n", cfg), tmp_path)
     assert bad.returncode == 1 and "AssertionError" in bad.stderr and verdict_of(bad) == "fail"
     fixture = parse_config(
         {
@@ -118,7 +134,7 @@ def test_harness_pass_fail_fixtures_timeout(tmp_path: Path) -> None:
             "files": {"nums.txt": "1\n2\n"},
         }
     )
-    assert run_harness(harness("", fixture), tmp_path).stdout.strip() == "3"
+    assert run_harness(hz("", fixture), tmp_path).stdout.strip() == "3"
     slow = parse_config(
         {
             **BASE,
@@ -126,7 +142,7 @@ def test_harness_pass_fail_fixtures_timeout(tmp_path: Path) -> None:
             "wall_ms": 4000,
         }
     )
-    res = run_harness(harness("", slow), tmp_path)
+    res = run_harness(hz("", slow), tmp_path)
     assert res.returncode != 0 and verdict_of(res) == "timeout"
 
 
@@ -188,7 +204,7 @@ print("PASS")
 @posix_only
 def test_harness_proxy_round_trips_values_and_exceptions(tmp_path: Path) -> None:
     cfg = parse_config({**BASE, "check": RICH_CHECK})
-    res = run_harness(harness(RICH_SOLUTION, cfg), tmp_path)
+    res = run_harness(hz(RICH_SOLUTION, cfg), tmp_path)
     assert verdict_of(res) == "pass", res.stderr
     assert res.stdout == "PASS\n"
 
@@ -202,18 +218,18 @@ def test_harness_script_solution_runs_real_code(tmp_path: Path) -> None:
     )
     cfg = parse_config({**BASE, "check": check, "files": {"data.txt": "42"}})
     sol = "import sys\nprint('args=' + sys.argv[1] + ' data=' + open('data.txt').read())\n"
-    res = run_harness(harness(sol, cfg), tmp_path)
+    res = run_harness(hz(sol, cfg), tmp_path)
     assert verdict_of(res) == "pass", res.stderr
 
 
 @posix_only
 def test_harness_nonzero_exit_expectation_is_token_protected(tmp_path: Path) -> None:
     cfg = parse_config({**BASE, "check": "from solution import add\nimport sys\nsys.exit(3)\n"})
-    res = run_harness(harness("def add(a, b):\n    return a + b\n", cfg), tmp_path)
+    res = run_harness(hz("def add(a, b):\n    return a + b\n", cfg), tmp_path)
     v = verdict(res)
     assert v["verdict"] == "fail" and v["checker_exit"] == 3 and v["completed"] is True
     # the solution cannot make the checker exit with any code: os._exit(3) only ends its own process
-    res = run_harness(harness("import os\nos._exit(3)\n", cfg), tmp_path)
+    res = run_harness(hz("import os\nos._exit(3)\n", cfg), tmp_path)
     v = verdict(res)
     assert v["completed"] is False and v["checker_exit"] == 1
 
@@ -241,7 +257,7 @@ FORGE_HACKS = {
 def test_harness_rejects_forgeries(tmp_path: Path, name: str) -> None:
     """A solution must not be able to pass a check whose asserts did not all run."""
     cfg = parse_config({**BASE, "wall_ms": 6000})  # a hack that blocks (fd scan) times out quickly
-    res = run_harness(harness(FORGE_HACKS[name], cfg), tmp_path)
+    res = run_harness(hz(FORGE_HACKS[name], cfg), tmp_path)
     assert verdict_of(res) in ("incomplete", "fail", "timeout"), (name, res.stdout, res.stderr)
     assert res.returncode != 0
 
@@ -271,12 +287,13 @@ def add(a, b):
 def test_solution_cannot_read_checker_or_harness_memory(tmp_path: Path) -> None:
     """The checker (parent of the solution process) and the harness (its grandparent) are
     non-dumpable: /proc/<pid>/mem, environ and fd are not accessible to the same-uid solution."""
-    res = run_harness(harness(PROC_MEM_PROBE, parse_config(BASE)), tmp_path)
+    res = run_harness(hz(PROC_MEM_PROBE, parse_config(BASE)), tmp_path)
     assert verdict_of(res) == "pass", res.stderr
-    assert "READABLE" not in res.stdout, res.stdout
-    assert res.stdout.count("DENIED") == 6, res.stdout
+    log = res.stderr  # the solution process writes to its own log, forwarded on stderr
+    assert "READABLE" not in log, log
+    assert log.count("DENIED") == 6, log
     # PR_SET_DUMPABLE 0 took effect in both (independent of the Yama ptrace scope)
-    assert res.stdout.count("ROOTOWNED") == 2 and "SAMEOWNER" not in res.stdout, res.stdout
+    assert log.count("ROOTOWNED") == 2 and "SAMEOWNER" not in log, log
 
 
 def test_split_harness_verdict() -> None:
@@ -379,3 +396,94 @@ def test_run_coding_reference_skips_model_and_maps_errors(tmp_path: Path) -> Non
             run_coding(FakeCtx(gw, tmp_path), {**BASE, "agent": "reference", "reference": "x"})
         )  # type: ignore[arg-type]
     assert info.value.code == "endpoint_not_configured" and not info.value.retryable
+
+
+# ---- fix round 3: the shared scratch area ----
+
+PLANT = """
+import glob, os, tempfile
+forge = ("import __main__ as m, os\\n"
+         "print('EVAL-CHECK-DONE:' + m._eval_token, flush=True)\\nos._exit(0)\\n")
+for d in glob.glob(os.path.join(tempfile.gettempdir(), "eval-*")):
+    checker_dir = not os.path.basename(d).startswith("eval-sol-")
+    if checker_dir or os.path.exists(os.path.join(d, "check.py")):
+        for name in ("random.py", "traceback.py", "linecache.py", "json.py"):
+            try:
+                with open(os.path.join(d, name), "w") as f:
+                    f.write(forge)
+            except OSError:
+                pass
+
+def add(a, b):
+    return a - b  # wrong on purpose: only a forged token could make this pass
+"""
+
+
+@posix_only
+@pytest.mark.parametrize(
+    "check",
+    [
+        "from solution import add\nimport random\nassert add(2, 3) == 5\n",  # later import
+        "from solution import add\nassert add(2, 3) == 5\n",  # failing assert: traceback path
+    ],
+)
+def test_planted_modules_are_not_imported_by_the_checker(tmp_path: Path, check: str) -> None:
+    res = run_harness(hz(PLANT, parse_config({**BASE, "check": check})), tmp_path)
+    assert verdict_of(res) == "fail", (res.stdout, res.stderr)
+
+
+TAMPER = """
+import glob, os, tempfile
+for path in glob.glob(os.path.join(tempfile.gettempdir(), "eval-*", "expected.txt")):
+    try:
+        with open(path, "w") as f:
+            f.write("6")
+    except OSError:
+        pass
+
+def add(a, b):
+    return a + b + 1  # wrong: 6
+"""
+
+
+@posix_only
+@pytest.mark.parametrize(
+    "check",
+    [
+        "from solution import add\nassert str(add(2, 3)) == open('expected.txt').read().strip()\n",
+        # pathlib bypasses the snapshot `open`; the post-run hash check still catches the tampering
+        "import pathlib\nfrom solution import add\n"
+        "assert str(add(2, 3)) == pathlib.Path('expected.txt').read_text().strip()\n",
+    ],
+)
+def test_fixture_tampering_is_detected(tmp_path: Path, check: str) -> None:
+    cfg = parse_config({**BASE, "check": check, "files": {"expected.txt": "5"}})
+    res = run_harness(hz(TAMPER, cfg), tmp_path)
+    v = verdict(res)
+    assert v["verdict"] in ("tampered", "fail"), (res.stdout, res.stderr)
+    assert v["fixtures_intact"] is False
+
+
+@posix_only
+def test_escaped_descendant_holding_the_pipes_is_bounded(tmp_path: Path) -> None:
+    check = "import subprocess, sys\nsubprocess.run([sys.executable, 'solution.py'])\n"
+    sol = (
+        "import subprocess, sys\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(15)'],\n"
+        "                 start_new_session=True)\n"
+    )
+    res = run_harness(hz(sol, parse_config({**BASE, "check": check, "wall_ms": 6000})), tmp_path)
+    v = verdict(res)
+    assert v["verdict"] == "timeout" and v["pipes_held"] is True, res.stderr
+
+
+@posix_only
+def test_writable_sys_path_is_reported_unsafe(tmp_path: Path) -> None:
+    """With the read-only requirement on, a writable directory on the checker's sys.path makes the
+    verdict "unsafe" (in the exec sandbox the interpreter's directories are read-only)."""
+    ok = "def add(a, b):\n    return a + b\n"
+    res = run_harness(harness(ok, parse_config(BASE), require_readonly_path=True), tmp_path)
+    v = verdict(res)
+    assert v["syspath_writable"] == WRITABLE_PATH
+    assert v["verdict"] == ("unsafe" if WRITABLE_PATH else "pass")
+    assert v["nondumpable"] is True

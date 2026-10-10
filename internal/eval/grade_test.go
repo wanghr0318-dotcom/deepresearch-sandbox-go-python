@@ -41,6 +41,8 @@ func TestGradeCoding(t *testing.T) {
 		{"expected nonzero without token", codingTask(Expect{ExitCode: intp(4)}), "succeeded", art("completed", intp(4), "", "fail", 4), Outcome{VerdictFail, "wrong_exit_code"}},
 		{"exec timeout", codingTask(Expect{}), "succeeded", art("timed_out", nil, "", "", 0), Outcome{VerdictFail, "exec_timeout"}},
 		{"check timeout", codingTask(Expect{}), "succeeded", art("completed", intp(1), "", "timeout", 1), Outcome{VerdictFail, "check_timeout"}},
+		{"unsafe", codingTask(Expect{}), "succeeded", art("completed", intp(1), "", "unsafe", 97), Outcome{VerdictFail, "harness_unsafe"}},
+		{"tampered", codingTask(Expect{}), "succeeded", art("completed", intp(0), "", "tampered", 0), Outcome{VerdictFail, "fixtures_tampered"}},
 		{"early exit", codingTask(Expect{}), "succeeded", art("completed", intp(1), "", "incomplete", 0), Outcome{VerdictFail, "check_incomplete"}},
 		{"exit 0 without verdict", codingTask(Expect{}), "succeeded", art("completed", intp(0), "", "", 0), Outcome{VerdictFail, "no_check_result"}},
 		{"signal", codingTask(Expect{}), "succeeded", art("completed", nil, "", "", 0), Outcome{VerdictFail, "exec_signal"}},

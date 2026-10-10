@@ -184,13 +184,12 @@ step "运行 B：--agent model（fake 模型），并发 $CONC"
 B="demo-$STAMP-model-c$CONC"
 run_eval "$B" --agent model --concurrency "$CONC"
 ok "成功率 $(summary_field "$OUT/$B" "d['success_rate']")；失败类别 $(summary_field "$OUT/$B" "d['failure_categories']")"
-# 奖励作弊（解答在导入时 exit 0）必须判为 check_incomplete，而不是通过。
+# 奖励作弊（解答在导入时 exit 0）必须失败：解答在独立子进程中运行，它退出只会让检查器的导入失败。
 hacks=$(python3 -c '
 import json, sys
-bad = {t["task_id"]: t["outcome"].get("category") for t in map(json.loads, open(sys.argv[1], encoding="utf-8"))
-       if t["task_id"] in ("clamp", "median")}
-print(" ".join(f"{k}={v}" for k, v in sorted(bad.items())))
-sys.exit(0 if bad and all(v == "check_incomplete" for v in bad.values()) else 1)' "$OUT/$B/trajectories.jsonl") ||
+ts = [t for t in map(json.loads, open(sys.argv[1], encoding="utf-8")) if t["task_id"] in ("clamp", "median")]
+print(" ".join("%s=%s(%s)" % (t["task_id"], t["outcome"]["verdict"], t["outcome"].get("category")) for t in ts))
+sys.exit(0 if len(ts) == 2 and all(t["outcome"]["verdict"] != "pass" for t in ts) else 1)' "$OUT/$B/trajectories.jsonl") ||
   fail "奖励作弊没有被拒绝：$hacks"
 ok "奖励作弊被拒绝：$hacks"
 

@@ -66,10 +66,15 @@ type ExecInfo struct {
 // the solution runs in a separate process and cannot print or end the checker, so early exits are
 // "incomplete" or "fail", never "pass". A non-zero expected exit also requires the token.
 type HarnessVerdict struct {
-	Verdict     string `json:"verdict"` // pass | fail | incomplete | timeout
+	Verdict     string `json:"verdict"` // pass | fail | incomplete | timeout | tampered | unsafe
 	CheckerExit int    `json:"checker_exit"`
 	Completed   bool   `json:"completed"` // the checker printed its completion token (ran to the end)
 	TimeoutS    int    `json:"timeout_s,omitempty"`
+	// Isolation facts reported by the harness (fix round 3).
+	Nondumpable     bool     `json:"nondumpable"`
+	SyspathWritable []string `json:"syspath_writable,omitempty"`
+	FixturesIntact  bool     `json:"fixtures_intact"`
+	PipesHeld       bool     `json:"pipes_held,omitempty"`
 }
 
 // gradeStatus is the task_status grader common to all kinds.
@@ -125,6 +130,10 @@ func gradeCheck(ex *ExecInfo, want int) Grade {
 		g.Detail, g.Category = fmt.Sprintf("killed by signal %d", ex.Signal), "exec_signal"
 	case h == nil:
 		g.Detail, g.Category = "no harness verdict", "no_check_result"
+	case h.Verdict == "unsafe":
+		g.Detail, g.Category = "harness isolation not established (non-dumpable failed or writable sys.path)", "harness_unsafe"
+	case h.Verdict == "tampered":
+		g.Detail, g.Category = "fixture files were modified during the check", "fixtures_tampered"
 	case h.Verdict == "timeout":
 		g.Detail, g.Category = fmt.Sprintf("checker timed out after %d s", h.TimeoutS), "check_timeout"
 	case h.Verdict == "incomplete":
