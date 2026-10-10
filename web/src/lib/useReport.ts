@@ -16,7 +16,12 @@ type ChatService = ReturnType<typeof useUserServices>["chat"];
 
 /** 每个对话服务对象最多缓存的报告数（按最近使用淘汰）。 */
 const CACHE_LIMIT = 8;
-const caches = new WeakMap<ChatService, Map<string, Promise<LoadedReport>>>();
+let caches = new WeakMap<ChatService, Map<string, Promise<LoadedReport>>>();
+
+/** 清空全部已加载的报告（退出登录或会话失效时调用：报告不留在内存中给下一个登录的用户）。 */
+export function clearReportCache(): void {
+  caches = new WeakMap();
+}
 
 function loadShared(chat: ChatService, key: string, turnId: string, artifactId: string, version: number): Promise<LoadedReport> {
   let cache = caches.get(chat);

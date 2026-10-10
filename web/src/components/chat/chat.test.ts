@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ChatApiLike } from "../../api/chat";
 import type { Question, RawRef, StepRow as StepRowData, StopInfo, TurnView as TurnViewData } from "../../lib/chat";
 import { applyEvent, emptyChat } from "../../lib/chat";
+import { clearReportCache } from "../../lib/useReport";
 import { userServicesKey } from "../../lib/userServices";
 import type { UserServices } from "../../lib/userServices";
 import { fakeChat, fakeSessionStream, sev } from "./chatkit";
@@ -776,6 +777,13 @@ describe("TurnView shows the report in the chat with a report card", () => {
     await flushPromises();
     expect(second.get("[data-testid=report]").text()).toContain("重试");
     expect(flaky).toHaveBeenCalledTimes(2);
+
+    // 退出登录清空缓存：之后再打开同一份报告重新下载。
+    clearReportCache();
+    const third = mountWith(SidePanel, { turn, tab: "report" }, { chat });
+    await flushPromises();
+    expect(third.get("[data-testid=report]").text()).toContain("正文");
+    expect(downloadArtifact).toHaveBeenCalledTimes(2);
   });
 
   it("sanitizes the in-chat report like the side panel (no script, handlers or javascript: links)", async () => {
