@@ -417,3 +417,26 @@ sudo bash scripts/demo-eval.sh
 ```
 
 **重放与确定性**：同一任务内，每个 Gateway 调用有确定的 call id 与指纹；Worker 崩溃或 server 重启后，恢复的 attempt 重发同一调用时直接得到 journal 中保存的结果，不再调用上游（模型回答、检查器运行与费用都不重复）。不同的评测运行之间不重放：真实模型的两次运行可能不同，因此 manifest 固定 suite、模型与服务端构建，用 fake upstream 得到可重复的结果。
+
+### 轨迹诊断（agentbox doctor-traces）
+
+`agentbox doctor-traces` 是运维工具：读失败与慢的运行，用确定性规则给出根因（附证据：受影响的服务端任务 ID 与调用 ID、各供应商 try 的计数与延迟分位、延迟占比；观测栈在运行时还有 trace ID 与按 span 名汇总的耗时），并在白名单内提出配置修改。它不修改运行中的 server：提议写成补丁，`--apply-to` 另写一份实验用的 flags 文件。设计见 [轨迹诊断设计](design/2026-10-10-trace-doctor-design.md)；一次实际闭环见 [轨迹诊断演示记录](evidence/2026-10-10-trace-doctor.md)。
+
+- **来源**：`--run <eval 运行目录>`（`trajectories.jsonl` + `manifest.json`），或 `--server <地址> --since 1h`（经运维 API 读取时间窗口内创建的任务：`GET /tasks`、`inspect` 与事件流；token 取 `$AGENTBOX_TOKEN` 或 `--data-dir`）。
+- **规则**：模型 try 挂起而没有每 try 超时、熔断/降级、供应商错误、搜索/抓取被调用期限截断、抓取被拒、工具额度与费用预算耗尽、exec 超时、退避占主导、对冲浪费、沙箱启动慢、准入排队、停止慢。一个失败或慢的任务归因于第一条解释它的规则；没有规则能解释的任务列为 unexplained（例如答案错误不是基础设施问题）。
+- **可修改的 flag（白名单与上下界）**：`--model-try-timeout`（1 s–2 m 或 0）、`--model-hedge-delay`（200 ms–60 s 或 0）、`--model-breaker-failures`（1–10）、`--model-breaker-open`（5 s–10 m）、`--call-deadline`（5 s–5 m）、`--model-call-deadline`（30 s–15 m）、`--turn-tool-budget`（1–1000）。其他建议（供应商顺序、run slots、suite 预算、skill 文本）只作为 advisory 写进报告与补丁注释。
+- **flags 文件**：每行一个 `--name=value`（`#` 注释），即 server 的命令行参数；`--config` 只读，`--apply-to` 另写 `<out>/experiment.flags`，输入文件不变。
+- **观测栈（可选）**：`--tempo http://127.0.0.1:3200 --prometheus http://127.0.0.1:9090 --loki http://127.0.0.1:3100`：按 `task.id` 在 Tempo 中找到 trace 并按 span 名汇总耗时、Prometheus 的 try/调用/熔断计数作为交叉核对、Loki 中 WARN/ERROR 日志按消息计数并附 trace ID。不可达时只记一条说明。
+- **可选的模型建议（默认关闭）**：`--advisor-model M --advisor-base-url URL --advisor-price IN:OUT [--advisor-budget-usd 0.05]`，Key 只读 `AGENTBOX_DOCTOR_API_KEY` 或 `AGENTBOX_MODEL_API_KEY`。一次调用，只发送诊断结果（ID、计数、延迟、错误码），最坏费用超出预算时不调用；模型的提议同样按白名单与上下界校验，与规则冲突时以规则为准。
+
+```bash
+./bin/agentbox doctor-traces --run eval-runs/<run> --config before.flags          # 报告 + proposal.patch
+./bin/agentbox doctor-traces --run eval-runs/<run> --apply-to before.flags --out doctor-out   # 另写 doctor-out/experiment.flags
+AGENTBOX_TOKEN=... ./bin/agentbox doctor-traces --server http://127.0.0.1:8080 --since 2h --tempo http://127.0.0.1:3200
+```
+
+一键闭环演示（root；全新数据目录与数据库，真实沙箱 + 两个 fake upstream，零模型费用；错误配置的 server 运行 suite → doctor 给出修改 → 以修改后的配置再运行 → `eval compare`，按 Wilson 区间判断改进是否超出噪声；`AGENTBOX_DOCTOR_OBS=1` 时同时导出到已运行的观测栈）：
+
+```bash
+sudo bash scripts/demo-doctor.sh
+```

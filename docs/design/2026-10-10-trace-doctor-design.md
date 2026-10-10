@@ -113,9 +113,9 @@ gets the first in this order (the order is "closest to the root cause first"):
 | Rule id | Fires when | Evidence | Proposal |
 |---|---|---|---|
 | `model_try_hang` | model tries that did not finish `ok` and ran ≥ max(10 s, 10 × the route's median ok latency), or are still in flight | per route: hung tries, their latency, ok p50/p99, tasks that timed out | `--model-try-timeout = clamp(4 × p99(ok model tries), 2 s, 120 s)` — only in chain mode (the flag applies to routed adapters); single provider: advisory "configure a fallback chain" |
-| `model_upstream_errors` | model tries with outcome retryable/fatal/unknown (excluding hangs and hedge losers) ≥ 5 % of a route's tries | per route and error code: counts, share, whether failover served the call | advisory: chain order (healthiest first) / add a fallback provider; `--model-breaker-failures` lowered to 2 when a route fails > 50 % |
+| `model_upstream_errors` | model tries with outcome retryable/fatal/unknown (excluding hangs and hedge losers) ≥ 5 % of a route's tries; explains failed tasks whose model call failed, and slow tasks whose calls survived failed tries (failover or retry cost) | per route and error code: counts, error rate, failed-try time as a share of the slow tasks' latency | advisory: chain order (healthiest first) / add a fallback provider / a hedge when the primary still fails ≥ 20 %; `--model-breaker-failures` lowered to 2 when a route fails > 50 % |
 | `breaker_degraded` | calls failed `model_degraded`, or tries skipped a route as `circuit_open` | counts per route, affected tasks | advisory (provider health); none applied |
-| `fetch_deadline` | search/fetch calls failed `call_deadline_exceeded` | counts per kind, cut-off latency vs ok p99 | `--call-deadline = clamp(max(4 × p99(ok search/fetch tries), 10 × current), 10 s, 120 s)` |
+| `fetch_deadline` | search/fetch calls that did not complete and whose tries were cut by the call deadline: tries at ≥ 85 % of `--call-deadline` (from the config, or its default), or — without the config — ≥ 3 failed tries that all stop within 15 % of the same latency; or the explicit `call_deadline_exceeded` code. (Observed on a real server: a cut fetch leaves the call `unknown` without a fail reason and its try `unknown / upstream_unconfirmed` just below the deadline.) | counts per kind, cut-off latency, ok tries and p99 per kind | `--call-deadline = clamp(max(4 × p99(ok search/fetch tries), 10 × current), 10 s, 120 s)` |
 | `fetch_blocked` | fetch tries rejected by policy or target (`egress_blocked`, `upstream_rejected`, `too_many_redirects`, `invalid_url`, HTTP 403/429 from the target) | counts per code | advisory: skill text (prefer primary sources, avoid sites that challenge bots); never applied |
 | `tool_budget_exhausted` | calls failed `tool_budget_exhausted` | counts, tasks | `--turn-tool-budget` raised by 50 % (bounded 1000) for turns; advisory for tasks (`research.max_fetch`) |
 | `cost_budget_exhausted` | calls failed `budget_exhausted` / `budget_insufficient_for_request` | counts, spent vs limit | advisory: raise `limits.budget_micro` in the suite or lower `max_tokens` |
@@ -146,7 +146,7 @@ Only these server flags can be changed by `--apply-to` (bounds enforced for rule
 
 Everything else (chain order, run slots, suite limits, skill text) is an **advisory** proposal: it appears
 in the findings and as a comment in the patch, and is never written. When two findings propose the same flag,
-the larger timeout/budget wins (the more permissive, so the experiment does not create new failures). The patch
+the larger value wins (every allowlisted flag is a timeout, delay, threshold or budget for which the larger value is the more permissive one, so the experiment does not create new failures by tightening something). The patch
 (`proposal.patch`) is a unified diff of the flags file; `--apply-to FILE` reads `FILE` and writes
 `<out>/experiment.flags` (the input is never modified). Values for flags that are absent from the file are
 appended with a comment naming the finding.
@@ -161,7 +161,8 @@ doctor sends **one** chat request: a system prompt with the allowlist and bounds
 allowlist or bounds are dropped and listed as rejected; accepted ones are merged *after* the rule proposals
 (rules win on conflict) and labelled `source: model`. The worst-case cost (prompt estimate + `max_tokens`)
 must fit `--advisor-budget-usd` (default 0.05) before the call is made; the actual cost from `usage` is
-reported. Any failure (budget, transport, format) leaves the deterministic report intact.
+reported. `--advisor-max-tokens` (default 1024) caps the reply; reasoning models spend output tokens before the
+answer, so an empty reply cut at the cap is reported as such. Any failure (budget, transport, format) leaves the deterministic report intact.
 
 ## 7. Outputs
 
@@ -187,8 +188,13 @@ Exit code: 0 when the analysis ran (findings or not), 1 on input errors, 2 on us
 - **Prometheus**: instant queries over the analysed window: try outcomes per provider
   (`agentbox_upstream_tries_total`), breaker transitions, `agentbox_gateway_calls_total` by result; shown
   as a table beside the journal-derived numbers (a cross-check: two independent paths should agree).
-- **Loki**: counts of the Gateway's `gateway: breaker` / `gateway: degraded` log lines in the window and a
-  sample of their `trace_id`s.
+- **Loki**: WARN/ERROR lines by message, and Gateway tries that did not succeed (`gateway: try` lines, which
+  are INFO) by endpoint, route, outcome and code, each with sample `trace_id`s — a log line leads to its trace.
+
+The window is the span of the analysed tasks padded by 10 s (more would pull in the next run when runs follow
+each other closely). Prometheus counts are a sampled cross-check: `increase()` cannot see what a fresh process
+counted before its first scrape or after its last one, so they can undercount; the journal and the logs are
+exact.
 
 Every enrichment is best effort: an unreachable endpoint adds a note, never an error.
 
@@ -220,8 +226,8 @@ Every enrichment is best effort: an unreachable endpoint adds a note, never an e
    (`-every chat:4:hang`), and serves search and fetch with 1.5 s fetch latency; *backup* is healthy.
 2. Server A ("before"): fallback chain primary → backup, **no** `--model-try-timeout` (a hung primary try
    holds the call until the eval timeout), and `--call-deadline 1s` (shorter than the fetch latency).
-3. `agentbox eval run` of `eval/suites/doctor.yaml` (coding tasks whose fake replies are correct, plus
-   research questions) with enough repetitions for N ≥ 60.
+3. `agentbox eval run` of `eval/suites/doctor.yaml` (6 coding tasks whose fake replies are correct, plus 2
+   research questions) with `--repeat 8 --concurrency 8 --seed 7`: N = 64 per run.
 4. `agentbox doctor-traces --run <A> --apply-to before.flags` → findings, `proposal.patch`,
    `experiment.flags`.
 5. Server B with `experiment.flags`; the same suite and seed.
@@ -239,5 +245,5 @@ interleaving; the *rate* is fixed, which is what the comparison measures.
 - Causality is not proven by one experiment: the before/after compare shows the effect of the whole
   experiment config. Rerun with one change at a time to attribute effects (the doctor prints each change
   with the finding that motivated it so this is easy to do).
-- Without Tempo the evidence uses server task ids and call ids; `agentbox inspect <task>` shows the same
+- Without Tempo the evidence uses server task ids and call ids; `agentbox task inspect <task>` shows the same
   journal.
