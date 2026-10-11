@@ -164,6 +164,28 @@ func (t *TenancyStore) MemberByName(ctx context.Context, usernameKey string) (te
 	return m, err
 }
 
+// ListMembers 返回 org 的成员（owner 在前，按用户名排序；G5 成员页）。
+func (t *TenancyStore) ListMembers(ctx context.Context, orgID int64) ([]tenant.Membership, error) {
+	out := []tenant.Membership{}
+	err := t.s.read(ctx, "ListMembers", func(ctx context.Context, q queryer) error {
+		rows, err := q.Query(ctx, "SELECT "+memberColumns+` FROM org_members m JOIN users u ON u.id = m.user_id
+			JOIN orgs o ON o.id = m.org_id WHERE m.org_id = $1 ORDER BY m.role = 'owner' DESC, u.username_key`, orgID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			m, err := scanMember(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, m)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 func memberOf(ctx context.Context, q queryer, userID int64) (tenant.Membership, error) {
 	return scanMember(q.QueryRow(ctx, "SELECT "+memberColumns+` FROM org_members m JOIN users u ON u.id = m.user_id
 		JOIN orgs o ON o.id = m.org_id WHERE m.user_id = $1`, userID))

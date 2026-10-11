@@ -14,7 +14,7 @@ import (
 )
 
 // undo0014 把库还原为只应用了 0013 的形状（undo0013 先执行它）。
-const undo0014 = `DROP TABLE model_request_tries, model_requests; DROP FUNCTION agentbox_model_request_partitions(timestamptz);
+const undo0014 = undo0015 + `DROP TABLE model_request_tries, model_requests; DROP FUNCTION agentbox_model_request_partitions(timestamptz);
 	DROP INDEX quota_holds_model_request; DELETE FROM schema_migrations WHERE version >= 14;
 `
 
