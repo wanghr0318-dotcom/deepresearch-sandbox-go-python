@@ -2422,7 +2422,7 @@ def test_stop_summary_past_deadline_writes_fallback_card_and_resume_does_not_div
 
 
 def test_monthly_quota_exhausted_names_the_level():
-    """org / user / key 的月度配额用尽（402 insufficient_quota）：处理与费用预算耗尽相同，说明指明是本月配额与层级。"""
+    """月度配额用尽（402 insufficient_quota）：处理同费用预算耗尽，说明指明本月配额与层级。"""
 
     def inject(c: Any) -> Exception | None:
         if c.kind == "chat" and c.subrun is None:

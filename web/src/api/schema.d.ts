@@ -877,7 +877,8 @@ export interface paths {
          * Replace the limits of an org (operator) or of a user or key (its org's owners, operator)
          * @description Every field is replaced; an absent field is null (no limit at that level). A user's or key's value cannot be
          *     above the same limit of its org (400 `exceeds_org_limit`). Only `rpm` is enforced on the runtime API
-         *     (`POST /sessions`, `/research`, `/sessions/{id}/messages`); `max_sandboxes` is checked when a task of the org
+         *     (`POST /sessions`, `/research`, `/sessions/{id}/messages`, `/sessions/{id}/wake`, `/turns/{id}/restore`, `/continue`,
+         *     `/finish`, `/answer`); `max_sandboxes` (org level only, else 400 `unsupported_limit`) is checked when a task of the org
          *     is admitted to a run slot; `tpm` and `max_streams` are for the model API.
          */
         put: operations["putLimits"];
@@ -1905,7 +1906,7 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
-        /** @description `invalid_request` (kind, body or period), or `exceeds_org_limit`: a user's or key's value above its org's */
+        /** @description `invalid_request` (kind, body or period); `exceeds_org_limit`: a user's or key's value above its org's; or `unsupported_limit`: `max_sandboxes` on a user or key (it is counted per org only) */
         QuotaBadRequest: {
             headers: {
                 [name: string]: unknown;
@@ -2921,6 +2922,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            429: components["responses"]["RuntimeRateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["SessionsUnavailable"];
         };
@@ -3086,6 +3088,7 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["TurnNotFound"];
             409: components["responses"]["TurnControlRejected"];
+            429: components["responses"]["RuntimeRateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["SessionsUnavailable"];
         };
@@ -3108,6 +3111,7 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["TurnNotFound"];
             409: components["responses"]["TurnControlRejected"];
+            429: components["responses"]["RuntimeRateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["SessionsUnavailable"];
         };
@@ -3142,6 +3146,7 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["TurnNotFound"];
             409: components["responses"]["TurnControlRejected"];
+            429: components["responses"]["RuntimeRateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["SessionsUnavailable"];
         };
@@ -3180,6 +3185,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            429: components["responses"]["RuntimeRateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["SessionsUnavailable"];
         };

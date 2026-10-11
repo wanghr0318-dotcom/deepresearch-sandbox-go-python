@@ -670,7 +670,8 @@ class Agent:
     async def _cost_budget_exhausted(self, exc: BudgetExhausted) -> LoopOutcome:
         """费用预算耗尽（402）：有完成的子主题时用其摘要写部分报告，否则失败。
 
-        org / user / key 的月度配额用尽（insufficient_quota）时，说明换成 Gateway 给出的"本月配额已用尽（层级）"；
+        org / user / key 的月度配额用尽（insufficient_quota）时，说明换成 Gateway 给出的
+        "本月配额已用尽（层级）"；
         处理不变。
         """
         quota = exc.code == "insufficient_quota"
