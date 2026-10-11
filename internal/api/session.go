@@ -41,13 +41,13 @@ var (
 
 // sessionRoutes 只在启用账号时注册；Config.Sessions 为 nil 时一律 503 sessions_unavailable（sessionOp）。
 var sessionRoutes = []route{
-	{"POST", "/sessions", accessWrite, audienceUser, []int{201, 400, 401, 403, 409, 500, 503}, sessionOp((*Handler).createSession)},
+	{"POST", "/sessions", accessWrite, audienceUser, []int{201, 400, 401, 403, 409, 429, 500, 503}, sessionOp((*Handler).createSession)},
 	{"GET", "/sessions", accessRead, audienceSession, []int{200, 400, 401, 403, 500, 503}, sessionOp((*Handler).listSessions)},
 	{"GET", "/sessions/{id}", accessRead, audienceSession, []int{200, 401, 403, 404, 500, 503}, sessionOp((*Handler).getSession)},
 	{"PATCH", "/sessions/{id}", accessWrite, audienceUser, []int{200, 400, 401, 403, 404, 409, 500, 503}, sessionOp((*Handler).renameSession)},
 	{"DELETE", "/sessions/{id}", accessWrite, audienceUser, []int{202, 401, 403, 404, 500, 503}, sessionOp((*Handler).deleteSession)},
 	{"POST", "/sessions/{id}/wake", accessWrite, audienceUser, sessionWriteStatuses, sessionOp((*Handler).wakeSession)},
-	{"POST", "/sessions/{id}/messages", accessWrite, audienceUser, sessionWriteStatuses, sessionOp((*Handler).sendMessage)},
+	{"POST", "/sessions/{id}/messages", accessWrite, audienceUser, []int{202, 400, 401, 403, 404, 409, 429, 500, 503}, sessionOp((*Handler).sendMessage)},
 	{"GET", "/sessions/{id}/turns", accessRead, audienceSession, sessionReadStatuses, sessionOp((*Handler).listTurns)},
 	{"GET", "/sessions/{id}/events", accessRead, audienceSession, sessionReadStatuses, sessionOp((*Handler).streamSessionEvents)},
 	{"POST", "/turns/{id}/stop", accessWrite, audienceUser, sessionWriteStatuses, sessionOp(turnControl("stop"))},

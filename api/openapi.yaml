@@ -195,6 +195,7 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
+        '429': {$ref: '#/components/responses/RuntimeRateLimited'}
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/Unavailable'}
   /status:
@@ -511,6 +512,7 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '409': {$ref: '#/components/responses/Conflict'}
+        '429': {$ref: '#/components/responses/RuntimeRateLimited'}
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/SessionsUnavailable'}
     get:
@@ -672,6 +674,7 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
+        '429': {$ref: '#/components/responses/RuntimeRateLimited'}
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/SessionsUnavailable'}
   /sessions/{id}/turns:
@@ -1215,6 +1218,122 @@ paths:
               schema: {$ref: '#/components/schemas/Error'}
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/limits/{kind}/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/QuotaKind'}
+      - {$ref: '#/components/parameters/QuotaID'}
+    get:
+      operationId: getLimits
+      summary: Rate and concurrency limits of an org, user or key (null = no limit at that level)
+      description: |
+        Org owners read their org and its users and keys; the operator reads everything. Members and API keys
+        cannot (403). Levels of another org answer 404 like ones that do not exist.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        '200':
+          description: The limits
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Limits'}
+        '400': {$ref: '#/components/responses/QuotaBadRequest'}
+        '401': {$ref: '#/components/responses/KeyUnauthorized'}
+        '403': {$ref: '#/components/responses/QuotaForbidden'}
+        '404': {$ref: '#/components/responses/QuotaNotFound'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/QuotaUnavailable'}
+    put:
+      operationId: putLimits
+      summary: Replace the limits of an org (operator) or of a user or key (its org's owners, operator)
+      description: |
+        Every field is replaced; an absent field is null (no limit at that level). A user's or key's value cannot be
+        above the same limit of its org (400 `exceeds_org_limit`). Only `rpm` is enforced on the runtime API
+        (`POST /sessions`, `/research`, `/sessions/{id}/messages`); `max_sandboxes` is checked when a task of the org
+        is admitted to a run slot; `tpm` and `max_streams` are for the model API.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LimitsRequest'}
+      responses:
+        '200':
+          description: The limits now in effect
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Limits'}
+        '400': {$ref: '#/components/responses/QuotaBadRequest'}
+        '401': {$ref: '#/components/responses/KeyUnauthorized'}
+        '403': {$ref: '#/components/responses/QuotaForbidden'}
+        '404': {$ref: '#/components/responses/QuotaNotFound'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/QuotaUnavailable'}
+  /v1/budgets/{kind}/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/QuotaKind'}
+      - {$ref: '#/components/parameters/QuotaID'}
+    get:
+      operationId: getBudget
+      summary: Monthly money budget and usage of an org, user or key (UTC month)
+      description: |
+        Usage counts every Gateway call made by the level's sandboxes: reserved (in flight), spent (settled) and
+        unknown (outcome unknown, charged in full). Same authorization as `GET /v1/limits/{kind}/{id}`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: period
+          in: query
+          required: false
+          description: The month, `YYYY-MM` (default the current UTC month)
+          schema: {type: string, pattern: '^[0-9]{4}-[0-9]{2}$'}
+      responses:
+        '200':
+          description: The budget
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Budget'}
+        '400': {$ref: '#/components/responses/QuotaBadRequest'}
+        '401': {$ref: '#/components/responses/KeyUnauthorized'}
+        '403': {$ref: '#/components/responses/QuotaForbidden'}
+        '404': {$ref: '#/components/responses/QuotaNotFound'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/QuotaUnavailable'}
+    put:
+      operationId: putBudget
+      summary: Set the monthly budget of an org (operator) or of a user or key (its org's owners, operator)
+      description: |
+        Sets the limit of the current UTC month; later months start with the same limit. null means unlimited.
+        A user's or key's limit cannot be above its org's limit for the month (400 `exceeds_org_limit`), and no
+        limit can be below the month's usage including reservations (409 `budget_below_usage`).
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BudgetRequest'}
+      responses:
+        '200':
+          description: The budget with its new limit
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Budget'}
+        '400': {$ref: '#/components/responses/QuotaBadRequest'}
+        '401': {$ref: '#/components/responses/KeyUnauthorized'}
+        '403': {$ref: '#/components/responses/QuotaForbidden'}
+        '404': {$ref: '#/components/responses/QuotaNotFound'}
+        '409':
+          description: '`budget_below_usage`: the limit is below this month''s usage (spent + reserved + unknown)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/QuotaUnavailable'}
 components:
   securitySchemes:
     bearerAuth:
@@ -1232,6 +1351,17 @@ components:
       name: x-api-key
       description: 'A platform API key `abx_live_<id>_<secret>` (tenancy enabled). The same key is also accepted as `Authorization: Bearer abx_live_...`.'
   parameters:
+    QuotaKind:
+      name: kind
+      in: path
+      required: true
+      schema: {type: string, enum: [org, user, key]}
+    QuotaID:
+      name: id
+      in: path
+      required: true
+      description: The org name, the username, or the key id
+      schema: {type: string}
     TaskID:
       name: id
       in: path
@@ -1265,6 +1395,38 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/SessionWriteRequest'}
   responses:
+    RuntimeRateLimited:
+      description: |
+        `rate_limit_exceeded`: the requests-per-minute limit of the caller's key, user or org is used up (API key and
+        session callers; the operator is never limited). Retry after `Retry-After` seconds.
+      headers:
+        Retry-After: {schema: {type: integer}, description: Seconds until a request can succeed}
+        x-ratelimit-limit-requests: {schema: {type: integer}, description: The most constrained level's limit per minute}
+        x-ratelimit-remaining-requests: {schema: {type: integer}, description: Requests left at that level}
+        x-ratelimit-reset-requests: {schema: {type: string}, description: 'Time until that level is full again, e.g. `12s`'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    QuotaBadRequest:
+      description: '`invalid_request` (kind, body or period), or `exceeds_org_limit`: a user''s or key''s value above its org''s'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    QuotaForbidden:
+      description: '`forbidden` (members; owners setting their own org''s limits), or `permission_denied` (API keys never manage limits or budgets)'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    QuotaNotFound:
+      description: '`org_not_found`, `user_not_found` or `key_not_found` (also a level of another org)'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    QuotaUnavailable:
+      description: '`quota_unavailable` (limits and budgets are not enabled), or as for every operation'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
     KeyUnauthorized:
       description: '`unauthorized` (no valid session or Bearer token); or `invalid_api_key`: the API key is malformed, unknown, revoked or expired, or its user or org is disabled'
       content:
@@ -1393,6 +1555,42 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
   schemas:
+    LimitsRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        rpm: {type: integer, nullable: true, minimum: 0, maximum: 2147483647, description: Requests per minute}
+        tpm: {type: integer, nullable: true, minimum: 0, maximum: 2147483647, description: Tokens per minute (model API)}
+        max_sandboxes: {type: integer, nullable: true, minimum: 0, maximum: 2147483647, description: Concurrent sandboxes of the org (checked at admission)}
+        max_streams: {type: integer, nullable: true, minimum: 0, maximum: 2147483647, description: Concurrent model streams (model API)}
+    Limits:
+      type: object
+      required: [kind, id, rpm, tpm, max_sandboxes, max_streams]
+      properties:
+        kind: {type: string, enum: [org, user, key]}
+        id: {type: string}
+        rpm: {type: integer, nullable: true}
+        tpm: {type: integer, nullable: true}
+        max_sandboxes: {type: integer, nullable: true}
+        max_streams: {type: integer, nullable: true}
+    BudgetRequest:
+      type: object
+      additionalProperties: false
+      required: [limit_micro]
+      properties:
+        limit_micro: {type: integer, nullable: true, minimum: 0, description: Monthly limit in micro-USD; null is unlimited}
+    Budget:
+      type: object
+      required: [kind, id, period, limit_micro, reserved_micro, spent_micro, unknown_micro, available_micro]
+      properties:
+        kind: {type: string, enum: [org, user, key]}
+        id: {type: string}
+        period: {type: string, description: 'The UTC month, `YYYY-MM`'}
+        limit_micro: {type: integer, nullable: true, description: null is unlimited}
+        reserved_micro: {type: integer}
+        spent_micro: {type: integer}
+        unknown_micro: {type: integer}
+        available_micro: {type: integer, nullable: true, description: limit − spent − reserved − unknown (null when unlimited)}
     Me:
       type: object
       required: [operator, scopes]

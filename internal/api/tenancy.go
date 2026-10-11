@@ -18,7 +18,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/tenant"
 )
 
-var tenantRoutes = []route{
+var tenantRoutes = append([]route{
 	{"GET", "/v1/me", accessRead, audienceMe, []int{200, 401, 403, 500, 503}, (*Handler).getMe},
 	{"POST", "/v1/keys", accessWrite, audienceManage, []int{201, 400, 401, 403, 404, 500, 503}, (*Handler).createKey},
 	{"GET", "/v1/keys", accessRead, audienceManage, []int{200, 401, 403, 500, 503}, (*Handler).listKeys},
@@ -30,7 +30,7 @@ var tenantRoutes = []route{
 	{"GET", "/v1/orgs/invites", accessRead, audienceCookie, []int{200, 401, 403, 500, 503}, (*Handler).listInvites},
 	{"POST", "/v1/orgs/invites/{id}/accept", accessWrite, audienceCookie, []int{200, 401, 403, 404, 409, 500, 503}, (*Handler).acceptInvite},
 	{"DELETE", "/v1/orgs/invites/{id}", accessWrite, audienceCookie, []int{204, 401, 403, 404, 500, 503}, (*Handler).deleteInvite},
-}
+}, quotaRoutes...)
 
 // keyCredential 返回请求携带的平台 API key：Authorization: Bearer abx_…，或没有 Authorization 头时以 abx_ 开头的
 // x-api-key（其他 x-api-key 值与今天一样忽略，cookie 照常认证）。未配置 Tenancy 时恒为 false（abx_ Bearer 按运维 token 判定）。

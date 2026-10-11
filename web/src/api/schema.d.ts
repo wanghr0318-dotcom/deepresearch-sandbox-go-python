@@ -856,10 +856,110 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/limits/{kind}/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: components["parameters"]["QuotaKind"];
+                /** @description The org name, the username, or the key id */
+                id: components["parameters"]["QuotaID"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Rate and concurrency limits of an org, user or key (null = no limit at that level)
+         * @description Org owners read their org and its users and keys; the operator reads everything. Members and API keys
+         *     cannot (403). Levels of another org answer 404 like ones that do not exist.
+         */
+        get: operations["getLimits"];
+        /**
+         * Replace the limits of an org (operator) or of a user or key (its org's owners, operator)
+         * @description Every field is replaced; an absent field is null (no limit at that level). A user's or key's value cannot be
+         *     above the same limit of its org (400 `exceeds_org_limit`). Only `rpm` is enforced on the runtime API
+         *     (`POST /sessions`, `/research`, `/sessions/{id}/messages`); `max_sandboxes` is checked when a task of the org
+         *     is admitted to a run slot; `tpm` and `max_streams` are for the model API.
+         */
+        put: operations["putLimits"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/budgets/{kind}/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: components["parameters"]["QuotaKind"];
+                /** @description The org name, the username, or the key id */
+                id: components["parameters"]["QuotaID"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Monthly money budget and usage of an org, user or key (UTC month)
+         * @description Usage counts every Gateway call made by the level's sandboxes: reserved (in flight), spent (settled) and
+         *     unknown (outcome unknown, charged in full). Same authorization as `GET /v1/limits/{kind}/{id}`.
+         */
+        get: operations["getBudget"];
+        /**
+         * Set the monthly budget of an org (operator) or of a user or key (its org's owners, operator)
+         * @description Sets the limit of the current UTC month; later months start with the same limit. null means unlimited.
+         *     A user's or key's limit cannot be above its org's limit for the month (400 `exceeds_org_limit`), and no
+         *     limit can be below the month's usage including reservations (409 `budget_below_usage`).
+         */
+        put: operations["putBudget"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        LimitsRequest: {
+            /** @description Requests per minute */
+            rpm?: number | null;
+            /** @description Tokens per minute (model API) */
+            tpm?: number | null;
+            /** @description Concurrent sandboxes of the org (checked at admission) */
+            max_sandboxes?: number | null;
+            /** @description Concurrent model streams (model API) */
+            max_streams?: number | null;
+        };
+        Limits: {
+            /** @enum {string} */
+            kind: "org" | "user" | "key";
+            id: string;
+            rpm: number | null;
+            tpm: number | null;
+            max_sandboxes: number | null;
+            max_streams: number | null;
+        };
+        BudgetRequest: {
+            /** @description Monthly limit in micro-USD; null is unlimited */
+            limit_micro: number | null;
+        };
+        Budget: {
+            /** @enum {string} */
+            kind: "org" | "user" | "key";
+            id: string;
+            /** @description The UTC month, `YYYY-MM` */
+            period: string;
+            /** @description null is unlimited */
+            limit_micro: number | null;
+            reserved_micro: number;
+            spent_micro: number;
+            unknown_micro: number;
+            /** @description limit − spent − reserved − unknown (null when unlimited) */
+            available_micro: number | null;
+        };
         Me: {
             operator: boolean;
             /** @description Absent for the operator */
@@ -1785,6 +1885,62 @@ export interface components {
         };
     };
     responses: {
+        /**
+         * @description `rate_limit_exceeded`: the requests-per-minute limit of the caller's key, user or org is used up (API key and
+         *     session callers; the operator is never limited). Retry after `Retry-After` seconds.
+         */
+        RuntimeRateLimited: {
+            headers: {
+                /** @description Seconds until a request can succeed */
+                "Retry-After"?: number;
+                /** @description The most constrained level's limit per minute */
+                "x-ratelimit-limit-requests"?: number;
+                /** @description Requests left at that level */
+                "x-ratelimit-remaining-requests"?: number;
+                /** @description Time until that level is full again, e.g. `12s` */
+                "x-ratelimit-reset-requests"?: string;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description `invalid_request` (kind, body or period), or `exceeds_org_limit`: a user's or key's value above its org's */
+        QuotaBadRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description `forbidden` (members; owners setting their own org's limits), or `permission_denied` (API keys never manage limits or budgets) */
+        QuotaForbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description `org_not_found`, `user_not_found` or `key_not_found` (also a level of another org) */
+        QuotaNotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description `quota_unavailable` (limits and budgets are not enabled), or as for every operation */
+        QuotaUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
         /** @description `unauthorized` (no valid session or Bearer token); or `invalid_api_key`: the API key is malformed, unknown, revoked or expired, or its user or org is disabled */
         KeyUnauthorized: {
             headers: {
@@ -1995,6 +2151,9 @@ export interface components {
         };
     };
     parameters: {
+        QuotaKind: "org" | "user" | "key";
+        /** @description The org name, the username, or the key id */
+        QuotaID: string;
         TaskID: string;
         ArtifactID: string;
         SessionID: string;
@@ -2195,6 +2354,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            429: components["responses"]["RuntimeRateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["Unavailable"];
         };
@@ -2622,6 +2782,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             409: components["responses"]["Conflict"];
+            429: components["responses"]["RuntimeRateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["SessionsUnavailable"];
         };
@@ -2809,6 +2970,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            429: components["responses"]["RuntimeRateLimited"];
             500: components["responses"]["Internal"];
             503: components["responses"]["SessionsUnavailable"];
         };
@@ -3512,6 +3674,146 @@ export interface operations {
             };
             500: components["responses"]["Internal"];
             503: components["responses"]["Unavailable"];
+        };
+    };
+    getLimits: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: components["parameters"]["QuotaKind"];
+                /** @description The org name, the username, or the key id */
+                id: components["parameters"]["QuotaID"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The limits */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Limits"];
+                };
+            };
+            400: components["responses"]["QuotaBadRequest"];
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["QuotaForbidden"];
+            404: components["responses"]["QuotaNotFound"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["QuotaUnavailable"];
+        };
+    };
+    putLimits: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: components["parameters"]["QuotaKind"];
+                /** @description The org name, the username, or the key id */
+                id: components["parameters"]["QuotaID"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LimitsRequest"];
+            };
+        };
+        responses: {
+            /** @description The limits now in effect */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Limits"];
+                };
+            };
+            400: components["responses"]["QuotaBadRequest"];
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["QuotaForbidden"];
+            404: components["responses"]["QuotaNotFound"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["QuotaUnavailable"];
+        };
+    };
+    getBudget: {
+        parameters: {
+            query?: {
+                /** @description The month, `YYYY-MM` (default the current UTC month) */
+                period?: string;
+            };
+            header?: never;
+            path: {
+                kind: components["parameters"]["QuotaKind"];
+                /** @description The org name, the username, or the key id */
+                id: components["parameters"]["QuotaID"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The budget */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Budget"];
+                };
+            };
+            400: components["responses"]["QuotaBadRequest"];
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["QuotaForbidden"];
+            404: components["responses"]["QuotaNotFound"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["QuotaUnavailable"];
+        };
+    };
+    putBudget: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                kind: components["parameters"]["QuotaKind"];
+                /** @description The org name, the username, or the key id */
+                id: components["parameters"]["QuotaID"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BudgetRequest"];
+            };
+        };
+        responses: {
+            /** @description The budget with its new limit */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Budget"];
+                };
+            };
+            400: components["responses"]["QuotaBadRequest"];
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["QuotaForbidden"];
+            404: components["responses"]["QuotaNotFound"];
+            /** @description `budget_below_usage`: the limit is below this month's usage (spent + reserved + unknown) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["QuotaUnavailable"];
         };
     };
 }
