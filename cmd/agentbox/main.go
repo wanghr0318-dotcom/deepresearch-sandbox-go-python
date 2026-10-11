@@ -85,6 +85,13 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "key" {
 		os.Exit(runKey(os.Args[2:], os.Stdout, os.Stderr))
 	}
+	// 限额与月度预算（G2）。
+	if len(os.Args) > 1 && os.Args[1] == "limits" {
+		os.Exit(runLimits(os.Args[2:], os.Stdout, os.Stderr))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "budget" {
+		os.Exit(runBudget(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	// 演示用 MCP 服务器（stdio；docs/design/2026-10-10-shell-file-mcp-design.md）：由 Gateway 按 --mcp-config 启动。
 	if len(os.Args) > 1 && os.Args[1] == "mcp-demo-server" {
 		if err := mcpdemo.ServeStdio(os.Stdin, os.Stdout); err != nil {
@@ -93,6 +100,6 @@ func main() {
 		}
 		return
 	}
-	fmt.Fprintln(os.Stderr, "用法: agentbox doctor | server ... | verify-invariants [--quiescent] ... | cache rotate-key --data-dir DIR | user list|disable|enable ... | org create|list|add-member ... | key create|list|revoke ... | task ... | status | eval run|report|compare ... | doctor-traces ... | mcp-demo-server")
+	fmt.Fprintln(os.Stderr, "用法: agentbox doctor | server ... | verify-invariants [--quiescent] ... | cache rotate-key --data-dir DIR | user list|disable|enable ... | org create|list|add-member ... | key create|list|revoke ... | limits set|show ... | budget set|show ... | task ... | status | eval run|report|compare ... | doctor-traces ... | mcp-demo-server")
 	os.Exit(2)
 }

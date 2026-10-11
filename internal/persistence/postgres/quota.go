@@ -479,12 +479,14 @@ func (q *QuotaStore) PutBudget(ctx context.Context, t quota.Target, period time.
 
 // OrgSandboxes 返回 org 的 max_sandboxes（nil 为不限）与当前存活环境数：环境的 attempt 属于该 org 的任务，或环境属于
 // 该 org 的会话；pending 是本 server 已准入、可能尚未建出环境的任务，其中尚无存活环境的也计入（各计一个）。
-// 不限时不计数。
+// 不限、或任务自己（或其会话）已有存活环境（不会新增沙箱）时 limit 为 nil，不计数。
 func (s *Store) OrgSandboxes(ctx context.Context, taskID string, pending []string) (orgID int64, limit *int64, live int64, err error) {
 	err = s.read(ctx, "OrgSandboxes", func(ctx context.Context, db queryer) error {
 		limit = nil
-		if err := db.QueryRow(ctx, `SELECT t.org_id, l.max_sandboxes FROM tasks t
-				LEFT JOIN limits l ON l.scope_kind = 'org' AND l.scope_id = t.org_id::text WHERE t.task_id = $1`, taskID).
+		if err := db.QueryRow(ctx, `SELECT t.org_id, CASE WHEN EXISTS (SELECT 1 FROM environments e LEFT JOIN attempts a ON a.attempt_id = e.attempt_id
+					WHERE e.stopped_at IS NULL AND e.kind <> 'exec' AND (a.task_id = t.task_id OR (t.session_id IS NOT NULL AND e.session_id = t.session_id)))
+				THEN NULL ELSE l.max_sandboxes END
+			FROM tasks t LEFT JOIN limits l ON l.scope_kind = 'org' AND l.scope_id = t.org_id::text WHERE t.task_id = $1`, taskID).
 			Scan(&orgID, &limit); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return notFoundf("任务 %s", taskID)

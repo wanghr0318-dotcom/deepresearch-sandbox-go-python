@@ -533,6 +533,9 @@ func TestOrgSandboxes(t *testing.T) {
 	if n := count(t, w.s, "SELECT count(*) FROM environments WHERE env_id = 'env-t1' AND attempt_id = 'att-t1' AND stopped_at IS NULL"); n != 1 {
 		t.Fatal("CreateAttempt 应已登记存活的环境 env-t1")
 	}
+	if _, limit, _, err := w.s.OrgSandboxes(ctx, "t1", nil); err != nil || limit != nil {
+		t.Fatalf("已有存活环境的任务不新增沙箱，不受上限约束：%v %v", limit, err)
+	}
 	if _, err := w.s.CreateResearch(ctx, w.other, api.CreateTaskRequest{RequestID: "r2", BodyHash: []byte("h"), TaskID: "t2",
 		Spec: json.RawMessage(`{}`), MaxFaultRetries: 1}); err != nil {
 		t.Fatal(err)
