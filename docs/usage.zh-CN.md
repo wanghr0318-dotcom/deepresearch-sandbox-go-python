@@ -265,6 +265,45 @@ sudo AGENTBOX_DATABASE_URL=... agentbox budget show org acme --period 2026-10
 
 `agentbox verify-invariants` 另核对 G1（每个预算行的 reserved / spent / unknown 等于其 hold 之和）与 G2（有上限的层级已用不超过上限）；hold 以高于预留的实际费用结算造成的超出单独列为 `G2 [超额，非违反]`，不算违反。
 
+### 用量、账单与对账
+
+启用账号时，server 每分钟把**已结算的预算 hold** 汇总进按日的 `usage_daily`（迁移 0015）：每行是一个 UTC 日、org、用户、key、模型与来源的请求数、输入与输出 token、已知费用（`cost_micro`，settled 的 hold）与未知费用（`unknown_micro`，`charged_unknown` 的 hold，即结果未知时按估算全额计入的部分）。来源 `model_api` 是模型 API 的请求（模型与 token 取自 `model_requests`）；来源 `runtime` 是沙箱经 Gateway 的调用（模型取自调用；搜索、抓取等记为端点名 `search`、`fetch`；运行时调用不记录 token，token 为 0）。被释放（没有发出、或可重试失败）的 hold 不算用量。日期取 hold 的创建时间，与 hold 计入的预算月份一致，所以一个月的用量与该月 `quota_budgets` 的 `spent_micro` / `unknown_micro` 逐分相等。
+
+汇总按 watermark 增量：每次从仍有 held hold 的最早一天（至多一小时前所在的一天）起删除并重算，重跑结果相同；多个 server 的汇总经 PostgreSQL advisory lock 串行，并与对账在同一快照中进行。用量页与账单至多落后一分钟（响应中的 `as_of` 是上次汇总的时间）。
+
+**HTTP 端点**（登录会话或运维 token；API key 一律 `403 permission_denied`）：
+
+- `GET /v1/usage?from=YYYY-MM-DD&to=YYYY-MM-DD&group_by=day,model,key,user,org,source`：默认本月 1 日到今天（UTC，至多 366 天）、按日分组；另可 `?user=`、`?key=` 过滤。成员只看到自己的用量，owner 看到本 org 的，运维看到全部 org（`?org=` 选一个）。看不到的 org、用户、key 与不存在的一样是 404。
+- `GET /v1/bills/YYYY-MM`：该月账单，按模型列出请求、输入与输出 token、已知与未知费用及合计，另按来源汇总；owner 为本 org 的账单，成员为自己在 org 中的部分（`username` 字段），运维须加 `?org=`。
+- `GET /v1/orgs/members`：org 的成员与角色（owner；运维须加 `?org=`），供"成员"页使用。
+
+```bash
+curl -s -H "Authorization: Bearer $(cat <data>/api.token)" 'http://127.0.0.1:8080/v1/usage?org=acme&group_by=day,model'
+curl -s -H "Authorization: Bearer $(cat <data>/api.token)" 'http://127.0.0.1:8080/v1/bills/2026-10?org=acme'
+```
+
+**运维 CLI**（直接连接数据库，看全部 org；`--rollup` 先汇总一次，适合 server 没在运行时）：
+
+```bash
+sudo AGENTBOX_DATABASE_URL=... agentbox usage --org acme --from 2026-10-01 --to 2026-10-31 --group-by day,model
+sudo AGENTBOX_DATABASE_URL=... agentbox bill show 2026-10 --org acme
+sudo AGENTBOX_DATABASE_URL=... agentbox bill reconcile 2026-10
+```
+
+`agentbox bill reconcile <YYYY-MM>` 在同一快照中先汇总，再从原始的 `quota_holds`、`model_requests` 与调用记录重算该月，与 `usage_daily`（逐日、org、用户、key、模型、来源）和 `quota_budgets`（每个层级的 spent 与 unknown）比较；一致时退出码 0，有差异时逐条打印（指明 org、用户、key 与模型）并以退出码 1 结束（`--json` 输出报告，`--no-rollup` 比较现有的 `usage_daily`）。已汇总过的历史日期不会被自动重算，所以其中被改动的数据会作为差异报告出来。`agentbox verify-invariants --usage-month YYYY-MM` 把同样的比较作为 `U1 [对账]` 项加入检查（只读，不先汇总，所以当月可能有尚未汇总的差异）。
+
+**网页**：登录后顶部导航有三页：
+
+- **API 密钥**（`#/keys`）：列出名称、ID、权限范围、创建时间、最近使用、过期时间与状态（有效、已过期、已吊销）；"新建密钥"选择权限范围（模型 API、运行时）与有效期，创建后在对话框中**只显示一次**完整密钥，带复制按钮与醒目的提示，关闭后无法再看；吊销需要再点一次"确认吊销"。收到组织邀请时页顶有提示。
+- **用量**（`#/usage`）：所选日期范围的费用（其中未知）、请求与 token 合计，每日费用与每日 token 的柱状图（SVG，悬停显示数值），按模型与按密钥的明细表，组织、本人与每个密钥的本月预算进度条（已花费、未知、预留中三段与剩余；只有 owner 能看预算），以及本月账单摘要。
+- **成员**（`#/org`）：所有人都能看到收到的邀请（接受或拒绝）与自己的组织，并可离开团队组织（需确认；回到个人组织，本组织的密钥被吊销）；owner 另可查看成员与角色、移出成员、按用户名与角色邀请、撤销待接受的邀请。
+
+**已知限制**：
+
+- 用量来自已结算的 hold，进行中的请求（hold 仍为 held）在结算后的下一次汇总才出现；hold 结算失败而由 sweep 转为未知的模型请求没有 `model_requests` 行，记为模型"（未记录）"。
+- 运行时调用不记录 token，只有请求数与费用。
+- 对账只能在一个快照中比较：`--no-rollup` 或 `verify-invariants --usage-month` 对当月会报告尚未汇总的新用量。
+
 ### 模型 API（`--model-api`，可选，默认关闭）
 
 `agentbox server` 加 `--model-api`（需要 `--model-base-url`，即启用账号与多租户）后，同一个监听地址另外提供：
