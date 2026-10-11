@@ -325,7 +325,7 @@ func (d *openAIMessages) message(raw json.RawMessage, field string) error {
 	if err != nil {
 		return err
 	}
-	if err := checkAllowed(m, field, openAIMessageFields...); err != nil {
+	if err := checkAllowedDump(m, field, openAIMessageFields...); err != nil {
 		return err
 	}
 	role, err := str(m["role"], field+".role")

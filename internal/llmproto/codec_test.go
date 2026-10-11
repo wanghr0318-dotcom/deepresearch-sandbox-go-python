@@ -28,7 +28,7 @@ func TestDecodeOpenAIRequestErrors(t *testing.T) {
 		{"bad max_tokens", `{"messages":[{"role":"user","content":"x"}],"max_tokens":0}`, false, "max_tokens"},
 		{"bad stream", `{"messages":[{"role":"user","content":"x"}],"stream":"yes"}`, false, "stream"},
 		{"stream_options key", `{"messages":[{"role":"user","content":"x"}],"stream_options":{"x":1}}`, true, "stream_options.x"},
-		{"unknown message field", `{"messages":[{"role":"user","content":"x","foo":{}}]}`, true, "messages[0].foo"},
+		{"unknown message field", `{"messages":[{"role":"user","content":"x","foo":1}]}`, true, "messages[0].foo"},
 		{"function role", `{"messages":[{"role":"function","content":"x","name":"f"}]}`, true, "messages[0].role"},
 		{"reasoning on user", `{"messages":[{"role":"user","content":"x","reasoning_content":"r"}]}`, true, "messages[0].reasoning_content"},
 		{"user without content", `{"messages":[{"role":"user"}]}`, false, "messages[0].content"},
