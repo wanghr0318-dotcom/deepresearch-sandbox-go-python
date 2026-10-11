@@ -1,6 +1,7 @@
 // 极简 hash 路由：页面路由全部放在 # 之后，永远不会与 API 路径（/tasks、/status、/auth、/research…）冲突。
 // - 用户页：#/login、#/register、#/（新对话）、#/s/<id>（对话会话）、
-//   #/research（早期的 DeepResearch 助手页）、#/research/<id>（早期研究的进度与报告）
+//   #/research（早期的 DeepResearch 助手页）、#/research/<id>（早期研究的进度与报告）、
+//   #/keys（API 密钥）、#/usage（用量与账单）、#/org（成员与邀请）
 // - 运维工作台：#/admin、#/admin/tasks、#/admin/tasks/<id>（TokenGate 不变）
 import { onBeforeUnmount, ref } from "vue";
 import type { Ref } from "vue";
@@ -13,6 +14,9 @@ export type Route =
   | { name: "chat"; id?: string }
   | { name: "legacy" }
   | { name: "research"; id: string }
+  | { name: "keys" }
+  | { name: "usage" }
+  | { name: "org" }
   | AdminRoute;
 
 /** 运维工作台的路由（#/admin/...）。 */
@@ -22,7 +26,7 @@ export function isAdminRoute(r: Route): r is AdminRoute {
 
 /** 需要登录的用户页。 */
 export function needsSession(r: Route): boolean {
-  return r.name === "chat" || r.name === "legacy" || r.name === "research";
+  return r.name === "chat" || r.name === "legacy" || r.name === "research" || r.name === "keys" || r.name === "usage" || r.name === "org";
 }
 
 function decodeId(raw: string): string | null {
@@ -44,6 +48,9 @@ export function parseHash(hash: string): Route {
     return id ? { name: "chat", id } : { name: "chat" };
   }
 
+  if (/^\/keys\/?$/.test(path)) return { name: "keys" };
+  if (/^\/usage\/?$/.test(path)) return { name: "usage" };
+  if (/^\/org\/?$/.test(path)) return { name: "org" };
   if (/^\/research\/?$/.test(path)) return { name: "legacy" };
   const research = /^\/research\/([^/?#]+)\/?$/.exec(path);
   if (research?.[1]) {
@@ -84,6 +91,18 @@ export function legacyHref(): string {
 
 export function researchHref(id: string): string {
   return `#/research/${encodeURIComponent(id)}`;
+}
+
+export function keysHref(): string {
+  return "#/keys";
+}
+
+export function usageHref(): string {
+  return "#/usage";
+}
+
+export function orgHref(): string {
+  return "#/org";
 }
 
 export function tasksHref(): string {

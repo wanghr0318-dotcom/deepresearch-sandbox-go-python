@@ -757,7 +757,12 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * Members of the caller's org with their roles (owners; the operator with `?org=`)
+         * @description Owners list their own org. The operator must name the org. Members get 403 `forbidden`; API keys 403
+         *     `permission_denied`. Another org is the same 404 as a missing one.
+         */
+        get: operations["listMembers"];
         put?: never;
         /**
          * Move a user into an org or change their role (operator only; users join through invites)
@@ -913,6 +918,56 @@ export interface paths {
          *     limit can be below the month's usage including reservations (409 `budget_below_usage`).
          */
         put: operations["putBudget"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Daily usage (requests, tokens, known and unknown cost) grouped by day, model, key, user, org or source
+         * @description Read from `usage_daily`, which a periodic rollup fills from settled budget holds (`as_of` is the time of the
+         *     last rollup). Cost is in micro-USD: `cost_micro` is known cost, `unknown_micro` was charged at the estimate
+         *     because the outcome was unknown. Source `model_api` is `/v1/chat/completions` and `/v1/messages`; source
+         *     `runtime` is the calls made by sandboxes (tokens are not recorded for them). Members see only their own
+         *     usage, owners their org's, the operator every org (or the one in `?org=`). API keys get 403
+         *     `permission_denied`. An org, user or key the caller cannot see is the same 404 as a missing one.
+         */
+        get: operations["getUsage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/bills/{month}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The UTC month, `YYYY-MM` */
+                month: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * A month's bill for an org (a member's own share for members) with per-model tokens and cost
+         * @description The month's `usage_daily` rows summed per model and per source, with known and unknown cost apart. Owners get
+         *     their org's bill and members their own share (`username` is set); the operator must name the org with
+         *     `?org=`. Same authorization as `GET /v1/usage`.
+         */
+        get: operations["getBill"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -1149,6 +1204,74 @@ export interface components {
             name: string;
             /** @description A username still alone in their personal org */
             owner?: string;
+        };
+        UsageTotals: {
+            requests: number;
+            prompt_tokens: number;
+            completion_tokens: number;
+            /** @description Known cost in micro-USD (settled) */
+            cost_micro: number;
+            /** @description Cost charged at the estimate because the outcome was unknown */
+            unknown_micro: number;
+        };
+        UsageRow: components["schemas"]["UsageTotals"] & {
+            /** @description `YYYY-MM-DD` (UTC) */
+            day?: string;
+            /** Format: int64 */
+            org_id?: number;
+            org?: string;
+            username?: string;
+            key_id?: string;
+            key_name?: string;
+            /** @description Empty when the request's record is missing */
+            model?: string;
+            /** @enum {string} */
+            source?: "runtime" | "model_api";
+        };
+        Usage: {
+            from: string;
+            to: string;
+            group_by: ("day" | "org" | "user" | "key" | "model" | "source")[];
+            rows: components["schemas"]["UsageRow"][];
+            total: components["schemas"]["UsageTotals"];
+            /**
+             * Format: date-time
+             * @description Time of the last rollup (null before the first)
+             */
+            as_of: string | null;
+        };
+        BillLine: components["schemas"]["UsageTotals"] & {
+            model: string;
+            /** @description cost_micro + unknown_micro */
+            total_micro: number;
+        };
+        BillSource: components["schemas"]["UsageTotals"] & {
+            /** @enum {string} */
+            source: "runtime" | "model_api";
+            total_micro: number;
+        };
+        Bill: {
+            month: string;
+            org: {
+                /** Format: int64 */
+                id: number;
+                name: string;
+            };
+            /** @description Set on a member's bill (their own share) */
+            username?: string;
+            models: components["schemas"]["BillLine"][];
+            sources: components["schemas"]["BillSource"][];
+            total: components["schemas"]["BillLine"];
+            /** Format: date-time */
+            as_of: string | null;
+        };
+        MemberList: {
+            org: {
+                /** Format: int64 */
+                id: number;
+                name: string;
+            };
+            members: components["schemas"]["Membership"][];
         };
         Membership: {
             /** Format: int64 */
@@ -2100,6 +2223,15 @@ export interface components {
         };
         /** @description `org_not_found`, `user_not_found` or `key_not_found` (also a level of another org) */
         QuotaNotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description `usage_unavailable` (usage accounting is not enabled), or as for every operation */
+        UsageUnavailable: {
             headers: {
                 [name: string]: unknown;
             };
@@ -3591,6 +3723,51 @@ export interface operations {
             503: components["responses"]["Unavailable"];
         };
     };
+    listMembers: {
+        parameters: {
+            query?: {
+                /** @description The org name (required for the operator) */
+                org?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The members, owners first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemberList"];
+                };
+            };
+            /** @description `invalid_request` (the operator did not name an org) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            /** @description `org_not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
     addMember: {
         parameters: {
             query?: never;
@@ -3994,6 +4171,113 @@ export interface operations {
             };
             500: components["responses"]["Internal"];
             503: components["responses"]["QuotaUnavailable"];
+        };
+    };
+    getUsage: {
+        parameters: {
+            query?: {
+                /** @description First UTC day, `YYYY-MM-DD` (default the first day of this month) */
+                from?: string;
+                /** @description Last UTC day, inclusive (default today); at most 366 days after `from` */
+                to?: string;
+                /** @description Comma-separated dimensions among `day`, `model`, `key`, `user`, `org`, `source` (default `day`) */
+                group_by?: string;
+                /** @description The org name (the operator; others may only name their own) */
+                org?: string;
+                /** @description A username of the org (members may only name themselves) */
+                user?: string;
+                /** @description An API key id the caller can see */
+                key?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The grouped rows and their total */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Usage"];
+                };
+            };
+            /** @description `invalid_request` (dates, range or group_by) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            /** @description `org_not_found`, `user_not_found` or `key_not_found` (also one the caller cannot see) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["UsageUnavailable"];
+        };
+    };
+    getBill: {
+        parameters: {
+            query?: {
+                /** @description The org name (required for the operator) */
+                org?: string;
+                /** @description Only this user's usage (owners and the operator) */
+                user?: string;
+                /** @description Only this key's usage */
+                key?: string;
+            };
+            header?: never;
+            path: {
+                /** @description The UTC month, `YYYY-MM` */
+                month: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The bill */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Bill"];
+                };
+            };
+            /** @description `invalid_request` (month, or the operator did not name an org) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            /** @description `org_not_found`, `user_not_found` or `key_not_found` (also one the caller cannot see) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["UsageUnavailable"];
         };
     };
     createChatCompletion: {
