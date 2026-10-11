@@ -346,6 +346,10 @@ func (f *serverFlags) modelSettings() (app.ModelConfig, error) {
 		return app.ModelConfig{}, err
 	}
 	model.Routing.Mode, model.Routing.Weights = fr.Mode, fr.Weights // 文件没有给出时为零值：ordered，与之前相同
+	model.PrimaryModels = fr.PrimaryModels                          // 没有给出时为 nil：主供应商提供全部声明的模型
+	if err := model.ValidatePrimaryModels(); err != nil {           // 启动前以退出码 2 拒绝
+		return app.ModelConfig{}, fmt.Errorf("--model-fallback-file: %w", err)
+	}
 	return model, nil
 }
 

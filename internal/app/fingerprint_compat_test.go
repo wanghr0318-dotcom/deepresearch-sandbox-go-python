@@ -30,3 +30,15 @@ func TestUpstreamFingerprintUnchangedForOpenAIConfigs(t *testing.T) {
 		}
 	}
 }
+
+// routing.primary_models changes the fingerprint when given (an empty map too), and nothing when absent.
+func TestPrimaryModelsFingerprint(t *testing.T) {
+	base := Config{Model: ModelConfig{BaseURL: "https://m/v1", Name: "a", Fallbacks: []ModelFallback{{Name: "b", BaseURL: "https://b/v1"}}}}
+	empty, listed := base, base
+	empty.Model.PrimaryModels = map[string]string{}
+	listed.Model.PrimaryModels = map[string]string{"a": "a"}
+	f0, f1, f2 := upstreamFingerprint(base), upstreamFingerprint(empty), upstreamFingerprint(listed)
+	if f0 == f1 || f0 == f2 || f1 == f2 {
+		t.Fatalf("fingerprints %s %s %s", f0, f1, f2)
+	}
+}

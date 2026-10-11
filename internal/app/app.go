@@ -189,6 +189,9 @@ type ModelConfig struct {
 	// Fallbacks 是按顺序的后备供应商（模型降级链，docs/design/2026-10-10-model-fallback-design.md）；空时只有
 	// 主供应商，行为与引入降级链之前完全相同。主供应商的路由名为 "primary"。
 	Fallbacks []ModelFallback
+	// PrimaryModels（降级链文件的 routing.primary_models）非 nil 时主供应商只提供其中的逻辑模型，并映射为其模型名；
+	// nil 时主供应商以同名提供全部声明的模型（与之前相同）。须有后备供应商，且每个声明的模型至少由一个路由提供。
+	PrimaryModels map[string]string
 	// Routing 是降级链的熔断、每 try 超时与对冲配置（只在有后备供应商时生效）。
 	Routing call.RoutingConfig
 }
@@ -226,6 +229,9 @@ func (m ModelConfig) validateFallbacks(allowPrivate []string) error {
 		return errors.New("app: 降级链的熔断、每 try 超时与对冲参数不能为负")
 	}
 	if len(m.Fallbacks) == 0 {
+		if m.PrimaryModels != nil {
+			return errors.New("app: routing.primary_models 需要后备供应商（--model-fallback-file 的 providers）")
+		}
 		if r.Mode != "" || len(r.Weights) > 0 {
 			return errors.New("app: 路由模式与权重需要后备供应商（--model-fallback-file）")
 		}
@@ -284,7 +290,38 @@ func (m ModelConfig) validateFallbacks(allowPrivate []string) error {
 			}
 		}
 	}
+	if err := m.ValidatePrimaryModels(); err != nil {
+		return err
+	}
 	return m.validateRoutingMode(seen)
+}
+
+// ValidatePrimaryModels 校验 routing.primary_models：逻辑模型须已声明、供应商模型名非空；给出时每个声明的模型须至少
+// 由一个路由提供（主供应商的 primary_models 或某个后备供应商）。
+func (m ModelConfig) ValidatePrimaryModels() error {
+	if m.PrimaryModels == nil {
+		return nil
+	}
+	for logical, vendor := range m.PrimaryModels {
+		if !m.declared(logical) || strings.TrimSpace(vendor) == "" {
+			return fmt.Errorf("app: routing.primary_models 的映射 %q → %q：逻辑模型须已声明、供应商模型名非空", logical, vendor)
+		}
+	}
+	for _, model := range declaredModels(m) {
+		served := false
+		if _, ok := m.PrimaryModels[model]; ok {
+			served = true
+		}
+		for _, fb := range m.Fallbacks {
+			if _, ok := fb.Models[model]; ok || len(fb.Models) == 0 {
+				served = true
+			}
+		}
+		if !served {
+			return fmt.Errorf("app: 声明的模型 %q 没有任何路由提供（routing.primary_models 不含它，后备供应商的 models 也不含它）", model)
+		}
+	}
+	return nil
 }
 
 func negativePrice(p upstream.Pricing) bool {
