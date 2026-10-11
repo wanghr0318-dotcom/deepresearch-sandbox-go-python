@@ -709,6 +709,7 @@ type server struct {
 	// 模型网关 G2（启用账号时）：限流器的 Redis 连接（配置了 --redis-addr 时）与 org 并发沙箱闸门。
 	limiterRedis *cache.Redis
 	sandboxGate  *sandboxGate
+	inflight     *inflightTries // 本进程在途的 Gateway try（复审 F7；启用账号时）
 
 	workspaces *workspace.Manager // --workspace-tools；nil 表示关闭
 	mcpHub     *mcp.Hub           // --mcp-config；nil 表示关闭
@@ -920,7 +921,12 @@ func (s *server) assembleGateway(blobs blob.Store) error {
 	} else if ad != nil {
 		adapters = append(adapters, ad)
 	}
-	cfg := call.Config{Store: s.store, Adapters: adapters, Pricing: pricing, ChatPricing: chatPricing,
+	var callStore call.Store = s.store
+	if s.cfg.Accounts { // 复审 F7：登记在途 try，结算失败而仍为 held 的预留由周期任务转换
+		s.inflight = newInflightTries()
+		callStore = trackingCallStore{Store: s.store, t: s.inflight}
+	}
+	cfg := call.Config{Store: callStore, Adapters: adapters, Pricing: pricing, ChatPricing: chatPricing,
 		Blobs: blobs, Events: hostEvents{s: s.store}, Limits: s.cfg.Gateway, Logger: s.log, Routing: s.cfg.Model.Routing}
 	if n := len(s.cfg.Model.Fallbacks); n > 0 {
 		names := []string{PrimaryRoute}
@@ -1407,6 +1413,13 @@ func (s *server) startAPI() error {
 				defer s.bg.Done()
 				s.sweepQuota(s.apiCtx, q)
 			}()
+			if st, ok := s.store.(staleLedgerStore); ok && s.inflight != nil {
+				s.bg.Add(1)
+				go func() {
+					defer s.bg.Done()
+					s.convertStaleLedger(s.apiCtx, st)
+				}()
+			}
 		}
 	}
 	var sessions api.Sessions // 未启用会话时保持 nil 接口：会话端点 503 sessions_unavailable

@@ -609,3 +609,60 @@ func TestQuotaUserRowsAreScopedToOrg(t *testing.T) {
 	expectUsage(t, w.budget(t, quota.LevelUser), 0, 10, 0)
 	checkQuota(t, w.s)
 }
+
+// TestConvertStaleReservations（复审 F7）：结算失败（这里直接不结算）的 try 在调用期限过去之后由周期任务按启动账本转换的
+// 同一路径转为 charged_unknown：reservation 与 hold 同步、任务账本与月度预算的 reserved 转入 unknown；没有其他 held 预留的
+// 在途调用转为 unknown；已完成的调用（对冲中另一条腿已结算）状态不变；期限未过的与已结算的不受影响。
+func TestConvertStaleReservations(t *testing.T) {
+	ctx := context.Background()
+	w := newQuotaWorld(t)
+	quotaTask(t, w, "t1", 10_000)
+	beginCall(t, w.s, "t1", "c1")
+	stuck := mustReserve(t, w.s, "t1", "c1", 70) // 结算失败：仍为 held
+	beginCall(t, w.s, "t1", "c2")
+	fresh := mustReserve(t, w.s, "t1", "c2", 5) // 期限未过
+	beginCall(t, w.s, "t1", "c3")
+	done := mustReserve(t, w.s, "t1", "c3", 9)
+	settle(t, w.s, call.Settlement{Try: done, Outcome: "ok", ActualMicro: 9, ResultSHA256: strings.Repeat("b", 64), ResultSize: 1})
+	if _, err := w.s.pool.Exec(ctx, "UPDATE calls SET created_at = now() - interval '1 hour', deadline_at = now() - interval '10 minutes' WHERE call_id IN ('c1', 'c3')"); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := w.s.StaleHeldReservations(ctx, 2*time.Minute)
+	if err != nil || len(ids) != 1 || ids[0] != stuck.ReservationID {
+		t.Fatalf("StaleHeldReservations = %v, %v", ids, err)
+	}
+	n, err := w.s.ConvertStaleReservations(ctx, append(ids, done.ReservationID, "rsv-missing"))
+	if err != nil || n != 1 {
+		t.Fatalf("ConvertStaleReservations = %d, %v", n, err)
+	}
+	checkI3(t, w.s)
+	for id, want := range map[string]string{stuck.ReservationID: "charged_unknown", fresh.ReservationID: "held", done.ReservationID: "settled"} {
+		if n := count(t, w.s, "SELECT count(*) FROM reservations r JOIN quota_holds q ON q.hold_id = r.reservation_id WHERE r.reservation_id = $1 AND r.state = $2 AND q.state = $2",
+			id, want); n != 1 {
+			t.Fatalf("%s 应为 %s（reservation 与 hold 同步）", id, want)
+		}
+	}
+	rec, _, err := w.s.LoadCall(ctx, "t1", "c1")
+	if err != nil || rec.State != call.StateUnknown || !rec.PossibleExternalDuplicate {
+		t.Fatalf("c1 = %+v, %v", rec, err)
+	}
+	expectBudget(t, w.s, "t1", call.Budget{LimitMicro: 10_000, ReservedMicro: 5, SpentMicro: 9, UnknownMicro: 70})
+	expectUsage(t, w.budget(t, quota.LevelOrg), 5, 9, 70)
+	if n, err := w.s.ConvertStaleReservations(ctx, []string{stuck.ReservationID}); err != nil || n != 0 {
+		t.Fatalf("再次转换应为空操作：%d, %v", n, err)
+	}
+
+	// 对冲中最终结果已结算（调用 completed），另一条腿结算失败：只转换那条腿，调用仍为 completed。
+	beginCall(t, w.s, "t1", "c4")
+	leg := mustReserve(t, w.s, "t1", "c4", 3)
+	if _, err := w.s.pool.Exec(ctx, `UPDATE calls SET state = 'completed', result_ref = repeat('b', 64), created_at = now() - interval '1 hour', deadline_at = now() - interval '10 minutes' WHERE call_id = 'c4'`); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := w.s.ConvertStaleReservations(ctx, []string{leg.ReservationID}); err != nil || n != 1 {
+		t.Fatalf("%d, %v", n, err)
+	}
+	if rec, _, _ := w.s.LoadCall(ctx, "t1", "c4"); rec.State != call.StateCompleted {
+		t.Fatalf("已完成的调用不应改变：%+v", rec)
+	}
+	checkQuota(t, w.s)
+}

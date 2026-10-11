@@ -724,48 +724,133 @@ const LedgerRestartError = "server_restart"
 func (s *Store) ConvertLedger(ctx context.Context) (recovery.LedgerConversion, error) {
 	var out recovery.LedgerConversion
 	err := s.run(ctx, "ConvertLedger", "ledger", func(ctx context.Context, tx pgx.Tx) error {
-		out = recovery.LedgerConversion{}
-		if _, err := tx.Exec(ctx, `UPDATE budgets b SET reserved_micro = b.reserved_micro - h.total, unknown_micro = b.unknown_micro + h.total
-			FROM (SELECT task_id, sum(amount) AS total FROM reservations WHERE state = 'held' AND kind = 'money' GROUP BY task_id) h
-			WHERE b.task_id = h.task_id`); err != nil {
-			return err
-		}
-		// sub-run 层同步（§9.6）：按 reservation 的归属分组，与 task 层同一事务（锁顺序 budgets → subrun_budgets）。
-		if _, err := tx.Exec(ctx, `UPDATE subrun_budgets b SET reserved_micro = b.reserved_micro - h.total, unknown_micro = b.unknown_micro + h.total
-			FROM (SELECT task_id, subrun_id, sum(amount) AS total FROM reservations WHERE state = 'held' AND kind = 'money' AND subrun_id IS NOT NULL
-				GROUP BY task_id, subrun_id) h
-			WHERE b.task_id = h.task_id AND b.subrun_id = h.subrun_id`); err != nil {
-			return err
-		}
-		// exec 配额（D10）：cpu 预留转 unknown；已标记启动的在途 exec 保守计入次数。
-		if _, err := tx.Exec(ctx, `UPDATE exec_quotas q SET cpu_reserved_usec = q.cpu_reserved_usec - h.total,
-				cpu_unknown_usec = q.cpu_unknown_usec + h.total, exec_count_used = q.exec_count_used + h.started
-			FROM (SELECT r.task_id, sum(r.amount) AS total, count(*) FILTER (WHERE t.exec_started_at IS NOT NULL) AS started
-				FROM reservations r JOIN call_tries t ON t.reservation_id = r.reservation_id
-				WHERE r.state = 'held' AND r.kind = 'cpu' GROUP BY r.task_id) h
-			WHERE q.task_id = h.task_id`); err != nil {
-			return err
-		}
-		tag, err := tx.Exec(ctx, `UPDATE calls c SET state = 'unknown',
-				possible_external_duplicate = c.possible_external_duplicate OR EXISTS (SELECT 1 FROM reservations r
-					WHERE r.task_id = c.task_id AND r.call_id = c.call_id AND r.state = 'held' AND r.kind = 'money')
-			WHERE c.state = 'in_flight'`)
+		var err error
+		out, err = convertLedgerTx(ctx, tx, nil)
+		return err
+	})
+	return out, err
+}
+
+// convertLedgerTx 是账本转换的事务体：ids 为 nil 时转换全部 held 的 reservation（启动时，ConvertLedger）；否则只转换
+// ids 中仍为 held 的（ConvertStaleReservations，调用方已按锁顺序锁住它们所属的账本、调用与 reservation 行）。
+// 只带 ids 时，调用仅在它不再有 ids 之外的 held reservation 时转为 unknown。
+func convertLedgerTx(ctx context.Context, tx pgx.Tx, ids []string) (recovery.LedgerConversion, error) {
+	var out recovery.LedgerConversion
+	// held 是参与转换的 reservation 条件（$1 为 ids，NULL 表示全部）。
+	const held = `state = 'held' AND ($1::text[] IS NULL OR reservation_id = ANY($1))`
+	if _, err := tx.Exec(ctx, `UPDATE budgets b SET reserved_micro = b.reserved_micro - h.total, unknown_micro = b.unknown_micro + h.total
+		FROM (SELECT task_id, sum(amount) AS total FROM reservations WHERE `+held+` AND kind = 'money' GROUP BY task_id) h
+		WHERE b.task_id = h.task_id`, ids); err != nil {
+		return out, err
+	}
+	// sub-run 层同步（§9.6）：按 reservation 的归属分组，与 task 层同一事务（锁顺序 budgets → subrun_budgets）。
+	if _, err := tx.Exec(ctx, `UPDATE subrun_budgets b SET reserved_micro = b.reserved_micro - h.total, unknown_micro = b.unknown_micro + h.total
+		FROM (SELECT task_id, subrun_id, sum(amount) AS total FROM reservations WHERE `+held+` AND kind = 'money' AND subrun_id IS NOT NULL
+			GROUP BY task_id, subrun_id) h
+		WHERE b.task_id = h.task_id AND b.subrun_id = h.subrun_id`, ids); err != nil {
+		return out, err
+	}
+	// exec 配额（D10）：cpu 预留转 unknown；已标记启动的在途 exec 保守计入次数。
+	if _, err := tx.Exec(ctx, `UPDATE exec_quotas q SET cpu_reserved_usec = q.cpu_reserved_usec - h.total,
+			cpu_unknown_usec = q.cpu_unknown_usec + h.total, exec_count_used = q.exec_count_used + h.started
+		FROM (SELECT r.task_id, sum(r.amount) AS total, count(*) FILTER (WHERE t.exec_started_at IS NOT NULL) AS started
+			FROM reservations r JOIN call_tries t ON t.reservation_id = r.reservation_id
+			WHERE r.state = 'held' AND ($1::text[] IS NULL OR r.reservation_id = ANY($1)) AND r.kind = 'cpu' GROUP BY r.task_id) h
+		WHERE q.task_id = h.task_id`, ids); err != nil {
+		return out, err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE calls c SET state = 'unknown',
+			possible_external_duplicate = c.possible_external_duplicate OR EXISTS (SELECT 1 FROM reservations r
+				WHERE r.task_id = c.task_id AND r.call_id = c.call_id AND r.state = 'held' AND r.kind = 'money'
+					AND ($1::text[] IS NULL OR r.reservation_id = ANY($1)))
+		WHERE c.state = 'in_flight' AND ($1::text[] IS NULL OR (
+			EXISTS (SELECT 1 FROM reservations r WHERE r.task_id = c.task_id AND r.call_id = c.call_id AND r.state = 'held'
+				AND r.reservation_id = ANY($1))
+			AND NOT EXISTS (SELECT 1 FROM reservations r WHERE r.task_id = c.task_id AND r.call_id = c.call_id AND r.state = 'held'
+				AND r.reservation_id <> ALL($1))))`, ids)
+	if err != nil {
+		return out, err
+	}
+	out.Calls = int(tag.RowsAffected())
+	if _, err := tx.Exec(ctx, `UPDATE call_tries t SET state = 'settled', outcome = 'unknown', error = $1
+		FROM reservations r WHERE r.reservation_id = t.reservation_id AND r.state = 'held' AND t.state = 'in_flight'
+			AND ($2::text[] IS NULL OR r.reservation_id = ANY($2))`,
+		LedgerRestartError, ids); err != nil {
+		return out, err
+	}
+	if err := convertTaskHoldsTx(ctx, tx, ids); err != nil {
+		return out, err
+	}
+	err = tx.QueryRow(ctx, `WITH x AS (UPDATE reservations SET state = 'charged_unknown' WHERE `+held+` RETURNING kind, amount)
+		SELECT count(*), COALESCE(sum(amount) FILTER (WHERE kind = 'money'), 0)::bigint FROM x`, ids).Scan(&out.Reservations, &out.UnknownMicro)
+	return out, err
+}
+
+// StaleHeldReservations 列出 money reservation 仍为 held、而其调用的 deadline_at 已过去 grace 以上的 reservation
+// （复审 F7：结算失败、例如对冲中另一条腿的结算出错时，它们原本要等下次重启的账本转换）。
+func (s *Store) StaleHeldReservations(ctx context.Context, grace time.Duration) ([]string, error) {
+	var out []string
+	err := s.read(ctx, "StaleHeldReservations", func(ctx context.Context, q queryer) error {
+		rows, err := q.Query(ctx, `SELECT r.reservation_id FROM reservations r JOIN calls c ON c.task_id = r.task_id AND c.call_id = r.call_id
+			WHERE r.state = 'held' AND r.kind = 'money' AND c.deadline_at + $1::bigint * interval '1 microsecond' < now()
+			ORDER BY c.deadline_at LIMIT 500`, grace.Microseconds())
 		if err != nil {
 			return err
 		}
-		out.Calls = int(tag.RowsAffected())
-		if _, err := tx.Exec(ctx, `UPDATE call_tries t SET state = 'settled', outcome = 'unknown', error = $1
-			FROM reservations r WHERE r.reservation_id = t.reservation_id AND r.state = 'held' AND t.state = 'in_flight'`,
-			LedgerRestartError); err != nil {
-			return err
-		}
-		if err := convertTaskHoldsTx(ctx, tx); err != nil {
-			return err
-		}
-		return tx.QueryRow(ctx, `WITH x AS (UPDATE reservations SET state = 'charged_unknown' WHERE state = 'held' RETURNING kind, amount)
-			SELECT count(*), COALESCE(sum(amount) FILTER (WHERE kind = 'money'), 0)::bigint FROM x`).Scan(&out.Reservations, &out.UnknownMicro)
+		out, err = pgx.CollectRows(rows, pgx.RowTo[string])
+		return err
 	})
 	return out, err
+}
+
+// ConvertStaleReservations 把仍为 held 的 money reservation 逐个按启动账本转换的同一路径转为 charged_unknown（复审 F7）：
+// 任务账本、sub-run 层、try、调用（没有其他 held reservation 时转为 unknown）与月度预算的 hold 同一事务转换，reservation
+// 与 hold 保持一致。每个 reservation 一个事务，按 SettleTry 的锁顺序先锁 budgets → subrun_budgets → calls →
+// reservations；已不是 held（期间已结算）的跳过。返回转换的数量。调用方须保证这些 try 已不在本进程中执行。
+func (s *Store) ConvertStaleReservations(ctx context.Context, ids []string) (int, error) {
+	n := 0
+	for _, id := range ids {
+		var done bool
+		err := s.run(ctx, "ConvertStaleReservation", id, func(ctx context.Context, tx pgx.Tx) error {
+			done = false
+			var taskID, callID, sub, state, kind string
+			err := tx.QueryRow(ctx, `SELECT task_id, call_id, COALESCE(subrun_id, ''), state, kind FROM reservations WHERE reservation_id = $1`, id).
+				Scan(&taskID, &callID, &sub, &state, &kind)
+			if errors.Is(err, pgx.ErrNoRows) || (err == nil && (state != "held" || kind != "money")) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if _, err := lockBudget(ctx, tx, taskID); err != nil {
+				return err
+			}
+			if sub != "" {
+				if _, err := lockSubrunBudgetTx(ctx, tx, taskID, sub); err != nil {
+					return err
+				}
+			}
+			if _, err := selectCallForUpdate(ctx, tx, taskID, callID); err != nil {
+				return err
+			}
+			if err := tx.QueryRow(ctx, "SELECT state FROM reservations WHERE reservation_id = $1 FOR UPDATE", id).Scan(&state); err != nil {
+				return err
+			}
+			if state != "held" {
+				return nil
+			}
+			conv, err := convertLedgerTx(ctx, tx, []string{id})
+			done = conv.Reservations == 1
+			return err
+		})
+		if err != nil {
+			return n, err
+		}
+		if done {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // LoadBudget 读取任务的账本（实现 call.Store）。

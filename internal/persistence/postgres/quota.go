@@ -511,22 +511,23 @@ func (s *Store) OrgSandboxes(ctx context.Context, taskID string, pending []strin
 	return orgID, limit, live, err
 }
 
-// convertTaskHoldsTx 是启动账本转换（ConvertLedger）的月度预算部分：reservation 仍为 held 的运行时调用 hold 按全额
+// convertTaskHoldsTx 是账本转换（convertLedgerTx；ids 为 nil 时全部）的月度预算部分：reservation 仍为 held 的运行时调用 hold 按全额
 // 转为 charged_unknown，各层级 reserved -= 金额、unknown += 金额（不变量 G1 保持）。须在 reservations 转换之前执行。
-func convertTaskHoldsTx(ctx context.Context, tx pgx.Tx) error {
+func convertTaskHoldsTx(ctx context.Context, tx pgx.Tx, ids []string) error {
 	if _, err := tx.Exec(ctx, `WITH h AS (SELECT q.org_id, q.user_id, q.key_id, q.period, q.amount_micro FROM quota_holds q
 			JOIN reservations r ON r.reservation_id = q.hold_id
-			WHERE q.state = 'held' AND q.source = 'task_call' AND r.state = 'held'),
+			WHERE q.state = 'held' AND q.source = 'task_call' AND r.state = 'held' AND ($1::text[] IS NULL OR r.reservation_id = ANY($1))),
 		lv AS (SELECT 'org' AS k, org_id::text AS i, period, amount_micro AS a FROM h
 			UNION ALL SELECT 'user', org_id::text || '/' || user_id::text, period, amount_micro FROM h WHERE user_id IS NOT NULL
 			UNION ALL SELECT 'key', key_id, period, amount_micro FROM h WHERE key_id IS NOT NULL),
 		agg AS (SELECT k, i, period, sum(a) AS total FROM lv GROUP BY k, i, period)
 		UPDATE quota_budgets b SET reserved_micro = b.reserved_micro - agg.total, unknown_micro = b.unknown_micro + agg.total
-		FROM agg WHERE b.scope_kind = agg.k AND b.scope_id = agg.i AND b.period = agg.period`); err != nil {
+		FROM agg WHERE b.scope_kind = agg.k AND b.scope_id = agg.i AND b.period = agg.period`, ids); err != nil {
 		return err
 	}
 	_, err := tx.Exec(ctx, `UPDATE quota_holds q SET state = 'charged_unknown', charged_micro = q.amount_micro
-		FROM reservations r WHERE r.reservation_id = q.hold_id AND r.state = 'held' AND q.state = 'held' AND q.source = 'task_call'`)
+		FROM reservations r WHERE r.reservation_id = q.hold_id AND r.state = 'held' AND q.state = 'held' AND q.source = 'task_call'
+			AND ($1::text[] IS NULL OR r.reservation_id = ANY($1))`, ids)
 	return err
 }
 

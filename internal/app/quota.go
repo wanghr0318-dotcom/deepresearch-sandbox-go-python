@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/cache"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/quota"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/ratelimit"
@@ -160,4 +161,105 @@ func (g *sandboxGate) release(taskID string) {
 	g.mu.Lock()
 	delete(g.pending, taskID)
 	g.mu.Unlock()
+}
+
+// ---- 结算失败后仍为 held 的预留（复审 F7）----
+
+// staleLedgerStore 是 Store 的可选能力：列出调用期限已过仍为 held 的 money reservation，并按启动账本转换的同一路径
+// 逐个转为 charged_unknown（reservation、任务账本与月度预算的 hold 同一事务）。
+type staleLedgerStore interface {
+	StaleHeldReservations(ctx context.Context, grace time.Duration) ([]string, error)
+	ConvertStaleReservations(ctx context.Context, ids []string) (int, error)
+}
+
+// 结算失败的预留的转换：每分钟一次；调用期限过去 staleGrace 之后才考虑（try 不会比调用期限活得更久）。
+const (
+	staleLedgerInterval = time.Minute
+	staleGrace          = 2 * time.Minute
+)
+
+// inflightTries 是本进程中已预留、尚未尝试结算的 try（按 reservation ID）。
+type inflightTries struct {
+	mu sync.Mutex
+	m  map[string]struct{}
+}
+
+func newInflightTries() *inflightTries { return &inflightTries{m: map[string]struct{}{}} }
+
+func (t *inflightTries) add(id string) {
+	t.mu.Lock()
+	t.m[id] = struct{}{}
+	t.mu.Unlock()
+}
+
+func (t *inflightTries) remove(id string) {
+	t.mu.Lock()
+	delete(t.m, id)
+	t.mu.Unlock()
+}
+
+func (t *inflightTries) has(id string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.m[id]
+	return ok
+}
+
+// trackingCallStore 在 Gateway 的 call.Store 外登记在途 try：ReserveTry 成功后登记，SettleTry 尝试之后（无论成败）注销。
+// 注销之后仍为 held 的 reservation 即结算失败，由 convertStaleLedger 转换。
+type trackingCallStore struct {
+	call.Store
+	t *inflightTries
+}
+
+func (s trackingCallStore) ReserveTry(ctx context.Context, r call.ReserveTryRequest) (call.Try, error) {
+	tr, err := s.Store.ReserveTry(ctx, r)
+	if err == nil {
+		s.t.add(tr.ReservationID)
+	}
+	return tr, err
+}
+
+func (s trackingCallStore) SettleTry(ctx context.Context, st call.Settlement) (call.CallRecord, error) {
+	defer s.t.remove(st.Try.ReservationID)
+	return s.Store.SettleTry(ctx, st)
+}
+
+// convertStaleLedgerOnce 把调用期限已过 staleGrace、仍为 held 且不在本进程中执行的 money reservation（及其 hold）转为
+// charged_unknown。在途的 try 从不触碰。
+func convertStaleLedgerOnce(ctx context.Context, st staleLedgerStore, inflight *inflightTries) (int, error) {
+	ids, err := st.StaleHeldReservations(ctx, staleGrace)
+	if err != nil || len(ids) == 0 {
+		return 0, err
+	}
+	stale := ids[:0]
+	for _, id := range ids {
+		if !inflight.has(id) {
+			stale = append(stale, id)
+		}
+	}
+	if len(stale) == 0 {
+		return 0, nil
+	}
+	return st.ConvertStaleReservations(ctx, stale)
+}
+
+// convertStaleLedger 每 staleLedgerInterval 运行一次 convertStaleLedgerOnce，直到 ctx 取消。
+func (s *server) convertStaleLedger(ctx context.Context, st staleLedgerStore) {
+	t := time.NewTicker(staleLedgerInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		n, err := convertStaleLedgerOnce(ctx, st, s.inflight)
+		switch {
+		case err != nil && ctx.Err() == nil:
+			s.log.Warn("转换结算失败的预留失败", "error", err.Error())
+		case n > 0:
+			s.log.Warn("结算失败、仍为 held 的预留按全额转为 charged_unknown（与重启时的账本转换相同）", "reservations", n)
+		}
+	}
 }

@@ -68,3 +68,33 @@ func TestSandboxGate(t *testing.T) {
 		t.Fatalf("a failing count lets the task through: %v", err)
 	}
 }
+
+type fakeStaleLedger struct {
+	ids       []string
+	converted []string
+}
+
+func (f *fakeStaleLedger) StaleHeldReservations(context.Context, time.Duration) ([]string, error) {
+	return f.ids, nil
+}
+func (f *fakeStaleLedger) ConvertStaleReservations(_ context.Context, ids []string) (int, error) {
+	f.converted = append(f.converted, ids...)
+	return len(ids), nil
+}
+
+// TestConvertStaleLedgerSkipsInflight (review F7): reservations whose try is still in flight in this process are
+// never converted; once the settlement was attempted (even if it failed) they are.
+func TestConvertStaleLedgerSkipsInflight(t *testing.T) {
+	inflight := newInflightTries()
+	inflight.add("r1")
+	f := &fakeStaleLedger{ids: []string{"r1", "r2"}}
+	n, err := convertStaleLedgerOnce(context.Background(), f, inflight)
+	if err != nil || n != 1 || len(f.converted) != 1 || f.converted[0] != "r2" {
+		t.Fatalf("%d %v %v", n, err, f.converted)
+	}
+	inflight.remove("r1")
+	f.converted, f.ids = nil, []string{"r1"}
+	if n, _ := convertStaleLedgerOnce(context.Background(), f, inflight); n != 1 {
+		t.Fatal("after the settlement attempt the reservation is converted")
+	}
+}
