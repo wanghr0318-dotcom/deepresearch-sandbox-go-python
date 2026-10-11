@@ -66,6 +66,10 @@ func TestModelFallbackFileGatewayFields(t *testing.T) {
 		{`{"providers":[{"name":"b","base_url":"https://b","price":{"in":1,"out":1}}],"routing":{"mode":"random"}}`, "routing.mode"},
 		{`{"providers":[{"name":"b","base_url":"https://b","price":{"in":1,"out":1}}],"routing":{"primary_weight":-1}}`, "primary_weight"},
 		{`{"providers":[{"name":"b","base_url":"https://b","price":{"in":1,"out":1}}],"routing":{"hedge":true}}`, "unknown field"},
+		{`{"providers":[{"name":"b","protocol":"anthropic","base_url":"https://b","anthropic_version":"2023-06-01\r\nX: y","price":{"in":1,"out":1}}]}`, "YYYY-MM-DD"},
+		{`{"providers":[{"name":"b","protocol":"anthropic","base_url":"https://b","anthropic_version":"latest","price":{"in":1,"out":1}}]}`, "YYYY-MM-DD"},
+		{`{"providers":[{"name":"b","base_url":"https://b","weight":2,"price":{"in":1,"out":1}}],"routing":{"mode":"ordered"}}`, "ordered"},
+		{`{"providers":[{"name":"b","base_url":"https://b","price":{"in":1,"out":1}}],"routing":{"mode":"ordered","primary_weight":2}}`, "ordered"},
 	} {
 		_, _, err := modelFallbackFile(write("bad.json", c.body), getenv)
 		if err == nil || !strings.Contains(err.Error(), c.want) {
@@ -81,6 +85,8 @@ func TestModelFallbackFileExitCode(t *testing.T) {
 	for i, body := range []string{
 		`{"providers":[{"name":"b","protocol":"gemini","base_url":"https://b.example/v1","price":{"in":1,"out":1}}]}`,
 		`{"providers":[{"name":"b","base_url":"https://b.example/v1","price":{"in":1,"out":1}}],"routing":{"mode":"fastest"}}`,
+		`{"providers":[{"name":"b","protocol":"anthropic","base_url":"https://b.example","anthropic_version":"v1","price":{"in":1,"out":1}}]}`,
+		`{"providers":[{"name":"b","base_url":"https://b.example/v1","weight":2,"price":{"in":1,"out":1}}],"routing":{"mode":"ordered"}}`,
 	} {
 		p := filepath.Join(dir, "bad.json")
 		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {

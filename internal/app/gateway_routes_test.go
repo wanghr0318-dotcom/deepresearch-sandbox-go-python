@@ -36,6 +36,10 @@ func TestFallbackProtocolsAndRoutingModes(t *testing.T) {
 		{"unknown mode", func(c *Config) { c.Model.Routing = call.RoutingConfig{Mode: "fastest"} }, "路由模式"},
 		{"weight of unknown route", func(c *Config) { c.Model.Routing = call.RoutingConfig{Weights: map[string]int{"nope": 1}} }, "权重"},
 		{"weight 0", func(c *Config) { c.Model.Routing = call.RoutingConfig{Weights: map[string]int{"claude": 0}} }, "权重"},
+		{"bad anthropic_version", func(c *Config) { c.Model.Fallbacks[0].AnthropicVersion = "2023-06-01\nX" }, "YYYY-MM-DD"},
+		{"ordered with weights", func(c *Config) {
+			c.Model.Routing = call.RoutingConfig{Mode: call.RoutingOrdered, Weights: map[string]int{"claude": 2}}
+		}, "ordered"},
 		{"mode without fallbacks", func(c *Config) {
 			c.Model.Fallbacks = nil
 			c.Model.Routing = call.RoutingConfig{Mode: call.RoutingWeighted}
@@ -76,6 +80,19 @@ func TestFallbackProtocolsAndRoutingModes(t *testing.T) {
 	fps := map[string]bool{upstreamFingerprint(base()): true, upstreamFingerprint(openai): true, upstreamFingerprint(weighted): true}
 	if len(fps) != 3 {
 		t.Fatal("upstream_fingerprint does not reflect protocol or routing mode")
+	}
+	// The default anthropic_version written out is the same configuration as leaving it out.
+	omitted := base()
+	omitted.Model.Fallbacks = []ModelFallback{omitted.Model.Fallbacks[0]}
+	omitted.Model.Fallbacks[0].AnthropicVersion = ""
+	if upstreamFingerprint(omitted) != upstreamFingerprint(base()) {
+		t.Fatal("explicit default anthropic_version changes the fingerprint")
+	}
+	other := base()
+	other.Model.Fallbacks = []ModelFallback{other.Model.Fallbacks[0]}
+	other.Model.Fallbacks[0].AnthropicVersion = "2024-01-01"
+	if upstreamFingerprint(other) == upstreamFingerprint(base()) {
+		t.Fatal("a different anthropic_version does not change the fingerprint")
 	}
 	// "openai" written out is the same configuration as the default.
 	explicit := openai

@@ -206,6 +206,9 @@ const PrimaryRoute = "primary"
 
 var routeNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
+// AnthropicVersionRE 是 anthropic_version 的形式（anthropic-version 头，例如 2023-06-01）。
+var AnthropicVersionRE = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+
 // validateFallbacks 校验后备供应商：需要主供应商；路由名合法、不重复、不是 primary；地址为 http(s) 且通过出站
 // 防护（§9.8；私有地址与 localhost 须在 allowPrivate 中，否则每次转到它都会被拒绝）；映射与按模型单价只涉及
 // 声明的模型；单价非负；熔断、超时与对冲参数非负，每 try 超时与对冲只在有后备供应商时可用。
@@ -239,6 +242,9 @@ func (m ModelConfig) validateFallbacks(allowPrivate []string) error {
 				return fmt.Errorf("app: 后备供应商 %s 的 anthropic_version 只用于 protocol anthropic", fb.Name)
 			}
 		case llmproto.ProtocolAnthropic:
+			if fb.AnthropicVersion != "" && !AnthropicVersionRE.MatchString(fb.AnthropicVersion) {
+				return fmt.Errorf("app: 后备供应商 %s 的 anthropic_version %q 须为 YYYY-MM-DD 形式的日期", fb.Name, fb.AnthropicVersion)
+			}
 		default:
 			return fmt.Errorf("app: 后备供应商 %s 的 protocol 须为 openai 或 anthropic，得到 %q", fb.Name, fb.Protocol)
 		}
@@ -284,6 +290,9 @@ func (m ModelConfig) validateRoutingMode(routes map[string]bool) error {
 	case "", call.RoutingOrdered, call.RoutingWeighted, call.RoutingLatency:
 	default:
 		return fmt.Errorf("app: 路由模式须为 ordered、weighted 或 latency，得到 %q", m.Routing.Mode)
+	}
+	if m.Routing.Mode == call.RoutingOrdered && len(m.Routing.Weights) > 0 {
+		return errors.New("app: 路由模式 ordered 不使用权重（权重只用于 weighted 与 latency）")
 	}
 	for name, w := range m.Routing.Weights {
 		if !routes[name] || w < 1 {

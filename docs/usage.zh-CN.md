@@ -322,16 +322,18 @@ sudo -E ./bin/agentbox server --data-dir /var/lib/agentbox --web-dir web/dist \
 | 字段 | 默认 | 含义 |
 |---|---|---|
 | `protocol` | `openai` | 供应商的线路格式。`openai`：请求发往 `base_url + /chat/completions`，Key 放在 `Authorization: Bearer`。`anthropic`：请求发往 `base_url + /v1/messages`（`base_url` 不含 `/v1`），Key 放在 `x-api-key`，并带 `anthropic-version`。 |
-| `anthropic_version` | `2023-06-01` | `anthropic-version` 头；只用于 `protocol: anthropic`。 |
+| `anthropic_version` | `2023-06-01` | `anthropic-version` 头，形如 `YYYY-MM-DD`；只用于 `protocol: anthropic`。 |
 | `weight` | 1 | 路由权重（至少 1），用于 `weighted` 与 `latency` 模式。 |
 | `price.cache_read`、`price.cache_write` | 按 `in` 计 | 缓存读取、缓存写入的输入单价（每百万 token 的微美元；`model_prices` 中同样可用）。预留按 `in` 与 `cache_write` 中较高者估算。 |
-| `routing.mode` | 有权重时 `weighted`，否则 `ordered` | `ordered`：按文件顺序（主供应商在前），与之前相同。`weighted`：在提供该模型、熔断器关闭的供应商中按平滑加权轮询（nginx 算法）选第一个，其余按权重从高到低作为后备。`latency`：同 `weighted`，有效权重为权重 ÷ 首 token 时间的 EWMA，不低于最快供应商的 5%，慢的供应商仍有少量探测流量。 |
+| `routing.mode` | 有权重时 `weighted`，否则 `ordered` | `ordered`：按文件顺序（主供应商在前），与之前相同。`weighted`：在提供该模型、熔断器就绪（关闭，或打开时长已过、可以半开试探）的供应商中按平滑加权轮询（nginx 算法）选第一个，其余按权重从高到低作为后备；熔断后恢复的供应商由此被试探并重新得到它的份额。`latency`：同 `weighted`，有效权重为权重 ÷ 延迟的 EWMA，不低于最快供应商的 5%，慢的供应商仍有少量探测流量。沙箱调用用整个回复时间，模型 API 的流式调用用首 token 时间（各自一个 EWMA，没有样本时用另一个）；超时与 unknown 记一个惩罚样本（每 try 超时与当前 EWMA 两倍中的较大者）。 |
 | `routing.primary_weight` | 1 | 主供应商（`--model-base-url`）的权重。 |
 
 - 沙箱里的 Worker 仍发送 OpenAI 格式的请求。转到 Anthropic 供应商时，Gateway 把请求转换为 Anthropic 格式，再把回复转回 OpenAI 格式，Worker 看到的结构与 OpenAI 供应商相同（`choices[0].message`、`tool_calls`、`finish_reason`、`usage.prompt_tokens`）。之前轮次 assistant 消息中的 `reasoning_content` 不发给 Anthropic 供应商。journal、重放、指纹、预留与结算的规则不变；结算按该供应商的价格，缓存 token 按缓存单价计。
 - 只有 OpenAI 格式才有的请求字段（例如 `response_format` 为 `json_schema`）不能转换：这样的请求跳过 Anthropic 供应商，跳过原因为 `unsupported_protocol`。
 - 熔断、每 try 超时与对冲的语义不变；每次调用的供应商顺序在调用开始时确定，同一调用内的换供应商与对冲沿用它。
-- 校验失败（未知的 `protocol` 或 `routing.mode`、`anthropic_version` 用于 openai 供应商、权重小于 1、负的缓存单价）时 `agentbox server` 以退出码 2 拒绝启动。
+- 校验失败（未知的 `protocol` 或 `routing.mode`、`anthropic_version` 用于 openai 供应商或不是 `YYYY-MM-DD`、权重小于 1、`routing.mode` 为 `ordered` 却给出权重、负的缓存单价）时 `agentbox server` 以退出码 2 拒绝启动。
+- 设置了缓存单价时，预留按输入、缓存读取、缓存写入单价中最高者估算输入，并为分段取整多留 1–2 微美元，因此在用量不超过估算假设时，实际费用不会超过预留。
+- 转到 Anthropic 供应商时，不符合 `^[a-zA-Z0-9_-]+$` 的工具调用 id（例如 `functions.web_search:0`）被确定性地改写，`tool_use` 与对应的 `tool_result` 保持一致。
 
 在上文的 `agentbox server` 命令后加：
 

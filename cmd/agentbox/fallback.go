@@ -159,6 +159,9 @@ func modelFallbackFile(path string, getenv func(string) string) ([]app.ModelFall
 		out = append(out, fb)
 	}
 	if len(weights) > 0 {
+		if fr.Mode == call.RoutingOrdered {
+			return nil, fr, fmt.Errorf("--model-fallback-file %s：routing.mode 为 ordered 时不能给出 weight 或 primary_weight（权重只用于 weighted 与 latency）", path)
+		}
 		fr.Weights = weights
 	}
 	return out, fr, nil
@@ -177,6 +180,9 @@ func fallbackFromFile(i int, p fallbackProvider, getenv func(string) string) (ap
 			return fb, 0, fmt.Errorf("%s 的 anthropic_version 只用于 protocol anthropic", what)
 		}
 	case llmproto.ProtocolAnthropic:
+		if p.AnthropicVersion != "" && !app.AnthropicVersionRE.MatchString(p.AnthropicVersion) {
+			return fb, 0, fmt.Errorf("%s 的 anthropic_version %q 须为 YYYY-MM-DD 形式的日期", what, p.AnthropicVersion)
+		}
 		fb.Protocol, fb.AnthropicVersion = llmproto.ProtocolAnthropic, p.AnthropicVersion
 	default:
 		return fb, 0, fmt.Errorf("%s 的 protocol 须为 openai 或 anthropic，得到 %q", what, p.Protocol)

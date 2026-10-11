@@ -68,11 +68,15 @@ func upstreamFingerprint(c Config) string {
 	}
 	fbs := make([]fallback, 0, len(c.Model.Fallbacks))
 	for _, fb := range c.Model.Fallbacks { // 不含 APIKey
-		proto := string(fb.Protocol)
+		// 默认值写出与省略是同一配置：openai 与默认的 anthropic_version 归一为空。
+		proto, version := string(fb.Protocol), fb.AnthropicVersion
 		if proto == string(llmproto.ProtocolOpenAI) {
 			proto = ""
 		}
-		fbs = append(fbs, fallback{fb.Name, fb.BaseURL, fb.Models, fb.Pricing, sortedPricing(fb.PricingByModel), proto, fb.AnthropicVersion})
+		if version == upstream.DefaultAnthropicVersion {
+			version = ""
+		}
+		fbs = append(fbs, fallback{fb.Name, fb.BaseURL, fb.Models, fb.Pricing, sortedPricing(fb.PricingByModel), proto, version})
 	}
 	b, _ := json.Marshal(struct {
 		BaseURL, Name     string
