@@ -491,6 +491,13 @@ func TestQuotaRuntimeCallHolds(t *testing.T) {
 		t.Fatalf("拒绝应说明层级：%v", err)
 	}
 	expectBudget(t, w.s, "t1", before)
+	// 复审 F8：配额一步在预留事务的最后（最后才锁 org 行），被拒绝时之前的写入全部回滚。
+	if n := count(t, w.s, "SELECT count(*) FROM reservations WHERE call_id = 'c3'") + count(t, w.s, "SELECT count(*) FROM call_tries WHERE call_id = 'c3'"); n != 0 {
+		t.Fatalf("被拒绝的 try 留下了 %d 行", n)
+	}
+	if rec, _, _ := w.s.LoadCall(ctx, "t1", "c3"); rec.State != call.StateResolving || rec.TriesUsed != 0 {
+		t.Fatalf("被拒绝后调用应不变：%+v", rec)
+	}
 	expectUsage(t, w.budget(t, quota.LevelUser), 0, 120, 60)
 	// 任务预算的拒绝优先于月度预算。
 	_, err = reserve(w.s, "t1", "c3", 20_000)
@@ -665,4 +672,120 @@ func TestConvertStaleReservations(t *testing.T) {
 		t.Fatalf("已完成的调用不应改变：%+v", rec)
 	}
 	checkQuota(t, w.s)
+}
+
+// TestQuotaMonthStartBurst（复审 F6）：月初预算行都还不存在时，同一 org 的 15 个用户（各带 key，即 3 个层级）共 180 个并发
+// Reserve + Settle 全部成功（默认的锁超时与操作期限）：缺失的行先在独立的短事务中建好，加锁事务不再等待插入。
+func TestQuotaMonthStartBurst(t *testing.T) {
+	ctx := context.Background()
+	w := newQuotaWorld(t)
+	type member struct {
+		user int64
+		key  string
+	}
+	var ms []member
+	for i := range 15 {
+		name := fmt.Sprintf("u%02d", i)
+		u, err := w.s.CreateUser(ctx, name, name, "h")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.s.TenancyStore().AddMember(ctx, w.org, name, tenant.Member); err != nil {
+			t.Fatal(err)
+		}
+		ms = append(ms, member{u.ID, mustKey(t, w.s, u.ID, tenant.AllScopes).ID})
+	}
+	if n := count(t, w.s, "SELECT count(*) FROM quota_budgets"); n != 0 {
+		t.Fatalf("开始时不应有预算行：%d", n)
+	}
+	var failed atomic.Int64
+	var wg sync.WaitGroup
+	for i := range 180 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m := ms[i%len(ms)]
+			id, err := w.q.Reserve(ctx, quota.Scope{OrgID: w.org, UserID: m.user, KeyID: m.key}, quota.SourceModelRequest,
+				fmt.Sprintf("burst-%d", i), 10, time.Now().Add(time.Hour))
+			if err == nil {
+				err = w.q.Settle(ctx, id, 10, false)
+			}
+			if err != nil {
+				failed.Add(1)
+				t.Log(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if failed.Load() != 0 {
+		t.Fatalf("%d 个操作失败（期望 0）", failed.Load())
+	}
+	expectUsage(t, w.budget(t, quota.LevelOrg), 0, 1800, 0)
+	checkQuota(t, w.s)
+}
+
+// TestQuotaPrecreateNextMonth（复审 F6）：每月最后一天，本月有上限的层级预先建好下个月的行（沿用上限）；其他日子与不限的
+// 层级不建。
+func TestQuotaPrecreateNextMonth(t *testing.T) {
+	ctx := context.Background()
+	w := newQuotaWorld(t)
+	w.setBudget(t, quota.LevelOrg, i64(700))
+	if _, err := w.q.Reserve(ctx, w.scope(), quota.SourceModelRequest, "x", 1, time.Now().Add(time.Hour)); err != nil { // user、key 行不限
+		t.Fatal(err)
+	}
+	var cur time.Time
+	if err := w.s.pool.QueryRow(ctx, "SELECT "+periodNow).Scan(&cur); err != nil {
+		t.Fatal(err)
+	}
+	mid := cur.AddDate(0, 0, 10)
+	if n, err := w.q.precreateNextMonth(ctx, &mid); err != nil || n != 0 {
+		t.Fatalf("月中不预建：%d, %v", n, err)
+	}
+	last := cur.AddDate(0, 1, 0).Add(-3 * time.Hour)
+	if n, err := w.q.precreateNextMonth(ctx, &last); err != nil || n != 1 {
+		t.Fatalf("最后一天预建有上限的 org 行：%d, %v", n, err)
+	}
+	next := cur.AddDate(0, 1, 0)
+	if b, err := w.q.GetBudget(ctx, w.target(quota.LevelOrg), next); err != nil || b.LimitMicro == nil || *b.LimitMicro != 700 ||
+		count(t, w.s, "SELECT count(*) FROM quota_budgets WHERE period = $1", next) != 1 {
+		t.Fatalf("下个月的行 = %+v, %v", b, err)
+	}
+	if n, _ := w.q.precreateNextMonth(ctx, &last); n != 0 {
+		t.Fatal("幂等")
+	}
+	checkQuota(t, w.s)
+}
+
+// TestMigration0013OnPopulatedDB（复审 F15）：有 held money reservation 的 0012 库升级到 0013：旧 reservation 没有 hold，
+// 照常结算（跳过 hold）与在重启时转换；升级后的新 try 有 hold；不变量全部成立。
+func TestMigration0013OnPopulatedDB(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	gwFixture(t, s, "t1", 1000)
+	beginCall(t, s, "t1", "c1")
+	old1 := mustReserve(t, s, "t1", "c1", 40)
+	beginCall(t, s, "t1", "c2")
+	mustReserve(t, s, "t1", "c2", 30)
+	if _, err := s.pool.Exec(ctx, undo0013); err != nil { // 还原为 0012 的形状：两个 held 的 reservation，没有 hold
+		t.Fatal(err)
+	}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, s, "SELECT count(*) FROM quota_holds"); n != 0 {
+		t.Fatalf("升级不应补建 hold：%d", n)
+	}
+	settle(t, s, call.Settlement{Try: old1, Outcome: "ok", ActualMicro: 25, ResultSHA256: strings.Repeat("c", 64), ResultSize: 1})
+	beginCall(t, s, "t1", "c3")
+	fresh := mustReserve(t, s, "t1", "c3", 7)
+	if n := count(t, s, "SELECT count(*) FROM quota_holds WHERE hold_id = $1 AND state = 'held'", fresh.ReservationID); n != 1 {
+		t.Fatal("升级后的新 try 应有 hold")
+	}
+	conv, err := s.ConvertLedger(ctx)
+	if err != nil || conv.Reservations != 2 || conv.UnknownMicro != 37 {
+		t.Fatalf("ConvertLedger = %+v, %v", conv, err)
+	}
+	expectBudget(t, s, "t1", call.Budget{LimitMicro: 1000, SpentMicro: 25, UnknownMicro: 37})
+	checkI3(t, s)
+	expectNoDBViolations(t, s)
 }

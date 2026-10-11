@@ -286,6 +286,13 @@ func (s *Store) ReserveTry(ctx context.Context, r call.ReserveTryRequest) (call.
 	}
 	var out call.Try
 	identity := r.TaskID + "/" + r.CallID + "@" + rid
+	// 复审 F6：本月缺失的预算行先在独立的短事务中创建（已提交），加锁的预留事务只锁已存在的行。
+	scope, haveScope := s.taskQuotaScope(ctx, r.TaskID)
+	if haveScope {
+		if err := s.ensureBudgetRows(ctx, scope.Targets()); err != nil {
+			return call.Try{}, err
+		}
+	}
 	body := func(ctx context.Context, tx pgx.Tx) error {
 		out = call.Try{}
 		if prev, ok, err := heldTry(ctx, tx, r, rid); err != nil || ok {
@@ -365,16 +372,6 @@ func (s *Store) ReserveTry(ctx context.Context, r call.ReserveTryRequest) (call.
 				sub.Available(), r.EstimateMicro)
 		}
 		tryNo := tries + 1
-		// 月度预算（模型网关 G2）：同一事务在任务的 org / user / key 各层级预留同额（hold_id = reservation_id）；
-		// 任一层级不足为 insufficient_quota，任务账本也不预留。锁顺序在 reservations 之后：quota_budgets → quota_holds。
-		qs, err := quotaScopeOfTask(ctx, tx, r.TaskID)
-		if err != nil {
-			return err
-		}
-		if err := reserveHoldTx(ctx, tx, holdRequest{ID: rid, Scope: qs, Source: quota.SourceTaskCall,
-			Ref: taskCallRef(r.TaskID, r.CallID, tryNo), Amount: r.EstimateMicro, Deadline: deadline}); err != nil {
-			return insufficientRejection(err)
-		}
 		if _, err := tx.Exec(ctx, `INSERT INTO reservations (reservation_id, task_id, call_id, try_no, kind, amount, state, subrun_id)
 			VALUES ($1, $2, $3, $4, 'money', $5, 'held', NULLIF($6, ''))`, rid, r.TaskID, r.CallID, tryNo, r.EstimateMicro, r.SubrunID); err != nil {
 			return err
@@ -395,6 +392,18 @@ func (s *Store) ReserveTry(ctx context.Context, r call.ReserveTryRequest) (call.
 		if _, err := tx.Exec(ctx, "UPDATE calls SET state = 'in_flight', tries_used = $3, resolving_since = NULL WHERE task_id = $1 AND call_id = $2",
 			r.TaskID, r.CallID, tryNo); err != nil {
 			return err
+		}
+		// 月度预算（模型网关 G2）：同一事务在任务的 org / user / key 各层级预留同额（hold_id = reservation_id）；
+		// 任一层级不足为 insufficient_quota，任务账本也不预留。锁顺序在 reservations 之后：quota_budgets → quota_holds。
+		qs := scope
+		if !haveScope {
+			if qs, err = quotaScopeOfTask(ctx, tx, r.TaskID); err != nil {
+				return err
+			}
+		}
+		if err := reserveHoldTx(ctx, tx, holdRequest{ID: rid, Scope: qs, Source: quota.SourceTaskCall,
+			Ref: taskCallRef(r.TaskID, r.CallID, tryNo), Amount: r.EstimateMicro, Deadline: deadline}); err != nil {
+			return insufficientRejection(err)
 		}
 		out = call.Try{TaskID: r.TaskID, CallID: r.CallID, TryNo: tryNo, ReservationID: rid, AttemptID: r.AttemptID}
 		return nil

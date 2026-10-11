@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -271,6 +272,9 @@ func (q *QuotaStore) Reserve(ctx context.Context, s quota.Scope, source quota.So
 	if err != nil {
 		return "", err
 	}
+	if err := q.s.ensureBudgetRows(ctx, s.Targets()); err != nil { // 复审 F6
+		return "", err
+	}
 	err = q.s.run(ctx, "QuotaReserve", id, func(ctx context.Context, tx pgx.Tx) error {
 		return reserveHoldTx(ctx, tx, holdRequest{ID: id, Scope: s, Source: source, Ref: ref, Amount: amount, Deadline: deadline})
 	})
@@ -316,6 +320,10 @@ func (q *QuotaStore) Release(ctx context.Context, id quota.HoldID) error {
 func (q *QuotaStore) Sweep(ctx context.Context, limit int) (int, error) {
 	if limit <= 0 {
 		limit = 500
+	}
+	// 复审 F6：每月最后一天预先建好下个月有上限的层级的行。
+	if _, err := q.precreateNextMonth(ctx, nil); err != nil {
+		return 0, err
 	}
 	var ids []string
 	err := q.s.read(ctx, "QuotaSweepScan", func(ctx context.Context, db queryer) error {
@@ -545,4 +553,114 @@ func quotaScopeOfTask(ctx context.Context, tx pgx.Tx, taskID string) (quota.Scop
 // taskCallRef 是运行时调用 hold 的 ref：task/call#try。
 func taskCallRef(taskID, callID string, tryNo int) string {
 	return taskID + "/" + callID + "#" + strconv.Itoa(tryNo)
+}
+
+// ---- 月初的预算行（复审 F6）----
+
+// quotaCacheMax 是进程内缓存的上限；超出时清空（只是少做一次独立的短事务）。
+const quotaCacheMax = 50_000
+
+// quotaCache 记住本进程已确认存在的预算行（按月份）与任务的计费主体（org、owner、key 在任务创建后不变）。
+type quotaCache struct {
+	mu     sync.Mutex
+	rows   map[string]struct{} // "<period>|<kind>|<id>"
+	scopes map[string]quota.Scope
+}
+
+func newQuotaCache() *quotaCache {
+	return &quotaCache{rows: map[string]struct{}{}, scopes: map[string]quota.Scope{}}
+}
+
+func rowKey(period time.Time, t quota.Target) string {
+	return period.Format("2006-01") + "|" + string(t.Level) + "|" + t.ID
+}
+
+// ensureBudgetRows 在独立的短事务中创建 targets 在数据库当前月份缺失的预算行（INSERT … ON CONFLICT DO NOTHING，
+// 已提交），使随后加锁的预留事务只锁已存在的行：月初大量并发的第一次预留不再在加锁事务里互相等待插入。本进程已确认的
+// 行（按应用时钟的月份）直接跳过；月份交界处应用时钟与数据库时钟不一致时只是多做一次，或回退到事务内的懒创建。
+func (s *Store) ensureBudgetRows(ctx context.Context, targets []quota.Target) error {
+	guess := quota.Period(time.Now())
+	s.qc.mu.Lock()
+	missing := false
+	for _, t := range targets {
+		if _, ok := s.qc.rows[rowKey(guess, t)]; !ok {
+			missing = true
+			break
+		}
+	}
+	s.qc.mu.Unlock()
+	if !missing {
+		return nil
+	}
+	kinds, ids := targetArrays(targets)
+	var period time.Time
+	err := s.run(ctx, "QuotaEnsureRows", string(targets[0].Level)+":"+targets[0].ID, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `WITH p AS (SELECT `+periodNow+` AS period),
+			ins AS (INSERT INTO quota_budgets (scope_kind, scope_id, period, limit_micro)
+				SELECT x.k, x.i, p.period, (SELECT b.limit_micro FROM quota_budgets b
+					WHERE b.scope_kind = x.k AND b.scope_id = x.i AND b.period < p.period ORDER BY b.period DESC LIMIT 1)
+				FROM p, unnest($1::text[], $2::text[]) AS x(k, i) ORDER BY CASE x.k WHEN 'org' THEN 0 WHEN 'user' THEN 1 ELSE 2 END
+				ON CONFLICT DO NOTHING)
+			SELECT period FROM p`, kinds, ids).Scan(&period)
+	})
+	if err != nil {
+		return err
+	}
+	period = period.UTC()
+	s.qc.mu.Lock()
+	if len(s.qc.rows) > quotaCacheMax {
+		clear(s.qc.rows)
+	}
+	for _, t := range targets {
+		s.qc.rows[rowKey(period, t)] = struct{}{}
+	}
+	s.qc.mu.Unlock()
+	return nil
+}
+
+// taskQuotaScope 返回任务的计费主体（缓存；任务不存在时 ok 为 false，由调用方的事务报告）。
+func (s *Store) taskQuotaScope(ctx context.Context, taskID string) (quota.Scope, bool) {
+	s.qc.mu.Lock()
+	sc, ok := s.qc.scopes[taskID]
+	s.qc.mu.Unlock()
+	if ok {
+		return sc, true
+	}
+	err := s.read(ctx, "TaskQuotaScope", func(ctx context.Context, q queryer) error {
+		var user *int64
+		err := q.QueryRow(ctx, "SELECT org_id, owner_user_id, COALESCE(key_id, '') FROM tasks WHERE task_id = $1", taskID).
+			Scan(&sc.OrgID, &user, &sc.KeyID)
+		if user != nil {
+			sc.UserID = *user
+		}
+		return err
+	})
+	if err != nil {
+		return quota.Scope{}, false
+	}
+	s.qc.mu.Lock()
+	if len(s.qc.scopes) > quotaCacheMax {
+		clear(s.qc.scopes)
+	}
+	s.qc.scopes[taskID] = sc
+	s.qc.mu.Unlock()
+	return sc, true
+}
+
+// precreateNextMonth 在每月最后一天（数据库时间，asOf 为 nil 时取 now()）为本月有上限的层级预先建好下个月的行（沿用
+// 本月的上限），使零点之后的第一批预留不必创建行。
+func (q *QuotaStore) precreateNextMonth(ctx context.Context, asOf *time.Time) (int, error) {
+	var n int
+	err := q.s.run(ctx, "QuotaPrecreate", "next-month", func(ctx context.Context, tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `WITH t AS (SELECT COALESCE($1::timestamptz, now()) AT TIME ZONE 'UTC' AS ts),
+				p AS (SELECT date_trunc('month', ts)::date AS cur, (date_trunc('month', ts) + interval '1 month')::date AS next, ts FROM t)
+			INSERT INTO quota_budgets (scope_kind, scope_id, period, limit_micro)
+			SELECT b.scope_kind, b.scope_id, p.next, b.limit_micro FROM quota_budgets b, p
+			WHERE b.period = p.cur AND b.limit_micro IS NOT NULL AND p.ts >= p.next - interval '1 day'
+			ORDER BY b.scope_kind, b.scope_id
+			ON CONFLICT DO NOTHING`, asOf)
+		n = int(tag.RowsAffected())
+		return err
+	})
+	return n, err
 }
