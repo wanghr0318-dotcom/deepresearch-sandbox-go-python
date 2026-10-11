@@ -94,7 +94,10 @@ def test_openai_tool_calls(harness, provider):
     assert name == "get_weather" and json.loads(args) == {"city": "Paris"} and finish == "tool_calls"
 
     # The tool result goes back and the model answers with text.
-    messages += [r.choices[0].message.model_dump(exclude_none=True), {"role": "tool", "tool_call_id": call.id, "content": "sunny"}]
+    messages += [
+        r.choices[0].message.model_dump(exclude_none=True),
+        {"role": "tool", "tool_call_id": call.id, "content": "sunny"},
+    ]
     r = client.chat.completions.create(model=harness["model"], messages=messages, tools=[WEATHER_OPENAI], max_tokens=64)
     assert r.choices[0].finish_reason == "stop" and r.choices[0].message.content
 
