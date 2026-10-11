@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -328,4 +331,158 @@ func TestEnsurePepper(t *testing.T) {
 	if _, err := apikey.LoadPepper(empty); err == nil {
 		t.Fatal("no pepper may be created when keys exist")
 	}
+}
+
+// TestRRStress (re-review R2-1): random concurrent moves, accepts, leaves, role changes, invites and key creation
+// finish without deadlock or contention errors; no org with members lacks an owner, no personal org holds another
+// user, and the invariants hold. Trimmed from the reviewer's 8 workers x 60 ops to run in a few seconds.
+func TestRRStress(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	ten := s.TenancyStore()
+	const nu = 8
+	ids := map[string]int64{}
+	for i := 0; i < nu; i++ {
+		n := fmt.Sprintf("su%d", i)
+		u, err := s.CreateUser(ctx, n, n, "h")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[n] = u.ID
+	}
+	var orgs []int64
+	for i := 0; i < 3; i++ {
+		o, _, err := ten.CreateOrgWithOwner(ctx, fmt.Sprintf("so%d", i), fmt.Sprintf("su%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		orgs = append(orgs, o.ID)
+	}
+	var mu sync.Mutex
+	var bad []error
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func(seed int64) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(seed))
+			for k := 0; k < 25; k++ {
+				u := fmt.Sprintf("su%d", r.Intn(nu))
+				o := orgs[r.Intn(len(orgs))]
+				role := tenant.Member
+				if r.Intn(2) == 0 {
+					role = tenant.Owner
+				}
+				inviter := ids[fmt.Sprintf("su%d", r.Intn(nu))]
+				var err error
+				switch r.Intn(5) {
+				case 0:
+					_, err = ten.AddMember(ctx, o, u, role)
+				case 1:
+					err = ten.RemoveMember(ctx, o, u)
+				case 2:
+					var inv tenant.Invite
+					if inv, err = ten.CreateInvite(ctx, o, u, role, inviter, time.Now().Add(time.Hour)); err == nil {
+						_, err = ten.AcceptInvite(ctx, inv.ID, ids[u])
+					}
+				case 3:
+					g, _ := apikey.Generate(testPepper)
+					_, err = ten.CreateKey(ctx, tenant.NewKey{ID: g.ID, UserID: ids[u], Name: "k", SecretHMAC: g.SecretHMAC, Scopes: tenant.Runtime})
+				case 4:
+					var inv tenant.Invite
+					if inv, err = ten.CreateInvite(ctx, o, u, role, inviter, time.Now().Add(time.Hour)); err == nil {
+						err = ten.DeleteInvite(ctx, inv.ID)
+					}
+				}
+				if err != nil && !isDomain(err) && !errors.Is(err, tenant.ErrUserInOtherOrg) && !errors.Is(err, tenant.ErrLastOwner) &&
+					!errors.Is(err, tenant.ErrAlreadyMember) && !errors.Is(err, tenant.ErrPersonalOrg) && !errors.Is(err, tenant.ErrPersonalOrgClosed) {
+					mu.Lock()
+					bad = append(bad, err)
+					mu.Unlock()
+				}
+			}
+		}(int64(w))
+	}
+	wg.Wait()
+	for _, e := range bad {
+		t.Errorf("non-domain error: %v", e)
+	}
+	if n := count(t, s, `SELECT count(*) FROM orgs o WHERE o.name <> 'operator' AND EXISTS (SELECT 1 FROM org_members m WHERE m.org_id = o.id)
+		AND NOT EXISTS (SELECT 1 FROM org_members m WHERE m.org_id = o.id AND m.role = 'owner')`); n != 0 {
+		t.Errorf("%d orgs with members but no owner", n)
+	}
+	if n := count(t, s, `SELECT count(*) FROM org_members m JOIN orgs o ON o.id = m.org_id WHERE o.name ~ '^user-[0-9]+$' AND o.name <> 'user-' || m.user_id`); n != 0 {
+		t.Errorf("%d foreign members in personal orgs", n)
+	}
+	if n := count(t, s, `SELECT count(*) FROM org_invites i WHERE NOT EXISTS (SELECT 1 FROM org_members m
+		WHERE m.org_id = i.org_id AND m.user_id = i.invited_by AND m.role = 'owner')`); n != 0 {
+		t.Logf("%d pending invites from non-owners (created by the test with random inviters; refused at accept)", n)
+	}
+	expectNoDBViolations(t, s)
+}
+
+// TestAcceptStaleInviter (R2-2): an invite whose inviter is no longer an owner of the org is refused at accept
+// (404) and deleted; demoting or removing an owner deletes the invites they sent.
+func TestAcceptStaleInviter(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{})
+	ten := s.TenancyStore()
+	alice, _ := s.CreateUser(ctx, "alice", "alice", "h")
+	bob, _ := s.CreateUser(ctx, "bob", "bob", "h")
+	carol, _ := s.CreateUser(ctx, "carol", "carol", "h")
+	if _, err := s.CreateUser(ctx, "dave", "dave", "h"); err != nil {
+		t.Fatal(err)
+	}
+	acme, _, err := ten.CreateOrgWithOwner(ctx, "acme", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ten.AddMember(ctx, acme.ID, "bob", tenant.Owner); err != nil {
+		t.Fatal(err)
+	}
+	exp := time.Now().Add(time.Hour)
+	// The inviter lost owner rights without going through the store (e.g. a raw role change): refused at accept.
+	stale, err := ten.CreateInvite(ctx, acme.ID, "carol", tenant.Owner, bob.ID, exp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, "UPDATE org_members SET role = 'member' WHERE user_id = $1", bob.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ten.AcceptInvite(ctx, stale.ID, carol.ID); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatalf("accept of a stale invite: %v", err)
+	}
+	if _, err := ten.GetInvite(ctx, stale.ID); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatal("the stale invite must be deleted")
+	}
+	if m, _ := ten.MemberByName(ctx, "carol"); m.OrgName != tenant.PersonalOrgName(carol.ID) {
+		t.Fatalf("carol must not have moved: %+v", m)
+	}
+	if _, err := s.pool.Exec(ctx, "UPDATE org_members SET role = 'owner' WHERE user_id = $1", bob.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Demotion through the store deletes bob's sent invites; alice's stay.
+	fromBob, _ := ten.CreateInvite(ctx, acme.ID, "carol", tenant.Member, bob.ID, exp)
+	fromAlice, _ := ten.CreateInvite(ctx, acme.ID, "dave", tenant.Member, alice.ID, exp)
+	if _, err := ten.AddMember(ctx, acme.ID, "bob", tenant.Member); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ten.GetInvite(ctx, fromBob.ID); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatal("a demoted owner's invites must be deleted")
+	}
+	if _, err := ten.GetInvite(ctx, fromAlice.ID); err != nil {
+		t.Fatalf("other owners' invites stay: %v", err)
+	}
+	// Removal deletes them too.
+	if _, err := ten.AddMember(ctx, acme.ID, "bob", tenant.Owner); err != nil {
+		t.Fatal(err)
+	}
+	fromBob, _ = ten.CreateInvite(ctx, acme.ID, "carol", tenant.Member, bob.ID, exp)
+	if err := ten.RemoveMember(ctx, acme.ID, "bob"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ten.GetInvite(ctx, fromBob.ID); !errors.Is(err, persistence.ErrNotFound) {
+		t.Fatal("a removed owner's invites must be deleted")
+	}
+	expectNoDBViolations(t, s)
 }

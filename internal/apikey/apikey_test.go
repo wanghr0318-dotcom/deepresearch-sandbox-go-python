@@ -352,3 +352,27 @@ func TestWatch(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// TestStaleTempPeppersRemoved: crash leftovers apikey.pepper.tmp-* older than a minute are removed on start; a
+// fresh one (a concurrent starter writing right now) is kept.
+func TestStaleTempPeppersRemoved(t *testing.T) {
+	dir := t.TempDir()
+	old := filepath.Join(dir, PepperFile+".tmp-123")
+	fresh := filepath.Join(dir, PepperFile+".tmp-456")
+	for _, f := range []string{old, fresh} {
+		if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	past := time.Now().Add(-2 * time.Minute)
+	if err := os.Chtimes(old, past, past); err != nil {
+		t.Fatal(err)
+	}
+	removeStaleTemps(dir)
+	if _, err := os.Stat(old); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale temp kept: %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("fresh temp removed: %v", err)
+	}
+}

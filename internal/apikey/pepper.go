@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 )
 
 // ErrPepper means the pepper file and the database disagree: the server must not start (exit 2), because a new
@@ -35,6 +36,7 @@ type PepperStore interface {
 //
 // Every mismatch is ErrPepper with an explanation; storage failures are returned as they are.
 func EnsurePepper(ctx context.Context, dataDir string, st PepperStore) ([]byte, error) {
+	removeStaleTemps(dataDir)
 	recorded, keys, err := st.PepperState(ctx)
 	if err != nil {
 		return nil, err
@@ -109,6 +111,19 @@ func createPepper(dataDir string) ([]byte, error) {
 	}
 	syncDir(dataDir)
 	return b[:], nil
+}
+
+// staleTempAge keeps a concurrent starter's temp file (being written right now) from being removed under it.
+const staleTempAge = time.Minute
+
+// removeStaleTemps removes apikey.pepper.tmp-* files left by a crash during createPepper (best effort).
+func removeStaleTemps(dataDir string) {
+	matches, _ := filepath.Glob(filepath.Join(dataDir, PepperFile+".tmp-*"))
+	for _, m := range matches {
+		if fi, err := os.Lstat(m); err == nil && fi.Mode().IsRegular() && time.Since(fi.ModTime()) > staleTempAge {
+			_ = os.Remove(m)
+		}
+	}
 }
 
 // syncDir makes the new directory entry durable (best effort; not supported on Windows).
