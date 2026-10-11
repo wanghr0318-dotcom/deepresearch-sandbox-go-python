@@ -1,0 +1,3 @@
+{"id": "chatcmpl-3", "object": "chat.completion", "created": 1700000002, "model": "kimi-k3",
+ "choices": [{"index": 0, "message": {"role": "assistant", "content": "Truncat"}, "finish_reason": "length"}],
+ "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}

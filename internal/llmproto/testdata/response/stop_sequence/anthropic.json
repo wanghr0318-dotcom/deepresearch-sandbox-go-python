@@ -1,0 +1,3 @@
+{"id": "msg_4", "type": "message", "role": "assistant", "model": "claude-x",
+ "content": [{"type": "text", "text": "one two"}], "stop_reason": "stop_sequence", "stop_sequence": "three",
+ "usage": {"input_tokens": 7, "output_tokens": 3}}

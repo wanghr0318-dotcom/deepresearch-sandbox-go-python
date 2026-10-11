@@ -1,0 +1,10 @@
+data: {"id":"chatcmpl-s3","object":"chat.completion.chunk","created":1700000300,"model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Think"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-s3","object":"chat.completion.chunk","created":1700000300,"model":"kimi-k3","choices":[{"index":0,"delta":{"reasoning_content":"ing."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-s3","object":"chat.completion.chunk","created":1700000300,"model":"kimi-k3","choices":[{"index":0,"delta":{"content":"42"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-s3","object":"chat.completion.chunk","created":1700000300,"model":"kimi-k3","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+data: [DONE]
+

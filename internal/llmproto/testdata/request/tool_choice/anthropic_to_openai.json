@@ -1,0 +1,33 @@
+{
+  "model": "smart",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Call lookup."
+    }
+  ],
+  "max_tokens": 64,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "tool_choice": {
+    "function": {
+      "name": "lookup"
+    },
+    "type": "function"
+  },
+  "parallel_tool_calls": false
+}

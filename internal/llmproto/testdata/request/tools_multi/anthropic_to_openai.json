@@ -1,0 +1,78 @@
+{
+  "model": "smart",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Use tools."
+    },
+    {
+      "role": "user",
+      "content": "Weather in Paris and Tokyo?"
+    },
+    {
+      "role": "assistant",
+      "content": "Checking both.",
+      "tool_calls": [
+        {
+          "id": "toolu_1",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\":\"Paris\"}"
+          }
+        },
+        {
+          "id": "toolu_2",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\":\"Tokyo\",\"unit\":\"c\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "18C cloudy",
+      "tool_call_id": "toolu_1"
+    },
+    {
+      "role": "tool",
+      "content": "25C\nsunny",
+      "tool_call_id": "toolu_2"
+    },
+    {
+      "role": "user",
+      "content": "Which is warmer?"
+    }
+  ],
+  "max_tokens": 1024,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Current weather",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "c",
+                "f"
+              ]
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    }
+  ],
+  "tool_choice": "required"
+}

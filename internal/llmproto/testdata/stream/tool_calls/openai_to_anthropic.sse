@@ -1,0 +1,45 @@
+event: message_start
+data: {"type":"message_start","message":{"id":"chatcmpl-s2","type":"message","role":"assistant","model":"kimi-k3","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"text":"","type":"text"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"text":"Checking.","type":"text_delta"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"id":"call_x","input":{},"name":"get_weather","type":"tool_use"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"partial_json":"{\"ci","type":"input_json_delta"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"partial_json":"ty\": \"Par","type":"input_json_delta"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"partial_json":"is\"}","type":"input_json_delta"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"id":"call_y","input":{},"name":"get_time","type":"tool_use"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"partial_json":"{","type":"input_json_delta"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"partial_json":"}","type":"input_json_delta"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":2}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":50,"output_tokens":21,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}
+
+event: message_stop
+data: {"type":"message_stop"}
+

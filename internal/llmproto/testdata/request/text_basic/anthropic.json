@@ -1,0 +1,13 @@
+{
+  "model": "smart",
+  "max_tokens": 256,
+  "system": [{"type": "text", "text": "You are terse."}, {"type": "text", "text": "Answer in English."}],
+  "messages": [
+    {"role": "user", "content": "Say hi"},
+    {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+    {"role": "user", "content": [{"type": "text", "text": "again"}]}
+  ],
+  "temperature": 0.3,
+  "top_p": 0.9,
+  "stop_sequences": ["END", "STOP"]
+}

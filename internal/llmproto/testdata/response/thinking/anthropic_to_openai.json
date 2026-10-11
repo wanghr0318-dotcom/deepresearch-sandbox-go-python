@@ -1,0 +1,22 @@
+{
+  "id": "msg_6",
+  "object": "chat.completion",
+  "created": 0,
+  "model": "claude-x",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "42",
+        "reasoning_content": "Let me think."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 9,
+    "completion_tokens": 30,
+    "total_tokens": 39
+  }
+}

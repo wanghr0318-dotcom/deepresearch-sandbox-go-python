@@ -1,0 +1,6 @@
+{"id": "chatcmpl-2", "object": "chat.completion", "created": 1700000001, "model": "kimi-k3",
+ "choices": [{"index": 0, "message": {"role": "assistant", "content": "Let me check.", "tool_calls": [
+   {"id": "call_a", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}},
+   {"id": "call_b", "type": "function", "function": {"name": "get_time", "arguments": "{}"}}]},
+   "finish_reason": "tool_calls"}],
+ "usage": {"prompt_tokens": 40, "completion_tokens": 20, "total_tokens": 60}}

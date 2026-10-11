@@ -1,0 +1,14 @@
+{
+  "model": "smart",
+  "max_tokens": 100,
+  "system": [{"type": "text", "text": "Long cached context.", "cache_control": {"type": "ephemeral"}}],
+  "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "Hello", "cache_control": {"type": "ephemeral"}}]},
+    {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_9", "name": "f", "input": {}}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_9", "content": "boom", "is_error": true}]}
+  ],
+  "tools": [{"name": "f", "input_schema": {"type": "object"}, "cache_control": {"type": "ephemeral"}}],
+  "metadata": {"user_id": "u-1"},
+  "top_k": 40,
+  "thinking": {"type": "disabled"}
+}

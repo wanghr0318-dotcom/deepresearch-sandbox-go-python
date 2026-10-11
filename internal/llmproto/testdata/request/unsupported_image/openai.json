@@ -1,0 +1,4 @@
+{
+  "model": "smart",
+  "messages": [{"role": "user", "content": [{"type": "text", "text": "What is this?"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]
+}

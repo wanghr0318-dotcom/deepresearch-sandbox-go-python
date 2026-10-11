@@ -1,0 +1,6 @@
+{"id": "msg_2", "type": "message", "role": "assistant", "model": "claude-x",
+ "content": [
+   {"type": "tool_use", "id": "toolu_a", "name": "get_weather", "input": {"city": "Paris"}},
+   {"type": "tool_use", "id": "toolu_b", "name": "get_time", "input": {}}],
+ "stop_reason": "tool_use", "stop_sequence": null,
+ "usage": {"input_tokens": 40, "output_tokens": 20}}
