@@ -75,7 +75,7 @@ func (c *Coordinator) startLeg(ctx context.Context, j *job, rs *routeSet, h *hed
 			span: span, tctx: tctx}
 		release()
 		lcancel(nil)
-		rs.observe(l, uerr, r.latency)
+		rs.observe(l, uerr, aborted, r.latency, c.routing.TryTimeout)
 		h.results <- r
 		if c.legDone != nil {
 			c.legDone(try.TryNo, l.hedge)

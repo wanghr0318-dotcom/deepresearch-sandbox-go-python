@@ -282,6 +282,8 @@ type job struct {
 	cancel   context.CancelCauseFunc
 	span     obs.Span // 本调用的 gateway.call span（关闭时为 no-op）
 	order    []int    // 本调用的路由顺序（模型降级链；routeSet.planOrder 在 try 循环开始时算出）
+	// convertible 缓存各（非 OpenAI 格式）路由能否执行本调用（routeSet.convertible）。
+	convertible map[int]bool
 }
 
 // New 构造 Coordinator。
@@ -1215,7 +1217,7 @@ func (c *Coordinator) runTry(ctx context.Context, j *job, rs *routeSet, l leg, t
 	r := legResult{leg: l, try: try, resp: resp, uerr: uerr, latency: c.now().Sub(start), aborted: aborted, span: span, tctx: tctx}
 	release()
 	rs.report(l, uerr, aborted)
-	rs.observe(l, uerr, r.latency)
+	rs.observe(l, uerr, aborted, r.latency, c.routing.TryTimeout)
 	c.logTry(j, rs, r, false)
 	return r, []int{l.route}
 }

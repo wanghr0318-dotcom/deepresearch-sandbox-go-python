@@ -145,21 +145,30 @@ type pick struct {
 }
 
 // convertible 报告规范化请求能否在路由 i 上执行：OpenAI 格式的路由总能（不解析请求体）；其他格式的路由须能转换。
-func (rs *routeSet) convertible(i int, resolved []byte) bool {
+// 结果按调用缓存在 j.convertible 中（规范化请求在调用内不变；只由调用的 goroutine 访问），每个路由只转换一次。
+func (rs *routeSet) convertible(j *job, i int) bool {
 	if rs.proto == nil || rs.proto.RouteProtocol(i) == llmproto.ProtocolOpenAI {
 		return true
 	}
-	return rs.proto.Convertible(i, resolved)
+	if ok, cached := j.convertible[i]; cached {
+		return ok
+	}
+	ok := rs.proto.Convertible(i, j.resolved)
+	if j.convertible == nil {
+		j.convertible = map[int]bool{}
+	}
+	j.convertible[i] = ok
+	return ok
 }
 
 // eligible 报告路由 i 能否执行本调用（提供该模型、格式可用），不看熔断器。
 func (rs *routeSet) eligible(j *job, i int) bool {
-	return rs.router.Serves(i, j.model) && rs.convertible(i, j.resolved)
+	return rs.router.Serves(i, j.model) && rs.convertible(j, i)
 }
 
-// planOrder 在调用开始时算出本调用的路由顺序（ordered 为配置顺序）。
+// planOrder 在调用开始时算出本调用的路由顺序（ordered 为配置顺序；沙箱调用用整个回复时间的延迟信号）。
 func (rs *routeSet) planOrder(j *job) {
-	j.order = rs.order(func(i int) bool { return rs.eligible(j, i) })
+	j.order = rs.order(func(i int) bool { return rs.eligible(j, i) }, signalResponse)
 }
 
 // pick 按本调用的路由顺序（j.order；未算出时为配置顺序）选第一个提供 model、格式可用、不在 tried 中且熔断器放行的
@@ -179,7 +188,7 @@ func (rs *routeSet) pick(j *job, tried map[int]bool) pick {
 		switch {
 		case !rs.router.Serves(i, j.model):
 			reason = SkipModelNotServed
-		case !rs.convertible(i, j.resolved):
+		case !rs.convertible(j, i):
 			reason = SkipProtocol
 		case tried[i]:
 			reason, p.anyTried = SkipTried, true
@@ -250,10 +259,18 @@ func providerFault(e *upstream.Error) bool {
 	return e.Status == 401 || e.Status == 403 || e.Status == 404
 }
 
-// observe 把一次 ok 的 try 的延迟记入该路由的 EWMA（latency 模式；其余模式与单供应商为空操作）。
-func (rs *routeSet) observe(l leg, uerr *upstream.Error, d time.Duration) {
-	if rs != nil && l.route >= 0 && uerr == nil {
-		rs.bal.observe(l.route, d)
+// observe 把一次 try 的结果记入该路由的整个回复时间 EWMA（latency 模式；其余模式与单供应商为空操作）：ok 记
+// 实际延迟；unknown 与超时（耗时达到每 try 超时）记惩罚样本；其他失败交给熔断器。Coordinator 自己取消的 try
+// （aborted：调用取消、对冲落败）不是供应商的问题，不记。
+func (rs *routeSet) observe(l leg, uerr *upstream.Error, aborted bool, d, tryTimeout time.Duration) {
+	if rs == nil || l.route < 0 || aborted {
+		return
+	}
+	switch {
+	case uerr == nil:
+		rs.bal.observe(signalResponse, l.route, d)
+	case uerr.Outcome == upstream.OutcomeUnknown || (tryTimeout > 0 && d >= tryTimeout):
+		rs.bal.penalize(signalResponse, l.route, d, tryTimeout)
 	}
 }
 

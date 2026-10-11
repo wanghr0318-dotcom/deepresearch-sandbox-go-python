@@ -78,7 +78,7 @@ func (m *ModelRouting) Plan(model string, only llmproto.Protocol) *RoutePlan {
 		}
 	}
 	if m.rs != nil {
-		p.order = m.rs.order(p.usable)
+		p.order = m.rs.order(p.usable, signalTTFT)
 	} else {
 		p.order = []int{0}
 	}
@@ -131,31 +131,30 @@ func (p *RoutePlan) Done(pick RoutePick, uerr *upstream.Error, aborted bool) {
 	p.m.rs.report(leg{route: pick.Route}, uerr, aborted)
 }
 
-// Failover 报告这次失败之后能否换下一个路由（第一个字节之前）：retryable 与 unknown 可以，fatal 不可以。
-func Failover(uerr *upstream.Error) bool {
-	return uerr != nil && (uerr.Outcome == upstream.OutcomeRetryable || uerr.Outcome == upstream.OutcomeUnknown)
-}
-
-// ObserveTTFT 记录路由的一次首 token 时间（latency 模式据此分配流量）。
-func (m *ModelRouting) ObserveTTFT(route int, d time.Duration) {
-	if m.rs != nil {
-		m.rs.bal.observe(route, d)
-	}
+// Failover 报告这次失败之后能否换下一个路由（首 token 之前）：retryable 与 unknown 可以，fatal 不可以；客户端的
+// ctx 已结束（断开、到期）时不可以——失败源于请求本身被取消，换供应商没有意义。
+func Failover(ctx context.Context, uerr *upstream.Error) bool {
+	return ctx.Err() == nil && uerr != nil &&
+		(uerr.Outcome == upstream.OutcomeRetryable || uerr.Outcome == upstream.OutcomeUnknown)
 }
 
 // errTryTimeout 是每 try 超时（到第一个事件为止）的取消原因。
 var errTryTimeout = errors.New("call: 每 try 超时（第一个事件之前）")
 
-// DoStream 在路由上发出流式请求（upstream.ChatAdapter.DoStream），每 try 超时（RoutingConfig.TryTimeout）只作用于
-// 第一个事件到达之前：超时的请求按 unknown 归类（已发出）或 retryable（未发出），与沙箱路径的每 try 超时相同。
-// 返回的流实现 upstream.StreamInfo。
+// DoStream 在路由上发出流式请求（upstream.ChatAdapter.DoStream：返回时首 token 已到达，之前的错误事件以 *Error
+// 返回）。每 try 超时（RoutingConfig.TryTimeout）作用于整个首 token 之前的时间：超时的请求按 unknown 归类（已发出）
+// 或 retryable（未发出），与沙箱路径的每 try 超时相同。首 token 时间自动记入该路由的 TTFT 延迟信号（latency
+// 模式）；超时与 unknown 记惩罚样本（客户端自己取消的除外）。返回的流实现 upstream.StreamInfo。
 func (m *ModelRouting) DoStream(ctx context.Context, route int, body []byte, proto llmproto.Protocol) (upstream.Stream, *upstream.Error) {
 	sctx, cancel := context.WithCancelCause(ctx)
+	tt := m.c.routing.TryTimeout
 	var timer *time.Timer
-	if tt := m.c.routing.TryTimeout; tt > 0 {
+	if tt > 0 {
 		timer = time.AfterFunc(tt, func() { cancel(errTryTimeout) })
 	}
+	start := time.Now()
 	s, e := m.ad.DoStream(sctx, route, body, proto)
+	defer func() { m.record(ctx, route, e, time.Since(start)) }()
 	if timer != nil && !timer.Stop() && e == nil {
 		// 超时恰好在第一个事件到达时触发：流已被取消，按 unknown（已发出、结果无法确认）处理。
 		_ = s.Close()
@@ -173,6 +172,20 @@ func (m *ModelRouting) DoStream(ctx context.Context, route int, body []byte, pro
 type routedStream struct {
 	upstream.Stream
 	cancel context.CancelCauseFunc
+}
+
+// record 记入首 token 时间（ok）或惩罚样本（unknown、超时）；客户端已取消时不记。
+func (m *ModelRouting) record(ctx context.Context, route int, e *upstream.Error, d time.Duration) {
+	if m.rs == nil || ctx.Err() != nil {
+		return
+	}
+	tt := m.c.routing.TryTimeout
+	switch {
+	case e == nil:
+		m.rs.bal.observe(signalTTFT, route, d)
+	case e.Outcome == upstream.OutcomeUnknown || (tt > 0 && d >= tt):
+		m.rs.bal.penalize(signalTTFT, route, d, tt)
+	}
 }
 
 func (s *routedStream) Close() error {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,7 +25,7 @@ func TestSmoothWeightedRoundRobin(t *testing.T) {
 	counts := make([]int, 3)
 	run, maxRun, last := 0, 0, -1
 	for n := 0; n < 10_000; n++ {
-		i := b.next([]int{0, 1, 2})
+		i := b.next([]int{0, 1, 2}, signalResponse)
 		counts[i]++
 		if i == last {
 			run++
@@ -43,7 +44,7 @@ func TestSmoothWeightedRoundRobin(t *testing.T) {
 	b = newBalancer(RoutingWeighted, []string{"a", "b", "c"}, map[string]int{"a": 5, "b": 1, "c": 1})
 	var seq []string
 	for n := 0; n < 7; n++ {
-		seq = append(seq, []string{"a", "b", "c"}[b.next([]int{0, 1, 2})])
+		seq = append(seq, []string{"a", "b", "c"}[b.next([]int{0, 1, 2}, signalResponse)])
 	}
 	if got := strings.Join(seq, " "); got != "a a b a c a a" {
 		t.Fatalf("sequence %s", got)
@@ -57,20 +58,20 @@ func TestLatencyModeShiftsTraffic(t *testing.T) {
 	share := func(n int) []int {
 		c := make([]int, 2)
 		for k := 0; k < n; k++ {
-			c[b.next([]int{0, 1})]++
+			c[b.next([]int{0, 1}, signalResponse)]++
 		}
 		return c
 	}
 	if c := share(1000); c[0] != 500 || c[1] != 500 {
 		t.Fatalf("no samples: %v, want equal split", c)
 	}
-	b.observe(0, 100*time.Millisecond)
-	b.observe(1, 10*time.Millisecond)
+	b.observe(signalResponse, 0, 100*time.Millisecond)
+	b.observe(signalResponse, 1, 10*time.Millisecond)
 	if c := share(1100); c[1] < 950 || c[0] < 50 {
 		t.Fatalf("b 10× faster: %v, want b ≈ 10/11", c)
 	}
 	for k := 0; k < 50; k++ { // b becomes very slow: its EWMA converges to 5 s
-		b.observe(1, 5*time.Second)
+		b.observe(signalResponse, 1, 5*time.Second)
 	}
 	c := share(1000)
 	if c[0] < 900 || c[1] == 0 {
@@ -81,8 +82,8 @@ func TestLatencyModeShiftsTraffic(t *testing.T) {
 	}
 	// A route without samples is treated like the fastest known one (it gets probed).
 	b2 := newBalancer(RoutingLatency, []string{"a", "b"}, nil)
-	b2.observe(0, 50*time.Millisecond)
-	if eff := b2.effective([]int{0, 1}); eff[0] != eff[1] {
+	b2.observe(signalResponse, 0, 50*time.Millisecond)
+	if eff := b2.effective([]int{0, 1}, signalResponse); eff[0] != eff[1] {
 		t.Fatalf("unsampled route effective weight %v", eff)
 	}
 }
@@ -123,12 +124,12 @@ func TestWeightedOrder(t *testing.T) {
 	h := newRouteHarness(t, routeLimits(), RoutingConfig{Mode: RoutingWeighted, Weights: map[string]int{"c": 4, "d": 2}}, fr)
 	rs := h.c.routes[upstream.KindChat]
 	all := func(int) bool { return true }
-	if got := fmt.Sprint(rs.order(all)); got != "[2 3 0 1]" {
+	if got := fmt.Sprint(rs.order(all, signalResponse)); got != "[2 3 0 1]" {
 		t.Fatalf("first order %s", got)
 	}
 	// ordered mode is the configuration order, always.
 	ho := newRouteHarness(t, routeLimits(), RoutingConfig{}, newRoutes("primary", "b"))
-	if got := fmt.Sprint(ho.c.routes[upstream.KindChat].order(all)); got != "[0 1]" || ho.c.routes[upstream.KindChat].bal != nil {
+	if got := fmt.Sprint(ho.c.routes[upstream.KindChat].order(all, signalResponse)); got != "[0 1]" || ho.c.routes[upstream.KindChat].bal != nil {
 		t.Fatalf("ordered %s", got)
 	}
 	if _, err := New(Config{Store: h.store, Blobs: h.blobs, Events: h.events, Routing: RoutingConfig{Mode: "random"}}); err == nil {
@@ -144,11 +145,11 @@ func mixedChain(p, q *fakeupstream.Server) upstream.Adapter {
 	d := upstream.NewDialer(upstream.DialerConfig{AllowPrivate: []string{"127.0.0.1"}})
 	return upstream.NewChat(upstream.ChatConfig{BaseURL: p.ModelBaseURL(), Model: fakeupstream.Model, APIKey: "key-openai",
 		Pricing: upstream.Pricing{InputMicroPerMTok: 1_000_000, OutputMicroPerMTok: 2_000_000}, MaxTokensDefault: 64,
-		HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0),
+		HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0), StreamHTTP: d.HTTPClient(0, 0),
 		Fallbacks: []upstream.ChatRoute{{Name: "claude", Protocol: llmproto.ProtocolAnthropic, BaseURL: q.URL(), APIKey: "key-anthropic",
 			Models:  map[string]string{fakeupstream.Model: "claude-x"},
 			Pricing: upstream.Pricing{InputMicroPerMTok: 3_000_000, OutputMicroPerMTok: 15_000_000, CacheReadMicroPerMTok: 300_000},
-			HTTP:    d.HTTPClient(upstream.DefaultModelMaxBody, 0)}}})
+			HTTP:    d.HTTPClient(upstream.DefaultModelMaxBody, 0), StreamHTTP: d.HTTPClient(0, 0)}}})
 }
 
 func mixedServers(t *testing.T) (*fakeupstream.Server, *fakeupstream.Server) {
@@ -271,7 +272,7 @@ func TestModelRoutingPlan(t *testing.T) {
 		s, e := m.DoStream(context.Background(), pick.Route, body, llmproto.ProtocolOpenAI)
 		plan.Done(pick, e, false)
 		if e != nil {
-			if !Failover(e) {
+			if !Failover(context.Background(), e) {
 				t.Fatalf("fatal %v", e)
 			}
 			continue
@@ -310,50 +311,250 @@ func drain(s upstream.Stream) (llmproto.Response, error) {
 	}
 }
 
-// The per-try timeout applies until the first event only: a provider that hangs before answering is cut
-// (unknown, so the model API can fail over); a stream whose events are slower than the timeout after the first
-// one is not cut.
+// The per-try timeout covers the time to first token: a provider that hangs before answering, or that sends
+// message_start and then stalls, is cut (unknown, so the model API can fail over); a stream whose events keep
+// coming after the first content is not cut even when the whole stream takes longer than the timeout.
 func TestModelRoutingTryTimeoutUntilFirstByte(t *testing.T) {
 	p, q := mixedServers(t)
-	m := modelRouting(t, mixedChain(p, q), RoutingConfig{TryTimeout: 200 * time.Millisecond})
+	const tt = 600 * time.Millisecond
+	m := modelRouting(t, mixedChain(p, q), RoutingConfig{TryTimeout: tt})
 	body := []byte(`{"model":"` + fakeupstream.Model + `","messages":[{"role":"user","content":"hi"}],"max_tokens":20}`)
 	q.Inject(fakeupstream.Messages, 1, fakeupstream.Action{Hang: true})
 	start := time.Now()
 	_, e := m.DoStream(context.Background(), 1, body, llmproto.ProtocolOpenAI)
-	if e == nil || e.Outcome != upstream.OutcomeUnknown || !Failover(e) || time.Since(start) > 5*time.Second {
+	if e == nil || e.Outcome != upstream.OutcomeUnknown || !Failover(context.Background(), e) || time.Since(start) > 5*time.Second {
 		t.Fatalf("hang: %v after %s", e, time.Since(start))
 	}
-	q.SetChunkDelay(fakeupstream.Messages, 150*time.Millisecond) // the whole stream takes ≫ 200 ms
+	// message_start arrives at once, then every event waits 3 s: no content within the timeout.
+	q.SetChunkDelay(fakeupstream.Messages, 3*time.Second)
+	start = time.Now()
+	_, e = m.DoStream(context.Background(), 1, body, llmproto.ProtocolOpenAI)
+	if e == nil || e.Outcome != upstream.OutcomeUnknown || time.Since(start) > 2*time.Second {
+		t.Fatalf("stall after message_start: %v after %s", e, time.Since(start))
+	}
+	// First content after 3 × 120 ms = 360 ms < 600 ms; the whole stream (7 events) takes ≥ 720 ms > 600 ms.
+	q.SetChunkDelay(fakeupstream.Messages, 120*time.Millisecond)
+	start = time.Now()
 	s, e := m.DoStream(context.Background(), 1, body, llmproto.ProtocolOpenAI)
 	if e != nil {
 		t.Fatal(e)
 	}
 	defer s.Close()
 	resp, err := drain(s)
-	if err != nil || len(resp.Blocks) != 1 || time.Since(start) < 400*time.Millisecond {
-		t.Fatalf("slow stream cut: %v %+v", err, resp)
+	if err != nil || len(resp.Blocks) != 1 || time.Since(start) < tt {
+		t.Fatalf("slow stream cut: %v %+v after %s", err, resp, time.Since(start))
 	}
 	if info, ok := s.(upstream.StreamInfo); !ok || !info.Converted() {
 		t.Fatal("StreamInfo not passed through")
 	}
+	// A cancelled client never fails over.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if Failover(ctx, e) || Failover(ctx, &upstream.Error{Outcome: upstream.OutcomeRetryable}) {
+		t.Fatal("Failover after the client went away")
+	}
 }
 
-// ObserveTTFT feeds latency mode: after the Anthropic route is measured much faster, most plans start there.
+// ModelRouting.DoStream records time to first token itself: after both routes were measured (the primary
+// slow, the Anthropic route fast), most latency-mode plans start on the Anthropic route.
 func TestModelRoutingLatencyMode(t *testing.T) {
 	p, q := mixedServers(t)
+	p.SetLatency(fakeupstream.Chat, 200*time.Millisecond)
 	m := modelRouting(t, mixedChain(p, q), RoutingConfig{Mode: RoutingLatency})
-	m.ObserveTTFT(0, 400*time.Millisecond)
-	m.ObserveTTFT(1, 20*time.Millisecond)
+	body := []byte(`{"model":"` + fakeupstream.Model + `","messages":[{"role":"user","content":"hi"}],"max_tokens":20}`)
+	for _, route := range []int{0, 1} {
+		s, e := m.DoStream(context.Background(), route, body, llmproto.ProtocolOpenAI)
+		if e != nil {
+			t.Fatal(e)
+		}
+		_ = s.Close()
+	}
+	rs := m.c.routes[upstream.KindChat]
+	if rs.bal.ewma[signalTTFT][0] < 0.2 || rs.bal.ewma[signalTTFT][1] >= 0.1 || rs.bal.ewma[signalResponse][0] != 0 {
+		t.Fatalf("ttft samples %v, response samples %v", rs.bal.ewma[signalTTFT], rs.bal.ewma[signalResponse])
+	}
 	first := map[string]int{}
-	for n := 0; n < 210; n++ {
+	for n := 0; n < 200; n++ {
 		pick, ok := m.Plan(fakeupstream.Model, "").Next()
 		if !ok {
 			t.Fatal("no route")
 		}
 		first[pick.Name]++
-		m.c.routes[upstream.KindChat].breakers[pick.Route].Abort()
+		rs.breakers[pick.Route].Abort()
 	}
-	if first["claude"] < 190 || first["primary"] == 0 {
+	if first["claude"] < 170 || first["primary"] == 0 {
 		t.Fatalf("first picks %v", first)
+	}
+}
+
+// The two latency signals are kept apart; a plan uses its own signal and falls back to the other one only
+// when no candidate has a sample of its own.
+func TestLatencySignalsSeparateWithFallback(t *testing.T) {
+	b := newBalancer(RoutingLatency, []string{"a", "b"}, nil)
+	b.observe(signalResponse, 0, 10*time.Millisecond) // sandbox: a fast
+	b.observe(signalResponse, 1, 100*time.Millisecond)
+	if eff := b.effective([]int{0, 1}, signalTTFT); eff[0] <= eff[1] {
+		t.Fatalf("no TTFT samples: falls back to the response signal, got %v", eff)
+	}
+	b.observe(signalTTFT, 0, 100*time.Millisecond) // model API: a slow
+	b.observe(signalTTFT, 1, 10*time.Millisecond)
+	if eff := b.effective([]int{0, 1}, signalTTFT); eff[0] >= eff[1] {
+		t.Fatalf("TTFT plan must use TTFT samples, got %v", eff)
+	}
+	if eff := b.effective([]int{0, 1}, signalResponse); eff[0] <= eff[1] {
+		t.Fatalf("sandbox plan must use response samples, got %v", eff)
+	}
+}
+
+// Timeouts and unknown outcomes record a penalty (max of the try timeout and 2× the EWMA), so a route that
+// starts hanging loses its traffic in latency mode before its breaker opens; aborted tries record nothing.
+func TestLatencyPenalty(t *testing.T) {
+	fr := newRoutes("primary", "b")
+	h := newRouteHarness(t, routeLimits(), RoutingConfig{Mode: RoutingLatency, TryTimeout: time.Second}, fr)
+	rs := h.c.routes[upstream.KindChat]
+	rs.bal.observe(signalResponse, 0, 50*time.Millisecond)
+	rs.bal.observe(signalResponse, 1, 10*time.Millisecond)
+	unknown := &upstream.Error{Outcome: upstream.OutcomeUnknown, Code: upstream.CodeUpstreamUnconfirmed}
+	rs.observe(leg{route: 1}, unknown, true, 2*time.Second, time.Second) // aborted: nothing
+	if got := rs.bal.ewma[signalResponse][1]; got != 0.01 {
+		t.Fatalf("aborted try changed the EWMA: %v", got)
+	}
+	rs.observe(leg{route: 1}, unknown, false, 300*time.Millisecond, time.Second)
+	if got := rs.bal.ewma[signalResponse][1]; got < 0.2 { // 0.2 × 1 s + 0.8 × 0.01 s
+		t.Fatalf("penalty not recorded: %v", got)
+	}
+	retryTimeout := &upstream.Error{Outcome: upstream.OutcomeRetryable, Code: upstream.CodeUpstreamUnreachable}
+	before := rs.bal.ewma[signalResponse][1]
+	rs.observe(leg{route: 1}, retryTimeout, false, time.Second, time.Second) // hit the try timeout
+	if rs.bal.ewma[signalResponse][1] <= before {
+		t.Fatal("timeout penalty not recorded")
+	}
+	for range 10 {
+		rs.observe(leg{route: 1}, unknown, false, time.Second, time.Second)
+	}
+	if eff := rs.bal.effective([]int{0, 1}, signalResponse); eff[1] > eff[0]*LatencyFloor*1.01 {
+		t.Fatalf("hanging route keeps traffic: %v", eff)
+	}
+}
+
+// Breaker recovery in weighted mode (review round 1, blocker): a route that was down until its breaker opened
+// gets its weighted share back once it is healthy and the open window has elapsed — the round-robin offers it
+// as a half-open probe, the probe succeeds and closes the breaker.
+func TestWeightedRouteRecoversAfterBreakerOpens(t *testing.T) {
+	fr := newRoutes("primary", "b", "c")
+	h := newRouteHarness(t, routeLimits(), RoutingConfig{Weights: map[string]int{"primary": 1, "b": 3, "c": 1}}, fr)
+	h.store.setLimit("t1", 1_000_000_000)
+	fr.setDown(1, true)
+	for n := 0; n < 20; n++ {
+		if r := h.invoke(t, inv(fmt.Sprintf("d%d", n), chatBody)); r.Status != 200 {
+			t.Fatalf("call %d: %+v", n, r)
+		}
+	}
+	if !strings.Contains(states(h.c), "b:open") {
+		t.Fatalf("states %s", states(h.c))
+	}
+	fr.setDown(1, false)
+	h.clk.advance(time.Hour)
+	before := fr.calls(1)
+	for n := 0; n < 100; n++ {
+		if r := h.invoke(t, inv(fmt.Sprintf("r%d", n), chatBody)); r.Status != 200 {
+			t.Fatalf("call %d: %+v", n, r)
+		}
+	}
+	if got := fr.calls(1) - before; got < 55 || got > 65 {
+		t.Fatalf("b got %d of 100 calls after recovery, want its share of 60", got)
+	}
+	if !strings.Contains(states(h.c), "b:closed") {
+		t.Fatalf("states %s", states(h.c))
+	}
+}
+
+// The same recovery through the model API's Plan/Next: once the window has elapsed the open route is offered
+// first in its turn (half-open probe) and, after Done with success, is closed again.
+func TestModelRoutingPlanRecoversOpenRoute(t *testing.T) {
+	fr := newRoutes("primary", "b")
+	h := newRouteHarness(t, routeLimits(), RoutingConfig{BreakerFailures: 1, Weights: map[string]int{"primary": 1, "b": 3}}, fr)
+	rs := h.c.routes[upstream.KindChat]
+	m := &ModelRouting{c: h.c, rs: rs, ad: fakeChat{fr}}
+	fail := &upstream.Error{Outcome: upstream.OutcomeRetryable, Code: upstream.CodeUpstreamUnavailable}
+	for {
+		plan := m.Plan("m", "")
+		pick, ok := plan.Next()
+		if !ok {
+			t.Fatal("no route")
+		}
+		if pick.Name == "b" {
+			plan.Done(pick, fail, false)
+			break
+		}
+		plan.Done(pick, nil, false)
+	}
+	if rs.breakers[1].Ready() {
+		t.Fatal("b not open")
+	}
+	h.clk.advance(time.Hour)
+	picks := map[string]int{}
+	for n := 0; n < 40; n++ {
+		plan := m.Plan("m", "")
+		pick, ok := plan.Next()
+		if !ok {
+			t.Fatal("no route")
+		}
+		picks[pick.Name]++
+		plan.Done(pick, nil, false)
+	}
+	if picks["b"] < 25 || states(h.c) != "primary:closed,b:closed" {
+		t.Fatalf("picks %v states %s", picks, states(h.c))
+	}
+}
+
+// fakeChat adapts fakeRoutes to upstream.ChatAdapter (all routes OpenAI, no streaming).
+type fakeChat struct{ *fakeRoutes }
+
+func (fakeChat) RouteProtocol(int) llmproto.Protocol { return llmproto.ProtocolOpenAI }
+func (fakeChat) Convertible(int, []byte) bool        { return true }
+func (fakeChat) DoStream(context.Context, int, []byte, llmproto.Protocol) (upstream.Stream, *upstream.Error) {
+	return nil, &upstream.Error{Outcome: upstream.OutcomeFatal}
+}
+
+// countingProto is a fakeRoutes whose route 1 is an Anthropic route; it counts Convertible calls.
+type countingProto struct {
+	*fakeRoutes
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *countingProto) RouteProtocol(i int) llmproto.Protocol {
+	if i == 1 {
+		return llmproto.ProtocolAnthropic
+	}
+	return llmproto.ProtocolOpenAI
+}
+
+func (c *countingProto) Convertible(int, []byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	return true
+}
+
+// The conversion check of a non-OpenAI route runs once per call, not in order, pick and ready again.
+func TestConvertibleCachedPerCall(t *testing.T) {
+	fr := newRoutes("primary", "claude")
+	fr.setDown(0, true)
+	cp := &countingProto{fakeRoutes: fr}
+	h := &harness{store: newFakeStore(t), ad: fr.fakeAdapter, blobs: &fakeBlobs{m: map[string][]byte{}}, events: &fakeEvents{}, logs: &syncBuffer{}}
+	c, err := New(Config{Store: h.store, Adapters: []upstream.Adapter{cp}, Blobs: h.blobs, Events: h.events, Limits: routeLimits(),
+		Pricing: map[upstream.Kind]upstream.Pricing{upstream.KindChat: fr.prices[0]}, Routing: RoutingConfig{Mode: RoutingWeighted}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.Close)
+	h.c = c
+	if r := h.invoke(t, inv("c1", chatBody)); r.Status != 200 {
+		t.Fatalf("result %+v", r)
+	}
+	if cp.calls != 1 {
+		t.Fatalf("Convertible called %d times in one call, want 1", cp.calls)
 	}
 }
