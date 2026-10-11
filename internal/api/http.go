@@ -261,6 +261,9 @@ func New(cfg Config) (*Handler, error) {
 	if cfg.Tenancy != nil && (cfg.Accounts == nil || cfg.APIKeys == nil) {
 		return nil, errors.New("api: 多租户（Tenancy）需要启用账号（Accounts）与 APIKeys")
 	}
+	if cfg.Tenancy != nil && apikey.LooksLikeKey(cfg.Token) {
+		return nil, errors.New("api: 启用多租户时运维 token 不能以 abx_ 开头（该前缀保留给平台 API key）")
+	}
 	active := routes
 	if cfg.Accounts != nil {
 		if cfg.ResearchSpec == nil {

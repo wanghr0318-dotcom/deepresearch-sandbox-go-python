@@ -760,12 +760,74 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Add a user to an org or change their role (owners for their org; the operator names the org)
-         * @description A user belongs to exactly one org. A user who is still alone in their personal org `user-<id>` moves
-         *     into the org; their keys in the old org are revoked in the same transaction. A user in any other org is
-         *     409 `user_in_other_org`. Demoting the last owner is 409 `last_owner`.
+         * Move a user into an org or change their role (operator only; users join through invites)
+         * @description Operator administration (also `agentbox org add-member`). Owners invite instead
+         *     (`POST /v1/orgs/invites`); a user moves only by accepting. A user belongs to exactly one org. A user who
+         *     is still alone in their personal org `user-<id>` moves into the org; their keys in the old org are revoked
+         *     in the same transaction. A user in any other org is 409 `user_in_other_org`; another user's personal org
+         *     is 409 `personal_org_closed`. Demoting the last owner is 409 `last_owner`.
          */
         post: operations["addMember"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/invites": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Pending invites of the caller, plus (for owners) those their org sent (user session only) */
+        get: operations["listInvites"];
+        put?: never;
+        /**
+         * Invite a user into the caller's org (owners, user session only); the user moves only on accept
+         * @description Invites expire after 7 days. Inviting the same user again renews the invite. A personal org `user-<id>`
+         *     accepts no other members (409 `personal_org_closed`).
+         */
+        post: operations["createInvite"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/invites/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Decline (the invited user) or revoke (an owner of the org) an invite */
+        delete: operations["deleteInvite"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/invites/{id}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Accept an invite (the invited user); moves the user into the org and revokes their keys in the old org */
+        post: operations["acceptInvite"];
         delete?: never;
         options?: never;
         head?: never;
@@ -787,7 +849,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Remove a member; they return to their personal org and their keys in this org are revoked */
+        /** Remove a member (owners, the operator) or leave the org yourself; they return to their personal org and their keys in this org are revoked */
         delete: operations["removeMember"];
         options?: never;
         head?: never;
@@ -875,8 +937,30 @@ export interface components {
             username: string;
             /** @enum {string} */
             role: "owner" | "member";
-            /** @description The org name; required for the operator, an owner defaults to their own org */
-            org?: string;
+            /** @description The org name */
+            org: string;
+        };
+        InviteRequest: {
+            username: string;
+            /** @enum {string} */
+            role: "owner" | "member";
+        };
+        Invite: {
+            id: string;
+            /** Format: int64 */
+            org_id: number;
+            org: string;
+            username: string;
+            /** @enum {string} */
+            role: "owner" | "member";
+            invited_by: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            expires_at: string;
+        };
+        InviteList: {
+            invites: components["schemas"]["Invite"][];
         };
         Error: {
             code: string;
@@ -3152,7 +3236,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description `org_exists`; or `user_in_other_org`: the owner is no longer in their personal org */
+            /** @description `org_exists`; or `user_in_other_org`: the owner is no longer alone in their personal org (nothing is created) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -3187,7 +3271,7 @@ export interface operations {
                     "application/json": components["schemas"]["Membership"];
                 };
             };
-            /** @description `invalid_request` (role, operator without org, the reserved org `operator`) */
+            /** @description `invalid_request` (role, missing org, the reserved org `operator`) */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -3207,7 +3291,163 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description `user_in_other_org` or `last_owner` */
+            /** @description `user_in_other_org`, `personal_org_closed` or `last_owner` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    listInvites: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Pending, unexpired invites */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InviteList"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    createInvite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InviteRequest"];
+            };
+        };
+        responses: {
+            /** @description The pending invite */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Invite"];
+                };
+            };
+            /** @description `invalid_request` */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            /** @description `user_not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `personal_org_closed` or `already_member` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    deleteInvite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            /** @description `invite_not_found` (also expired, or not visible to the caller) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    acceptInvite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The new membership */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Membership"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            /** @description `invite_not_found` (also expired, or another user's invite) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `user_in_other_org` (the user is no longer alone in their personal org) or `last_owner` */
             409: {
                 headers: {
                     [name: string]: unknown;

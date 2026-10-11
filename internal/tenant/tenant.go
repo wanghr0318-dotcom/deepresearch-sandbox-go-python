@@ -136,6 +136,9 @@ func ValidateOrgName(name string) error {
 	return nil
 }
 
+// IsPersonalOrgName reports whether name has the personal-org form user-<n> (of any user).
+func IsPersonalOrgName(name string) bool { return personalNameRe.MatchString(name) }
+
 // IsPersonalOrg reports whether name is the personal org of userID.
 func IsPersonalOrg(name string, userID int64) bool { return name == PersonalOrgName(userID) }
 
@@ -191,24 +194,65 @@ var (
 	ErrUserInOtherOrg = errors.New("tenant: user already belongs to another org")
 	ErrLastOwner      = errors.New("tenant: an org must keep at least one owner")
 	ErrPersonalOrg    = errors.New("tenant: a user cannot leave their personal org")
+	// ErrPersonalOrgClosed: a personal org (user-<id>) never has members other than its own user.
+	ErrPersonalOrgClosed = errors.New("tenant: a personal org accepts no other members")
+	// ErrAlreadyMember: the invited user is already in the org.
+	ErrAlreadyMember = errors.New("tenant: user is already a member of the org")
 )
+
+// InviteTTL is how long an org invite stays acceptable.
+const InviteTTL = 7 * 24 * time.Hour
+
+// Invite is a pending invitation of a user into an org; the user moves only when they accept it.
+type Invite struct {
+	ID        string    `json:"id"`
+	OrgID     int64     `json:"org_id"`
+	OrgName   string    `json:"org"`
+	UserID    int64     `json:"-"`
+	Username  string    `json:"username"`
+	Role      Role      `json:"role"`
+	InvitedBy string    `json:"invited_by"`
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// InviteFilter selects pending (unexpired) invites: those of UserID, or (when OrgID is set) also those of OrgID.
+// Zero values do not match anything except when both are zero (all invites).
+type InviteFilter struct {
+	UserID, OrgID int64
+}
 
 // Store is the tenancy storage. Not-found is persistence.ErrNotFound and duplicates persistence.ErrConflict.
 type Store interface {
 	// CreateOrg creates an org with a validated name; an existing name is persistence.ErrConflict.
 	CreateOrg(ctx context.Context, name string) (Org, error)
+	// CreateOrgWithOwner creates the org and moves ownerKey's user into it as owner in one transaction (the move
+	// rules of AddMember apply; on any error nothing is created).
+	CreateOrgWithOwner(ctx context.Context, name, ownerKey string) (Org, Membership, error)
 	ListOrgs(ctx context.Context) ([]Org, error)
 	OrgByName(ctx context.Context, name string) (Org, error)
 	// MemberByName returns the membership of a user by normalized (lower-case) username.
 	MemberByName(ctx context.Context, usernameKey string) (Membership, error)
-	// AddMember puts a user into org with role. A user already in org has their role updated. A user in their
-	// personal org (alone) moves; their keys in the old org are revoked in the same transaction. A user in any
-	// other org is ErrUserInOtherOrg. Demoting the last owner is ErrLastOwner.
+	// AddMember puts a user into org with role (an operator action; users join through invites). A user already
+	// in org has their role updated. A user in their personal org (alone) moves; their keys in the old org are
+	// revoked in the same transaction. A user in any other org is ErrUserInOtherOrg. Demoting the last owner is
+	// ErrLastOwner. Another user's personal org is ErrPersonalOrgClosed.
 	AddMember(ctx context.Context, orgID int64, usernameKey string, role Role) (Membership, error)
 	// RemoveMember returns the user to their personal org (as owner) and revokes their keys in org. A user who is
 	// not in org is persistence.ErrNotFound; removing the last owner is ErrLastOwner; org being the user's personal
 	// org is ErrPersonalOrg.
 	RemoveMember(ctx context.Context, orgID int64, usernameKey string) error
+	// CreateInvite records (or renews) a pending invite of the user into org, expiring at expiresAt. A personal org
+	// is ErrPersonalOrgClosed; a user already in org is ErrAlreadyMember; unknown user persistence.ErrNotFound.
+	CreateInvite(ctx context.Context, orgID int64, usernameKey string, role Role, invitedBy int64, expiresAt time.Time) (Invite, error)
+	ListInvites(ctx context.Context, f InviteFilter) ([]Invite, error)
+	// GetInvite returns a pending (unexpired) invite; otherwise persistence.ErrNotFound.
+	GetInvite(ctx context.Context, id string) (Invite, error)
+	// AcceptInvite moves the invite's user into its org with the AddMember move rules and deletes the invite, in
+	// one transaction. A missing or expired invite, or one for another user, is persistence.ErrNotFound.
+	AcceptInvite(ctx context.Context, id string, userID int64) (Membership, error)
+	// DeleteInvite removes an invite (decline or revoke); missing is persistence.ErrNotFound.
+	DeleteInvite(ctx context.Context, id string) error
 	// CreateKey stores a key for the user in the user's current org.
 	CreateKey(ctx context.Context, k NewKey) (Key, error)
 	ListKeys(ctx context.Context, f KeyFilter) ([]Key, error)

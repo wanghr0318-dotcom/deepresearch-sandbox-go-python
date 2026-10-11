@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"errors"
 	"flag"
 	"fmt"
@@ -73,6 +74,8 @@ func tenancyError(err error) string {
 	switch {
 	case errors.Is(err, tenant.ErrUserInOtherOrg):
 		return "该用户已属于另一个 org（只能从其个人 org 迁入）"
+	case errors.Is(err, tenant.ErrPersonalOrgClosed):
+		return "个人 org 不接受其他成员"
 	case errors.Is(err, tenant.ErrLastOwner):
 		return "org 须至少保留一个 owner"
 	case errors.Is(err, persistence.ErrConflict):
@@ -129,18 +132,23 @@ func runOrg(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "agentbox org create:", err)
 			return 2
 		}
-		o, err := ten.CreateOrg(ctx, pos[0])
-		if err != nil {
-			return fail(err)
-		}
-		fmt.Fprintf(stdout, "已创建 org %s（id %d）\n", o.Name, o.ID)
-		if *owner != "" {
-			m, err := ten.AddMember(ctx, o.ID, usernameKeyOf(*owner), tenant.Owner)
+		if *owner == "" {
+			o, err := ten.CreateOrg(ctx, pos[0])
 			if err != nil {
 				return fail(err)
 			}
-			fmt.Fprintf(stdout, "%s 为 %s 的 owner\n", m.Username, o.Name)
+			fmt.Fprintf(stdout, "已创建 org %s（id %d）\n", o.Name, o.ID)
+			break
 		}
+		// 建 org 与移入 owner 在同一事务中：owner 无法移入时不留下 org。
+		o, m, err := ten.CreateOrgWithOwner(ctx, pos[0], usernameKeyOf(*owner))
+		if errors.Is(err, persistence.ErrNotFound) {
+			return fail(fmt.Errorf("用户 %q 不存在", *owner))
+		}
+		if err != nil {
+			return fail(err)
+		}
+		fmt.Fprintf(stdout, "已创建 org %s（id %d），%s 为其 owner\n", o.Name, o.ID, m.Username)
 	case "list":
 		orgs, err := ten.ListOrgs(ctx)
 		if err != nil {
@@ -226,6 +234,16 @@ func runKey(args []string, stdout, stderr io.Writer) int {
 	fail := func(err error) int {
 		fmt.Fprintf(stderr, "agentbox key %s: %s\n", sub, tenancyError(err))
 		return 1
+	}
+	if sub == "create" { // 只用与数据库登记一致的 pepper：否则建出的 key 在 server 上无法校验
+		recorded, _, err := s.APIKeys().PepperState(ctx)
+		if err != nil {
+			return fail(err)
+		}
+		if recorded == nil || !hmac.Equal(recorded, apikey.Fingerprint(pepper)) {
+			fmt.Fprintln(stderr, "agentbox key create: --data-dir 中的 apikey.pepper 与数据库登记的不一致（或 server 尚未以它启动过）")
+			return 1
+		}
 	}
 	switch sub {
 	case "create":

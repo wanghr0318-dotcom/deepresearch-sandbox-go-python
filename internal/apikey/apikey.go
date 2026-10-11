@@ -114,35 +114,6 @@ func ValidName(name string) bool {
 	return n >= 1 && n <= maxKeyNameRunes
 }
 
-// LoadOrCreatePepper reads <dataDir>/apikey.pepper, creating it (0600, 32 random bytes in hex) when it does not
-// exist. Every server sharing a database must use the same pepper file.
-func LoadOrCreatePepper(dataDir string) ([]byte, error) {
-	path := filepath.Join(dataDir, PepperFile)
-	p, err := LoadPepper(dataDir)
-	if err == nil || !errors.Is(err, os.ErrNotExist) {
-		return p, err
-	}
-	var b [pepperBytes]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if errors.Is(err, os.ErrExist) { // created concurrently: use that one
-		return LoadPepper(dataDir)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("apikey: create %s: %w", PepperFile, err)
-	}
-	_, werr := f.WriteString(hex.EncodeToString(b[:]) + "\n")
-	serr := f.Sync()
-	cerr := f.Close()
-	if err := errors.Join(werr, serr, cerr); err != nil {
-		_ = os.Remove(path)
-		return nil, fmt.Errorf("apikey: write %s: %w", PepperFile, err)
-	}
-	return b[:], nil
-}
-
 // LoadPepper reads an existing <dataDir>/apikey.pepper; it must be 0600 (not checked on Windows).
 func LoadPepper(dataDir string) ([]byte, error) {
 	path := filepath.Join(dataDir, PepperFile)

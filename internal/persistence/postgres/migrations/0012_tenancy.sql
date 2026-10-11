@@ -30,6 +30,24 @@ CREATE TABLE api_keys (
 );
 CREATE INDEX api_keys_org ON api_keys(org_id);
 CREATE INDEX api_keys_user ON api_keys(user_id);
+-- 邀请：用户只有接受邀请才会迁入另一个 org（个人 org 不接受其他成员）。同一 org 与用户至多一条，接受、拒绝或撤销即删除。
+CREATE TABLE org_invites (
+    id         text PRIMARY KEY CHECK (id ~ '^inv_[a-z2-7]{16}$'),
+    org_id     bigint NOT NULL REFERENCES orgs(id),
+    user_id    bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role       text NOT NULL CHECK (role IN ('owner', 'member')),
+    invited_by bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL,
+    UNIQUE (org_id, user_id)
+);
+CREATE INDEX org_invites_user ON org_invites(user_id);
+-- pepper 指纹（HMAC(pepper, 固定标签)）：server 启动时核对 <data>/apikey.pepper，缺失或不一致时拒绝启动而不是另建。
+CREATE TABLE apikey_pepper (
+    id          boolean PRIMARY KEY DEFAULT true CHECK (id),
+    fingerprint bytea NOT NULL CHECK (length(fingerprint) = 32),
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
 CREATE TABLE limits (
     scope_kind    text NOT NULL CHECK (scope_kind IN ('org', 'user', 'key')),
     scope_id      text NOT NULL,

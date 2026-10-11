@@ -21,6 +21,7 @@ import (
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/admission"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/apikey"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/app"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/mcp"
@@ -233,6 +234,11 @@ func runServer(args []string, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "agentbox server:", err)
 			return 1
 		}
+	}
+	// 启用账号（即多租户）时以 abx_ 开头的 Bearer 按平台 API key 校验，这样的运维 token 将无法使用：拒绝启动。
+	if st.accounts && apikey.LooksLikeKey(cfg.APIToken) {
+		fmt.Fprintln(stderr, "agentbox server: "+api.TokenFile+" 不能以 abx_ 开头（该前缀保留给平台 API key）")
+		return 2
 	}
 	return f.serve(cfg, serverDeps(dir, *f.dsn, execDigest, newProvider), stderr)
 }
@@ -477,6 +483,9 @@ func (f *serverFlags) serve(cfg app.Config, deps app.Deps, stderr io.Writer) int
 	}
 	if err := app.Run(ctx, cfg, deps); err != nil {
 		fmt.Fprintln(stderr, "agentbox server:", err)
+		if errors.Is(err, apikey.ErrPepper) { // pepper 文件与数据库不一致：配置错误，拒绝启动
+			return 2
+		}
 		return 1
 	}
 	return 0

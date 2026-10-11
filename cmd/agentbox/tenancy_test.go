@@ -27,7 +27,7 @@ func TestOrgAndKeyCommands(t *testing.T) {
 		}
 	}
 	dir := t.TempDir()
-	pepper, err := apikey.LoadOrCreatePepper(dir) // what the server creates on first start
+	pepper, err := apikey.EnsurePepper(ctx, dir, s.APIKeys()) // what the server does on first start
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,6 +94,22 @@ func TestOrgAndKeyCommands(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(empty, apikey.PepperFile)); err == nil {
 		t.Fatal("the CLI must not create a pepper")
+	}
+	// A pepper that is not the one recorded in the database is refused (its keys would never verify).
+	other := t.TempDir()
+	if _, err := apikey.LoadOrCreatePepper(other); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, errb := run(key, "create", "--user", "bob", "--name", "x", "--scopes", "models", "--data-dir", other); code != 1 ||
+		!strings.Contains(errb, "apikey.pepper") {
+		t.Fatalf("foreign pepper = %d %q", code, errb)
+	}
+	// org create --owner is one transaction: an owner who cannot move leaves no org behind.
+	if code, _, errb := run(org, "create", "beta", "--owner", "bob"); code != 1 || !strings.Contains(errb, "另一个 org") {
+		t.Fatalf("org create with an owner in another org = %d %q", code, errb)
+	}
+	if code, out, _ := run(org, "list"); code != 0 || strings.Contains(out, "beta") {
+		t.Fatalf("beta must not exist: %q", out)
 	}
 	for _, c := range []struct {
 		fn   func([]string, io.Writer, io.Writer) int

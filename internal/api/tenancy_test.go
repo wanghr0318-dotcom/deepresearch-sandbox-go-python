@@ -23,6 +23,8 @@ type fakeTenancy struct {
 	orgs    map[int64]*tenant.Org
 	members map[int64]tenant.Membership // user id → membership
 	keys    map[string]*fakeKey
+	invites map[string]tenant.Invite
+	nextInv int
 	evict   func(id string) // NOTIFY apikey_changed
 }
 
@@ -32,7 +34,8 @@ type fakeKey struct {
 }
 
 func newFakeTenancy(acc *fakeAccounts) *fakeTenancy {
-	f := &fakeTenancy{acc: acc, orgs: map[int64]*tenant.Org{}, members: map[int64]tenant.Membership{}, keys: map[string]*fakeKey{}}
+	f := &fakeTenancy{acc: acc, orgs: map[int64]*tenant.Org{}, members: map[int64]tenant.Membership{}, keys: map[string]*fakeKey{},
+		invites: map[string]tenant.Invite{}}
 	f.orgLocked(tenant.OperatorOrg)
 	return f
 }
@@ -142,6 +145,106 @@ func (f *fakeTenancy) revokeLocked(userID, orgID int64) {
 func (f *fakeTenancy) AddMember(_ context.Context, orgID int64, key string, role tenant.Role) (tenant.Membership, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.addLocked(orgID, key, role)
+}
+
+func (f *fakeTenancy) CreateOrgWithOwner(_ context.Context, name, ownerKey string) (tenant.Org, tenant.Membership, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, o := range f.orgs {
+		if o.Name == name {
+			return tenant.Org{}, tenant.Membership{}, persistence.ErrConflict
+		}
+	}
+	if _, _, ok := f.userLocked(ownerKey); !ok {
+		return tenant.Org{}, tenant.Membership{}, persistence.ErrNotFound
+	}
+	o := f.orgLocked(name)
+	m, err := f.addLocked(o.ID, ownerKey, tenant.Owner)
+	if err != nil {
+		delete(f.orgs, o.ID)
+		return tenant.Org{}, tenant.Membership{}, err
+	}
+	return f.withCount(*o), m, nil
+}
+
+func (f *fakeTenancy) CreateInvite(_ context.Context, orgID int64, key string, role tenant.Role, by int64, exp time.Time) (tenant.Invite, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	o, ok := f.orgs[orgID]
+	if !ok {
+		return tenant.Invite{}, persistence.ErrNotFound
+	}
+	u, m, ok := f.userLocked(key)
+	switch {
+	case !ok:
+		return tenant.Invite{}, persistence.ErrNotFound
+	case o.Name == tenant.OperatorOrg:
+		return tenant.Invite{}, persistence.ErrInvalid
+	case tenant.IsPersonalOrgName(o.Name):
+		return tenant.Invite{}, tenant.ErrPersonalOrgClosed
+	case m.OrgID == orgID:
+		return tenant.Invite{}, tenant.ErrAlreadyMember
+	}
+	for id, inv := range f.invites {
+		if inv.OrgID == orgID && inv.UserID == u.ID {
+			delete(f.invites, id)
+		}
+	}
+	f.nextInv++
+	inv := tenant.Invite{ID: fmt.Sprintf("inv_%016d", f.nextInv), OrgID: orgID, OrgName: o.Name, UserID: u.ID, Username: u.Username,
+		Role: role, InvitedBy: fmt.Sprint(by), CreatedAt: time.Now(), ExpiresAt: exp}
+	f.invites[inv.ID] = inv
+	return inv, nil
+}
+
+func (f *fakeTenancy) ListInvites(_ context.Context, flt tenant.InviteFilter) ([]tenant.Invite, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []tenant.Invite
+	for _, inv := range f.invites {
+		if inv.ExpiresAt.After(time.Now()) && (inv.UserID == flt.UserID || (flt.OrgID != 0 && inv.OrgID == flt.OrgID)) {
+			out = append(out, inv)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeTenancy) GetInvite(_ context.Context, id string) (tenant.Invite, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	inv, ok := f.invites[id]
+	if !ok || !inv.ExpiresAt.After(time.Now()) {
+		return tenant.Invite{}, persistence.ErrNotFound
+	}
+	return inv, nil
+}
+
+func (f *fakeTenancy) AcceptInvite(_ context.Context, id string, userID int64) (tenant.Membership, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	inv, ok := f.invites[id]
+	if !ok || inv.UserID != userID || !inv.ExpiresAt.After(time.Now()) {
+		return tenant.Membership{}, persistence.ErrNotFound
+	}
+	m, err := f.addLocked(inv.OrgID, strings.ToLower(inv.Username), inv.Role)
+	if err == nil {
+		delete(f.invites, id)
+	}
+	return m, err
+}
+
+func (f *fakeTenancy) DeleteInvite(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.invites[id]; !ok {
+		return persistence.ErrNotFound
+	}
+	delete(f.invites, id)
+	return nil
+}
+
+func (f *fakeTenancy) addLocked(orgID int64, key string, role tenant.Role) (tenant.Membership, error) {
 	o, ok := f.orgs[orgID]
 	if !ok {
 		return tenant.Membership{}, persistence.ErrNotFound
@@ -152,6 +255,9 @@ func (f *fakeTenancy) AddMember(_ context.Context, orgID int64, key string, role
 	u, cur, ok := f.userLocked(key)
 	if !ok {
 		return tenant.Membership{}, persistence.ErrNotFound
+	}
+	if tenant.IsPersonalOrgName(o.Name) && !tenant.IsPersonalOrg(o.Name, u.ID) {
+		return tenant.Membership{}, tenant.ErrPersonalOrgClosed
 	}
 	switch {
 	case cur.OrgID == orgID:
@@ -457,10 +563,9 @@ func TestInvalidKeys(t *testing.T) {
 	st, body, _ := ts.do("GET", "/v1/me", "", bearer(full))
 	expect(t, st, body, 200, "") // cached in the verifier now
 	for name, hdr := range map[string]map[string]string{
-		"malformed bearer":  bearer("abx_live_nope"),
-		"malformed x-key":   xAPIKey("abx_live_nope"),
-		"non-abx x-api-key": xAPIKey(adminToken),
-		"key plus cookie":   {"Authorization": "Bearer abx_live_nope", "Cookie": SessionCookie + "=" + cookie},
+		"malformed bearer": bearer("abx_live_nope"),
+		"malformed x-key":  xAPIKey("abx_live_nope"),
+		"key plus cookie":  {"Authorization": "Bearer abx_live_nope", "Cookie": SessionCookie + "=" + cookie},
 	} {
 		st, body, hdrs := ts.do("GET", "/v1/me", "", hdr)
 		expect(t, st, body, 401, "invalid_api_key")
@@ -502,7 +607,7 @@ func TestInvalidKeys(t *testing.T) {
 	}
 }
 
-// TestManagementMatrix: member / owner / operator / other org against keys and members.
+// TestManagementMatrix: member / owner / operator / other org against keys, members and invites.
 func TestManagementMatrix(t *testing.T) {
 	ts := newTenantServer(t)
 	_, alice := ts.acc.seedUser(t, "alice")
@@ -510,29 +615,80 @@ func TestManagementMatrix(t *testing.T) {
 	_, carol := ts.acc.seedUser(t, "carol")
 	ts.acc.seedUser(t, "dave")
 
-	// The operator creates org acme with alice as owner; alice adds bob.
+	// The operator creates org acme with alice as owner (one transaction).
 	st, body, _ := ts.do("POST", "/v1/orgs", `{"name":"acme","owner":"alice"}`, adminAuth)
 	expect(t, st, body, 201, "")
 	st, body, _ = ts.do("POST", "/v1/orgs", `{"name":"acme"}`, adminAuth)
 	expect(t, st, body, 409, "org_exists")
+	st, body, _ = ts.do("POST", "/v1/orgs", `{"name":"beta","owner":"nobody"}`, adminAuth)
+	expect(t, st, body, 404, "user_not_found")
+	if _, err := ts.ten.OrgByName(context.Background(), "beta"); err == nil {
+		t.Fatal("a failed owner move must not leave the org behind")
+	}
 	st, body, _ = ts.do("POST", "/v1/orgs", `{"name":"user-9"}`, adminAuth)
 	expect(t, st, body, 400, "invalid_org_name")
 	st, body, _ = ts.do("POST", "/v1/orgs", `{"name":"beta"}`, session(alice))
 	expect(t, st, body, 403, "forbidden")
-	st, body, _ = ts.do("POST", "/v1/orgs/members", `{"username":"bob","role":"member"}`, session(alice))
+
+	// Users never move anyone directly: POST /v1/orgs/members is operator-only.
+	st, body, _ = ts.do("POST", "/v1/orgs/members", `{"username":"bob","role":"member","org":"acme"}`, session(alice))
+	expect(t, st, body, 403, "forbidden")
+	// Bob joins acme only by accepting alice's invite.
+	st, body, _ = ts.do("POST", "/v1/orgs/invites", `{"username":"bob","role":"member"}`, session(alice))
+	expect(t, st, body, 201, "")
+	var inv tenant.Invite
+	decodeJSONBody(t, body, &inv)
+	if inv.OrgName != "acme" || inv.Username != "bob" || inv.ExpiresAt.Before(time.Now().Add(6*24*time.Hour)) {
+		t.Fatalf("invite %s", body)
+	}
+	if m, _ := ts.ten.MemberByName(context.Background(), "bob"); m.OrgName != "user-2" {
+		t.Fatalf("an invite alone does not move: %+v", m)
+	}
+	// carol (other org) can neither see nor accept nor revoke it; the operator does not use invites.
+	st, body, _ = ts.do("POST", "/v1/orgs/invites/"+inv.ID+"/accept", "", session(carol))
+	expect(t, st, body, 404, "invite_not_found")
+	st, body, _ = ts.do("DELETE", "/v1/orgs/invites/"+inv.ID, "", session(carol))
+	expect(t, st, body, 404, "invite_not_found")
+	st, body, _ = ts.do("GET", "/v1/orgs/invites", "", session(carol))
 	expect(t, st, body, 200, "")
-	// bob (member) cannot manage members; carol (other org) cannot add to acme.
-	st, body, _ = ts.do("POST", "/v1/orgs/members", `{"username":"dave","role":"member"}`, session(bob))
+	if strings.Contains(string(body), inv.ID) {
+		t.Fatalf("invites are not visible across orgs: %s", body)
+	}
+	st, body, _ = ts.do("GET", "/v1/orgs/invites", "", adminAuth)
 	expect(t, st, body, 403, "forbidden")
-	st, body, _ = ts.do("POST", "/v1/orgs/members", `{"username":"dave","role":"member","org":"acme"}`, session(carol))
+	// alice (owner) sees it, bob sees it; bob accepts.
+	for _, c := range []string{alice, bob} {
+		st, body, _ = ts.do("GET", "/v1/orgs/invites", "", session(c))
+		expect(t, st, body, 200, "")
+		if !strings.Contains(string(body), inv.ID) {
+			t.Fatalf("invite not listed: %s", body)
+		}
+	}
+	st, body, _ = ts.do("POST", "/v1/orgs/invites/"+inv.ID+"/accept", "", session(bob))
+	expect(t, st, body, 200, "")
+	st, body, _ = ts.do("POST", "/v1/orgs/invites/"+inv.ID+"/accept", "", session(bob))
+	expect(t, st, body, 404, "invite_not_found")
+	st, body, _ = ts.do("POST", "/v1/orgs/invites", `{"username":"bob","role":"member"}`, session(alice))
+	expect(t, st, body, 409, "already_member")
+	// bob (member) cannot invite; a personal org takes no members; carol declines an invite.
+	st, body, _ = ts.do("POST", "/v1/orgs/invites", `{"username":"dave","role":"member"}`, session(bob))
 	expect(t, st, body, 403, "forbidden")
-	// The operator must name the org; bob is already in acme so carol's org cannot take him.
+	st, body, _ = ts.do("POST", "/v1/orgs/invites", `{"username":"dave","role":"member"}`, session(carol))
+	expect(t, st, body, 409, "personal_org_closed")
+	st, body, _ = ts.do("POST", "/v1/orgs/invites", `{"username":"carol","role":"member"}`, session(alice))
+	expect(t, st, body, 201, "")
+	decodeJSONBody(t, body, &inv)
+	st, body, _ = ts.do("DELETE", "/v1/orgs/invites/"+inv.ID, "", session(carol))
+	expect(t, st, body, 204, "")
+	st, body, _ = ts.do("POST", "/v1/orgs/invites", `{"username":"nobody","role":"member"}`, session(alice))
+	expect(t, st, body, 404, "user_not_found")
+	// The operator moves users directly (must name the org); personal and operator orgs refuse.
 	st, body, _ = ts.do("POST", "/v1/orgs/members", `{"username":"dave","role":"member"}`, adminAuth)
 	expect(t, st, body, 400, "invalid_request")
-	st, body, _ = ts.do("POST", "/v1/orgs/members", `{"username":"bob","role":"member","org":"user-3"}`, adminAuth)
+	st, body, _ = ts.do("POST", "/v1/orgs/members", `{"username":"dave","role":"member","org":"user-3"}`, adminAuth)
+	expect(t, st, body, 409, "personal_org_closed")
+	st, body, _ = ts.do("POST", "/v1/orgs/members", `{"username":"bob","role":"member","org":"user-2"}`, adminAuth)
 	expect(t, st, body, 409, "user_in_other_org")
-	st, body, _ = ts.do("POST", "/v1/orgs/members", `{"username":"nobody","role":"member"}`, session(alice))
-	expect(t, st, body, 404, "user_not_found")
 	st, body, _ = ts.do("POST", "/v1/orgs/members", `{"username":"dave","role":"member","org":"operator"}`, adminAuth)
 	expect(t, st, body, 400, "invalid_request")
 
@@ -559,7 +715,6 @@ func TestManagementMatrix(t *testing.T) {
 	if ids := list(adminAuth); len(ids) != 3 {
 		t.Fatalf("operator sees all keys: %v", ids)
 	}
-	// Revocation: member not someone else's; other org's owner not; owner yes; operator yes.
 	st, body, _ = ts.do("DELETE", "/v1/keys/"+aliceKey, "", session(bob))
 	expect(t, st, body, 404, "key_not_found")
 	st, body, _ = ts.do("DELETE", "/v1/keys/"+bobKey, "", session(carol))
@@ -570,7 +725,6 @@ func TestManagementMatrix(t *testing.T) {
 	expect(t, st, body, 200, "")
 	st, body, _ = ts.do("DELETE", "/v1/keys/k_aaaaaaaaaaaaaaaa", "", adminAuth)
 	expect(t, st, body, 404, "key_not_found")
-	// Keys for others: a user cannot, the operator can (and must name the user).
 	st, body, _ = ts.do("POST", "/v1/keys", `{"name":"x","scopes":["models"],"username":"bob"}`, session(alice))
 	expect(t, st, body, 403, "forbidden")
 	st, body, _ = ts.do("POST", "/v1/keys", `{"name":"x","scopes":["models"]}`, adminAuth)
@@ -578,14 +732,14 @@ func TestManagementMatrix(t *testing.T) {
 	st, body, _ = ts.do("POST", "/v1/keys", `{"name":"x","scopes":["models"],"username":"dave"}`, adminAuth)
 	expect(t, st, body, 201, "")
 
-	// Members: the last owner stays; removing bob returns him to his personal org.
+	// Members: the last owner stays; bob may leave by himself; an owner may remove; others may not.
 	st, body, _ = ts.do("DELETE", "/v1/orgs/members/alice", "", session(alice))
 	expect(t, st, body, 409, "last_owner")
-	st, body, _ = ts.do("POST", "/v1/orgs/members", `{"username":"alice","role":"member"}`, session(alice))
-	expect(t, st, body, 409, "last_owner")
-	st, body, _ = ts.do("DELETE", "/v1/orgs/members/bob", "", session(bob))
+	st, body, _ = ts.do("DELETE", "/v1/orgs/members/alice", "", session(bob))
 	expect(t, st, body, 403, "forbidden")
-	st, body, _ = ts.do("DELETE", "/v1/orgs/members/bob", "", session(alice))
+	st, body, _ = ts.do("DELETE", "/v1/orgs/members/bob?org=acme", "", session(carol))
+	expect(t, st, body, 403, "forbidden")
+	st, body, _ = ts.do("DELETE", "/v1/orgs/members/Bob", "", session(bob)) // self, case-insensitive
 	expect(t, st, body, 204, "")
 	st, body, _ = ts.do("DELETE", "/v1/orgs/members/bob", "", session(alice))
 	expect(t, st, body, 404, "member_not_found")
@@ -597,5 +751,26 @@ func TestManagementMatrix(t *testing.T) {
 	decodeJSONBody(t, body, &me)
 	if me.Org == nil || me.Org.Name != "user-2" || me.Role != "owner" {
 		t.Fatalf("bob back in his personal org: %s", body)
+	}
+}
+
+// TestStrayXAPIKeyIgnored: an x-api-key that is not an abx_ key is ignored, so cookie auth proceeds as before.
+func TestStrayXAPIKeyIgnored(t *testing.T) {
+	ts := newTenantServer(t)
+	_, cookie := ts.acc.seedUser(t, "alice")
+	st, body, _ := ts.do("GET", "/auth/me", "", map[string]string{"Cookie": SessionCookie + "=" + cookie, "x-api-key": "foo"})
+	expect(t, st, body, 200, "")
+	st, body, _ = ts.do("GET", "/auth/me", "", map[string]string{"x-api-key": "foo"})
+	expect(t, st, body, 401, "unauthorized")
+}
+
+// TestOperatorTokenMustNotLookLikeKey: with tenancy on, an abx_ operator token would be unusable; New refuses it.
+func TestOperatorTokenMustNotLookLikeKey(t *testing.T) {
+	acc := newFakeAccounts(newFakeStore())
+	ten := newFakeTenancy(acc)
+	_, err := New(Config{Store: newFakeStore(), Blobs: &fakeBlobs{}, ListenAddr: "127.0.0.1:1", Token: "abx_operator", Accounts: acc,
+		ResearchSpec: testResearchSpec, Tenancy: ten, APIKeys: apikey.NewVerifier(ten, []byte("p"), nil)})
+	if err == nil {
+		t.Fatal("an abx_ operator token must be refused when tenancy is on")
 	}
 }

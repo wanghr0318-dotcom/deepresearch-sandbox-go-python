@@ -666,6 +666,8 @@ type server struct {
 	cancelWork context.CancelFunc
 	bg         sync.WaitGroup // 后台 goroutine（cleanup loop、报警重试）
 
+	pepper []byte // 平台 API key 的 pepper（启用账号时由 EnsurePepper 取得）
+
 	apiSrv    *http.Server
 	apiCtx    context.Context // API 请求的基础 ctx：关闭 API 时取消（结束 SSE）
 	cancelAPI context.CancelFunc
@@ -741,6 +743,13 @@ func (s *server) run(ctx context.Context, deadline <-chan time.Time) error {
 		return fmt.Errorf("app: 迁移: %w", err)
 	}
 	s.step("migrate")
+	if s.cfg.Accounts {
+		// 平台 API key（G1）：<data>/apikey.pepper 须与数据库登记的指纹一致；首次启动（库中没有 key 与指纹）时创建。
+		// 不一致或缺失时拒绝启动（apikey.ErrPepper，server 退出码 2），不静默另建使已发放的 key 全部失效。
+		if s.pepper, err = apikey.EnsurePepper(ctx, dir, store.APIKeys()); err != nil {
+			return fmt.Errorf("app: %w", err)
+		}
+	}
 	if err := s.assemble(); err != nil {
 		return err
 	}
@@ -1321,13 +1330,8 @@ func (s *server) startAPI() error {
 	var keys api.KeyVerifier
 	if s.cfg.Accounts {
 		accounts = notifyingAccounts{Accounts: s.store, n: store}
-		// 平台 API key（G1）：pepper 文件 <data>/apikey.pepper 首次启动时创建（0600）；共享数据库的各 server 须使用同一份。
-		pepper, err := apikey.LoadOrCreatePepper(s.d.DataDir)
-		if err != nil {
-			_ = ln.Close()
-			return fmt.Errorf("app: %w", err)
-		}
-		v := apikey.NewVerifier(s.store.APIKeys(), pepper, nil)
+		// 平台 API key（G1）：pepper 已在迁移之后核对（EnsurePepper）。
+		v := apikey.NewVerifier(s.store.APIKeys(), s.pepper, nil)
 		s.bg.Add(1)
 		go func() {
 			defer s.bg.Done()

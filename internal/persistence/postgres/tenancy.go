@@ -6,7 +6,11 @@ package postgres
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base32"
 	"errors"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -128,6 +132,10 @@ func (t *TenancyStore) OrgByName(ctx context.Context, name string) (tenant.Org, 
 }
 
 // ---- 成员 ----
+//
+// 锁顺序（避免死锁）：先锁用户行（users FOR UPDATE；同一用户的成员变更、接受邀请与建 key 在此串行化），再按 id
+// 升序锁涉及的 org 行（orgs FOR UPDATE；同一 org 的人数与"至少一个 owner"检查在此串行化）。建 key 取 users FOR SHARE
+// 再取成员行，与之一致。
 
 const memberColumns = "m.org_id, o.name, u.id, u.username, m.role"
 
@@ -154,17 +162,12 @@ func (t *TenancyStore) MemberByName(ctx context.Context, usernameKey string) (te
 	return m, err
 }
 
-// lockOrgForMembers 锁定 org 行（同一 org 的成员变更串行化，"至少一个 owner" 的检查据此成立）。
-func lockOrgForMembers(ctx context.Context, tx pgx.Tx, orgID int64) (string, error) {
-	var name string
-	err := tx.QueryRow(ctx, "SELECT name FROM orgs WHERE id = $1 FOR UPDATE", orgID).Scan(&name)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", notFoundf("org %d", orgID)
-	}
-	return name, err
+func memberOf(ctx context.Context, q queryer, userID int64) (tenant.Membership, error) {
+	return scanMember(q.QueryRow(ctx, "SELECT "+memberColumns+` FROM org_members m JOIN users u ON u.id = m.user_id
+		JOIN orgs o ON o.id = m.org_id WHERE m.user_id = $1`, userID))
 }
 
-// lockUserByName 锁定用户行并返回其 ID（同一用户的成员变更与建 key 串行化）。
+// lockUserByName 锁定用户行并返回其 ID。
 func lockUserByName(ctx context.Context, tx pgx.Tx, usernameKey string) (int64, error) {
 	var id int64
 	err := tx.QueryRow(ctx, "SELECT id FROM users WHERE username_key = $1 FOR UPDATE", usernameKey).Scan(&id)
@@ -174,6 +177,25 @@ func lockUserByName(ctx context.Context, tx pgx.Tx, usernameKey string) (int64, 
 	return id, err
 }
 
+// lockOrgs 按 id 升序锁定 org 行（FOR UPDATE），返回 id → 名称；不存在的 id 不在结果中。
+func lockOrgs(ctx context.Context, tx pgx.Tx, ids ...int64) (map[int64]string, error) {
+	sorted := slices.Clone(ids)
+	slices.Sort(sorted)
+	out := map[int64]string{}
+	for _, id := range slices.Compact(sorted) {
+		var name string
+		err := tx.QueryRow(ctx, "SELECT name FROM orgs WHERE id = $1 FOR UPDATE", id).Scan(&name)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out[id] = name
+	}
+	return out, nil
+}
+
 // otherOwners 返回 org 中除 userID 之外的 owner 数。
 func otherOwners(ctx context.Context, tx pgx.Tx, orgID, userID int64) (int64, error) {
 	var n int64
@@ -181,81 +203,132 @@ func otherOwners(ctx context.Context, tx pgx.Tx, orgID, userID int64) (int64, er
 	return n, err
 }
 
-// AddMember 把用户加入 org（实现 tenant.Store；规则见接口）。保留 org operator 不接受成员。
+// placeMember 是 AddMember、AcceptInvite 与 CreateOrgWithOwner 共用的事务体：调用方已锁定用户行。按锁顺序锁定
+// 用户当前的 org 与目标 org 之后再检查：保留 org operator 不接受成员；他人的个人 org 不接受成员；已在目标 org 中
+// 只改角色（不能降级最后一个 owner）；只能从单独一人的个人 org 迁出，旧 org 中的 key 同一事务吊销（不变量 G4）。
+func placeMember(ctx context.Context, tx pgx.Tx, orgID, userID int64, role tenant.Role) (tenant.Membership, error) {
+	if _, err := tenant.ParseRole(string(role)); err != nil {
+		return tenant.Membership{}, invalidf("%v", err)
+	}
+	var curOrg int64
+	var curRole string
+	err := tx.QueryRow(ctx, "SELECT org_id, role FROM org_members WHERE user_id = $1", userID).Scan(&curOrg, &curRole)
+	hasCur := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return tenant.Membership{}, err
+	}
+	ids := []int64{orgID}
+	if hasCur {
+		ids = append(ids, curOrg)
+	}
+	names, err := lockOrgs(ctx, tx, ids...)
+	if err != nil {
+		return tenant.Membership{}, err
+	}
+	target, ok := names[orgID]
+	switch {
+	case !ok:
+		return tenant.Membership{}, notFoundf("org %d", orgID)
+	case target == tenant.OperatorOrg:
+		return tenant.Membership{}, invalidf("保留 org %s 不接受成员", target)
+	case tenant.IsPersonalOrgName(target) && !tenant.IsPersonalOrg(target, userID):
+		return tenant.Membership{}, tenant.ErrPersonalOrgClosed
+	}
+	switch {
+	case hasCur && curOrg == orgID:
+		if curRole == string(tenant.Owner) && role != tenant.Owner {
+			n, err := otherOwners(ctx, tx, orgID, userID)
+			if err != nil {
+				return tenant.Membership{}, err
+			}
+			if n == 0 {
+				return tenant.Membership{}, tenant.ErrLastOwner
+			}
+		}
+		if _, err := tx.Exec(ctx, "UPDATE org_members SET role = $3 WHERE org_id = $1 AND user_id = $2", orgID, userID, string(role)); err != nil {
+			return tenant.Membership{}, err
+		}
+		return memberOf(ctx, tx, userID)
+	case hasCur:
+		var size int64
+		if err := tx.QueryRow(ctx, "SELECT count(*) FROM org_members WHERE org_id = $1", curOrg).Scan(&size); err != nil {
+			return tenant.Membership{}, err
+		}
+		if !tenant.IsPersonalOrg(names[curOrg], userID) || size > 1 {
+			return tenant.Membership{}, tenant.ErrUserInOtherOrg
+		}
+		if err := revokeUserKeys(ctx, tx, userID, curOrg); err != nil {
+			return tenant.Membership{}, err
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM org_members WHERE user_id = $1", userID); err != nil {
+			return tenant.Membership{}, err
+		}
+	}
+	if _, err := tx.Exec(ctx, "INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, $3)", orgID, userID, string(role)); err != nil {
+		return tenant.Membership{}, err
+	}
+	return memberOf(ctx, tx, userID)
+}
+
+// AddMember 把用户直接放入 org（实现 tenant.Store；运维操作，规则见 placeMember）。
 func (t *TenancyStore) AddMember(ctx context.Context, orgID int64, usernameKey string, role tenant.Role) (tenant.Membership, error) {
 	if _, err := tenant.ParseRole(string(role)); err != nil {
 		return tenant.Membership{}, invalidf("%v", err)
 	}
 	var out tenant.Membership
 	err := t.s.run(ctx, "AddMember", usernameKey, func(ctx context.Context, tx pgx.Tx) error {
-		orgName, err := lockOrgForMembers(ctx, tx, orgID)
-		if err != nil {
-			return err
-		}
-		if orgName == tenant.OperatorOrg {
-			return invalidf("保留 org %s 不接受成员", orgName)
-		}
 		userID, err := lockUserByName(ctx, tx, usernameKey)
 		if err != nil {
 			return err
 		}
-		var curOrg, size int64
-		var curName, curRole string
-		err = tx.QueryRow(ctx, `SELECT m.org_id, o.name, m.role, (SELECT count(*) FROM org_members x WHERE x.org_id = m.org_id)
-			FROM org_members m JOIN orgs o ON o.id = m.org_id WHERE m.user_id = $1`, userID).Scan(&curOrg, &curName, &curRole, &size)
-		switch {
-		case errors.Is(err, pgx.ErrNoRows):
-			// 没有 org（不应发生：注册与迁移都建立个人 org）：直接加入。
-		case err != nil:
-			return err
-		case curOrg == orgID:
-			if curRole == string(tenant.Owner) && role != tenant.Owner {
-				n, err := otherOwners(ctx, tx, orgID, userID)
-				if err != nil {
-					return err
-				}
-				if n == 0 {
-					return tenant.ErrLastOwner
-				}
-			}
-			if _, err := tx.Exec(ctx, "UPDATE org_members SET role = $3 WHERE org_id = $1 AND user_id = $2", orgID, userID, string(role)); err != nil {
-				return err
-			}
-			out, err = memberOf(ctx, tx, userID)
-			return err
-		case !tenant.IsPersonalOrg(curName, userID) || size > 1:
-			return tenant.ErrUserInOtherOrg
-		default:
-			// 从个人 org 迁出：该 org 中的 key 随之吊销（不变量 G4：未吊销 key 的 org 等于其用户的 org）。
-			if err := revokeUserKeys(ctx, tx, userID, curOrg); err != nil {
-				return err
-			}
-			if _, err := tx.Exec(ctx, "DELETE FROM org_members WHERE user_id = $1", userID); err != nil {
-				return err
-			}
-		}
-		if _, err := tx.Exec(ctx, "INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, $3)", orgID, userID, string(role)); err != nil {
-			return err
-		}
-		out, err = memberOf(ctx, tx, userID)
+		out, err = placeMember(ctx, tx, orgID, userID, role)
 		return err
 	})
 	return out, err
 }
 
-func memberOf(ctx context.Context, q queryer, userID int64) (tenant.Membership, error) {
-	return scanMember(q.QueryRow(ctx, "SELECT "+memberColumns+` FROM org_members m JOIN users u ON u.id = m.user_id
-		JOIN orgs o ON o.id = m.org_id WHERE m.user_id = $1`, userID))
-}
-
-// RemoveMember 把用户移出 org，回到其个人 org（实现 tenant.Store；规则见接口）。
-func (t *TenancyStore) RemoveMember(ctx context.Context, orgID int64, usernameKey string) error {
-	return t.s.run(ctx, "RemoveMember", usernameKey, func(ctx context.Context, tx pgx.Tx) error {
-		orgName, err := lockOrgForMembers(ctx, tx, orgID)
+// CreateOrgWithOwner 在一个事务中建 org 并把用户移入为 owner（实现 tenant.Store）：任何一步失败都不留下 org。
+func (t *TenancyStore) CreateOrgWithOwner(ctx context.Context, name, ownerKey string) (tenant.Org, tenant.Membership, error) {
+	if err := tenant.ValidateOrgName(name); err != nil {
+		return tenant.Org{}, tenant.Membership{}, invalidf("%v", err)
+	}
+	var o tenant.Org
+	var m tenant.Membership
+	err := t.s.run(ctx, "CreateOrgWithOwner", name, func(ctx context.Context, tx pgx.Tx) error {
+		userID, err := lockUserByName(ctx, tx, ownerKey)
 		if err != nil {
 			return err
 		}
+		var id int64
+		err = tx.QueryRow(ctx, "INSERT INTO orgs (name) VALUES ($1) ON CONFLICT (name) DO NOTHING RETURNING id", name).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return conflictf("org %s 已存在", name)
+		}
+		if err != nil {
+			return err
+		}
+		if m, err = placeMember(ctx, tx, id, userID, tenant.Owner); err != nil {
+			return err
+		}
+		o, err = scanOrg(tx.QueryRow(ctx, "SELECT "+orgColumns+" FROM orgs o WHERE o.id = $1", id))
+		return err
+	})
+	return o, m, err
+}
+
+// RemoveMember 把用户移出 org，回到其个人 org（实现 tenant.Store；规则见接口）。成员自己离开也用它。
+func (t *TenancyStore) RemoveMember(ctx context.Context, orgID int64, usernameKey string) error {
+	return t.s.run(ctx, "RemoveMember", usernameKey, func(ctx context.Context, tx pgx.Tx) error {
 		userID, err := lockUserByName(ctx, tx, usernameKey)
+		if err != nil {
+			return err
+		}
+		var personal int64
+		if err := tx.QueryRow(ctx, "SELECT COALESCE((SELECT id FROM orgs WHERE name = $1), 0)", tenant.PersonalOrgName(userID)).
+			Scan(&personal); err != nil {
+			return err
+		}
+		names, err := lockOrgs(ctx, tx, orgID, personal)
 		if err != nil {
 			return err
 		}
@@ -267,7 +340,7 @@ func (t *TenancyStore) RemoveMember(ctx context.Context, orgID int64, usernameKe
 		if err != nil {
 			return err
 		}
-		if tenant.IsPersonalOrg(orgName, userID) {
+		if tenant.IsPersonalOrg(names[orgID], userID) {
 			return tenant.ErrPersonalOrg
 		}
 		if role == string(tenant.Owner) {
@@ -286,6 +359,156 @@ func (t *TenancyStore) RemoveMember(ctx context.Context, orgID int64, usernameKe
 			return err
 		}
 		return ensurePersonalOrg(ctx, tx, userID)
+	})
+}
+
+// ---- 邀请 ----
+
+const inviteColumns = `i.id, i.org_id, o.name, i.user_id, u.username, i.role, b.username, i.created_at, i.expires_at`
+
+const inviteFrom = ` FROM org_invites i JOIN orgs o ON o.id = i.org_id JOIN users u ON u.id = i.user_id JOIN users b ON b.id = i.invited_by`
+
+func scanInvite(row pgx.Row) (tenant.Invite, error) {
+	var inv tenant.Invite
+	var role string
+	err := row.Scan(&inv.ID, &inv.OrgID, &inv.OrgName, &inv.UserID, &inv.Username, &role, &inv.InvitedBy, &inv.CreatedAt, &inv.ExpiresAt)
+	inv.Role = tenant.Role(role)
+	return inv, err
+}
+
+func newInviteID() (string, error) {
+	var b [10]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return "inv_" + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b[:])), nil
+}
+
+// CreateInvite 登记（或续期）邀请（实现 tenant.Store）。同一 org 与用户只有一条待处理邀请：再次邀请更新角色与期限，
+// ID 不变。
+func (t *TenancyStore) CreateInvite(ctx context.Context, orgID int64, usernameKey string, role tenant.Role, invitedBy int64,
+	expiresAt time.Time) (tenant.Invite, error) {
+	if _, err := tenant.ParseRole(string(role)); err != nil {
+		return tenant.Invite{}, invalidf("%v", err)
+	}
+	id, err := newInviteID()
+	if err != nil {
+		return tenant.Invite{}, err
+	}
+	var out tenant.Invite
+	err = t.s.run(ctx, "CreateInvite", usernameKey, func(ctx context.Context, tx pgx.Tx) error {
+		var userID int64
+		err := tx.QueryRow(ctx, "SELECT id FROM users WHERE username_key = $1", usernameKey).Scan(&userID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("用户 %s", usernameKey)
+		}
+		if err != nil {
+			return err
+		}
+		var orgName string
+		err = tx.QueryRow(ctx, "SELECT name FROM orgs WHERE id = $1", orgID).Scan(&orgName)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("org %d", orgID)
+		}
+		if err != nil {
+			return err
+		}
+		switch {
+		case orgName == tenant.OperatorOrg:
+			return invalidf("保留 org %s 不接受成员", orgName)
+		case tenant.IsPersonalOrgName(orgName):
+			return tenant.ErrPersonalOrgClosed
+		}
+		var member bool
+		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM org_members WHERE org_id = $1 AND user_id = $2)", orgID, userID).
+			Scan(&member); err != nil {
+			return err
+		}
+		if member {
+			return tenant.ErrAlreadyMember
+		}
+		var got string
+		if err := tx.QueryRow(ctx, `INSERT INTO org_invites (id, org_id, user_id, role, invited_by, expires_at) VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (org_id, user_id) DO UPDATE SET role = EXCLUDED.role, invited_by = EXCLUDED.invited_by,
+				created_at = now(), expires_at = EXCLUDED.expires_at
+			RETURNING id`, id, orgID, userID, string(role), invitedBy, expiresAt).Scan(&got); err != nil {
+			return err
+		}
+		out, err = scanInvite(tx.QueryRow(ctx, "SELECT "+inviteColumns+inviteFrom+" WHERE i.id = $1", got))
+		return err
+	})
+	return out, err
+}
+
+// ListInvites 列出未过期的邀请（实现 tenant.Store），按创建时间倒序。
+func (t *TenancyStore) ListInvites(ctx context.Context, f tenant.InviteFilter) ([]tenant.Invite, error) {
+	var out []tenant.Invite
+	err := t.s.read(ctx, "ListInvites", func(ctx context.Context, q queryer) error {
+		rows, err := q.Query(ctx, "SELECT "+inviteColumns+inviteFrom+` WHERE i.expires_at > now()
+			AND (($1::bigint = 0 AND $2::bigint = 0) OR i.user_id = $1 OR ($2::bigint <> 0 AND i.org_id = $2))
+			ORDER BY i.created_at DESC, i.id`, f.UserID, f.OrgID)
+		if err != nil {
+			return err
+		}
+		out, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (tenant.Invite, error) { return scanInvite(r) })
+		return err
+	})
+	return out, err
+}
+
+// GetInvite 读取未过期的邀请（实现 tenant.Store）。
+func (t *TenancyStore) GetInvite(ctx context.Context, id string) (tenant.Invite, error) {
+	var out tenant.Invite
+	err := t.s.read(ctx, "GetInvite", func(ctx context.Context, q queryer) error {
+		var err error
+		out, err = scanInvite(q.QueryRow(ctx, "SELECT "+inviteColumns+inviteFrom+" WHERE i.id = $1 AND i.expires_at > now()", id))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("邀请 %s", id)
+		}
+		return err
+	})
+	return out, err
+}
+
+// AcceptInvite 接受邀请（实现 tenant.Store）：锁用户行，读取并删除邀请，按 placeMember 的规则迁入。
+func (t *TenancyStore) AcceptInvite(ctx context.Context, id string, userID int64) (tenant.Membership, error) {
+	var out tenant.Membership
+	err := t.s.run(ctx, "AcceptInvite", id, func(ctx context.Context, tx pgx.Tx) error {
+		var locked int64
+		err := tx.QueryRow(ctx, "SELECT id FROM users WHERE id = $1 AND NOT disabled FOR UPDATE", userID).Scan(&locked)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("用户 %d", userID)
+		}
+		if err != nil {
+			return err
+		}
+		var orgID int64
+		var role string
+		err = tx.QueryRow(ctx, `DELETE FROM org_invites WHERE id = $1 AND user_id = $2 AND expires_at > now() RETURNING org_id, role`,
+			id, userID).Scan(&orgID, &role)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("邀请 %s", id)
+		}
+		if err != nil {
+			return err
+		}
+		out, err = placeMember(ctx, tx, orgID, userID, tenant.Role(role))
+		return err
+	})
+	return out, err
+}
+
+// DeleteInvite 删除邀请（实现 tenant.Store；拒绝或撤销）。
+func (t *TenancyStore) DeleteInvite(ctx context.Context, id string) error {
+	return t.s.run(ctx, "DeleteInvite", id, func(ctx context.Context, tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, "DELETE FROM org_invites WHERE id = $1", id)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return notFoundf("邀请 %s", id)
+		}
+		return nil
 	})
 }
 
@@ -322,9 +545,12 @@ func (t *TenancyStore) CreateKey(ctx context.Context, k tenant.NewKey) (tenant.K
 	}
 	var out tenant.Key
 	err := t.s.run(ctx, "CreateKey", k.ID, func(ctx context.Context, tx pgx.Tx) error {
+		// 锁顺序与成员变更一致：先 users（FOR SHARE），再成员行。
 		var orgID int64
-		err := tx.QueryRow(ctx, `SELECT m.org_id FROM org_members m JOIN users u ON u.id = m.user_id
-			WHERE m.user_id = $1 AND NOT u.disabled FOR SHARE OF m`, k.UserID).Scan(&orgID)
+		err := tx.QueryRow(ctx, "SELECT id FROM users WHERE id = $1 AND NOT disabled FOR SHARE", k.UserID).Scan(&orgID)
+		if err == nil {
+			err = tx.QueryRow(ctx, "SELECT org_id FROM org_members WHERE user_id = $1 FOR SHARE", k.UserID).Scan(&orgID)
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			return notFoundf("用户 %d", k.UserID)
 		}
@@ -395,6 +621,30 @@ func (t *TenancyStore) RevokeKey(ctx context.Context, id string) (tenant.Key, er
 		}
 		out, err = getKey(ctx, tx, id)
 		return err
+	})
+	return out, err
+}
+
+// ---- pepper 指纹（apikey.PepperStore） ----
+
+// PepperState 返回已登记的 pepper 指纹（没有时为 nil）与是否已有任何 API key（实现 apikey.PepperStore）。
+func (t *TenancyStore) PepperState(ctx context.Context) ([]byte, bool, error) {
+	var fp []byte
+	var keys bool
+	err := t.s.read(ctx, "PepperState", func(ctx context.Context, q queryer) error {
+		return q.QueryRow(ctx, `SELECT (SELECT fingerprint FROM apikey_pepper), EXISTS (SELECT 1 FROM api_keys)`).Scan(&fp, &keys)
+	})
+	return fp, keys, err
+}
+
+// RecordPepper 登记指纹（已有时不变），返回已登记的指纹（实现 apikey.PepperStore）。
+func (t *TenancyStore) RecordPepper(ctx context.Context, fp []byte) ([]byte, error) {
+	var out []byte
+	err := t.s.run(ctx, "RecordPepper", "", func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "INSERT INTO apikey_pepper (fingerprint) VALUES ($1) ON CONFLICT (id) DO NOTHING", fp); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, "SELECT fingerprint FROM apikey_pepper").Scan(&out)
 	})
 	return out, err
 }

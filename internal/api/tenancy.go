@@ -1,7 +1,8 @@
 package api
 
 // 本文件是多租户管理端点与平台 API key 认证（模型网关设计 2026-10-11 §5、§8；G1）：GET /v1/me，POST/GET/DELETE
-// /v1/keys，POST/DELETE /v1/orgs/members，POST /v1/orgs（运维）。只在启用账号且配置了 Tenancy 时注册。
+// /v1/keys，POST /v1/orgs 与 POST /v1/orgs/members（运维），DELETE /v1/orgs/members/{user}（owner、运维或本人离开），
+// /v1/orgs/invites（owner 邀请、被邀请者接受或拒绝：用户只有同意才会迁入另一个 org）。只在启用账号且配置了 Tenancy 时注册。
 // API key 永远不能管理 key、成员与 org（audienceManage / audienceAdmin 对 key 一律 403 permission_denied），
 // 泄露的 key 因而不能铸造新 key。
 
@@ -23,12 +24,16 @@ var tenantRoutes = []route{
 	{"GET", "/v1/keys", accessRead, audienceManage, []int{200, 401, 403, 500, 503}, (*Handler).listKeys},
 	{"DELETE", "/v1/keys/{id}", accessWrite, audienceManage, []int{200, 401, 403, 404, 500, 503}, (*Handler).revokeKey},
 	{"POST", "/v1/orgs", accessWrite, audienceAdmin, []int{201, 400, 401, 403, 404, 409, 500, 503}, (*Handler).createOrg},
-	{"POST", "/v1/orgs/members", accessWrite, audienceManage, []int{200, 400, 401, 403, 404, 409, 500, 503}, (*Handler).addMember},
+	{"POST", "/v1/orgs/members", accessWrite, audienceAdmin, []int{200, 400, 401, 403, 404, 409, 500, 503}, (*Handler).addMember},
 	{"DELETE", "/v1/orgs/members/{user}", accessWrite, audienceManage, []int{204, 400, 401, 403, 404, 409, 500, 503}, (*Handler).removeMember},
+	{"POST", "/v1/orgs/invites", accessWrite, audienceCookie, []int{201, 400, 401, 403, 404, 409, 500, 503}, (*Handler).createInvite},
+	{"GET", "/v1/orgs/invites", accessRead, audienceCookie, []int{200, 401, 403, 500, 503}, (*Handler).listInvites},
+	{"POST", "/v1/orgs/invites/{id}/accept", accessWrite, audienceCookie, []int{200, 401, 403, 404, 409, 500, 503}, (*Handler).acceptInvite},
+	{"DELETE", "/v1/orgs/invites/{id}", accessWrite, audienceCookie, []int{204, 401, 403, 404, 500, 503}, (*Handler).deleteInvite},
 }
 
-// keyCredential 返回请求携带的平台 API key：Authorization: Bearer abx_…，或没有 Authorization 头时的 x-api-key
-// （x-api-key 只用于 key：其他值同样按无效 key 处理）。未配置 Tenancy 时恒为 false（abx_ Bearer 按运维 token 判定）。
+// keyCredential 返回请求携带的平台 API key：Authorization: Bearer abx_…，或没有 Authorization 头时以 abx_ 开头的
+// x-api-key（其他 x-api-key 值与今天一样忽略，cookie 照常认证）。未配置 Tenancy 时恒为 false（abx_ Bearer 按运维 token 判定）。
 func (h *Handler) keyCredential(r *http.Request) (string, bool) {
 	if h.cfg.Tenancy == nil {
 		return "", false
@@ -37,8 +42,8 @@ func (h *Handler) keyCredential(r *http.Request) (string, bool) {
 		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		return got, ok && apikey.LooksLikeKey(got)
 	}
-	if _, present := r.Header["X-Api-Key"]; present {
-		return r.Header.Get("X-Api-Key"), true
+	if v := r.Header.Get("X-Api-Key"); apikey.LooksLikeKey(v) {
+		return v, true
 	}
 	return "", false
 }
@@ -71,6 +76,10 @@ func writeTenancyError(w http.ResponseWriter, err error, notFoundCode, notFoundM
 		writeError(w, http.StatusConflict, "last_owner", "org 须至少保留一个 owner")
 	case errors.Is(err, tenant.ErrPersonalOrg):
 		writeError(w, http.StatusConflict, "personal_org", "不能离开个人 org")
+	case errors.Is(err, tenant.ErrPersonalOrgClosed):
+		writeError(w, http.StatusConflict, "personal_org_closed", "个人 org 不接受其他成员")
+	case errors.Is(err, tenant.ErrAlreadyMember):
+		writeError(w, http.StatusConflict, "already_member", "该用户已是 org 的成员")
 	default:
 		writeStoreError(w, err)
 	}
@@ -285,7 +294,7 @@ type orgJSON struct {
 
 type createOrgBody struct {
 	Name  string `json:"name"`
-	Owner string `json:"owner,omitempty"` // 可选：把该用户（须仍在个人 org 中）移入为 owner
+	Owner string `json:"owner,omitempty"` // 可选：把该用户（须仍单独在个人 org 中）移入为 owner，与建 org 同一事务
 }
 
 func (h *Handler) createOrg(w http.ResponseWriter, r *http.Request) {
@@ -298,72 +307,38 @@ func (h *Handler) createOrg(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	var ownerKey string
+	var o tenant.Org
+	var owner *tenant.Membership
+	var err error
 	if body.Owner != "" {
-		var ok bool
-		if ownerKey, ok = usernameKey(w, body.Owner); !ok {
+		key, ok := usernameKey(w, body.Owner)
+		if !ok {
 			return
 		}
-		m, err := h.cfg.Tenancy.MemberByName(ctx, ownerKey) // 先确认能移入，避免建了 org 却加不了 owner
-		if err != nil {
-			writeTenancyError(w, err, "user_not_found", "用户不存在")
-			return
-		}
-		if !tenant.IsPersonalOrg(m.OrgName, m.UserID) {
-			writeTenancyError(w, tenant.ErrUserInOtherOrg, "", "")
-			return
-		}
+		var m tenant.Membership
+		o, m, err = h.cfg.Tenancy.CreateOrgWithOwner(ctx, body.Name, key)
+		owner = &m
+	} else {
+		o, err = h.cfg.Tenancy.CreateOrg(ctx, body.Name)
 	}
-	o, err := h.cfg.Tenancy.CreateOrg(ctx, body.Name)
 	if errors.Is(err, persistence.ErrConflict) {
 		writeError(w, http.StatusConflict, "org_exists", "org 名称已被使用")
 		return
 	}
 	if err != nil {
-		writeStoreError(w, err)
+		writeTenancyError(w, err, "user_not_found", "用户不存在")
 		return
 	}
-	out := orgJSON{ID: o.ID, Name: o.Name, Disabled: o.Disabled, CreatedAt: o.CreatedAt, Members: o.Members}
-	if ownerKey != "" {
-		m, err := h.cfg.Tenancy.AddMember(ctx, o.ID, ownerKey, tenant.Owner)
-		if err != nil {
-			writeTenancyError(w, err, "user_not_found", "用户不存在")
-			return
-		}
-		out.Owner, out.Members = &m, 1
-	}
-	writeJSON(w, http.StatusCreated, out)
-}
-
-// memberOrg 确定成员操作的目标 org：运维须给出 org 名称；owner 默认自己的 org（给出的名称须是自己的 org）。
-func (h *Handler) memberOrg(w http.ResponseWriter, r *http.Request, orgName string) (int64, bool) {
-	tp := caller(r).tenant()
-	orgID := tp.OrgID
-	switch {
-	case orgName != "":
-		o, err := h.cfg.Tenancy.OrgByName(r.Context(), orgName)
-		if err != nil {
-			writeTenancyError(w, err, "org_not_found", "org 不存在")
-			return 0, false
-		}
-		orgID = o.ID
-	case tp.Operator:
-		writeError(w, http.StatusBadRequest, "invalid_request", "运维管理成员须指定 org")
-		return 0, false
-	}
-	if !tenant.CanManageMembers(tp, orgID) {
-		writeError(w, http.StatusForbidden, "forbidden", "只有 org 的 owner 或运维可以管理成员")
-		return 0, false
-	}
-	return orgID, true
+	writeJSON(w, http.StatusCreated, orgJSON{ID: o.ID, Name: o.Name, Disabled: o.Disabled, CreatedAt: o.CreatedAt, Members: o.Members, Owner: owner})
 }
 
 type addMemberBody struct {
 	Username string `json:"username"`
 	Role     string `json:"role"`
-	Org      string `json:"org,omitempty"`
+	Org      string `json:"org"`
 }
 
+// addMember 由运维把用户直接放入 org（或改角色）。用户自己加入 org 须接受邀请（POST /v1/orgs/invites/{id}/accept）。
 func (h *Handler) addMember(w http.ResponseWriter, r *http.Request) {
 	var body addMemberBody
 	if !decodeBody(w, r, &body) {
@@ -374,15 +349,20 @@ func (h *Handler) addMember(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "role 须为 owner 或 member")
 		return
 	}
-	orgID, ok := h.memberOrg(w, r, body.Org)
-	if !ok {
+	if body.Org == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "须指定 org")
+		return
+	}
+	o, err := h.cfg.Tenancy.OrgByName(r.Context(), body.Org)
+	if err != nil {
+		writeTenancyError(w, err, "org_not_found", "org 不存在")
 		return
 	}
 	key, ok := usernameKey(w, body.Username)
 	if !ok {
 		return
 	}
-	m, err := h.cfg.Tenancy.AddMember(r.Context(), orgID, key, role)
+	m, err := h.cfg.Tenancy.AddMember(r.Context(), o.ID, key, role)
 	if errors.Is(err, persistence.ErrInvalid) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "保留 org 不接受成员")
 		return
@@ -394,17 +374,146 @@ func (h *Handler) addMember(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, m)
 }
 
+// removeMember 移出成员：org 的 owner 与运维（运维须给 ?org=），或成员自己离开（路径中的用户是调用者本人）。被移出者
+// 回到其个人 org，其在该 org 的 key 吊销；最后一个 owner 不能被移出或离开。
 func (h *Handler) removeMember(w http.ResponseWriter, r *http.Request) {
-	orgID, ok := h.memberOrg(w, r, r.URL.Query().Get("org"))
-	if !ok {
-		return
-	}
+	p := caller(r)
+	tp := p.tenant()
 	key, ok := usernameKey(w, r.PathValue("user"))
 	if !ok {
 		return
 	}
+	orgName := r.URL.Query().Get("org")
+	orgID := tp.OrgID
+	switch {
+	case orgName != "":
+		o, err := h.cfg.Tenancy.OrgByName(r.Context(), orgName)
+		if err != nil {
+			writeTenancyError(w, err, "org_not_found", "org 不存在")
+			return
+		}
+		orgID = o.ID
+	case tp.Operator:
+		writeError(w, http.StatusBadRequest, "invalid_request", "运维管理成员须指定 org")
+		return
+	}
+	self := !p.admin && strings.EqualFold(p.user.Username, r.PathValue("user")) && orgID == tp.OrgID
+	if !self && !tenant.CanManageMembers(tp, orgID) {
+		writeError(w, http.StatusForbidden, "forbidden", "只有 org 的 owner 或运维可以移出成员（成员可以自己离开）")
+		return
+	}
 	if err := h.cfg.Tenancy.RemoveMember(r.Context(), orgID, key); err != nil {
 		writeTenancyError(w, err, "member_not_found", "该用户不是 org 的成员")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---- /v1/orgs/invites ----
+
+type inviteBody struct {
+	Username string `json:"username"`
+	Role     string `json:"role"`
+}
+
+// createInvite：org 的 owner（登录会话）邀请用户；用户接受后才迁入。个人 org 不接受其他成员。
+func (h *Handler) createInvite(w http.ResponseWriter, r *http.Request) {
+	tp := caller(r).tenant()
+	var body inviteBody
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	role, err := tenant.ParseRole(body.Role)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "role 须为 owner 或 member")
+		return
+	}
+	if !tenant.CanInvite(tp, tp.OrgID) {
+		writeError(w, http.StatusForbidden, "forbidden", "只有 org 的 owner 可以邀请成员")
+		return
+	}
+	key, ok := usernameKey(w, body.Username)
+	if !ok {
+		return
+	}
+	inv, err := h.cfg.Tenancy.CreateInvite(r.Context(), tp.OrgID, key, role, tp.UserID, h.now().Add(tenant.InviteTTL).UTC())
+	if errors.Is(err, persistence.ErrInvalid) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "保留 org 不接受成员")
+		return
+	}
+	if err != nil {
+		writeTenancyError(w, err, "user_not_found", "用户不存在")
+		return
+	}
+	writeJSON(w, http.StatusCreated, inv)
+}
+
+type inviteListJSON struct {
+	Invites []tenant.Invite `json:"invites"`
+}
+
+// listInvites：调用者收到的邀请；owner 另见自己 org 发出的待处理邀请。
+func (h *Handler) listInvites(w http.ResponseWriter, r *http.Request) {
+	tp := caller(r).tenant()
+	f := tenant.InviteFilter{UserID: tp.UserID}
+	if tp.Role == tenant.Owner {
+		f.OrgID = tp.OrgID
+	}
+	invs, err := h.cfg.Tenancy.ListInvites(r.Context(), f)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	out := inviteListJSON{Invites: make([]tenant.Invite, 0, len(invs))}
+	for _, inv := range invs {
+		if tenant.CanSeeInvite(tp, inv) {
+			out.Invites = append(out.Invites, inv)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// inviteFor 读取路径中的邀请；调用者看不到的与不存在的回答相同的 404。
+func (h *Handler) inviteFor(w http.ResponseWriter, r *http.Request) (tenant.Invite, bool) {
+	inv, err := h.cfg.Tenancy.GetInvite(r.Context(), r.PathValue("id"))
+	if err == nil && !tenant.CanSeeInvite(caller(r).tenant(), inv) {
+		err = persistence.ErrNotFound
+	}
+	if err != nil {
+		writeTenancyError(w, err, "invite_not_found", "邀请不存在或已过期")
+		return inv, false
+	}
+	return inv, true
+}
+
+// acceptInvite：被邀请的用户接受，迁入邀请的 org（须仍单独在个人 org 中；旧 key 同一事务吊销）。
+func (h *Handler) acceptInvite(w http.ResponseWriter, r *http.Request) {
+	tp := caller(r).tenant()
+	inv, ok := h.inviteFor(w, r)
+	if !ok {
+		return
+	}
+	if inv.UserID != tp.UserID {
+		writeError(w, http.StatusNotFound, "invite_not_found", "邀请不存在或已过期")
+		return
+	}
+	m, err := h.cfg.Tenancy.AcceptInvite(r.Context(), inv.ID, tp.UserID)
+	if err != nil {
+		writeTenancyError(w, err, "invite_not_found", "邀请不存在或已过期")
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
+// deleteInvite：被邀请的用户拒绝，或 org 的 owner 撤销。
+func (h *Handler) deleteInvite(w http.ResponseWriter, r *http.Request) {
+	inv, ok := h.inviteFor(w, r)
+	if !ok {
+		return
+	}
+	if err := h.cfg.Tenancy.DeleteInvite(r.Context(), inv.ID); err != nil {
+		writeTenancyError(w, err, "invite_not_found", "邀请不存在或已过期")
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")

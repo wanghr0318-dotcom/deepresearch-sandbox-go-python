@@ -51,10 +51,12 @@ type Listener interface {
 	ListenKeyChanges(ctx context.Context, ready func(), onChange func(payload string)) error
 }
 
-// Source is a Store that can also deliver change notifications (the PostgreSQL implementation).
+// Source is a Store that can also deliver change notifications and record the pepper fingerprint (the PostgreSQL
+// implementation).
 type Source interface {
 	Store
 	Listener
+	PepperStore
 }
 
 // Identity is a verified key: its principal plus the username (for the user-facing runtime endpoints).

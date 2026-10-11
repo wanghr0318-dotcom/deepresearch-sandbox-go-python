@@ -23,7 +23,7 @@ import (
 const undo0012 = `DROP TRIGGER tasks_fill_org ON tasks; DROP TRIGGER sessions_fill_org ON sessions; DROP FUNCTION agentbox_fill_org();
 	ALTER TABLE tasks DROP COLUMN org_id, DROP COLUMN key_id;
 	ALTER TABLE sessions DROP COLUMN org_id, DROP COLUMN key_id;
-	DROP TABLE limits, api_keys, org_members, orgs;
+	DROP TABLE limits, apikey_pepper, org_invites, api_keys, org_members, orgs;
 	DELETE FROM schema_migrations WHERE version >= 12;
 `
 
@@ -149,7 +149,14 @@ func TestTenancyOrgsAndMembers(t *testing.T) {
 	if k, _ := ten.GetKey(ctx, g.ID); k.RevokedAt == nil {
 		t.Fatal("the moved user's old key must be revoked")
 	}
-	if _, err := ten.AddMember(ctx, orgIDByName(t, s, tenant.PersonalOrgName(alice.ID)), "bob", tenant.Member); !errors.Is(err, tenant.ErrUserInOtherOrg) {
+	if _, err := ten.AddMember(ctx, orgIDByName(t, s, tenant.PersonalOrgName(alice.ID)), "carol", tenant.Member); !errors.Is(err, tenant.ErrPersonalOrgClosed) {
+		t.Fatalf("a personal org takes no other members: %v", err)
+	}
+	beta, err := ten.CreateOrg(ctx, "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ten.AddMember(ctx, beta.ID, "bob", tenant.Member); !errors.Is(err, tenant.ErrUserInOtherOrg) {
 		t.Fatalf("user in another org: %v", err)
 	}
 	if _, err := ten.AddMember(ctx, orgIDByName(t, s, tenant.OperatorOrg), "carol", tenant.Member); !errors.Is(err, persistence.ErrInvalid) {
@@ -180,7 +187,7 @@ func TestTenancyOrgsAndMembers(t *testing.T) {
 		t.Fatalf("bob back home: %+v, %v", m, err)
 	}
 	orgs, err := ten.ListOrgs(ctx)
-	if err != nil || len(orgs) != 5 { // operator, 3 personal, acme
+	if err != nil || len(orgs) != 6 { // operator, 3 personal, acme, beta
 		t.Fatalf("ListOrgs = %+v, %v", orgs, err)
 	}
 	if o, err := ten.OrgByName(ctx, "acme"); err != nil || o.Members != 1 {
@@ -492,7 +499,14 @@ func TestTenancyHTTP(t *testing.T) {
 		return b
 	}
 	do("POST", "/v1/orgs", `{"name":"acme","owner":"alice"}`, operator, 201)
-	do("POST", "/v1/orgs/members", `{"username":"bob","role":"member"}`, cookie["alice"], 200)
+	do("POST", "/v1/orgs/members", `{"username":"bob","role":"member","org":"acme"}`, cookie["alice"], 403) // operator only
+	var inv struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(do("POST", "/v1/orgs/invites", `{"username":"bob","role":"member"}`, cookie["alice"], 201), &inv); err != nil {
+		t.Fatal(err)
+	}
+	do("POST", "/v1/orgs/invites/"+inv.ID+"/accept", "", cookie["bob"], 200)
 	do("POST", "/v1/orgs/members", `{"username":"carol","role":"member"}`, cookie["bob"], 403) // member
 	do("POST", "/v1/orgs/members", `{"username":"carol","role":"member","org":"acme"}`, cookie["carol"], 403)
 

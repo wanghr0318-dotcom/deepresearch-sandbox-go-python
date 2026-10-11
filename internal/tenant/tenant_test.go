@@ -114,4 +114,19 @@ func TestAuthorizationMatrix(t *testing.T) {
 	if CanCreateOrg(owner) || !CanCreateOrg(op) || CanCreateOrg(Principal{Operator: true, KeyID: "k_c"}) {
 		t.Error("CanCreateOrg")
 	}
+	if CanAddMembers(owner) || !CanAddMembers(op) || CanAddMembers(key) {
+		t.Error("CanAddMembers: users join only through invites")
+	}
+	if !CanInvite(owner, org) || CanInvite(owner, other) || CanInvite(member, org) || CanInvite(op, org) || CanInvite(key, org) {
+		t.Error("CanInvite")
+	}
+	inv := Invite{OrgID: org, UserID: 7}
+	invitee := Principal{OrgID: other, UserID: 7, Role: Owner, Scopes: AllScopes}
+	if !CanSeeInvite(owner, inv) || !CanSeeInvite(invitee, inv) || CanSeeInvite(member, inv) || CanSeeInvite(op, inv) ||
+		CanSeeInvite(Principal{OrgID: other, UserID: 9, Role: Owner}, inv) || CanSeeInvite(key, inv) {
+		t.Error("CanSeeInvite")
+	}
+	if !IsPersonalOrgName("user-12") || IsPersonalOrgName("acme") {
+		t.Error("IsPersonalOrgName")
+	}
 }
