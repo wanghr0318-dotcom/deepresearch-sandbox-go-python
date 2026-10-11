@@ -41,6 +41,12 @@ type metrics struct {
 	cost         *prometheus.CounterVec
 	breakers     *prometheus.CounterVec
 	tools        *prometheus.HistogramVec
+	modelReqs    *prometheus.CounterVec
+	modelDur     *prometheus.HistogramVec
+	modelTTFT    *prometheus.HistogramVec
+	modelStreams *prometheus.CounterVec
+	modelRejects *prometheus.CounterVec
+	modelDrops   *prometheus.CounterVec
 
 	mu        sync.Mutex
 	toolCount map[string]int
@@ -79,11 +85,28 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Help: "Circuit breaker state changes of model routes (to: closed, open, half_open)."}, []string{"kind", "route", "to"}),
 		tools: prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "tool_calls_per_task",
 			Help: "search/fetch/exec calls per task or turn over all its runs, observed at its terminal status.", Buckets: toolBuckets}, []string{"kind"}),
+		modelReqs: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "model_requests_total",
+			Help: "Model API requests that reached routing, by client protocol, logical model, provider and HTTP status."},
+			[]string{"protocol", "model", "provider", "status"}),
+		modelDur: prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "model_request_duration_seconds",
+			Help: "Model API request duration (streams count until they end).", Buckets: startBuckets}, []string{"protocol", "provider"}),
+		modelTTFT: prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "model_ttft_seconds",
+			Help: "Model API time to first token: request arrival to the provider's first content.", Buckets: latencyBuckets},
+			[]string{"protocol", "provider"}),
+		modelStreams: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "model_streams_total",
+			Help: "Streamed model API responses by completeness (complete=false: provider failure, disconnect or max duration)."},
+			[]string{"protocol", "complete"}),
+		modelRejects: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "model_rejections_total",
+			Help: "Model API requests refused before any provider was tried (rate_limit, quota, auth, unsupported, invalid, unavailable)."},
+			[]string{"protocol", "reason"}),
+		modelDrops: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "model_dropped_fields_total",
+			Help: "Request fields left out when converting between OpenAI and Anthropic formats."}, []string{"field"}),
 		toolCount: map[string]int{},
 		gauges:    &gaugeCollector{},
 	}
 	reg.MustRegister(m.httpReqs, m.httpDur, m.tasks, m.runs, m.attempts, m.attemptReady, m.taskStart, m.stop, m.calls,
-		m.tries, m.tryDur, m.cost, m.breakers, m.tools, m.gauges)
+		m.tries, m.tryDur, m.cost, m.breakers, m.tools, m.modelReqs, m.modelDur, m.modelTTFT, m.modelStreams, m.modelRejects,
+		m.modelDrops, m.gauges)
 	return m
 }
 
@@ -164,6 +187,23 @@ func (m *metrics) compactLocked() {
 }
 
 func (m *metrics) RegisterGauges(fn func() []obs.Gauge) { m.gauges.add(fn) }
+
+func (m *metrics) ModelRequest(protocol, model, provider string, status int, d time.Duration) {
+	m.modelReqs.WithLabelValues(protocol, model, provider, strconv.Itoa(status)).Inc()
+	m.modelDur.WithLabelValues(protocol, provider).Observe(d.Seconds())
+}
+
+func (m *metrics) ModelTTFT(protocol, provider string, d time.Duration) {
+	m.modelTTFT.WithLabelValues(protocol, provider).Observe(d.Seconds())
+}
+
+func (m *metrics) ModelStream(protocol string, complete bool) {
+	m.modelStreams.WithLabelValues(protocol, strconv.FormatBool(complete)).Inc()
+}
+
+func (m *metrics) ModelRejected(protocol, reason string) { m.modelRejects.WithLabelValues(protocol, reason).Inc() }
+
+func (m *metrics) ModelDropped(field string) { m.modelDrops.WithLabelValues(field).Inc() }
 
 // gaugeCollector is an unchecked collector sampling the registered callbacks at scrape time.
 type gaugeCollector struct {
