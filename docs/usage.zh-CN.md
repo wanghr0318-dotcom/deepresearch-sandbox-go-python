@@ -199,6 +199,35 @@ CI=true go test -count=1 -run 'Session|ToolBudget' ./tests/e2e/
 CI=true CGO_ENABLED=0 go test -count=1 -p 1 -timeout 60m -run 'E2[89]|E3[0-3]' ./tests/e2e/   # 以 root 运行
 ```
 
+### 多租户：org、成员与平台 API key
+
+启用账号时（`--model-base-url`），每个用户恰属一个 org：注册时建立个人 org `user-<id>`，自己是 owner；升级到 0012 迁移时已有用户同样补建，运维 token 创建的任务与会话归保留 org `operator`。任务与会话记录所属 org，以及经 API key 创建时的 key。
+
+**平台 API key**：格式 `abx_live_<id>_<secret>`；库中只存 `HMAC-SHA256(pepper, secret)`，pepper 是 server 首次启动时在数据目录中创建的 `apikey.pepper`（0600；共享同一数据库的各 server 必须使用同一份）。完整 key 只在创建时显示一次。调用时用 `Authorization: Bearer abx_live_…` 或 `x-api-key: abx_live_…`（不以 `abx_` 开头的 Bearer 仍按运维 token 判定）。scope：`runtime`（以 key 的用户身份调用会话、研究与自己的任务，登出除外）与 `models`（模型 API，后续版本提供）。无效、已吊销或已过期的 key 为 `401 invalid_api_key`，缺少 scope 为 `403 permission_denied`；**key 永远不能创建或吊销 key、管理成员或 org**（同样 `403 permission_denied`），泄露的 key 不能铸造新 key。校验结果在内存中缓存 30 s，吊销、成员迁出与停用用户经 PostgreSQL `NOTIFY apikey_changed` 立即通知各 server；`last_used_at` 每个 key 每分钟至多写一次。
+
+**HTTP 端点**（[OpenAPI](../api/openapi.yaml) 的 `/v1/*`）：`GET /v1/me`（任何已认证的调用者）；`POST /v1/keys`（登录用户为自己建 key，运维须给 `username`）、`GET /v1/keys`（成员看自己的，owner 看 org 的，运维看全部）、`DELETE /v1/keys/{id}`（吊销，幂等）；`POST /v1/orgs/members`、`DELETE /v1/orgs/members/{user}`（owner 管理自己的 org，运维须指定 `org`）；`POST /v1/orgs`（运维）。只能把仍单独留在个人 org 中的用户迁入另一个 org（其旧 key 同时吊销）；移出成员会回到其个人 org，其在该 org 的 key 吊销；org 至少保留一个 owner。
+
+**运维 CLI**（与 `agentbox user` 一样直接连接数据库；`key create` 读取 server 数据目录中的 pepper）：
+
+```bash
+sudo AGENTBOX_DATABASE_URL=... agentbox org create acme --owner alice     # alice 须仍在个人 org 中
+sudo AGENTBOX_DATABASE_URL=... agentbox org add-member acme bob --role member
+sudo AGENTBOX_DATABASE_URL=... agentbox org list
+sudo AGENTBOX_DATABASE_URL=... agentbox key create --user bob --name ci --scopes runtime,models --expires-in 720h --data-dir <server 的数据目录>
+sudo AGENTBOX_DATABASE_URL=... agentbox key list --org acme
+sudo AGENTBOX_DATABASE_URL=... agentbox key revoke <key id>
+```
+
+用 key 调用运行时 API（`$KEY` 为上面打印的完整 key）：
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:8080/v1/me
+curl -s -H "x-api-key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"request_id":"r1","topic":"示例主题"}' http://127.0.0.1:8080/research
+```
+
+`agentbox verify-invariants` 另核对 G4（每个未吊销 key 的 org 等于其用户的 org）与 G5（带 key 的任务与会话属于该 key 的 org）。
+
 ### 代码执行沙箱
 
 编排 Worker 经 Gateway 的 `POST /v1/exec` 请求运行一段 Python（SDK：`ctx.gateway.exec(step_id, code, inputs=[(sha256, path)], wall_ms=...)`；对话 Agent 以工具 `run_python` 调用它）。server 为**每次**调用新建一个 exec 环境，运行 `python3 -I -B /in/.agentbox/main.py`（cwd `/out`），收集 `/out` 后销毁环境。
