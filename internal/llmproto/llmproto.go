@@ -17,6 +17,7 @@ package llmproto
 
 import (
 	"encoding/json"
+	"math"
 )
 
 // Protocol is a wire format.
@@ -83,6 +84,10 @@ type Message struct {
 	Blocks []Block
 	// Name is OpenAI's per-message name (dropped when converting to Anthropic).
 	Name string
+	// Extras are message fields of the source format without a neutral equivalent (OpenAI refusal,
+	// annotations, audio, function_call echoed back by clients), verbatim. They are re-emitted only in the
+	// source format.
+	Extras map[string]json.RawMessage
 }
 
 // Tool is a function the model may call.
@@ -187,7 +192,30 @@ type Usage struct {
 }
 
 // PromptTotal is all input tokens, cached or not (OpenAI's prompt_tokens).
-func (u Usage) PromptTotal() int64 { return u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens }
+func (u Usage) PromptTotal() int64 {
+	return satAdd(satAdd(u.InputTokens, u.CacheReadTokens), u.CacheWriteTokens)
+}
+
+// Total is all tokens, input and output (saturating).
+func (u Usage) Total() int64 { return satAdd(u.PromptTotal(), u.OutputTokens) }
+
+// clamped returns u with negative counts set to 0 (providers' usage is not trusted).
+func (u Usage) clamped() Usage {
+	return Usage{InputTokens: max(u.InputTokens, 0), OutputTokens: max(u.OutputTokens, 0),
+		CacheReadTokens: max(u.CacheReadTokens, 0), CacheWriteTokens: max(u.CacheWriteTokens, 0)}
+}
+
+// satAdd adds two non-negative counts, saturating at math.MaxInt64.
+func satAdd(a, b int64) int64 {
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
+// MaxTokensLimit is the largest max_tokens a request may ask for; larger values are an
+// *InvalidRequestError. It keeps worst-case cost estimates (max_tokens × price) far from overflow.
+const MaxTokensLimit = 1 << 20
 
 // Response is a non-stream chat response in the neutral format.
 type Response struct {
@@ -200,6 +228,9 @@ type Response struct {
 	StopSequence string // the stop sequence that matched (Anthropic only)
 	Usage        Usage
 	HasUsage     bool // the response carried usage
+	// Repaired lists tool calls whose arguments are not a JSON object (e.g. cut by max_tokens). They are
+	// kept verbatim, but an Anthropic encoding, whose tool input must be an object, sends {} for them.
+	Repaired []string
 }
 
 // FormatOnly returns the fields of the request that cannot be converted to the other format. A request

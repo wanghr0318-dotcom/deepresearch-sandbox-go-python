@@ -3,6 +3,7 @@ package llmproto
 import (
 	"errors"
 	"io"
+	"strings"
 )
 
 // EventType is the type of a stream event (§7.2).
@@ -112,7 +113,9 @@ func (r *EventReader) Next() (Event, error) {
 		}
 		ev, err := r.sse.Next()
 		if err != nil {
-			if errors.Is(err, io.EOF) {
+			// End of input, or a cut inside an event (which is dropped): Finish decides whether the stream
+			// was complete (an OpenAI stream with a finish_reason but no [DONE] is).
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				r.queue, r.err = r.dec.Finish()
 				if r.err == nil {
 					r.err = io.EOF
@@ -137,19 +140,26 @@ func (r *EventReader) Next() (Event, error) {
 // Usage is the usage the stream reported so far.
 func (r *EventReader) Usage() (Usage, bool) { return r.dec.Usage() }
 
-// Collector assembles a Response from stream events.
+// Collector assembles a Response from stream events. Fragments are appended to one builder per block, so
+// collecting is linear in the size of the stream.
 type Collector struct {
 	resp    Response
-	blocks  map[int]*Block
+	blocks  map[int]*collected
 	order   []int
 	errInfo *ErrorInfo
 	done    bool
 }
 
+// collected is a block being assembled.
+type collected struct {
+	block           Block
+	text, args, sig strings.Builder
+}
+
 // Add adds one event.
 func (c *Collector) Add(ev Event) {
 	if c.blocks == nil {
-		c.blocks = map[int]*Block{}
+		c.blocks = map[int]*collected{}
 	}
 	switch ev.Type {
 	case EventMessageStart:
@@ -158,14 +168,13 @@ func (c *Collector) Add(ev Event) {
 			c.resp.Usage, c.resp.HasUsage = *ev.Usage, true
 		}
 	case EventBlockStart:
-		b := &Block{Type: ev.Block, ID: ev.ToolID, Name: ev.ToolName}
-		c.blocks[ev.Index] = b
+		c.blocks[ev.Index] = &collected{block: Block{Type: ev.Block, ID: ev.ToolID, Name: ev.ToolName}}
 		c.order = append(c.order, ev.Index)
 	case EventBlockDelta:
 		if b := c.blocks[ev.Index]; b != nil {
-			b.Text += ev.Text
-			b.Arguments += ev.Arguments
-			b.Signature += ev.Signature
+			b.text.WriteString(ev.Text)
+			b.args.WriteString(ev.Arguments)
+			b.sig.WriteString(ev.Signature)
 		}
 	case EventMessageDelta:
 		c.resp.StopReason, c.resp.StopSequence = ev.StopReason, ev.StopSequence
@@ -180,12 +189,23 @@ func (c *Collector) Add(ev Event) {
 	}
 }
 
-// Response is the response assembled so far.
+// Response is the response assembled so far. A tool call that received no argument fragment has
+// arguments {}; one whose arguments are not a JSON object is listed in Repaired.
 func (c *Collector) Response() Response {
 	r := c.resp
-	r.Blocks = nil
-	for _, i := range c.order {
-		r.Blocks = append(r.Blocks, *c.blocks[i])
+	r.Blocks, r.Repaired = nil, nil
+	for n, i := range c.order {
+		cb := c.blocks[i]
+		b := cb.block
+		b.Text, b.Arguments, b.Signature = cb.text.String(), cb.args.String(), cb.sig.String()
+		if b.Type == BlockToolCall {
+			if strings.TrimSpace(b.Arguments) == "" {
+				b.Arguments = "{}"
+			} else if !isJSONObject(b.Arguments) {
+				r.Repaired = append(r.Repaired, idx("blocks", n)+".arguments")
+			}
+		}
+		r.Blocks = append(r.Blocks, b)
 	}
 	return r
 }

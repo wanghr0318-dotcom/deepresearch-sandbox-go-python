@@ -52,6 +52,7 @@ func DecodeAnthropicRequest(body []byte) (Request, error) {
 	f.boolean("stream", &req.Stream)
 	err = steps(
 		func() error { return f.err },
+		func() error { return checkMaxTokens(req.MaxTokens) },
 		func() error { return decodeStopSequences(&req, obj["stop_sequences"]) },
 		func() error { return decodeAnthropicSystem(&req, obj["system"]) },
 		func() error { return decodeAnthropicTools(&req, obj["tools"]) },
@@ -66,9 +67,15 @@ func DecodeAnthropicRequest(body []byte) (Request, error) {
 	return req, nil
 }
 
+// maxOpenAIStop is the most stop sequences OpenAI accepts.
+const maxOpenAIStop = 4
+
 func decodeStopSequences(req *Request, raw json.RawMessage) error {
 	if !isNull(raw) && json.Unmarshal(raw, &req.Stop) != nil {
 		return invalidf("stop_sequences", "must be an array of strings")
+	}
+	if len(req.Stop) > maxOpenAIStop {
+		req.feature("stop_sequences", FeatureUnsupported)
 	}
 	return nil
 }
@@ -180,6 +187,13 @@ func decodeAnthropicTool(req *Request, raw json.RawMessage, field string) error 
 func decodeAnthropicToolChoice(req *Request, raw json.RawMessage) error {
 	if isNull(raw) {
 		return nil
+	}
+	obj, err := object(raw, "tool_choice")
+	if err != nil {
+		return err
+	}
+	if err := checkAllowed(obj, "tool_choice", "type", "name", "disable_parallel_tool_use"); err != nil {
+		return err
 	}
 	var tc struct {
 		Type                   string `json:"type"`
@@ -352,7 +366,7 @@ func anthropicToolResultBlock(req *Request, obj map[string]json.RawMessage, raw 
 	if f.err != nil {
 		return Block{}, f.err
 	}
-	text, opaque, err := anthropicToolResultContent(obj["content"], field+".content")
+	text, opaque, err := anthropicToolResultContent(req, obj["content"], field+".content")
 	if err != nil {
 		return Block{}, err
 	}
@@ -383,7 +397,7 @@ func anthropicThinkingBlock(obj map[string]json.RawMessage, field string) (Block
 
 // anthropicToolResultContent returns the text of a tool result's content (absent, a string, or an array of
 // text blocks, joined by newlines), or the field of its first non-text block.
-func anthropicToolResultContent(raw json.RawMessage, field string) (text, opaque string, err error) {
+func anthropicToolResultContent(req *Request, raw json.RawMessage, field string) (text, opaque string, err error) {
 	if isNull(raw) {
 		return "", "", nil
 	}
@@ -398,8 +412,9 @@ func anthropicToolResultContent(raw json.RawMessage, field string) (text, opaque
 	texts := make([]string, 0, len(items))
 	for i, it := range items {
 		var blk struct {
-			Type string  `json:"type"`
-			Text *string `json:"text"`
+			Type         string          `json:"type"`
+			Text         *string         `json:"text"`
+			CacheControl json.RawMessage `json:"cache_control"`
 		}
 		if json.Unmarshal(it, &blk) != nil {
 			return "", "", invalidf(idx(field, i), "must be a content block")
@@ -409,6 +424,9 @@ func anthropicToolResultContent(raw json.RawMessage, field string) (text, opaque
 		}
 		if blk.Text == nil {
 			return "", "", invalidf(idx(field, i)+".text", "must be a string")
+		}
+		if !isNull(blk.CacheControl) {
+			req.feature(idx(field, i)+".cache_control", FeatureDrop)
 		}
 		texts = append(texts, *blk.Text)
 	}

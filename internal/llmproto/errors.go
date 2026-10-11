@@ -32,6 +32,22 @@ func (e *InvalidRequestError) Error() string {
 	return "invalid request: " + e.Field + ": " + e.Message
 }
 
+// BadResponseError is a provider response (or stream) that cannot be decoded or converted. It is the
+// provider's fault, not the client's: it maps to 502 upstream_error (Anthropic api_error).
+type BadResponseError struct {
+	Field   string // JSON path; may be empty
+	Message string
+}
+
+func (e *BadResponseError) Error() string {
+	if e.Field == "" {
+		return "bad provider response: " + e.Message
+	}
+	return "bad provider response: " + e.Field + ": " + e.Message
+}
+
+func badResponse(field, msg string) error { return &BadResponseError{Field: field, Message: msg} }
+
 func invalidf(field, msg string) error { return &InvalidRequestError{Field: field, Message: msg} }
 
 func unsupported(field, reason string) error {
@@ -92,15 +108,19 @@ func (c ErrorClass) info() classInfo {
 }
 
 // ClassOf returns the class of a codec error: ClassUnsupportedField for *UnsupportedFieldError,
-// ClassInvalidRequest for *InvalidRequestError, ClassInternal otherwise.
+// ClassInvalidRequest for *InvalidRequestError, ClassUpstream for *BadResponseError and ErrBadStream
+// (the provider's fault), ClassInternal otherwise.
 func ClassOf(err error) ErrorClass {
 	var u *UnsupportedFieldError
 	var i *InvalidRequestError
+	var b *BadResponseError
 	switch {
 	case errors.As(err, &u):
 		return ClassUnsupportedField
 	case errors.As(err, &i):
 		return ClassInvalidRequest
+	case errors.As(err, &b), errors.Is(err, ErrBadStream):
+		return ClassUpstream
 	}
 	return ClassInternal
 }

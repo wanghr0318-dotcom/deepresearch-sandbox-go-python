@@ -89,6 +89,7 @@ func (d *anthropicStreamDecoder) apply(u *anthropicUsageDelta) {
 	if u.CacheReadInputTokens != nil {
 		d.usage.CacheReadTokens = *u.CacheReadInputTokens
 	}
+	d.usage = d.usage.clamped()
 }
 
 func (d *anthropicStreamDecoder) Decode(ev SSEEvent) ([]Event, error) {
@@ -194,6 +195,9 @@ type AnthropicStreamOptions struct {
 	// Source is the format of the provider whose events are encoded. Thinking blocks from an OpenAI provider
 	// (reasoning_content) have no signature and are left out.
 	Source Protocol
+	// Model is the message's model when message_start does not give one (e.g. the request's model). An
+	// empty message id is replaced by a generated "msg_…" id.
+	Model string
 }
 
 type anthropicStreamEncoder struct {
@@ -268,6 +272,12 @@ func (e *anthropicStreamEncoder) Encode(ev Event) ([]byte, error) {
 	switch ev.Type {
 	case EventMessageStart:
 		m := anthropicStartMessage{ID: ev.ID, Type: "message", Role: "assistant", Model: ev.Model, Content: []json.RawMessage{}}
+		if m.ID == "" {
+			m.ID = "msg_" + randomHex()
+		}
+		if m.Model == "" {
+			m.Model = e.opts.Model
+		}
 		if ev.Usage != nil {
 			m.Usage = anthropicUsageOf(*ev.Usage)
 			m.Usage.OutputTokens = 0

@@ -18,7 +18,8 @@
     "completion_tokens": 10,
     "total_tokens": 1010,
     "prompt_tokens_details": {
-      "cached_tokens": 750
+      "cached_tokens": 750,
+      "cache_write_tokens": 200
     }
   }
 }

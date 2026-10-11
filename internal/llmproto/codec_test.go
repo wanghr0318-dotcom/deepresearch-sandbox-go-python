@@ -18,15 +18,17 @@ func TestDecodeOpenAIRequestErrors(t *testing.T) {
 		field       string // the field the error names
 	}{
 		{"not object", `[]`, false, ""},
-		{"unknown field", `{"messages":[{"role":"user","content":"x"}],"max_completion_tokens":5}`, true, "max_completion_tokens"},
+		{"unknown field", `{"messages":[{"role":"user","content":"x"}],"max_output_tokens":5}`, true, "max_output_tokens"},
+		{"max_tokens too large", `{"messages":[{"role":"user","content":"x"}],"max_tokens":1048577}`, false, "max_tokens"},
+		{"max_completion_tokens too large", `{"messages":[{"role":"user","content":"x"}],"max_completion_tokens":1048577}`, false, "max_tokens"},
+		{"echoed refusal on user", `{"messages":[{"role":"user","content":"x","refusal":"no"}]}`, true, "messages[0].refusal"},
 		{"functions", `{"messages":[{"role":"user","content":"x"}],"functions":[]}`, true, "functions"},
 		{"no messages", `{"model":"m"}`, false, "messages"},
 		{"empty messages", `{"messages":[]}`, false, "messages"},
-		{"only system", `{"messages":[{"role":"system","content":"s"}]}`, false, "messages"},
 		{"bad max_tokens", `{"messages":[{"role":"user","content":"x"}],"max_tokens":0}`, false, "max_tokens"},
 		{"bad stream", `{"messages":[{"role":"user","content":"x"}],"stream":"yes"}`, false, "stream"},
 		{"stream_options key", `{"messages":[{"role":"user","content":"x"}],"stream_options":{"x":1}}`, true, "stream_options.x"},
-		{"unknown message field", `{"messages":[{"role":"user","content":"x","audio":{}}]}`, true, "messages[0].audio"},
+		{"unknown message field", `{"messages":[{"role":"user","content":"x","foo":{}}]}`, true, "messages[0].foo"},
 		{"function role", `{"messages":[{"role":"function","content":"x","name":"f"}]}`, true, "messages[0].role"},
 		{"reasoning on user", `{"messages":[{"role":"user","content":"x","reasoning_content":"r"}]}`, true, "messages[0].reasoning_content"},
 		{"user without content", `{"messages":[{"role":"user"}]}`, false, "messages[0].content"},
@@ -52,6 +54,8 @@ func TestDecodeAnthropicRequestErrors(t *testing.T) {
 		field       string
 	}{
 		{"unknown field", `{"max_tokens":5,"messages":[{"role":"user","content":"x"}],"container":"c"}`, true, "container"},
+		{"max_tokens too large", `{"max_tokens":1048577,"messages":[{"role":"user","content":"x"}]}`, false, "max_tokens"},
+		{"tool_choice field", `{"max_tokens":5,"messages":[{"role":"user","content":"x"}],"tool_choice":{"type":"auto","foo":1}}`, true, "tool_choice.foo"},
 		{"bad role", `{"max_tokens":5,"messages":[{"role":"system","content":"x"}]}`, false, "messages[0].role"},
 		{"tool_use in user", `{"max_tokens":5,"messages":[{"role":"user","content":[{"type":"tool_use","id":"t","name":"f","input":{}}]}]}`, false, "messages[0].content[0]"},
 		{"tool_result in assistant", `{"max_tokens":5,"messages":[{"role":"assistant","content":[{"type":"tool_result","tool_use_id":"t"}]}]}`, false, "messages[0].content[0]"},
@@ -99,7 +103,7 @@ func TestGatewayCompatible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := req.FormatOnly(); !slices.Equal(got, []string{"response_format", "messages[2].reasoning_content"}) {
+	if got := req.FormatOnly(); !slices.Equal(got, []string{"response_format", "seed", "messages[2].reasoning_content"}) {
 		t.Fatalf("FormatOnly = %v", got)
 	}
 	if p, ok := req.OnlyProtocol(); !ok || p != ProtocolOpenAI {
@@ -163,8 +167,20 @@ func TestToolArgumentsMustBeObject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := EncodeAnthropicRequest(req); ClassOf(err) != ClassInvalidRequest {
-		t.Fatalf("err = %v", err)
+	// Recorded on decode (F4): the request is pinned to OpenAI, and CanConvertTo agrees with the encoder.
+	field := "messages[0].tool_calls[0].function.arguments"
+	if got := req.FormatOnly(); !slices.Equal(got, []string{field}) {
+		t.Fatalf("FormatOnly = %v", got)
+	}
+	var u *UnsupportedFieldError
+	if err := req.CanConvertTo(ProtocolAnthropic); !errors.As(err, &u) || u.Field != field {
+		t.Fatalf("CanConvertTo = %v", err)
+	}
+	if _, err := EncodeAnthropicRequest(req); !errors.As(err, &u) || u.Field != field {
+		t.Fatalf("encode err = %v", err)
+	}
+	if _, err := EncodeOpenAIRequest(req); err != nil { // pass-through still works
+		t.Fatal(err)
 	}
 }
 
@@ -227,12 +243,27 @@ func TestErrorObjects(t *testing.T) {
 func TestSSEReader(t *testing.T) {
 	in := ": comment\r\nevent: a\r\ndata: one\r\ndata:two\r\nid: 7\r\n\r\n\nevent: lonely\n\ndata: x\rdata: y\r\rdata: tail"
 	r := NewSSEReader(strings.NewReader(in), 0)
-	want := []SSEEvent{{"a", "one\ntwo"}, {"", "x\ny"}, {"", "tail"}}
+	want := []SSEEvent{{"a", "one\ntwo"}, {"", "x\ny"}}
 	for _, w := range want {
 		ev, err := r.Next()
 		if err != nil || ev != w {
 			t.Fatalf("Next = %+v, %v; want %+v", ev, err, w)
 		}
+	}
+	// An event cut off by the end of input (here a partial line) is dropped: the stream was cut (F6).
+	if _, err := r.Next(); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("cut event err = %v", err)
+	}
+	// A whole line without the blank line after it is cut as well; a clean end is io.EOF.
+	if _, err := NewSSEReader(strings.NewReader("data: x\n"), 0).Next(); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("unterminated event err = %v", err)
+	}
+	if _, err := NewSSEReader(strings.NewReader("data: x\n\n: bye\n"), 0).Next(); err != nil {
+		t.Fatal(err)
+	}
+	r = NewSSEReader(strings.NewReader("data: x\n\n"), 0)
+	if _, err := r.Next(); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := r.Next(); !errors.Is(err, io.EOF) {
 		t.Fatalf("end err = %v", err)

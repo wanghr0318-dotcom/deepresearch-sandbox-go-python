@@ -221,6 +221,9 @@ type OpenAIStreamOptions struct {
 	IncludeUsage bool
 	// Created is the "created" of every chunk when message_start does not give one.
 	Created int64
+	// Model is the "model" of every chunk when message_start does not give one (e.g. the request's model).
+	// An empty message id is replaced by a generated "chatcmpl-…" id.
+	Model string
 }
 
 type openAIStreamEncoder struct {
@@ -230,13 +233,15 @@ type openAIStreamEncoder struct {
 	created int64
 	tools   map[int]int // block index → tool call index
 	types   map[int]BlockType
+	sent    map[int]bool // tool blocks that sent an argument fragment
 	usage   *Usage
 	ended   bool
 }
 
 // NewOpenAIStreamEncoder encodes neutral events as OpenAI chat completion chunks.
 func NewOpenAIStreamEncoder(opts OpenAIStreamOptions) StreamEncoder {
-	return &openAIStreamEncoder{opts: opts, created: opts.Created, tools: map[int]int{}, types: map[int]BlockType{}}
+	return &openAIStreamEncoder{opts: opts, created: opts.Created, tools: map[int]int{}, types: map[int]BlockType{},
+		sent: map[int]bool{}}
 }
 
 type openAIChunkOut struct {
@@ -274,6 +279,12 @@ func (e *openAIStreamEncoder) Encode(ev Event) ([]byte, error) {
 	switch ev.Type {
 	case EventMessageStart:
 		e.id, e.model = ev.ID, ev.Model
+		if e.id == "" {
+			e.id = "chatcmpl-" + randomHex()
+		}
+		if e.model == "" {
+			e.model = e.opts.Model
+		}
 		if ev.Created != 0 {
 			e.created = ev.Created
 		}
@@ -283,6 +294,14 @@ func (e *openAIStreamEncoder) Encode(ev Event) ([]byte, error) {
 		return e.blockStart(ev), nil
 	case EventBlockDelta:
 		return e.blockDelta(ev), nil
+	case EventBlockStop:
+		// A tool call without any argument fragment (a tool without input) gets "{}", as OpenAI sends it.
+		if ti, ok := e.tools[ev.Index]; ok && !e.sent[ev.Index] {
+			e.sent[ev.Index] = true
+			args := "{}"
+			return e.chunk(openAIDelta{ToolCalls: []openAIToolCall{{Index: &ti, Function: openAIFunctionCall{Arguments: &args}}}}, nil), nil
+		}
+		return nil, nil
 	case EventMessageDelta:
 		if ev.Usage != nil {
 			u := *ev.Usage
@@ -334,6 +353,7 @@ func (e *openAIStreamEncoder) blockDelta(ev Event) []byte {
 			return nil
 		}
 		ti := e.tools[ev.Index]
+		e.sent[ev.Index] = true
 		d.ToolCalls = []openAIToolCall{{Index: &ti, Function: openAIFunctionCall{Arguments: &a}}}
 	default:
 		return nil

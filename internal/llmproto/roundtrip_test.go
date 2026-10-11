@@ -74,7 +74,7 @@ func randRequest(r *rand.Rand) Request {
 	if r.IntN(2) == 0 {
 		req.Temperature = ptr(float64(r.IntN(10)) / 10)
 	}
-	if r.IntN(2) == 0 {
+	if req.Temperature == nil && r.IntN(2) == 0 { // not both: top_p is dropped for Anthropic
 		req.TopP = ptr(0.5)
 	}
 	for range r.IntN(3) {

@@ -1,0 +1,31 @@
+{
+  "id": "chatcmpl-8",
+  "object": "chat.completion",
+  "created": 1700000008,
+  "model": "kimi-k3",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_t",
+            "type": "function",
+            "function": {
+              "name": "web_search",
+              "arguments": "{\"query\":\"solid-state batt"
+            }
+          }
+        ]
+      },
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 16,
+    "total_tokens": 26
+  }
+}

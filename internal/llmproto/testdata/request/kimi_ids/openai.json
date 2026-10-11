@@ -1,0 +1,71 @@
+{
+  "model": "kimi",
+  "max_tokens": 100,
+  "messages": [
+    {
+      "role": "user",
+      "content": "search"
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "functions.web_search:0",
+          "type": "function",
+          "function": {
+            "name": "web_search",
+            "arguments": "{\"q\":\"a\"}"
+          }
+        },
+        {
+          "id": "functions.web_search:1",
+          "type": "function",
+          "function": {
+            "name": "web_search",
+            "arguments": "{\"q\":\"b\"}"
+          }
+        },
+        {
+          "id": "call_ok-1",
+          "type": "function",
+          "function": {
+            "name": "web_search",
+            "arguments": "{}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "functions.web_search:0",
+      "content": "A"
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "functions.web_search:1",
+      "content": "B"
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_ok-1",
+      "content": "C"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "web_search",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

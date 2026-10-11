@@ -2,31 +2,45 @@ package llmproto
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 )
 
 // openAIFields are the accepted top-level fields of an OpenAI chat request: the fields that
-// internal/gateway/upstream accepts for sandbox calls, plus the client-side fields the model API needs
-// (stream_options, parallel_tool_calls, user, reasoning_effort, n, logprobs, top_logprobs). Any other field
-// is an *UnsupportedFieldError, as in gateway/upstream (max_completion_tokens, functions, … are refused).
-var openAIFields = []string{
-	"model", "messages", "max_tokens", "temperature", "top_p", "stop", "stream",
-	"tools", "tool_choice", "response_format", "seed", "presence_penalty", "frequency_penalty",
-	"stream_options", "parallel_tool_calls", "user", "reasoning_effort", "n", "logprobs", "top_logprobs",
-}
+// internal/gateway/upstream accepts for sandbox calls (whose own allowlist stays strict), plus the
+// client-side fields of the Chat Completions API. Fields without a neutral equivalent are kept in
+// Request.Extras (openAIExtraFields). Unknown fields (and the deprecated functions / function_call) are an
+// *UnsupportedFieldError.
+var openAIFields = append([]string{
+	"model", "messages", "max_tokens", "max_completion_tokens", "temperature", "top_p", "stop", "stream",
+	"tools", "tool_choice", "stream_options", "parallel_tool_calls",
+}, openAIExtraFields...)
 
-// openAIExtraFields are the top-level fields without a neutral equivalent, kept in Request.Extras.
-var openAIExtraFields = []string{"response_format", "seed", "presence_penalty", "frequency_penalty", "user",
-	"reasoning_effort", "n", "logprobs", "top_logprobs"}
+// openAIExtraFields are the top-level fields without a neutral equivalent, kept in Request.Extras and
+// classified by openAIExtra. max_completion_tokens is also kept, so that a same-format encoding uses that
+// name.
+var openAIExtraFields = []string{"max_completion_tokens", "response_format", "seed", "presence_penalty", "frequency_penalty",
+	"user", "reasoning_effort", "n", "logprobs", "top_logprobs", "metadata", "store", "logit_bias", "service_tier",
+	"prediction", "modalities", "audio", "web_search_options", "verbosity", "prompt_cache_key", "safety_identifier"}
 
-// openAIMessageFields are the accepted message fields (as in gateway/upstream).
-var openAIMessageFields = []string{"role", "content", "name", "tool_call_id", "tool_calls", "reasoning_content"}
+// openAIMessageFields are the accepted message fields: those of gateway/upstream plus the assistant fields
+// clients echo back from a previous response (openAIEchoedFields).
+var openAIMessageFields = append([]string{"role", "content", "name", "tool_call_id", "tool_calls", "reasoning_content"},
+	openAIEchoedFields...)
+
+// openAIEchoedFields are assistant message fields that the openai SDK echoes back when a client appends a
+// response message to its history. Null or empty values are ignored; others are kept in Message.Extras and
+// pin the request to OpenAI providers.
+var openAIEchoedFields = []string{"refusal", "annotations", "audio", "function_call"}
 
 // openAIExtra classifies a top-level OpenAI field without a neutral equivalent. ok is false for values that
-// are no-ops in the other format (n=1, logprobs=false, response_format text).
+// are no-ops in the other format (n=1, logprobs=false, response_format text) and for max_completion_tokens,
+// which is mapped to MaxTokens.
 func openAIExtra(field string, raw json.RawMessage) (kind FeatureKind, ok bool) {
 	switch field {
-	case "seed", "presence_penalty", "frequency_penalty", "user":
+	case "max_completion_tokens":
+		return "", false
+	case "presence_penalty", "frequency_penalty", "user":
 		return FeatureDrop, !isNull(raw)
 	case "n":
 		return FeatureUnsupported, !isNull(raw) && strings.TrimSpace(string(raw)) != "1"
@@ -41,8 +55,8 @@ func openAIExtra(field string, raw json.RawMessage) (kind FeatureKind, ok bool) 
 		}
 		return FeatureUnsupported, true
 	}
-	// reasoning_effort, top_logprobs
-	return FeatureUnsupported, !isNull(raw)
+	// seed, reasoning_effort, top_logprobs, metadata, store, logit_bias, service_tier, prediction, …
+	return FeatureUnsupported, !isNull(raw) && !isEmptyJSON(raw)
 }
 
 // DecodeOpenAIRequest decodes an OpenAI chat completions request.
@@ -58,12 +72,19 @@ func DecodeOpenAIRequest(body []byte) (Request, error) {
 	f := &fields{obj: obj}
 	f.str("model", &req.Model)
 	f.positive("max_tokens", &req.MaxTokens)
+	var maxCompletion int64
+	f.positive("max_completion_tokens", &maxCompletion)
+	if maxCompletion > 0 && (req.MaxTokens == 0 || maxCompletion < req.MaxTokens) {
+		req.MaxTokens = maxCompletion // both given: the smaller one
+	}
 	f.number("temperature", &req.Temperature)
 	f.number("top_p", &req.TopP)
 	f.boolean("stream", &req.Stream)
 	f.boolPtr("parallel_tool_calls", &req.ParallelToolCalls)
 	err = steps(
 		func() error { return f.err },
+		func() error { return checkMaxTokens(req.MaxTokens) },
+		func() error { openAISampling(&req); return nil },
 		func() error { return decodeOpenAIStop(&req, obj["stop"]) },
 		func() error { return decodeStreamOptions(&req, obj["stream_options"]) },
 		func() error { return decodeOpenAITools(&req, obj["tools"]) },
@@ -75,6 +96,26 @@ func DecodeOpenAIRequest(body []byte) (Request, error) {
 		return Request{}, err
 	}
 	return req, nil
+}
+
+// checkMaxTokens refuses max_tokens above MaxTokensLimit.
+func checkMaxTokens(n int64) error {
+	if n > MaxTokensLimit {
+		return invalidf("max_tokens", "must be at most 1048576")
+	}
+	return nil
+}
+
+// openAISampling records the sampling settings Anthropic cannot take: temperature above 1 (Anthropic's
+// range is [0, 1]) pins the request to OpenAI; with both temperature and top_p, top_p is dropped (current
+// Claude models refuse both).
+func openAISampling(req *Request) {
+	if req.Temperature != nil && *req.Temperature > 1 {
+		req.feature("temperature", FeatureUnsupported)
+	}
+	if req.Temperature != nil && req.TopP != nil {
+		req.feature("top_p", FeatureDrop)
+	}
 }
 
 func decodeOpenAIStop(req *Request, raw json.RawMessage) error {
@@ -100,8 +141,11 @@ func decodeStreamOptions(req *Request, raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	if err := checkAllowed(so, "stream_options", "include_usage"); err != nil {
+	if err := checkAllowed(so, "stream_options", "include_usage", "include_obfuscation"); err != nil {
 		return err
+	}
+	if v, ok := so["include_obfuscation"]; ok && !isNull(v) {
+		req.feature("stream_options.include_obfuscation", FeatureDrop) // not re-emitted in any format
 	}
 	f := &fields{obj: so, prefix: "stream_options"}
 	f.boolean("include_usage", &req.IncludeUsage)
@@ -268,8 +312,8 @@ func decodeOpenAIMessages(req *Request, raw json.RawMessage) error {
 			return err
 		}
 	}
-	if len(req.Messages) == 0 {
-		return invalidf("messages", "must contain a non-system message")
+	if len(req.Messages) == 0 { // only system messages: valid for OpenAI, Anthropic needs a message
+		req.feature("messages", FeatureUnsupported)
 	}
 	return nil
 }
@@ -298,6 +342,12 @@ func (d *openAIMessages) message(raw json.RawMessage, field string) error {
 	if name != "" {
 		d.req.feature(field+".name", FeatureDrop)
 	}
+	extras := echoedExtras(m)
+	for _, k := range openAIEchoedFields {
+		if _, ok := extras[k]; ok && role != "assistant" {
+			return unsupported(field+"."+k, "only for assistant messages")
+		}
+	}
 	tool := false
 	switch role {
 	case "system", "developer":
@@ -305,11 +355,7 @@ func (d *openAIMessages) message(raw json.RawMessage, field string) error {
 	case "user":
 		err = d.user(m, field, name)
 	case "assistant":
-		var msg Message
-		if msg, err = decodeOpenAIAssistant(d.req, m, field); err == nil {
-			msg.Name = name
-			d.req.Messages = append(d.req.Messages, msg)
-		}
+		err = d.assistant(m, field, name, extras)
 	case "tool":
 		err, tool = d.tool(m, field), true
 	default:
@@ -320,6 +366,40 @@ func (d *openAIMessages) message(raw json.RawMessage, field string) error {
 		d.leading = false
 	}
 	return err
+}
+
+func (d *openAIMessages) assistant(m map[string]json.RawMessage, field, name string, extras map[string]json.RawMessage) error {
+	msg, err := decodeOpenAIAssistant(d.req, m, field)
+	if err != nil {
+		return err
+	}
+	msg.Name, msg.Extras = name, extras
+	for _, k := range openAIEchoedFields {
+		if _, ok := extras[k]; ok {
+			d.req.feature(field+"."+k, FeatureUnsupported)
+		}
+	}
+	if len(msg.Blocks) == 0 { // content "" or null without tool calls: Anthropic rejects an empty turn
+		d.req.feature(field, FeatureDrop)
+	}
+	d.req.Messages = append(d.req.Messages, msg)
+	return nil
+}
+
+// echoedExtras returns the echoed assistant fields (openAIEchoedFields) that are neither null nor empty.
+func echoedExtras(m map[string]json.RawMessage) map[string]json.RawMessage {
+	var out map[string]json.RawMessage
+	for _, k := range openAIEchoedFields {
+		v, ok := m[k]
+		if !ok || isNull(v) || isEmptyJSON(v) {
+			continue
+		}
+		if out == nil {
+			out = map[string]json.RawMessage{}
+		}
+		out[k] = clone(v)
+	}
+	return out
 }
 
 // checkRoleFields rejects message fields that belong to another role.
@@ -412,16 +492,14 @@ func decodeOpenAIAssistant(req *Request, m map[string]json.RawMessage, field str
 			return Message{}, err
 		}
 	}
-	// An assistant message that only calls tools may have content "" or null.
-	if len(calls) > 0 && len(content) == 1 && content[0].Type == BlockText && content[0].Text == "" {
-		content = nil
-	}
+	// Empty text is left out (an assistant message that only calls tools has content "" or null).
+	content = slices.DeleteFunc(content, func(b Block) bool { return b.Type == BlockText && b.Text == "" })
 	if _, ok := m["content"]; !ok && len(calls) == 0 {
 		return Message{}, invalidf(field+".content", "must be given when there are no tool_calls")
 	}
 	msg.Blocks = append(msg.Blocks, content...)
 	for j, c := range calls {
-		b, err := decodeOpenAIToolCall(c, idx(field+".tool_calls", j))
+		b, err := decodeOpenAIToolCall(req, c, idx(field+".tool_calls", j))
 		if err != nil {
 			return Message{}, err
 		}
@@ -430,7 +508,7 @@ func decodeOpenAIAssistant(req *Request, m map[string]json.RawMessage, field str
 	return msg, nil
 }
 
-func decodeOpenAIToolCall(raw json.RawMessage, field string) (Block, error) {
+func decodeOpenAIToolCall(req *Request, raw json.RawMessage, field string) (Block, error) {
 	var call struct {
 		ID       string `json:"id"`
 		Type     string `json:"type"`
@@ -454,6 +532,8 @@ func decodeOpenAIToolCall(raw json.RawMessage, field string) (Block, error) {
 	}
 	if strings.TrimSpace(args) == "" {
 		args = "{}" // a call without arguments
+	} else if !isJSONObject(args) { // e.g. cut by max_tokens: OpenAI replays it, Anthropic needs an object
+		req.feature(field+".function.arguments", FeatureUnsupported)
 	}
 	return Block{Type: BlockToolCall, ID: call.ID, Name: call.Function.Name, Arguments: args}, nil
 }

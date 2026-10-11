@@ -1,0 +1,25 @@
+{
+  "id": "chatcmpl-9",
+  "object": "chat.completion",
+  "created": 1700000009,
+  "model": "gpt-x",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "ok"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1000,
+    "completion_tokens": 5,
+    "total_tokens": 1005,
+    "prompt_tokens_details": {
+      "cached_tokens": 600,
+      "cache_write_tokens": 300
+    }
+  }
+}

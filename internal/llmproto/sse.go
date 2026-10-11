@@ -23,8 +23,9 @@ var ErrSSETooLarge = errors.New("llmproto: SSE event too large")
 // SSEReader reads server-sent events (WHATWG event-stream framing: "event:", "data:", comments, LF, CRLF or
 // CR line ends). Fields other than event and data (id, retry) are ignored.
 type SSEReader struct {
-	r   *bufio.Reader
-	max int
+	r       *bufio.Reader
+	max     int
+	afterCR bool // the last line ended with CR: a following LF belongs to it
 }
 
 // NewSSEReader reads events from r; max ≤ 0 means DefaultMaxSSEEvent.
@@ -35,8 +36,9 @@ func NewSSEReader(r io.Reader, max int) *SSEReader {
 	return &SSEReader{r: bufio.NewReaderSize(r, 64<<10), max: max}
 }
 
-// Next returns the next event. At the end of input it returns io.EOF; an event cut off by the end of input
-// (no blank line after it) is still returned when it has data.
+// Next returns the next event. At the end of input it returns io.EOF. An event that the input cuts off (a
+// partial line, or no blank line after it) is discarded, as the WHATWG rules say, and Next returns
+// io.ErrUnexpectedEOF: the stream was cut.
 func (s *SSEReader) Next() (SSEEvent, error) {
 	var (
 		ev      SSEEvent
@@ -47,9 +49,8 @@ func (s *SSEReader) Next() (SSEEvent, error) {
 	for {
 		line, err := s.readLine()
 		if err != nil {
-			if errors.Is(err, io.EOF) && hasData {
-				ev.Data = data.String()
-				return ev, nil
+			if errors.Is(err, io.EOF) && (hasData || ev.Event != "") {
+				return SSEEvent{}, io.ErrUnexpectedEOF
 			}
 			return SSEEvent{}, err
 		}
@@ -83,24 +84,29 @@ func (s *SSEReader) Next() (SSEEvent, error) {
 	}
 }
 
-// readLine reads one line without its terminator (LF, CRLF or CR).
+// readLine reads one line without its terminator (LF, CRLF or CR). A line cut off by the end of input is
+// io.ErrUnexpectedEOF; io.EOF means the input ended at a line boundary.
 func (s *SSEReader) readLine() (string, error) {
 	var buf []byte
 	for {
 		b, err := s.r.ReadByte()
 		if err != nil {
 			if errors.Is(err, io.EOF) && len(buf) > 0 {
-				return string(buf), nil
+				return "", io.ErrUnexpectedEOF
 			}
 			return "", err
+		}
+		if s.afterCR {
+			s.afterCR = false
+			if b == '\n' {
+				continue // the LF of a CRLF; never wait for it after a bare CR
+			}
 		}
 		switch b {
 		case '\n':
 			return string(buf), nil
 		case '\r':
-			if next, err := s.r.Peek(1); err == nil && next[0] == '\n' {
-				_, _ = s.r.ReadByte()
-			}
+			s.afterCR = true
 			return string(buf), nil
 		}
 		buf = append(buf, b)

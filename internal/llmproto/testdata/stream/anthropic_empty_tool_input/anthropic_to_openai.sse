@@ -1,0 +1,12 @@
+data: {"id":"msg_s6","object":"chat.completion.chunk","created":1700000000,"model":"claude-x","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"msg_s6","object":"chat.completion.chunk","created":1700000000,"model":"claude-x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"toolu_now","type":"function","function":{"name":"get_time","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"msg_s6","object":"chat.completion.chunk","created":1700000000,"model":"claude-x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]},"finish_reason":null}]}
+
+data: {"id":"msg_s6","object":"chat.completion.chunk","created":1700000000,"model":"claude-x","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"msg_s6","object":"chat.completion.chunk","created":1700000000,"model":"claude-x","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":9,"total_tokens":21}}
+
+data: [DONE]
+

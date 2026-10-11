@@ -2,6 +2,7 @@ package llmproto
 
 import (
 	"encoding/json"
+	"strings"
 )
 
 // OpenAI request encoding and response decoding/encoding; request decoding is in openai_request.go.
@@ -10,6 +11,7 @@ type openAIRequestOut struct {
 	Model             string             `json:"model,omitempty"`
 	Messages          []openAIMessageOut `json:"messages"`
 	MaxTokens         int64              `json:"max_tokens,omitempty"`
+	MaxCompletion     int64              `json:"max_completion_tokens,omitempty"`
 	Temperature       *float64           `json:"temperature,omitempty"`
 	TopP              *float64           `json:"top_p,omitempty"`
 	Stop              []string           `json:"stop,omitempty"`
@@ -31,6 +33,11 @@ type openAIMessageOut struct {
 	Name             string           `json:"name,omitempty"`
 	ToolCallID       string           `json:"tool_call_id,omitempty"`
 	ToolCalls        []openAIToolCall `json:"tool_calls,omitempty"`
+	// Echoed assistant fields (Message.Extras), re-emitted in a same-format encoding only.
+	Refusal      json.RawMessage `json:"refusal,omitempty"`
+	Annotations  json.RawMessage `json:"annotations,omitempty"`
+	Audio        json.RawMessage `json:"audio,omitempty"`
+	FunctionCall json.RawMessage `json:"function_call,omitempty"`
 }
 
 type openAIToolCall struct {
@@ -68,7 +75,13 @@ func encodeOpenAIRequest(req Request) ([]byte, error) {
 	same := req.Source == ProtocolOpenAI
 	out := openAIRequestOut{
 		Model: req.Model, MaxTokens: req.MaxTokens, Temperature: req.Temperature, TopP: req.TopP,
-		Stop: req.Stop, Stream: req.Stream, ParallelToolCalls: req.ParallelToolCalls,
+		Stop: req.Stop, Stream: req.Stream,
+	}
+	if len(req.Tools) > 0 || same { // OpenAI refuses parallel_tool_calls without tools
+		out.ParallelToolCalls = req.ParallelToolCalls
+	}
+	if _, ok := req.Extras["max_completion_tokens"]; ok && same { // keep the client's field name
+		out.MaxTokens, out.MaxCompletion = 0, req.MaxTokens
 	}
 	// A converted stream always asks for usage: Anthropic streams always carry it and metering needs it.
 	if req.Stream && (req.IncludeUsage || (req.Source != "" && !same)) {
@@ -90,6 +103,9 @@ func encodeOpenAIRequest(req Request) ([]byte, error) {
 	}
 	if out.ToolChoice, err = openAIToolChoiceOf(req.ToolChoice); err != nil {
 		return nil, err
+	}
+	if len(req.Tools) == 0 && !same { // OpenAI refuses tool_choice without tools
+		out.ToolChoice = nil
 	}
 	body, err := marshalNoEscape(out)
 	if err != nil {
@@ -183,6 +199,10 @@ func encodeOpenAIMessage(m Message, same bool) ([]openAIMessageOut, error) {
 	case RoleAssistant:
 		msg, err := openAIAssistantMessage(m.Blocks)
 		msg.Name = name
+		if same {
+			msg.Refusal, msg.Annotations, msg.Audio, msg.FunctionCall = m.Extras["refusal"], m.Extras["annotations"],
+				m.Extras["audio"], m.Extras["function_call"]
+		}
 		return []openAIMessageOut{msg}, err
 	}
 	return nil, invalidf("messages", "unknown role "+string(m.Role))
@@ -269,17 +289,25 @@ type openAIUsageIn struct {
 	CompletionTokens    int64 `json:"completion_tokens"`
 	CachedTokens        int64 `json:"cached_tokens"` // Moonshot reports cached tokens here
 	PromptTokensDetails *struct {
-		CachedTokens int64 `json:"cached_tokens"`
+		CachedTokens     int64 `json:"cached_tokens"`
+		CacheWriteTokens int64 `json:"cache_write_tokens"`
 	} `json:"prompt_tokens_details"`
 }
 
+// neutral splits prompt_tokens into uncached input, cache reads and cache writes; negative counts are 0.
 func (u *openAIUsageIn) neutral() Usage {
-	cached := u.CachedTokens
-	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0 {
-		cached = u.PromptTokensDetails.CachedTokens
+	prompt := max(u.PromptTokens, 0)
+	cached, written := u.CachedTokens, int64(0)
+	if d := u.PromptTokensDetails; d != nil {
+		if d.CachedTokens > 0 {
+			cached = d.CachedTokens
+		}
+		written = d.CacheWriteTokens
 	}
-	cached = min(cached, u.PromptTokens)
-	return Usage{InputTokens: u.PromptTokens - cached, OutputTokens: u.CompletionTokens, CacheReadTokens: cached}
+	cached = min(max(cached, 0), prompt)
+	written = min(max(written, 0), prompt-cached)
+	return Usage{InputTokens: prompt - cached - written, OutputTokens: max(u.CompletionTokens, 0),
+		CacheReadTokens: cached, CacheWriteTokens: written}
 }
 
 type openAIUsageOut struct {
@@ -290,13 +318,15 @@ type openAIUsageOut struct {
 }
 
 type openAICachedOut struct {
-	CachedTokens int64 `json:"cached_tokens"`
+	CachedTokens     int64 `json:"cached_tokens"`
+	CacheWriteTokens int64 `json:"cache_write_tokens,omitempty"`
 }
 
 func openAIUsage(u Usage) *openAIUsageOut {
-	out := &openAIUsageOut{PromptTokens: u.PromptTotal(), CompletionTokens: u.OutputTokens, TotalTokens: u.PromptTotal() + u.OutputTokens}
-	if u.CacheReadTokens > 0 {
-		out.PromptTokensDetails = &openAICachedOut{CachedTokens: u.CacheReadTokens}
+	u = u.clamped()
+	out := &openAIUsageOut{PromptTokens: u.PromptTotal(), CompletionTokens: u.OutputTokens, TotalTokens: u.Total()}
+	if u.CacheReadTokens > 0 || u.CacheWriteTokens > 0 {
+		out.PromptTokensDetails = &openAICachedOut{CachedTokens: u.CacheReadTokens, CacheWriteTokens: u.CacheWriteTokens}
 	}
 	return out
 }
@@ -352,10 +382,10 @@ type openAIResponseIn struct {
 func DecodeOpenAIResponse(body []byte) (Response, error) {
 	var in openAIResponseIn
 	if err := json.Unmarshal(body, &in); err != nil {
-		return Response{}, invalidf("", "response is not a chat completion: "+err.Error())
+		return Response{}, badResponse("", "not a chat completion: "+err.Error())
 	}
 	if len(in.Choices) == 0 {
-		return Response{}, invalidf("choices", "must be a non-empty array")
+		return Response{}, badResponse("choices", "must be a non-empty array")
 	}
 	c := in.Choices[0]
 	resp := Response{Source: ProtocolOpenAI, ID: in.ID, Model: in.Model, Created: in.Created}
@@ -365,7 +395,7 @@ func DecodeOpenAIResponse(body []byte) (Response, error) {
 	scratch := Request{}
 	content, err := openAIContent(&scratch, c.Message.Content, "choices[0].message.content")
 	if err != nil {
-		return Response{}, err
+		return Response{}, badResponse("choices[0].message.content", err.Error())
 	}
 	for _, b := range content {
 		if b.Type == BlockText && b.Text != "" {
@@ -375,8 +405,14 @@ func DecodeOpenAIResponse(body []byte) (Response, error) {
 	if r := c.Message.Refusal; r != nil && *r != "" && len(content) == 0 {
 		resp.Blocks = append(resp.Blocks, Block{Type: BlockText, Text: *r})
 	}
-	for _, tc := range c.Message.ToolCalls {
-		resp.Blocks = append(resp.Blocks, Block{Type: BlockToolCall, ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
+	for i, tc := range c.Message.ToolCalls {
+		args := tc.Function.Arguments
+		if strings.TrimSpace(args) == "" {
+			args = "{}"
+		} else if !isJSONObject(args) { // e.g. cut by max_tokens
+			resp.Repaired = append(resp.Repaired, idx("choices[0].message.tool_calls", i)+".function.arguments")
+		}
+		resp.Blocks = append(resp.Blocks, Block{Type: BlockToolCall, ID: tc.ID, Name: tc.Function.Name, Arguments: args})
 	}
 	finish := ""
 	if c.FinishReason != nil {
@@ -407,11 +443,18 @@ type openAIChoiceOut struct {
 }
 
 // EncodeOpenAIResponse encodes resp as a non-stream OpenAI chat completion. Thinking blocks become
-// reasoning_content.
+// reasoning_content; opaque blocks of another format (redacted thinking, server tool blocks) are left out.
 func EncodeOpenAIResponse(resp Response) ([]byte, error) {
-	msgs, err := encodeOpenAIMessage(Message{Role: RoleAssistant, Blocks: resp.Blocks}, false)
+	blocks := make([]Block, 0, len(resp.Blocks))
+	for _, b := range resp.Blocks {
+		if b.Type == BlockOpaque && resp.Source != ProtocolOpenAI {
+			continue
+		}
+		blocks = append(blocks, b)
+	}
+	msgs, err := encodeOpenAIMessage(Message{Role: RoleAssistant, Blocks: blocks}, false)
 	if err != nil {
-		return nil, err
+		return nil, badResponse("", err.Error())
 	}
 	out := openAIResponseOut{ID: resp.ID, Object: "chat.completion", Created: resp.Created, Model: resp.Model,
 		Choices: []openAIChoiceOut{{Message: msgs[0], FinishReason: openAIFinish(resp.StopReason)}}}

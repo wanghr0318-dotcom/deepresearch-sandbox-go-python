@@ -5,7 +5,6 @@
     {"role": "developer", "content": "Be brief."},
     {"role": "user", "name": "alice", "content": "Hello"}
   ],
-  "seed": 7,
   "user": "end-user-42",
   "presence_penalty": 0.5,
   "frequency_penalty": 0.1,

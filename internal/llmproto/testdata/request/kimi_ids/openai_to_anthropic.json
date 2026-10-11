@@ -1,0 +1,70 @@
+{
+  "model": "kimi",
+  "max_tokens": 100,
+  "messages": [
+    {
+      "role": "user",
+      "content": "search"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "functions_web_search_0_61a05b74",
+          "name": "web_search",
+          "input": {
+            "q": "a"
+          }
+        },
+        {
+          "type": "tool_use",
+          "id": "functions_web_search_1_2dfa060f",
+          "name": "web_search",
+          "input": {
+            "q": "b"
+          }
+        },
+        {
+          "type": "tool_use",
+          "id": "call_ok-1",
+          "name": "web_search",
+          "input": {}
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "functions_web_search_0_61a05b74",
+          "content": "A"
+        },
+        {
+          "type": "tool_result",
+          "tool_use_id": "functions_web_search_1_2dfa060f",
+          "content": "B"
+        },
+        {
+          "type": "tool_result",
+          "tool_use_id": "call_ok-1",
+          "content": "C"
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "web_search",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "q": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ]
+}

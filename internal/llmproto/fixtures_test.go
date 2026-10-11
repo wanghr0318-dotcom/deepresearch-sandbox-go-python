@@ -181,6 +181,13 @@ func normalizeRequest(r Request) Request {
 	r.Messages = slices.Clone(r.Messages)
 	for i := range r.Messages {
 		r.Messages[i].Blocks = blocks(r.Messages[i].Blocks)
+		if r.Messages[i].Extras != nil {
+			ex := map[string]json.RawMessage{}
+			for k, v := range r.Messages[i].Extras {
+				ex[k] = c(v)
+			}
+			r.Messages[i].Extras = ex
+		}
 	}
 	r.Tools = slices.Clone(r.Tools)
 	for i := range r.Tools {
@@ -230,12 +237,25 @@ func TestResponseFixtures(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if !reflect.DeepEqual(same, resp) {
+				if !reflect.DeepEqual(normalizeResponse(same), normalizeResponse(resp)) {
 					t.Errorf("same-format round trip\n got: %+v\nwant: %+v", same, resp)
 				}
 			})
 		}
 	}
+}
+
+// normalizeResponse compacts the raw JSON of opaque blocks (encoding compacts them).
+func normalizeResponse(r Response) Response {
+	r.Blocks = slices.Clone(r.Blocks)
+	for i, b := range r.Blocks {
+		if b.Raw != nil {
+			if c, err := compactJSON(b.Raw); err == nil {
+				r.Blocks[i].Raw = json.RawMessage(c)
+			}
+		}
+	}
+	return r
 }
 
 // convertedStop is the stop reason after a trip through format p (OpenAI has no stop_sequence).
@@ -246,15 +266,9 @@ func convertedStop(r StopReason, p Protocol) StopReason {
 	return r
 }
 
-// convertedUsage is the usage after a trip through format p (OpenAI has no cache write count: those tokens
-// are ordinary prompt tokens there).
-func convertedUsage(u Usage, p Protocol) Usage {
-	if p == ProtocolOpenAI {
-		u.InputTokens += u.CacheWriteTokens
-		u.CacheWriteTokens = 0
-	}
-	return u
-}
+// convertedUsage is the usage after a trip through format p: unchanged, since OpenAI carries cache reads
+// and writes in prompt_tokens_details.
+func convertedUsage(u Usage, _ Protocol) Usage { return u }
 
 // sseFrame is one parsed frame of an SSE golden file.
 type sseFrame struct {

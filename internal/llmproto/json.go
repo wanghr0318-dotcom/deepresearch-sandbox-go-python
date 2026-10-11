@@ -2,6 +2,8 @@ package llmproto
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -262,4 +264,26 @@ func recordExtras(req *Request, obj map[string]json.RawMessage, names []string, 
 
 func (r *Request) feature(field string, kind FeatureKind) {
 	r.Features = append(r.Features, Feature{Field: field, Kind: kind})
+}
+
+// isJSONObject reports whether s is a JSON object.
+func isJSONObject(s string) bool {
+	var obj map[string]json.RawMessage
+	return json.Unmarshal([]byte(s), &obj) == nil && obj != nil
+}
+
+// isEmptyJSON reports whether raw is "", [] or {}.
+func isEmptyJSON(raw json.RawMessage) bool {
+	switch string(bytes.Join(bytes.Fields(raw), nil)) {
+	case `""`, "[]", "{}":
+		return true
+	}
+	return false
+}
+
+// randomHex is 12 random bytes in hex (generated message ids).
+func randomHex() string {
+	var b [12]byte
+	_, _ = rand.Read(b[:]) // crypto/rand.Read never fails
+	return hex.EncodeToString(b[:])
 }

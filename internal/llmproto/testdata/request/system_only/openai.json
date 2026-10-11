@@ -1,0 +1,10 @@
+{
+  "model": "smart",
+  "max_tokens": 5,
+  "messages": [
+    {
+      "role": "system",
+      "content": "Write a haiku."
+    }
+  ]
+}

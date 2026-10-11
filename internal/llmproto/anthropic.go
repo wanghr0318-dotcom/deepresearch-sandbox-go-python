@@ -1,6 +1,8 @@
 package llmproto
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 )
@@ -51,6 +53,9 @@ func encodeAnthropicRequest(req Request) ([]byte, error) {
 	}
 	out := anthropicRequestOut{Model: req.Model, MaxTokens: req.MaxTokens, Temperature: req.Temperature, TopP: req.TopP,
 		StopSequences: req.Stop, Stream: req.Stream}
+	if req.Source != ProtocolAnthropic && out.Temperature != nil && out.TopP != nil {
+		out.TopP = nil // current Claude models refuse both (recorded as dropped on decode)
+	}
 	var err error
 	if out.System, err = anthropicSystem(req.System); err != nil {
 		return nil, err
@@ -98,6 +103,9 @@ func anthropicSystem(system []Block) (json.RawMessage, error) {
 func anthropicMessages(msgs []Message) ([]anthropicMessageOut, error) {
 	var merged []Message
 	for _, m := range msgs {
+		if m.Role == RoleAssistant && len(m.Blocks) == 0 {
+			continue // an empty assistant turn (recorded as dropped on decode); Anthropic rejects empty content
+		}
 		if m.Role != RoleUser && m.Role != RoleAssistant {
 			return nil, unsupported("messages", "role "+string(m.Role)+" has no anthropic equivalent")
 		}
@@ -141,6 +149,9 @@ func anthropicTools(tools []Tool) ([]json.RawMessage, error) {
 // anthropicToolChoiceOf encodes tool_choice; parallel_tool_calls false becomes disable_parallel_tool_use.
 func anthropicToolChoiceOf(req Request) (*anthropicToolChoice, error) {
 	var out *anthropicToolChoice
+	if len(req.Tools) == 0 && req.Source != ProtocolAnthropic {
+		return nil, nil // a converted tool_choice without tools is meaningless
+	}
 	if tc := req.ToolChoice; tc != nil {
 		types := map[ToolChoiceMode]string{ToolChoiceAuto: "auto", ToolChoiceNone: "none", ToolChoiceRequired: "any", ToolChoiceTool: "tool"}
 		typ, ok := types[tc.Mode]
@@ -152,7 +163,7 @@ func anthropicToolChoiceOf(req Request) (*anthropicToolChoice, error) {
 			out.Name = tc.Name
 		}
 	}
-	if p := req.ParallelToolCalls; p != nil && !*p && len(req.Tools) > 0 {
+	if p := req.ParallelToolCalls; p != nil && !*p && (len(req.Tools) > 0 || req.Source == ProtocolAnthropic) {
 		if out == nil {
 			out = &anthropicToolChoice{Type: "auto"}
 		}
@@ -202,6 +213,25 @@ type anthropicBlockOut struct {
 	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 }
 
+// AnthropicToolID maps a tool call id to one Anthropic accepts (^[a-zA-Z0-9_-]+$): every other byte
+// becomes '_' and, when anything changed, '_' and the first 8 hex digits of the SHA-256 of the original id
+// are appended so that distinct ids stay distinct. Valid ids are returned unchanged. The mapping is
+// deterministic, so a tool_use id and the tool_use_id of its result still match.
+func AnthropicToolID(id string) string {
+	b := []byte(id)
+	changed := false
+	for i, c := range b {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			b[i], changed = '_', true
+		}
+	}
+	if !changed {
+		return id
+	}
+	sum := sha256.Sum256([]byte(id))
+	return string(b) + "_" + hex.EncodeToString(sum[:4])
+}
+
 // toolInput returns the arguments of a tool call as an Anthropic input object.
 func toolInput(args string) (json.RawMessage, error) {
 	if strings.TrimSpace(args) == "" {
@@ -227,10 +257,10 @@ func anthropicBlock(b Block) (json.RawMessage, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = anthropicBlockOut{Type: "tool_use", ID: b.ID, Name: b.Name, Input: in}
+		out = anthropicBlockOut{Type: "tool_use", ID: AnthropicToolID(b.ID), Name: b.Name, Input: in}
 	case BlockToolResult:
 		c := b.Text
-		out = anthropicBlockOut{Type: "tool_result", ToolUseID: b.ID, Content: &c, IsError: b.IsError}
+		out = anthropicBlockOut{Type: "tool_result", ToolUseID: AnthropicToolID(b.ID), Content: &c, IsError: b.IsError}
 	case BlockThinking:
 		t, s := b.Text, b.Signature
 		out = anthropicBlockOut{Type: "thinking", Thinking: &t, Signature: &s}
@@ -251,11 +281,12 @@ type anthropicUsage struct {
 }
 
 func (u anthropicUsage) neutral() Usage {
-	return Usage{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, CacheReadTokens: u.CacheReadInputTokens,
-		CacheWriteTokens: u.CacheCreationInputTokens}
+	return (Usage{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, CacheReadTokens: u.CacheReadInputTokens,
+		CacheWriteTokens: u.CacheCreationInputTokens}).clamped()
 }
 
 func anthropicUsageOf(u Usage) anthropicUsage {
+	u = u.clamped()
 	return anthropicUsage{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, CacheCreationInputTokens: u.CacheWriteTokens,
 		CacheReadInputTokens: u.CacheReadTokens}
 }
@@ -302,10 +333,10 @@ type anthropicResponseIn struct {
 func DecodeAnthropicResponse(body []byte) (Response, error) {
 	var in anthropicResponseIn
 	if err := json.Unmarshal(body, &in); err != nil {
-		return Response{}, invalidf("", "response is not a message: "+err.Error())
+		return Response{}, badResponse("", "not a message: "+err.Error())
 	}
 	if in.Type != "message" {
-		return Response{}, invalidf("type", "must be message")
+		return Response{}, badResponse("type", "must be message")
 	}
 	resp := Response{Source: ProtocolAnthropic, ID: in.ID, Model: in.Model}
 	for i, raw := range in.Content {
@@ -341,7 +372,7 @@ func responseBlock(raw json.RawMessage, field string) (Block, error) {
 		Signature string          `json:"signature"`
 	}
 	if err := json.Unmarshal(raw, &blk); err != nil {
-		return Block{}, invalidf(field, "must be a content block")
+		return Block{}, badResponse(field, "must be a content block")
 	}
 	switch blk.Type {
 	case "text":
@@ -351,7 +382,7 @@ func responseBlock(raw json.RawMessage, field string) (Block, error) {
 		if !isNull(blk.Input) {
 			c, err := compactJSON(blk.Input)
 			if err != nil {
-				return Block{}, invalidf(field+".input", "must be JSON")
+				return Block{}, badResponse(field+".input", "must be JSON")
 			}
 			args = c
 		}
@@ -374,7 +405,8 @@ type anthropicResponseOut struct {
 }
 
 // EncodeAnthropicResponse encodes resp as a non-stream Anthropic message. Thinking blocks without a
-// signature (OpenAI reasoning_content) are left out: they are not valid Anthropic thinking blocks.
+// signature (OpenAI reasoning_content) are left out: they are not valid Anthropic thinking blocks. Tool calls
+// whose arguments are not a JSON object (resp.Repaired) are sent with input {}.
 func EncodeAnthropicResponse(resp Response) ([]byte, error) {
 	out := anthropicResponseOut{ID: resp.ID, Type: "message", Role: "assistant", Model: resp.Model,
 		Content: []json.RawMessage{}, StopReason: anthropicStop(resp.StopReason), Usage: anthropicUsageOf(resp.Usage)}
@@ -389,9 +421,12 @@ func EncodeAnthropicResponse(resp Response) ([]byte, error) {
 		if b.Type == BlockOpaque && resp.Source != ProtocolAnthropic {
 			continue
 		}
+		if b.Type == BlockToolCall && !isJSONObject(b.Arguments) {
+			b.Arguments = "{}" // cut or malformed arguments (listed in resp.Repaired): Anthropic input must be an object
+		}
 		raw, err := anthropicBlock(b)
 		if err != nil {
-			return nil, err
+			return nil, badResponse("content", err.Error())
 		}
 		out.Content = append(out.Content, raw)
 	}
