@@ -491,7 +491,7 @@ func (c Config) gatewayAdapters(d *upstream.Dialer) ([]upstream.Adapter, map[ups
 		}
 		adapters = append(adapters, upstream.NewChat(upstream.ChatConfig{BaseURL: c.Model.BaseURL, Model: c.Model.Name,
 			Models: c.Model.Models, APIKey: c.Model.APIKey, Pricing: c.Model.Pricing, PricingByModel: chatPricing, MaxTokensCap: c.Model.MaxTokensCap,
-			HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0), PrimaryName: PrimaryRoute, Fallbacks: fallbacks,
+			HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0), PrimaryName: PrimaryRoute, PrimaryModels: c.Model.PrimaryModels, Fallbacks: fallbacks,
 			StreamHTTP: d.HTTPClient(0, 0)})) // 流式回复不限总长（模型 API；单个事件与总时长另有上限）
 	}
 	return adapters, pricing, chatPricing

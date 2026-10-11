@@ -28,6 +28,9 @@ type ChatConfig struct {
 	StreamHTTP *http.Client
 	// PrimaryName 是主供应商的路由名（Router.Routes()[0]）；空时为 "primary"。
 	PrimaryName string
+	// PrimaryModels 非 nil 时主供应商只提供其中的逻辑模型，并把它们映射为该供应商的模型名（与 ChatRoute.Models
+	// 相同；空映射表示主供应商不提供任何模型）。nil（默认）时主供应商以同名提供全部声明的模型，与之前相同。
+	PrimaryModels map[string]string
 	// Fallbacks 是按顺序的后备供应商（模型降级链）；空时只有主供应商，行为与引入降级链之前完全相同。
 	// 非空时（链模式）2xx 但没有非空 choices 数组的响应按 unknown / upstream_bad_response 处理（可转下一供应商）；
 	// 这也适用于主供应商（路由 0）：链模式下 Do 与 DoOn(0) 同样检查。
@@ -76,6 +79,7 @@ type chatRoute struct {
 	protocol              llmproto.Protocol // openai 或 anthropic
 	anthropicVersion      string
 	models                map[string]string
+	restricted            bool // 只提供 models 中的逻辑模型（否则以同名提供全部声明的模型）
 	pricing               Pricing
 	pricingByModel        map[string]Pricing
 	http                  *http.Client
@@ -101,7 +105,8 @@ func NewChat(cfg ChatConfig) Adapter {
 	}
 	a := &chatAdapter{cfg: cfg, allowed: allowed, http: defaultClient(cfg.HTTP, DefaultModelMaxBody), strictOK: len(cfg.Fallbacks) > 0}
 	a.routes = append(a.routes, chatRoute{name: cfg.PrimaryName, baseURL: cfg.BaseURL, apiKey: cfg.APIKey,
-		protocol: llmproto.ProtocolOpenAI, http: a.http, streamHTTP: defaultClient(cfg.StreamHTTP, 0)})
+		protocol: llmproto.ProtocolOpenAI, models: cfg.PrimaryModels, restricted: cfg.PrimaryModels != nil,
+		http: a.http, streamHTTP: defaultClient(cfg.StreamHTTP, 0)})
 	for _, r := range cfg.Fallbacks {
 		proto, version := llmproto.ProtocolOpenAI, ""
 		if r.Protocol == llmproto.ProtocolAnthropic {
@@ -111,8 +116,9 @@ func NewChat(cfg ChatConfig) Adapter {
 			}
 		}
 		a.routes = append(a.routes, chatRoute{name: r.Name, baseURL: strings.TrimRight(r.BaseURL, "/"), apiKey: r.APIKey,
-			protocol: proto, anthropicVersion: version, models: r.Models, pricing: r.Pricing, pricingByModel: r.PricingByModel,
-			http: defaultClient(r.HTTP, DefaultModelMaxBody), streamHTTP: defaultClient(r.StreamHTTP, 0)})
+			protocol: proto, anthropicVersion: version, models: r.Models, restricted: len(r.Models) > 0, pricing: r.Pricing,
+			pricingByModel: r.PricingByModel,
+			http:           defaultClient(r.HTTP, DefaultModelMaxBody), streamHTTP: defaultClient(r.StreamHTTP, 0)})
 	}
 	return a
 }
@@ -144,12 +150,13 @@ func (a *chatAdapter) Routes() []string {
 	return out
 }
 
-// Serves 实现 Router：主供应商提供全部声明的模型；后备供应商提供 Models 中的逻辑模型（Models 为空时全部）。
+// Serves 实现 Router：主供应商提供全部声明的模型（配置了 PrimaryModels 时只提供其中的）；后备供应商提供 Models 中的
+// 逻辑模型（Models 为空时全部）。
 func (a *chatAdapter) Serves(route int, model string) bool {
 	if route < 0 || route >= len(a.routes) || !a.allowed[model] {
 		return false
 	}
-	if route == 0 || len(a.routes[route].models) == 0 {
+	if !a.routes[route].restricted {
 		return true
 	}
 	_, ok := a.routes[route].models[model]
@@ -168,7 +175,7 @@ func (a *chatAdapter) PricingOn(route int, model string) Pricing {
 	return r.pricing
 }
 
-// providerModel 返回路由对逻辑模型使用的模型名（主供应商与未映射时原样）。
+// providerModel 返回路由对逻辑模型使用的模型名（未映射时原样）。
 func (r chatRoute) providerModel(model string) string {
 	if m, ok := r.models[model]; ok && m != "" {
 		return m

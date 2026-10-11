@@ -240,6 +240,23 @@ func (r *Recorder) Cost(kind, provider, model string, micro int64) {
 	r.add("Cost kind=%s provider=%s model=%s micro=%d", kind, provider, model, micro)
 }
 func (r *Recorder) ToolCall(taskID, kind string) { r.add("ToolCall task=%s kind=%s", taskID, kind) }
+func (r *Recorder) ModelRequest(protocol, model, provider string, status int, _ time.Duration) {
+	r.add("ModelRequest protocol=%s model=%s provider=%s status=%d", protocol, model, provider, status)
+}
+func (r *Recorder) ModelTTFT(protocol, provider string, _ time.Duration) {
+	r.add("ModelTTFT protocol=%s provider=%s", protocol, provider)
+}
+func (r *Recorder) ModelStream(protocol string, complete bool) {
+	r.add("ModelStream protocol=%s complete=%t", protocol, complete)
+}
+func (r *Recorder) ModelRejected(protocol, reason string) {
+	r.add("ModelRejected protocol=%s reason=%s", protocol, reason)
+}
+func (r *Recorder) ModelDropped(field string) { r.add("ModelDropped field=%s", field) }
+func (r *Recorder) ModelHoldOvershoot(protocol string) {
+	r.add("ModelHoldOvershoot protocol=%s", protocol)
+}
+func (r *Recorder) ModelRecordFailure() { r.add("ModelRecordFailure") }
 func (r *Recorder) RegisterGauges(fn func() []obs.Gauge) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

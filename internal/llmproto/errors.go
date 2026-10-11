@@ -58,8 +58,8 @@ func unsupported(field, reason string) error {
 // ErrorClass is a situation of §7.5; each has a status and an error shape in both formats.
 type ErrorClass string
 
-// Error classes (§7.5). ClassModelNotFound and ClassInternal extend the table for unknown models and
-// server faults.
+// Error classes (§7.5). ClassModelNotFound, ClassInternal and ClassUnavailable extend the table for unknown
+// models, server faults and an unavailable store.
 const (
 	ClassInvalidAPIKey     ErrorClass = "invalid_api_key"
 	ClassPermissionDenied  ErrorClass = "permission_denied"
@@ -71,6 +71,9 @@ const (
 	ClassModelDegraded     ErrorClass = "model_degraded"
 	ClassUpstream          ErrorClass = "upstream_error"
 	ClassInternal          ErrorClass = "internal_error"
+	// ClassUnavailable is a dependency of the gateway itself being down (PostgreSQL: no model call runs without a
+	// money reservation, so the model API fails closed, design §7.8).
+	ClassUnavailable ErrorClass = "service_unavailable"
 )
 
 type classInfo struct {
@@ -91,6 +94,7 @@ var classes = map[ErrorClass]classInfo{
 	ClassModelDegraded:     {http.StatusServiceUnavailable, "server_error", "model_degraded", "overloaded_error"},
 	ClassUpstream:          {http.StatusBadGateway, "server_error", "upstream_error", "api_error"},
 	ClassInternal:          {http.StatusInternalServerError, "server_error", "internal_error", "api_error"},
+	ClassUnavailable:       {http.StatusServiceUnavailable, "server_error", "service_unavailable", "api_error"},
 }
 
 // Status is the HTTP status of the class (500 for an unknown class).

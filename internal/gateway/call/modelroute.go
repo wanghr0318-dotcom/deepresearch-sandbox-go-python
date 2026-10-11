@@ -144,7 +144,7 @@ var errTryTimeout = errors.New("call: 每 try 超时（第一个事件之前）"
 // DoStream 在路由上发出流式请求（upstream.ChatAdapter.DoStream：返回时首 token 已到达，之前的错误事件以 *Error
 // 返回）。每 try 超时（RoutingConfig.TryTimeout）作用于整个首 token 之前的时间：超时的请求按 unknown 归类（已发出）
 // 或 retryable（未发出），与沙箱路径的每 try 超时相同。首 token 时间自动记入该路由的 TTFT 延迟信号（latency
-// 模式）；超时与 unknown 记惩罚样本（客户端自己取消的除外）。返回的流实现 upstream.StreamInfo。
+// 模式）；超时与 unknown 记惩罚样本（客户端自己取消的除外）。返回的流实现 upstream.StreamInfo 与 upstream.RawStream。
 func (m *ModelRouting) DoStream(ctx context.Context, route int, body []byte, proto llmproto.Protocol) (upstream.Stream, *upstream.Error) {
 	sctx, cancel := context.WithCancelCause(ctx)
 	tt := m.c.routing.TryTimeout
@@ -204,4 +204,12 @@ func (s *routedStream) Dropped() []string {
 func (s *routedStream) Converted() bool {
 	i, ok := s.Stream.(upstream.StreamInfo)
 	return ok && i.Converted()
+}
+
+// TakeRaw 实现 upstream.RawStream（底层流不支持时 ok 为 false）。
+func (s *routedStream) TakeRaw() ([]llmproto.SSEEvent, bool) {
+	if r, ok := s.Stream.(upstream.RawStream); ok {
+		return r.TakeRaw()
+	}
+	return nil, false
 }

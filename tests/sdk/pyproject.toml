@@ -1,0 +1,20 @@
+[project]
+name = "agentbox-sdk-compat"
+version = "0.0.0"
+description = "Compatibility tests of the model API with the official openai and anthropic Python SDKs (unmodified)"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40",
+    "openai>=1.50",
+    "pytest>=8",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120

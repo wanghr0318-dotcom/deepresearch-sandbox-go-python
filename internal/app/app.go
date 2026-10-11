@@ -131,6 +131,12 @@ type Config struct {
 	// Accounts 启用用户账号（/auth/*、POST /research；server 在配置了 --model-base-url 时设置）。须配置模型上游，
 	// UserOrchestratorModel 与 UserWorkerModel 须为声明的模型。
 	Accounts bool
+	// ModelAPI 打开模型 API（--model-api，模型网关设计 §7；G3）：POST /v1/chat/completions、POST /v1/messages、
+	// GET /v1/models，需要 Accounts。ModelAPIMaxDuration 是一个模型 API 请求（含流）的总时长上限（0 取 10 min）。
+	ModelAPI            bool
+	ModelAPIMaxDuration time.Duration
+	// ModelAPIMaxBody 是模型 API 请求体的上限（字节；0 取 8 MiB）。
+	ModelAPIMaxBody int64
 	// UserOrchestratorModel 与 UserWorkerModel 是用户研究 spec 的 orchestrator_model 与 worker_model（用户不能
 	// 指定模型；server 默认 kimi-k3 与 kimi-k2.6）。
 	UserOrchestratorModel, UserWorkerModel string
@@ -185,6 +191,9 @@ type ModelConfig struct {
 	// Fallbacks 是按顺序的后备供应商（模型降级链，docs/design/2026-10-10-model-fallback-design.md）；空时只有
 	// 主供应商，行为与引入降级链之前完全相同。主供应商的路由名为 "primary"。
 	Fallbacks []ModelFallback
+	// PrimaryModels（降级链文件的 routing.primary_models）非 nil 时主供应商只提供其中的逻辑模型，并映射为其模型名；
+	// nil 时主供应商以同名提供全部声明的模型（与之前相同）。须有后备供应商，且每个声明的模型至少由一个路由提供。
+	PrimaryModels map[string]string
 	// Routing 是降级链的熔断、每 try 超时与对冲配置（只在有后备供应商时生效）。
 	Routing call.RoutingConfig
 }
@@ -222,6 +231,9 @@ func (m ModelConfig) validateFallbacks(allowPrivate []string) error {
 		return errors.New("app: 降级链的熔断、每 try 超时与对冲参数不能为负")
 	}
 	if len(m.Fallbacks) == 0 {
+		if m.PrimaryModels != nil {
+			return errors.New("app: routing.primary_models 需要后备供应商（--model-fallback-file 的 providers）")
+		}
 		if r.Mode != "" || len(r.Weights) > 0 {
 			return errors.New("app: 路由模式与权重需要后备供应商（--model-fallback-file）")
 		}
@@ -280,7 +292,38 @@ func (m ModelConfig) validateFallbacks(allowPrivate []string) error {
 			}
 		}
 	}
+	if err := m.ValidatePrimaryModels(); err != nil {
+		return err
+	}
 	return m.validateRoutingMode(seen)
+}
+
+// ValidatePrimaryModels 校验 routing.primary_models：逻辑模型须已声明、供应商模型名非空；给出时每个声明的模型须至少
+// 由一个路由提供（主供应商的 primary_models 或某个后备供应商）。
+func (m ModelConfig) ValidatePrimaryModels() error {
+	if m.PrimaryModels == nil {
+		return nil
+	}
+	for logical, vendor := range m.PrimaryModels {
+		if !m.declared(logical) || strings.TrimSpace(vendor) == "" {
+			return fmt.Errorf("app: routing.primary_models 的映射 %q → %q：逻辑模型须已声明、供应商模型名非空", logical, vendor)
+		}
+	}
+	for _, model := range declaredModels(m) {
+		served := false
+		if _, ok := m.PrimaryModels[model]; ok {
+			served = true
+		}
+		for _, fb := range m.Fallbacks {
+			if _, ok := fb.Models[model]; ok || len(fb.Models) == 0 {
+				served = true
+			}
+		}
+		if !served {
+			return fmt.Errorf("app: 声明的模型 %q 没有任何路由提供（routing.primary_models 不含它，后备供应商的 models 也不含它）", model)
+		}
+	}
+	return nil
 }
 
 func negativePrice(p upstream.Pricing) bool {
@@ -436,6 +479,15 @@ func (c Config) withDefaults() Config {
 }
 
 func (c Config) validate() error {
+	if c.ModelAPI && !c.Accounts {
+		return errors.New("app: 模型 API（--model-api）需要配置模型上游（--model-base-url，同时启用账号与多租户）")
+	}
+	if c.ModelAPIMaxDuration < 0 {
+		return errors.New("app: --model-api-max-duration 须 > 0")
+	}
+	if c.ModelAPIMaxBody < 0 {
+		return errors.New("app: --model-api-max-body 须 > 0")
+	}
 	if c.RedisAddr != "" {
 		if host, port, err := net.SplitHostPort(c.RedisAddr); err != nil || host == "" || port == "" {
 			return fmt.Errorf("app: Redis 地址 %q 须为 host:port", c.RedisAddr)
@@ -696,10 +748,12 @@ type server struct {
 	coord     *resource.Coordinator
 	taskDeps  task.Deps
 	calls     *call.Coordinator // Gateway 的记账与 journal 所有者
-	edge      *edge.Edge        // Gateway 的每 attempt 入口（task.Access）
-	blobs     blob.Store        // runner、Gateway 与 API 产物下载共用的 BlobStore
-	sessions  *sessionRuntime   // 会话：session Scheduler（启动执行时建立）与会话 turn 的执行
-	sessDeps  session.Deps      // session actor 的依赖（启用会话时）
+	// modelRoutes 是模型 API（--model-api）的路由视图，Gateway 装配后设置。
+	modelRoutes modelRoutes
+	edge        *edge.Edge      // Gateway 的每 attempt 入口（task.Access）
+	blobs       blob.Store      // runner、Gateway 与 API 产物下载共用的 BlobStore
+	sessions    *sessionRuntime // 会话：session Scheduler（启动执行时建立）与会话 turn 的执行
+	sessDeps    session.Deps    // session actor 的依赖（启用会话时）
 
 	execGate   *admission.ExecGate // exec slots（启用 exec 时；nil 表示关闭）
 	execDigest string              // exec 模板摘要（指纹的 image_digest）
@@ -961,6 +1015,9 @@ func (s *server) assembleGateway(blobs blob.Store) error {
 		return fmt.Errorf("app: Gateway 调用协调器: %w", err)
 	}
 	s.calls = calls
+	if mr := calls.ModelRouting(); mr != nil {
+		s.modelRoutes.p.Store(mr)
+	}
 	if err := s.assembleWorkspaces(blobs); err != nil {
 		return err
 	}
@@ -1429,6 +1486,15 @@ func (s *server) startAPI() error {
 			}
 		}
 	}
+	var modelAPI http.Handler // 未启用时保持 nil 接口：模型 API 的路径与今天一样是 404
+	mh, err := s.modelAPIHandler(quotas, limiter)
+	if err != nil {
+		_ = ln.Close()
+		return err
+	}
+	if mh != nil {
+		modelAPI = mh
+	}
 	var sessions api.Sessions // 未启用会话时保持 nil 接口：会话端点 503 sessions_unavailable
 	if s.cfg.sessionsEnabled() {
 		sessions = notifyingSessions{Sessions: s.store.Sessions(), s: s}
@@ -1441,7 +1507,7 @@ func (s *server) startAPI() error {
 		EffectiveLimits: s.cfg.effectiveLimits, CacheMetrics: s.cacheMetrics,
 		Accounts: accounts, ResearchSpec: s.cfg.researchSpec, SecureCookies: tlsCfg != nil,
 		Sessions: sessions, TurnSpec: s.cfg.turnSpec, ServerInfo: s.serverInfo,
-		Tenancy: tenancy, APIKeys: keys, Quota: quotas, RateLimiter: limiter,
+		Tenancy: tenancy, APIKeys: keys, Quota: quotas, RateLimiter: limiter, ModelAPI: modelAPI,
 	})
 	if err != nil {
 		_ = ln.Close()

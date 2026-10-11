@@ -60,9 +60,14 @@ func (h *Handler) authenticateKey(w http.ResponseWriter, r *http.Request, raw st
 		writeStoreError(w, err)
 		return r, false
 	}
+	return r.WithContext(withPrincipal(r.Context(), keyPrincipal(id))), true
+}
+
+// keyPrincipal 是已校验的 key 所代表的调用者：key 的用户，带 key ID 与 scope。
+func keyPrincipal(id apikey.Identity) principal {
 	tp := id.Principal
 	u := User{ID: tp.UserID, Username: id.Username, Role: "user", OrgID: tp.OrgID, OrgRole: string(tp.Role)}
-	return r.WithContext(withPrincipal(r.Context(), principal{user: u, key: tp.KeyID, scopes: tp.Scopes})), true
+	return principal{user: u, key: tp.KeyID, scopes: tp.Scopes}
 }
 
 // writeTenancyError 映射多租户用例的错误；notFound 为 ErrNotFound 时的错误码与消息。

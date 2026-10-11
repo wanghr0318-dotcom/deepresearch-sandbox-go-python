@@ -60,6 +60,8 @@ type fallbackProvider struct {
 type fallbackRouting struct {
 	Mode          string `json:"mode"`
 	PrimaryWeight *int   `json:"primary_weight"`
+	// PrimaryModels（可选）：主供应商只提供这些逻辑模型，并映射为其模型名；没有给出时主供应商以同名提供全部声明的模型。
+	PrimaryModels map[string]string `json:"primary_models"`
 }
 
 type fallbackFile struct {
@@ -71,6 +73,8 @@ type fallbackFile struct {
 type fileRouting struct {
 	Mode    call.RoutingMode
 	Weights map[string]int
+	// PrimaryModels 是 routing.primary_models（没有给出时为 nil）。
+	PrimaryModels map[string]string
 }
 
 var envNameRE = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,127}$`)
@@ -145,6 +149,9 @@ func modelFallbackFile(path string, getenv func(string) string) ([]app.ModelFall
 		}
 		if w > 0 {
 			weights[app.PrimaryRoute] = w
+		}
+		if f.Routing.PrimaryModels != nil {
+			fr.PrimaryModels = f.Routing.PrimaryModels
 		}
 	}
 	var out []app.ModelFallback

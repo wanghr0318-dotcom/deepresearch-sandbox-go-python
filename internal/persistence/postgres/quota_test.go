@@ -24,7 +24,7 @@ import (
 )
 
 // undo0013 把库还原为只应用了 0012 的形状（undo0012 先执行它）。
-const undo0013 = `DROP INDEX environments_live_attempt, environments_live_session; DROP TABLE quota_holds, quota_budgets; DELETE FROM schema_migrations WHERE version >= 13;
+const undo0013 = undo0014 + `DROP INDEX environments_live_attempt, environments_live_session; DROP TABLE quota_holds, quota_budgets; DELETE FROM schema_migrations WHERE version >= 13;
 `
 
 // quotaViolations 返回 G1、G2 的违反（单条语句，一致快照）。

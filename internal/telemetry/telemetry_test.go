@@ -137,6 +137,11 @@ func TestMetricsEndpoint(t *testing.T) {
 	m.GatewayCall("chat", "completed")
 	m.UpstreamTry("chat", "openai_compat", "fake-model", "ok", 200, 40*time.Millisecond)
 	m.Cost("chat", "openai_compat", "fake-model", 1234)
+	m.ModelRequest("anthropic", "smart", "claude", 200, time.Second)
+	m.ModelTTFT("anthropic", "claude", 80*time.Millisecond)
+	m.ModelStream("anthropic", false)
+	m.ModelRejected("openai", "quota")
+	m.ModelDropped("cache_control")
 	m.RegisterGauges(func() []obs.Gauge {
 		return []obs.Gauge{
 			{Name: "sandbox_envs", Help: "Environments not yet stopped.", Labels: map[string]string{"kind": "task"}, Value: 2},
@@ -161,6 +166,12 @@ func TestMetricsEndpoint(t *testing.T) {
 		`agentbox_gateway_calls_total{kind="chat",result="completed"} 1`,
 		`agentbox_upstream_tries_total{kind="chat",model="fake-model",outcome="ok",provider="openai_compat",status="200"} 1`,
 		`agentbox_cost_micro_usd_total{kind="chat",model="fake-model",provider="openai_compat"} 1234`,
+		`agentbox_model_requests_total{model="smart",protocol="anthropic",provider="claude",status="200"} 1`,
+		`agentbox_model_request_duration_seconds_count{protocol="anthropic",provider="claude"} 1`,
+		`agentbox_model_ttft_seconds_count{protocol="anthropic",provider="claude"} 1`,
+		`agentbox_model_streams_total{complete="false",protocol="anthropic"} 1`,
+		`agentbox_model_rejections_total{protocol="openai",reason="quota"} 1`,
+		`agentbox_model_dropped_fields_total{field="cache_control"} 1`,
 		`agentbox_sandbox_envs{kind="task"} 2`,
 		`agentbox_run_slots_in_use 1`,
 		`go_goroutines`,

@@ -78,6 +78,10 @@ func upstreamFingerprint(c Config) string {
 		}
 		fbs = append(fbs, fallback{fb.Name, fb.BaseURL, fb.Models, fb.Pricing, sortedPricing(fb.PricingByModel), proto, version})
 	}
+	var primaryModels *map[string]string
+	if c.Model.PrimaryModels != nil {
+		primaryModels = &c.Model.PrimaryModels
+	}
 	b, _ := json.Marshal(struct {
 		BaseURL, Name     string
 		Models            []string
@@ -87,8 +91,9 @@ func upstreamFingerprint(c Config) string {
 		Search, SearchURL string
 		Fallbacks         []fallback
 		Routing           any
+		PrimaryModels     *map[string]string `json:",omitempty"` // 只在给出时出现（空映射也出现）：旧配置的摘要不变
 	}{c.Model.BaseURL, c.Model.Name, c.Model.Models, c.Model.Pricing, byModel, c.Model.MaxTokensCap,
-		c.SearchProvider, c.SearchBaseURL, fbs, c.Model.Routing})
+		c.SearchProvider, c.SearchBaseURL, fbs, c.Model.Routing, primaryModels})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:8])
 }

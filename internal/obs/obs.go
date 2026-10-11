@@ -88,6 +88,26 @@ type Recorder interface {
 	ToolCall(taskID, kind string)
 	// RegisterGauges registers a callback sampled at scrape time.
 	RegisterGauges(fn func() []Gauge)
+
+	// Model API (model gateway design §7, G3). protocol is the client's format (openai, anthropic); model is a
+	// configured logical model or "unknown"; provider is a configured route name or "none".
+
+	// ModelRequest is one model API request that reached the routing step, with the HTTP status sent.
+	ModelRequest(protocol, model, provider string, status int, d time.Duration)
+	// ModelTTFT is the time from a model API request's arrival to the provider's first content.
+	ModelTTFT(protocol, provider string, d time.Duration)
+	// ModelStream is the end of a streamed model API response, complete or not (stream_complete).
+	ModelStream(protocol string, complete bool)
+	// ModelRejected is a model API request refused before any provider was tried; reason is one of
+	// rate_limit, quota, auth, unsupported, invalid, unavailable.
+	ModelRejected(protocol, reason string)
+	// ModelDropped is a request field left out when converting between formats (field: its last path segment,
+	// e.g. cache_control).
+	ModelDropped(field string)
+	// ModelHoldOvershoot is a model API request whose known actual cost exceeded its quota hold (settled at the actual).
+	ModelHoldOvershoot(protocol string)
+	// ModelRecordFailure is a model_requests row that could not be written after retries.
+	ModelRecordFailure()
 }
 
 // Gauge is one sampled gauge value. Labels must be bounded enumerations.
@@ -198,3 +218,10 @@ func (nop) UpstreamTry(string, string, string, string, int, time.Duration) {}
 func (nop) Cost(string, string, string, int64)                             {}
 func (nop) ToolCall(string, string)                                        {}
 func (nop) RegisterGauges(func() []Gauge)                                  {}
+func (nop) ModelRequest(string, string, string, int, time.Duration)        {}
+func (nop) ModelTTFT(string, string, time.Duration)                        {}
+func (nop) ModelStream(string, bool)                                       {}
+func (nop) ModelRejected(string, string)                                   {}
+func (nop) ModelDropped(string)                                            {}
+func (nop) ModelHoldOvershoot(string)                                      {}
+func (nop) ModelRecordFailure()                                            {}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -96,6 +97,43 @@ func TestModelFallbackFileExitCode(t *testing.T) {
 		code := runServer([]string{"--data-dir", t.TempDir(), "--database-url", "postgres://x", "--model-base-url", "https://m.example/v1",
 			"--model-name", "m", "--model-fallback-file", p}, &stderr)
 		if code != 2 || !strings.Contains(stderr.String(), "model-fallback-file") {
+			t.Errorf("case %d: exit %d (%s), want 2", i, code, stderr.String())
+		}
+	}
+}
+
+// routing.primary_models (model gateway G3 review M3): parsed into the routing; an unknown logical model, an empty
+// vendor name or a declared model no route serves stops the server with exit code 2. Without it nothing changes.
+func TestPrimaryModels(t *testing.T) {
+	dir := t.TempDir()
+	write := func(body string) string {
+		p := filepath.Join(dir, "fb.json")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	ok := write(`{"providers":[{"name":"claude","protocol":"anthropic","base_url":"https://c.example","models":{"smart":"claude-x"},"price":{"in":1,"out":1}}],
+		"routing":{"primary_models":{"kimi-k3":"kimi-k3"}}}`)
+	if _, fr, err := modelFallbackFile(ok, os.Getenv); err != nil || fr.PrimaryModels["kimi-k3"] != "kimi-k3" || len(fr.PrimaryModels) != 1 {
+		t.Fatalf("%+v %v", fr, err)
+	}
+	if _, fr, err := modelFallbackFile(write(`{"providers":[{"name":"b","base_url":"https://b","price":{"in":1,"out":1}}]}`), os.Getenv); err != nil || fr.PrimaryModels != nil {
+		t.Fatalf("absent: %+v %v", fr, err)
+	}
+	if runtime.GOOS != "linux" {
+		return // runServer 只在 Linux 上可用
+	}
+	for i, body := range []string{
+		`{"providers":[{"name":"c","base_url":"https://c.example/v1","models":{"smart":"x"},"price":{"in":1,"out":1}}],"routing":{"primary_models":{"nope":"x"}}}`,
+		`{"providers":[{"name":"c","base_url":"https://c.example/v1","models":{"smart":"x"},"price":{"in":1,"out":1}}],"routing":{"primary_models":{"kimi-k3":" "}}}`,
+		// kimi-k2.6 is declared but neither the primary nor the fallback serves it.
+		`{"providers":[{"name":"c","base_url":"https://c.example/v1","models":{"smart":"x"},"price":{"in":1,"out":1}}],"routing":{"primary_models":{"kimi-k3":"kimi-k3"}}}`,
+	} {
+		var stderr bytes.Buffer
+		code := runServer([]string{"--data-dir", t.TempDir(), "--database-url", "postgres://x", "--model-base-url", "https://m.example/v1",
+			"--model-name", "kimi-k3", "--models", "kimi-k3,kimi-k2.6,smart", "--model-fallback-file", write(body)}, &stderr)
+		if code != 2 || !strings.Contains(stderr.String(), "primary_models") {
 			t.Errorf("case %d: exit %d (%s), want 2", i, code, stderr.String())
 		}
 	}

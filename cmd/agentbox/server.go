@@ -122,6 +122,9 @@ type serverFlags struct {
 	workerSubruns       *bool
 	subrunCancelTimeout *time.Duration
 	workspaceTools      *bool
+	modelAPI            *bool
+	modelAPIMaxDuration *time.Duration
+	modelAPIMaxBody     *int64
 	workspaceIdle       *time.Duration
 	mcpConfig           *string
 	logFile             *string
@@ -181,6 +184,9 @@ func newServerFlags(fs *flag.FlagSet) *serverFlags {
 	f.workerSubruns = fs.Bool("worker-subruns", true, "在 init 中请求 sub-run 扩展（init.extensions = [\"subruns\"]；Worker 的 ready 须回 subruns: 1，否则以 extension_mismatch 拒绝）")
 	f.subrunCancelTimeout = fs.Duration("subrun-cancel-timeout", subrun.DefaultCancelTimeout, "宿主取消 sub-run 后等待其 subrun_end 的时限 T_subrun_cancel（须 > 0；超时终止整个 attempt，会话模式终止 incarnation）")
 	f.workspaceTools = fs.Bool("workspace-tools", false, "为对话 Agent 打开工作区工具 exec_shell、read_file、write_file、list_dir（/v1/workspace/*；每条命令在独立 exec 环境中运行、按 exec 配额记账；需要 --exec-slots > 0）")
+	f.modelAPI = fs.Bool("model-api", false, "打开模型 API：POST /v1/chat/completions（OpenAI 格式）、POST /v1/messages（Anthropic 格式）、GET /v1/models，以平台 API key（models scope）调用，经 Gateway 的模型路由，按 key、user、org 限流与计费（需要 --model-base-url）")
+	f.modelAPIMaxDuration = fs.Duration("model-api-max-duration", 10*time.Minute, "模型 API 一个请求（含流式回复）的总时长上限（须 > 0）；超过时流以错误事件结束")
+	f.modelAPIMaxBody = fs.Int64("model-api-max-body", 8<<20, "模型 API 请求体的上限（字节，须 > 0）；读取请求体另有 30 s 的期限")
 	f.workspaceIdle = fs.Duration("workspace-idle-timeout", app.DefaultWorkspaceIdleTimeout, "工作区空闲多久后过期（文件丢弃，之后的操作为 410 workspace_expired）；turn 结束时工作区总会被销毁")
 	f.mcpConfig = fs.String("mcp-config", "", "MCP 服务器配置文件（JSON：servers[]{name, transport stdio|http, command|url, allowed_tools, …}）；为空时不启用 MCP（/v1/mcp/* 为 404）")
 	fs.IntVar(&f.ex.Slots, "exec-slots", app.DefaultExecSlots, "全局并发 exec 数（/v1/exec 的独立沙箱）；0 关闭 exec（/v1/exec 为 404）。exec 内存总量 = 本值 × --exec-memory-max，不计入 --memory-bytes，须一并规划")
@@ -292,6 +298,18 @@ func (f *serverFlags) settings(stderr io.Writer) (serverSettings, int) {
 			}
 		}
 	}
+	if *f.modelAPI && !st.accounts {
+		fmt.Fprintln(stderr, "agentbox server: --model-api 需要 --model-base-url（模型 API 经 Gateway 的模型路由，并需要账号与多租户）")
+		return serverSettings{}, 2
+	}
+	if *f.modelAPIMaxDuration <= 0 {
+		fmt.Fprintln(stderr, "agentbox server: --model-api-max-duration 须 > 0")
+		return serverSettings{}, 2
+	}
+	if *f.modelAPIMaxBody <= 0 {
+		fmt.Fprintln(stderr, "agentbox server: --model-api-max-body 须 > 0")
+		return serverSettings{}, 2
+	}
 	st.sess = app.Config{Accounts: st.accounts}
 	if err := sessionFlags(&st.sess, *f.turnToolBudget, *f.sessionIdleFreeze, *f.sessionEvictAfter, *f.sessionWorkerArgv); err != nil {
 		return fail(err)
@@ -334,6 +352,10 @@ func (f *serverFlags) modelSettings() (app.ModelConfig, error) {
 		return app.ModelConfig{}, err
 	}
 	model.Routing.Mode, model.Routing.Weights = fr.Mode, fr.Weights // 文件没有给出时为零值：ordered，与之前相同
+	model.PrimaryModels = fr.PrimaryModels                          // 没有给出时为 nil：主供应商提供全部声明的模型
+	if err := model.ValidatePrimaryModels(); err != nil {           // 启动前以退出码 2 拒绝
+		return app.ModelConfig{}, fmt.Errorf("--model-fallback-file: %w", err)
+	}
 	return model, nil
 }
 
@@ -409,6 +431,9 @@ func (f *serverFlags) appConfig(st serverSettings) app.Config {
 		CacheOff:              *f.cacheMode == "off",
 		Gateway:               st.gateway,
 		Accounts:              st.accounts,
+		ModelAPI:              *f.modelAPI,
+		ModelAPIMaxDuration:   *f.modelAPIMaxDuration,
+		ModelAPIMaxBody:       *f.modelAPIMaxBody,
 		UserOrchestratorModel: *f.userOrchestrator,
 		UserWorkerModel:       *f.userWorker,
 		TurnToolBudget:        st.sess.TurnToolBudget,

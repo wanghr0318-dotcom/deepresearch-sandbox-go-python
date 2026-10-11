@@ -203,7 +203,7 @@ CI=true CGO_ENABLED=0 go test -count=1 -p 1 -timeout 60m -run 'E2[89]|E3[0-3]' .
 
 启用账号时（`--model-base-url`），每个用户恰属一个 org：注册时建立个人 org `user-<id>`，自己是 owner；升级到 0012 迁移时已有用户同样补建，运维 token 创建的任务与会话归保留 org `operator`。任务与会话记录所属 org，以及经 API key 创建时的 key。个人 org 不接受其他成员。
 
-**平台 API key**：格式 `abx_live_<id>_<secret>`；库中只存 `HMAC-SHA256(pepper, secret)`。pepper 是 server 首次启动时在数据目录中原子创建的 `apikey.pepper`（0600），其指纹登记在数据库中：之后每次启动核对，文件缺失（而库中已有 key 或指纹）或与登记的不一致时 server 拒绝启动（退出码 2），不会另建 pepper 使已发放的 key 全部失效。共享同一数据库的各 server 必须使用同一份文件；备份不含它，须另行保管。完整 key 只在创建时显示一次。调用时用 `Authorization: Bearer abx_live_…` 或 `x-api-key: abx_live_…`（不以 `abx_` 开头的 Bearer 仍按运维 token 判定，不以 `abx_` 开头的 `x-api-key` 被忽略；因此启用账号时运维 token 不能以 `abx_` 开头，否则 server 拒绝启动）。scope：`runtime`（以 key 的用户身份调用会话、研究与自己的任务，登出除外）与 `models`（模型 API，后续版本提供）。无效、已吊销或已过期的 key 为 `401 invalid_api_key`，缺少 scope 为 `403 permission_denied`；**key 永远不能创建或吊销 key、管理成员、邀请或 org**（同样 `403 permission_denied`），泄露的 key 不能铸造新 key。校验结果在内存中缓存 30 s，吊销、成员迁出与停用用户经 PostgreSQL `NOTIFY apikey_changed` 立即通知各 server；`last_used_at` 每个 key 每分钟至多写一次。
+**平台 API key**：格式 `abx_live_<id>_<secret>`；库中只存 `HMAC-SHA256(pepper, secret)`。pepper 是 server 首次启动时在数据目录中原子创建的 `apikey.pepper`（0600），其指纹登记在数据库中：之后每次启动核对，文件缺失（而库中已有 key 或指纹）或与登记的不一致时 server 拒绝启动（退出码 2），不会另建 pepper 使已发放的 key 全部失效。共享同一数据库的各 server 必须使用同一份文件；备份不含它，须另行保管。完整 key 只在创建时显示一次。调用时用 `Authorization: Bearer abx_live_…` 或 `x-api-key: abx_live_…`（不以 `abx_` 开头的 Bearer 仍按运维 token 判定，不以 `abx_` 开头的 `x-api-key` 被忽略；因此启用账号时运维 token 不能以 `abx_` 开头，否则 server 拒绝启动）。scope：`runtime`（以 key 的用户身份调用会话、研究与自己的任务，登出除外）与 `models`（模型 API，见下文"模型 API"）。无效、已吊销或已过期的 key 为 `401 invalid_api_key`，缺少 scope 为 `403 permission_denied`；**key 永远不能创建或吊销 key、管理成员、邀请或 org**（同样 `403 permission_denied`），泄露的 key 不能铸造新 key。校验结果在内存中缓存 30 s，吊销、成员迁出与停用用户经 PostgreSQL `NOTIFY apikey_changed` 立即通知各 server；`last_used_at` 每个 key 每分钟至多写一次。
 
 **加入与离开 org（须本人同意）**：org 的 owner（登录会话）邀请用户 `POST /v1/orgs/invites {username, role}`（7 天有效，再次邀请即续期）；被邀请者 `GET /v1/orgs/invites` 查看，`POST /v1/orgs/invites/{id}/accept` 接受或 `DELETE /v1/orgs/invites/{id}` 拒绝；owner 可撤销本 org 发出的邀请，邀请不跨 org 可见。只有仍单独留在个人 org 中的用户能接受（接受时其旧 key 同一事务吊销）。成员可以自己离开（`DELETE /v1/orgs/members/<自己>`），owner 可以移出成员；离开或被移出的用户回到其个人 org，其在该 org 的 key 吊销；org 至少保留一个 owner。运维可以直接移入用户（`POST /v1/orgs/members {username, role, org}` 或 `agentbox org add-member`）。
 
@@ -236,7 +236,7 @@ curl -s -H "x-api-key: $KEY" -H 'Content-Type: application/json' \
 
 启用账号（多租户）时，每个 org、用户与 key 都可以设**限额**与**月度预算**；一次请求必须同时通过它存在的每个层级。值为 null（或 CLI 的 `none`）表示该层级不限，默认全部不限。
 
-- **限额**（`limits` 表）：`rpm`（每分钟请求数）、`tpm`（每分钟 token 数，留给模型 API）、`max_sandboxes`（org 的并发沙箱数）、`max_streams`（并发模型流，留给模型 API）。目前生效的是：
+- **限额**（`limits` 表）：`rpm`（每分钟请求数）、`tpm`（每分钟 token 数，模型 API）、`max_sandboxes`（org 的并发沙箱数）、`max_streams`（并发模型流，模型 API）。`tpm` 与 `max_streams` 见下文"模型 API"；其余生效方式是：
   - `rpm`：作用于运行时 API 中新建 turn 或启动沙箱的端点 `POST /sessions`、`POST /research`、`POST /sessions/{id}/messages`、`POST /sessions/{id}/wake`、`POST /turns/{id}/restore`、`/continue`、`/finish`、`/answer`，对 API key 与登录用户按 key、用户、org 三级的令牌桶同时扣减（任一级不足则都不扣），运维 token 不受限。超出时返回 `429 rate_limit_exceeded`（错误体仍为 `{code, message}`），带 `Retry-After`（秒）与 `x-ratelimit-limit-requests`、`x-ratelimit-remaining-requests`、`x-ratelimit-reset-requests`。配置了 `--redis-addr` 时桶在 Redis 中（一个 Lua 脚本原子地检查全部层级），各 server 共享；Redis 出错或超过 50 ms 时退化为每个 server 各自的进程内桶，请求不受影响，指标 `agentbox_ratelimit_degraded` 为 1，5 s 后再试 Redis（本地连接池暂时占满不算 Redis 故障）。
   - `max_sandboxes`（只能设在 org 层级，用户与 key 层级为 `400 unsupported_limit`）：任务申请运行槽位时检查。没有上限的 org 不做任何计数；有上限时按 PostgreSQL 中该 org 存活的任务与会话环境（加上本 server 已准入、尚未建出环境的任务）计数，达到上限的任务按 org 严格先来先到排队（保持 `queued`，指标 `agentbox_org_sandbox_waiting`），本 server 有沙箱归还时立即唤醒队首。已有存活环境的会话 turn 不新增沙箱，不受影响。
 - **月度预算**（`quota_budgets`，按 UTC 月）：沙箱经 Gateway 发出的每个模型、搜索、抓取（以及 MCP）调用，在预留任务预算的同一事务中，于任务所属 org、用户与 key 各层级放一个 hold（`quota_holds`）；任一层级不足时调用被拒绝（`402 insufficient_quota`，Worker 按预算耗尽处理），任务预算照常生效且优先判定。hold 随调用的结算同步转换：成功按实际费用计入 spent，可重试/致命失败释放，结果未知按预留全额计入 unknown（重启时的账本转换同样处理）。结算失败（例如对冲中另一条腿的结算出错）而仍为 held 的预留，在调用期限过去 2 分钟后由每分钟一次的任务按重启时账本转换的同一路径转为 unknown（在途的 try 不受影响）。月度预算不足时 Worker 收到的说明是"本月配额已用尽（org/user/key）"。用户层级按 (org, 用户) 记：用户换到另一个 org 后在新 org 中是全新的用户层级，原 org 的行与花费留在原 org。没有配置预算时只多写这些 hold 行。设置的上限从当月起生效，之后的月份沿用；上限不能低于当月已用（含预留）。
@@ -264,6 +264,46 @@ sudo AGENTBOX_DATABASE_URL=... agentbox budget show org acme --period 2026-10
 ```
 
 `agentbox verify-invariants` 另核对 G1（每个预算行的 reserved / spent / unknown 等于其 hold 之和）与 G2（有上限的层级已用不超过上限）；hold 以高于预留的实际费用结算造成的超出单独列为 `G2 [超额，非违反]`，不算违反。
+
+### 模型 API（`--model-api`，可选，默认关闭）
+
+`agentbox server` 加 `--model-api`（需要 `--model-base-url`，即启用账号与多租户）后，同一个监听地址另外提供：
+
+- `POST /v1/chat/completions`：OpenAI Chat Completions 格式；
+- `POST /v1/messages`：Anthropic Messages 格式（接受并回显 `anthropic-version` 头）；
+- `GET /v1/models`：可用的逻辑模型（OpenAI 列表格式；带 `anthropic-version` 头时为 Anthropic 格式）。
+
+不加 `--model-api` 时这三个路径与之前一样是 404。调用者须有 `models` scope：平台 key 以 `Authorization: Bearer abx_live_…`（OpenAI SDK）或 `x-api-key: abx_live_…`（Anthropic SDK）调用，登录会话与运维 token 也可以。错误一律以调用方的格式返回（OpenAI 的 `{"error":{…}}` 或 Anthropic 的 `{"type":"error","error":{…}}`）：key 无效 401，缺少 scope 403，请求不合法或用了无法表达的字段 400，模型不存在 404，限流或预算用尽 429，供应商失败 502，全部供应商熔断或 PostgreSQL 不可用 503。
+
+**路由**：请求的 `model` 是声明的逻辑模型（`--model-name` / `--models`），经 Gateway 的模型路由（主供应商与 `--model-fallback-file` 中的后备供应商、权重、熔断，见"模型降级链"）发往供应商。客户端格式与供应商格式相同时请求体原样转发（只改 `model`），流式回复按供应商发出的事件逐个转发；不同时经 `internal/llmproto` 转换请求与回复（只有一种格式才有的 `cache_control`、`metadata.user_id` 等被丢弃并计数；thinking、图片、`response_format` 等无法表达的字段使请求只发往同格式的供应商，没有这样的供应商时 `400 unsupported_field`）。第一个字节写给客户端之前，可重试的失败（429、5xx、连接失败、内容之前的 `overloaded_error` 事件）换下一个供应商；之后不能再换，客户端收到其格式的错误事件。
+
+**限流与计费**：每个请求按 key、用户、org 三级扣 `rpm`（每分钟请求数，与运行时 API 共用同一个桶；在读取请求体之前扣）与 `tpm`（估算 token：请求体字节数 ÷ 2 + 1024 + `max_tokens`，结束后按实际用量退还多扣的部分），流式请求另占一个 `max_streams` 并发名额；超出时 `429 rate_limit_exceeded`，带 `Retry-After` 与 `x-ratelimit-{limit,remaining,reset}-{requests,tokens}`（运维 token 不受限）。之后按候选供应商中最高的单价估算最坏费用（输入估算 × 最高输入单价 + `max_tokens` × 最高输出单价；客户端没有给 `max_tokens` 时补 4096；同时给出 `max_tokens` 与 `max_completion_tokens` 时只转发较小的那个），在各层级的月度预算中放一个 hold（`source = model_request`）；任一层级不足时 `429 insufficient_quota`（Anthropic 调用方为 `rate_limit_error`），消息指出是哪一级。请求结束后按实际用量结算（实际费用超过预留时按实际结算，超出由 `verify-invariants` 的 G2 单独报告，并计入 `agentbox_model_hold_overshoot_total`）；用量没有到达（客户端断开、供应商中途失败、流在 `finish_reason` 之后、用量 chunk 之前被切断）时按估算全额记为 `charged_unknown`。PostgreSQL 不可用时没有 hold 就不发出任何模型调用：`503`。
+
+**流与时长**：`--model-api-max-duration`（默认 10 min）限制一个请求（含流）的总时长，超过时流以错误事件结束；向不再读取的客户端写入同样在这个时限（另加 2 s）之后被切断，请求照常结算。请求体上限 `--model-api-max-body`（默认 8 MiB），读取请求体限时 30 s。客户端断开时取消上游请求并照常结算；客户端断开与供应商对没有的模型回答 404 都不计入熔断器，404 时换下一个提供该模型的路由。请求进行中吊销 key 不影响这个请求（由上面的时长上限约束），下一个请求即为 401。
+
+**记录与指标**：每个取得了 hold 的请求在结算之后写入 `model_requests`（客户端与供应商格式、是否转换、状态、用量、费用、首字时间、`stream_complete`、丢弃的字段）与 `model_request_tries`（每次尝试的供应商、结局、状态与耗时），两表按月分区（迁移 0014）；响应头 `x-request-id` 即其 ID。写入 `model_requests` 失败时重试 3 次，仍失败则记日志并计入 `agentbox_model_request_record_failures_total`（hold 已结算）。指标（`--metrics-listen`）：`agentbox_model_requests_total{protocol,model,provider,status}`、`agentbox_model_ttft_seconds`、`agentbox_model_streams_total{complete}`、`agentbox_model_rejections_total{reason}`（rate_limit、quota、auth、unsupported、invalid、unavailable）、`agentbox_model_dropped_fields_total{field}`。`agentbox verify-invariants` 另核对 G3（每个 `model_requests` 行恰好对应一个 hold，且该 hold 已结算）。
+
+```bash
+# 在"对话式助手"的启动命令上追加
+--model-api --model-api-max-duration 10m --model-api-max-body 8388608
+
+# 为自己建一个 models scope 的 key（或运维：agentbox key create --scopes models ...），再调用
+curl -s http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"kimi-k3","messages":[{"role":"user","content":"你好"}],"max_tokens":200}'
+curl -sN http://127.0.0.1:8080/v1/messages -H "x-api-key: $KEY" -H 'anthropic-version: 2023-06-01' -H 'Content-Type: application/json' \
+  -d '{"model":"kimi-k3","max_tokens":200,"stream":true,"messages":[{"role":"user","content":"你好"}]}'
+```
+
+官方 SDK 只需改 `base_url` 与 key：`openai.OpenAI(base_url="http://127.0.0.1:8080/v1", api_key=KEY)`、`anthropic.Anthropic(base_url="http://127.0.0.1:8080", api_key=KEY)`。兼容性测试不需要模型 Key 与 root：`AGENTBOX_TEST_DATABASE_URL=... bash scripts/sdk-compat.sh` 以未修改的 `openai` 与 `anthropic` Python SDK，分别对 fake upstream 的 OpenAI 模式与 Anthropic 模式，跑非流式、流式与工具调用（`tests/sdk`）。
+
+**已知限制**：
+
+- 主供应商（`--model-base-url`）总是 OpenAI 格式；Anthropic 格式的供应商只能作为后备供应商配置。主供应商默认以同名提供全部声明的模型，用降级链文件的 `routing.primary_models` 限制（见"模型降级链"）。
+- 原样转发时回复中的 `model` 是供应商的模型名（例如 `kimi-k3`、`claude-x`），不改写为逻辑模型名；转换时为逻辑模型名或供应商在 message_start 中给出的名字。
+- 原样转发的流中，供应商在内容之后发出的错误事件按原文转发给客户端（同一格式，可能含供应商的错误消息）；其余错误一律由 Gateway 生成，不回显供应商的错误正文。
+- 非流式请求由供应商的流组装：同格式时回复也经过重新编码（不是逐字节转发），`logprobs` 只支持流式请求；`n` 只能为 1。
+- 输入 token 按字节数估算（÷ 3），只用于限流与预留，结算按供应商报告的实际用量。
+- 在 hold 之前就被拒绝的请求（认证、限流、预算）不写 `model_requests`，只计入指标。
 
 ### 代码执行沙箱
 
@@ -393,11 +433,12 @@ sudo -E ./bin/agentbox server --data-dir /var/lib/agentbox --web-dir web/dist \
 | `price.cache_read`、`price.cache_write` | 按 `in` 计 | 缓存读取、缓存写入的输入单价（每百万 token 的微美元；`model_prices` 中同样可用）。预留按 `in` 与 `cache_write` 中较高者估算。 |
 | `routing.mode` | 有权重时 `weighted`，否则 `ordered` | `ordered`：按文件顺序（主供应商在前），与之前相同。`weighted`：在提供该模型、熔断器就绪（关闭，或打开时长已过、可以半开试探）的供应商中按平滑加权轮询（nginx 算法）选第一个，其余按权重从高到低作为后备；熔断后恢复的供应商由此被试探并重新得到它的份额。`latency`：同 `weighted`，有效权重为权重 ÷ 延迟的 EWMA，不低于最快供应商的 5%，慢的供应商仍有少量探测流量。沙箱调用用整个回复时间，模型 API 的流式调用用首 token 时间（各自一个 EWMA，没有样本时用另一个）；超时与 unknown 记一个惩罚样本（每 try 超时与当前 EWMA 两倍中的较大者）。 |
 | `routing.primary_weight` | 1 | 主供应商（`--model-base-url`）的权重。 |
+| `routing.primary_models` | 不给出 | 主供应商只提供的逻辑模型及其在该供应商的模型名，例如 `{"kimi-k3": "kimi-k3"}`；空对象 `{}` 表示主供应商不提供任何模型（全部交给后备供应商）。不给出时主供应商以同名提供全部声明的模型（与之前相同，指纹不变）。给出时每个声明的模型须至少由一个路由提供（主供应商的 `primary_models`，或某个后备供应商的 `models`；`models` 为空的后备供应商提供全部模型），否则以退出码 2 拒绝启动。逻辑模型只由某个后备供应商真正提供时（例如 `smart` 只映射到 Claude），应当用它把主供应商限制在自己的模型上，主供应商就不会收到它没有的模型名。 |
 
 - 沙箱里的 Worker 仍发送 OpenAI 格式的请求。转到 Anthropic 供应商时，Gateway 把请求转换为 Anthropic 格式，再把回复转回 OpenAI 格式，Worker 看到的结构与 OpenAI 供应商相同（`choices[0].message`、`tool_calls`、`finish_reason`、`usage.prompt_tokens`）。之前轮次 assistant 消息中的 `reasoning_content` 不发给 Anthropic 供应商。journal、重放、指纹、预留与结算的规则不变；结算按该供应商的价格，缓存 token 按缓存单价计。
 - 只有 OpenAI 格式才有的请求字段（例如 `response_format` 为 `json_schema`）不能转换：这样的请求跳过 Anthropic 供应商，跳过原因为 `unsupported_protocol`。
 - 熔断、每 try 超时与对冲的语义不变；每次调用的供应商顺序在调用开始时确定，同一调用内的换供应商与对冲沿用它。
-- 校验失败（未知的 `protocol` 或 `routing.mode`、`anthropic_version` 用于 openai 供应商或不是 `YYYY-MM-DD`、权重小于 1、`routing.mode` 为 `ordered` 却给出权重、负的缓存单价）时 `agentbox server` 以退出码 2 拒绝启动。
+- 校验失败（未知的 `protocol` 或 `routing.mode`、`anthropic_version` 用于 openai 供应商或不是 `YYYY-MM-DD`、权重小于 1、`routing.mode` 为 `ordered` 却给出权重、负的缓存单价、`primary_models` 含未声明的模型或空的模型名、某个声明的模型没有任何路由提供）时 `agentbox server` 以退出码 2 拒绝启动。
 - 设置了缓存单价时，预留按输入、缓存读取、缓存写入单价中最高者估算输入，并为分段取整多留 1–2 微美元，因此在用量不超过估算假设时，实际费用不会超过预留。
 - 转到 Anthropic 供应商时，不符合 `^[a-zA-Z0-9_-]+$` 的工具调用 id（例如 `functions.web_search:0`）被确定性地改写，`tool_use` 与对应的 `tool_result` 保持一致。
 

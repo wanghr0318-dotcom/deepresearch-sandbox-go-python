@@ -5773,7 +5773,7 @@ func TestMigration0008(t *testing.T) {
 		t.Fatalf("应依次应用 0001–0008，得到 %d 个", n)
 	}
 	rows, err := s.pool.Query(ctx, `SELECT c.relname::text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p') AND c.relname <> 'schema_migrations' ORDER BY 1`)
+		WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p') AND NOT c.relispartition AND c.relname <> 'schema_migrations' ORDER BY 1`)
 	if err != nil {
 		t.Fatal(err)
 	}

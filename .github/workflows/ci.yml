@@ -149,6 +149,36 @@ jobs:
           name: linux-integration-test-json
           path: test.json
 
+  # 模型 API 的 SDK 兼容性（模型网关设计 §10）：官方 openai 与 anthropic Python SDK（不修改），各对 fake upstream 的
+  # OpenAI 模式与 Anthropic 模式，覆盖非流式、流式与工具调用。不需要 root、不产生模型费用。
+  sdk-compat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: public.ecr.aws/docker/library/postgres:16-alpine
+        env:
+          POSTGRES_USER: agentbox
+          POSTGRES_PASSWORD: agentbox
+          POSTGRES_DB: agentbox
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentbox -d agentbox"
+          --health-interval 2s --health-timeout 2s --health-retries 30
+    env:
+      AGENTBOX_TEST_DATABASE_URL: postgres://agentbox:agentbox@localhost:5432/agentbox?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.14"
+      - name: SDK 兼容性测试（锁文件必须最新）
+        run: bash scripts/sdk-compat.sh
+
   # Python Worker SDK：最低支持版本 3.11 必须实际覆盖。
   python:
     runs-on: ubuntu-24.04

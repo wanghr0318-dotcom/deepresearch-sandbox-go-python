@@ -74,6 +74,7 @@ const (
 	audienceCookie                  // 只限用户的 cookie 会话（登出）；运维 403 forbidden，API key 403 permission_denied
 	audienceMe                      // 任何已认证的调用者（含任意 scope 的 API key）
 	audienceManage                  // 运维或用户 cookie 会话（管理 key、成员）；API key 403 permission_denied
+	audienceModels                  // 模型 API：认证与授权由 authorizeModel 以调用方的格式完成（key 需要 models scope）
 )
 
 // keyAllowed 报告 API key 调用者能否访问 audience 的操作：/v1/me 总可以；用户的运行时操作（会话、研究、任务）
@@ -99,7 +100,7 @@ var accountRoutes = []route{
 
 // allRoutes 是全部可能注册的操作（openapi.yaml 描述的全集）。
 func allRoutes() []route {
-	return append(append(append(append([]route{}, routes...), accountRoutes...), sessionRoutes...), tenantRoutes...)
+	return append(append(append(append(append([]route{}, routes...), accountRoutes...), sessionRoutes...), tenantRoutes...), modelRoutes...)
 }
 
 func (h *Handler) now() time.Time {
