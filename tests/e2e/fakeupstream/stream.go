@@ -92,20 +92,23 @@ func (s *Server) newStream(w http.ResponseWriter, r *http.Request, rec *Request,
 
 // send 发出一个事件；返回 false 时流已结束（客户端离开、注入的失败），调用方停止发送。注入的切断以
 // panic(http.ErrAbortHandler) 中止连接：客户端读到不完整的 chunked 正文。
-func (st *sseStream) send(event string, data string) bool {
+//
+// 结局总在客户端能读到流的结尾之前记录（last 为真时在写出最后一个事件之前记为 ok；错误事件与切断同样先记录）：
+// 读完流的客户端随即查看 Requests 时一定看到结局，不依赖时序。
+func (st *sseStream) send(event string, data string, last bool) bool {
 	if a := st.rec.Action; a.FailAfterChunks > 0 && st.sent == a.FailAfterChunks {
 		if a.FailWithError {
+			st.s.setOutcome(st.rec, OutcomeStreamError)
 			_, _ = fmt.Fprint(st.w, st.failFrame)
 			st.flush()
-			st.s.setOutcome(st.rec, OutcomeStreamError)
 			return false
 		}
+		st.s.setOutcome(st.rec, OutcomeDisconnected)
 		if a.FailMidLine { // the first half of the next event's data line
 			line := "data: " + data
 			_, _ = fmt.Fprint(st.w, line[:len(line)/2])
 		}
 		st.flush()
-		st.s.setOutcome(st.rec, OutcomeDisconnected)
 		panic(http.ErrAbortHandler)
 	}
 	if st.sent > 0 && st.delay > 0 {
@@ -123,6 +126,9 @@ func (st *sseStream) send(event string, data string) bool {
 		b.WriteString("event: " + event + "\n")
 	}
 	b.WriteString("data: " + data + "\n\n")
+	if last {
+		st.s.setOutcome(st.rec, OutcomeOK)
+	}
 	if _, err := fmt.Fprint(st.w, b.String()); err != nil {
 		st.s.setOutcome(st.rec, OutcomeAborted)
 		return false
@@ -135,14 +141,14 @@ func (st *sseStream) send(event string, data string) bool {
 // frame is one SSE event to send: its event name (empty for OpenAI) and data.
 type frame struct{ event, data string }
 
-// sendAll sends frames in order and reports whether all were sent.
-func (st *sseStream) sendAll(frames []frame) bool {
-	for _, f := range frames {
-		if !st.send(f.event, f.data) {
-			return false
+// sendAll sends frames in order; the outcome (ok, or the failure) is recorded before the client can see
+// the end of the stream.
+func (st *sseStream) sendAll(frames []frame) {
+	for i, f := range frames {
+		if !st.send(f.event, f.data, i == len(frames)-1) {
+			return
 		}
 	}
-	return true
 }
 
 func (st *sseStream) flush() {
@@ -218,9 +224,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, rec *Request
 	}
 	frames = append(frames, frame{data: "[DONE]"})
 	st := s.newStream(w, r, rec, "data: "+mustJSON(errBody("stream_failed"))+"\n\n")
-	if st.sendAll(frames) {
-		s.setOutcome(rec, OutcomeOK)
-	}
+	st.sendAll(frames)
 }
 
 // messagesRequest 是 /v1/messages 请求中本服务器读取的字段。
@@ -345,19 +349,19 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request, rec *Request, 
 	read, write := s.cacheRead, s.cacheWrite
 	s.mu.Unlock()
 	if key != "" && r.Header.Get("X-Api-Key") != key {
-		writeJSON(w, http.StatusUnauthorized, anthropicErrBody(http.StatusUnauthorized, "invalid x-api-key"))
 		s.setOutcome(rec, OutcomeStatus)
+		writeJSON(w, http.StatusUnauthorized, anthropicErrBody(http.StatusUnauthorized, "invalid x-api-key"))
 		return
 	}
 	if r.Header.Get("Anthropic-Version") == "" {
-		writeJSON(w, http.StatusBadRequest, anthropicErrBody(http.StatusBadRequest, "anthropic-version: header is required"))
 		s.setOutcome(rec, OutcomeStatus)
+		writeJSON(w, http.StatusBadRequest, anthropicErrBody(http.StatusBadRequest, "anthropic-version: header is required"))
 		return
 	}
 	var req messagesRequest
 	if err := json.Unmarshal(body, &req); err != nil || len(req.Messages) == 0 || req.MaxTokens <= 0 {
-		writeJSON(w, http.StatusBadRequest, anthropicErrBody(http.StatusBadRequest, "messages and max_tokens are required"))
 		s.setOutcome(rec, OutcomeStatus)
+		writeJSON(w, http.StatusBadRequest, anthropicErrBody(http.StatusBadRequest, "messages and max_tokens are required"))
 		return
 	}
 	var content json.RawMessage
@@ -385,9 +389,9 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request, rec *Request, 
 		return
 	}
 	w.Header().Set("Request-Id", fmt.Sprintf("fake-req-%d", rec.Seq))
+	s.setOutcome(rec, OutcomeOK) // before the reply: a client that has it sees the outcome
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "type": "message", "role": "assistant", "model": req.Model,
 		"content": blocks, "stop_reason": stop, "stop_sequence": nil, "usage": usage})
-	s.setOutcome(rec, OutcomeOK)
 }
 
 // streamMessages 以 Anthropic 的事件序列发出回复：message_start（输入用量，output_tokens 为 1）、每个内容块的
@@ -415,9 +419,7 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, rec *Req
 		"usage": map[string]int64{"output_tokens": usage.OutputTokens}})
 	add(map[string]any{"type": "message_stop"})
 	st := s.newStream(w, r, rec, "event: error\ndata: "+mustJSON(anthropicErrBody(529, "Overloaded"))+"\n\n")
-	if st.sendAll(frames) {
-		s.setOutcome(rec, OutcomeOK)
-	}
+	st.sendAll(frames)
 }
 
 // blockEvents 返回一个内容块的 content_block_start 内容与各个 delta。
