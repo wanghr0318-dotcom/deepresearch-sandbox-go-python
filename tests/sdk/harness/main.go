@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/signal"
@@ -46,7 +47,24 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/tests/e2e/fakeupstream"
 )
 
-const model = "m-1"
+const (
+	model        = "m-1"
+	failingModel = "m-fail" // its provider fails after the first content (mid-stream error)
+)
+
+// failingProvider streams a little text and then an error event, in OpenAI or Anthropic format by path.
+func failingProvider(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	if strings.HasSuffix(r.URL.Path, "/messages") {
+		fmt.Fprint(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_f\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m-fail\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n")
+		fmt.Fprint(w, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
+		fmt.Fprint(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n")
+		fmt.Fprint(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"provider overloaded mid-stream\"}}\n\n")
+		return
+	}
+	fmt.Fprint(w, "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m-fail\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"},\"finish_reason\":null}]}\n\n")
+	fmt.Fprint(w, "data: {\"error\":{\"message\":\"provider failed mid-stream\",\"type\":\"server_error\"}}\n\n")
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -99,17 +117,34 @@ func run() error {
 	fu := fakeupstream.New()
 	defer fu.Close()
 	fu.SetChatHook(func(body []byte) json.RawMessage {
-		if !strings.Contains(string(body), `"tools"`) || strings.Contains(string(body), `"role":"tool"`) {
+		b := string(body)
+		switch {
+		case strings.Contains(b, "Answer in French"):
+			return json.RawMessage(`{"role":"assistant","content":"Bonjour"}`)
+		case !strings.Contains(b, `"tools"`) || strings.Contains(b, `"role":"tool"`):
 			return nil
+		case strings.Contains(b, "Tokyo"):
+			return json.RawMessage(`{"role":"assistant","content":null,"tool_calls":[` +
+				`{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}},` +
+				`{"id":"call_2","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Tokyo\"}"}}]}`)
 		}
 		return json.RawMessage(`{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]}`)
 	})
 	fu.SetMessagesHook(func(body []byte) json.RawMessage {
-		if !strings.Contains(string(body), `"tools"`) || strings.Contains(string(body), `"tool_result"`) {
+		b := string(body)
+		switch {
+		case strings.Contains(b, "Answer in French"):
+			return json.RawMessage(`[{"type":"text","text":"Bonjour"}]`)
+		case !strings.Contains(b, `"tools"`) || strings.Contains(b, `"tool_result"`):
 			return nil
+		case strings.Contains(b, "Tokyo"):
+			return json.RawMessage(`[{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"Paris"}},` +
+				`{"type":"tool_use","id":"toolu_2","name":"get_weather","input":{"city":"Tokyo"}}]`)
 		}
 		return json.RawMessage(`[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"Paris"}}]`)
 	})
+	broken := httptest.NewServer(http.HandlerFunc(failingProvider))
+	defer broken.Close()
 	verifier := apikey.NewVerifier(st.APIKeys(), pepper, nil)
 	tmp, err := os.MkdirTemp("", "agentbox-sdk-")
 	if err != nil {
@@ -121,13 +156,13 @@ func run() error {
 		return err
 	}
 	limiter, streams := ratelimit.NewLocal(time.Now), ratelimit.NewConcurrency()
-	out := map[string]string{"key": g.Full, "model": model}
+	out := map[string]string{"key": g.Full, "model": model, "failing_model": failingModel}
 	for _, mode := range []string{"openai", "anthropic"} {
-		rt, err := routing(fu, mode)
+		rt, err := routing(fu, broken.URL, mode)
 		if err != nil {
 			return err
 		}
-		mh := modelapi.New(modelapi.Config{Routing: func() *call.ModelRouting { return rt }, Models: []string{model},
+		mh := modelapi.New(modelapi.Config{Routing: func() *call.ModelRouting { return rt }, Models: []string{model, failingModel},
 			Holder: st.Quota(), Limits: st.Quota(), Limiter: limiter, Streams: streams, Store: st.ModelRequests()})
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -159,16 +194,26 @@ func run() error {
 	return nil
 }
 
-// routing builds the Gateway's model routes for a mode.
-func routing(fu *fakeupstream.Server, mode string) (*call.ModelRouting, error) {
+// routing builds the Gateway's model routes for a mode: model is served by fakeupstream in that mode's format (with
+// routing.primary_models; in Anthropic mode the OpenAI-format primary serves nothing), failingModel by a provider of
+// the same format that fails after the first content.
+func routing(fu *fakeupstream.Server, brokenURL, mode string) (*call.ModelRouting, error) {
 	d := upstream.NewDialer(upstream.DialerConfig{AllowPrivate: []string{"127.0.0.1"}})
 	price := upstream.Pricing{InputMicroPerMTok: 1_000_000, OutputMicroPerMTok: 2_000_000}
-	cfg := upstream.ChatConfig{BaseURL: fu.ModelBaseURL(), Model: model, APIKey: "sk-fake", Pricing: price,
-		HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0), StreamHTTP: d.HTTPClient(0, 0)}
+	route := func(name string, proto llmproto.Protocol, base string, models map[string]string) upstream.ChatRoute {
+		return upstream.ChatRoute{Name: name, Protocol: proto, BaseURL: base, APIKey: "sk-fake", Models: models, Pricing: price,
+			HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0), StreamHTTP: d.HTTPClient(0, 0)}
+	}
+	cfg := upstream.ChatConfig{BaseURL: fu.ModelBaseURL(), Model: model, Models: []string{model, failingModel}, APIKey: "sk-fake",
+		Pricing: price, PrimaryModels: map[string]string{model: model},
+		HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0), StreamHTTP: d.HTTPClient(0, 0),
+		Fallbacks: []upstream.ChatRoute{route("broken", llmproto.ProtocolOpenAI, brokenURL+"/v1", map[string]string{failingModel: failingModel})}}
 	if mode == "anthropic" {
-		cfg.BaseURL = "http://127.0.0.1:1/v1"
-		cfg.Fallbacks = []upstream.ChatRoute{{Name: "claude", Protocol: llmproto.ProtocolAnthropic, BaseURL: fu.URL(),
-			APIKey: "sk-ant-fake", Pricing: price, HTTP: d.HTTPClient(upstream.DefaultModelMaxBody, 0), StreamHTTP: d.HTTPClient(0, 0)}}
+		cfg.PrimaryModels = map[string]string{}
+		cfg.Fallbacks = []upstream.ChatRoute{
+			route("claude", llmproto.ProtocolAnthropic, fu.URL(), map[string]string{model: model}),
+			route("broken", llmproto.ProtocolAnthropic, brokenURL, map[string]string{failingModel: failingModel}),
+		}
 	}
 	c, err := call.New(call.Config{Store: nopStore{}, Blobs: nopBlobs{}, Events: nopEvents{}, Adapters: []upstream.Adapter{upstream.NewChat(cfg)}})
 	if err != nil {
