@@ -261,14 +261,14 @@ var invariantQueries = []struct {
 			AND b.spent_micro + b.reserved_micro + b.unknown_micro - COALESCE(o.amt, 0) > b.limit_micro`},
 	// 模型网关设计 §9 的不变量 3（G3）：每个 model_requests 行恰好对应一个 hold（source = model_request、ref = 行 id 的 hold
 	// 恰有一个，且就是行的 hold_id），且该 hold 已不是 held（行在 hold 结算或释放之后才写入）。
-	{"G3", "A", `SELECT r.id, CASE
+	{"G3", "A", `WITH hc AS (SELECT ref, count(*) AS n FROM quota_holds WHERE source = 'model_request' GROUP BY ref HAVING count(*) > 1)
+		SELECT r.id, CASE
 			WHEN h.hold_id IS NULL THEN format('hold %s 不存在', r.hold_id)
 			WHEN h.source <> 'model_request' OR h.ref <> r.id THEN format('hold %s 属于 %s %s', h.hold_id, h.source, h.ref)
 			WHEN h.state = 'held' THEN format('已完成的请求的 hold %s 仍为 held', h.hold_id)
-			ELSE format('请求有 %s 个 hold', (SELECT count(*) FROM quota_holds q WHERE q.source = 'model_request' AND q.ref = r.id)) END
-		FROM model_requests r LEFT JOIN quota_holds h ON h.hold_id = r.hold_id
-		WHERE h.hold_id IS NULL OR h.source <> 'model_request' OR h.ref <> r.id OR h.state = 'held'
-			OR (SELECT count(*) FROM quota_holds q WHERE q.source = 'model_request' AND q.ref = r.id) <> 1`},
+			ELSE format('请求有 %s 个 hold', hc.n) END
+		FROM model_requests r LEFT JOIN quota_holds h ON h.hold_id = r.hold_id LEFT JOIN hc ON hc.ref = r.id
+		WHERE h.hold_id IS NULL OR h.source <> 'model_request' OR h.ref <> r.id OR h.state = 'held' OR hc.n IS NOT NULL`},
 }
 
 // quotaLevelsCTE 把每个 hold 展开到它的各个层级（lv：k、i、period、state、amount_micro、charged_micro）。

@@ -42,6 +42,10 @@ const (
 	DefaultMaxDuration = 10 * time.Minute
 	DefaultMaxTokens   = 4096
 	DefaultMaxBody     = 8 << 20
+	DefaultBodyTimeout = 30 * time.Second
+	// writeGrace is how long past the maximum duration a write may take (a reading client still gets the final error
+	// event; a client that stopped reading is cut).
+	writeGrace = 2 * time.Second
 	// holdGrace is added to the maximum duration for the hold's deadline: settlement happens after the stream ends.
 	holdGrace = 5 * time.Minute
 	// finishTimeout bounds settlement and recording after the request (the client may be gone).
@@ -68,8 +72,10 @@ type Config struct {
 	MaxDuration time.Duration
 	// DefaultMaxTokens is sent when the client gives no max_tokens, so the worst-case cost is bounded (default 4096).
 	DefaultMaxTokens int64
-	// MaxBody bounds the request body (default 8 MiB).
+	// MaxBody bounds the request body (default 8 MiB, --model-api-max-body).
 	MaxBody int64
+	// BodyTimeout bounds reading the request body (default 30 s).
+	BodyTimeout time.Duration
 	Logger  *slog.Logger
 	Now     func() time.Time
 	NewID   func() string
@@ -90,6 +96,9 @@ func New(cfg Config) *Handler {
 	}
 	if cfg.MaxBody <= 0 {
 		cfg.MaxBody = DefaultMaxBody
+	}
+	if cfg.BodyTimeout <= 0 {
+		cfg.BodyTimeout = DefaultBodyTimeout
 	}
 	if cfg.Streams == nil {
 		cfg.Streams = ratelimit.NewConcurrency()

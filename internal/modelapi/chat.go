@@ -1,6 +1,7 @@
 package modelapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -60,8 +61,9 @@ type exchange struct {
 	usageKnown bool
 	complete   *bool // streams only
 
-	status  int
-	errCode string
+	status   int
+	errCode  string
+	finished bool // finish ran
 }
 
 // serveChat is POST /v1/chat/completions and POST /v1/messages (§7.7).
@@ -73,10 +75,20 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request, p llmproto.P
 		reject(w, p, "auth", llmproto.ErrorInfo{Class: llmproto.ClassInvalidAPIKey, Message: "authentication required"})
 		return
 	}
-	// 2. Decode in the client's format.
+	scope := quota.ScopeOf(pr)
+	// 3a. The requests-per-minute limit does not need the body: take it before reading one.
+	lim, ok := h.limitRequests(ctx, w, p, pr, scope)
+	if !ok {
+		return
+	}
+	defer lim.releaseSlot() // also on panics (idempotent; finish releases it earlier)
+	// 2. Decode in the client's format: the body is bounded in size and in time.
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(start.Add(h.cfg.BodyTimeout)) // not supported by every writer (tests): then unbounded
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, h.cfg.MaxBody))
+	_ = rc.SetReadDeadline(time.Time{})
 	if err != nil {
-		reject(w, p, "invalid", llmproto.ErrorInfo{Class: llmproto.ClassInvalidRequest, Message: "request body unreadable or larger than the limit"})
+		reject(w, p, "invalid", llmproto.ErrorInfo{Class: llmproto.ClassInvalidRequest, Message: "request body unreadable, too slow or larger than the limit"})
 		return
 	}
 	req, err := llmproto.DecodeRequest(p, body)
@@ -97,11 +109,9 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request, p llmproto.P
 		reject(w, p, "invalid", llmproto.ErrorFrom(err))
 		return
 	}
-	inputEst := (int64(len(body)) + 2) / 3 // conservative: about 3 bytes per token
-	scope := quota.ScopeOf(pr)
-	// 3. Rate limits: requests, estimated tokens and a stream slot.
-	lim, ok := h.limit(ctx, w, p, pr, scope, inputEst+maxTok, req.Stream)
-	if !ok {
+	inputEst := inputEstimate(body)
+	// 3b. Estimated tokens per minute and a stream slot.
+	if !lim.limitTokens(ctx, w, p, inputEst+maxTok, req.Stream) {
 		return
 	}
 	undo := func() {
@@ -148,11 +158,32 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request, p llmproto.P
 	w.Header().Set("x-request-id", id)
 	x := &exchange{h: h, w: w, r: r, proto: p, req: req, body: body, start: start, id: id, rt: rt, plan: plan,
 		inputEst: inputEst, maxTok: maxTok}
+	// 8 runs whatever happens from here, panics included (then the panic goes on to net/http).
+	defer func() {
+		if v := recover(); v != nil {
+			if x.status == 0 {
+				x.status, x.errCode = http.StatusInternalServerError, string(llmproto.ClassInternal)
+			}
+			h.finish(x, pr, lim, hold, est)
+			panic(v)
+		}
+	}()
+	// --model-api-max-duration bounds the whole request: rctx cuts the upstream, and a write deadline cuts a write to a
+	// client that stopped reading (a blocked Write does not see rctx). When rctx ends early (client gone) the deadline is
+	// brought forward; the grace lets a reading client still receive the final error event.
+	_ = rc.SetWriteDeadline(start.Add(h.cfg.MaxDuration + writeGrace))
 	rctx, cancel := context.WithTimeout(ctx, h.cfg.MaxDuration)
+	stop := context.AfterFunc(rctx, func() { _ = rc.SetWriteDeadline(time.Now().Add(writeGrace)) })
 	x.run(rctx)
+	stop()
 	cancel()
 	h.finish(x, pr, lim, hold, est)
 }
+
+// inputEstimate is the conservative input token estimate of a request body: byte-level tokenizers can emit about one
+// token per two bytes (short words, digits, rarer CJK), and providers add hidden prompt tokens (tool-use system
+// prompts, role markers): bytes ÷ 2 + 1024.
+func inputEstimate(body []byte) int64 { return int64(len(body))/2 + 1024 }
 
 // checkSupported refuses what the gateway cannot serve whatever the provider: more than one choice, and log
 // probabilities on non-stream requests (non-stream replies are assembled from the provider's stream).
@@ -173,19 +204,38 @@ func checkSupported(req llmproto.Request) error {
 	return nil
 }
 
-// withMaxTokens adds max_tokens = def to a request that has none, so the worst-case cost is bounded, and returns
-// the body and the effective max_tokens.
+// withMaxTokens adds max_tokens = def to a request that has none, so the worst-case cost is bounded; when an OpenAI
+// request gives both max_tokens and max_completion_tokens it keeps only the effective (smaller) one, so a provider
+// that honours the other cannot exceed the hold. It returns the body and the effective max_tokens.
 func withMaxTokens(body []byte, req llmproto.Request, def int64) ([]byte, int64, error) {
-	if req.MaxTokens > 0 {
+	if req.MaxTokens > 0 && !bytes.Contains(body, []byte(`"max_completion_tokens"`)) {
 		return body, req.MaxTokens, nil
 	}
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return nil, 0, &llmproto.InvalidRequestError{Message: "body is not a JSON object"}
 	}
-	obj["max_tokens"] = json.RawMessage(fmt.Sprint(def))
+	_, hasMT := obj["max_tokens"]
+	_, hasMCT := obj["max_completion_tokens"]
+	switch {
+	case req.MaxTokens > 0 && hasMT && hasMCT:
+		var mt int64
+		if json.Unmarshal(obj["max_tokens"], &mt) == nil && mt == req.MaxTokens {
+			delete(obj, "max_completion_tokens")
+		} else {
+			delete(obj, "max_tokens")
+		}
+	case req.MaxTokens > 0:
+		return body, req.MaxTokens, nil
+	default:
+		obj["max_tokens"] = json.RawMessage(fmt.Sprint(def))
+	}
+	eff := req.MaxTokens
+	if eff <= 0 {
+		eff = def
+	}
 	out, err := json.Marshal(obj)
-	return out, def, err
+	return out, eff, err
 }
 
 // mulCeil is ⌈a·b / 10⁶⌉ (tokens × micro-USD per million tokens), saturating far below overflow.
@@ -233,12 +283,15 @@ func (x *exchange) run(ctx context.Context) {
 		}
 		t0 := x.h.cfg.Now()
 		s, uerr := x.rt.DoStream(ctx, pick.Route, x.body, x.proto)
-		x.plan.Done(pick, uerr, false)
+		// A client that left is not the provider's fault, and neither is a model the provider does not have (a
+		// logical model only another route serves): neither counts against the shared breaker.
+		notFound := uerr != nil && uerr.Status == http.StatusNotFound
+		x.plan.Done(pick, uerr, x.r.Context().Err() != nil || notFound)
 		try := Try{No: len(x.tries) + 1, Provider: pick.Name, Skipped: pick.Skipped}
 		if uerr != nil {
 			try.Outcome, try.Status, try.Latency = string(uerr.Outcome), uerr.Status, x.h.cfg.Now().Sub(t0)
 			x.failedTry(try, pick, uerr)
-			if call.Failover(ctx, uerr) {
+			if call.Failover(ctx, uerr) || (notFound && ctx.Err() == nil) {
 				continue
 			}
 			break
@@ -285,7 +338,11 @@ func (x *exchange) fail(ctx context.Context) {
 		x.status, x.errCode = statusClientClosed, codeClientDisconnected
 		return
 	case ctx.Err() != nil:
-		x.writeError(llmproto.ErrorInfo{Class: llmproto.ClassUpstream, Message: "the request exceeded the maximum duration before the first token"})
+		msg := "the request exceeded the maximum duration before the first token"
+		if x.ttfb != nil {
+			msg = "the request exceeded the maximum duration while the reply was being received"
+		}
+		x.writeError(llmproto.ErrorInfo{Class: llmproto.ClassUpstream, Message: msg})
 		x.errCode = codeMaxDuration
 		return
 	case x.plan.Degraded() || x.lastErr == nil:
@@ -306,6 +363,8 @@ func upstreamErrorInfo(e *upstream.Error) llmproto.ErrorInfo {
 		return llmproto.ErrorInfo{Class: llmproto.ClassInvalidRequest, Message: fmt.Sprintf("the provider rejected the request (HTTP %d)", e.Status)}
 	case e.Status == http.StatusTooManyRequests:
 		return llmproto.ErrorInfo{Class: llmproto.ClassRateLimit, Message: "the providers are rate limiting; try again later"}
+	case e.Status == http.StatusNotFound:
+		return llmproto.ErrorInfo{Class: llmproto.ClassModelNotFound, Param: "model", Message: "no provider has this model"}
 	}
 	return llmproto.ErrorInfo{Class: llmproto.ClassUpstream, Message: fmt.Sprintf("the provider failed (HTTP %d)", e.Status)}
 }
@@ -354,8 +413,12 @@ func (x *exchange) settleUsage(t *tracker, s upstream.Stream) {
 func (x *exchange) collect(ctx context.Context, s upstream.Stream, pick call.RoutePick) bool {
 	var col llmproto.Collector
 	var t tracker
+	raw, _ := s.(upstream.RawStream)
 	for {
 		ev, err := s.Next()
+		if raw != nil {
+			_, _ = raw.TakeRaw() // a non-stream reply is re-encoded: drop the raw events as they come
+		}
 		if err != nil {
 			break
 		}
@@ -471,10 +534,12 @@ func (x *exchange) stream(ctx context.Context, s upstream.Stream, pick call.Rout
 		return
 	}
 	switch {
-	case x.r.Context().Err() != nil || gone:
+	case x.r.Context().Err() != nil:
 		x.errCode = codeClientDisconnected
-	case ctx.Err() != nil:
+	case ctx.Err() != nil: // max duration (also a stalled reader whose write hit the deadline)
 		x.errCode = codeMaxDuration
+	case gone:
+		x.errCode = codeClientDisconnected
 	default:
 		x.errCode = codeStreamError
 	}

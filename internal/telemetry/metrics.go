@@ -47,6 +47,8 @@ type metrics struct {
 	modelStreams *prometheus.CounterVec
 	modelRejects *prometheus.CounterVec
 	modelDrops   *prometheus.CounterVec
+	modelOver    *prometheus.CounterVec
+	modelRecFail prometheus.Counter
 
 	mu        sync.Mutex
 	toolCount map[string]int
@@ -101,12 +103,16 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			[]string{"protocol", "reason"}),
 		modelDrops: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "model_dropped_fields_total",
 			Help: "Request fields left out when converting between OpenAI and Anthropic formats."}, []string{"field"}),
+		modelOver: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "model_hold_overshoot_total",
+			Help: "Model API requests whose known actual cost exceeded their quota hold (settled at the actual cost)."}, []string{"protocol"}),
+		modelRecFail: prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Name: "model_request_record_failures_total",
+			Help: "model_requests rows that could not be written after retries (the hold is settled; reconcile reports the gap)."}),
 		toolCount: map[string]int{},
 		gauges:    &gaugeCollector{},
 	}
 	reg.MustRegister(m.httpReqs, m.httpDur, m.tasks, m.runs, m.attempts, m.attemptReady, m.taskStart, m.stop, m.calls,
 		m.tries, m.tryDur, m.cost, m.breakers, m.tools, m.modelReqs, m.modelDur, m.modelTTFT, m.modelStreams, m.modelRejects,
-		m.modelDrops, m.gauges)
+		m.modelDrops, m.modelOver, m.modelRecFail, m.gauges)
 	return m
 }
 
@@ -206,6 +212,10 @@ func (m *metrics) ModelRejected(protocol, reason string) {
 }
 
 func (m *metrics) ModelDropped(field string) { m.modelDrops.WithLabelValues(field).Inc() }
+
+func (m *metrics) ModelHoldOvershoot(protocol string) { m.modelOver.WithLabelValues(protocol).Inc() }
+
+func (m *metrics) ModelRecordFailure() { m.modelRecFail.Inc() }
 
 // gaugeCollector is an unchecked collector sampling the registered callbacks at scrape time.
 type gaugeCollector struct {

@@ -197,3 +197,34 @@ func TestModelAPIKeyRevokedMidStream(t *testing.T) {
 		t.Fatalf("after revoke: %d %s", st, body)
 	}
 }
+
+// Review n4, n6: a wrong method is 405 in the caller's format; the CORS preflight allows the Anthropic headers.
+func TestModelAPIMethodAndPreflight(t *testing.T) {
+	ts := newModelServer(t, &modelEcho{})
+	for _, c := range []struct{ method, path, allow, code string }{
+		{"GET", "/v1/chat/completions", "POST", "invalid_request_error"},
+		{"PUT", "/v1/messages", "POST", "anthropic:invalid_request_error"},
+		{"POST", "/v1/models", "GET", "invalid_request_error"},
+	} {
+		req, _ := http.NewRequest(c.method, ts.srv.URL+c.path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != 405 || resp.Header.Get("Allow") != c.allow || modelErr(t, b) != c.code {
+			t.Fatalf("%s %s: %d %s %s", c.method, c.path, resp.StatusCode, resp.Header.Get("Allow"), b)
+		}
+	}
+	req, _ := http.NewRequest("OPTIONS", ts.srv.URL+"/v1/messages", nil)
+	req.Header.Set("Origin", ts.srv.URL)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if h := resp.Header.Get("Access-Control-Allow-Headers"); resp.StatusCode != 204 || !strings.Contains(h, "x-api-key") || !strings.Contains(h, "anthropic-version") {
+		t.Fatalf("preflight %d %q", resp.StatusCode, h)
+	}
+}

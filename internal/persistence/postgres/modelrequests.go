@@ -1,8 +1,8 @@
 package postgres
 
 // 本文件是模型 API 请求记录（模型网关设计 2026-10-11 §4、§7.7 第 8 步；G3）：model_requests 与 model_request_tries 在
-// 请求的 hold 结算之后一个事务写入。两表按 created_at 的 UTC 月分区：写入某月之前先确保该月与下月的分区存在
-// （agentbox_model_request_partitions，单独的短事务；每个进程每月只做一次）。
+// 请求的 hold 结算之后一个事务写入。两表按 created_at 的 UTC 月分区：写入某月之前先确保该月（与尽力确保下月）的分区
+// 存在（agentbox_model_request_partitions，每个月份单独的短事务；每个进程每月只做一次）。
 
 import (
 	"context"
@@ -23,13 +23,14 @@ var _ modelapi.Store = (*ModelRequestStore)(nil)
 type ModelRequestStore struct {
 	s *Store
 
-	mu    sync.Mutex
-	parts map[string]bool // 已确认存在分区的月份（"YYYY-MM"）
+	mu      sync.Mutex
+	parts   map[string]bool             // 已确认存在分区的月份（"YYYY-MM"）
+	flights map[string]*partitionFlight // 正在创建分区的月份
 }
 
 // ModelRequests 以 modelapi.Store 接口返回模型请求记录用例（装配以接口持有，不导入本包）。
 func (s *Store) ModelRequests() modelapi.Store {
-	return &ModelRequestStore{s: s, parts: map[string]bool{}}
+	return &ModelRequestStore{s: s, parts: map[string]bool{}, flights: map[string]*partitionFlight{}}
 }
 
 // RecordModelRequest 实现 modelapi.Store：同一 ID 重复写入为空操作（提交结果未知时重跑）。OrgID 为 0（运维）时取保留
@@ -81,26 +82,70 @@ func insertModelRequestTx(ctx context.Context, tx pgx.Tx, r modelapi.Record) err
 	return err
 }
 
-// ensurePartition 确保 t 所在月份与下一个月的分区存在（每个进程每月一次）。并发创建同一分区时，落败的一方得到
-// "已存在" 类错误，视为成功。
+// ensurePartition 确保 t 所在月份的分区存在（必须），并尽力建好下一个月的（失败不影响本次写入）。
 func (m *ModelRequestStore) ensurePartition(ctx context.Context, t time.Time) error {
-	month := t.UTC().Format("2006-01")
+	u := t.UTC()
+	month := time.Date(u.Year(), u.Month(), 1, 0, 0, 0, 0, time.UTC)
+	if err := m.ensureMonth(ctx, month); err != nil {
+		return err
+	}
+	_ = m.ensureMonth(ctx, month.AddDate(0, 1, 0))
+	return nil
+}
+
+// partitionFlight 是一个月份正在进行的分区创建（进程内同一月份只建一次，其余等待其结果）。
+type partitionFlight struct {
+	done chan struct{}
+	err  error
+}
+
+// ensureMonth 确保 month（UTC 月的第一天）的分区存在：每个月份在进程内只建一次（single-flight），确认存在之后才缓存。
+func (m *ModelRequestStore) ensureMonth(ctx context.Context, month time.Time) error {
+	key := month.Format("2006-01")
 	m.mu.Lock()
-	done := m.parts[month]
-	m.mu.Unlock()
-	if done {
+	if m.parts[key] {
+		m.mu.Unlock()
 		return nil
 	}
-	err := m.s.run(ctx, "ModelRequestPartitions", month, func(ctx context.Context, tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `SELECT agentbox_model_request_partitions($1), agentbox_model_request_partitions($1 + interval '1 month')`, t)
-		return err
-	})
-	var pgErr *pgconn.PgError
-	if err != nil && !(errors.As(err, &pgErr) && (pgErr.Code == "42P07" || pgErr.Code == "23505")) {
-		return fmt.Errorf("postgres: 模型请求分区 %s: %w", month, err)
+	if f, ok := m.flights[key]; ok {
+		m.mu.Unlock()
+		select {
+		case <-f.done:
+			return f.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	m.mu.Lock()
-	m.parts[month] = true
+	f := &partitionFlight{done: make(chan struct{})}
+	m.flights[key] = f
 	m.mu.Unlock()
+	f.err = m.createMonth(ctx, month)
+	m.mu.Lock()
+	if f.err == nil {
+		m.parts[key] = true
+	}
+	delete(m.flights, key)
+	m.mu.Unlock()
+	close(f.done)
+	return f.err
+}
+
+// createMonth 在一个短事务中建 month 的两个分区（CREATE TABLE IF NOT EXISTS）。另一个 server 同时建同一分区时，落败的
+// 一方得到 42P07 或 23505：再执行一次（对方已提交，IF NOT EXISTS 成功），无害。
+func (m *ModelRequestStore) createMonth(ctx context.Context, month time.Time) error {
+	var err error
+	for range 2 {
+		err = m.s.run(ctx, "ModelRequestPartitions", month.Format("2006-01"), func(ctx context.Context, tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `SELECT agentbox_model_request_partitions($1)`, month)
+			return err
+		})
+		var pgErr *pgconn.PgError
+		if err == nil || !errors.As(err, &pgErr) || (pgErr.Code != "42P07" && pgErr.Code != "23505") {
+			break
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("postgres: 模型请求分区 %s: %w", month.Format("2006-01"), err)
+	}
 	return nil
 }

@@ -26,6 +26,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/account"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/apikey"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/llmproto"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/quota"
@@ -472,12 +473,21 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Vary", "Origin")
 		if r.Method == http.MethodOptions { // 预检不携带凭据
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID")
+			allow := "Authorization, Content-Type, Last-Event-ID"
+			if h.cfg.ModelAPI != nil { // 模型 API 的 Anthropic 风格调用（G3）
+				allow += ", x-api-key, anthropic-version"
+			}
+			w.Header().Set("Access-Control-Allow-Headers", allow)
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 	}
 	if h.isModelPath(r) { // 模型 API 以调用方的格式认证（serveModelAPI）
+		if allow := modelMethod(r.URL.Path); r.Method != allow {
+			w.Header().Set("Allow", allow)
+			writeModelStatus(w, modelProtocol(r), http.StatusMethodNotAllowed, llmproto.ClassInvalidRequest, "method not allowed; use "+allow)
+			return
+		}
 		h.mux.ServeHTTP(w, r)
 		return
 	}
@@ -589,6 +599,9 @@ func (s *statusWriter) Flush() {
 		f.Flush()
 	}
 }
+
+// Unwrap 让 http.ResponseController 找到底层的 ResponseWriter（模型 API 的读写期限，G3 复审 M1、m5）。
+func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 func (s *statusWriter) status() int {
 	if s.code == 0 {

@@ -253,6 +253,10 @@ func (r *Recorder) ModelRejected(protocol, reason string) {
 	r.add("ModelRejected protocol=%s reason=%s", protocol, reason)
 }
 func (r *Recorder) ModelDropped(field string) { r.add("ModelDropped field=%s", field) }
+func (r *Recorder) ModelHoldOvershoot(protocol string) {
+	r.add("ModelHoldOvershoot protocol=%s", protocol)
+}
+func (r *Recorder) ModelRecordFailure() { r.add("ModelRecordFailure") }
 func (r *Recorder) RegisterGauges(fn func() []obs.Gauge) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -15,10 +15,13 @@ import (
 
 // taken is what a request took from the rate limits (§7.7 step 3); finish gives back what was not used.
 type taken struct {
-	h       *Handler
-	tpm     []ratelimit.Bucket
-	tokens  int64
-	release func() // stream slot
+	h         *Handler
+	scope     quota.Scope
+	limits    map[quota.Level]quota.Limits
+	refundRPM func()
+	tpm       []ratelimit.Bucket
+	tokens    int64
+	release   func() // stream slot (idempotent)
 }
 
 // refundTokens returns n of the estimated tokens to the tokens-per-minute buckets.
@@ -63,14 +66,14 @@ func streamSlots(s quota.Scope, ls map[quota.Level]quota.Limits) []ratelimit.Slo
 	return out
 }
 
-// limit takes one request and tokens estimated tokens at every level with a limit, and a stream slot when stream
-// (§6.1, §7.7 step 3). The operator is not limited (as on the runtime API). Limits are read from PostgreSQL: when it
-// is unavailable the request is refused with 503 (fail closed). A limiter fault lets the request through (rate
-// limits protect capacity; money is protected by the hold). On refusal it writes 429 rate_limit_exceeded with
-// Retry-After and the x-ratelimit headers and returns false.
-func (h *Handler) limit(ctx context.Context, w http.ResponseWriter, p llmproto.Protocol, pr tenant.Principal, s quota.Scope,
-	tokens int64, stream bool) (*taken, bool) {
-	t := &taken{h: h, tokens: tokens}
+// limitRequests takes one request from the requests-per-minute bucket of every level with an rpm limit (§6.1, §7.7
+// step 3). It runs before the body is read: rpm does not need it, so a caller over its limit costs no body read. The
+// operator is not limited (as on the runtime API). Limits are read from PostgreSQL: when it is unavailable the request is
+// refused with 503 (fail closed). A limiter fault lets the request through (rate limits protect capacity; money is
+// protected by the hold). On refusal it writes 429 rate_limit_exceeded with Retry-After and the x-ratelimit headers.
+func (h *Handler) limitRequests(ctx context.Context, w http.ResponseWriter, p llmproto.Protocol, pr tenant.Principal,
+	s quota.Scope) (*taken, bool) {
+	t := &taken{h: h, scope: s, refundRPM: func() {}}
 	if pr.Operator || s.OrgID == 0 {
 		return t, true
 	}
@@ -80,53 +83,60 @@ func (h *Handler) limit(ctx context.Context, w http.ResponseWriter, p llmproto.P
 		reject(w, p, "unavailable", llmproto.ErrorInfo{Class: llmproto.ClassUnavailable, Message: "limits are unavailable; try again later"})
 		return nil, false
 	}
-	rpm, tpm := buckets(s, ls)
-	if h.cfg.Limiter == nil {
-		rpm, tpm = nil, nil
+	t.limits = ls
+	rpm, _ := buckets(s, ls)
+	if h.cfg.Limiter == nil || len(rpm) == 0 {
+		return t, true
 	}
-	refundRPM := func() {}
-	if len(rpm) > 0 {
-		d, ok := h.take(ctx, rpm, 1)
-		if ok {
-			rateHeaders(w, "requests", d)
-		}
-		if ok && !d.Allowed {
-			h.tooMany(w, p, d, "too many requests: the requests-per-minute limit is reached")
-			return nil, false
-		}
-		if ok {
-			refundRPM = func() { h.cfg.Limiter.Refund(context.WithoutCancel(ctx), rpm, 1) }
-		}
+	d, ok := h.take(ctx, rpm, 1)
+	if !ok {
+		return t, true
 	}
-	if len(tpm) > 0 {
+	rateHeaders(w, "requests", d)
+	if !d.Allowed {
+		h.tooMany(w, p, d, "too many requests: the requests-per-minute limit is reached")
+		return nil, false
+	}
+	t.refundRPM = func() { h.cfg.Limiter.Refund(context.WithoutCancel(ctx), rpm, 1) }
+	return t, true
+}
+
+// limitTokens takes tokens estimated tokens from the tokens-per-minute bucket of every level with a tpm limit, and a
+// stream slot when stream (after decoding: the estimate needs the body). On refusal it gives the request back to the
+// rpm buckets and writes 429.
+func (t *taken) limitTokens(ctx context.Context, w http.ResponseWriter, p llmproto.Protocol, tokens int64, stream bool) bool {
+	h := t.h
+	t.tokens = tokens
+	_, tpm := buckets(t.scope, t.limits)
+	if h.cfg.Limiter != nil && len(tpm) > 0 {
 		d, ok := h.take(ctx, tpm, tokens)
 		if ok {
 			rateHeaders(w, "tokens", d)
 		}
 		if ok && !d.Allowed {
-			refundRPM()
+			t.refundRPM()
 			h.tooMany(w, p, d, "too many tokens: the tokens-per-minute limit is reached (estimate "+strconv.FormatInt(tokens, 10)+")")
-			return nil, false
+			return false
 		}
 		if ok {
 			t.tpm = tpm
 		}
 	}
 	if stream {
-		if slots := streamSlots(s, ls); len(slots) > 0 {
+		if slots := streamSlots(t.scope, t.limits); len(slots) > 0 {
 			release, full, ok := h.cfg.Streams.Acquire(slots)
 			if !ok {
-				refundRPM()
+				t.refundRPM()
 				t.refundTokens(context.WithoutCancel(ctx), tokens)
 				w.Header().Set("Retry-After", "1")
 				reject(w, p, "rate_limit", llmproto.ErrorInfo{Class: llmproto.ClassRateLimit,
 					Message: "too many concurrent streams (max_streams " + strconv.FormatInt(full.Limit, 10) + ")"})
-				return nil, false
+				return false
 			}
 			t.release = release
 		}
 	}
-	return t, true
+	return true
 }
 
 // take takes n from buckets; ok is false when the limiter failed (the request is let through).

@@ -104,6 +104,10 @@ type Recorder interface {
 	// ModelDropped is a request field left out when converting between formats (field: its last path segment,
 	// e.g. cache_control).
 	ModelDropped(field string)
+	// ModelHoldOvershoot is a model API request whose known actual cost exceeded its quota hold (settled at the actual).
+	ModelHoldOvershoot(protocol string)
+	// ModelRecordFailure is a model_requests row that could not be written after retries.
+	ModelRecordFailure()
 }
 
 // Gauge is one sampled gauge value. Labels must be bounded enumerations.
@@ -219,3 +223,5 @@ func (nop) ModelTTFT(string, string, time.Duration)                        {}
 func (nop) ModelStream(string, bool)                                       {}
 func (nop) ModelRejected(string, string)                                   {}
 func (nop) ModelDropped(string)                                            {}
+func (nop) ModelHoldOvershoot(string)                                      {}
+func (nop) ModelRecordFailure()                                            {}

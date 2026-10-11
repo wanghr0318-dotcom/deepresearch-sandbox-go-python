@@ -135,6 +135,8 @@ type Config struct {
 	// GET /v1/models，需要 Accounts。ModelAPIMaxDuration 是一个模型 API 请求（含流）的总时长上限（0 取 10 min）。
 	ModelAPI            bool
 	ModelAPIMaxDuration time.Duration
+	// ModelAPIMaxBody 是模型 API 请求体的上限（字节；0 取 8 MiB）。
+	ModelAPIMaxBody int64
 	// UserOrchestratorModel 与 UserWorkerModel 是用户研究 spec 的 orchestrator_model 与 worker_model（用户不能
 	// 指定模型；server 默认 kimi-k3 与 kimi-k2.6）。
 	UserOrchestratorModel, UserWorkerModel string
@@ -482,6 +484,9 @@ func (c Config) validate() error {
 	}
 	if c.ModelAPIMaxDuration < 0 {
 		return errors.New("app: --model-api-max-duration 须 > 0")
+	}
+	if c.ModelAPIMaxBody < 0 {
+		return errors.New("app: --model-api-max-body 须 > 0")
 	}
 	if c.RedisAddr != "" {
 		if host, port, err := net.SplitHostPort(c.RedisAddr); err != nil || host == "" || port == "" {
@@ -1482,8 +1487,13 @@ func (s *server) startAPI() error {
 		}
 	}
 	var modelAPI http.Handler // 未启用时保持 nil 接口：模型 API 的路径与今天一样是 404
-	if h := s.modelAPIHandler(quotas, limiter); h != nil {
-		modelAPI = h
+	mh, err := s.modelAPIHandler(quotas, limiter)
+	if err != nil {
+		_ = ln.Close()
+		return err
+	}
+	if mh != nil {
+		modelAPI = mh
 	}
 	var sessions api.Sessions // 未启用会话时保持 nil 接口：会话端点 503 sessions_unavailable
 	if s.cfg.sessionsEnabled() {

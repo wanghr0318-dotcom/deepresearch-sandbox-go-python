@@ -49,9 +49,22 @@ func modelProtocol(r *http.Request) llmproto.Protocol {
 	return llmproto.ProtocolOpenAI
 }
 
+// modelMethod 是模型 API 路径唯一的方法。
+func modelMethod(path string) string {
+	if path == "/v1/models" {
+		return http.MethodGet
+	}
+	return http.MethodPost
+}
+
 // writeModelError 以调用方的格式写出错误。
 func writeModelError(w http.ResponseWriter, p llmproto.Protocol, class llmproto.ErrorClass, msg string) {
-	status, body := llmproto.EncodeError(p, llmproto.ErrorInfo{Class: class, Message: msg})
+	writeModelStatus(w, p, class.Status(), class, msg)
+}
+
+// writeModelStatus 同 writeModelError，状态码另给（405 没有对应的错误类别）。
+func writeModelStatus(w http.ResponseWriter, p llmproto.Protocol, status int, class llmproto.ErrorClass, msg string) {
+	_, body := llmproto.EncodeError(p, llmproto.ErrorInfo{Class: class, Message: msg})
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)

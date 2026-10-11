@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -137,3 +138,33 @@ func TestModelRequestStore(t *testing.T) {
 }
 
 func itoa(v int64) string { return strconv.FormatInt(v, 10) }
+
+// Partitions under concurrency (G3 review m3): several stores (as on several servers) and many goroutines each ensure
+// the same new months at once; every month ends up created, nobody fails, and a month is cached only once it exists.
+func TestModelRequestPartitionsConcurrent(t *testing.T) {
+	w := newQuotaWorld(t)
+	at := time.Now().AddDate(1, 2, 0)
+	stores := []*ModelRequestStore{w.s.ModelRequests().(*ModelRequestStore), w.s.ModelRequests().(*ModelRequestStore)}
+	var wg sync.WaitGroup
+	errs := make(chan error, 32)
+	for i := range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- stores[i%2].ensurePartition(context.Background(), at.AddDate(0, i%3, 0))
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for k := range 4 {
+		name := "model_requests_" + at.AddDate(0, k, 0).UTC().Format("200601")
+		if n := count(t, w.s, `SELECT count(*) FROM pg_class WHERE relname = $1`, name); n != 1 {
+			t.Fatalf("partition %s missing", name)
+		}
+	}
+}
