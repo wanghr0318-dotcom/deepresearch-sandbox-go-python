@@ -26,7 +26,7 @@ type Stream interface {
 	Next() (llmproto.Event, error)
 	// Usage 是流中到目前为止报告的用量（各项互不包含，llmproto 语义）。
 	Usage() (llmproto.Usage, bool)
-	// Close 结束流（取消上游请求、关闭响应体）；可重复调用。
+	// Close 结束流（取消上游请求、关闭响应体、清空预读的事件）；可重复调用。之后 Next 立即返回 ErrStreamClosed。
 	Close() error
 }
 
@@ -93,9 +93,22 @@ func (a *chatAdapter) DoStream(ctx context.Context, route int, body []byte, prot
 	return st, nil
 }
 
+// 首 token 之前缓存的前导事件的上限（先到者为准）。超出时上游在没有任何内容的情况下发出了异常多的事件：按
+// retryable / upstream_bad_response 处理（还没有向客户端写出任何字节，可以换供应商）。
+const (
+	maxPrefetchEvents = 1024
+	maxPrefetchBytes  = 1 << 20
+)
+
+// errPrefetchTooLarge 是前导事件超过上限的原因。
+var errPrefetchTooLarge = errors.New("上游流在首 token 之前发出的事件超过上限")
+
 // prefetch 读到第一个内容事件（首 token）为止：message_start、只有角色或内容为空的块开始等前导事件先缓存，由
-// Next 依次交付。期间的读失败与 Do 同样归类；内容之前到达的错误事件按 StreamEventError 归类（可换供应商）。
+// Next 依次交付；空的文本片段（不含任何内容的 block_delta）直接丢弃，不缓存、不计数。期间的读失败与 Do 同样
+// 归类；内容之前到达的错误事件按 StreamEventError 归类（可换供应商）；缓存超过上限（maxPrefetchEvents 个事件或
+// maxPrefetchBytes 字节）为 retryable / upstream_bad_response。
 func (s *eventStream) prefetch(ctx context.Context) *Error {
+	size := 0
 	for {
 		ev, err := s.rd.Next()
 		if err != nil {
@@ -104,11 +117,24 @@ func (s *eventStream) prefetch(ctx context.Context) *Error {
 		if ev.Type == llmproto.EventError {
 			return StreamEventError(ev.Err)
 		}
+		if ev.Type == llmproto.EventBlockDelta && !isContent(ev) {
+			continue // 空的片段：没有内容，交付它也没有意义
+		}
+		size += eventSize(ev)
+		if len(s.pending) >= maxPrefetchEvents || size > maxPrefetchBytes {
+			return newErr(OutcomeRetryable, http.StatusBadGateway, CodeUpstreamBadResponse, errPrefetchTooLarge)
+		}
 		s.pending = append(s.pending, ev)
 		if isContent(ev) {
 			return nil
 		}
 	}
+}
+
+// eventSize 估算一个缓存事件占用的字节数（字符串字段之和加固定开销）。
+func eventSize(ev llmproto.Event) int {
+	return 64 + len(ev.ID) + len(ev.Model) + len(ev.ToolID) + len(ev.ToolName) + len(ev.Text) + len(ev.Arguments) +
+		len(ev.Signature) + len(ev.StopSequence)
 }
 
 // isContent 报告事件是否为首 token：非空的文本、参数或签名片段，工具调用的开始（带名字），或者结束类事件
@@ -283,20 +309,34 @@ type eventStream struct {
 	body      io.ReadCloser
 	cancel    context.CancelFunc
 	rd        *llmproto.EventReader
-	pending   []llmproto.Event
 	dropped   []string
 	converted bool
 	closeOnce sync.Once
+
+	mu      sync.Mutex       // 保护 pending 与 closed（Close 可能与 Next 在不同 goroutine 中调用）
+	pending []llmproto.Event // 预读的事件，由 Next 重放
+	closed  bool
 }
+
+// ErrStreamClosed 是 Close 之后调用 Next 得到的错误。
+var ErrStreamClosed = errors.New("upstream: 流已关闭")
 
 // Next 先重放预读的事件，再读流。流结束为 io.EOF；其他读失败（连接切断、超过单个事件的上限、格式错误）都包装为
 // io.ErrUnexpectedEOF（errors.Is 可判断，原因保留在文本中）。
+// Close 之后 Next 立即返回 ErrStreamClosed（预读的事件已清空，不再交付）。
 func (s *eventStream) Next() (llmproto.Event, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return llmproto.Event{}, ErrStreamClosed
+	}
 	if len(s.pending) > 0 {
 		ev := s.pending[0]
 		s.pending = s.pending[1:]
+		s.mu.Unlock()
 		return ev, nil
 	}
+	s.mu.Unlock()
 	ev, err := s.rd.Next()
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		err = fmt.Errorf("%w: %w", io.ErrUnexpectedEOF, err)
@@ -307,6 +347,9 @@ func (s *eventStream) Next() (llmproto.Event, error) {
 func (s *eventStream) Usage() (llmproto.Usage, bool) { return s.rd.Usage() }
 
 func (s *eventStream) Close() error {
+	s.mu.Lock()
+	s.closed, s.pending = true, nil
+	s.mu.Unlock()
 	s.closeOnce.Do(func() {
 		s.cancel()
 		_ = s.body.Close()
