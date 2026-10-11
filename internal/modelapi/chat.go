@@ -164,6 +164,7 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request, p llmproto.P
 			if x.status == 0 {
 				x.status, x.errCode = http.StatusInternalServerError, string(llmproto.ClassInternal)
 			}
+			_ = rc.Flush()
 			h.finish(x, pr, lim, hold, est)
 			panic(v)
 		}
@@ -177,7 +178,13 @@ func (h *Handler) serveChat(w http.ResponseWriter, r *http.Request, p llmproto.P
 	x.run(rctx)
 	stop()
 	cancel()
+	// The client gets the whole reply (a small non-stream body, a stream's last chunk, a max-duration 502 or error
+	// event) before the accounting starts: finish may take a while (PostgreSQL), and bytes left in the buffer would
+	// otherwise be written after it, past the write deadline. After finish, the remaining bytes (the chunked
+	// terminator) get a fresh grace.
+	_ = rc.Flush()
 	h.finish(x, pr, lim, hold, est)
+	_ = rc.SetWriteDeadline(time.Now().Add(writeGrace))
 }
 
 // inputEstimate is the conservative input token estimate of a request body: byte-level tokenizers can emit about one
