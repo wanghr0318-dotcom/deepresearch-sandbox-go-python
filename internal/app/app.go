@@ -29,6 +29,7 @@ import (
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/admission"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/apikey"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/blob"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/datadir"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/cache"
@@ -47,6 +48,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/runner"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/session"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/task"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/tenant"
 )
 
 // ErrOwnershipLost 是失去数据库所有权后 Run 返回的错误（errors.Is 同时匹配 persistence.ErrOwnershipLost）。
@@ -484,6 +486,9 @@ type Store interface {
 	turnFactsStore
 	EnvUIDRangeID(ctx context.Context, envID string) (string, error)
 	Sessions() api.Sessions
+	// 多租户（模型网关设计 2026-10-11；G1）：org、成员与 key 的管理用例，以及 key 校验读取与 apikey_changed 通知。
+	Tenancy() tenant.Store
+	APIKeys() apikey.Source
 	subrunStore // sub-run 生命周期（M4 Plan 14），经 subrunHost 交给 runner
 	// Migrate 执行尚未应用的迁移（安装引导之后）。
 	Migrate(ctx context.Context) error
@@ -1312,8 +1317,23 @@ func (s *server) startAPI() error {
 	}
 	store := notifyingStore{Store: s.store, s: s}
 	var accounts api.Accounts // 未启用时保持 nil 接口（api 以 nil 判定）
+	var tenancy tenant.Store
+	var keys api.KeyVerifier
 	if s.cfg.Accounts {
 		accounts = notifyingAccounts{Accounts: s.store, n: store}
+		// 平台 API key（G1）：pepper 文件 <data>/apikey.pepper 首次启动时创建（0600）；共享数据库的各 server 须使用同一份。
+		pepper, err := apikey.LoadOrCreatePepper(s.d.DataDir)
+		if err != nil {
+			_ = ln.Close()
+			return fmt.Errorf("app: %w", err)
+		}
+		v := apikey.NewVerifier(s.store.APIKeys(), pepper, nil)
+		s.bg.Add(1)
+		go func() {
+			defer s.bg.Done()
+			v.Watch(s.apiCtx, s.store.APIKeys(), s.log) // 关闭 API 时 apiCtx 取消
+		}()
+		tenancy, keys = s.store.Tenancy(), v
 	}
 	var sessions api.Sessions // 未启用会话时保持 nil 接口：会话端点 503 sessions_unavailable
 	if s.cfg.sessionsEnabled() {
@@ -1327,6 +1347,7 @@ func (s *server) startAPI() error {
 		EffectiveLimits: s.cfg.effectiveLimits, CacheMetrics: s.cacheMetrics,
 		Accounts: accounts, ResearchSpec: s.cfg.researchSpec, SecureCookies: tlsCfg != nil,
 		Sessions: sessions, TurnSpec: s.cfg.turnSpec, ServerInfo: s.serverInfo,
+		Tenancy: tenancy, APIKeys: keys,
 	})
 	if err != nil {
 		_ = ln.Close()

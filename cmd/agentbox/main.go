@@ -78,6 +78,13 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "user" {
 		os.Exit(runUser(os.Args[2:], os.Stdout, os.Stderr))
 	}
+	// 多租户（模型网关设计 2026-10-11 §8）：org 与平台 API key 的运维管理，直接连接 PostgreSQL。
+	if len(os.Args) > 1 && os.Args[1] == "org" {
+		os.Exit(runOrg(os.Args[2:], os.Stdout, os.Stderr))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "key" {
+		os.Exit(runKey(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	// 演示用 MCP 服务器（stdio；docs/design/2026-10-10-shell-file-mcp-design.md）：由 Gateway 按 --mcp-config 启动。
 	if len(os.Args) > 1 && os.Args[1] == "mcp-demo-server" {
 		if err := mcpdemo.ServeStdio(os.Stdin, os.Stdout); err != nil {
@@ -86,6 +93,6 @@ func main() {
 		}
 		return
 	}
-	fmt.Fprintln(os.Stderr, "用法: agentbox doctor | server ... | verify-invariants [--quiescent] ... | cache rotate-key --data-dir DIR | user list|disable|enable ... | task ... | status | eval run|report|compare ... | doctor-traces ... | mcp-demo-server")
+	fmt.Fprintln(os.Stderr, "用法: agentbox doctor | server ... | verify-invariants [--quiescent] ... | cache rotate-key --data-dir DIR | user list|disable|enable ... | org create|list|add-member ... | key create|list|revoke ... | task ... | status | eval run|report|compare ... | doctor-traces ... | mcp-demo-server")
 	os.Exit(2)
 }
