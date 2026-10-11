@@ -22,9 +22,10 @@ type quotaStorer interface {
 	Quota() quota.Store
 }
 
-// orgSandboxer 是 Store 的可选能力：org 的 max_sandboxes 与存活环境数（含本 server 已准入、尚无环境的任务）。
+// orgSandboxer 是 Store 的可选能力：org 的 max_sandboxes 与存活沙箱数（含本 server 已准入、尚无环境的任务）。
 type orgSandboxer interface {
-	OrgSandboxes(ctx context.Context, taskID string, pending []string) (orgID int64, limit *int64, live int64, err error)
+	OrgSandboxLimit(ctx context.Context, taskID string) (orgID int64, limit *int64, err error)
+	OrgLiveSandboxes(ctx context.Context, orgID int64, taskID string, pending []string) (live int64, self bool, err error)
 }
 
 // 默认值。
@@ -90,77 +91,199 @@ func (s *server) sweepQuota(ctx context.Context, q quota.Store) {
 	}
 }
 
-// sandboxGate 在准入时执行 org 的并发沙箱上限（limits.max_sandboxes，org 层级）：存活环境数（PostgreSQL，含其他 server）
-// 加本 server 已准入、尚无环境的任务达到上限时，任务等待（每 sandboxGatePoll 复查）。同一 server 上的检查串行，
-// 跨 server 的并发准入可能各超出一个。查询失败时放行（这是容量限制；钱由预算保护）。
+// sandboxGate 在准入时执行 org 的并发沙箱上限（limits.max_sandboxes，只在 org 层级）：
+//   - 没有上限的 org 只读一次上限（主键查找），不计数、不排队（复审 F3）；
+//   - 有上限时按 org 严格 FIFO 排队（复审 F2）：只有队首计数——PostgreSQL 中该 org 的存活沙箱（含其他 server）加本 server
+//     已准入、尚无环境的任务——有空位即准入；本 server 归还授予时唤醒队首，轮询（sandboxGatePoll）只是兜底（其他
+//     server 的沙箱停止、上限被调高）；
+//   - 计数 + 登记按 org 串行（每个 org 一把锁，不是全局锁），跨 server 的并发准入可能各超出一个；
+//   - 查询失败时放行（这是容量限制；钱由预算保护）。
+//
+// 等待期间任务保持 queued（与等待 run slot 相同；没有单独的等待事件）。
 type sandboxGate struct {
 	store orgSandboxer
 	log   *slog.Logger
 	poll  time.Duration
 
-	admitMu sync.Mutex // 串行化"计数 + 登记"
 	mu      sync.Mutex
-	pending map[string]bool // 本 server 持有授予的任务
+	orgs    map[int64]*orgQueue
+	pending map[string]int64 // 本 server 持有授予的任务 → 其 org
+}
+
+// orgQueue 是一个 org 的等待者（FIFO）与"计数 + 登记"的锁。
+type orgQueue struct {
+	admit   sync.Mutex
+	waiters []*gateWaiter
+}
+
+type gateWaiter struct {
+	task string
+	wake chan struct{} // 容量 1：队首变化或沙箱归还时通知
 }
 
 func newSandboxGate(store orgSandboxer, log *slog.Logger) *sandboxGate {
-	return &sandboxGate{store: store, log: log, poll: sandboxGatePoll, pending: map[string]bool{}}
+	return &sandboxGate{store: store, log: log, poll: sandboxGatePoll, orgs: map[int64]*orgQueue{}, pending: map[string]int64{}}
 }
 
-func (g *sandboxGate) pendingTasks() []string {
+func notify(w *gateWaiter) {
+	select {
+	case w.wake <- struct{}{}:
+	default:
+	}
+}
+
+// Waiting 返回正在等待 org 并发沙箱上限的任务数（指标）。
+func (g *sandboxGate) Waiting() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	out := make([]string, 0, len(g.pending))
-	for id := range g.pending {
-		out = append(out, id)
+	n := 0
+	for _, q := range g.orgs {
+		n += len(q.waiters)
 	}
-	return out
+	return n
+}
+
+func (g *sandboxGate) register(task string, org int64) {
+	g.mu.Lock()
+	g.pending[task] = org
+	g.mu.Unlock()
 }
 
 // admit 等到 taskID 所属 org 有空位，并把它登记为本 server 已准入；ctx 取消时返回其错误。
 func (g *sandboxGate) admit(ctx context.Context, taskID string) error {
+	org, limit, err := g.limit(ctx, taskID)
+	if err != nil || limit == nil {
+		if err == nil || ctx.Err() == nil {
+			g.register(taskID, org)
+			return nil
+		}
+		return err
+	}
+	w := &gateWaiter{task: taskID, wake: make(chan struct{}, 1)}
+	g.mu.Lock()
+	q := g.orgs[org]
+	if q == nil {
+		q = &orgQueue{}
+		g.orgs[org] = q
+	}
+	q.waiters = append(q.waiters, w)
+	g.mu.Unlock()
+	defer g.leave(org, q, w)
+	waited := false
 	for {
-		ok, err := g.try(ctx, taskID)
-		if err != nil || ok {
-			return err
+		if g.head(q) == w {
+			ok, err := g.try(ctx, org, q, taskID)
+			if err != nil || ok {
+				return err
+			}
+		}
+		if !waited {
+			waited = true
+			g.log.Info("任务等待 org 的并发沙箱上限", "task_id", taskID, "org_id", org)
 		}
 		t := time.NewTimer(g.poll)
 		select {
 		case <-ctx.Done():
 			t.Stop()
 			return ctx.Err()
+		case <-w.wake:
+			t.Stop()
 		case <-t.C:
 		}
 	}
 }
 
-func (g *sandboxGate) try(ctx context.Context, taskID string) (bool, error) {
-	g.admitMu.Lock()
-	defer g.admitMu.Unlock()
+// limit 读取任务的 org 与其上限；查询失败时放行（limit nil）。
+func (g *sandboxGate) limit(ctx context.Context, taskID string) (int64, *int64, error) {
 	qctx, cancel := context.WithTimeout(ctx, sandboxGateQueryMax)
-	org, limit, live, err := g.store.OrgSandboxes(qctx, taskID, g.pendingTasks())
-	cancel()
+	defer cancel()
+	org, limit, err := g.store.OrgSandboxLimit(qctx, taskID)
 	if err != nil {
 		if ctx.Err() != nil {
-			return false, ctx.Err()
+			return 0, nil, ctx.Err()
 		}
-		g.log.Warn("org 并发沙箱检查失败，放行", "task_id", taskID, "error", err.Error())
-	} else if limit != nil && live >= *limit {
-		return false, nil
-	} else if limit != nil {
-		g.log.Debug("org 并发沙箱检查通过", "org_id", org, "live", live, "limit", *limit)
+		g.log.Warn("读取 org 并发沙箱上限失败，放行", "task_id", taskID, "error", err.Error())
+		return org, nil, nil
+	}
+	return org, limit, nil
+}
+
+func (g *sandboxGate) head(q *orgQueue) *gateWaiter {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(q.waiters) == 0 {
+		return nil
+	}
+	return q.waiters[0]
+}
+
+// leave 把 w 移出队列；队首变化时通知新的队首。
+func (g *sandboxGate) leave(org int64, q *orgQueue, w *gateWaiter) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wasHead := len(q.waiters) > 0 && q.waiters[0] == w
+	for i, x := range q.waiters {
+		if x == w {
+			q.waiters = append(q.waiters[:i], q.waiters[i+1:]...)
+			break
+		}
+	}
+	if len(q.waiters) == 0 {
+		delete(g.orgs, org)
+		return
+	}
+	if wasHead {
+		notify(q.waiters[0])
+	}
+}
+
+// try 是队首的一次检查：在 org 的锁下重读上限并计数，有空位（或任务自己已有存活环境）则登记。
+func (g *sandboxGate) try(ctx context.Context, org int64, q *orgQueue, taskID string) (bool, error) {
+	q.admit.Lock()
+	defer q.admit.Unlock()
+	_, limit, err := g.limit(ctx, taskID)
+	if err != nil {
+		return false, err
+	}
+	if limit == nil {
+		g.register(taskID, org)
+		return true, nil
 	}
 	g.mu.Lock()
-	g.pending[taskID] = true
+	pend := make([]string, 0, len(g.pending))
+	for id, o := range g.pending {
+		if o == org {
+			pend = append(pend, id)
+		}
+	}
 	g.mu.Unlock()
+	qctx, cancel := context.WithTimeout(ctx, sandboxGateQueryMax)
+	live, self, err := g.store.OrgLiveSandboxes(qctx, org, taskID, pend)
+	cancel()
+	switch {
+	case err != nil && ctx.Err() != nil:
+		return false, ctx.Err()
+	case err != nil:
+		g.log.Warn("org 并发沙箱计数失败，放行", "task_id", taskID, "error", err.Error())
+	case !self && live >= *limit:
+		return false, nil
+	}
+	g.register(taskID, org)
 	return true, nil
 }
 
-// release 在任务归还授予时注销。
+// release 在任务归还授予时注销，并唤醒其 org 的队首。
 func (g *sandboxGate) release(taskID string) {
 	g.mu.Lock()
+	defer g.mu.Unlock()
+	org, ok := g.pending[taskID]
+	if !ok {
+		return
+	}
 	delete(g.pending, taskID)
-	g.mu.Unlock()
+	if q := g.orgs[org]; q != nil && len(q.waiters) > 0 {
+		notify(q.waiters[0])
+	}
 }
 
 // ---- 结算失败后仍为 held 的预留（复审 F7）----

@@ -487,36 +487,37 @@ func (q *QuotaStore) PutBudget(ctx context.Context, t quota.Target, period time.
 	return out, err
 }
 
-// OrgSandboxes 返回 org 的 max_sandboxes（nil 为不限）与当前存活环境数：环境的 attempt 属于该 org 的任务，或环境属于
-// 该 org 的会话；pending 是本 server 已准入、可能尚未建出环境的任务，其中尚无存活环境的也计入（各计一个）。
-// 不限、或任务自己（或其会话）已有存活环境（不会新增沙箱）时 limit 为 nil，不计数。
-func (s *Store) OrgSandboxes(ctx context.Context, taskID string, pending []string) (orgID int64, limit *int64, live int64, err error) {
-	err = s.read(ctx, "OrgSandboxes", func(ctx context.Context, db queryer) error {
+// OrgSandboxLimit 返回任务所属的 org 与该 org 的 max_sandboxes（nil 为不限）。只读两行（主键查找）：没有上限的 org
+// 在准入时不做任何计数（复审 F3）。任务不存在为 ErrNotFound。
+func (s *Store) OrgSandboxLimit(ctx context.Context, taskID string) (orgID int64, limit *int64, err error) {
+	err = s.read(ctx, "OrgSandboxLimit", func(ctx context.Context, db queryer) error {
 		limit = nil
-		if err := db.QueryRow(ctx, `SELECT t.org_id, CASE WHEN EXISTS (SELECT 1 FROM environments e LEFT JOIN attempts a ON a.attempt_id = e.attempt_id
-					WHERE e.stopped_at IS NULL AND e.kind <> 'exec' AND (a.task_id = t.task_id OR (t.session_id IS NOT NULL AND e.session_id = t.session_id)))
-				THEN NULL ELSE l.max_sandboxes END
-			FROM tasks t LEFT JOIN limits l ON l.scope_kind = 'org' AND l.scope_id = t.org_id::text WHERE t.task_id = $1`, taskID).
-			Scan(&orgID, &limit); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return notFoundf("任务 %s", taskID)
-			}
-			return err
+		err := db.QueryRow(ctx, `SELECT t.org_id, l.max_sandboxes FROM tasks t
+			LEFT JOIN limits l ON l.scope_kind = 'org' AND l.scope_id = t.org_id::text WHERE t.task_id = $1`, taskID).Scan(&orgID, &limit)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("任务 %s", taskID)
 		}
-		if limit == nil {
-			return nil
-		}
-		return db.QueryRow(ctx, `SELECT
-				(SELECT count(*) FROM environments e
-					LEFT JOIN attempts a ON a.attempt_id = e.attempt_id LEFT JOIN tasks t ON t.task_id = a.task_id
-					LEFT JOIN sessions s ON s.session_id = e.session_id
-					WHERE e.stopped_at IS NULL AND e.kind <> 'exec' AND COALESCE(s.org_id, t.org_id) = $1)
-				+ (SELECT count(*) FROM tasks p WHERE p.task_id = ANY($2::text[]) AND p.org_id = $1 AND NOT EXISTS (
-					SELECT 1 FROM environments e LEFT JOIN attempts a ON a.attempt_id = e.attempt_id
-					WHERE e.stopped_at IS NULL AND e.kind <> 'exec' AND (a.task_id = p.task_id OR (p.session_id IS NOT NULL AND e.session_id = p.session_id))))`,
-			orgID, pending).Scan(&live)
+		return err
 	})
-	return orgID, limit, live, err
+	return orgID, limit, err
+}
+
+// OrgLiveSandboxes 返回 org 当前的存活沙箱数：attempt 属于该 org 的任务、或属于该 org 的会话的未停止环境（exec 环境
+// 不计），加上 pending（本 server 已准入、可能尚未建出环境的任务）中尚无存活环境的（各计一个）。self 报告 taskID 自己
+// （或其会话）已有存活环境——它不会新增沙箱。走 0013 的未停止环境部分索引（复审 F3）。
+func (s *Store) OrgLiveSandboxes(ctx context.Context, orgID int64, taskID string, pending []string) (live int64, self bool, err error) {
+	err = s.read(ctx, "OrgLiveSandboxes", func(ctx context.Context, db queryer) error {
+		return db.QueryRow(ctx, `WITH le AS (SELECT e.attempt_id, e.session_id FROM environments e WHERE e.stopped_at IS NULL AND e.kind <> 'exec'),
+			lt AS (SELECT a.task_id, le.session_id FROM le LEFT JOIN attempts a ON a.attempt_id = le.attempt_id)
+			SELECT
+				(SELECT count(*) FROM lt LEFT JOIN tasks t ON t.task_id = lt.task_id LEFT JOIN sessions s ON s.session_id = lt.session_id
+					WHERE COALESCE(s.org_id, t.org_id) = $1)
+				+ (SELECT count(*) FROM tasks p WHERE p.task_id = ANY($2::text[]) AND p.org_id = $1 AND NOT EXISTS (SELECT 1 FROM lt
+					WHERE lt.task_id = p.task_id OR (p.session_id IS NOT NULL AND lt.session_id = p.session_id))),
+				EXISTS (SELECT 1 FROM tasks t, lt WHERE t.task_id = $3 AND (lt.task_id = t.task_id OR (t.session_id IS NOT NULL AND lt.session_id = t.session_id)))`,
+			orgID, pending, taskID).Scan(&live, &self)
+	})
+	return live, self, err
 }
 
 // convertTaskHoldsTx 是账本转换（convertLedgerTx；ids 为 nil 时全部）的月度预算部分：reservation 仍为 held 的运行时调用 hold 按全额

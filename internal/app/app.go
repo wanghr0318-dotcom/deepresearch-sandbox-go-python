@@ -867,6 +867,13 @@ func (s *server) assemble() error {
 	// 模型网关 G2：启用账号（多租户）时，org 的并发沙箱上限在准入时检查。
 	if sb, ok := s.store.(orgSandboxer); ok && s.cfg.Accounts {
 		s.sandboxGate = newSandboxGate(sb, s.log)
+		if obs.Metrics() {
+			g := s.sandboxGate
+			obs.M().RegisterGauges(func() []obs.Gauge {
+				return []obs.Gauge{{Name: "org_sandbox_waiting", Help: "Tasks waiting for their org's max_sandboxes (queued, FIFO per org).",
+					Value: float64(g.Waiting())}}
+			})
+		}
 	}
 	s.taskDeps = task.Deps{
 		Store:     s.store,

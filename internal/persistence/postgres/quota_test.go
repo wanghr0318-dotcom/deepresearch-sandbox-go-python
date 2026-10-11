@@ -22,7 +22,7 @@ import (
 )
 
 // undo0013 把库还原为只应用了 0012 的形状（undo0012 先执行它）。
-const undo0013 = `DROP TABLE quota_holds, quota_budgets; DELETE FROM schema_migrations WHERE version >= 13;
+const undo0013 = `DROP INDEX environments_live_attempt, environments_live_session; DROP TABLE quota_holds, quota_budgets; DELETE FROM schema_migrations WHERE version >= 13;
 `
 
 // quotaViolations 返回 G1、G2 的违反（单条语句，一致快照）。
@@ -525,39 +525,46 @@ func TestQuotaRuntimeCallHolds(t *testing.T) {
 	checkQuota(t, w.s)
 }
 
-// TestOrgSandboxes：org 的 max_sandboxes 不限时不计数；有上限时计入该 org 存活的任务环境与本 server 已准入、尚无环境的任务。
+// TestOrgSandboxes：OrgSandboxLimit 只读上限；OrgLiveSandboxes 计入该 org 存活的任务环境与本 server 已准入、尚无环境的
+// 任务（已有环境的不重复计），self 报告任务自己已有存活环境；已停止的环境不计。
 func TestOrgSandboxes(t *testing.T) {
 	ctx := context.Background()
 	w := newQuotaWorld(t)
 	quotaTask(t, w, "t1", 100)
-	org, limit, live, err := w.s.OrgSandboxes(ctx, "t1", nil)
-	if err != nil || org != w.org || limit != nil || live != 0 {
-		t.Fatalf("不限：%d %v %d %v", org, limit, live, err)
+	org, limit, err := w.s.OrgSandboxLimit(ctx, "t1")
+	if err != nil || org != w.org || limit != nil {
+		t.Fatalf("不限：%d %v %v", org, limit, err)
 	}
 	if err := w.q.PutLimits(ctx, w.target(quota.LevelOrg), quota.Limits{MaxSandboxes: i64(2)}); err != nil {
 		t.Fatal(err)
 	}
+	if _, limit, err = w.s.OrgSandboxLimit(ctx, "t1"); err != nil || limit == nil || *limit != 2 {
+		t.Fatalf("有上限：%v %v", limit, err)
+	}
 	if n := count(t, w.s, "SELECT count(*) FROM environments WHERE env_id = 'env-t1' AND attempt_id = 'att-t1' AND stopped_at IS NULL"); n != 1 {
 		t.Fatal("CreateAttempt 应已登记存活的环境 env-t1")
 	}
-	if _, limit, _, err := w.s.OrgSandboxes(ctx, "t1", nil); err != nil || limit != nil {
-		t.Fatalf("已有存活环境的任务不新增沙箱，不受上限约束：%v %v", limit, err)
+	if _, self, err := w.s.OrgLiveSandboxes(ctx, w.org, "t1", nil); err != nil || !self {
+		t.Fatalf("t1 自己已有存活环境：%v %v", self, err)
 	}
 	if _, err := w.s.CreateResearch(ctx, w.other, api.CreateTaskRequest{RequestID: "r2", BodyHash: []byte("h"), TaskID: "t2",
 		Spec: json.RawMessage(`{}`), MaxFaultRetries: 1}); err != nil {
 		t.Fatal(err)
 	}
-	_, limit, live, err = w.s.OrgSandboxes(ctx, "t2", []string{"t1", "t2", "zzz"})
-	if err != nil || limit == nil || *limit != 2 || live != 2 { // env-t1 + t2（已准入、无环境）；t1 有环境不重复计
-		t.Fatalf("有上限：%v %d %v", limit, live, err)
+	live, self, err := w.s.OrgLiveSandboxes(ctx, w.org, "t2", []string{"t1", "t2", "zzz"})
+	if err != nil || self || live != 2 { // env-t1 + t2（已准入、无环境）；t1 有环境不重复计
+		t.Fatalf("计数：%d %v %v", live, self, err)
+	}
+	if live, _, _ := w.s.OrgLiveSandboxes(ctx, w.org+1000, "t2", nil); live != 0 {
+		t.Fatalf("其他 org：%d", live)
 	}
 	if _, err := w.s.pool.Exec(ctx, "UPDATE environments SET stopped_at = now() WHERE env_id = 'env-t1'"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, live, _ = w.s.OrgSandboxes(ctx, "t2", nil); live != 0 {
+	if live, _, _ = w.s.OrgLiveSandboxes(ctx, w.org, "t2", nil); live != 0 {
 		t.Fatalf("已停止的环境不计：%d", live)
 	}
-	if _, _, _, err := w.s.OrgSandboxes(ctx, "nope", nil); !errors.Is(err, persistence.ErrNotFound) {
+	if _, _, err := w.s.OrgSandboxLimit(ctx, "nope"); !errors.Is(err, persistence.ErrNotFound) {
 		t.Fatalf("%v", err)
 	}
 }

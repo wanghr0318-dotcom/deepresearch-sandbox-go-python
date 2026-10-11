@@ -33,3 +33,7 @@ CREATE TABLE quota_holds (
 );
 CREATE INDEX quota_holds_expiry ON quota_holds (deadline_at) WHERE state = 'held';
 CREATE INDEX quota_holds_org_period ON quota_holds (org_id, period);
+
+-- 复审 F3：准入时按 org 计数存活沙箱，只扫未停止的环境。
+CREATE INDEX environments_live_attempt ON environments (attempt_id) WHERE stopped_at IS NULL;
+CREATE INDEX environments_live_session ON environments (session_id) WHERE stopped_at IS NULL;
