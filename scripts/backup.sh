@@ -9,7 +9,7 @@
 # 包含：PostgreSQL 逻辑备份（pg_dump -Fc）、<data>/blobs、<data>/install_id、<data>/bootstrap_token（数据库只存其
 # 哈希，恢复必须带上）、非机密配置（systemd 单元、TLS 证书公钥部分）、manifest.json（计数与各组件 SHA-256）。
 # 不包含（机密，恢复时重新生成或另行提供）：<data>/api.token、<data>/cache.key、Key 与数据库口令所在的 env 文件、
-# TLS 私钥、<data>/apikey.pepper（平台 API key 的 HMAC pepper：另行保管；丢失后已发放的 key 全部失效，须重新发放）。
+# TLS 私钥、<data>/apikey.pepper（平台 API key 的 HMAC pepper：另行保管；库中登记了其指纹，缺失或不一致时 server 拒绝启动）。
 # 运行时状态（envs、workspaces、gateway）不备份。
 #
 # 一致性：先 pg_dump 再归档 blobs。blob 在数据库引用它之前写入且内容寻址、只增不改，所以先取的数据库快照引用的
