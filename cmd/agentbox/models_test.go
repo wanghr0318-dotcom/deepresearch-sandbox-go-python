@@ -535,3 +535,25 @@ func TestModelRoutingFlags(t *testing.T) {
 		}
 	}
 }
+
+// --model-api（模型网关 G3）：默认关闭；需要 --model-base-url；--model-api-max-duration 默认 10 min、须 > 0。
+func TestModelAPIFlags(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("runServer 只在 Linux 上可用")
+	}
+	var stderr strings.Builder
+	if code := runServer([]string{"-help"}, &stderr); code != 2 || !strings.Contains(stderr.String(), "-model-api\n") ||
+		!strings.Contains(stderr.String(), "-model-api-max-duration duration") || !strings.Contains(stderr.String(), "(default 10m0s)") {
+		t.Fatalf("-help 退出码 %d：%s", code, stderr.String())
+	}
+	for _, args := range [][]string{
+		{"--model-api"},
+		{"--model-base-url", "https://api.moonshot.cn/v1", "--model-name", "kimi-k3", "--models", "kimi-k2.6,kimi-k3", "--model-api", "--model-api-max-duration", "0s"},
+	} {
+		stderr.Reset()
+		code := runServer(append([]string{"--data-dir", t.TempDir(), "--database-url", "postgres://x"}, args...), &stderr)
+		if code != 2 || !strings.Contains(stderr.String(), "--model-api") {
+			t.Errorf("%v：退出码 %d（%s），期望 2", args, code, stderr.String())
+		}
+	}
+}

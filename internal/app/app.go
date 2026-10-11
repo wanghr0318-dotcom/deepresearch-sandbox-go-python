@@ -131,6 +131,10 @@ type Config struct {
 	// Accounts 启用用户账号（/auth/*、POST /research；server 在配置了 --model-base-url 时设置）。须配置模型上游，
 	// UserOrchestratorModel 与 UserWorkerModel 须为声明的模型。
 	Accounts bool
+	// ModelAPI 打开模型 API（--model-api，模型网关设计 §7；G3）：POST /v1/chat/completions、POST /v1/messages、
+	// GET /v1/models，需要 Accounts。ModelAPIMaxDuration 是一个模型 API 请求（含流）的总时长上限（0 取 10 min）。
+	ModelAPI            bool
+	ModelAPIMaxDuration time.Duration
 	// UserOrchestratorModel 与 UserWorkerModel 是用户研究 spec 的 orchestrator_model 与 worker_model（用户不能
 	// 指定模型；server 默认 kimi-k3 与 kimi-k2.6）。
 	UserOrchestratorModel, UserWorkerModel string
@@ -436,6 +440,12 @@ func (c Config) withDefaults() Config {
 }
 
 func (c Config) validate() error {
+	if c.ModelAPI && !c.Accounts {
+		return errors.New("app: 模型 API（--model-api）需要配置模型上游（--model-base-url，同时启用账号与多租户）")
+	}
+	if c.ModelAPIMaxDuration < 0 {
+		return errors.New("app: --model-api-max-duration 须 > 0")
+	}
 	if c.RedisAddr != "" {
 		if host, port, err := net.SplitHostPort(c.RedisAddr); err != nil || host == "" || port == "" {
 			return fmt.Errorf("app: Redis 地址 %q 须为 host:port", c.RedisAddr)
@@ -696,6 +706,8 @@ type server struct {
 	coord     *resource.Coordinator
 	taskDeps  task.Deps
 	calls     *call.Coordinator // Gateway 的记账与 journal 所有者
+	// modelRoutes 是模型 API（--model-api）的路由视图，Gateway 装配后设置。
+	modelRoutes modelRoutes
 	edge      *edge.Edge        // Gateway 的每 attempt 入口（task.Access）
 	blobs     blob.Store        // runner、Gateway 与 API 产物下载共用的 BlobStore
 	sessions  *sessionRuntime   // 会话：session Scheduler（启动执行时建立）与会话 turn 的执行
@@ -961,6 +973,9 @@ func (s *server) assembleGateway(blobs blob.Store) error {
 		return fmt.Errorf("app: Gateway 调用协调器: %w", err)
 	}
 	s.calls = calls
+	if mr := calls.ModelRouting(); mr != nil {
+		s.modelRoutes.p.Store(mr)
+	}
 	if err := s.assembleWorkspaces(blobs); err != nil {
 		return err
 	}
@@ -1429,6 +1444,10 @@ func (s *server) startAPI() error {
 			}
 		}
 	}
+	var modelAPI http.Handler // 未启用时保持 nil 接口：模型 API 的路径与今天一样是 404
+	if h := s.modelAPIHandler(quotas, limiter); h != nil {
+		modelAPI = h
+	}
 	var sessions api.Sessions // 未启用会话时保持 nil 接口：会话端点 503 sessions_unavailable
 	if s.cfg.sessionsEnabled() {
 		sessions = notifyingSessions{Sessions: s.store.Sessions(), s: s}
@@ -1441,7 +1460,7 @@ func (s *server) startAPI() error {
 		EffectiveLimits: s.cfg.effectiveLimits, CacheMetrics: s.cacheMetrics,
 		Accounts: accounts, ResearchSpec: s.cfg.researchSpec, SecureCookies: tlsCfg != nil,
 		Sessions: sessions, TurnSpec: s.cfg.turnSpec, ServerInfo: s.serverInfo,
-		Tenancy: tenancy, APIKeys: keys, Quota: quotas, RateLimiter: limiter,
+		Tenancy: tenancy, APIKeys: keys, Quota: quotas, RateLimiter: limiter, ModelAPI: modelAPI,
 	})
 	if err != nil {
 		_ = ln.Close()
