@@ -13,6 +13,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/llmproto"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs/obstest"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/quota"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/ratelimit"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/tests/e2e/fakeupstream"
 )
 
@@ -146,4 +147,34 @@ func TestRPMBeforeBody(t *testing.T) {
 		t.Fatalf("%d %s", resp.StatusCode, code)
 	}
 	_ = fakeupstream.Chat
+}
+
+// slotCheckStore records how many streams were in use under the key's slot when the request was recorded.
+type slotCheckStore struct {
+	*fakeStore
+	streams *ratelimit.Concurrency
+	inUse   chan int64
+}
+
+func (s *slotCheckStore) RecordModelRequest(ctx context.Context, r Record) error {
+	s.inUse <- s.streams.InUse("key:k_test:streams")
+	return s.fakeStore.RecordModelRequest(ctx, r)
+}
+
+// The stream slot is free before the request is recorded (and settled): the stream is over when the accounting
+// starts, so the caller's next stream is never refused while PostgreSQL work is still running, and a test that waits
+// for the record can rely on the slot (the -race flake on G5's CI).
+func TestSlotReleasedBeforeRecord(t *testing.T) {
+	one := int64(1)
+	streams := ratelimit.NewConcurrency()
+	st := &slotCheckStore{fakeStore: &fakeStore{ch: make(chan Record, 4)}, streams: streams, inUse: make(chan int64, 4)}
+	e := newEnv(t, modeOpenAI, func(c *Config) { c.Store, c.Streams = st, streams })
+	e.store = st.fakeStore
+	e.limits.ls = map[quota.Level]quota.Limits{quota.LevelKey: {MaxStreams: &one}}
+	resp := e.post(context.Background(), llmproto.ProtocolOpenAI, chatBody(llmproto.ProtocolOpenAI, "m-1", true, ""))
+	readAll(t, resp)
+	e.record()
+	if n := <-st.inUse; n != 0 {
+		t.Fatalf("%d stream(s) still held when the request was recorded", n)
+	}
 }
