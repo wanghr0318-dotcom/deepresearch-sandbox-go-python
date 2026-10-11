@@ -11,7 +11,7 @@ import (
 
 func TestTargetsInLockOrder(t *testing.T) {
 	got := Scope{OrgID: 7, UserID: 3, KeyID: "k_x"}.Targets()
-	want := []Target{{LevelOrg, "7"}, {LevelUser, "3"}, {LevelKey, "k_x"}}
+	want := []Target{{LevelOrg, "7"}, {LevelUser, "7/3"}, {LevelKey, "k_x"}}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("%v", got)
 	}

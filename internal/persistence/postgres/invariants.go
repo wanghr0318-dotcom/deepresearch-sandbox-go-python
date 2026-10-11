@@ -263,7 +263,7 @@ var invariantQueries = []struct {
 
 // quotaLevelsCTE 把每个 hold 展开到它的各个层级（lv：k、i、period、state、amount_micro、charged_micro）。
 const quotaLevelsCTE = `lv AS (SELECT 'org' AS k, org_id::text AS i, period, state, amount_micro, charged_micro FROM quota_holds
-		UNION ALL SELECT 'user', user_id::text, period, state, amount_micro, charged_micro FROM quota_holds WHERE user_id IS NOT NULL
+		UNION ALL SELECT 'user', org_id::text || '/' || user_id::text, period, state, amount_micro, charged_micro FROM quota_holds WHERE user_id IS NOT NULL
 		UNION ALL SELECT 'key', key_id, period, state, amount_micro, charged_micro FROM quota_holds WHERE key_id IS NOT NULL)`
 
 // quotaOverCTE 是各层级各月已结算 hold 的 charged 超出其预留的部分之和（excess：k、i、period、amt）。

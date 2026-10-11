@@ -53,6 +53,9 @@ func TestLimitsAndBudgetCommands(t *testing.T) {
 	if code, _, errb := run(runLimits, "show", "key", "k_aaaaaaaaaaaaaaaa"); code != 1 || !strings.Contains(errb, "不存在") {
 		t.Fatalf("unknown key = %d %q", code, errb)
 	}
+	if code, _, errb := run(runLimits, "set", "user", "alice", "--max-sandboxes", "1"); code != 1 || !strings.Contains(errb, "只能在 org 层级") {
+		t.Fatalf("user-level max_sandboxes = %d %q", code, errb)
+	}
 	if code, _, _ := run(runLimits, "set", "team", "x"); code != 1 {
 		t.Fatalf("unknown kind = %d", code)
 	}

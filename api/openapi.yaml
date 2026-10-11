@@ -633,6 +633,7 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
+        '429': {$ref: '#/components/responses/RuntimeRateLimited'}
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/SessionsUnavailable'}
   /sessions/{id}/messages:
@@ -780,6 +781,7 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/TurnNotFound'}
         '409': {$ref: '#/components/responses/TurnControlRejected'}
+        '429': {$ref: '#/components/responses/RuntimeRateLimited'}
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/SessionsUnavailable'}
   /turns/{id}/finish:
@@ -800,6 +802,7 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/TurnNotFound'}
         '409': {$ref: '#/components/responses/TurnControlRejected'}
+        '429': {$ref: '#/components/responses/RuntimeRateLimited'}
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/SessionsUnavailable'}
   /turns/{id}/answer:
@@ -824,6 +827,7 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/TurnNotFound'}
         '409': {$ref: '#/components/responses/TurnControlRejected'}
+        '429': {$ref: '#/components/responses/RuntimeRateLimited'}
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/SessionsUnavailable'}
   /turns/{id}/restore:
@@ -853,6 +857,7 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
+        '429': {$ref: '#/components/responses/RuntimeRateLimited'}
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/SessionsUnavailable'}
   /turns/{id}/raw/{sha256}:
@@ -1249,7 +1254,8 @@ paths:
       description: |
         Every field is replaced; an absent field is null (no limit at that level). A user's or key's value cannot be
         above the same limit of its org (400 `exceeds_org_limit`). Only `rpm` is enforced on the runtime API
-        (`POST /sessions`, `/research`, `/sessions/{id}/messages`); `max_sandboxes` is checked when a task of the org
+        (`POST /sessions`, `/research`, `/sessions/{id}/messages`, `/sessions/{id}/wake`, `/turns/{id}/restore`, `/continue`,
+        `/finish`, `/answer`); `max_sandboxes` (org level only, else 400 `unsupported_limit`) is checked when a task of the org
         is admitted to a run slot; `tpm` and `max_streams` are for the model API.
       security:
         - bearerAuth: []
@@ -1408,7 +1414,7 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
     QuotaBadRequest:
-      description: '`invalid_request` (kind, body or period), or `exceeds_org_limit`: a user''s or key''s value above its org''s'
+      description: '`invalid_request` (kind, body or period); `exceeds_org_limit`: a user''s or key''s value above its org''s; or `unsupported_limit`: `max_sandboxes` on a user or key (it is counted per org only)'
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}

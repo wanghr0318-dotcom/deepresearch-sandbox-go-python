@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -64,6 +65,9 @@ func (f *fakeQuota) LimitsFor(_ context.Context, s quota.Scope) (map[quota.Level
 }
 
 func (f *fakeQuota) GetBudget(_ context.Context, t quota.Target, p time.Time) (quota.Budget, error) {
+	if p.IsZero() {
+		p = time.Now()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	b := f.budgets[t]
@@ -72,6 +76,9 @@ func (f *fakeQuota) GetBudget(_ context.Context, t quota.Target, p time.Time) (q
 }
 
 func (f *fakeQuota) PutBudget(_ context.Context, t quota.Target, p time.Time, limit *int64) (quota.Budget, error) {
+	if p.IsZero() {
+		p = time.Now()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	b := f.budgets[t]
@@ -311,4 +318,60 @@ func TestRuntimeRateLimitRedisDown(t *testing.T) {
 	st, body, _ = qs.do("GET", "/v1/me", "", session(alice))
 	expect(t, st, body, 200, "")
 	_ = json.Unmarshal(body, &me)
+}
+
+// TestRateLimitCoversEveryStart (review F1): restoring a turn, waking a session and resuming a paused turn create a
+// turn or start a sandbox, so they share the requests-per-minute buckets; stopping a turn does not.
+func TestRateLimitCoversEveryStart(t *testing.T) {
+	qs := newQuotaServer(t, ratelimit.NewLocal(nil))
+	alice, _, _, _ := qs.acme(t)
+	k, kID := qs.mintKey(t, alice, "runtime")
+	st, body, _ := qs.do("PUT", "/v1/limits/key/"+kID, `{"rpm":1}`, session(alice))
+	expect(t, st, body, 200, "")
+	st, body, _ = qs.do("POST", "/sessions", `{"request_id":"s1"}`, bearer(k))
+	expect(t, st, body, 201, "")
+	for _, p := range []string{"/turns/t1/restore", "/sessions/s1/wake", "/turns/t1/continue", "/turns/t1/finish", "/turns/t1/answer"} {
+		st, body, h := qs.do("POST", p, `{"request_id":"x"}`, bearer(k))
+		expect(t, st, body, 429, "rate_limit_exceeded")
+		if h.Get("Retry-After") == "" {
+			t.Fatalf("%s: no Retry-After", p)
+		}
+	}
+	if st, body, _ := qs.do("POST", "/turns/t1/stop", `{"request_id":"x"}`, bearer(k)); st == 429 {
+		t.Fatalf("stop must not be rate limited: %s", body)
+	}
+}
+
+// TestQuotaNotFoundBodiesIdentical (review F4): an object of another org and one that does not exist get the same
+// 404 body, so owners cannot enumerate names across orgs.
+func TestQuotaNotFoundBodiesIdentical(t *testing.T) {
+	qs := newQuotaServer(t, nil)
+	alice, _, carol, _ := qs.acme(t)
+	_, carolKey := qs.mintKey(t, carol, "runtime")
+	for _, pair := range [][2]string{
+		{"/v1/limits/user/carol", "/v1/limits/user/nobody"},
+		{"/v1/limits/user/carol", "/v1/limits/user/" + strings.Repeat("x", 300)},
+		{"/v1/budgets/org/user-3", "/v1/budgets/org/nope"},
+		{"/v1/limits/key/" + carolKey, "/v1/limits/key/k_aaaaaaaaaaaaaaaa"},
+		{"/v1/limits/key/" + carolKey, "/v1/limits/key/bad"},
+	} {
+		st1, b1, _ := qs.do("GET", pair[0], "", session(alice))
+		st2, b2, _ := qs.do("GET", pair[1], "", session(alice))
+		if st1 != 404 || st2 != 404 || string(b1) != string(b2) {
+			t.Errorf("%s → %d %s; %s → %d %s", pair[0], st1, b1, pair[1], st2, b2)
+		}
+	}
+}
+
+// TestMaxSandboxesOrgOnly (review F12): max_sandboxes is counted per org, so a user or key value is rejected.
+func TestMaxSandboxesOrgOnly(t *testing.T) {
+	qs := newQuotaServer(t, nil)
+	alice, _, _, _ := qs.acme(t)
+	_, kID := qs.mintKey(t, alice, "runtime")
+	for _, p := range []string{"/v1/limits/user/bob", "/v1/limits/key/" + kID} {
+		st, body, _ := qs.do("PUT", p, `{"max_sandboxes":1}`, adminAuth)
+		expect(t, st, body, 400, "unsupported_limit")
+	}
+	st, body, _ := qs.do("PUT", "/v1/limits/org/acme", `{"max_sandboxes":1}`, adminAuth)
+	expect(t, st, body, 200, "")
 }

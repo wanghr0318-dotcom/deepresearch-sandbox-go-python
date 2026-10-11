@@ -52,19 +52,25 @@ func ScopeOf(p tenant.Principal) Scope {
 // Target is one level of a scope.
 type Target struct {
 	Level Level
-	ID    string // org and user: decimal ID; key: key ID
+	ID    string // org: decimal org ID; user: "<org ID>/<user ID>" (UserTargetID); key: key ID
 }
 
 // Targets returns the scope's levels in lock order (org, user, key). The org must be resolved (OrgID ≠ 0).
 func (s Scope) Targets() []Target {
 	out := []Target{{LevelOrg, strconv.FormatInt(s.OrgID, 10)}}
 	if s.UserID != 0 {
-		out = append(out, Target{LevelUser, strconv.FormatInt(s.UserID, 10)})
+		out = append(out, Target{LevelUser, UserTargetID(s.OrgID, s.UserID)})
 	}
 	if s.KeyID != "" {
 		out = append(out, Target{LevelKey, s.KeyID})
 	}
 	return out
+}
+
+// UserTargetID is the ID of a user level: user rows are scoped to (org, user), so a user who moves to another org
+// starts with fresh user-level limits and budgets there, and the old org keeps the rows with its spend.
+func UserTargetID(orgID, userID int64) string {
+	return strconv.FormatInt(orgID, 10) + "/" + strconv.FormatInt(userID, 10)
 }
 
 // Source is what a hold pays for.
@@ -180,10 +186,12 @@ type Store interface {
 	PutLimits(ctx context.Context, t Target, l Limits) error
 	// LimitsFor returns the limits of every level of s, keyed by level (levels without a row are absent).
 	LimitsFor(ctx context.Context, s Scope) (map[Level]Limits, error)
-	// GetBudget returns t's budget for period (a row that does not exist yet shows the limit it would be created
+	// GetBudget returns t's budget for period, or for the database's current UTC month when period is zero (a row that
+	// does not exist yet shows the limit it would be created
 	// with and zero usage).
 	GetBudget(ctx context.Context, t Target, period time.Time) (Budget, error)
-	// PutBudget sets t's monthly limit (nil = unlimited) for period; later months created afterwards carry it forward.
+	// PutBudget sets t's monthly limit (nil = unlimited) for period (zero: the database's current month); later
+	// months created afterwards carry it forward.
 	// A limit below the period's current usage is rejected with *BelowUsageError.
 	PutBudget(ctx context.Context, t Target, period time.Time, limitMicro *int64) (Budget, error)
 	// OperatorOrg returns the ID of the reserved org "operator".

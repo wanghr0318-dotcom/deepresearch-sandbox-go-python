@@ -2,9 +2,10 @@ package api
 
 // 本文件是限额与月度预算（模型网关设计 2026-10-11 §6、§8；G2）：GET/PUT /v1/limits/{kind}/{id} 与
 // GET/PUT /v1/budgets/{kind}/{id}（kind 为 org、user、key；id 分别为 org 名称、用户名、key ID），以及运行时 API 创建
-// 端点（POST /sessions、/research、/sessions/{id}/messages；POST /tasks 只对运维开放，不限流）按 key、user、org 三级的每分钟请求数限流。
+// 端点（POST /sessions、/research、/sessions/{id}/messages、/turns/{id}/restore，以及启动沙箱的唤醒与 continue、finish、answer；
+// POST /tasks 只对运维开放，不限流）按 key、user、org 三级的每分钟请求数限流。
 // 授权：owner 可读写本 org 的用户与 key、只读本 org；运维全部；成员与 API key 一律不可（key 为 403 permission_denied）。
-// 用户与 key 层级的值不能超过其 org 自己的上限。调用者看不到的对象（其他 org）与不存在的回答相同的 404。
+// 用户与 key 层级的值不能超过其 org 自己的上限。调用者看不到的对象（其他 org）与不存在的回答完全相同的 404。
 
 import (
 	"context"
@@ -14,7 +15,9 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/account"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/apikey"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/quota"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/ratelimit"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/tenant"
@@ -33,6 +36,9 @@ var quotaRoutes = []route{
 // rateLimitedRoutes 是按每分钟请求数限流的运行时创建端点（API key 与 cookie 调用者；运维不限）。
 var rateLimitedRoutes = map[string]bool{
 	"POST /sessions": true, "POST /research": true, "POST /sessions/{id}/messages": true,
+	// 复审 F1：同样新建 turn（restore）或启动沙箱（唤醒会话；continue、finish、answer 以新的 attempt 恢复暂停的 turn）。
+	"POST /turns/{id}/restore": true, "POST /sessions/{id}/wake": true,
+	"POST /turns/{id}/continue": true, "POST /turns/{id}/finish": true, "POST /turns/{id}/answer": true,
 }
 
 // quotaTarget 是路径中的 {kind}/{id} 解析后的层级与其所属 org。
@@ -42,6 +48,9 @@ type quotaTarget struct {
 	kind   string
 	id     string
 }
+
+// quotaNotFoundMsg 是各层级唯一的 404 消息：不存在与其他 org 的对象回答完全相同的正文（复审 F4，不泄露存在性）。
+var quotaNotFoundMsg = map[quota.Level]string{quota.LevelOrg: "org 不存在", quota.LevelUser: "用户不存在", quota.LevelKey: "key 不存在"}
 
 // resolveQuotaTarget 解析 {kind}/{id} 并按读（write 为 false）或写授权；失败时已写出响应。
 func (h *Handler) resolveQuotaTarget(w http.ResponseWriter, r *http.Request, write bool) (quotaTarget, bool) {
@@ -57,36 +66,42 @@ func (h *Handler) resolveQuotaTarget(w http.ResponseWriter, r *http.Request, wri
 	}
 	ctx := r.Context()
 	notFound := func() (quotaTarget, bool) {
-		writeError(w, http.StatusNotFound, string(level)+"_not_found", "不存在")
+		writeError(w, http.StatusNotFound, string(level)+"_not_found", quotaNotFoundMsg[level])
+		return qt, false
+	}
+	// lookupFailed 把查找错误写出：不存在为同一个 404，其余为存储错误。
+	lookupFailed := func(err error) (quotaTarget, bool) {
+		if errors.Is(err, persistence.ErrNotFound) {
+			return notFound()
+		}
+		writeStoreError(w, err)
 		return qt, false
 	}
 	switch level {
 	case quota.LevelOrg:
 		o, err := h.cfg.Tenancy.OrgByName(ctx, qt.id)
 		if err != nil {
-			writeTenancyError(w, err, "org_not_found", "org 不存在")
-			return qt, false
+			return lookupFailed(err)
 		}
 		qt.org, qt.target = o.ID, quota.Target{Level: level, ID: strconv.FormatInt(o.ID, 10)}
 	case quota.LevelUser:
-		key, ok := usernameKey(w, qt.id)
-		if !ok {
-			return qt, false
+		_, key, err := account.NormalizeUsername(qt.id)
+		if err != nil {
+			return notFound()
 		}
 		m, err := h.cfg.Tenancy.MemberByName(ctx, key)
 		if err != nil {
-			writeTenancyError(w, err, "user_not_found", "用户不存在")
-			return qt, false
+			return lookupFailed(err)
 		}
-		qt.org, qt.target = m.OrgID, quota.Target{Level: level, ID: strconv.FormatInt(m.UserID, 10)}
+		// 用户层级按 (org, user) 记（复审 F5）：指的是该用户在其当前 org 中的行。
+		qt.org, qt.target = m.OrgID, quota.Target{Level: level, ID: quota.UserTargetID(m.OrgID, m.UserID)}
 	case quota.LevelKey:
 		if !apikey.ValidID(qt.id) {
 			return notFound()
 		}
 		k, err := h.cfg.Tenancy.GetKey(ctx, qt.id)
 		if err != nil {
-			writeTenancyError(w, err, "key_not_found", "key 不存在")
-			return qt, false
+			return lookupFailed(err)
 		}
 		qt.org, qt.target = k.OrgID, quota.Target{Level: level, ID: k.ID}
 	}
@@ -140,6 +155,10 @@ func (h *Handler) putLimits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	if qt.target.Level != quota.LevelOrg && body.MaxSandboxes != nil { // 复审 F12：并发沙箱只在 org 层级计数
+		writeError(w, http.StatusBadRequest, "unsupported_limit", "max_sandboxes 只能在 org 层级设置")
+		return
+	}
 	if qt.target.Level != quota.LevelOrg {
 		orgLimits, err := h.cfg.Quota.GetLimits(ctx, quota.Target{Level: quota.LevelOrg, ID: strconv.FormatInt(qt.org, 10)})
 		if err != nil {
@@ -182,7 +201,7 @@ func toBudgetJSON(qt quotaTarget, b quota.Budget) budgetJSON {
 }
 
 func (h *Handler) getBudget(w http.ResponseWriter, r *http.Request) {
-	period := quota.Period(h.now())
+	var period time.Time // 零值：数据库时间所在的月份（与 hold 相同）
 	if s := r.URL.Query().Get("period"); s != "" {
 		p, err := time.Parse("2006-01", s)
 		if err != nil {
@@ -222,7 +241,7 @@ func (h *Handler) putBudget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	period := quota.Period(h.now())
+	var period time.Time // 本月以数据库时间为准（与 hold 相同）
 	if qt.target.Level != quota.LevelOrg && body.LimitMicro != nil {
 		ob, err := h.cfg.Quota.GetBudget(ctx, quota.Target{Level: quota.LevelOrg, ID: strconv.FormatInt(qt.org, 10)}, period)
 		if err != nil {

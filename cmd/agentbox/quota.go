@@ -80,7 +80,7 @@ func resolveTarget(ctx context.Context, s *postgres.Store, kind, id string) (quo
 		if err != nil {
 			return quota.Target{}, 0, fmt.Errorf("用户 %s: %s", id, tenancyError(err))
 		}
-		return quota.Target{Level: level, ID: strconv.FormatInt(m.UserID, 10)}, m.OrgID, nil
+		return quota.Target{Level: level, ID: quota.UserTargetID(m.OrgID, m.UserID)}, m.OrgID, nil
 	}
 	k, err := ten.GetKey(ctx, id)
 	if err != nil {
@@ -145,6 +145,10 @@ func runLimits(args []string, stdout, stderr io.Writer) int {
 		tpm.apply(&l.TPM)
 		sandboxes.apply(&l.MaxSandboxes)
 		streams.apply(&l.MaxStreams)
+		if t.Level != quota.LevelOrg && l.MaxSandboxes != nil {
+			fmt.Fprintln(stderr, "agentbox limits: max_sandboxes 只能在 org 层级设置")
+			return 1
+		}
 		if t.Level != quota.LevelOrg {
 			ol, err := q.GetLimits(ctx, orgTarget(org))
 			if err != nil {
@@ -225,7 +229,7 @@ func runBudget(args []string, stdout, stderr io.Writer) int {
 		}
 		limit = &v
 	}
-	p := quota.Period(time.Now())
+	var p time.Time // 零值：数据库时间所在的月份
 	if *period != "" {
 		t, err := time.Parse("2006-01", *period)
 		if err != nil {
