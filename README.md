@@ -127,7 +127,8 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer $KEY
 ```
 
 ```python
-import anthropic, openai
+import os, anthropic, openai
+KEY = os.environ["KEY"]
 openai.OpenAI(base_url="http://127.0.0.1:8080/v1", api_key=KEY).chat.completions.create(
     model="kimi-k3", messages=[{"role": "user", "content": "你好"}], max_tokens=200)
 anthropic.Anthropic(base_url="http://127.0.0.1:8080", api_key=KEY).messages.create(
