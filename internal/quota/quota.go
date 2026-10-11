@@ -45,7 +45,9 @@ type Scope struct {
 }
 
 // ScopeOf returns the scope a request by p is charged to.
-func ScopeOf(p tenant.Principal) Scope { return Scope{OrgID: p.OrgID, UserID: p.UserID, KeyID: p.KeyID} }
+func ScopeOf(p tenant.Principal) Scope {
+	return Scope{OrgID: p.OrgID, UserID: p.UserID, KeyID: p.KeyID}
+}
 
 // Target is one level of a scope.
 type Target struct {
@@ -153,7 +155,7 @@ func (l Limits) Empty() bool {
 // A level cannot be given more than its org allows (design §8).
 func (l Limits) Exceeding(parent Limits) string {
 	for _, f := range []struct {
-		name      string
+		name       string
 		own, outer *int64
 	}{{"rpm", l.RPM, parent.RPM}, {"tpm", l.TPM, parent.TPM}, {"max_sandboxes", l.MaxSandboxes, parent.MaxSandboxes},
 		{"max_streams", l.MaxStreams, parent.MaxStreams}} {

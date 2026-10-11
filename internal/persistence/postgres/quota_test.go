@@ -107,7 +107,9 @@ func newQuotaWorld(t *testing.T) quotaWorld {
 	return quotaWorld{s: s, q: s.QuotaStore(), org: o.ID, user: alice.ID, key: g.ID, other: bob.ID}
 }
 
-func (w quotaWorld) scope() quota.Scope { return quota.Scope{OrgID: w.org, UserID: w.user, KeyID: w.key} }
+func (w quotaWorld) scope() quota.Scope {
+	return quota.Scope{OrgID: w.org, UserID: w.user, KeyID: w.key}
+}
 
 func (w quotaWorld) target(l quota.Level) quota.Target {
 	switch l {
