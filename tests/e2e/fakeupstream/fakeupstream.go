@@ -7,6 +7,13 @@
 //     第一条 system 消息以阶段标记（"[stage:plan]"、"[stage:summarize]"、"[stage:report]"）开头时按
 //     SetStageReply 的脚本回复，否则回复确定性的占位文本；响应带 usage（prompt_tokens、completion_tokens）。
 //     模型 adapter 的 BaseURL 为 ModelBaseURL()（= URL()+"/v1"）。
+//     请求带 "stream": true 时以 SSE 流式回复（chat.completion.chunk、文本与工具参数分多个 chunk、[DONE]）；
+//     stream_options.include_usage 为真时在 [DONE] 前另发一个 choices 为空、带 usage 的 chunk。
+//   - POST /v1/messages：Anthropic Messages 兼容（类别 Messages，模型网关设计 §10）。须带 anthropic-version 头；
+//     SetAnthropicKey 设置后 x-api-key 须与之相等（否则 401 authentication_error）。非流式回复 message 对象；
+//     "stream": true 时按 Anthropic 的事件序列流式回复（message_start 带输入用量、content_block_start/
+//     delta/stop、message_delta 带输出用量、message_stop）。回复内容同 chat：SetMessagesHook 的脚本、
+//     system 的阶段标记或确定性的占位文本。根地址 URL() 即 Anthropic 的 base_url。
 //   - POST /search：tavily 兼容（{query, max_results} → {request_id, results:[{title, url, content, snippet}]}）；
 //     结果 URL 指向本服务器的 /pages/...，可以继续抓取。Gateway 的 fake 搜索供应商配置了搜索上游地址
 //     （app.Config.SearchBaseURL / --search-base-url = URL()）时访问本端点；Gateway 返回给 Worker 的形状是
@@ -15,10 +22,13 @@
 //     E21–E25 用），否则返回确定性的 text/plain 正文、不带新鲜度头（Gateway 的 fetch adapter 把它包装为
 //     {url, final_url, status, content_type, truncated, encoding, content}）。
 //
-// SetLatency 给某类别的正常回复加固定延迟（缓存收益测量用）。
+// SetLatency 给某类别的正常回复加固定延迟（缓存收益测量用）；SetChunkDelay 给流式回复的相邻 chunk 之间加延迟。
+// SetCacheUsage 让两种模型回复的用量带缓存 token（OpenAI prompt_tokens_details.cached_tokens；Anthropic
+// cache_read_input_tokens 与 cache_creation_input_tokens）。
 //
 // 故障注入按类别与"该类别的第 n 次请求"声明（Inject）：返回指定状态（可带 Retry-After）、挂起（直到 Release
-// 或客户端离开）、或发出响应头与部分正文后切断连接（响应中途断开）。
+// 或客户端离开）、或发出响应头与部分正文后切断连接（响应中途断开）；流式回复还可以在发出 N 个 chunk 后
+// 切断连接或发出错误事件（Action.FailAfterChunks、FailWithError）。
 //
 // 计数：Count 是该类别收到的请求数（含注入故障的请求）；Distinct 按调用身份去重——请求带 X-Agentbox-Call-Id
 // 时以它为身份，否则以请求体的 sha256 为身份（Gateway 不把 call id 转发给上游，因此经 Gateway 的请求按请求体
@@ -48,9 +58,10 @@ import (
 type Kind string
 
 const (
-	Chat   Kind = "chat"
-	Search Kind = "search"
-	Fetch  Kind = "fetch"
+	Chat     Kind = "chat"
+	Search   Kind = "search"
+	Fetch    Kind = "fetch"
+	Messages Kind = "messages" // Anthropic /v1/messages
 )
 
 // Model 是本上游声明的模型名（与 Gateway 配置的模型名一致）。
@@ -75,6 +86,10 @@ type Action struct {
 	Hang bool
 	// Disconnect 为真时发出 200 响应头与部分正文后切断连接（Content-Length 声明的长度不足）。
 	Disconnect bool
+	// FailAfterChunks 大于零时，流式回复发出这么多个 SSE 事件后失败：FailWithError 为假时切断连接，
+	// 为真时发出该格式的错误事件后结束。非流式请求不受影响（正常回复）。
+	FailAfterChunks int
+	FailWithError   bool
 }
 
 func (a Action) String() string {
@@ -83,6 +98,10 @@ func (a Action) String() string {
 		return "hang"
 	case a.Disconnect:
 		return "disconnect"
+	case a.FailAfterChunks > 0 && a.FailWithError:
+		return fmt.Sprintf("error after %d chunks", a.FailAfterChunks)
+	case a.FailAfterChunks > 0:
+		return fmt.Sprintf("cut after %d chunks", a.FailAfterChunks)
 	case a.Status != 0 && a.RetryAfter != "":
 		return fmt.Sprintf("status %d (Retry-After %s)", a.Status, a.RetryAfter)
 	case a.Status != 0:
@@ -97,6 +116,7 @@ const (
 	OutcomeStatus       = "status"       // 按注入的状态回复
 	OutcomeDisconnected = "disconnected" // 发出部分响应后切断
 	OutcomeAborted      = "aborted"      // 挂起期间客户端离开（取消或超时）
+	OutcomeStreamError  = "stream_error" // 流式回复中途发出错误事件（FailWithError）
 )
 
 // Request 是一次请求的记录。
@@ -107,6 +127,8 @@ type Request struct {
 	Key           string    // 调用身份（X-Agentbox-Call-Id，或 "sha256:<请求体哈希>"）
 	Path          string    // 请求路径
 	Authorization string    // Authorization 头（测试据此确认 Key 只在上游请求头中出现）
+	APIKey        string    // x-api-key 头（Anthropic 格式的 Key）
+	Stream        bool      // 模型请求带 "stream": true
 	Stage         string    // chat 请求的阶段标记（第一条 system 消息以它开头时）；其他为空
 	Body          string    // 请求体（测试据此重建 Worker 发给 Gateway 的同一请求）
 	Action        Action    // 注入的动作
@@ -138,6 +160,14 @@ type Server struct {
 	every map[Kind]periodic
 	// chatHook 非 nil 时先于阶段标记决定 chat 回复（SetChatHook）：返回非 nil 的 assistant message 即为回复。
 	chatHook func(body []byte) json.RawMessage
+	// messagesHook 非 nil 时先于阶段标记决定 /v1/messages 的回复（SetMessagesHook）：返回非 nil 的 content 数组即为回复。
+	messagesHook func(body []byte) json.RawMessage
+	// anthropicKey 非空时 /v1/messages 要求 x-api-key 与之相等（SetAnthropicKey）。
+	anthropicKey string
+	// chunkDelay 是各类别流式回复相邻 chunk 之间的延迟（SetChunkDelay；首字延迟测量用）。
+	chunkDelay map[Kind]time.Duration
+	// cacheRead、cacheWrite 是模型回复用量中的缓存 token（SetCacheUsage）。
+	cacheRead, cacheWrite int64
 }
 
 type periodic struct {
@@ -154,14 +184,15 @@ type page struct {
 // New 启动一个监听 127.0.0.1 随机端口的 fake upstream；测试结束时调用 Close。
 func New() *Server {
 	s := &Server{
-		counts:   map[Kind]int{},
-		faults:   map[Kind]map[int]Action{},
-		pages:    map[string]page{},
-		code:     map[string]string{},
-		latency:  map[Kind]time.Duration{},
-		always:   map[Kind]Action{},
-		every:    map[Kind]periodic{},
-		released: make(chan struct{}),
+		counts:     map[Kind]int{},
+		faults:     map[Kind]map[int]Action{},
+		pages:      map[string]page{},
+		code:       map[string]string{},
+		latency:    map[Kind]time.Duration{},
+		chunkDelay: map[Kind]time.Duration{},
+		always:     map[Kind]Action{},
+		every:      map[Kind]periodic{},
+		released:   make(chan struct{}),
 		stages: map[string]string{
 			StagePlan:      `{"tasks":[{"title":"fake 任务","intent":"fake 意图","query":"fake 查询"}]}`,
 			StageSummarize: "## 任务总结\n- fake 发现 [1]",
@@ -315,13 +346,13 @@ func (s *Server) ResultURL(query string, i int) string {
 	return fmt.Sprintf("%s/pages/%s/%d", s.srv.URL, hex.EncodeToString(sum[:4]), i)
 }
 
-// StageCount 返回第一条 system 消息以阶段标记 stage 开头的 chat 请求数。
+// StageCount 返回第一条 system 消息（/v1/messages 为 system）以阶段标记 stage 开头的模型请求数。
 func (s *Server) StageCount(stage string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
 	for _, r := range s.reqs {
-		if r.Kind == Chat && r.Stage == stage {
+		if (r.Kind == Chat || r.Kind == Messages) && r.Stage == stage {
 			n++
 		}
 	}
@@ -380,6 +411,8 @@ func kindOf(r *http.Request) (Kind, bool) {
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
 		return Chat, true
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/messages":
+		return Messages, true
 	case r.Method == http.MethodPost && r.URL.Path == "/search":
 		return Search, true
 	case r.Method == http.MethodGet:
@@ -405,14 +438,18 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		key = "sha256:" + hex.EncodeToString(sum[:])
 	}
 	var stage string
-	if kind == Chat {
+	switch kind {
+	case Chat:
 		stage = stageOf(body)
+	case Messages:
+		stage = messagesStageOf(body)
 	}
 	s.mu.Lock()
 	s.seq++
 	s.counts[kind]++
 	rec := &Request{Seq: s.seq, Kind: kind, N: s.counts[kind], Key: key, Path: r.URL.Path,
-		Authorization: r.Header.Get("Authorization"), Stage: stage, Body: string(body),
+		Authorization: r.Header.Get("Authorization"), APIKey: r.Header.Get("X-Api-Key"), Stream: streamRequested(kind, body),
+		Stage: stage, Body: string(body),
 		Action: s.faults[kind][s.counts[kind]], At: time.Now()}
 	if p, ok := s.every[kind]; rec.Action == (Action{}) && ok && rec.N%p.k == 0 {
 		rec.Action = p.a
@@ -444,7 +481,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		if a.RetryAfter != "" {
 			w.Header().Set("Retry-After", a.RetryAfter)
 		}
-		writeJSON(w, a.Status, errBody(fmt.Sprintf("injected_%d", a.Status)))
+		if kind == Messages {
+			writeJSON(w, a.Status, anthropicErrBody(a.Status, fmt.Sprintf("injected_%d", a.Status)))
+		} else {
+			writeJSON(w, a.Status, errBody(fmt.Sprintf("injected_%d", a.Status)))
+		}
 		s.setOutcome(rec, OutcomeStatus)
 		return
 	}
@@ -463,7 +504,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	switch kind {
 	case Chat:
-		s.chat(w, rec, body)
+		s.chat(w, r, rec, body)
+	case Messages:
+		s.messages(w, r, rec, body)
 	case Search:
 		s.search(w, rec, body)
 	default:
@@ -526,7 +569,11 @@ func (s *Server) disconnect(w http.ResponseWriter, rec *Request) {
 }
 
 type chatRequest struct {
-	Model    string `json:"model"`
+	Model         string `json:"model"`
+	Stream        bool   `json:"stream"`
+	StreamOptions *struct {
+		IncludeUsage bool `json:"include_usage"`
+	} `json:"stream_options"`
 	Messages []struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
@@ -555,14 +602,20 @@ type ChatMessage struct {
 	Content string `json:"content"`
 }
 
-// ChatUsage 是用量（Gateway 据此按价格表结算 ok 的 try）。
+// ChatUsage 是用量（Gateway 据此按价格表结算 ok 的 try）。PromptTokensDetails 只在 SetCacheUsage 设置了缓存读取时出现。
 type ChatUsage struct {
-	PromptTokens     int64 `json:"prompt_tokens"`
-	CompletionTokens int64 `json:"completion_tokens"`
-	TotalTokens      int64 `json:"total_tokens"`
+	PromptTokens        int64                `json:"prompt_tokens"`
+	CompletionTokens    int64                `json:"completion_tokens"`
+	TotalTokens         int64                `json:"total_tokens"`
+	PromptTokensDetails *PromptTokensDetails `json:"prompt_tokens_details,omitempty"`
 }
 
-func (s *Server) chat(w http.ResponseWriter, rec *Request, body []byte) {
+// PromptTokensDetails 是 prompt_tokens 中的缓存部分。
+type PromptTokensDetails struct {
+	CachedTokens int64 `json:"cached_tokens"`
+}
+
+func (s *Server) chat(w http.ResponseWriter, r *http.Request, rec *Request, body []byte) {
 	var req chatRequest
 	if err := json.Unmarshal(body, &req); err != nil || len(req.Messages) == 0 {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid_request"))
@@ -583,9 +636,13 @@ func (s *Server) chat(w http.ResponseWriter, rec *Request, body []byte) {
 			}
 			prompt := int64(len(body)+3) / 4
 			completion := int64(len(msg)+3) / 4
+			if req.Stream {
+				s.streamChat(w, r, rec, req, msg, finish, s.chatUsage(prompt, completion))
+				return
+			}
 			writeJSON(w, http.StatusOK, map[string]any{"id": fmt.Sprintf("chatcmpl-fake-%d", rec.Seq), "object": "chat.completion",
 				"model": req.Model, "choices": []map[string]any{{"index": 0, "message": msg, "finish_reason": finish}},
-				"usage": ChatUsage{PromptTokens: prompt, CompletionTokens: completion, TotalTokens: prompt + completion}})
+				"usage": s.chatUsage(prompt, completion)})
 			s.setOutcome(rec, OutcomeOK)
 			return
 		}
@@ -609,10 +666,18 @@ func (s *Server) chat(w http.ResponseWriter, rec *Request, body []byte) {
 	prompt := int64(len(body)+3) / 4
 	completion := int64(len(content)+3) / 4
 	w.Header().Set("X-Request-Id", fmt.Sprintf("fake-req-%d", rec.Seq))
+	if req.Stream {
+		msg, err := json.Marshal(ChatMessage{Role: "assistant", Content: content})
+		if err != nil {
+			panic(err) // 只编码本包的结构体
+		}
+		s.streamChat(w, r, rec, req, msg, "stop", s.chatUsage(prompt, completion))
+		return
+	}
 	writeJSON(w, http.StatusOK, ChatReply{
 		ID: fmt.Sprintf("chatcmpl-fake-%d", rec.Seq), Object: "chat.completion", Model: req.Model,
 		Choices: []ChatChoice{{Message: ChatMessage{Role: "assistant", Content: content}, FinishReason: "stop"}},
-		Usage:   ChatUsage{PromptTokens: prompt, CompletionTokens: completion, TotalTokens: prompt + completion},
+		Usage:   s.chatUsage(prompt, completion),
 	})
 	s.setOutcome(rec, OutcomeOK)
 }
