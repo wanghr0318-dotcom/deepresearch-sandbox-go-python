@@ -390,7 +390,7 @@ func statusFor(code string) int {
 	case persistence.CodeNotCurrentAttempt, persistence.CodeCancelRequested,
 		persistence.CodeFingerprintMismatch, persistence.CodeCallInProgress, persistence.CodeSubrunClosed, CodeExecCancelled:
 		return 409
-	case persistence.CodeBudgetExhausted, persistence.CodeBudgetInsufficient, persistence.CodeSubrunBudgetExhausted,
+	case persistence.CodeBudgetExhausted, persistence.CodeBudgetInsufficient, persistence.CodeSubrunBudgetExhausted, persistence.CodeInsufficientQuota,
 		CodeExecQuotaExhausted, CodeExecCPUExhausted, CodeExecWallExhausted, CodeExecBlocked:
 		return 402
 	case persistence.CodeTriesExhausted, persistence.CodeToolBudgetExhausted:
@@ -417,7 +417,7 @@ func statusFor(code string) int {
 func retryableReason(reason string) bool {
 	switch reason {
 	case upstream.CodeUpstreamRateLimited, upstream.CodeUpstreamUnavailable, upstream.CodeUpstreamUnreachable,
-		persistence.CodeBudgetExhausted, persistence.CodeBudgetInsufficient, persistence.CodeSubrunBudgetExhausted,
+		persistence.CodeBudgetExhausted, persistence.CodeBudgetInsufficient, persistence.CodeSubrunBudgetExhausted, persistence.CodeInsufficientQuota,
 		persistence.CodeAccessRevoked, persistence.CodeNotCurrentAttempt, persistence.CodeCancelRequested,
 		CodeStoreUnavailable, CodeGatewayShutdown, CodeModelDegraded,
 		CodeExecCancelled, CodeExecQueueTimeout, CodeExecEnvUnavailable, CodeExecStartFailed,

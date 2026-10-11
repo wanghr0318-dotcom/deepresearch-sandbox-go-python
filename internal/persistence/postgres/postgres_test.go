@@ -2098,6 +2098,9 @@ func checkI3(t *testing.T, s *Store) {
 	if bad != nil {
 		t.Fatalf("违反 I3：%s", *bad)
 	}
+	if quotaTablesExist(t, s) { // 模型网关 G2：运行时调用的 hold 跟随 reservation，G1、G2 成立
+		checkQuota(t, s)
+	}
 }
 
 func beginCall(t *testing.T, s *Store, taskID, callID string) call.CallRecord {

@@ -20,7 +20,7 @@ import (
 )
 
 // undo0012 把库还原为只应用了 0011 的形状；回滚到更早迁移的测试先执行它。
-const undo0012 = `DROP TRIGGER tasks_fill_org ON tasks; DROP TRIGGER sessions_fill_org ON sessions; DROP FUNCTION agentbox_fill_org();
+const undo0012 = undo0013 + `DROP TRIGGER tasks_fill_org ON tasks; DROP TRIGGER sessions_fill_org ON sessions; DROP FUNCTION agentbox_fill_org();
 	ALTER TABLE tasks DROP COLUMN org_id, DROP COLUMN key_id;
 	ALTER TABLE sessions DROP COLUMN org_id, DROP COLUMN key_id;
 	DROP TABLE limits, apikey_pepper, org_invites, api_keys, org_members, orgs;

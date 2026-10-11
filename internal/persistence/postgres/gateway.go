@@ -6,12 +6,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/faultinject"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/quota"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/recovery"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/subrun"
 )
@@ -306,8 +308,9 @@ func (s *Store) ReserveTry(ctx context.Context, r call.ReserveTryRequest) (call.
 		var state, callSubrun string
 		var tries int
 		var expired bool
-		err = tx.QueryRow(ctx, `SELECT state, tries_used, now() >= deadline_at, COALESCE(subrun_id, '') FROM calls
-			WHERE task_id = $1 AND call_id = $2 FOR UPDATE`, r.TaskID, r.CallID).Scan(&state, &tries, &expired, &callSubrun)
+		var deadline time.Time
+		err = tx.QueryRow(ctx, `SELECT state, tries_used, now() >= deadline_at, COALESCE(subrun_id, ''), deadline_at FROM calls
+			WHERE task_id = $1 AND call_id = $2 FOR UPDATE`, r.TaskID, r.CallID).Scan(&state, &tries, &expired, &callSubrun, &deadline)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return notFoundf("调用 %s/%s", r.TaskID, r.CallID)
 		}
@@ -362,6 +365,16 @@ func (s *Store) ReserveTry(ctx context.Context, r call.ReserveTryRequest) (call.
 				sub.Available(), r.EstimateMicro)
 		}
 		tryNo := tries + 1
+		// 月度预算（模型网关 G2）：同一事务在任务的 org / user / key 各层级预留同额（hold_id = reservation_id）；
+		// 任一层级不足为 insufficient_quota，任务账本也不预留。锁顺序在 reservations 之后：quota_budgets → quota_holds。
+		qs, err := quotaScopeOfTask(ctx, tx, r.TaskID)
+		if err != nil {
+			return err
+		}
+		if err := reserveHoldTx(ctx, tx, holdRequest{ID: rid, Scope: qs, Source: quota.SourceTaskCall,
+			Ref: taskCallRef(r.TaskID, r.CallID, tryNo), Amount: r.EstimateMicro, Deadline: deadline}); err != nil {
+			return insufficientRejection(err)
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO reservations (reservation_id, task_id, call_id, try_no, kind, amount, state, subrun_id)
 			VALUES ($1, $2, $3, $4, 'money', $5, 'held', NULLIF($6, ''))`, rid, r.TaskID, r.CallID, tryNo, r.EstimateMicro, r.SubrunID); err != nil {
 			return err
@@ -612,6 +625,10 @@ func (s *Store) SettleTry(ctx context.Context, st call.Settlement) (call.CallRec
 		if _, err := tx.Exec(ctx, "UPDATE reservations SET state = $2 WHERE reservation_id = $1", rid, newRes); err != nil {
 			return err
 		}
+		// 月度预算的 hold 随 reservation 同步转换（模型网关 G2）；0013 之前创建的 reservation 没有 hold。
+		if _, err := settleHoldTx(ctx, tx, rid, newRes, spent+unknown); err != nil && !errors.Is(err, persistence.ErrNotFound) {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `UPDATE call_tries SET state = 'settled', outcome = $4, latency_ms = $5, cost_micro = $6, error = $7,
 				hedge_lost = $8
 			WHERE task_id = $1 AND call_id = $2 AND try_no = $3`, t.TaskID, t.CallID, t.TryNo, st.Outcome, st.LatencyMs, cost, st.Error,
@@ -740,6 +757,9 @@ func (s *Store) ConvertLedger(ctx context.Context) (recovery.LedgerConversion, e
 		if _, err := tx.Exec(ctx, `UPDATE call_tries t SET state = 'settled', outcome = 'unknown', error = $1
 			FROM reservations r WHERE r.reservation_id = t.reservation_id AND r.state = 'held' AND t.state = 'in_flight'`,
 			LedgerRestartError); err != nil {
+			return err
+		}
+		if err := convertTaskHoldsTx(ctx, tx); err != nil {
 			return err
 		}
 		return tx.QueryRow(ctx, `WITH x AS (UPDATE reservations SET state = 'charged_unknown' WHERE state = 'held' RETURNING kind, amount)

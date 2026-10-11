@@ -235,6 +235,60 @@ var invariantQueries = []struct {
 		UNION ALL
 		SELECT s.session_id, format('会话的 org 为 %s，key %s 的 org 为 %s', s.org_id, k.id, k.org_id)
 		FROM sessions s JOIN api_keys k ON k.id = s.key_id WHERE s.org_id <> k.org_id`},
+	// 不变量 1（G1）：每个预算行 reserved = 该层级该月 held hold 的金额之和，spent = settled hold 的 charged 之和，
+	// unknown = charged_unknown hold 的 charged 之和（即 spent + unknown = 已结算 hold 的 charged 之和）；hold 指向的
+	// 预算行必须存在。
+	{"G1", "A", `WITH ` + quotaLevelsCTE + `,
+		agg AS (SELECT k, i, period, COALESCE(sum(amount_micro) FILTER (WHERE state = 'held'), 0) AS held,
+				COALESCE(sum(charged_micro) FILTER (WHERE state = 'settled'), 0) AS spent,
+				COALESCE(sum(charged_micro) FILTER (WHERE state = 'charged_unknown'), 0) AS unk
+			FROM lv GROUP BY k, i, period)
+		SELECT COALESCE(b.scope_kind, agg.k) || ':' || COALESCE(b.scope_id, agg.i) || '@' || to_char(COALESCE(b.period, agg.period), 'YYYY-MM'),
+			format('reserved=%s（held 之和 %s），spent=%s（settled 之和 %s），unknown=%s（charged_unknown 之和 %s）',
+				COALESCE(b.reserved_micro::text, '∅'), COALESCE(agg.held, 0), COALESCE(b.spent_micro::text, '∅'), COALESCE(agg.spent, 0),
+				COALESCE(b.unknown_micro::text, '∅'), COALESCE(agg.unk, 0))
+		FROM quota_budgets b FULL JOIN agg ON agg.k = b.scope_kind AND agg.i = b.scope_id AND agg.period = b.period
+		WHERE b.scope_kind IS NULL OR b.reserved_micro <> COALESCE(agg.held, 0) OR b.spent_micro <> COALESCE(agg.spent, 0)
+			OR b.unknown_micro <> COALESCE(agg.unk, 0)`},
+	// 不变量 2（G2）：有上限的层级 spent + reserved + unknown ≤ limit。hold 结算时 charged 超过其预留（实际费用或 unknown
+	// 的保守估计高于预留）造成的超出单独报告（QuotaOvershoots），扣除后仍超出才是违反。
+	{"G2", "A", `WITH ` + quotaLevelsCTE + `, ` + quotaOverCTE + `
+		SELECT b.scope_kind || ':' || b.scope_id || '@' || to_char(b.period, 'YYYY-MM'),
+			format('spent %s + reserved %s + unknown %s = %s > limit %s（其中结算超出预留 %s）', b.spent_micro, b.reserved_micro,
+				b.unknown_micro, b.spent_micro + b.reserved_micro + b.unknown_micro, b.limit_micro, COALESCE(o.amt, 0))
+		FROM quota_budgets b LEFT JOIN excess o ON o.k = b.scope_kind AND o.i = b.scope_id AND o.period = b.period
+		WHERE b.limit_micro IS NOT NULL
+			AND b.spent_micro + b.reserved_micro + b.unknown_micro - COALESCE(o.amt, 0) > b.limit_micro`},
+}
+
+// quotaLevelsCTE 把每个 hold 展开到它的各个层级（lv：k、i、period、state、amount_micro、charged_micro）。
+const quotaLevelsCTE = `lv AS (SELECT 'org' AS k, org_id::text AS i, period, state, amount_micro, charged_micro FROM quota_holds
+		UNION ALL SELECT 'user', user_id::text, period, state, amount_micro, charged_micro FROM quota_holds WHERE user_id IS NOT NULL
+		UNION ALL SELECT 'key', key_id, period, state, amount_micro, charged_micro FROM quota_holds WHERE key_id IS NOT NULL)`
+
+// quotaOverCTE 是各层级各月已结算 hold 的 charged 超出其预留的部分之和（excess：k、i、period、amt）。
+const quotaOverCTE = `excess AS (SELECT k, i, period, sum(charged_micro - amount_micro) AS amt FROM lv
+		WHERE state IN ('settled', 'charged_unknown') AND charged_micro > amount_micro GROUP BY k, i, period)`
+
+// QuotaOvershoots 列出超过上限、但超出部分全部来自 hold 结算超出预留的预算行（不变量 G2 单独报告的情形，不是违反）。
+func (s *Store) QuotaOvershoots(ctx context.Context) ([]string, error) {
+	var out []string
+	err := s.read(ctx, "QuotaOvershoots", func(ctx context.Context, q queryer) error {
+		rows, err := q.Query(ctx, `WITH `+quotaLevelsCTE+`, `+quotaOverCTE+`
+			SELECT format('%s:%s@%s：spent %s + reserved %s + unknown %s = %s > limit %s，结算超出预留 %s',
+				b.scope_kind, b.scope_id, to_char(b.period, 'YYYY-MM'), b.spent_micro, b.reserved_micro, b.unknown_micro,
+				b.spent_micro + b.reserved_micro + b.unknown_micro, b.limit_micro, o.amt)
+			FROM quota_budgets b JOIN excess o ON o.k = b.scope_kind AND o.i = b.scope_id AND o.period = b.period
+			WHERE b.limit_micro IS NOT NULL AND b.spent_micro + b.reserved_micro + b.unknown_micro > b.limit_micro
+				AND b.spent_micro + b.reserved_micro + b.unknown_micro - o.amt <= b.limit_micro
+			ORDER BY 1`)
+		if err != nil {
+			return err
+		}
+		out, err = pgx.CollectRows(rows, pgx.RowTo[string])
+		return err
+	})
+	return out, err
 }
 
 // DBViolations 运行只依赖数据库的不变量检查（实现 invariants.Store）。

@@ -50,13 +50,16 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agentbox verify-invariants: 需要 --data-dir 与 --database-url（或环境变量 "+databaseURLEnv+"）")
 		return 2
 	}
-	vs, err := verify(*dataDir, *dsn, *cgroupRoot, *quiescent, *timeout)
+	vs, notes, err := verify(*dataDir, *dsn, *cgroupRoot, *quiescent, *timeout)
 	if err != nil {
 		fmt.Fprintln(stderr, "agentbox verify-invariants:", err)
 		return 2
 	}
 	for _, v := range vs {
 		fmt.Fprintf(stdout, "%s [%s] %s\n", v.ID, v.Class, v.Detail)
+	}
+	for _, n := range notes { // G2 单独报告：hold 结算超出预留造成的超额，不算违反
+		fmt.Fprintf(stdout, "G2 [超额，非违反] %s\n", n)
 	}
 	if len(vs) > 0 {
 		fmt.Fprintf(stderr, "agentbox verify-invariants: %d 项违反\n", len(vs))
@@ -66,32 +69,37 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func verify(dataDir, dsn, cgroupRoot string, quiescent bool, timeout time.Duration) ([]invariants.Violation, error) {
+func verify(dataDir, dsn, cgroupRoot string, quiescent bool, timeout time.Duration) ([]invariants.Violation, []string, error) {
 	dir, err := filepath.Abs(dataDir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	installID, ok, err := datadir.NewIDFile(dir).Read()
 	switch {
 	case err != nil:
-		return nil, err
+		return nil, nil, err
 	case !ok:
-		return nil, fmt.Errorf("数据目录 %s 没有 install_id：不是已引导的安装", dir)
+		return nil, nil, fmt.Errorf("数据目录 %s 没有 install_id：不是已引导的安装", dir)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	store, err := postgres.Open(ctx, postgres.Options{DSN: dsn})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer store.Close()
 	scanner, err := local.New(local.Options{DataDir: dir, CgroupRoot: cgroupRoot, InstallID: installID, Starter: scanOnlyStarter{}})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	blobs, err := blob.NewLocal(filepath.Join(dir, "blobs"))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return invariants.Verify(ctx, store, scanner, blobs, quiescent)
+	vs, err := invariants.Verify(ctx, store, scanner, blobs, quiescent)
+	if err != nil {
+		return nil, nil, err
+	}
+	notes, err := store.QuotaOvershoots(ctx)
+	return vs, notes, err
 }

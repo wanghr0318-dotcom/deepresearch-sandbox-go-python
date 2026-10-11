@@ -67,6 +67,8 @@ const (
 	CodeFingerprintMismatch  = "fingerprint_mismatch"            // 同一 call_id 的指纹不同
 	CodeCallInProgress       = "call_in_progress"                // 该调用已有执行中的 try 或仍在解析
 	CodeToolBudgetExhausted  = "tool_budget_exhausted"           // 搜索/抓取的每 turn 工具调用额度已用完（429，不可重试）
+	// CodeInsufficientQuota：调用所属 org / user / key 的月度预算不足（模型网关 G2；Gateway 以 402 返回，同预算耗尽）。
+	CodeInsufficientQuota = "insufficient_quota"
 )
 
 // sub-run 用例的原因码（规格 §8.4、§9.2、§9.6、§13；M4 Plan 14）。值与协议 subrun_started.code 及 Gateway 的
