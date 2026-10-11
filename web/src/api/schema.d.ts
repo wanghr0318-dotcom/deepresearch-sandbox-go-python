@@ -674,10 +674,294 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The authenticated caller (operator, user session or API key of any scope) */
+        get: operations["getMe"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List keys (members their own, owners their org's, the operator all), newest first */
+        get: operations["listKeys"];
+        put?: never;
+        /**
+         * Create a platform API key (the full key is returned once)
+         * @description A user session creates keys for itself only, in its current org; the operator must name the user
+         *     (`username`). API keys can never create keys (403 `permission_denied`). Only the HMAC of the secret is
+         *     stored; the full `abx_live_<id>_<secret>` key appears in this response and nowhere else.
+         */
+        post: operations["createKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/keys/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Revoke a key (idempotent; effective on every server at once via NOTIFY apikey_changed) */
+        delete: operations["revokeKey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create an org (operator only), optionally moving a user in as its owner */
+        post: operations["createOrg"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Move a user into an org or change their role (operator only; users join through invites)
+         * @description Operator administration (also `agentbox org add-member`). Owners invite instead
+         *     (`POST /v1/orgs/invites`); a user moves only by accepting. A user belongs to exactly one org. A user who
+         *     is still alone in their personal org `user-<id>` moves into the org; their keys in the old org are revoked
+         *     in the same transaction. A user in any other org is 409 `user_in_other_org`; another user's personal org
+         *     is 409 `personal_org_closed`. Demoting the last owner is 409 `last_owner`.
+         */
+        post: operations["addMember"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/invites": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Pending invites of the caller, plus (for owners) those their org sent (user session only) */
+        get: operations["listInvites"];
+        put?: never;
+        /**
+         * Invite a user into the caller's org (owners, user session only); the user moves only on accept
+         * @description Invites expire after 7 days. Inviting the same user again renews the invite. A personal org `user-<id>`
+         *     accepts no other members (409 `personal_org_closed`).
+         */
+        post: operations["createInvite"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/invites/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Decline (the invited user) or revoke (an owner of the org) an invite */
+        delete: operations["deleteInvite"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/invites/{id}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Accept an invite (the invited user); moves the user into the org and revokes their keys in the old org */
+        post: operations["acceptInvite"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/members/{user}": {
+        parameters: {
+            query?: {
+                /** @description The org name (required for the operator; an owner defaults to their own org) */
+                org?: string;
+            };
+            header?: never;
+            path: {
+                user: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Remove a member (owners, the operator) or leave the org yourself; they return to their personal org and their keys in this org are revoked */
+        delete: operations["removeMember"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        Me: {
+            operator: boolean;
+            /** @description Absent for the operator */
+            username?: string;
+            org?: {
+                /** Format: int64 */
+                id?: number;
+                name?: string;
+            };
+            /** @enum {string} */
+            role?: "owner" | "member";
+            scopes: ("runtime" | "models")[];
+            /** @description Present when the caller authenticated with an API key */
+            key_id?: string;
+        };
+        ApiKey: {
+            id: string;
+            name: string;
+            /** Format: int64 */
+            org_id: number;
+            username: string;
+            scopes: ("runtime" | "models")[];
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            expires_at?: string;
+            /** Format: date-time */
+            revoked_at?: string;
+            /**
+             * Format: date-time
+             * @description Updated at most once a minute
+             */
+            last_used_at?: string;
+        };
+        CreatedKey: components["schemas"]["ApiKey"] & {
+            /** @description The full key `abx_live_<id>_<secret>`, returned only here */
+            key: string;
+        };
+        KeyList: {
+            keys: components["schemas"]["ApiKey"][];
+        };
+        CreateKeyRequest: {
+            name: string;
+            scopes: ("runtime" | "models")[];
+            /** Format: date-time */
+            expires_at?: string;
+            /** @description Operator only: the user the key is for */
+            username?: string;
+        };
+        Org: {
+            /** Format: int64 */
+            id: number;
+            name: string;
+            disabled: boolean;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            members: number;
+            owner?: components["schemas"]["Membership"];
+        };
+        CreateOrgRequest: {
+            name: string;
+            /** @description A username still alone in their personal org */
+            owner?: string;
+        };
+        Membership: {
+            /** Format: int64 */
+            org_id: number;
+            org: string;
+            username: string;
+            /** @enum {string} */
+            role: "owner" | "member";
+        };
+        AddMemberRequest: {
+            username: string;
+            /** @enum {string} */
+            role: "owner" | "member";
+            /** @description The org name */
+            org: string;
+        };
+        InviteRequest: {
+            username: string;
+            /** @enum {string} */
+            role: "owner" | "member";
+        };
+        Invite: {
+            id: string;
+            /** Format: int64 */
+            org_id: number;
+            org: string;
+            username: string;
+            /** @enum {string} */
+            role: "owner" | "member";
+            invited_by: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            expires_at: string;
+        };
+        InviteList: {
+            invites: components["schemas"]["Invite"][];
+        };
         Error: {
             code: string;
             message: string;
@@ -1501,6 +1785,24 @@ export interface components {
         };
     };
     responses: {
+        /** @description `unauthorized` (no valid session or Bearer token); or `invalid_api_key`: the API key is malformed, unknown, revoked or expired, or its user or org is disabled */
+        KeyUnauthorized: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description `forbidden` (not open to this caller, or not the caller's key or org); or `permission_denied`: API keys can never manage keys, members or orgs */
+        KeyForbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
         /** @description `session_not_found` (also another user's session, an unowned one, and for a user a `closed` one) */
         SessionNotFound: {
             headers: {
@@ -2761,6 +3063,455 @@ export interface operations {
             };
             500: components["responses"]["BlobUnavailable"];
             503: components["responses"]["SessionsUnavailable"];
+        };
+    };
+    getMe: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The caller's principal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["Forbidden"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    listKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The keys (never the secrets) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KeyList"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    createKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateKeyRequest"];
+            };
+        };
+        responses: {
+            /** @description The key, including the full secret (shown once) */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreatedKey"];
+                };
+            };
+            /** @description `invalid_request` (name, expires_at in the past, operator without username) or `invalid_scopes` */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            /** @description `user_not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    revokeKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The revoked key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiKey"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            /** @description `key_not_found` (also a key the caller may not manage) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    createOrg: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateOrgRequest"];
+            };
+        };
+        responses: {
+            /** @description The org */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Org"];
+                };
+            };
+            /** @description `invalid_request` or `invalid_org_name` (2–63 of a-z 0-9 . _ -; `operator` and `user-<n>` are reserved) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            /** @description `user_not_found` (owner) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `org_exists`; or `user_in_other_org`: the owner is no longer alone in their personal org (nothing is created) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    addMember: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddMemberRequest"];
+            };
+        };
+        responses: {
+            /** @description The membership */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Membership"];
+                };
+            };
+            /** @description `invalid_request` (role, missing org, the reserved org `operator`) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            /** @description `user_not_found` or `org_not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `user_in_other_org`, `personal_org_closed` or `last_owner` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    listInvites: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Pending, unexpired invites */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InviteList"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    createInvite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InviteRequest"];
+            };
+        };
+        responses: {
+            /** @description The pending invite */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Invite"];
+                };
+            };
+            /** @description `invalid_request` */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            /** @description `user_not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `personal_org_closed` or `already_member` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    deleteInvite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            /** @description `invite_not_found` (also expired, or not visible to the caller) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    acceptInvite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The new membership */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Membership"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            /** @description `invite_not_found` (also expired, or another user's invite) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `user_in_other_org` (the user is no longer alone in their personal org) or `last_owner` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
+        };
+    };
+    removeMember: {
+        parameters: {
+            query?: {
+                /** @description The org name (required for the operator; an owner defaults to their own org) */
+                org?: string;
+            };
+            header?: never;
+            path: {
+                user: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `invalid_request` (operator without org) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["KeyUnauthorized"];
+            403: components["responses"]["KeyForbidden"];
+            /** @description `member_not_found`, `user_not_found` or `org_not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `last_owner` or `personal_org` (a user cannot leave their personal org) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+            503: components["responses"]["Unavailable"];
         };
     };
 }

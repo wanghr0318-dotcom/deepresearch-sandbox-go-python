@@ -14,6 +14,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/account"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/tenant"
 )
 
 // SessionCookie 是用户会话 cookie 的名称（值为会话 ID 明文；库中只存其 sha256）。
@@ -26,16 +27,32 @@ const (
 	maxTopicRunes     = 500
 )
 
-// principal 是请求的调用者：运维（Bearer token）或用户（会话 cookie）。
+// principal 是请求的调用者：运维（Bearer token）、用户（会话 cookie）或以用户身份调用的平台 API key（模型网关
+// 设计 §5：key 只在其 scope 内代表其用户，永远不能管理 key、成员、org、限额与预算）。
 type principal struct {
-	admin bool
-	user  User
+	admin  bool
+	user   User
+	key    string        // 平台 API key ID；cookie 与运维为空
+	scopes tenant.Scopes // key 调用者的 scope（cookie 与运维为全部）
+}
+
+// tenant 返回调用者的 tenant.Principal（运维的 OrgID 为 0：运维创建的任务与会话由数据库归入保留 org operator）。
+func (p principal) tenant() tenant.Principal {
+	if p.admin {
+		return tenant.Principal{Operator: true, Scopes: tenant.AllScopes}
+	}
+	tp := tenant.Principal{OrgID: p.user.OrgID, UserID: p.user.ID, KeyID: p.key, Scopes: tenant.AllScopes, Role: tenant.Role(p.user.OrgRole)}
+	if p.key != "" {
+		tp.Scopes = p.scopes
+	}
+	return tp
 }
 
 type principalKey struct{}
 
+// withPrincipal 同时放入 tenant.Principal（tenant.FromContext 可读）。
 func withPrincipal(ctx context.Context, p principal) context.Context {
-	return context.WithValue(ctx, principalKey{}, p)
+	return tenant.WithPrincipal(context.WithValue(ctx, principalKey{}, p), p.tenant())
 }
 
 // principalFrom 返回已认证的调用者；未启用账号或尚未认证时 ok 为 false。
@@ -54,20 +71,35 @@ const (
 	audienceList                    // 运维看全部；用户只看自己的
 	audienceUser                    // 只限用户会话；运维 403 forbidden
 	audienceSession                 // 运维，或会话的所有者（由会话处理器判定；他人 404 session_not_found）
+	audienceCookie                  // 只限用户的 cookie 会话（登出）；运维 403 forbidden，API key 403 permission_denied
+	audienceMe                      // 任何已认证的调用者（含任意 scope 的 API key）
+	audienceManage                  // 运维或用户 cookie 会话（管理 key、成员）；API key 403 permission_denied
 )
+
+// keyAllowed 报告 API key 调用者能否访问 audience 的操作：/v1/me 总可以；用户的运行时操作（会话、研究、任务）
+// 需要 runtime scope；运维、登出与管理操作永远不可以。
+func keyAllowed(aud audience, p principal) bool {
+	switch aud {
+	case audienceMe:
+		return true
+	case audienceUser, audienceTask, audienceList, audienceSession:
+		return p.scopes.Has(tenant.Runtime)
+	}
+	return false
+}
 
 // accountRoutes 只在 Config.Accounts 非 nil 时注册。
 var accountRoutes = []route{
 	{"POST", "/auth/register", accessWrite, audienceAnyone, []int{201, 400, 401, 403, 409, 429, 500, 503}, (*Handler).register},
 	{"POST", "/auth/login", accessWrite, audienceAnyone, []int{200, 400, 401, 403, 429, 500, 503}, (*Handler).login},
-	{"POST", "/auth/logout", accessWrite, audienceUser, []int{204, 401, 403, 500, 503}, (*Handler).logout},
+	{"POST", "/auth/logout", accessWrite, audienceCookie, []int{204, 401, 403, 500, 503}, (*Handler).logout},
 	{"GET", "/auth/me", accessRead, audienceUser, []int{200, 401, 403, 500, 503}, (*Handler).me},
 	{"POST", "/research", accessWrite, audienceUser, []int{202, 400, 401, 403, 409, 500, 503}, (*Handler).createResearch},
 }
 
 // allRoutes 是全部可能注册的操作（openapi.yaml 描述的全集）。
 func allRoutes() []route {
-	return append(append(append([]route{}, routes...), accountRoutes...), sessionRoutes...)
+	return append(append(append(append([]route{}, routes...), accountRoutes...), sessionRoutes...), tenantRoutes...)
 }
 
 func (h *Handler) now() time.Time {
@@ -128,10 +160,13 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, aud audience
 	case !ok:
 		writeError(w, http.StatusUnauthorized, "unauthorized", "需要登录或有效的 Bearer token")
 		return r, false
+	case p.key != "" && !keyAllowed(aud, p):
+		writeError(w, http.StatusForbidden, "permission_denied", "API key 无权调用该操作（缺少 scope，或该操作需要登录会话或运维 token）")
+		return r, false
 	case aud == audienceAdmin && !p.admin:
 		writeError(w, http.StatusForbidden, "forbidden", "该操作只对运维开放")
 		return r, false
-	case aud == audienceUser && p.admin:
+	case (aud == audienceUser || aud == audienceCookie) && p.admin:
 		writeError(w, http.StatusForbidden, "forbidden", "该操作只对用户会话开放")
 		return r, false
 	}
@@ -404,7 +439,7 @@ func (h *Handler) createResearch(w http.ResponseWriter, r *http.Request) {
 	}
 	req := CreateTaskRequest{
 		RequestID: body.RequestID, BodyHash: bodyHash(canon), TaskID: h.cfg.NewTaskID(),
-		Spec: mustCanonical(spec), ConfigVersion: h.cfg.ConfigVersion, MaxFaultRetries: h.cfg.MaxFaultRetries,
+		Spec: mustCanonical(spec), ConfigVersion: h.cfg.ConfigVersion, MaxFaultRetries: h.cfg.MaxFaultRetries, KeyID: p.key,
 	}
 	if len(limits) > 0 {
 		req.Limits = mustCanonical(limits)

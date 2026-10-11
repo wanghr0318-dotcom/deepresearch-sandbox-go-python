@@ -35,7 +35,7 @@ func TestConsumersDoNotDependOnPostgres(t *testing.T) {
 		"internal/api", "internal/task", "internal/session", "internal/runner", "internal/resource",
 		"internal/ownership", "internal/persistence", "internal/datadir", "internal/blob",
 		"internal/gateway/call", "internal/gateway/edge", "internal/gateway/upstream", "internal/gateway/cache",
-		"internal/gateway/workspace", "internal/gateway/mcp",
+		"internal/gateway/workspace", "internal/gateway/mcp", "internal/tenant", "internal/apikey",
 	} {
 		forbid(t, pkg, forbidden)
 	}
@@ -140,6 +140,17 @@ func TestAccountIsPureLogic(t *testing.T) {
 	forbidDirect(t, "internal/account", []string{
 		module + "/internal/persistence", "net/http", module + "/internal/api",
 	})
+}
+
+// TestTenancyLayering：tenant 是多租户的纯模型（Principal、角色、scope、授权规则），只依赖标准库；apikey 不处理 HTTP，
+// 也不依赖 api（模型网关设计 2026-10-11 §3：tenant ← apikey ← api / modelapi）。
+func TestTenancyLayering(t *testing.T) {
+	for _, d := range deps(t, "internal/tenant") {
+		if first, _, _ := strings.Cut(d, "/"); strings.Contains(first, ".") && d != module+"/internal/tenant" {
+			t.Errorf("internal/tenant 依赖了标准库之外的包 %s", d)
+		}
+	}
+	forbid(t, "internal/apikey", []string{"net/http", module + "/internal/api"})
 }
 
 // TestSubrunIsPureLogic：subrun 是 sub-run 的纯逻辑（状态机、定义哈希、恢复判定），传递依赖中不得有

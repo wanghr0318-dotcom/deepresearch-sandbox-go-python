@@ -26,6 +26,7 @@ type CreateSessionRequest struct {
 	SessionID   string
 	OwnerUserID int64 // 0 = 运维创建（无主）
 	Title       string
+	KeyID       string // 创建会话的平台 API key（cookie 与运维为空）
 }
 
 // CreateTurnRequest 是向会话发送一条消息（或恢复一个 turn）的输入。TaskID 由调用方在事务前生成。
@@ -43,6 +44,7 @@ type CreateTurnRequest struct {
 	// Research 覆盖服务端生成的 spec.research（只在 api 层合并进 Spec）。
 	Operator bool
 	Research json.RawMessage
+	KeyID    string // 发送消息的平台 API key（cookie 与运维为空）；turn 任务的 org 取该 key 的 org
 }
 
 // CreateTurnResult 是 CreateTurn 的结果（OpenAPI MessageResult）。

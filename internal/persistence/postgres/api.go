@@ -112,11 +112,12 @@ func createTaskTx(ctx context.Context, tx pgx.Tx, req api.CreateTaskRequest, bud
 	if turn != nil {
 		sessionID, restoredFrom, turnIndex, created = turn.sessionID, turn.restoredFrom, turn.turnIndex, turn.created
 	}
+	// org_id 由触发器填写（0012）：有 key_id 时取 key 的 org，否则取 owner 的 org，无主为保留 org operator。
 	if _, err := tx.Exec(ctx, `INSERT INTO tasks (task_id, spec_json, config_version, limits_json, status, max_fault_retries, owner_user_id,
-			session_id, turn_index, restored_from_task_id)
-		VALUES ($1, $2, $3, $4, 'queued', $5, NULLIF($6::bigint, 0), NULLIF($7, ''), $8, NULLIF($9, ''))`,
+			session_id, turn_index, restored_from_task_id, key_id)
+		VALUES ($1, $2, $3, $4, 'queued', $5, NULLIF($6::bigint, 0), NULLIF($7, ''), $8, NULLIF($9, ''), NULLIF($10, ''))`,
 		req.TaskID, []byte(req.Spec), req.ConfigVersion, nullJSON(req.Limits), req.MaxFaultRetries, owner,
-		sessionID, turnIndex, restoredFrom); err != nil {
+		sessionID, turnIndex, restoredFrom, req.KeyID); err != nil {
 		return err
 	}
 	for _, q := range []string{

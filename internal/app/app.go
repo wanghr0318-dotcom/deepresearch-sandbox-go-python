@@ -29,6 +29,7 @@ import (
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/admission"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/apikey"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/blob"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/datadir"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/cache"
@@ -47,6 +48,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/runner"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/session"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/task"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/tenant"
 )
 
 // ErrOwnershipLost 是失去数据库所有权后 Run 返回的错误（errors.Is 同时匹配 persistence.ErrOwnershipLost）。
@@ -484,6 +486,9 @@ type Store interface {
 	turnFactsStore
 	EnvUIDRangeID(ctx context.Context, envID string) (string, error)
 	Sessions() api.Sessions
+	// 多租户（模型网关设计 2026-10-11；G1）：org、成员与 key 的管理用例，以及 key 校验读取与 apikey_changed 通知。
+	Tenancy() tenant.Store
+	APIKeys() apikey.Source
 	subrunStore // sub-run 生命周期（M4 Plan 14），经 subrunHost 交给 runner
 	// Migrate 执行尚未应用的迁移（安装引导之后）。
 	Migrate(ctx context.Context) error
@@ -661,6 +666,8 @@ type server struct {
 	cancelWork context.CancelFunc
 	bg         sync.WaitGroup // 后台 goroutine（cleanup loop、报警重试）
 
+	pepper []byte // 平台 API key 的 pepper（启用账号时由 EnsurePepper 取得）
+
 	apiSrv    *http.Server
 	apiCtx    context.Context // API 请求的基础 ctx：关闭 API 时取消（结束 SSE）
 	cancelAPI context.CancelFunc
@@ -736,6 +743,13 @@ func (s *server) run(ctx context.Context, deadline <-chan time.Time) error {
 		return fmt.Errorf("app: 迁移: %w", err)
 	}
 	s.step("migrate")
+	if s.cfg.Accounts {
+		// 平台 API key（G1）：<data>/apikey.pepper 须与数据库登记的指纹一致；首次启动（库中没有 key 与指纹）时创建。
+		// 不一致或缺失时拒绝启动（apikey.ErrPepper，server 退出码 2），不静默另建使已发放的 key 全部失效。
+		if s.pepper, err = apikey.EnsurePepper(ctx, dir, store.APIKeys()); err != nil {
+			return fmt.Errorf("app: %w", err)
+		}
+	}
 	if err := s.assemble(); err != nil {
 		return err
 	}
@@ -1312,8 +1326,18 @@ func (s *server) startAPI() error {
 	}
 	store := notifyingStore{Store: s.store, s: s}
 	var accounts api.Accounts // 未启用时保持 nil 接口（api 以 nil 判定）
+	var tenancy tenant.Store
+	var keys api.KeyVerifier
 	if s.cfg.Accounts {
 		accounts = notifyingAccounts{Accounts: s.store, n: store}
+		// 平台 API key（G1）：pepper 已在迁移之后核对（EnsurePepper）。
+		v := apikey.NewVerifier(s.store.APIKeys(), s.pepper, nil)
+		s.bg.Add(1)
+		go func() {
+			defer s.bg.Done()
+			v.Watch(s.apiCtx, s.store.APIKeys(), s.log) // 关闭 API 时 apiCtx 取消
+		}()
+		tenancy, keys = s.store.Tenancy(), v
 	}
 	var sessions api.Sessions // 未启用会话时保持 nil 接口：会话端点 503 sessions_unavailable
 	if s.cfg.sessionsEnabled() {
@@ -1327,6 +1351,7 @@ func (s *server) startAPI() error {
 		EffectiveLimits: s.cfg.effectiveLimits, CacheMetrics: s.cacheMetrics,
 		Accounts: accounts, ResearchSpec: s.cfg.researchSpec, SecureCookies: tlsCfg != nil,
 		Sessions: sessions, TurnSpec: s.cfg.turnSpec, ServerInfo: s.serverInfo,
+		Tenancy: tenancy, APIKeys: keys,
 	})
 	if err != nil {
 		_ = ln.Close()

@@ -224,6 +224,17 @@ var invariantQueries = []struct {
 	{"I11", "A", `SELECT uid_range_id, format('%s 个存活环境使用同一 UID 范围：%s', count(*), string_agg(env_id, ', ' ORDER BY env_id))
 		FROM environments WHERE stopped_at IS NULL AND uid_range_id IS NOT NULL
 		GROUP BY uid_range_id HAVING count(*) > 1`},
+	// 模型网关设计 §9 的不变量 4（G4）：每个未吊销 API key 的 org 等于其用户当前的 org（成员迁出时其在旧 org 的 key
+	// 同一事务吊销，故只核对未吊销的 key）。
+	{"G4", "A", `SELECT k.id, format('key 的 org 为 %s，用户 %s 的 org 为 %s', k.org_id, k.user_id, COALESCE(m.org_id::text, '∅'))
+		FROM api_keys k LEFT JOIN org_members m ON m.user_id = k.user_id
+		WHERE k.revoked_at IS NULL AND m.org_id IS DISTINCT FROM k.org_id`},
+	// 不变量 5（G5）：带 key_id 的任务与会话属于该 key 的 org。
+	{"G5", "A", `SELECT t.task_id, format('任务的 org 为 %s，key %s 的 org 为 %s', t.org_id, k.id, k.org_id)
+		FROM tasks t JOIN api_keys k ON k.id = t.key_id WHERE t.org_id <> k.org_id
+		UNION ALL
+		SELECT s.session_id, format('会话的 org 为 %s，key %s 的 org 为 %s', s.org_id, k.id, k.org_id)
+		FROM sessions s JOIN api_keys k ON k.id = s.key_id WHERE s.org_id <> k.org_id`},
 }
 
 // DBViolations 运行只依赖数据库的不变量检查（实现 invariants.Store）。
