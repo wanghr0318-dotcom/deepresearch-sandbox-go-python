@@ -1,0 +1,14 @@
+data: {"id":"chatcmpl-k2","object":"chat.completion.chunk","created":1700000011,"model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-k2","object":"chat.completion.chunk","created":1700000011,"model":"kimi-k3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"functions.web_search:0","type":"function","function":{"name":"web_search","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-k2","object":"chat.completion.chunk","created":1700000011,"model":"kimi-k3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-k2","object":"chat.completion.chunk","created":1700000011,"model":"kimi-k3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-k2","object":"chat.completion.chunk","created":1700000011,"model":"kimi-k3","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-k2","object":"chat.completion.chunk","created":1700000011,"model":"kimi-k3","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28}}
+
+data: [DONE]
+

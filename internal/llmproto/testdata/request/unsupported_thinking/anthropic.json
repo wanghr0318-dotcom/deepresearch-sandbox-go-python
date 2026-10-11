@@ -1,0 +1,10 @@
+{
+  "model": "smart",
+  "max_tokens": 2048,
+  "thinking": {"type": "enabled", "budget_tokens": 1024},
+  "messages": [
+    {"role": "user", "content": "q"},
+    {"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "sig=="}, {"type": "text", "text": "a"}]},
+    {"role": "user", "content": "more"}
+  ]
+}

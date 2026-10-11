@@ -1,0 +1,111 @@
+{
+  "model": "smart",
+  "max_tokens": 1024,
+  "system": "Use tools.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Weather in Paris and Tokyo?"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "call_1",
+          "name": "get_weather",
+          "input": {
+            "city": "Paris"
+          }
+        },
+        {
+          "type": "tool_use",
+          "id": "call_2",
+          "name": "get_weather",
+          "input": {
+            "city": "Tokyo",
+            "unit": "c"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "call_1",
+          "content": "18C cloudy"
+        },
+        {
+          "type": "tool_result",
+          "tool_use_id": "call_2",
+          "content": "25C sunny"
+        },
+        {
+          "type": "text",
+          "text": "Which is warmer?"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "Tokyo."
+        },
+        {
+          "type": "tool_use",
+          "id": "call_3",
+          "name": "get_time",
+          "input": {}
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "call_3",
+          "content": "12:00"
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Current weather",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          },
+          "unit": {
+            "type": "string",
+            "enum": [
+              "c",
+              "f"
+            ]
+          }
+        },
+        "required": [
+          "city"
+        ]
+      }
+    },
+    {
+      "name": "get_time",
+      "input_schema": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "auto"
+  }
+}

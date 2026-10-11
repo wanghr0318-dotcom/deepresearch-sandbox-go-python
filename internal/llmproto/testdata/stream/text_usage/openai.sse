@@ -1,0 +1,12 @@
+data: {"id":"chatcmpl-s1","object":"chat.completion.chunk","created":1700000100,"model":"kimi-k3","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-s1","object":"chat.completion.chunk","created":1700000100,"model":"kimi-k3","choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-s1","object":"chat.completion.chunk","created":1700000100,"model":"kimi-k3","choices":[{"index":0,"delta":{"content":"lo & <you>"},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-s1","object":"chat.completion.chunk","created":1700000100,"model":"kimi-k3","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}
+
+data: {"id":"chatcmpl-s1","object":"chat.completion.chunk","created":1700000100,"model":"kimi-k3","choices":[],"usage":{"prompt_tokens":120,"completion_tokens":4,"total_tokens":124,"prompt_tokens_details":{"cached_tokens":100}}}
+
+data: [DONE]
+

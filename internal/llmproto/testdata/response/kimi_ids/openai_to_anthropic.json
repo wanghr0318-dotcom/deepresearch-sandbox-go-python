@@ -1,0 +1,32 @@
+{
+  "id": "chatcmpl-k1",
+  "type": "message",
+  "role": "assistant",
+  "model": "kimi-k3",
+  "content": [
+    {
+      "type": "tool_use",
+      "id": "functions_web_search_0_61a05b74",
+      "name": "web_search",
+      "input": {
+        "q": "a"
+      }
+    },
+    {
+      "type": "tool_use",
+      "id": "functions_fetch_1_aea10592",
+      "name": "fetch",
+      "input": {
+        "url": "https://example.com"
+      }
+    }
+  ],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 20,
+    "output_tokens": 10,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0
+  }
+}

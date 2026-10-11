@@ -1,0 +1,20 @@
+{
+  "model": "smart",
+  "max_tokens": 100,
+  "system": "Be brief.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello"
+    }
+  ],
+  "tools": [
+    {
+      "name": "f",
+      "input_schema": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  ]
+}

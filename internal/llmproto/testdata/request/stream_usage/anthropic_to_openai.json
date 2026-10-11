@@ -1,0 +1,14 @@
+{
+  "model": "smart",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hi"
+    }
+  ],
+  "max_tokens": 50,
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  }
+}

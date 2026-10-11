@@ -212,6 +212,19 @@ func TestProtocolIsStdlibOnly(t *testing.T) {
 	}
 }
 
+// TestLLMProtoIsStdlibOnly: internal/llmproto (the model gateway's neutral format and codecs, design
+// 2026-10-11 §3) depends on the standard library only, so that any layer can use it.
+func TestLLMProtoIsStdlibOnly(t *testing.T) {
+	for _, d := range deps(t, "internal/llmproto") {
+		if d == module+"/internal/llmproto" {
+			continue
+		}
+		if first, _, _ := strings.Cut(d, "/"); strings.Contains(first, ".") {
+			t.Errorf("internal/llmproto depends on non-stdlib package %s", d)
+		}
+	}
+}
+
 // TestTestOnlyPackagesNotInProduction：provider/fake、providertest 只被测试导入（-deps 不含测试文件的导入）。
 func TestTestOnlyPackagesNotInProduction(t *testing.T) {
 	cmd := exec.Command("go", "list", module+"/...")

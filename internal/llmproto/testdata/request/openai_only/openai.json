@@ -1,0 +1,44 @@
+{
+  "model": "smart",
+  "max_completion_tokens": 200,
+  "metadata": {
+    "trace": "t1"
+  },
+  "store": false,
+  "logit_bias": {
+    "50256": -100
+  },
+  "service_tier": "auto",
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "hi"
+    },
+    {
+      "role": "assistant",
+      "content": "hello",
+      "refusal": null,
+      "annotations": [
+        {
+          "type": "url_citation",
+          "url_citation": {
+            "url": "https://example.com",
+            "title": "e",
+            "start_index": 0,
+            "end_index": 5
+          }
+        }
+      ],
+      "audio": null,
+      "function_call": null
+    },
+    {
+      "role": "user",
+      "content": "more"
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "id": "chatcmpl-2",
+  "type": "message",
+  "role": "assistant",
+  "model": "kimi-k3",
+  "content": [
+    {
+      "type": "text",
+      "text": "Let me check."
+    },
+    {
+      "type": "tool_use",
+      "id": "call_a",
+      "name": "get_weather",
+      "input": {
+        "city": "Paris"
+      }
+    },
+    {
+      "type": "tool_use",
+      "id": "call_b",
+      "name": "get_time",
+      "input": {}
+    }
+  ],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 40,
+    "output_tokens": 20,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0
+  }
+}

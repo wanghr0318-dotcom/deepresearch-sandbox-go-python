@@ -1,0 +1,14 @@
+data: {"id":"msg_s3","object":"chat.completion.chunk","created":1700000000,"model":"claude-x","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"msg_s3","object":"chat.completion.chunk","created":1700000000,"model":"claude-x","choices":[{"index":0,"delta":{"reasoning_content":"Let me "},"finish_reason":null}]}
+
+data: {"id":"msg_s3","object":"chat.completion.chunk","created":1700000000,"model":"claude-x","choices":[{"index":0,"delta":{"reasoning_content":"think."},"finish_reason":null}]}
+
+data: {"id":"msg_s3","object":"chat.completion.chunk","created":1700000000,"model":"claude-x","choices":[{"index":0,"delta":{"content":"42"},"finish_reason":null}]}
+
+data: {"id":"msg_s3","object":"chat.completion.chunk","created":1700000000,"model":"claude-x","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"msg_s3","object":"chat.completion.chunk","created":1700000000,"model":"claude-x","choices":[],"usage":{"prompt_tokens":30,"completion_tokens":40,"total_tokens":70}}
+
+data: [DONE]
+

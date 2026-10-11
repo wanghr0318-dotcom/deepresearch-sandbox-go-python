@@ -1,0 +1,22 @@
+{
+  "id": "msg_9",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-x",
+  "content": [
+    {
+      "type": "redacted_thinking",
+      "data": "abc"
+    },
+    {
+      "type": "text",
+      "text": "hello"
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 3,
+    "output_tokens": 2
+  }
+}

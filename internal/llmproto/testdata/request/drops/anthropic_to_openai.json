@@ -1,0 +1,44 @@
+{
+  "model": "smart",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Long cached context."
+    },
+    {
+      "role": "user",
+      "content": "Hello"
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "toolu_9",
+          "type": "function",
+          "function": {
+            "name": "f",
+            "arguments": "{}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "boom",
+      "tool_call_id": "toolu_9"
+    }
+  ],
+  "max_tokens": 100,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "f",
+        "parameters": {
+          "type": "object"
+        }
+      }
+    }
+  ]
+}

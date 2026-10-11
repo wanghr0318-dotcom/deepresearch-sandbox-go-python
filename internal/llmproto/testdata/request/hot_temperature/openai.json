@@ -1,0 +1,11 @@
+{
+  "model": "smart",
+  "max_tokens": 5,
+  "temperature": 1.5,
+  "messages": [
+    {
+      "role": "user",
+      "content": "x"
+    }
+  ]
+}

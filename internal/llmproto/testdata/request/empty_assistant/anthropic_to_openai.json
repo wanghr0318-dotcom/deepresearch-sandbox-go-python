@@ -1,0 +1,29 @@
+{
+  "model": "smart",
+  "messages": [
+    {
+      "role": "user",
+      "content": "a"
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "toolu_1",
+          "type": "function",
+          "function": {
+            "name": "f",
+            "arguments": "{}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "r",
+      "tool_call_id": "toolu_1"
+    }
+  ],
+  "max_tokens": 50
+}

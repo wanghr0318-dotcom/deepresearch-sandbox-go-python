@@ -15,6 +15,14 @@
 //   - -inject chat:3:503,search:2:429：第 N 次该类请求以给定状态回复（演示 Gateway 的重试与上游错误指标）。
 //   - -every chat:4:hang,fetch:5:503：该类请求中序号为 K 的倍数者挂起（直到客户端离开）、以给定状态回复或
 //     （disconnect）中途断开：故障速率固定的不稳定供应商（trace doctor 演示）。
+//
+// 模型网关（2026-10-11 设计 §10）：类别 messages 是 Anthropic 的 /v1/messages（base_url 为打印的 url）；
+// 以上各选项的 kind 都可以是 messages。
+//   - -anthropic-key-env NAME：/v1/messages 要求 x-api-key 等于环境变量 NAME 的值（Key 不出现在命令行）。
+//   - -fail-after chat:2:5,messages:1:3:error：该类第 N 次流式请求发出 K 个 SSE 事件后切断连接（加 :error 时
+//     改为发出错误事件，加 :midline 时在下一个事件的一行中间切断）。
+//   - -chunk-delay chat=50ms：流式回复相邻事件之间的延迟（首字延迟测量）。
+//   - -cache-usage 300:20：模型回复用量带缓存读取 300、缓存写入 20 个 token。
 package main
 
 import (
@@ -43,11 +51,19 @@ func main() {
 	inject := flag.String("inject", "", "注入的错误回复，逗号分隔的 kind:N:status（第 N 次该类请求以 status 回复）")
 	every := flag.String("every", "", "周期故障，逗号分隔的 kind:K:action（序号为 K 的倍数的请求；action 为 hang、disconnect 或 4xx/5xx 状态）")
 	suitePath := flag.String("eval-suite", "", "agentbox eval 的 suite 文件：编码任务的 fake_reply 作为 [stage:code] 回复")
+	keyEnv := flag.String("anthropic-key-env", "", "/v1/messages 要求 x-api-key 等于该环境变量的值")
+	failAfter := flag.String("fail-after", "", "流式故障，逗号分隔的 kind:N:K[:error]（第 N 次该类请求发出 K 个事件后切断或发出错误事件）")
+	chunkDelay := flag.String("chunk-delay", "", "流式回复相邻事件之间的延迟，逗号分隔的 kind=duration")
+	cacheUsage := flag.String("cache-usage", "", "模型回复用量中的缓存 token，read:write")
 	flag.Parse()
 
 	fu := fakeupstream.New()
 	fu.SetResearch(researchTasks)
 	if err := configure(fu, *latency, *inject, *every); err != nil {
+		fmt.Fprintln(os.Stderr, "fakeupstream:", err)
+		os.Exit(2)
+	}
+	if err := configureStreams(fu, *keyEnv, *failAfter, *chunkDelay, *cacheUsage); err != nil {
 		fmt.Fprintln(os.Stderr, "fakeupstream:", err)
 		os.Exit(2)
 	}
@@ -86,16 +102,19 @@ func main() {
 		}
 		break
 	}
-	fmt.Printf("counts chat=%d search=%d fetch=%d plan=%d summarize=%d report=%d code=%d\n",
+	fmt.Printf("counts chat=%d search=%d fetch=%d plan=%d summarize=%d report=%d code=%d messages=%d\n",
 		fu.Count(fakeupstream.Chat), fu.Count(fakeupstream.Search), fu.Count(fakeupstream.Fetch),
 		fu.StageCount(fakeupstream.StagePlan), fu.StageCount(fakeupstream.StageSummarize), fu.StageCount(fakeupstream.StageReport),
-		fu.StageCount(fakeupstream.StageCode))
+		fu.StageCount(fakeupstream.StageCode), fu.Count(fakeupstream.Messages))
 	fu.Close()
 }
 
+// kinds 是命令行中的类别名。
+var kinds = map[string]fakeupstream.Kind{"chat": fakeupstream.Chat, "search": fakeupstream.Search, "fetch": fakeupstream.Fetch,
+	"messages": fakeupstream.Messages}
+
 // configure 应用 -latency、-inject 与 -every。
 func configure(fu *fakeupstream.Server, latency, inject, every string) error {
-	kinds := map[string]fakeupstream.Kind{"chat": fakeupstream.Chat, "search": fakeupstream.Search, "fetch": fakeupstream.Fetch}
 	for _, item := range strings.Split(latency, ",") {
 		if item = strings.TrimSpace(item); item == "" {
 			continue
@@ -106,7 +125,7 @@ func configure(fu *fakeupstream.Server, latency, inject, every string) error {
 			fu.SetLatency(kind, d)
 			continue
 		}
-		return fmt.Errorf("-latency %q: 须为 kind=duration（kind 为 chat、search、fetch）", item)
+		return fmt.Errorf("-latency %q: 须为 kind=duration（kind 为 chat、search、fetch、messages）", item)
 	}
 	for _, item := range strings.Split(inject, ",") {
 		if item = strings.TrimSpace(item); item == "" {
@@ -155,4 +174,57 @@ func periodicAction(s string) (fakeupstream.Action, bool) {
 		return fakeupstream.Action{}, false
 	}
 	return fakeupstream.Action{Status: status}, true
+}
+
+// configureStreams 应用 -anthropic-key-env、-fail-after、-chunk-delay 与 -cache-usage。
+func configureStreams(fu *fakeupstream.Server, keyEnv, failAfter, chunkDelay, cacheUsage string) error {
+	if keyEnv != "" {
+		key := os.Getenv(keyEnv)
+		if key == "" {
+			return fmt.Errorf("-anthropic-key-env %s: 环境变量为空", keyEnv)
+		}
+		fu.SetAnthropicKey(key)
+	}
+	for _, item := range strings.Split(failAfter, ",") {
+		if item = strings.TrimSpace(item); item == "" {
+			continue
+		}
+		parts := strings.Split(item, ":")
+		if len(parts) == 3 || (len(parts) == 4 && (parts[3] == "error" || parts[3] == "midline")) {
+			kind, known := kinds[parts[0]]
+			n, nerr := strconv.Atoi(parts[1])
+			k, kerr := strconv.Atoi(parts[2])
+			if known && nerr == nil && kerr == nil && n >= 1 && k >= 1 {
+				mode := ""
+				if len(parts) == 4 {
+					mode = parts[3]
+				}
+				fu.Inject(kind, n, fakeupstream.Action{FailAfterChunks: k, FailWithError: mode == "error", FailMidLine: mode == "midline"})
+				continue
+			}
+		}
+		return fmt.Errorf("-fail-after %q: 须为 kind:N:K、kind:N:K:error 或 kind:N:K:midline（N、K ≥ 1）", item)
+	}
+	for _, item := range strings.Split(chunkDelay, ",") {
+		if item = strings.TrimSpace(item); item == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(item, "=")
+		d, err := time.ParseDuration(v)
+		if kind, known := kinds[k]; ok && known && err == nil && d >= 0 {
+			fu.SetChunkDelay(kind, d)
+			continue
+		}
+		return fmt.Errorf("-chunk-delay %q: 须为 kind=duration", item)
+	}
+	if cacheUsage != "" {
+		r, w, ok := strings.Cut(cacheUsage, ":")
+		read, rerr := strconv.ParseInt(r, 10, 64)
+		write, werr := strconv.ParseInt(w, 10, 64)
+		if !ok || rerr != nil || werr != nil || read < 0 || write < 0 {
+			return fmt.Errorf("-cache-usage %q: 须为 read:write（非负整数）", cacheUsage)
+		}
+		fu.SetCacheUsage(read, write)
+	}
+	return nil
 }

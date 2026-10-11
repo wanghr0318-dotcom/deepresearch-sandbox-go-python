@@ -1,0 +1,17 @@
+{
+  "model": "smart",
+  "max_tokens": 5,
+  "stop_sequences": [
+    "a",
+    "b",
+    "c",
+    "d",
+    "e"
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "x"
+    }
+  ]
+}

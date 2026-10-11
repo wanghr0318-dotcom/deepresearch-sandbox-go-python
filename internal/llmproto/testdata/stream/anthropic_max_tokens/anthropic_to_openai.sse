@@ -1,0 +1,10 @@
+data: {"id":"msg_s4","object":"chat.completion.chunk","created":1700000000,"model":"claude-x","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"msg_s4","object":"chat.completion.chunk","created":1700000000,"model":"claude-x","choices":[{"index":0,"delta":{"content":"Trunc"},"finish_reason":null}]}
+
+data: {"id":"msg_s4","object":"chat.completion.chunk","created":1700000000,"model":"claude-x","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+data: {"id":"msg_s4","object":"chat.completion.chunk","created":1700000000,"model":"claude-x","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}
+
+data: [DONE]
+

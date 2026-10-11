@@ -1,0 +1,23 @@
+{
+  "model": "smart",
+  "max_tokens": 1024,
+  "system": "Use tools.",
+  "messages": [
+    {"role": "user", "content": "Weather in Paris and Tokyo?"},
+    {"role": "assistant", "content": [
+      {"type": "text", "text": "Checking both."},
+      {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}},
+      {"type": "tool_use", "id": "toolu_2", "name": "get_weather", "input": {"city": "Tokyo", "unit": "c"}}
+    ]},
+    {"role": "user", "content": [
+      {"type": "tool_result", "tool_use_id": "toolu_1", "content": "18C cloudy"},
+      {"type": "tool_result", "tool_use_id": "toolu_2", "content": [{"type": "text", "text": "25C"}, {"type": "text", "text": "sunny"}]},
+      {"type": "text", "text": "Which is warmer?"}
+    ]}
+  ],
+  "tools": [
+    {"name": "get_weather", "description": "Current weather",
+      "input_schema": {"type": "object", "properties": {"city": {"type": "string"}, "unit": {"type": "string", "enum": ["c", "f"]}}, "required": ["city"]}}
+  ],
+  "tool_choice": {"type": "any"}
+}

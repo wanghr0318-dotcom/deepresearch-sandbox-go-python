@@ -1,0 +1,10 @@
+{
+  "model": "smart",
+  "max_tokens": 100,
+  "messages": [
+    {"role": "user", "content": "q"},
+    {"role": "assistant", "content": "", "reasoning_content": "thinking...", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+    {"role": "tool", "tool_call_id": "c1", "content": "r"}
+  ],
+  "reasoning_effort": "high"
+}
