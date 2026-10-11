@@ -274,7 +274,7 @@ func parseSSE(t *testing.T, b []byte) []sseFrame {
 		if err != nil {
 			t.Fatal(err)
 		}
-		out = append(out, sseFrame{ev.Event, ev.Data})
+		out = append(out, sseFrame(ev))
 	}
 }
 

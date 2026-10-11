@@ -92,11 +92,8 @@ func (d *anthropicStreamDecoder) apply(u *anthropicUsageDelta) {
 }
 
 func (d *anthropicStreamDecoder) Decode(ev SSEEvent) ([]Event, error) {
-	if d.done {
-		return nil, nil
-	}
 	data := strings.TrimSpace(ev.Data)
-	if data == "" {
+	if d.done || data == "" {
 		return nil, nil
 	}
 	var in anthropicEventIn
@@ -109,50 +106,11 @@ func (d *anthropicStreamDecoder) Decode(ev SSEEvent) ([]Event, error) {
 			return nil, fmt.Errorf("%w: message_start without message", ErrBadStream)
 		}
 		d.apply(in.Message.Usage)
-		out := Event{Type: EventMessageStart, ID: in.Message.ID, Model: in.Message.Model}
-		if d.hasUsage {
-			u := d.usage
-			out.Usage = &u
-		}
-		return []Event{out}, nil
+		return []Event{{Type: EventMessageStart, ID: in.Message.ID, Model: in.Message.Model, Usage: d.usageSoFar()}}, nil
 	case "content_block_start":
-		cb := in.ContentBlock
-		if cb == nil {
-			return nil, fmt.Errorf("%w: content_block_start without content_block", ErrBadStream)
-		}
-		var out []Event
-		switch cb.Type {
-		case "text":
-			out = append(out, Event{Type: EventBlockStart, Index: in.Index, Block: BlockText})
-			if cb.Text != "" {
-				out = append(out, Event{Type: EventBlockDelta, Index: in.Index, Text: cb.Text})
-			}
-		case "thinking":
-			out = append(out, Event{Type: EventBlockStart, Index: in.Index, Block: BlockThinking})
-			if cb.Thinking != "" {
-				out = append(out, Event{Type: EventBlockDelta, Index: in.Index, Text: cb.Thinking})
-			}
-		case "tool_use":
-			out = append(out, Event{Type: EventBlockStart, Index: in.Index, Block: BlockToolCall, ToolID: cb.ID, ToolName: cb.Name})
-		default:
-			d.skipped[in.Index] = true
-		}
-		return out, nil
+		return d.blockStart(in)
 	case "content_block_delta":
-		if d.skipped[in.Index] || in.Delta == nil {
-			return nil, nil
-		}
-		switch in.Delta.Type {
-		case "text_delta":
-			return []Event{{Type: EventBlockDelta, Index: in.Index, Text: in.Delta.Text}}, nil
-		case "input_json_delta":
-			return []Event{{Type: EventBlockDelta, Index: in.Index, Arguments: in.Delta.PartialJSON}}, nil
-		case "thinking_delta":
-			return []Event{{Type: EventBlockDelta, Index: in.Index, Text: in.Delta.Thinking}}, nil
-		case "signature_delta":
-			return []Event{{Type: EventBlockDelta, Index: in.Index, Signature: in.Delta.Signature}}, nil
-		}
-		return nil, nil
+		return d.blockDelta(in), nil
 	case "content_block_stop":
 		if d.skipped[in.Index] {
 			return nil, nil
@@ -160,18 +118,12 @@ func (d *anthropicStreamDecoder) Decode(ev SSEEvent) ([]Event, error) {
 		return []Event{{Type: EventBlockStop, Index: in.Index}}, nil
 	case "message_delta":
 		d.apply(in.Usage)
-		out := Event{Type: EventMessageDelta, StopReason: StopEnd}
-		if in.Delta != nil {
-			if in.Delta.StopReason != nil {
-				out.StopReason = stopFromAnthropic(*in.Delta.StopReason)
-			}
-			if in.Delta.StopSequence != nil {
-				out.StopSequence = *in.Delta.StopSequence
-			}
+		out := Event{Type: EventMessageDelta, StopReason: StopEnd, Usage: d.usageSoFar()}
+		if in.Delta != nil && in.Delta.StopReason != nil {
+			out.StopReason = stopFromAnthropic(*in.Delta.StopReason)
 		}
-		if d.hasUsage {
-			u := d.usage
-			out.Usage = &u
+		if in.Delta != nil && in.Delta.StopSequence != nil {
+			out.StopSequence = *in.Delta.StopSequence
 		}
 		return []Event{out}, nil
 	case "message_stop":
@@ -188,6 +140,53 @@ func (d *anthropicStreamDecoder) Decode(ev SSEEvent) ([]Event, error) {
 	return nil, nil // ping and unknown event types
 }
 
+// usageSoFar is a copy of the usage seen so far, or nil.
+func (d *anthropicStreamDecoder) usageSoFar() *Usage {
+	if !d.hasUsage {
+		return nil
+	}
+	u := d.usage
+	return &u
+}
+
+func (d *anthropicStreamDecoder) blockStart(in anthropicEventIn) ([]Event, error) {
+	cb := in.ContentBlock
+	if cb == nil {
+		return nil, fmt.Errorf("%w: content_block_start without content_block", ErrBadStream)
+	}
+	types := map[string]BlockType{"text": BlockText, "thinking": BlockThinking, "tool_use": BlockToolCall}
+	t, ok := types[cb.Type]
+	if !ok {
+		d.skipped[in.Index] = true
+		return nil, nil
+	}
+	out := []Event{{Type: EventBlockStart, Index: in.Index, Block: t, ToolID: cb.ID, ToolName: cb.Name}}
+	if initial := cb.Text + cb.Thinking; initial != "" {
+		out = append(out, Event{Type: EventBlockDelta, Index: in.Index, Text: initial})
+	}
+	return out, nil
+}
+
+func (d *anthropicStreamDecoder) blockDelta(in anthropicEventIn) []Event {
+	if d.skipped[in.Index] || in.Delta == nil {
+		return nil
+	}
+	ev := Event{Type: EventBlockDelta, Index: in.Index}
+	switch in.Delta.Type {
+	case "text_delta":
+		ev.Text = in.Delta.Text
+	case "input_json_delta":
+		ev.Arguments = in.Delta.PartialJSON
+	case "thinking_delta":
+		ev.Text = in.Delta.Thinking
+	case "signature_delta":
+		ev.Signature = in.Delta.Signature
+	default:
+		return nil // citations and unknown deltas
+	}
+	return []Event{ev}
+}
+
 // --- encoder ---
 
 // AnthropicStreamOptions configures an Anthropic stream encoder.
@@ -198,18 +197,17 @@ type AnthropicStreamOptions struct {
 }
 
 type anthropicStreamEncoder struct {
-	opts    AnthropicStreamOptions
-	index   map[int]int // source block index → output index
-	skipped map[int]bool
-	types   map[int]BlockType
-	next    int
-	ended   bool
+	opts  AnthropicStreamOptions
+	index map[int]int // source block index → output index (absent: block left out)
+	types map[int]BlockType
+	next  int
+	ended bool
 }
 
 // NewAnthropicStreamEncoder encodes neutral events as Anthropic message stream events. Output block indices
 // are renumbered from 0 in order of block_start.
 func NewAnthropicStreamEncoder(opts AnthropicStreamOptions) StreamEncoder {
-	return &anthropicStreamEncoder{opts: opts, index: map[int]int{}, skipped: map[int]bool{}, types: map[int]BlockType{}}
+	return &anthropicStreamEncoder{opts: opts, index: map[int]int{}, types: map[int]BlockType{}}
 }
 
 func anthropicFrame(v any) []byte {
@@ -276,54 +274,12 @@ func (e *anthropicStreamEncoder) Encode(ev Event) ([]byte, error) {
 		}
 		return anthropicFrame(anthropicMessageStartOut{Type: "message_start", Message: m}), nil
 	case EventBlockStart:
-		if ev.Block == BlockThinking && e.opts.Source == ProtocolOpenAI {
-			e.skipped[ev.Index] = true
-			return nil, nil
-		}
-		var cb map[string]any
-		switch ev.Block {
-		case BlockText:
-			cb = map[string]any{"type": "text", "text": ""}
-		case BlockThinking:
-			cb = map[string]any{"type": "thinking", "thinking": "", "signature": ""}
-		case BlockToolCall:
-			cb = map[string]any{"type": "tool_use", "id": ev.ToolID, "name": ev.ToolName, "input": map[string]any{}}
-		default:
-			e.skipped[ev.Index] = true
-			return nil, nil
-		}
-		out := e.next
-		e.next++
-		e.index[ev.Index] = out
-		e.types[ev.Index] = ev.Block
-		return anthropicFrame(anthropicBlockStartOut{Type: "content_block_start", Index: out, ContentBlock: cb}), nil
+		return e.blockStart(ev), nil
 	case EventBlockDelta:
-		out, ok := e.index[ev.Index]
-		if !ok || e.skipped[ev.Index] {
-			return nil, nil
-		}
-		var frames []byte
-		switch e.types[ev.Index] {
-		case BlockText:
-			if ev.Text != "" {
-				frames = anthropicFrame(anthropicDeltaOut{Type: "content_block_delta", Index: out, Delta: map[string]string{"type": "text_delta", "text": ev.Text}})
-			}
-		case BlockThinking:
-			if ev.Text != "" {
-				frames = anthropicFrame(anthropicDeltaOut{Type: "content_block_delta", Index: out, Delta: map[string]string{"type": "thinking_delta", "thinking": ev.Text}})
-			}
-			if ev.Signature != "" {
-				frames = append(frames, anthropicFrame(anthropicDeltaOut{Type: "content_block_delta", Index: out, Delta: map[string]string{"type": "signature_delta", "signature": ev.Signature}})...)
-			}
-		case BlockToolCall:
-			if ev.Arguments != "" {
-				frames = anthropicFrame(anthropicDeltaOut{Type: "content_block_delta", Index: out, Delta: map[string]string{"type": "input_json_delta", "partial_json": ev.Arguments}})
-			}
-		}
-		return frames, nil
+		return e.blockDelta(ev), nil
 	case EventBlockStop:
 		out, ok := e.index[ev.Index]
-		if !ok || e.skipped[ev.Index] {
+		if !ok {
 			return nil, nil
 		}
 		return anthropicFrame(anthropicIndexOut{Type: "content_block_stop", Index: out}), nil
@@ -350,4 +306,46 @@ func (e *anthropicStreamEncoder) Encode(ev Event) ([]byte, error) {
 		return FormatSSE("error", EncodeAnthropicError(info)), nil
 	}
 	return nil, nil
+}
+
+// blockStart opens an output block (renumbered from 0); thinking from an OpenAI provider is left out.
+func (e *anthropicStreamEncoder) blockStart(ev Event) []byte {
+	var cb map[string]any
+	switch {
+	case ev.Block == BlockText:
+		cb = map[string]any{"type": "text", "text": ""}
+	case ev.Block == BlockThinking && e.opts.Source != ProtocolOpenAI:
+		cb = map[string]any{"type": "thinking", "thinking": "", "signature": ""}
+	case ev.Block == BlockToolCall:
+		cb = map[string]any{"type": "tool_use", "id": ev.ToolID, "name": ev.ToolName, "input": map[string]any{}}
+	default:
+		return nil
+	}
+	out := e.next
+	e.next++
+	e.index[ev.Index] = out
+	e.types[ev.Index] = ev.Block
+	return anthropicFrame(anthropicBlockStartOut{Type: "content_block_start", Index: out, ContentBlock: cb})
+}
+
+func (e *anthropicStreamEncoder) blockDelta(ev Event) []byte {
+	out, ok := e.index[ev.Index]
+	if !ok {
+		return nil
+	}
+	delta := func(kind, key, value string) []byte {
+		if value == "" {
+			return nil
+		}
+		return anthropicFrame(anthropicDeltaOut{Type: "content_block_delta", Index: out, Delta: map[string]string{"type": kind, key: value}})
+	}
+	switch e.types[ev.Index] {
+	case BlockText:
+		return delta("text_delta", "text", ev.Text)
+	case BlockThinking:
+		return append(delta("thinking_delta", "thinking", ev.Text), delta("signature_delta", "signature", ev.Signature)...)
+	case BlockToolCall:
+		return delta("input_json_delta", "partial_json", ev.Arguments)
+	}
+	return nil
 }

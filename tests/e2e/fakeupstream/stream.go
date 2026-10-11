@@ -128,6 +128,19 @@ func (st *sseStream) send(event string, data string) bool {
 	return true
 }
 
+// frame is one SSE event to send: its event name (empty for OpenAI) and data.
+type frame struct{ event, data string }
+
+// sendAll sends frames in order and reports whether all were sent.
+func (st *sseStream) sendAll(frames []frame) bool {
+	for _, f := range frames {
+		if !st.send(f.event, f.data) {
+			return false
+		}
+	}
+	return true
+}
+
 func (st *sseStream) flush() {
 	if f, ok := st.w.(http.Flusher); ok {
 		f.Flush()
@@ -155,7 +168,8 @@ func pieces(s string, n int) []string {
 }
 
 // streamChat 以 OpenAI chat.completion.chunk 流发出 msg（assistant message：content、reasoning_content、
-// tool_calls）。
+// tool_calls）：角色 chunk、思考与文本每 8 个字符一个 chunk、每个工具调用一个起始 chunk 加每 5 个字符一个
+// 参数 chunk、finish_reason chunk、（include_usage 时）用量 chunk、[DONE]。
 func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, rec *Request, req chatRequest, msg json.RawMessage, finish string, usage ChatUsage) {
 	var m struct {
 		Content          *string `json:"content"`
@@ -171,51 +185,36 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, rec *Request
 	if err := json.Unmarshal(msg, &m); err != nil {
 		panic(fmt.Sprintf("fakeupstream: chat hook 返回的 message 不合法: %v", err))
 	}
-	id := fmt.Sprintf("chatcmpl-fake-%d", rec.Seq)
-	created := time.Now().Unix()
-	chunk := func(delta map[string]any, finish any) string {
-		return mustJSON(map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": req.Model,
-			"choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": finish}}})
+	id, created := fmt.Sprintf("chatcmpl-fake-%d", rec.Seq), time.Now().Unix()
+	var frames []frame
+	add := func(delta map[string]any, finish any) {
+		frames = append(frames, frame{data: mustJSON(map[string]any{"id": id, "object": "chat.completion.chunk", "created": created,
+			"model": req.Model, "choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": finish}}})})
 	}
-	errFrame := "data: " + mustJSON(errBody("stream_failed")) + "\n\n"
-	st := s.newStream(w, r, rec, errFrame)
-	if !st.send("", chunk(map[string]any{"role": "assistant", "content": ""}, nil)) {
-		return
-	}
+	add(map[string]any{"role": "assistant", "content": ""}, nil)
 	for _, p := range pieces(m.ReasoningContent, 8) {
-		if !st.send("", chunk(map[string]any{"reasoning_content": p}, nil)) {
-			return
-		}
+		add(map[string]any{"reasoning_content": p}, nil)
 	}
 	if m.Content != nil {
 		for _, p := range pieces(*m.Content, 8) {
-			if !st.send("", chunk(map[string]any{"content": p}, nil)) {
-				return
-			}
+			add(map[string]any{"content": p}, nil)
 		}
 	}
 	for i, tc := range m.ToolCalls {
-		first := map[string]any{"tool_calls": []map[string]any{{"index": i, "id": tc.ID, "type": "function",
-			"function": map[string]string{"name": tc.Function.Name, "arguments": ""}}}}
-		if !st.send("", chunk(first, nil)) {
-			return
-		}
+		add(map[string]any{"tool_calls": []map[string]any{{"index": i, "id": tc.ID, "type": "function",
+			"function": map[string]string{"name": tc.Function.Name, "arguments": ""}}}}, nil)
 		for _, p := range pieces(tc.Function.Arguments, 5) {
-			if !st.send("", chunk(map[string]any{"tool_calls": []map[string]any{{"index": i, "function": map[string]string{"arguments": p}}}}, nil)) {
-				return
-			}
+			add(map[string]any{"tool_calls": []map[string]any{{"index": i, "function": map[string]string{"arguments": p}}}}, nil)
 		}
 	}
-	if !st.send("", chunk(map[string]any{}, finish)) {
-		return
-	}
+	add(map[string]any{}, finish)
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
-		if !st.send("", mustJSON(map[string]any{"id": id, "object": "chat.completion.chunk", "created": created, "model": req.Model,
-			"choices": []any{}, "usage": usage})) {
-			return
-		}
+		frames = append(frames, frame{data: mustJSON(map[string]any{"id": id, "object": "chat.completion.chunk", "created": created,
+			"model": req.Model, "choices": []any{}, "usage": usage})})
 	}
-	if st.send("", "[DONE]") {
+	frames = append(frames, frame{data: "[DONE]"})
+	st := s.newStream(w, r, rec, "data: "+mustJSON(errBody("stream_failed"))+"\n\n")
+	if st.sendAll(frames) {
 		s.setOutcome(rec, OutcomeOK)
 	}
 }
@@ -311,6 +310,23 @@ func anthropicErrBody(status int, message string) map[string]any {
 	return map[string]any{"type": "error", "error": map[string]string{"type": anthropicErrType(status), "message": message}}
 }
 
+// messagesText 是没有脚本时的回复文本：阶段标记对应的回复（[stage:code] 按评测任务）或确定性的占位文本。
+func (s *Server) messagesText(rec *Request, req messagesRequest, body []byte) string {
+	sum := sha256.Sum256(body)
+	text := "fake 回复 " + hex.EncodeToString(sum[:4])
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if reply, ok := s.stages[rec.Stage]; ok && rec.Stage != "" {
+		text = reply
+	}
+	if id, ok := evalTaskID(req.firstUserText()); ok && rec.Stage == StageCode {
+		if reply, ok := s.code[id]; ok {
+			text = reply
+		}
+	}
+	return text
+}
+
 // anthropicUsage 是 Anthropic 格式的用量。
 type anthropicUsage struct {
 	InputTokens              int64 `json:"input_tokens"`
@@ -345,23 +361,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request, rec *Request, 
 		content = hook(body)
 	}
 	if content == nil {
-		sum := sha256.Sum256(body)
-		text := "fake 回复 " + hex.EncodeToString(sum[:4])
-		s.mu.Lock()
-		if st := rec.Stage; st != "" {
-			if reply, ok := s.stages[st]; ok {
-				text = reply
-			}
-			if st == StageCode {
-				if id, ok := evalTaskID(req.firstUserText()); ok {
-					if reply, ok := s.code[id]; ok {
-						text = reply
-					}
-				}
-			}
-		}
-		s.mu.Unlock()
-		content = json.RawMessage(mustJSON([]map[string]string{{"type": "text", "text": text}}))
+		content = json.RawMessage(mustJSON([]map[string]string{{"type": "text", "text": s.messagesText(rec, req, body)}}))
 	}
 	var blocks []map[string]any
 	if err := json.Unmarshal(content, &blocks); err != nil {
@@ -390,63 +390,57 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request, rec *Request, 
 // content_block_start / content_block_delta（text_delta、input_json_delta、thinking_delta、signature_delta）/
 // content_block_stop、第一个块开始后一个 ping、message_delta（stop_reason 与累计 output_tokens）、message_stop。
 func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, rec *Request, id, model string, blocks []map[string]any, stop string, usage anthropicUsage) {
-	errFrame := "event: error\ndata: " + mustJSON(anthropicErrBody(529, "Overloaded")) + "\n\n"
-	st := s.newStream(w, r, rec, errFrame)
+	var frames []frame
+	add := func(v map[string]any) { frames = append(frames, frame{event: v["type"].(string), data: mustJSON(v)}) }
 	start := usage
 	start.OutputTokens = 1
-	ev := func(v map[string]any) bool { return st.send(v["type"].(string), mustJSON(v)) }
-	if !ev(map[string]any{"type": "message_start", "message": map[string]any{"id": id, "type": "message", "role": "assistant",
-		"model": model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": start}}) {
-		return
-	}
+	add(map[string]any{"type": "message_start", "message": map[string]any{"id": id, "type": "message", "role": "assistant",
+		"model": model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": start}})
 	for i, b := range blocks {
-		typ, _ := b["type"].(string)
-		var cb map[string]any
-		var deltas []map[string]any
-		switch typ {
-		case "text":
-			cb = map[string]any{"type": "text", "text": ""}
-			text, _ := b["text"].(string)
-			for _, p := range pieces(text, 8) {
-				deltas = append(deltas, map[string]any{"type": "text_delta", "text": p})
-			}
-		case "tool_use":
-			cb = map[string]any{"type": "tool_use", "id": b["id"], "name": b["name"], "input": map[string]any{}}
-			for _, p := range pieces(mustJSON(b["input"]), 5) {
-				deltas = append(deltas, map[string]any{"type": "input_json_delta", "partial_json": p})
-			}
-		case "thinking":
-			cb = map[string]any{"type": "thinking", "thinking": "", "signature": ""}
-			th, _ := b["thinking"].(string)
-			for _, p := range pieces(th, 8) {
-				deltas = append(deltas, map[string]any{"type": "thinking_delta", "thinking": p})
-			}
-			if sig, _ := b["signature"].(string); sig != "" {
-				deltas = append(deltas, map[string]any{"type": "signature_delta", "signature": sig})
-			}
-		default:
-			panic("fakeupstream: 不支持的内容块类型 " + typ)
-		}
-		if !ev(map[string]any{"type": "content_block_start", "index": i, "content_block": cb}) {
-			return
-		}
-		if i == 0 && !ev(map[string]any{"type": "ping"}) {
-			return
+		cb, deltas := blockEvents(b)
+		add(map[string]any{"type": "content_block_start", "index": i, "content_block": cb})
+		if i == 0 {
+			add(map[string]any{"type": "ping"})
 		}
 		for _, d := range deltas {
-			if !ev(map[string]any{"type": "content_block_delta", "index": i, "delta": d}) {
-				return
-			}
+			add(map[string]any{"type": "content_block_delta", "index": i, "delta": d})
 		}
-		if !ev(map[string]any{"type": "content_block_stop", "index": i}) {
-			return
-		}
+		add(map[string]any{"type": "content_block_stop", "index": i})
 	}
-	if !ev(map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil},
-		"usage": map[string]int64{"output_tokens": usage.OutputTokens}}) {
-		return
-	}
-	if ev(map[string]any{"type": "message_stop"}) {
+	add(map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil},
+		"usage": map[string]int64{"output_tokens": usage.OutputTokens}})
+	add(map[string]any{"type": "message_stop"})
+	st := s.newStream(w, r, rec, "event: error\ndata: "+mustJSON(anthropicErrBody(529, "Overloaded"))+"\n\n")
+	if st.sendAll(frames) {
 		s.setOutcome(rec, OutcomeOK)
+	}
+}
+
+// blockEvents 返回一个内容块的 content_block_start 内容与各个 delta。
+func blockEvents(b map[string]any) (map[string]any, []map[string]any) {
+	var deltas []map[string]any
+	switch typ, _ := b["type"].(string); typ {
+	case "text":
+		text, _ := b["text"].(string)
+		for _, p := range pieces(text, 8) {
+			deltas = append(deltas, map[string]any{"type": "text_delta", "text": p})
+		}
+		return map[string]any{"type": "text", "text": ""}, deltas
+	case "tool_use":
+		for _, p := range pieces(mustJSON(b["input"]), 5) {
+			deltas = append(deltas, map[string]any{"type": "input_json_delta", "partial_json": p})
+		}
+		return map[string]any{"type": "tool_use", "id": b["id"], "name": b["name"], "input": map[string]any{}}, deltas
+	case "thinking":
+		th, _ := b["thinking"].(string)
+		for _, p := range pieces(th, 8) {
+			deltas = append(deltas, map[string]any{"type": "thinking_delta", "thinking": p})
+		}
+		if sig, _ := b["signature"].(string); sig != "" {
+			deltas = append(deltas, map[string]any{"type": "signature_delta", "signature": sig})
+		}
+		return map[string]any{"type": "thinking", "thinking": "", "signature": ""}, deltas
+	default:
+		panic("fakeupstream: 不支持的内容块类型 " + typ)
 	}
 }

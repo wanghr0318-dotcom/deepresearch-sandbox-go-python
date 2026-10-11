@@ -5,386 +5,6 @@ import (
 	"strings"
 )
 
-// anthropicFields are the accepted top-level fields of an Anthropic messages request. Any other field is an
-// *UnsupportedFieldError.
-var anthropicFields = []string{
-	"model", "messages", "system", "max_tokens", "temperature", "top_p", "top_k", "stop_sequences", "stream",
-	"tools", "tool_choice", "metadata", "thinking", "service_tier",
-}
-
-// DecodeAnthropicRequest decodes an Anthropic messages request.
-func DecodeAnthropicRequest(body []byte) (Request, error) {
-	obj, err := object(body, "")
-	if err != nil {
-		return Request{}, err
-	}
-	if err := checkAllowed(obj, "", anthropicFields...); err != nil {
-		return Request{}, err
-	}
-	req := Request{Source: ProtocolAnthropic}
-	if raw, ok := obj["model"]; ok {
-		if req.Model, err = str(raw, "model"); err != nil {
-			return Request{}, err
-		}
-	}
-	if raw, ok := obj["max_tokens"]; ok && !isNull(raw) {
-		if req.MaxTokens, err = positiveInt(raw, "max_tokens"); err != nil {
-			return Request{}, err
-		}
-	}
-	if req.Temperature, err = number(obj["temperature"], "temperature"); err != nil {
-		return Request{}, err
-	}
-	if req.TopP, err = number(obj["top_p"], "top_p"); err != nil {
-		return Request{}, err
-	}
-	if raw, ok := obj["stop_sequences"]; ok && !isNull(raw) {
-		if json.Unmarshal(raw, &req.Stop) != nil {
-			return Request{}, invalidf("stop_sequences", "must be an array of strings")
-		}
-	}
-	if raw, ok := obj["stream"]; ok && !isNull(raw) {
-		if req.Stream, err = boolean(raw, "stream"); err != nil {
-			return Request{}, err
-		}
-	}
-	if raw, ok := obj["system"]; ok && !isNull(raw) {
-		if err := decodeAnthropicSystem(&req, raw); err != nil {
-			return Request{}, err
-		}
-	}
-	if raw, ok := obj["tools"]; ok && !isNull(raw) {
-		if err := decodeAnthropicTools(&req, raw); err != nil {
-			return Request{}, err
-		}
-	}
-	if raw, ok := obj["tool_choice"]; ok && !isNull(raw) {
-		if err := decodeAnthropicToolChoice(&req, raw); err != nil {
-			return Request{}, err
-		}
-	}
-	for _, f := range []string{"metadata", "top_k", "service_tier", "thinking"} {
-		raw, ok := obj[f]
-		if !ok {
-			continue
-		}
-		if req.Extras == nil {
-			req.Extras = map[string]json.RawMessage{}
-		}
-		req.Extras[f] = clone(raw)
-		if isNull(raw) {
-			continue
-		}
-		switch f {
-		case "thinking":
-			var th struct {
-				Type string `json:"type"`
-			}
-			if json.Unmarshal(raw, &th) == nil && th.Type == "disabled" {
-				continue
-			}
-			req.Features = append(req.Features, Feature{Field: f, Kind: FeatureUnsupported})
-		case "metadata":
-			md, err := object(raw, "metadata")
-			if err != nil {
-				return Request{}, err
-			}
-			for k := range md {
-				req.Features = append(req.Features, Feature{Field: "metadata." + k, Kind: FeatureDrop})
-			}
-		default:
-			req.Features = append(req.Features, Feature{Field: f, Kind: FeatureDrop})
-		}
-	}
-	if err := decodeAnthropicMessages(&req, obj["messages"]); err != nil {
-		return Request{}, err
-	}
-	return req, nil
-}
-
-func decodeAnthropicSystem(req *Request, raw json.RawMessage) error {
-	if isString(raw) {
-		s, err := str(raw, "system")
-		req.System = []Block{{Type: BlockText, Text: s}}
-		return err
-	}
-	items, err := array(raw, "system")
-	if err != nil {
-		return invalidf("system", "must be a string or an array of text blocks")
-	}
-	for i, it := range items {
-		field := idx("system", i)
-		b, err := decodeAnthropicBlock(req, it, field, RoleUser)
-		if err != nil {
-			return err
-		}
-		if b.Type != BlockText {
-			return invalidf(field, "system blocks must be text")
-		}
-		req.System = append(req.System, b)
-	}
-	return nil
-}
-
-func decodeAnthropicTools(req *Request, raw json.RawMessage) error {
-	items, err := array(raw, "tools")
-	if err != nil {
-		return err
-	}
-	for i, it := range items {
-		field := idx("tools", i)
-		obj, err := object(it, field)
-		if err != nil {
-			return err
-		}
-		typ := ""
-		if t, ok := obj["type"]; ok && !isNull(t) {
-			if typ, err = str(t, field+".type"); err != nil {
-				return err
-			}
-		}
-		if typ != "" && typ != "custom" { // server tools (web search, code execution …)
-			req.Tools = append(req.Tools, Tool{Raw: clone(it)})
-			req.Features = append(req.Features, Feature{Field: field, Kind: FeatureUnsupported})
-			continue
-		}
-		if err := checkAllowed(obj, field, "type", "name", "description", "input_schema", "cache_control"); err != nil {
-			return err
-		}
-		t := Tool{}
-		if t.Name, err = str(obj["name"], field+".name"); err != nil || t.Name == "" {
-			return invalidf(field+".name", "must be a non-empty string")
-		}
-		if t.Description, err = optStr(obj["description"], field+".description"); err != nil {
-			return err
-		}
-		if _, err := object(obj["input_schema"], field+".input_schema"); err != nil {
-			return err
-		}
-		t.Parameters = clone(obj["input_schema"])
-		if cc, ok := obj["cache_control"]; ok && !isNull(cc) {
-			t.CacheControl = clone(cc)
-			req.Features = append(req.Features, Feature{Field: field + ".cache_control", Kind: FeatureDrop})
-		}
-		req.Tools = append(req.Tools, t)
-	}
-	return nil
-}
-
-func decodeAnthropicToolChoice(req *Request, raw json.RawMessage) error {
-	var tc struct {
-		Type                   string `json:"type"`
-		Name                   string `json:"name"`
-		DisableParallelToolUse *bool  `json:"disable_parallel_tool_use"`
-	}
-	if json.Unmarshal(raw, &tc) != nil {
-		return invalidf("tool_choice", "must be an object")
-	}
-	switch tc.Type {
-	case "auto":
-		req.ToolChoice = &ToolChoice{Mode: ToolChoiceAuto}
-	case "any":
-		req.ToolChoice = &ToolChoice{Mode: ToolChoiceRequired}
-	case "none":
-		req.ToolChoice = &ToolChoice{Mode: ToolChoiceNone}
-	case "tool":
-		if tc.Name == "" {
-			return invalidf("tool_choice.name", "must be a non-empty string")
-		}
-		req.ToolChoice = &ToolChoice{Mode: ToolChoiceTool, Name: tc.Name}
-	default:
-		return invalidf("tool_choice.type", "must be auto, any, tool or none")
-	}
-	if d := tc.DisableParallelToolUse; d != nil {
-		p := !*d
-		req.ParallelToolCalls = &p
-	}
-	return nil
-}
-
-func decodeAnthropicMessages(req *Request, raw json.RawMessage) error {
-	items, err := array(raw, "messages")
-	if err != nil || len(items) == 0 {
-		return invalidf("messages", "must be a non-empty array")
-	}
-	for i, it := range items {
-		field := idx("messages", i)
-		m, err := object(it, field)
-		if err != nil {
-			return err
-		}
-		if err := checkAllowed(m, field, "role", "content"); err != nil {
-			return err
-		}
-		roleS, err := str(m["role"], field+".role")
-		if err != nil {
-			return err
-		}
-		role := Role(roleS)
-		if role != RoleUser && role != RoleAssistant {
-			return invalidf(field+".role", "must be user or assistant")
-		}
-		msg := Message{Role: role}
-		content := m["content"]
-		switch {
-		case isString(content):
-			s, err := str(content, field+".content")
-			if err != nil {
-				return err
-			}
-			msg.Blocks = []Block{{Type: BlockText, Text: s}}
-		case isArray(content):
-			blocks, _ := array(content, field+".content")
-			for j, b := range blocks {
-				blk, err := decodeAnthropicBlock(req, b, idx(field+".content", j), role)
-				if err != nil {
-					return err
-				}
-				msg.Blocks = append(msg.Blocks, blk)
-			}
-		default:
-			return invalidf(field+".content", "must be a string or an array of content blocks")
-		}
-		req.Messages = append(req.Messages, msg)
-	}
-	return nil
-}
-
-// decodeAnthropicBlock decodes one content block of a message (or of the system prompt).
-func decodeAnthropicBlock(req *Request, raw json.RawMessage, field string, role Role) (Block, error) {
-	obj, err := object(raw, field)
-	if err != nil {
-		return Block{}, err
-	}
-	typ, err := str(obj["type"], field+".type")
-	if err != nil {
-		return Block{}, err
-	}
-	var b Block
-	switch typ {
-	case "text":
-		if err := checkAllowed(obj, field, "type", "text", "cache_control", "citations"); err != nil {
-			return Block{}, err
-		}
-		b = Block{Type: BlockText}
-		if b.Text, err = str(obj["text"], field+".text"); err != nil {
-			return Block{}, err
-		}
-		if c, ok := obj["citations"]; ok && !isNull(c) {
-			req.Features = append(req.Features, Feature{Field: field + ".citations", Kind: FeatureDrop})
-		}
-	case "tool_use":
-		if role != RoleAssistant {
-			return Block{}, invalidf(field, "tool_use blocks belong to assistant messages")
-		}
-		if err := checkAllowed(obj, field, "type", "id", "name", "input", "cache_control"); err != nil {
-			return Block{}, err
-		}
-		b = Block{Type: BlockToolCall}
-		if b.ID, err = str(obj["id"], field+".id"); err != nil {
-			return Block{}, err
-		}
-		if b.Name, err = str(obj["name"], field+".name"); err != nil {
-			return Block{}, err
-		}
-		if _, err := object(obj["input"], field+".input"); err != nil {
-			return Block{}, err
-		}
-		if b.Arguments, err = compactJSON(obj["input"]); err != nil {
-			return Block{}, invalidf(field+".input", "must be an object")
-		}
-	case "tool_result":
-		if role != RoleUser {
-			return Block{}, invalidf(field, "tool_result blocks belong to user messages")
-		}
-		if err := checkAllowed(obj, field, "type", "tool_use_id", "content", "is_error", "cache_control"); err != nil {
-			return Block{}, err
-		}
-		b = Block{Type: BlockToolResult}
-		if b.ID, err = str(obj["tool_use_id"], field+".tool_use_id"); err != nil {
-			return Block{}, err
-		}
-		text, opaque, err := anthropicToolResultContent(obj["content"], field+".content")
-		if err != nil {
-			return Block{}, err
-		}
-		if opaque != "" { // images or documents in a tool result: keep the whole block verbatim
-			req.Features = append(req.Features, Feature{Field: opaque, Kind: FeatureUnsupported})
-			return Block{Type: BlockOpaque, Raw: clone(raw)}, nil
-		}
-		b.Text = text
-		if e, ok := obj["is_error"]; ok && !isNull(e) {
-			if b.IsError, err = boolean(e, field+".is_error"); err != nil {
-				return Block{}, err
-			}
-			if b.IsError {
-				req.Features = append(req.Features, Feature{Field: field + ".is_error", Kind: FeatureDrop})
-			}
-		}
-	case "thinking":
-		if role != RoleAssistant {
-			return Block{}, invalidf(field, "thinking blocks belong to assistant messages")
-		}
-		if err := checkAllowed(obj, field, "type", "thinking", "signature"); err != nil {
-			return Block{}, err
-		}
-		b = Block{Type: BlockThinking}
-		if b.Text, err = str(obj["thinking"], field+".thinking"); err != nil {
-			return Block{}, err
-		}
-		if b.Signature, err = optStr(obj["signature"], field+".signature"); err != nil {
-			return Block{}, err
-		}
-		req.Features = append(req.Features, Feature{Field: field, Kind: FeatureUnsupported})
-		return b, nil
-	default: // image, document, redacted_thinking, search_result, server tool blocks …
-		req.Features = append(req.Features, Feature{Field: field, Kind: FeatureUnsupported})
-		return Block{Type: BlockOpaque, Raw: clone(raw)}, nil
-	}
-	if cc, ok := obj["cache_control"]; ok && !isNull(cc) {
-		b.CacheControl = clone(cc)
-		req.Features = append(req.Features, Feature{Field: field + ".cache_control", Kind: FeatureDrop})
-	}
-	return b, nil
-}
-
-// anthropicToolResultContent returns the text of a tool result's content (absent, a string, or an array of
-// text blocks), or the field of its first non-text block.
-func anthropicToolResultContent(raw json.RawMessage, field string) (text, opaque string, err error) {
-	if isNull(raw) {
-		return "", "", nil
-	}
-	if isString(raw) {
-		s, err := str(raw, field)
-		return s, "", err
-	}
-	items, err := array(raw, field)
-	if err != nil {
-		return "", "", invalidf(field, "must be a string or an array of content blocks")
-	}
-	var b strings.Builder
-	for i, it := range items {
-		var blk struct {
-			Type string  `json:"type"`
-			Text *string `json:"text"`
-		}
-		if json.Unmarshal(it, &blk) != nil {
-			return "", "", invalidf(idx(field, i), "must be a content block")
-		}
-		if blk.Type != "text" {
-			return "", idx(field, i), nil
-		}
-		if blk.Text == nil {
-			return "", "", invalidf(idx(field, i)+".text", "must be a string")
-		}
-		if i > 0 {
-			b.WriteString("\n")
-		}
-		b.WriteString(*blk.Text)
-	}
-	return b.String(), "", nil
-}
-
 // --- encoding ---
 
 type anthropicRequestOut struct {
@@ -431,24 +51,53 @@ func encodeAnthropicRequest(req Request) ([]byte, error) {
 	}
 	out := anthropicRequestOut{Model: req.Model, MaxTokens: req.MaxTokens, Temperature: req.Temperature, TopP: req.TopP,
 		StopSequences: req.Stop, Stream: req.Stream}
-	if len(req.System) > 0 {
-		if len(req.System) == 1 && req.System[0].CacheControl == nil {
-			out.System = mustMarshalNoEscape(req.System[0].Text)
-		} else {
-			blocks := make([]json.RawMessage, 0, len(req.System))
-			for _, s := range req.System {
-				b, err := anthropicBlock(s)
-				if err != nil {
-					return nil, err
-				}
-				blocks = append(blocks, b)
-			}
-			out.System = mustMarshalNoEscape(blocks)
-		}
+	var err error
+	if out.System, err = anthropicSystem(req.System); err != nil {
+		return nil, err
 	}
-	// Consecutive messages of the same role become one turn (e.g. tool results followed by user text).
+	if out.Messages, err = anthropicMessages(req.Messages); err != nil {
+		return nil, err
+	}
+	if out.Tools, err = anthropicTools(req.Tools); err != nil {
+		return nil, err
+	}
+	if out.ToolChoice, err = anthropicToolChoiceOf(req); err != nil {
+		return nil, err
+	}
+	body, err := marshalNoEscape(out)
+	if err != nil {
+		return nil, invalidf("", err.Error())
+	}
+	if req.Source == ProtocolAnthropic && len(req.Extras) > 0 {
+		return mergeExtras(body, req.Extras)
+	}
+	return body, nil
+}
+
+// anthropicSystem encodes the system prompt: a string for one plain block, else an array of text blocks.
+func anthropicSystem(system []Block) (json.RawMessage, error) {
+	switch {
+	case len(system) == 0:
+		return nil, nil
+	case len(system) == 1 && system[0].CacheControl == nil:
+		return mustMarshalNoEscape(system[0].Text), nil
+	}
+	blocks := make([]json.RawMessage, 0, len(system))
+	for _, s := range system {
+		b, err := anthropicBlock(s)
+		if err != nil {
+			return nil, err
+		}
+		blocks = append(blocks, b)
+	}
+	return mustMarshalNoEscape(blocks), nil
+}
+
+// anthropicMessages encodes the messages; consecutive messages of the same role become one turn (e.g. tool
+// results followed by user text).
+func anthropicMessages(msgs []Message) ([]anthropicMessageOut, error) {
 	var merged []Message
-	for _, m := range req.Messages {
+	for _, m := range msgs {
 		if m.Role != RoleUser && m.Role != RoleAssistant {
 			return nil, unsupported("messages", "role "+string(m.Role)+" has no anthropic equivalent")
 		}
@@ -458,16 +107,22 @@ func encodeAnthropicRequest(req Request) ([]byte, error) {
 		}
 		merged = append(merged, m)
 	}
+	out := make([]anthropicMessageOut, 0, len(merged))
 	for _, m := range merged {
 		content, err := anthropicContent(m.Blocks)
 		if err != nil {
 			return nil, err
 		}
-		out.Messages = append(out.Messages, anthropicMessageOut{Role: string(m.Role), Content: content})
+		out = append(out, anthropicMessageOut{Role: string(m.Role), Content: content})
 	}
-	for _, t := range req.Tools {
+	return out, nil
+}
+
+func anthropicTools(tools []Tool) ([]json.RawMessage, error) {
+	var out []json.RawMessage
+	for _, t := range tools {
 		if t.Raw != nil {
-			out.Tools = append(out.Tools, t.Raw) // only reachable for an Anthropic source (else unsupported)
+			out = append(out, t.Raw) // only reachable for an Anthropic source (else unsupported)
 			continue
 		}
 		schema := t.Parameters
@@ -478,38 +133,32 @@ func encodeAnthropicRequest(req Request) ([]byte, error) {
 		if err != nil {
 			return nil, invalidf("tools", err.Error())
 		}
-		out.Tools = append(out.Tools, b)
+		out = append(out, b)
 	}
+	return out, nil
+}
+
+// anthropicToolChoiceOf encodes tool_choice; parallel_tool_calls false becomes disable_parallel_tool_use.
+func anthropicToolChoiceOf(req Request) (*anthropicToolChoice, error) {
+	var out *anthropicToolChoice
 	if tc := req.ToolChoice; tc != nil {
-		switch tc.Mode {
-		case ToolChoiceAuto:
-			out.ToolChoice = &anthropicToolChoice{Type: "auto"}
-		case ToolChoiceNone:
-			out.ToolChoice = &anthropicToolChoice{Type: "none"}
-		case ToolChoiceRequired:
-			out.ToolChoice = &anthropicToolChoice{Type: "any"}
-		case ToolChoiceTool:
-			out.ToolChoice = &anthropicToolChoice{Type: "tool", Name: tc.Name}
-		default:
+		types := map[ToolChoiceMode]string{ToolChoiceAuto: "auto", ToolChoiceNone: "none", ToolChoiceRequired: "any", ToolChoiceTool: "tool"}
+		typ, ok := types[tc.Mode]
+		if !ok {
 			return nil, invalidf("tool_choice", "unknown mode "+string(tc.Mode))
+		}
+		out = &anthropicToolChoice{Type: typ}
+		if tc.Mode == ToolChoiceTool {
+			out.Name = tc.Name
 		}
 	}
 	if p := req.ParallelToolCalls; p != nil && !*p && len(req.Tools) > 0 {
-		if out.ToolChoice == nil {
-			out.ToolChoice = &anthropicToolChoice{Type: "auto"}
+		if out == nil {
+			out = &anthropicToolChoice{Type: "auto"}
 		}
-		if out.ToolChoice.Type != "none" {
-			out.ToolChoice.DisableParallelToolUse = true
-		}
+		out.DisableParallelToolUse = out.Type != "none"
 	}
-	body, err := marshalNoEscape(out)
-	if err != nil {
-		return nil, invalidf("", err.Error())
-	}
-	if req.Source == ProtocolAnthropic && len(req.Extras) > 0 {
-		return mergeExtras(body, req.Extras)
-	}
-	return body, nil
+	return out, nil
 }
 
 // anthropicContent encodes message blocks: a string for one plain text block, else an array of blocks.

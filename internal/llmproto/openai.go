@@ -2,445 +2,7 @@ package llmproto
 
 import (
 	"encoding/json"
-	"strings"
 )
-
-// openAIFields are the accepted top-level fields of an OpenAI chat request: the fields that
-// internal/gateway/upstream accepts for sandbox calls, plus the client-side fields the model API needs
-// (stream_options, parallel_tool_calls, user, reasoning_effort, n, logprobs, top_logprobs). Any other field
-// is an *UnsupportedFieldError, as in gateway/upstream (max_completion_tokens, functions, … are refused).
-var openAIFields = []string{
-	"model", "messages", "max_tokens", "temperature", "top_p", "stop", "stream",
-	"tools", "tool_choice", "response_format", "seed", "presence_penalty", "frequency_penalty",
-	"stream_options", "parallel_tool_calls", "user", "reasoning_effort", "n", "logprobs", "top_logprobs",
-}
-
-// openAIMessageFields are the accepted message fields (as in gateway/upstream).
-var openAIMessageFields = []string{"role", "content", "name", "tool_call_id", "tool_calls", "reasoning_content"}
-
-// openAIExtra classifies a top-level OpenAI field without a neutral equivalent. ok is false for values that
-// are no-ops in the other format (n=1, logprobs=false, response_format text).
-func openAIExtra(field string, raw json.RawMessage) (kind FeatureKind, ok bool) {
-	switch field {
-	case "seed", "presence_penalty", "frequency_penalty", "user":
-		return FeatureDrop, !isNull(raw)
-	case "n":
-		return FeatureUnsupported, !isNull(raw) && strings.TrimSpace(string(raw)) != "1"
-	case "logprobs":
-		return FeatureUnsupported, !isNull(raw) && strings.TrimSpace(string(raw)) != "false"
-	case "response_format":
-		var rf struct {
-			Type string `json:"type"`
-		}
-		if isNull(raw) || (json.Unmarshal(raw, &rf) == nil && rf.Type == "text") {
-			return "", false
-		}
-		return FeatureUnsupported, true
-	}
-	// reasoning_effort, top_logprobs
-	return FeatureUnsupported, !isNull(raw)
-}
-
-// DecodeOpenAIRequest decodes an OpenAI chat completions request.
-func DecodeOpenAIRequest(body []byte) (Request, error) {
-	obj, err := object(body, "")
-	if err != nil {
-		return Request{}, err
-	}
-	if err := checkAllowed(obj, "", openAIFields...); err != nil {
-		return Request{}, err
-	}
-	req := Request{Source: ProtocolOpenAI}
-	if raw, ok := obj["model"]; ok {
-		if req.Model, err = str(raw, "model"); err != nil {
-			return Request{}, err
-		}
-	}
-	if raw, ok := obj["max_tokens"]; ok && !isNull(raw) {
-		if req.MaxTokens, err = positiveInt(raw, "max_tokens"); err != nil {
-			return Request{}, err
-		}
-	}
-	if req.Temperature, err = number(obj["temperature"], "temperature"); err != nil {
-		return Request{}, err
-	}
-	if req.TopP, err = number(obj["top_p"], "top_p"); err != nil {
-		return Request{}, err
-	}
-	if raw, ok := obj["stop"]; ok && !isNull(raw) {
-		if req.Stop, err = decodeStop(raw); err != nil {
-			return Request{}, err
-		}
-	}
-	if raw, ok := obj["stream"]; ok && !isNull(raw) {
-		if req.Stream, err = boolean(raw, "stream"); err != nil {
-			return Request{}, err
-		}
-	}
-	if raw, ok := obj["stream_options"]; ok && !isNull(raw) {
-		so, err := object(raw, "stream_options")
-		if err != nil {
-			return Request{}, err
-		}
-		if err := checkAllowed(so, "stream_options", "include_usage"); err != nil {
-			return Request{}, err
-		}
-		if iu, ok := so["include_usage"]; ok && !isNull(iu) {
-			if req.IncludeUsage, err = boolean(iu, "stream_options.include_usage"); err != nil {
-				return Request{}, err
-			}
-		}
-	}
-	if raw, ok := obj["parallel_tool_calls"]; ok && !isNull(raw) {
-		b, err := boolean(raw, "parallel_tool_calls")
-		if err != nil {
-			return Request{}, err
-		}
-		req.ParallelToolCalls = &b
-	}
-	if raw, ok := obj["tools"]; ok && !isNull(raw) {
-		if err := decodeOpenAITools(&req, raw); err != nil {
-			return Request{}, err
-		}
-	}
-	if raw, ok := obj["tool_choice"]; ok && !isNull(raw) {
-		tc, err := decodeOpenAIToolChoice(raw)
-		if err != nil {
-			return Request{}, err
-		}
-		req.ToolChoice = &tc
-	}
-	for _, f := range []string{"response_format", "seed", "presence_penalty", "frequency_penalty", "user",
-		"reasoning_effort", "n", "logprobs", "top_logprobs"} {
-		raw, ok := obj[f]
-		if !ok {
-			continue
-		}
-		if req.Extras == nil {
-			req.Extras = map[string]json.RawMessage{}
-		}
-		req.Extras[f] = clone(raw)
-		if kind, ok := openAIExtra(f, raw); ok {
-			req.Features = append(req.Features, Feature{Field: f, Kind: kind})
-		}
-	}
-	if err := decodeOpenAIMessages(&req, obj["messages"]); err != nil {
-		return Request{}, err
-	}
-	return req, nil
-}
-
-func decodeStop(raw json.RawMessage) ([]string, error) {
-	if isString(raw) {
-		s, err := str(raw, "stop")
-		return []string{s}, err
-	}
-	var ss []string
-	if json.Unmarshal(raw, &ss) != nil {
-		return nil, invalidf("stop", "must be a string or an array of strings")
-	}
-	return ss, nil
-}
-
-func decodeOpenAITools(req *Request, raw json.RawMessage) error {
-	items, err := array(raw, "tools")
-	if err != nil {
-		return err
-	}
-	for i, it := range items {
-		field := idx("tools", i)
-		obj, err := object(it, field)
-		if err != nil {
-			return err
-		}
-		typ, err := str(obj["type"], field+".type")
-		if err != nil {
-			return err
-		}
-		if typ != "function" {
-			req.Tools = append(req.Tools, Tool{Raw: clone(it)})
-			req.Features = append(req.Features, Feature{Field: field, Kind: FeatureUnsupported})
-			continue
-		}
-		if err := checkAllowed(obj, field, "type", "function"); err != nil {
-			return err
-		}
-		fn, err := object(obj["function"], field+".function")
-		if err != nil {
-			return err
-		}
-		if err := checkAllowed(fn, field+".function", "name", "description", "parameters", "strict"); err != nil {
-			return err
-		}
-		t := Tool{}
-		if t.Name, err = str(fn["name"], field+".function.name"); err != nil || t.Name == "" {
-			return invalidf(field+".function.name", "must be a non-empty string")
-		}
-		if t.Description, err = optStr(fn["description"], field+".function.description"); err != nil {
-			return err
-		}
-		if p, ok := fn["parameters"]; ok && !isNull(p) {
-			if _, err := object(p, field+".function.parameters"); err != nil {
-				return err
-			}
-			t.Parameters = clone(p)
-		}
-		if s, ok := fn["strict"]; ok && !isNull(s) {
-			b, err := boolean(s, field+".function.strict")
-			if err != nil {
-				return err
-			}
-			t.Strict = &b
-			req.Features = append(req.Features, Feature{Field: field + ".function.strict", Kind: FeatureDrop})
-		}
-		req.Tools = append(req.Tools, t)
-	}
-	return nil
-}
-
-func decodeOpenAIToolChoice(raw json.RawMessage) (ToolChoice, error) {
-	if isString(raw) {
-		s, _ := str(raw, "tool_choice")
-		switch s {
-		case "auto":
-			return ToolChoice{Mode: ToolChoiceAuto}, nil
-		case "none":
-			return ToolChoice{Mode: ToolChoiceNone}, nil
-		case "required":
-			return ToolChoice{Mode: ToolChoiceRequired}, nil
-		}
-		return ToolChoice{}, invalidf("tool_choice", "must be auto, none, required or a function")
-	}
-	var tc struct {
-		Type     string `json:"type"`
-		Function struct {
-			Name string `json:"name"`
-		} `json:"function"`
-	}
-	if json.Unmarshal(raw, &tc) != nil || tc.Type != "function" || tc.Function.Name == "" {
-		return ToolChoice{}, invalidf("tool_choice", "must be auto, none, required or a function")
-	}
-	return ToolChoice{Mode: ToolChoiceTool, Name: tc.Function.Name}, nil
-}
-
-// openAIContent decodes a content value (string, null or an array of parts) into blocks. Text parts become
-// text blocks; other parts (image_url, input_audio, file, refusal …) become opaque blocks and are recorded
-// as unsupported features.
-func openAIContent(req *Request, raw json.RawMessage, field string) ([]Block, error) {
-	if isNull(raw) {
-		return nil, nil
-	}
-	if isString(raw) {
-		s, err := str(raw, field)
-		return []Block{{Type: BlockText, Text: s}}, err
-	}
-	parts, err := array(raw, field)
-	if err != nil {
-		return nil, invalidf(field, "must be a string or an array of content parts")
-	}
-	var out []Block
-	for j, p := range parts {
-		pf := idx(field, j)
-		var part struct {
-			Type string           `json:"type"`
-			Text *json.RawMessage `json:"text"`
-		}
-		if json.Unmarshal(p, &part) != nil || part.Type == "" {
-			return nil, invalidf(pf, "must be a content part with a type")
-		}
-		if part.Type == "text" {
-			if part.Text == nil {
-				return nil, invalidf(pf+".text", "must be a string")
-			}
-			s, err := str(*part.Text, pf+".text")
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, Block{Type: BlockText, Text: s})
-			continue
-		}
-		out = append(out, Block{Type: BlockOpaque, Raw: clone(p)})
-		req.Features = append(req.Features, Feature{Field: pf, Kind: FeatureUnsupported})
-	}
-	return out, nil
-}
-
-// textOnly joins text blocks; ok is false when blocks holds anything else.
-func textOnly(blocks []Block) (string, bool) {
-	var b strings.Builder
-	for _, bl := range blocks {
-		if bl.Type != BlockText {
-			return "", false
-		}
-		b.WriteString(bl.Text)
-	}
-	return b.String(), true
-}
-
-func decodeOpenAIMessages(req *Request, raw json.RawMessage) error {
-	items, err := array(raw, "messages")
-	if err != nil || len(items) == 0 {
-		return invalidf("messages", "must be a non-empty array")
-	}
-	leading := true   // still in the leading system messages
-	lastTool := false // the previous message was a tool message (its result was appended to the last user message)
-	for i, it := range items {
-		field := idx("messages", i)
-		m, err := object(it, field)
-		if err != nil {
-			return err
-		}
-		if err := checkAllowed(m, field, openAIMessageFields...); err != nil {
-			return err
-		}
-		role, err := str(m["role"], field+".role")
-		if err != nil || role == "" {
-			return invalidf(field+".role", "must be a string")
-		}
-		if _, ok := m["reasoning_content"]; ok && role != "assistant" {
-			return unsupported(field+".reasoning_content", "only for assistant messages")
-		}
-		if _, ok := m["tool_calls"]; ok && role != "assistant" {
-			return invalidf(field+".tool_calls", "only for assistant messages")
-		}
-		if _, ok := m["tool_call_id"]; ok && role != "tool" {
-			return invalidf(field+".tool_call_id", "only for tool messages")
-		}
-		name := ""
-		if raw, ok := m["name"]; ok && !isNull(raw) {
-			if name, err = str(raw, field+".name"); err != nil {
-				return err
-			}
-			req.Features = append(req.Features, Feature{Field: field + ".name", Kind: FeatureDrop})
-		}
-		switch role {
-		case "system", "developer":
-			blocks, err := openAIContent(req, m["content"], field+".content")
-			if err != nil {
-				return err
-			}
-			text, ok := textOnly(blocks)
-			if !ok || len(blocks) == 0 {
-				return invalidf(field+".content", "system content must be text")
-			}
-			if leading {
-				req.System = append(req.System, Block{Type: BlockText, Text: text})
-			} else {
-				req.Messages = append(req.Messages, Message{Role: RoleSystem, Blocks: []Block{{Type: BlockText, Text: text}}, Name: name})
-				req.Features = append(req.Features, Feature{Field: field + ".role", Kind: FeatureUnsupported})
-			}
-			lastTool = false
-			continue
-		case "user":
-			blocks, err := openAIContent(req, m["content"], field+".content")
-			if err != nil {
-				return err
-			}
-			if _, ok := m["content"]; !ok || blocks == nil {
-				return invalidf(field+".content", "must be a string or an array of content parts")
-			}
-			req.Messages = append(req.Messages, Message{Role: RoleUser, Blocks: blocks, Name: name})
-			lastTool = false
-		case "assistant":
-			msg, err := decodeOpenAIAssistant(req, m, field)
-			if err != nil {
-				return err
-			}
-			msg.Name = name
-			req.Messages = append(req.Messages, msg)
-			lastTool = false
-		case "tool":
-			id, err := str(m["tool_call_id"], field+".tool_call_id")
-			if err != nil || id == "" {
-				return invalidf(field+".tool_call_id", "must be a non-empty string")
-			}
-			blocks, err := openAIContent(req, m["content"], field+".content")
-			if err != nil {
-				return err
-			}
-			text, ok := textOnly(blocks)
-			if !ok {
-				return unsupported(field+".content", "tool results must be text")
-			}
-			b := Block{Type: BlockToolResult, ID: id, Text: text}
-			if lastTool {
-				last := &req.Messages[len(req.Messages)-1]
-				last.Blocks = append(last.Blocks, b)
-			} else {
-				req.Messages = append(req.Messages, Message{Role: RoleUser, Blocks: []Block{b}})
-			}
-			lastTool = true
-		default:
-			return unsupported(field+".role", "role "+role+" is not supported")
-		}
-		leading = false
-	}
-	if len(req.Messages) == 0 {
-		return invalidf("messages", "must contain a non-system message")
-	}
-	return nil
-}
-
-func decodeOpenAIAssistant(req *Request, m map[string]json.RawMessage, field string) (Message, error) {
-	msg := Message{Role: RoleAssistant}
-	if raw, ok := m["reasoning_content"]; ok && !isNull(raw) {
-		rc, err := str(raw, field+".reasoning_content")
-		if err != nil {
-			return Message{}, err
-		}
-		msg.Blocks = append(msg.Blocks, Block{Type: BlockThinking, Text: rc})
-		req.Features = append(req.Features, Feature{Field: field + ".reasoning_content", Kind: FeatureUnsupported})
-	}
-	content, err := openAIContent(req, m["content"], field+".content")
-	if err != nil {
-		return Message{}, err
-	}
-	var calls []json.RawMessage
-	if raw, ok := m["tool_calls"]; ok && !isNull(raw) {
-		if calls, err = array(raw, field+".tool_calls"); err != nil {
-			return Message{}, err
-		}
-	}
-	// An assistant message that only calls tools may have content "" or null.
-	if len(calls) > 0 && len(content) == 1 && content[0].Type == BlockText && content[0].Text == "" {
-		content = nil
-	}
-	if _, ok := m["content"]; !ok && len(calls) == 0 {
-		return Message{}, invalidf(field+".content", "must be given when there are no tool_calls")
-	}
-	msg.Blocks = append(msg.Blocks, content...)
-	for j, c := range calls {
-		cf := idx(field+".tool_calls", j)
-		var call struct {
-			ID       string `json:"id"`
-			Type     string `json:"type"`
-			Function *struct {
-				Name      string           `json:"name"`
-				Arguments *json.RawMessage `json:"arguments"`
-			} `json:"function"`
-		}
-		if json.Unmarshal(c, &call) != nil || call.Function == nil {
-			return Message{}, invalidf(cf, "must be a function tool call")
-		}
-		if call.Type != "" && call.Type != "function" {
-			return Message{}, unsupported(cf+".type", "only function tool calls are supported")
-		}
-		if call.ID == "" || call.Function.Name == "" {
-			return Message{}, invalidf(cf, "id and function.name must be non-empty")
-		}
-		args := ""
-		if call.Function.Arguments != nil {
-			if args, err = optStr(*call.Function.Arguments, cf+".function.arguments"); err != nil {
-				return Message{}, err
-			}
-		}
-		if strings.TrimSpace(args) == "" {
-			args = "{}" // a call without arguments
-		}
-		msg.Blocks = append(msg.Blocks, Block{Type: BlockToolCall, ID: call.ID, Name: call.Function.Name, Arguments: args})
-	}
-	return msg, nil
-}
 
 // --- encoding ---
 
@@ -522,9 +84,28 @@ func encodeOpenAIRequest(req Request) ([]byte, error) {
 		}
 		out.Messages = append(out.Messages, msgs...)
 	}
-	for _, t := range req.Tools {
+	var err error
+	if out.Tools, err = openAITools(req.Tools, same); err != nil {
+		return nil, err
+	}
+	if out.ToolChoice, err = openAIToolChoiceOf(req.ToolChoice); err != nil {
+		return nil, err
+	}
+	body, err := marshalNoEscape(out)
+	if err != nil {
+		return nil, invalidf("", err.Error())
+	}
+	if same && len(req.Extras) > 0 {
+		return mergeExtras(body, req.Extras)
+	}
+	return body, nil
+}
+
+func openAITools(tools []Tool, same bool) ([]json.RawMessage, error) {
+	var out []json.RawMessage
+	for _, t := range tools {
 		if t.Raw != nil {
-			out.Tools = append(out.Tools, t.Raw) // only reachable for an OpenAI source (else unsupported)
+			out = append(out, t.Raw) // only reachable for an OpenAI source (else unsupported)
 			continue
 		}
 		def := openAIFunctionDef{Name: t.Name, Description: t.Description, Parameters: t.Parameters}
@@ -535,26 +116,22 @@ func encodeOpenAIRequest(req Request) ([]byte, error) {
 		if err != nil {
 			return nil, invalidf("tools", err.Error())
 		}
-		out.Tools = append(out.Tools, b)
+		out = append(out, b)
 	}
-	if tc := req.ToolChoice; tc != nil {
-		switch tc.Mode {
-		case ToolChoiceAuto, ToolChoiceNone, ToolChoiceRequired:
-			out.ToolChoice = mustMarshalNoEscape(string(tc.Mode))
-		case ToolChoiceTool:
-			out.ToolChoice = mustMarshalNoEscape(map[string]any{"type": "function", "function": map[string]string{"name": tc.Name}})
-		default:
-			return nil, invalidf("tool_choice", "unknown mode "+string(tc.Mode))
-		}
+	return out, nil
+}
+
+func openAIToolChoiceOf(tc *ToolChoice) (json.RawMessage, error) {
+	if tc == nil {
+		return nil, nil
 	}
-	body, err := marshalNoEscape(out)
-	if err != nil {
-		return nil, invalidf("", err.Error())
+	switch tc.Mode {
+	case ToolChoiceAuto, ToolChoiceNone, ToolChoiceRequired:
+		return mustMarshalNoEscape(string(tc.Mode)), nil
+	case ToolChoiceTool:
+		return mustMarshalNoEscape(map[string]any{"type": "function", "function": map[string]string{"name": tc.Name}}), nil
 	}
-	if same && len(req.Extras) > 0 {
-		return mergeExtras(body, req.Extras)
-	}
-	return body, nil
+	return nil, invalidf("tool_choice", "unknown mode "+string(tc.Mode))
 }
 
 // mergeExtras adds the extra top-level fields to an encoded object (encoded fields win).
@@ -602,74 +179,87 @@ func encodeOpenAIMessage(m Message, same bool) ([]openAIMessageOut, error) {
 		text, _ := textOnly(m.Blocks)
 		return []openAIMessageOut{{Role: "system", Content: mustMarshalNoEscape(text), Name: name}}, nil
 	case RoleUser:
-		var out []openAIMessageOut
-		var run []Block
-		flush := func() {
-			if len(run) > 0 {
-				out = append(out, openAIMessageOut{Role: "user", Content: openAIParts(run), Name: name})
-				run = nil
-			}
-		}
-		for _, b := range m.Blocks {
-			switch b.Type {
-			case BlockToolResult:
-				flush()
-				out = append(out, openAIMessageOut{Role: "tool", ToolCallID: b.ID, Content: mustMarshalNoEscape(b.Text)})
-			case BlockText, BlockOpaque:
-				run = append(run, b)
-			default:
-				return nil, invalidf("messages", "a user message cannot hold a "+string(b.Type)+" block")
-			}
-		}
-		flush()
-		if len(out) == 0 { // an empty user message
-			out = append(out, openAIMessageOut{Role: "user", Content: mustMarshalNoEscape(""), Name: name})
-		}
-		return out, nil
+		return openAIUserMessages(m.Blocks, name)
 	case RoleAssistant:
-		msg := openAIMessageOut{Role: "assistant", Name: name}
-		var texts []Block
-		var reasoning strings.Builder
-		hasReasoning := false
-		for _, b := range m.Blocks {
-			switch b.Type {
-			case BlockText, BlockOpaque:
-				texts = append(texts, b)
-			case BlockThinking:
-				reasoning.WriteString(b.Text)
-				hasReasoning = true
-			case BlockToolCall:
-				args := b.Arguments
-				if args == "" {
-					args = "{}"
-				}
-				msg.ToolCalls = append(msg.ToolCalls, openAIToolCall{ID: b.ID, Type: "function",
-					Function: openAIFunctionCall{Name: b.Name, Arguments: &args}})
-			default:
-				return nil, invalidf("messages", "an assistant message cannot hold a "+string(b.Type)+" block")
-			}
-		}
-		switch {
-		case len(texts) > 0:
-			// Assistant text is one string (clients read message.content as a string); Anthropic splits one
-			// answer into several text blocks only around citations, so the blocks are joined without a separator.
-			if joined, ok := textOnly(texts); ok {
-				msg.Content = mustMarshalNoEscape(joined)
-			} else {
-				msg.Content = openAIParts(texts)
-			}
-		case len(msg.ToolCalls) > 0:
-			msg.Content = json.RawMessage("null")
-		default:
-			msg.Content = mustMarshalNoEscape("")
-		}
-		if hasReasoning {
-			r := reasoning.String()
-			msg.ReasoningContent = &r
-		}
-		return []openAIMessageOut{msg}, nil
+		msg, err := openAIAssistantMessage(m.Blocks)
+		msg.Name = name
+		return []openAIMessageOut{msg}, err
 	}
 	return nil, invalidf("messages", "unknown role "+string(m.Role))
+}
+
+// openAIUserMessages encodes a user turn: each tool result becomes a tool message, each run of text (and
+// opaque) blocks a user message.
+func openAIUserMessages(blocks []Block, name string) ([]openAIMessageOut, error) {
+	var out []openAIMessageOut
+	var run []Block
+	flush := func() {
+		if len(run) > 0 {
+			out = append(out, openAIMessageOut{Role: "user", Content: openAIParts(run), Name: name})
+			run = nil
+		}
+	}
+	for _, b := range blocks {
+		switch b.Type {
+		case BlockToolResult:
+			flush()
+			out = append(out, openAIMessageOut{Role: "tool", ToolCallID: b.ID, Content: mustMarshalNoEscape(b.Text)})
+		case BlockText, BlockOpaque:
+			run = append(run, b)
+		default:
+			return nil, invalidf("messages", "a user message cannot hold a "+string(b.Type)+" block")
+		}
+	}
+	flush()
+	if len(out) == 0 { // an empty user message
+		out = append(out, openAIMessageOut{Role: "user", Content: mustMarshalNoEscape(""), Name: name})
+	}
+	return out, nil
+}
+
+// openAIAssistantMessage encodes an assistant turn: text as content, thinking as reasoning_content, tool
+// calls as tool_calls.
+func openAIAssistantMessage(blocks []Block) (openAIMessageOut, error) {
+	msg := openAIMessageOut{Role: "assistant"}
+	var texts []Block
+	var reasoning *string
+	for _, b := range blocks {
+		switch b.Type {
+		case BlockText, BlockOpaque:
+			texts = append(texts, b)
+		case BlockThinking:
+			r := b.Text
+			if reasoning != nil {
+				r = *reasoning + r
+			}
+			reasoning = &r
+		case BlockToolCall:
+			args := b.Arguments
+			if args == "" {
+				args = "{}"
+			}
+			msg.ToolCalls = append(msg.ToolCalls, openAIToolCall{ID: b.ID, Type: "function",
+				Function: openAIFunctionCall{Name: b.Name, Arguments: &args}})
+		default:
+			return openAIMessageOut{}, invalidf("messages", "an assistant message cannot hold a "+string(b.Type)+" block")
+		}
+	}
+	msg.ReasoningContent = reasoning
+	switch {
+	case len(texts) > 0:
+		// Assistant text is one string (clients read message.content as a string); Anthropic splits one
+		// answer into several text blocks only around citations, so the blocks are joined without a separator.
+		if joined, ok := textOnly(texts); ok {
+			msg.Content = mustMarshalNoEscape(joined)
+		} else {
+			msg.Content = openAIParts(texts)
+		}
+	case len(msg.ToolCalls) > 0:
+		msg.Content = json.RawMessage("null")
+	default:
+		msg.Content = mustMarshalNoEscape("")
+	}
+	return msg, nil
 }
 
 // --- responses ---

@@ -37,44 +37,45 @@ func (d *openAIStreamDecoder) Done() bool { return d.done }
 func (d *openAIStreamDecoder) Usage() (Usage, bool) { return d.usage, d.hasUsage }
 
 type openAIChunkIn struct {
-	ID      string `json:"id"`
-	Model   string `json:"model"`
-	Created int64  `json:"created"`
-	Choices []struct {
-		Index int `json:"index"`
-		Delta struct {
-			Content          *string `json:"content"`
-			ReasoningContent *string `json:"reasoning_content"`
-			ToolCalls        []struct {
-				Index    *int   `json:"index"`
-				ID       string `json:"id"`
-				Function struct {
-					Name      string `json:"name"`
-					Arguments string `json:"arguments"`
-				} `json:"function"`
-			} `json:"tool_calls"`
-		} `json:"delta"`
-		FinishReason *string        `json:"finish_reason"`
-		Usage        *openAIUsageIn `json:"usage"`
-	} `json:"choices"`
-	Usage *openAIUsageIn `json:"usage"`
-	Error *struct {
+	ID      string           `json:"id"`
+	Model   string           `json:"model"`
+	Created int64            `json:"created"`
+	Choices []openAIChoiceIn `json:"choices"`
+	Usage   *openAIUsageIn   `json:"usage"`
+	Error   *struct {
 		Message string          `json:"message"`
 		Type    string          `json:"type"`
 		Code    json.RawMessage `json:"code"`
 	} `json:"error"`
 }
 
+type openAIChoiceIn struct {
+	Index int `json:"index"`
+	Delta struct {
+		Content          *string               `json:"content"`
+		ReasoningContent *string               `json:"reasoning_content"`
+		ToolCalls        []openAIToolCallDelta `json:"tool_calls"`
+	} `json:"delta"`
+	FinishReason *string        `json:"finish_reason"`
+	Usage        *openAIUsageIn `json:"usage"` // some providers put usage in the last choice
+}
+
+type openAIToolCallDelta struct {
+	Index    *int   `json:"index"`
+	ID       string `json:"id"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
 func (d *openAIStreamDecoder) Decode(ev SSEEvent) ([]Event, error) {
-	if d.done {
-		return nil, nil
-	}
 	data := strings.TrimSpace(ev.Data)
-	if data == "[DONE]" {
-		return d.end(), nil
-	}
-	if data == "" {
+	switch {
+	case d.done || data == "":
 		return nil, nil
+	case data == "[DONE]":
+		return d.end(), nil
 	}
 	var c openAIChunkIn
 	if err := json.Unmarshal([]byte(data), &c); err != nil {
@@ -100,46 +101,64 @@ func (d *openAIStreamDecoder) Decode(ev SSEEvent) ([]Event, error) {
 		if ch.Index != 0 {
 			continue // only the first choice (n > 1 is not converted)
 		}
-		if ch.Usage != nil {
-			d.usage, d.hasUsage = ch.Usage.neutral(), true
+		var err error
+		if out, err = d.choice(out, ch); err != nil {
+			return nil, err
 		}
-		dl := ch.Delta
-		if dl.ReasoningContent != nil && *dl.ReasoningContent != "" {
-			out = d.ensure(out, BlockThinking)
-			out = append(out, Event{Type: EventBlockDelta, Index: d.open, Text: *dl.ReasoningContent})
+	}
+	return out, nil
+}
+
+// choice turns the delta of the first choice into events.
+func (d *openAIStreamDecoder) choice(out []Event, ch openAIChoiceIn) ([]Event, error) {
+	if ch.Usage != nil {
+		d.usage, d.hasUsage = ch.Usage.neutral(), true
+	}
+	dl := ch.Delta
+	if dl.ReasoningContent != nil && *dl.ReasoningContent != "" {
+		out = d.ensure(out, BlockThinking)
+		out = append(out, Event{Type: EventBlockDelta, Index: d.open, Text: *dl.ReasoningContent})
+	}
+	if dl.Content != nil && *dl.Content != "" {
+		out = d.ensure(out, BlockText)
+		out = append(out, Event{Type: EventBlockDelta, Index: d.open, Text: *dl.Content})
+	}
+	for pos, tc := range dl.ToolCalls {
+		var err error
+		if out, err = d.toolCall(out, pos, tc); err != nil {
+			return nil, err
 		}
-		if dl.Content != nil && *dl.Content != "" {
-			out = d.ensure(out, BlockText)
-			out = append(out, Event{Type: EventBlockDelta, Index: d.open, Text: *dl.Content})
-		}
-		for pos, tc := range dl.ToolCalls {
-			ti := pos
-			if tc.Index != nil {
-				ti = *tc.Index
-			}
-			bi, known := d.tools[ti]
-			if !known {
-				if tc.ID == "" && tc.Function.Name == "" {
-					return nil, fmt.Errorf("%w: tool call %d has no id or name", ErrBadStream, ti)
-				}
-				out = d.close(out)
-				bi = d.next
-				d.next++
-				d.tools[ti] = bi
-				d.open, d.openType = bi, BlockToolCall
-				out = append(out, Event{Type: EventBlockStart, Index: bi, Block: BlockToolCall, ToolID: tc.ID, ToolName: tc.Function.Name})
-			} else if bi != d.open {
-				return nil, fmt.Errorf("%w: interleaved tool call deltas", ErrBadStream)
-			}
-			if tc.Function.Arguments != "" {
-				out = append(out, Event{Type: EventBlockDelta, Index: bi, Arguments: tc.Function.Arguments})
-			}
-		}
-		if ch.FinishReason != nil && *ch.FinishReason != "" {
-			out = d.close(out)
-			f := *ch.FinishReason
-			d.finish = &f
-		}
+	}
+	if ch.FinishReason != nil && *ch.FinishReason != "" {
+		out = d.close(out)
+		f := *ch.FinishReason
+		d.finish = &f
+	}
+	return out, nil
+}
+
+// toolCall turns one tool call delta into events: a new tool index opens a tool_call block.
+func (d *openAIStreamDecoder) toolCall(out []Event, pos int, tc openAIToolCallDelta) ([]Event, error) {
+	ti := pos
+	if tc.Index != nil {
+		ti = *tc.Index
+	}
+	bi, known := d.tools[ti]
+	switch {
+	case !known && tc.ID == "" && tc.Function.Name == "":
+		return nil, fmt.Errorf("%w: tool call %d has no id or name", ErrBadStream, ti)
+	case !known:
+		out = d.close(out)
+		bi = d.next
+		d.next++
+		d.tools[ti] = bi
+		d.open, d.openType = bi, BlockToolCall
+		out = append(out, Event{Type: EventBlockStart, Index: bi, Block: BlockToolCall, ToolID: tc.ID, ToolName: tc.Function.Name})
+	case bi != d.open:
+		return nil, fmt.Errorf("%w: interleaved tool call deltas", ErrBadStream)
+	}
+	if tc.Function.Arguments != "" {
+		out = append(out, Event{Type: EventBlockDelta, Index: bi, Arguments: tc.Function.Arguments})
 	}
 	return out, nil
 }
@@ -261,37 +280,9 @@ func (e *openAIStreamEncoder) Encode(ev Event) ([]byte, error) {
 		empty := ""
 		return e.chunk(openAIDelta{Role: "assistant", Content: &empty}, nil), nil
 	case EventBlockStart:
-		e.types[ev.Index] = ev.Block
-		if ev.Block != BlockToolCall {
-			return nil, nil
-		}
-		ti := len(e.tools)
-		e.tools[ev.Index] = ti
-		empty := ""
-		return e.chunk(openAIDelta{ToolCalls: []openAIToolCall{{Index: &ti, ID: ev.ToolID, Type: "function",
-			Function: openAIFunctionCall{Name: ev.ToolName, Arguments: &empty}}}}, nil), nil
+		return e.blockStart(ev), nil
 	case EventBlockDelta:
-		switch e.types[ev.Index] {
-		case BlockText:
-			if ev.Text == "" {
-				return nil, nil
-			}
-			t := ev.Text
-			return e.chunk(openAIDelta{Content: &t}, nil), nil
-		case BlockThinking:
-			if ev.Text == "" {
-				return nil, nil // signatures have no OpenAI equivalent
-			}
-			t := ev.Text
-			return e.chunk(openAIDelta{ReasoningContent: &t}, nil), nil
-		case BlockToolCall:
-			if ev.Arguments == "" {
-				return nil, nil
-			}
-			ti, a := e.tools[ev.Index], ev.Arguments
-			return e.chunk(openAIDelta{ToolCalls: []openAIToolCall{{Index: &ti, Function: openAIFunctionCall{Arguments: &a}}}}, nil), nil
-		}
-		return nil, nil
+		return e.blockDelta(ev), nil
 	case EventMessageDelta:
 		if ev.Usage != nil {
 			u := *ev.Usage
@@ -301,17 +292,7 @@ func (e *openAIStreamEncoder) Encode(ev Event) ([]byte, error) {
 		return e.chunk(openAIDelta{}, &f), nil
 	case EventMessageStop:
 		e.ended = true
-		var out []byte
-		if e.opts.IncludeUsage {
-			u := Usage{}
-			if e.usage != nil {
-				u = *e.usage
-			}
-			c := openAIChunkOut{ID: e.id, Object: "chat.completion.chunk", Created: e.created, Model: e.model,
-				Choices: []openAIChunkChoice{}, Usage: openAIUsage(u)}
-			out = FormatSSE("", mustMarshalNoEscape(c))
-		}
-		return append(out, FormatSSE("", []byte("[DONE]"))...), nil
+		return e.stop(), nil
 	case EventError:
 		e.ended = true
 		info := ErrorInfo{Class: ClassUpstream, Message: "stream failed"}
@@ -321,4 +302,56 @@ func (e *openAIStreamEncoder) Encode(ev Event) ([]byte, error) {
 		return FormatSSE("", EncodeOpenAIError(info)), nil
 	}
 	return nil, nil
+}
+
+func (e *openAIStreamEncoder) blockStart(ev Event) []byte {
+	e.types[ev.Index] = ev.Block
+	if ev.Block != BlockToolCall {
+		return nil
+	}
+	ti := len(e.tools)
+	e.tools[ev.Index] = ti
+	empty := ""
+	return e.chunk(openAIDelta{ToolCalls: []openAIToolCall{{Index: &ti, ID: ev.ToolID, Type: "function",
+		Function: openAIFunctionCall{Name: ev.ToolName, Arguments: &empty}}}}, nil)
+}
+
+func (e *openAIStreamEncoder) blockDelta(ev Event) []byte {
+	var d openAIDelta
+	switch t, a := ev.Text, ev.Arguments; e.types[ev.Index] {
+	case BlockText:
+		if t == "" {
+			return nil
+		}
+		d.Content = &t
+	case BlockThinking:
+		if t == "" {
+			return nil // signatures have no OpenAI equivalent
+		}
+		d.ReasoningContent = &t
+	case BlockToolCall:
+		if a == "" {
+			return nil
+		}
+		ti := e.tools[ev.Index]
+		d.ToolCalls = []openAIToolCall{{Index: &ti, Function: openAIFunctionCall{Arguments: &a}}}
+	default:
+		return nil
+	}
+	return e.chunk(d, nil)
+}
+
+// stop is the usage chunk (when asked for) and [DONE].
+func (e *openAIStreamEncoder) stop() []byte {
+	var out []byte
+	if e.opts.IncludeUsage {
+		u := Usage{}
+		if e.usage != nil {
+			u = *e.usage
+		}
+		c := openAIChunkOut{ID: e.id, Object: "chat.completion.chunk", Created: e.created, Model: e.model,
+			Choices: []openAIChunkChoice{}, Usage: openAIUsage(u)}
+		out = FormatSSE("", mustMarshalNoEscape(c))
+	}
+	return append(out, FormatSSE("", []byte("[DONE]"))...)
 }

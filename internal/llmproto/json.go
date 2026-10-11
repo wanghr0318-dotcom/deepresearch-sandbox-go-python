@@ -155,3 +155,111 @@ func mustMarshalNoEscape(v any) []byte {
 	}
 	return b
 }
+
+// fields reads the fields of one decoded JSON object. Absent and null fields are skipped. The first error
+// sticks: later reads do nothing, and err holds it.
+type fields struct {
+	obj    map[string]json.RawMessage
+	prefix string
+	err    error
+}
+
+func (f *fields) path(name string) string { return join(f.prefix, name) }
+
+// get returns a present, non-null field (nothing after an error).
+func (f *fields) get(name string) (json.RawMessage, bool) {
+	if f.err != nil {
+		return nil, false
+	}
+	raw, ok := f.obj[name]
+	if !ok || isNull(raw) {
+		return nil, false
+	}
+	return raw, true
+}
+
+func (f *fields) str(name string, dst *string) {
+	if raw, ok := f.get(name); ok {
+		*dst, f.err = str(raw, f.path(name))
+	}
+}
+
+// name reads a required non-empty string.
+func (f *fields) name(name string, dst *string) {
+	if f.err != nil {
+		return
+	}
+	f.str(name, dst)
+	if f.err == nil && *dst == "" {
+		f.err = invalidf(f.path(name), "must be a non-empty string")
+	}
+}
+
+func (f *fields) positive(name string, dst *int64) {
+	if raw, ok := f.get(name); ok {
+		*dst, f.err = positiveInt(raw, f.path(name))
+	}
+}
+
+func (f *fields) number(name string, dst **float64) {
+	if raw, ok := f.get(name); ok {
+		*dst, f.err = number(raw, f.path(name))
+	}
+}
+
+func (f *fields) boolean(name string, dst *bool) {
+	if raw, ok := f.get(name); ok {
+		*dst, f.err = boolean(raw, f.path(name))
+	}
+}
+
+func (f *fields) boolPtr(name string, dst **bool) {
+	if raw, ok := f.get(name); ok {
+		var b bool
+		if b, f.err = boolean(raw, f.path(name)); f.err == nil {
+			*dst = &b
+		}
+	}
+}
+
+// schema reads a required JSON object verbatim.
+func (f *fields) schema(name string, dst *json.RawMessage) {
+	if f.err != nil {
+		return
+	}
+	if _, f.err = object(f.obj[name], f.path(name)); f.err == nil {
+		*dst = clone(f.obj[name])
+	}
+}
+
+// steps runs decoding steps in order and returns the first error.
+func steps(fns ...func() error) error {
+	for _, fn := range fns {
+		if err := fn(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// recordExtras keeps the given top-level fields verbatim in req.Extras and records the format-only ones
+// (classify returns ok=false for values that are no-ops in the other format).
+func recordExtras(req *Request, obj map[string]json.RawMessage, names []string, classify func(string, json.RawMessage) (FeatureKind, bool)) {
+	for _, name := range names {
+		raw, ok := obj[name]
+		if !ok {
+			continue
+		}
+		if req.Extras == nil {
+			req.Extras = map[string]json.RawMessage{}
+		}
+		req.Extras[name] = clone(raw)
+		if kind, ok := classify(name, raw); ok {
+			req.Features = append(req.Features, Feature{Field: name, Kind: kind})
+		}
+	}
+}
+
+func (r *Request) feature(field string, kind FeatureKind) {
+	r.Features = append(r.Features, Feature{Field: field, Kind: kind})
+}
