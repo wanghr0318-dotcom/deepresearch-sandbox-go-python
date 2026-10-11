@@ -53,14 +53,14 @@ type BudgetDiff struct {
 
 // Report is the result of reconciling a month.
 type Report struct {
-	Month   string       `json:"month"`
-	Raw     Totals       `json:"raw"`    // the month recomputed from the raw holds
-	Rollup  Totals       `json:"rollup"` // the month in usage_daily
-	Usage   []Diff       `json:"usage_differences"`
+	Month  string `json:"month"`
+	Raw    Totals `json:"raw"`    // the month recomputed from the raw holds
+	Rollup Totals `json:"rollup"` // the month in usage_daily
+	Usage  []Diff `json:"usage_differences"`
 	// SkippedFrom is the first day whose usage_daily rows were not compared (not final yet: on or after the rollup
 	// watermark, when reconciling without a rollup); empty when every day was compared.
-	SkippedFrom string `json:"skipped_from,omitempty"`
-	Budgets []BudgetDiff `json:"budget_differences"`
+	SkippedFrom string       `json:"skipped_from,omitempty"`
+	Budgets     []BudgetDiff `json:"budget_differences"`
 	// Names for printing (filled by the store).
 	OrgNames  map[int64]string `json:"-"`
 	Usernames map[int64]string `json:"-"`
