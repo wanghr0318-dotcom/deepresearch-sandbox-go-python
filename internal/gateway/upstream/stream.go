@@ -59,6 +59,13 @@ type StreamInfo interface {
 	Converted() bool
 }
 
+// RawStream 是 DoStream 返回的流的原文视图（类型断言取得）：请求格式与路由格式相同（原样转发）时，TakeRaw 返回自
+// 上次调用以来读到的供应商 SSE 事件原文（含 ping、[DONE] 等不产生中立事件的事件），ok 为 true；经过格式转换的流
+// ok 为 false。模型 API 据此把同格式的流逐个事件原样转发给客户端（§7.3），同时照常经 Next 读取用量与完整性。
+type RawStream interface {
+	TakeRaw() (events []llmproto.SSEEvent, ok bool)
+}
+
 var _ ChatAdapter = (*chatAdapter)(nil)
 
 // errorBodyMax 是流式请求得到 HTTP 错误时读取（并丢弃）的响应体上限。
@@ -86,6 +93,9 @@ func (a *chatAdapter) DoStream(ctx context.Context, route int, body []byte, prot
 	}
 	st := &eventStream{body: resp.Body, cancel: cancel, rd: llmproto.NewEventReader(resp.Body, rt.protocol),
 		dropped: dropped, converted: proto != rt.protocol}
+	if !st.converted {
+		st.rd.OnSSE(func(ev llmproto.SSEEvent) { st.raw = append(st.raw, ev) })
+	}
 	if e := st.prefetch(ctx); e != nil {
 		_ = st.Close()
 		return nil, e
@@ -311,6 +321,7 @@ type eventStream struct {
 	rd        *llmproto.EventReader
 	dropped   []string
 	converted bool
+	raw       []llmproto.SSEEvent // 原样转发时读到而尚未取走的 SSE 事件原文（TakeRaw）
 	closeOnce sync.Once
 
 	mu      sync.Mutex       // 保护 pending 与 closed（Close 可能与 Next 在不同 goroutine 中调用）
@@ -358,4 +369,14 @@ func (s *eventStream) Close() error {
 }
 
 func (s *eventStream) Dropped() []string { return s.dropped }
+
+// TakeRaw 实现 RawStream。
+func (s *eventStream) TakeRaw() ([]llmproto.SSEEvent, bool) {
+	if s.converted {
+		return nil, false
+	}
+	out := s.raw
+	s.raw = nil
+	return out, true
+}
 func (s *eventStream) Converted() bool   { return s.converted }

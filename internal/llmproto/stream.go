@@ -93,7 +93,13 @@ type EventReader struct {
 	dec   StreamDecoder
 	queue []Event
 	err   error
+	onSSE func(SSEEvent)
 }
+
+// OnSSE sets f to be called with every SSE event read, before it is decoded (a same-format gateway forwards the
+// provider's events verbatim while still decoding them for usage and completeness). Events read so far are
+// not replayed.
+func (r *EventReader) OnSSE(f func(SSEEvent)) { r.onSSE = f }
 
 // NewEventReader reads the SSE body r of a provider of format p.
 func NewEventReader(r io.Reader, p Protocol) *EventReader {
@@ -124,6 +130,9 @@ func (r *EventReader) Next() (Event, error) {
 			}
 			r.err = err
 			continue
+		}
+		if r.onSSE != nil {
+			r.onSSE(ev)
 		}
 		evs, err := r.dec.Decode(ev)
 		if err != nil {

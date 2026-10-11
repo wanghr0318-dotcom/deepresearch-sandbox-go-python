@@ -350,3 +350,25 @@ func TestOnlyEmptyAssistant(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// OnSSE sees every SSE event before it is decoded, including those that produce no event (ping).
+func TestEventReaderOnSSE(t *testing.T) {
+	body := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n" +
+		"event: ping\ndata: {\"type\":\"ping\"}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	rd := NewEventReader(strings.NewReader(body), ProtocolAnthropic)
+	var seen []string
+	rd.OnSSE(func(ev SSEEvent) { seen = append(seen, ev.Event) })
+	for {
+		if _, err := rd.Next(); err != nil {
+			if !errors.Is(err, io.EOF) {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+	if strings.Join(seen, ",") != "message_start,ping,message_delta,message_stop" {
+		t.Fatalf("seen %v", seen)
+	}
+}
