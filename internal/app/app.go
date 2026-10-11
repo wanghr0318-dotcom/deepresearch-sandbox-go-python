@@ -52,6 +52,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/session"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/task"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/tenant"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/usage"
 )
 
 // ErrOwnershipLost 是失去数据库所有权后 Run 返回的错误（errors.Is 同时匹配 persistence.ErrOwnershipLost）。
@@ -1459,6 +1460,7 @@ func (s *server) startAPI() error {
 	var keys api.KeyVerifier
 	var quotas quota.Store
 	var limiter ratelimit.Limiter
+	var usages usage.Store
 	if s.cfg.Accounts {
 		accounts = notifyingAccounts{Accounts: s.store, n: store}
 		// 平台 API key（G1）：pepper 已在迁移之后核对（EnsurePepper）。
@@ -1484,6 +1486,15 @@ func (s *server) startAPI() error {
 					s.convertStaleLedger(s.apiCtx, st)
 				}()
 			}
+			if us, ok := s.store.(usageStorer); ok { // 模型网关 G5：用量与账单端点、周期汇总
+				u := us.Usage()
+				usages = u
+				s.bg.Add(1)
+				go func() {
+					defer s.bg.Done()
+					s.rollupUsage(s.apiCtx, u, 0)
+				}()
+			}
 		}
 	}
 	var modelAPI http.Handler // 未启用时保持 nil 接口：模型 API 的路径与今天一样是 404
@@ -1507,7 +1518,7 @@ func (s *server) startAPI() error {
 		EffectiveLimits: s.cfg.effectiveLimits, CacheMetrics: s.cacheMetrics,
 		Accounts: accounts, ResearchSpec: s.cfg.researchSpec, SecureCookies: tlsCfg != nil,
 		Sessions: sessions, TurnSpec: s.cfg.turnSpec, ServerInfo: s.serverInfo,
-		Tenancy: tenancy, APIKeys: keys, Quota: quotas, RateLimiter: limiter, ModelAPI: modelAPI,
+		Tenancy: tenancy, APIKeys: keys, Quota: quotas, RateLimiter: limiter, ModelAPI: modelAPI, Usage: usages,
 	})
 	if err != nil {
 		_ = ln.Close()

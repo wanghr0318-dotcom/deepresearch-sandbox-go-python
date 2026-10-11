@@ -37,7 +37,7 @@ func TestConsumersDoNotDependOnPostgres(t *testing.T) {
 		"internal/ownership", "internal/persistence", "internal/datadir", "internal/blob",
 		"internal/gateway/call", "internal/gateway/edge", "internal/gateway/upstream", "internal/gateway/cache",
 		"internal/gateway/workspace", "internal/gateway/mcp", "internal/tenant", "internal/apikey", "internal/quota", "internal/ratelimit",
-		"internal/modelapi",
+		"internal/modelapi", "internal/usage",
 	} {
 		forbid(t, pkg, forbidden)
 	}
@@ -425,12 +425,13 @@ func TestDoctorUsesPublicSurfacesOnly(t *testing.T) {
 	}
 }
 
-// TestQuotaLayering：ratelimit 只依赖标准库（Redis 客户端经 Evaler 接口传入）；quota 只依赖 tenant 与标准库
+// TestQuotaLayering：ratelimit 只依赖标准库（Redis 客户端经 Evaler 接口传入）；quota 与 usage 只依赖 tenant 与标准库
 // （模型网关设计 2026-10-11 §3；PostgreSQL 实现在 internal/persistence/postgres）。
 func TestQuotaLayering(t *testing.T) {
 	for pkg, allowed := range map[string][]string{
 		"internal/ratelimit": {module + "/internal/ratelimit"},
 		"internal/quota":     {module + "/internal/quota", module + "/internal/tenant"},
+		"internal/usage":     {module + "/internal/usage", module + "/internal/tenant"},
 	} {
 		for _, d := range deps(t, pkg) {
 			if first, _, _ := strings.Cut(d, "/"); strings.Contains(first, ".") && !slices.Contains(allowed, d) {

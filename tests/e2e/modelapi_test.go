@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -17,7 +18,9 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/llmproto"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/modelapi"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence/postgres"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/quota"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/usage"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/tests/e2e/fakeupstream"
 )
 
@@ -28,6 +31,11 @@ func (s gatedStore) Quota() quota.Store {
 
 func (s gatedStore) ModelRequests() modelapi.Store {
 	return s.Store.(interface{ ModelRequests() modelapi.Store }).ModelRequests()
+}
+
+// Usage passes the usage store through the gate (G5: the usage endpoints and the periodic rollup).
+func (s gatedStore) Usage() usage.Store {
+	return s.Store.(interface{ Usage() usage.Store }).Usage()
 }
 
 // The model API wired by app.Run (--model-api, model gateway G3): a user registers, mints a models-scoped key, and
@@ -120,6 +128,40 @@ func TestModelAPIEndToEnd(t *testing.T) {
 	}
 	if n != 4 || settled != 4 {
 		t.Fatalf("model_requests: %d rows, %d settled at their cost", n, settled)
+	}
+
+	// G5: after a rollup (the server's runs every minute; this one is direct), the four requests are the user's usage
+	// and bill, by model; an API key cannot read usage.
+	ps, err := postgres.Open(context.Background(), postgres.Options{DSN: h.dsn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ps.Close()
+	if _, err := ps.UsageStore().Rollup(context.Background(), time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	var u struct {
+		Rows []struct {
+			Model  string `json:"model"`
+			Source string `json:"source"`
+			usage.Totals
+		} `json:"rows"`
+	}
+	st, b = do("GET", "/v1/usage?group_by=model,source", "", map[string]string{"Cookie": cookie})
+	if st != 200 || json.Unmarshal(b, &u) != nil || len(u.Rows) != 1 || u.Rows[0].Model != model || u.Rows[0].Source != "model_api" ||
+		u.Rows[0].Requests != 4 || u.Rows[0].CostMicro <= 0 || u.Rows[0].PromptTokens <= 0 {
+		t.Fatalf("usage: %d %s", st, b)
+	}
+	st, b = do("GET", "/v1/bills/"+time.Now().UTC().Format("2006-01"), "", map[string]string{"Cookie": cookie})
+	if st != 200 || !strings.Contains(string(b), `"model":"`+model+`"`) || !strings.Contains(string(b), `"requests":4`) {
+		t.Fatalf("bill: %d %s", st, b)
+	}
+	if st, b := do("GET", "/v1/usage", "", auth); st != 403 || !strings.Contains(string(b), "permission_denied") {
+		t.Fatalf("usage with a key: %d %s", st, b)
+	}
+	rep, err := ps.UsageStore().Reconcile(context.Background(), time.Now(), true)
+	if err != nil || !rep.OK() || rep.Raw.Requests != 4 {
+		t.Fatalf("reconcile: %+v %v", rep, err)
 	}
 	h.finish()
 }
