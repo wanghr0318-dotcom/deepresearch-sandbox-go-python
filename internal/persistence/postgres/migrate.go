@@ -28,6 +28,7 @@ var agentboxTables = []string{
 	"artifact_heads", "artifacts", "budgets", "calls", "call_tries", "reservations", "users", "sessions", "auth_sessions",
 	"session_control", "session_progress", "session_event_seq", "session_events", "incarnations", "subruns", "subrun_budgets",
 	"exec_quotas", "orgs", "org_members", "org_invites", "api_keys", "apikey_pepper", "limits", "quota_budgets", "quota_holds",
+	"model_requests", "model_request_tries",
 }
 
 // inspectTablesSQL 在同一份目录中查三组表名是否存在：pg_catalog 限定 current_schema()。
