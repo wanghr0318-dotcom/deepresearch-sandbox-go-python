@@ -94,7 +94,11 @@ func (a *chatAdapter) DoStream(ctx context.Context, route int, body []byte, prot
 	st := &eventStream{body: resp.Body, cancel: cancel, rd: llmproto.NewEventReader(resp.Body, rt.protocol),
 		dropped: dropped, converted: proto != rt.protocol}
 	if !st.converted {
-		st.rd.OnSSE(func(ev llmproto.SSEEvent) { st.raw = append(st.raw, ev) })
+		st.rd.OnSSE(func(ev llmproto.SSEEvent) {
+			st.mu.Lock()
+			st.raw = append(st.raw, ev)
+			st.mu.Unlock()
+		})
 	}
 	if e := st.prefetch(ctx); e != nil {
 		_ = st.Close()
@@ -321,11 +325,11 @@ type eventStream struct {
 	rd        *llmproto.EventReader
 	dropped   []string
 	converted bool
-	raw       []llmproto.SSEEvent // 原样转发时读到而尚未取走的 SSE 事件原文（TakeRaw）
 	closeOnce sync.Once
 
-	mu      sync.Mutex       // 保护 pending 与 closed（Close 可能与 Next 在不同 goroutine 中调用）
-	pending []llmproto.Event // 预读的事件，由 Next 重放
+	mu      sync.Mutex          // 保护 pending、raw 与 closed（Close 可能与 Next 在不同 goroutine 中调用）
+	pending []llmproto.Event    // 预读的事件，由 Next 重放
+	raw     []llmproto.SSEEvent // 原样转发时读到而尚未取走的 SSE 事件原文（TakeRaw）
 	closed  bool
 }
 
@@ -359,7 +363,7 @@ func (s *eventStream) Usage() (llmproto.Usage, bool) { return s.rd.Usage() }
 
 func (s *eventStream) Close() error {
 	s.mu.Lock()
-	s.closed, s.pending = true, nil
+	s.closed, s.pending, s.raw = true, nil, nil
 	s.mu.Unlock()
 	s.closeOnce.Do(func() {
 		s.cancel()
@@ -375,8 +379,11 @@ func (s *eventStream) TakeRaw() ([]llmproto.SSEEvent, bool) {
 	if s.converted {
 		return nil, false
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	out := s.raw
 	s.raw = nil
 	return out, true
 }
-func (s *eventStream) Converted() bool   { return s.converted }
+
+func (s *eventStream) Converted() bool { return s.converted }
