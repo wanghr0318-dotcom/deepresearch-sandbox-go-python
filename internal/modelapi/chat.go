@@ -372,7 +372,11 @@ func (x *exchange) collect(ctx context.Context, s upstream.Stream, pick call.Rou
 		x.usage, x.usageKnown = llmproto.Usage{}, false
 		e := &upstream.Error{Outcome: upstream.OutcomeUnknown, Status: http.StatusBadGateway, Code: upstream.CodeUpstreamUnconfirmed}
 		x.lastErr = e
-		return !call.Failover(ctx, e)
+		if call.Failover(ctx, e) {
+			return false
+		}
+		x.fail(ctx) // no failover (the client left or the maximum duration passed): answer now
+		return true
 	}
 	resp := col.Response()
 	if resp.Created == 0 {

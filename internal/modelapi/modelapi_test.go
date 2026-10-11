@@ -442,11 +442,21 @@ func TestMaxDuration(t *testing.T) {
 	if r.ErrorCode != codeMaxDuration || *r.StreamComplete {
 		t.Fatalf("record %+v", r)
 	}
+	// A non-stream reply still being collected at the limit: an error in the client's format, no failover.
+	resp = e.post(context.Background(), llmproto.ProtocolOpenAI, chatBody(llmproto.ProtocolOpenAI, "m-1", false, ""))
+	code, msg := errorOf(t, llmproto.ProtocolOpenAI, readAll(t, resp))
+	if resp.StatusCode != 502 || code != "upstream_error" || !strings.Contains(msg, "maximum duration") {
+		t.Fatalf("%d %s %s", resp.StatusCode, code, msg)
+	}
+	if r = e.record(); r.Status != 502 || r.ErrorCode != codeMaxDuration || len(r.Tries) != 1 || r.Tries[0].Outcome != "unknown" ||
+		e.holder.get(r.HoldID).state != quota.StateChargedUnknown {
+		t.Fatalf("record %+v", r)
+	}
 
 	e2 := newEnv(t, modeOpenAI, func(c *Config) { c.MaxDuration = 300 * time.Millisecond })
 	e2.p.Inject(fakeupstream.Chat, 1, fakeupstream.Action{Hang: true})
 	resp = e2.post(context.Background(), llmproto.ProtocolOpenAI, chatBody(llmproto.ProtocolOpenAI, "m-1", false, ""))
-	code, msg := errorOf(t, llmproto.ProtocolOpenAI, readAll(t, resp))
+	code, msg = errorOf(t, llmproto.ProtocolOpenAI, readAll(t, resp))
 	if resp.StatusCode != 502 || code != "upstream_error" || !strings.Contains(msg, "maximum duration") {
 		t.Fatalf("%d %s %s", resp.StatusCode, code, msg)
 	}
