@@ -114,7 +114,7 @@ func (qs *quotaServer) acme(t *testing.T) (alice, bob, carol string, org int64) 
 	expect(t, st, body, 201, "")
 	var o orgJSON
 	decodeJSONBody(t, body, &o)
-	st, body, _ = qs.do("POST", "/v1/orgs/members", `{"username":"bob","role":"member"}`, session(alice))
+	st, body, _ = qs.do("POST", "/v1/orgs/members", `{"username":"bob","role":"member","org":"acme"}`, adminAuth)
 	expect(t, st, body, 200, "")
 	return alice, bob, carol, o.ID
 }
