@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -236,6 +238,33 @@ type messagesRequest struct {
 }
 
 // systemText 是 system 字段的文本（字符串，或文本块数组的第一块）。
+// anthropicToolIDRE is the pattern the Anthropic API requires of tool_use.id and tool_result.tool_use_id.
+var anthropicToolIDRE = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// invalidToolID returns the first tool_use.id or tool_result.tool_use_id that the real API would reject
+// (400 invalid_request_error), or "".
+func (m messagesRequest) invalidToolID() string {
+	for _, msg := range m.Messages {
+		var blocks []struct {
+			Type      string `json:"type"`
+			ID        string `json:"id"`
+			ToolUseID string `json:"tool_use_id"`
+		}
+		if json.Unmarshal(msg.Content, &blocks) != nil {
+			continue // string content
+		}
+		for _, b := range blocks {
+			switch {
+			case b.Type == "tool_use" && !anthropicToolIDRE.MatchString(b.ID):
+				return b.ID
+			case b.Type == "tool_result" && !anthropicToolIDRE.MatchString(b.ToolUseID):
+				return b.ToolUseID
+			}
+		}
+	}
+	return ""
+}
+
 func (m messagesRequest) systemText() string {
 	var s string
 	if json.Unmarshal(m.System, &s) == nil {
@@ -357,6 +386,12 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request, rec *Request, 
 	var req messagesRequest
 	if err := json.Unmarshal(body, &req); err != nil || len(req.Messages) == 0 || req.MaxTokens <= 0 {
 		writeJSON(w, http.StatusBadRequest, anthropicErrBody(http.StatusBadRequest, "messages and max_tokens are required"))
+		s.setOutcome(rec, OutcomeStatus)
+		return
+	}
+	if bad := req.invalidToolID(); bad != "" {
+		writeJSON(w, http.StatusBadRequest, anthropicErrBody(http.StatusBadRequest,
+			"messages: tool id "+strconv.Quote(bad)+" does not match ^[a-zA-Z0-9_-]+$"))
 		s.setOutcome(rec, OutcomeStatus)
 		return
 	}

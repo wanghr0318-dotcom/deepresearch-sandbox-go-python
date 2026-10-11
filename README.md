@@ -43,7 +43,7 @@
 | **会话** | 每个对话是一个长期运行的沙箱进程：空闲 10 分钟冻结（cgroup freezer），1 小时后驱逐，下一条消息从最后提交的会话 checkpoint 恢复。 |
 | **Agent** | 工具调用式 Agent：渐进披露的 skill（`read_skill`）、`ask_user`、待办清单、`web_search`、`web_fetch`、`run_python`。每轮 30 次搜索与抓取，由 Gateway 强制，不靠模型自觉。 |
 | **并行 sub-run** | 同一轮内 2–4 个子主题并发执行，采用两层账本（task 与 sub-run）；可以取消，停止或崩溃后继续时，已完成的子主题不会重跑。 |
-| **模型降级链** | 一个逻辑模型可由按顺序排列的多个 OpenAI 兼容供应商提供：可重试的失败立即转下一个供应商，每次尝试都是 journal 中独立计价的 try；每个供应商一个熔断器，全部熔断时立即返回 `503 model_degraded`；可选对冲请求。重放与指纹不受影响。 |
+| **模型降级链** | 一个逻辑模型可由多个供应商提供（OpenAI 兼容或 Anthropic 格式；沙箱 Worker 始终看到 OpenAI 格式）：可重试的失败立即转下一个供应商，每次尝试都是 journal 中独立计价的 try（可按缓存读取、写入单价计）；按顺序、平滑加权轮询或首 token 延迟分配流量；每个供应商一个熔断器，全部熔断时立即返回 `503 model_degraded`；可选对冲请求。重放与指纹不受影响。 |
 | **exec 沙箱** | 模型写的 Python 每次在全新、无网络的环境中运行，有独立 UID、CPU 与墙钟配额，并收集输出文件。 |
 | **工作区工具与 MCP（可选）** | `--workspace-tools`：每轮一个工作区，`write_file` / `read_file` / `list_dir` 与 `exec_shell`（每条命令一个全新的 exec 沙箱，文件在命令之间保留，按 exec 配额记账，路径只能是工作区内的相对路径，符号链接不会保留）。`--mcp-config`：Gateway 作为 MCP 客户端（stdio 或 streamable HTTP）连接运维配置的服务器，只暴露允许清单中的工具，调用记入 journal 并计入每轮工具额度；沙箱不接触 MCP 服务器与其凭据。[设计](docs/design/2026-10-10-shell-file-mcp-design.md)、[记录](docs/evidence/2026-10-10-shell-file-mcp.md)。 |
 | **Kubernetes provider（可选）** | `--provider k8s` 把每个环境放进一个 Pod：经 pods/exec 运行镜像内的 helper 作为控制通道，非 root、只读根、丢弃全部 capability、无 ServiceAccount token、deny-all NetworkPolicy；worker 镜像按 digest 固定；预热池让环境就绪从约 1 s 降到约 10 ms。与本地 provider 通过同一套契约一致性测试。 |

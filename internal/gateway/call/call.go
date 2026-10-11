@@ -281,6 +281,9 @@ type job struct {
 	ctx      context.Context // Coordinator 自有；CancelAttempt / CancelSubrun 以取消类原因取消
 	cancel   context.CancelCauseFunc
 	span     obs.Span // 本调用的 gateway.call span（关闭时为 no-op）
+	order    []int    // 本调用的路由顺序（模型降级链；routeSet.planOrder 在 try 循环开始时算出）
+	// convertible 缓存各（非 OpenAI 格式）路由能否执行本调用（routeSet.convertible）。
+	convertible map[int]bool
 }
 
 // New 构造 Coordinator。
@@ -332,6 +335,9 @@ func New(cfg Config) (*Coordinator, error) {
 	}
 	if c.storeTimeout <= 0 {
 		c.storeTimeout = 30 * time.Second
+	}
+	if err := cfg.Routing.validate(); err != nil {
+		return nil, err
 	}
 	c.routing = cfg.Routing.withDefaults()
 	c.routes = map[upstream.Kind]*routeSet{}
@@ -1027,6 +1033,9 @@ func (c *Coordinator) execute(j *job, rec CallRecord) (Result, error) {
 	state := rec.State
 	rs := c.routes[in.Kind]
 	tried := map[int]bool{} // 本轮已失败的路由
+	if rs != nil {
+		rs.planOrder(j)
+	}
 	var lastCode string
 	var lastRetryAfter time.Duration
 	for n := 1; ; n++ {
@@ -1126,7 +1135,7 @@ func (c *Coordinator) execute(j *job, rec CallRecord) (Result, error) {
 			for _, rt := range legsTried {
 				tried[rt] = true
 			}
-			if rs.ready(j.model, tried) {
+			if rs.ready(j, tried) {
 				continue
 			}
 			tried = map[int]bool{}
@@ -1208,6 +1217,7 @@ func (c *Coordinator) runTry(ctx context.Context, j *job, rs *routeSet, l leg, t
 	r := legResult{leg: l, try: try, resp: resp, uerr: uerr, latency: c.now().Sub(start), aborted: aborted, span: span, tctx: tctx}
 	release()
 	rs.report(l, uerr, aborted)
+	rs.observe(l, uerr, aborted, r.latency, c.routing.TryTimeout)
 	c.logTry(j, rs, r, false)
 	return r, []int{l.route}
 }
@@ -1323,8 +1333,11 @@ func (c *Coordinator) cost(kind upstream.Kind, model string, u upstream.Usage, e
 	}
 	switch kind {
 	case upstream.KindChat:
-		add(u.InputTokens, p.InputMicroPerMTok, 1_000_000)
-		add(u.OutputTokens, p.OutputMicroPerMTok, 1_000_000)
+		v, ok := p.ChatCost(u) // 含缓存读取、写入单价（未设置时与输入单价合并，结果与之前相同）
+		if !ok {
+			return est
+		}
+		return v
 	case upstream.KindSearch:
 		add(int64(u.Requests), p.SearchMicroPerRequest, 1)
 	case upstream.KindFetch:

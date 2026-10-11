@@ -38,6 +38,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/mcp"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/workspace"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/llmproto"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/ownership"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
@@ -186,12 +187,16 @@ type ModelConfig struct {
 	Routing call.RoutingConfig
 }
 
-// ModelFallback 是一个后备模型供应商（OpenAI 兼容）。APIKey 来自宿主环境变量（配置给出变量名），与主供应商的 Key
-// 一样只交给 chat adapter。
+// ModelFallback 是一个后备模型供应商（OpenAI 兼容或 Anthropic 格式）。APIKey 来自宿主环境变量（配置给出变量名），
+// 与主供应商的 Key 一样只交给 chat adapter。
 type ModelFallback struct {
-	Name    string // 路由名：小写字母、数字、- 与 _，1–32 个字符，不能为 primary，不能重复
-	BaseURL string // http(s)
-	APIKey  string
+	Name string // 路由名：小写字母、数字、- 与 _，1–32 个字符，不能为 primary，不能重复
+	// Protocol 是线路格式：空或 openai（默认）、anthropic（模型网关设计 §7.6）。
+	Protocol llmproto.Protocol
+	BaseURL  string // http(s)；anthropic 时不含 /v1（请求发往 BaseURL + /v1/messages）
+	// AnthropicVersion 是 anthropic 的 anthropic-version 头；空时为默认值。只用于 anthropic。
+	AnthropicVersion string
+	APIKey           string
 	// Models 把逻辑模型（须为声明的模型）映射为该供应商的模型名；空时以同名提供全部声明的模型。
 	Models         map[string]string
 	Pricing        upstream.Pricing            // 该供应商的默认单价；Version 为空时由单价生成
@@ -203,6 +208,9 @@ const PrimaryRoute = "primary"
 
 var routeNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
+// AnthropicVersionRE 是 anthropic_version 的形式（anthropic-version 头，例如 2023-06-01）。
+var AnthropicVersionRE = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+
 // validateFallbacks 校验后备供应商：需要主供应商；路由名合法、不重复、不是 primary；地址为 http(s) 且通过出站
 // 防护（§9.8；私有地址与 localhost 须在 allowPrivate 中，否则每次转到它都会被拒绝）；映射与按模型单价只涉及
 // 声明的模型；单价非负；熔断、超时与对冲参数非负，每 try 超时与对冲只在有后备供应商时可用。
@@ -212,6 +220,9 @@ func (m ModelConfig) validateFallbacks(allowPrivate []string) error {
 		return errors.New("app: 降级链的熔断、每 try 超时与对冲参数不能为负")
 	}
 	if len(m.Fallbacks) == 0 {
+		if r.Mode != "" || len(r.Weights) > 0 {
+			return errors.New("app: 路由模式与权重需要后备供应商（--model-fallback-file）")
+		}
 		if r.TryTimeout > 0 || r.HedgeDelay > 0 {
 			return errors.New("app: 每 try 超时与对冲（--model-try-timeout、--model-hedge-delay）需要后备供应商（--model-fallback-file）")
 		}
@@ -227,6 +238,18 @@ func (m ModelConfig) validateFallbacks(allowPrivate []string) error {
 			return fmt.Errorf("app: 后备供应商名 %q 须为 1–32 个小写字母、数字、- 或 _，不能重复，也不能为 %s", fb.Name, PrimaryRoute)
 		}
 		seen[fb.Name] = true
+		switch fb.Protocol {
+		case "", llmproto.ProtocolOpenAI:
+			if fb.AnthropicVersion != "" {
+				return fmt.Errorf("app: 后备供应商 %s 的 anthropic_version 只用于 protocol anthropic", fb.Name)
+			}
+		case llmproto.ProtocolAnthropic:
+			if fb.AnthropicVersion != "" && !AnthropicVersionRE.MatchString(fb.AnthropicVersion) {
+				return fmt.Errorf("app: 后备供应商 %s 的 anthropic_version %q 须为 YYYY-MM-DD 形式的日期", fb.Name, fb.AnthropicVersion)
+			}
+		default:
+			return fmt.Errorf("app: 后备供应商 %s 的 protocol 须为 openai 或 anthropic，得到 %q", fb.Name, fb.Protocol)
+		}
 		u, err := url.Parse(fb.BaseURL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("app: 后备供应商 %s 的地址须为 http(s) URL", fb.Name)
@@ -246,13 +269,36 @@ func (m ModelConfig) validateFallbacks(allowPrivate []string) error {
 				return fmt.Errorf("app: 后备供应商 %s 的模型映射 %q → %q：逻辑模型须已声明、供应商模型名非空", fb.Name, logical, vendor)
 			}
 		}
-		if fb.Pricing.InputMicroPerMTok < 0 || fb.Pricing.OutputMicroPerMTok < 0 {
+		if negativePrice(fb.Pricing) {
 			return fmt.Errorf("app: 后备供应商 %s 的单价不能为负数", fb.Name)
 		}
 		for model, p := range fb.PricingByModel {
-			if !m.declared(model) || p.InputMicroPerMTok < 0 || p.OutputMicroPerMTok < 0 {
+			if !m.declared(model) || negativePrice(p) {
 				return fmt.Errorf("app: 后备供应商 %s 的模型 %q 单价：模型须已声明、单价非负", fb.Name, model)
 			}
+		}
+	}
+	return m.validateRoutingMode(seen)
+}
+
+func negativePrice(p upstream.Pricing) bool {
+	return p.InputMicroPerMTok < 0 || p.OutputMicroPerMTok < 0 || p.CacheReadMicroPerMTok < 0 || p.CacheWriteMicroPerMTok < 0
+}
+
+// validateRoutingMode 校验路由模式与权重（模型网关设计 §7.6）：模式为 ordered、weighted 或 latency（空为默认），
+// 权重 ≥ 1 且只给出存在的路由。
+func (m ModelConfig) validateRoutingMode(routes map[string]bool) error {
+	switch m.Routing.Mode {
+	case "", call.RoutingOrdered, call.RoutingWeighted, call.RoutingLatency:
+	default:
+		return fmt.Errorf("app: 路由模式须为 ordered、weighted 或 latency，得到 %q", m.Routing.Mode)
+	}
+	if m.Routing.Mode == call.RoutingOrdered && len(m.Routing.Weights) > 0 {
+		return errors.New("app: 路由模式 ordered 不使用权重（权重只用于 weighted 与 latency）")
+	}
+	for name, w := range m.Routing.Weights {
+		if !routes[name] || w < 1 {
+			return fmt.Errorf("app: 路由 %q 的权重 %d：须为存在的路由、至少为 1", name, w)
 		}
 	}
 	return nil
@@ -279,7 +325,11 @@ func withPricingVersions(m map[string]upstream.Pricing) map[string]upstream.Pric
 }
 
 func configPricingVersion(p upstream.Pricing) string {
-	return fmt.Sprintf("config/in=%d,out=%d", p.InputMicroPerMTok, p.OutputMicroPerMTok)
+	v := fmt.Sprintf("config/in=%d,out=%d", p.InputMicroPerMTok, p.OutputMicroPerMTok)
+	if p.CacheReadMicroPerMTok != 0 || p.CacheWriteMicroPerMTok != 0 { // 只在设置了缓存单价时出现（旧配置的版本不变）
+		v += fmt.Sprintf(",cache_read=%d,cache_write=%d", p.CacheReadMicroPerMTok, p.CacheWriteMicroPerMTok)
+	}
+	return v
 }
 
 // workerEnvAllowed 是沙箱内 Worker 环境变量的白名单（Config.WorkerEnv 的键）：凭据不能经由环境变量进入沙箱。
@@ -869,7 +919,7 @@ func (s *server) assembleGateway(blobs blob.Store) error {
 			names = append(names, fb.Name)
 		}
 		s.log.Info("模型降级链已启用", "routes", strings.Join(names, ","), "try_timeout", s.cfg.Model.Routing.TryTimeout,
-			"hedge_delay", s.cfg.Model.Routing.HedgeDelay)
+			"hedge_delay", s.cfg.Model.Routing.HedgeDelay, "routing_mode", s.cfg.Model.Routing.EffectiveMode())
 	}
 	if err := s.assembleCache(blobs); err != nil {
 		return err

@@ -38,11 +38,13 @@ type Request struct {
 	Deadline time.Time
 }
 
-// Usage 是上游返回或 adapter 计量的用量。
+// Usage 是上游返回或 adapter 计量的用量。InputTokens 是全部输入 token（OpenAI 的 prompt_tokens，含缓存）；
+// CacheReadTokens 与 CacheWriteTokens 是其中的缓存读取与缓存写入部分（供应商给出时），按各自单价计费。
 type Usage struct {
-	InputTokens, OutputTokens int64
-	Requests                  int
-	ResponseBytes             int64
+	InputTokens, OutputTokens         int64
+	CacheReadTokens, CacheWriteTokens int64
+	Requests                          int
+	ResponseBytes                     int64
 }
 
 // Response 是上游结果。Do 返回 retryable 错误时，Response 只携带 RetryAfter（供应商给出 Retry-After 时非零）。
@@ -140,6 +142,68 @@ type Pricing struct {
 	Version                                     string
 	InputMicroPerMTok, OutputMicroPerMTok       int64
 	SearchMicroPerRequest, FetchMicroPerRequest int64
+	// CacheReadMicroPerMTok 与 CacheWriteMicroPerMTok 是缓存读取、缓存写入的输入单价；0 表示按输入单价计。
+	// 零值不进入 JSON（配置摘要与只有输入、输出单价的价格表完全相同）。
+	CacheReadMicroPerMTok  int64 `json:",omitempty"`
+	CacheWriteMicroPerMTok int64 `json:",omitempty"`
+}
+
+// cacheRead 与 cacheWrite 是缓存读取、写入的生效单价（未设置时为输入单价）。
+func (p Pricing) cacheRead() int64 {
+	if p.CacheReadMicroPerMTok > 0 {
+		return p.CacheReadMicroPerMTok
+	}
+	return p.InputMicroPerMTok
+}
+
+func (p Pricing) cacheWrite() int64 {
+	if p.CacheWriteMicroPerMTok > 0 {
+		return p.CacheWriteMicroPerMTok
+	}
+	return p.InputMicroPerMTok
+}
+
+// EstimateInputPrice 是估算输入 token 时用的单价：输入、缓存读取与缓存写入单价中最高者（预留须保守：不论输入
+// 如何分为缓存与非缓存部分，费用都不超过按它估算的值）。没有缓存单价时就是输入单价。
+func (p Pricing) EstimateInputPrice() int64 {
+	return max(p.InputMicroPerMTok, p.cacheRead(), p.cacheWrite())
+}
+
+// roundingAllowance 是估算的取整余量：ChatCost 对每个单独计价的部分向上取整，设置了缓存单价时输入多出一或两段，
+// 每段至多多出 1 微美元。没有缓存单价时为 0（估算与之前相同）。
+func (p Pricing) roundingAllowance() int64 {
+	return boolInt(p.CacheReadMicroPerMTok > 0) + boolInt(p.CacheWriteMicroPerMTok > 0)
+}
+
+// ChatCost 由用量计算模型调用的费用（微美元，每项向上取整）：非缓存输入 × 输入单价 + 缓存读取 × 缓存读取单价 +
+// 缓存写入 × 缓存写入单价 + 输出 × 输出单价。未设置的缓存单价不单列（并入输入），因此没有缓存单价的价格表与
+// "输入 × 输入单价 + 输出 × 输出单价"逐位相同（含取整）。用量为负、缓存 token 超过输入或溢出时 ok 为 false
+// （调用方按估算结算）。
+func (p Pricing) ChatCost(u Usage) (int64, bool) {
+	if u.CacheReadTokens < 0 || u.CacheWriteTokens < 0 || u.InputTokens < 0 || u.OutputTokens < 0 {
+		return 0, false
+	}
+	var cr, cw int64
+	if p.CacheReadMicroPerMTok > 0 {
+		cr = u.CacheReadTokens
+	}
+	if p.CacheWriteMicroPerMTok > 0 {
+		cw = u.CacheWriteTokens
+	}
+	plain := u.InputTokens - cr - cw
+	if plain < 0 {
+		return 0, false
+	}
+	var total int64
+	for _, part := range [][2]int64{{plain, p.InputMicroPerMTok}, {cr, p.cacheRead()},
+		{cw, p.cacheWrite()}, {u.OutputTokens, p.OutputMicroPerMTok}} {
+		v, err := mulCeil(part[0], part[1], microPerMillionTokens)
+		if err != nil || total > math.MaxInt64-v {
+			return 0, false
+		}
+		total += v
+	}
+	return total, true
 }
 
 // 默认上限（§19）。

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/llmproto"
 )
 
 // ChatConfig 配置 OpenAI 兼容的 chat adapter。
@@ -21,6 +23,9 @@ type ChatConfig struct {
 	MaxTokensDefault int          // max_tokens 缺省值；≤ 0 时取 1024（不超过 MaxTokensCap）
 	MaxTokensCap     int          // max_tokens 上限，超出者截断（§9.6）；≤ 0 时取 4096
 	HTTP             *http.Client // 须来自验证 Dialer.HTTPClient；nil 时用默认 Dialer（8 MiB）
+	// StreamHTTP 是 DoStream 用的客户端：须来自验证 Dialer.HTTPClient(0, 0)（不限总长：长的流式回复可远超 8 MiB，
+	// 单个事件仍受 llmproto 的上限约束，总时长由调用方的 ctx 约束）。nil 时用默认 Dialer。
+	StreamHTTP *http.Client
 	// PrimaryName 是主供应商的路由名（Router.Routes()[0]）；空时为 "primary"。
 	PrimaryName string
 	// Fallbacks 是按顺序的后备供应商（模型降级链）；空时只有主供应商，行为与引入降级链之前完全相同。
@@ -29,17 +34,24 @@ type ChatConfig struct {
 	Fallbacks []ChatRoute
 }
 
-// ChatRoute 是降级链中的一个后备供应商（OpenAI 兼容）。
+// ChatRoute 是降级链中的一个后备供应商（OpenAI 兼容或 Anthropic 格式）。
 type ChatRoute struct {
-	Name    string // 路由名（进入 call_tries.provider 与日志）
-	BaseURL string // 请求发往 BaseURL + "/chat/completions"
-	APIKey  string // 来自宿主环境变量（配置给出变量名）；只放在 Authorization 头
+	Name string // 路由名（进入 call_tries.provider 与日志）
+	// Protocol 是供应商的线路格式：空或 openai（默认）为 OpenAI 兼容，anthropic 为 Anthropic Messages API。
+	Protocol llmproto.Protocol
+	// BaseURL：openai 时请求发往 BaseURL + "/chat/completions"；anthropic 时发往 BaseURL + "/v1/messages"。
+	BaseURL string
+	// AnthropicVersion 是 anthropic 路由的 anthropic-version 头；空时为 DefaultAnthropicVersion。
+	AnthropicVersion string
+	// APIKey 来自宿主环境变量（配置给出变量名）；openai 时只放在 Authorization 头，anthropic 时只放在 x-api-key 头。
+	APIKey string
 	// Models 把逻辑模型（声明的白名单中的名字）映射为该供应商的模型名；不在其中的逻辑模型不由它提供。
 	// 空时以同名提供全部声明的模型。
 	Models         map[string]string
 	Pricing        Pricing            // 该供应商的默认价格表
 	PricingByModel map[string]Pricing // 按逻辑模型的价格表；缺项用 Pricing
 	HTTP           *http.Client       // 须来自验证 Dialer.HTTPClient；nil 时用默认 Dialer（8 MiB）
+	StreamHTTP     *http.Client       // DoStream 的客户端（不限总长），同 ChatConfig.StreamHTTP
 }
 
 // PricingFor 返回模型的价格表：PricingByModel 中有该模型时取它，否则取默认 Pricing。
@@ -61,10 +73,13 @@ type chatAdapter struct {
 // chatRoute 是一个路由的执行参数。主供应商（下标 0）的 models 为 nil（逻辑模型名原样发出），价格取 cfg.PricingFor。
 type chatRoute struct {
 	name, baseURL, apiKey string
+	protocol              llmproto.Protocol // openai 或 anthropic
+	anthropicVersion      string
 	models                map[string]string
 	pricing               Pricing
 	pricingByModel        map[string]Pricing
 	http                  *http.Client
+	streamHTTP            *http.Client // DoStream：不限总长
 }
 
 // NewChat 构造 OpenAI 兼容的 chat adapter（§9.3 子集：仅声明的模型、纯文本消息、非流式）。
@@ -85,12 +100,39 @@ func NewChat(cfg ChatConfig) Adapter {
 		cfg.PrimaryName = "primary"
 	}
 	a := &chatAdapter{cfg: cfg, allowed: allowed, http: defaultClient(cfg.HTTP, DefaultModelMaxBody), strictOK: len(cfg.Fallbacks) > 0}
-	a.routes = append(a.routes, chatRoute{name: cfg.PrimaryName, baseURL: cfg.BaseURL, apiKey: cfg.APIKey, http: a.http})
+	a.routes = append(a.routes, chatRoute{name: cfg.PrimaryName, baseURL: cfg.BaseURL, apiKey: cfg.APIKey,
+		protocol: llmproto.ProtocolOpenAI, http: a.http, streamHTTP: defaultClient(cfg.StreamHTTP, 0)})
 	for _, r := range cfg.Fallbacks {
+		proto, version := llmproto.ProtocolOpenAI, ""
+		if r.Protocol == llmproto.ProtocolAnthropic {
+			proto, version = llmproto.ProtocolAnthropic, r.AnthropicVersion
+			if version == "" {
+				version = DefaultAnthropicVersion
+			}
+		}
 		a.routes = append(a.routes, chatRoute{name: r.Name, baseURL: strings.TrimRight(r.BaseURL, "/"), apiKey: r.APIKey,
-			models: r.Models, pricing: r.Pricing, pricingByModel: r.PricingByModel, http: defaultClient(r.HTTP, DefaultModelMaxBody)})
+			protocol: proto, anthropicVersion: version, models: r.Models, pricing: r.Pricing, pricingByModel: r.PricingByModel,
+			http: defaultClient(r.HTTP, DefaultModelMaxBody), streamHTTP: defaultClient(r.StreamHTTP, 0)})
 	}
 	return a
+}
+
+// RouteProtocol 返回路由的线路格式（主供应商总是 openai；不存在的路由为 openai）。
+func (a *chatAdapter) RouteProtocol(route int) llmproto.Protocol {
+	if route < 0 || route >= len(a.routes) {
+		return llmproto.ProtocolOpenAI
+	}
+	return a.routes[route].protocol
+}
+
+// Convertible 实现 ProtocolRouter：规范化的（OpenAI 格式）请求能否在该路由上执行。OpenAI 路由总能；Anthropic
+// 路由须能转换（只有一种格式才有的字段，如 n、logprobs、非文本 response_format，不能转换）。
+func (a *chatAdapter) Convertible(route int, resolved []byte) bool {
+	if route < 0 || route >= len(a.routes) {
+		return false
+	}
+	_, _, model, e := chatInputs(resolved)
+	return e == nil && a.routes[route].convertible(resolved, model)
 }
 
 // Routes 实现 Router：主供应商在前，后备供应商按配置顺序。
@@ -300,7 +342,7 @@ func (a *chatAdapter) EstimateOn(route int, resolved []byte) (int64, error) {
 		return 0, e
 	}
 	p := a.PricingOn(route, model)
-	ci, err := mulCeil(in, p.InputMicroPerMTok, microPerMillionTokens)
+	ci, err := mulCeil(in, p.EstimateInputPrice(), microPerMillionTokens) // 输入、缓存读取、缓存写入单价中最高者
 	if err != nil {
 		return 0, err
 	}
@@ -308,6 +350,7 @@ func (a *chatAdapter) EstimateOn(route int, resolved []byte) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	ci += p.roundingAllowance() // 设置了缓存单价时输入分多段向上取整：每多一段补 1 微美元
 	if ci > (1<<63-1)-co {
 		return 0, errors.New("估算溢出")
 	}
@@ -320,7 +363,20 @@ type chatReply struct {
 	Usage   *struct {
 		PromptTokens     int64 `json:"prompt_tokens"`
 		CompletionTokens int64 `json:"completion_tokens"`
+		// PromptTokensDetails 宽松解析（cachedTokens）：形状不符时忽略，不使整个回复无法解析。
+		PromptTokensDetails json.RawMessage `json:"prompt_tokens_details"`
 	} `json:"usage"`
+}
+
+// cachedTokens 宽松地取 prompt_tokens_details.cached_tokens：不是对象、没有该字段或不是整数时为 0。
+func cachedTokens(raw json.RawMessage) int64 {
+	var d struct {
+		CachedTokens int64 `json:"cached_tokens"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &d) != nil || d.CachedTokens < 0 {
+		return 0
+	}
+	return d.CachedTokens
 }
 
 // Do 发出非流式请求。2xx 且可解析 → ok（Body 为上游原文）；上游未返回 usage 时按保守估算计量
@@ -331,6 +387,7 @@ func (a *chatAdapter) Do(ctx context.Context, resolved []byte) (Response, *Error
 
 // DoOn 实现 Router：向该路由发出请求（请求体的 model 换成该供应商的模型名，其余不变）。链模式下 2xx 但没有
 // 非空 choices 的响应为 unknown / upstream_bad_response（已发出、可能已计费；Coordinator 可转下一供应商）。
+// Anthropic 路由先把请求转为 Anthropic 格式，再把回复转回 OpenAI 格式（anthropic.go）。
 func (a *chatAdapter) DoOn(ctx context.Context, route int, resolved []byte) (Response, *Error) {
 	if route < 0 || route >= len(a.routes) {
 		return Response{}, fatalf(http.StatusBadGateway, CodeUnsupportedProvider, "路由 %d 不存在", route)
@@ -339,6 +396,9 @@ func (a *chatAdapter) DoOn(ctx context.Context, route int, resolved []byte) (Res
 	in, maxTok, model, e := chatInputs(resolved)
 	if e != nil {
 		return Response{}, e
+	}
+	if rt.protocol == llmproto.ProtocolAnthropic {
+		return a.doAnthropic(ctx, rt, resolved, in, maxTok, model)
 	}
 	if pm := rt.providerModel(model); pm != model {
 		obj, e := decodeObject(resolved)
@@ -352,15 +412,9 @@ func (a *chatAdapter) DoOn(ctx context.Context, route int, resolved []byte) (Res
 		}
 		resolved = out
 	}
-	req, err := http.NewRequest(http.MethodPost, rt.baseURL+"/chat/completions", bytes.NewReader(resolved))
-	if err != nil {
-		return Response{}, newErr(OutcomeFatal, http.StatusBadGateway, CodeInvalidURL, errors.New("模型上游地址不合法"))
-	}
-	req.Header.Set("Content-Type", contentTypeJSON)
-	req.Header.Set("Accept", contentTypeJSON)
-	req.Header.Set("User-Agent", userAgent)
-	if rt.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+rt.apiKey)
+	req, e := rt.newRequest(resolved, false)
+	if e != nil {
+		return Response{}, e
 	}
 	r, e := exchange(ctx, rt.http, req, true)
 	if e != nil {
@@ -376,6 +430,9 @@ func (a *chatAdapter) DoOn(ctx context.Context, route int, resolved []byte) (Res
 	usage := Usage{Requests: 1, ResponseBytes: int64(len(r.body)), InputTokens: in, OutputTokens: maxTok}
 	if reply.Usage != nil {
 		usage.InputTokens, usage.OutputTokens = reply.Usage.PromptTokens, reply.Usage.CompletionTokens
+		if n := cachedTokens(reply.Usage.PromptTokensDetails); n > 0 && n <= usage.InputTokens {
+			usage.CacheReadTokens = n // 只在设置了缓存读取单价时单独计价（Pricing.ChatCost）
+		}
 	}
 	id := r.resp.Header.Get("X-Request-Id")
 	if id == "" {

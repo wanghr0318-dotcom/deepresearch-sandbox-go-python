@@ -226,3 +226,23 @@ func TestStreamFaults(t *testing.T) {
 		t.Fatalf("non-stream with FailAfterChunks: %d", resp.StatusCode)
 	}
 }
+
+// TestMessagesToolIDPattern: like the real API, /v1/messages refuses tool_use.id and tool_result.tool_use_id that
+// do not match ^[a-zA-Z0-9_-]+$ with 400 invalid_request_error, so conversion regressions are caught.
+func TestMessagesToolIDPattern(t *testing.T) {
+	s := New()
+	defer s.Close()
+	turn := func(id string) string {
+		return `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"q"},` +
+			`{"role":"assistant","content":[{"type":"tool_use","id":"` + id + `","name":"f","input":{}}]},` +
+			`{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + id + `","content":"r"}]}]}`
+	}
+	for id, want := range map[string]int{"toolu_01-ok": 200, "functions.web_search:0": 400, "c1#1": 400} {
+		resp := post(t, s.URL()+"/v1/messages", turn(id), "anthropic-version", "2023-06-01")
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != want || (want == 400 && !strings.Contains(string(b), "invalid_request_error")) {
+			t.Errorf("id %q: %d %s", id, resp.StatusCode, b)
+		}
+	}
+}
