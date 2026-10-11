@@ -142,14 +142,9 @@ func (a *chatAdapter) passThrough(route int, rt chatRoute, body []byte) ([]byte,
 	obj["model"], _ = json.Marshal(rt.providerModel(model))
 	obj["stream"] = json.RawMessage("true")
 	if rt.protocol == llmproto.ProtocolOpenAI {
-		opts := map[string]json.RawMessage{}
-		if raw, ok := obj["stream_options"]; ok && !isJSONNull(raw) {
-			if json.Unmarshal(raw, &opts) != nil || opts == nil {
-				return nil, fatalf(http.StatusBadRequest, CodeInvalidRequest, "stream_options 须为对象")
-			}
+		if e := includeUsage(obj); e != nil {
+			return nil, e
 		}
-		opts["include_usage"] = json.RawMessage("true") // 计量需要用量
-		obj["stream_options"], _ = json.Marshal(opts)
 	} else if _, ok := obj["max_tokens"]; !ok {
 		obj["max_tokens"], _ = json.Marshal(a.cfg.MaxTokensDefault)
 	}
@@ -158,6 +153,19 @@ func (a *chatAdapter) passThrough(route int, rt chatRoute, body []byte) ([]byte,
 		return nil, fatalf(http.StatusBadRequest, CodeInvalidRequest, "无法编码请求")
 	}
 	return out, nil
+}
+
+// includeUsage 设置 OpenAI 请求的 stream_options.include_usage（计量需要用量），保留 stream_options 的其他字段。
+func includeUsage(obj map[string]json.RawMessage) *Error {
+	opts := map[string]json.RawMessage{}
+	if raw, ok := obj["stream_options"]; ok && !isJSONNull(raw) {
+		if json.Unmarshal(raw, &opts) != nil || opts == nil {
+			return fatalf(http.StatusBadRequest, CodeInvalidRequest, "stream_options 须为对象")
+		}
+	}
+	opts["include_usage"] = json.RawMessage("true")
+	obj["stream_options"], _ = json.Marshal(opts)
+	return nil
 }
 
 // streamTrip 发出流式请求、只读响应头：传输层失败按 transportError 归类；非 2xx 读完（有上限）错误响应体后按
