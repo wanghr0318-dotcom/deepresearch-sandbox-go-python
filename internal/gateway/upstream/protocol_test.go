@@ -24,11 +24,11 @@ func mixedAdapter(t *testing.T, p, q *fakeupstream.Server) ChatAdapter {
 	d := NewDialer(DialerConfig{AllowPrivate: []string{"127.0.0.1"}})
 	a := NewChat(ChatConfig{BaseURL: p.ModelBaseURL(), Model: "m-1", Models: []string{"m-1", "m-2"}, APIKey: "key-openai",
 		Pricing: Pricing{InputMicroPerMTok: 1_000_000, OutputMicroPerMTok: 2_000_000}, MaxTokensDefault: 100,
-		HTTP: d.HTTPClient(DefaultModelMaxBody, 10*time.Second),
+		HTTP: d.HTTPClient(DefaultModelMaxBody, 10*time.Second), StreamHTTP: d.HTTPClient(0, 0),
 		Fallbacks: []ChatRoute{{Name: "claude", Protocol: llmproto.ProtocolAnthropic, BaseURL: q.URL(), APIKey: "key-anthropic",
 			Models:  map[string]string{"m-1": "claude-x"},
 			Pricing: Pricing{InputMicroPerMTok: 3_000_000, OutputMicroPerMTok: 15_000_000, CacheReadMicroPerMTok: 300_000, CacheWriteMicroPerMTok: 3_750_000},
-			HTTP:    d.HTTPClient(DefaultModelMaxBody, 10*time.Second)}}})
+			HTTP:    d.HTTPClient(DefaultModelMaxBody, 10*time.Second), StreamHTTP: d.HTTPClient(0, 0)}}})
 	ca, ok := a.(ChatAdapter)
 	if !ok {
 		t.Fatal("NewChat does not implement ChatAdapter")
@@ -274,8 +274,9 @@ func TestDoStreamBothProtocols(t *testing.T) {
 	}
 }
 
-// Failures after the first event are returned by Next (no failover possible): a cut stream gives
-// io.ErrUnexpectedEOF; an error event ends the stream with the error recorded.
+// Failures after the first content are returned by Next (no failover possible): a cut stream gives
+// io.ErrUnexpectedEOF; an error event ends the stream with the error recorded. (A cut before any content is an
+// error of DoStream itself: TestDoStreamErrorsBeforeFirstByte.)
 func TestDoStreamFailAfterChunks(t *testing.T) {
 	p, q := fakePair(t)
 	a := mixedAdapter(t, p, q)
@@ -285,10 +286,11 @@ func TestDoStreamFailAfterChunks(t *testing.T) {
 		route int
 		srv   *fakeupstream.Server
 		kind  fakeupstream.Kind
-	}{{"openai", 0, p, fakeupstream.Chat}, {"anthropic", 1, q, fakeupstream.Messages}} {
+		after int // events up to and including the first content (Anthropic: message_start, block start, ping, delta)
+	}{{"openai", 0, p, fakeupstream.Chat, 2}, {"anthropic", 1, q, fakeupstream.Messages, 4}} {
 		t.Run(c.name, func(t *testing.T) {
-			c.srv.Inject(c.kind, 1, fakeupstream.Action{FailAfterChunks: 2})
-			c.srv.Inject(c.kind, 2, fakeupstream.Action{FailAfterChunks: 2, FailWithError: true})
+			c.srv.Inject(c.kind, 1, fakeupstream.Action{FailAfterChunks: c.after})
+			c.srv.Inject(c.kind, 2, fakeupstream.Action{FailAfterChunks: c.after, FailWithError: true})
 			s, e := a.DoStream(context.Background(), c.route, body, llmproto.ProtocolOpenAI)
 			if e != nil {
 				t.Fatal(e)
@@ -333,6 +335,7 @@ func TestDoStreamErrorsBeforeFirstByte(t *testing.T) {
 	q.Inject(fakeupstream.Messages, 4, fakeupstream.Action{Disconnect: true})
 	q.Inject(fakeupstream.Messages, 5, fakeupstream.Action{Hang: true})
 	q.Inject(fakeupstream.Messages, 6, fakeupstream.Action{FailAfterChunks: 1, FailWithError: true})
+	q.Inject(fakeupstream.Messages, 7, fakeupstream.Action{FailAfterChunks: 2, FailWithError: true})
 	for i, want := range []struct {
 		o    Outcome
 		code string
@@ -348,16 +351,19 @@ func TestDoStreamErrorsBeforeFirstByte(t *testing.T) {
 	defer cancel()
 	_, e := a.DoStream(ctx, 1, body, llmproto.ProtocolOpenAI)
 	wantErr(t, e, OutcomeUnknown, CodeUpstreamUnconfirmed)
-	// The 6th request sends message_start and then an error event: the first event is not an error, so the
-	// stream is returned and the error is seen by the reader.
-	s, e := a.DoStream(context.Background(), 1, body, llmproto.ProtocolOpenAI)
-	if e != nil {
-		t.Fatal(e)
+	// The 6th and 7th requests send message_start (and an empty text block start) and then overloaded_error:
+	// the error comes before any content, so DoStream returns it as a retryable *Error (failover possible).
+	for range 2 {
+		s, e := a.DoStream(context.Background(), 1, body, llmproto.ProtocolOpenAI)
+		if s != nil {
+			t.Fatal("stream returned for an error before content")
+		}
+		wantErr(t, e, OutcomeRetryable, CodeUpstreamUnavailable)
 	}
-	_ = s.Close()
 	// A provider that is down hard: not sent → retryable.
 	d := NewDialer(DialerConfig{AllowPrivate: []string{"127.0.0.1"}})
-	dead := NewChat(ChatConfig{BaseURL: "http://" + closedAddr(t) + "/v1", Model: "m-1", HTTP: d.HTTPClient(DefaultModelMaxBody, 0)}).(ChatAdapter)
+	dead := NewChat(ChatConfig{BaseURL: "http://" + closedAddr(t) + "/v1", Model: "m-1", HTTP: d.HTTPClient(DefaultModelMaxBody, 0),
+		StreamHTTP: d.HTTPClient(0, 0)}).(ChatAdapter)
 	_, e = dead.DoStream(context.Background(), 0, body, llmproto.ProtocolOpenAI)
 	wantErr(t, e, OutcomeRetryable, CodeUpstreamUnreachable)
 	// Requests that cannot be sent at all are fatal before any I/O.
@@ -367,16 +373,28 @@ func TestDoStreamErrorsBeforeFirstByte(t *testing.T) {
 	wantErr(t, e, OutcomeFatal, CodeUnsupportedField)
 }
 
-// An error event as the very first event (no content yet) is classified by its class.
-func TestStreamErrorEventClassification(t *testing.T) {
+// An error event before any content is classified like the same error as an HTTP status: by the provider's
+// error type when known (overloaded_error → 529 retryable, authentication_error → 401 fatal), else by class.
+func TestStreamEventErrorClassification(t *testing.T) {
 	for _, c := range []struct {
-		class llmproto.ErrorClass
-		o     Outcome
-	}{{llmproto.ClassRateLimit, OutcomeRetryable}, {llmproto.ClassModelDegraded, OutcomeRetryable}, {llmproto.ClassUpstream, OutcomeRetryable},
-		{llmproto.ClassInvalidRequest, OutcomeFatal}, {llmproto.ClassInvalidAPIKey, OutcomeFatal}} {
-		if e := streamErrorEvent(&llmproto.ErrorInfo{Class: c.class}); e.Outcome != c.o {
-			t.Errorf("%s: %s", c.class, e.Outcome)
+		info   llmproto.ErrorInfo
+		o      Outcome
+		status int
+	}{
+		{llmproto.ErrorInfo{Class: llmproto.ClassUpstream, ProviderType: "overloaded_error"}, OutcomeRetryable, 529},
+		{llmproto.ErrorInfo{Class: llmproto.ClassUpstream, ProviderType: "api_error"}, OutcomeRetryable, 500},
+		{llmproto.ErrorInfo{Class: llmproto.ClassRateLimit, ProviderType: "rate_limit_error"}, OutcomeRetryable, 429},
+		{llmproto.ErrorInfo{Class: llmproto.ClassInvalidRequest, ProviderType: "invalid_request_error"}, OutcomeFatal, 400},
+		{llmproto.ErrorInfo{Class: llmproto.ClassUpstream, ProviderType: "authentication_error"}, OutcomeFatal, 401},
+		{llmproto.ErrorInfo{Class: llmproto.ClassModelDegraded}, OutcomeRetryable, 503},
+		{llmproto.ErrorInfo{Class: llmproto.ClassInvalidAPIKey}, OutcomeFatal, 401},
+	} {
+		if e := StreamEventError(&c.info); e.Outcome != c.o || e.Status != c.status {
+			t.Errorf("%+v: %s %d", c.info, e.Outcome, e.Status)
 		}
+	}
+	if e := StreamEventError(nil); e.Outcome != OutcomeRetryable {
+		t.Errorf("nil: %v", e)
 	}
 }
 

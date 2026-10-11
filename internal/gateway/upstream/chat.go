@@ -23,6 +23,9 @@ type ChatConfig struct {
 	MaxTokensDefault int          // max_tokens 缺省值；≤ 0 时取 1024（不超过 MaxTokensCap）
 	MaxTokensCap     int          // max_tokens 上限，超出者截断（§9.6）；≤ 0 时取 4096
 	HTTP             *http.Client // 须来自验证 Dialer.HTTPClient；nil 时用默认 Dialer（8 MiB）
+	// StreamHTTP 是 DoStream 用的客户端：须来自验证 Dialer.HTTPClient(0, 0)（不限总长：长的流式回复可远超 8 MiB，
+	// 单个事件仍受 llmproto 的上限约束，总时长由调用方的 ctx 约束）。nil 时用默认 Dialer。
+	StreamHTTP *http.Client
 	// PrimaryName 是主供应商的路由名（Router.Routes()[0]）；空时为 "primary"。
 	PrimaryName string
 	// Fallbacks 是按顺序的后备供应商（模型降级链）；空时只有主供应商，行为与引入降级链之前完全相同。
@@ -48,6 +51,7 @@ type ChatRoute struct {
 	Pricing        Pricing            // 该供应商的默认价格表
 	PricingByModel map[string]Pricing // 按逻辑模型的价格表；缺项用 Pricing
 	HTTP           *http.Client       // 须来自验证 Dialer.HTTPClient；nil 时用默认 Dialer（8 MiB）
+	StreamHTTP     *http.Client       // DoStream 的客户端（不限总长），同 ChatConfig.StreamHTTP
 }
 
 // PricingFor 返回模型的价格表：PricingByModel 中有该模型时取它，否则取默认 Pricing。
@@ -75,6 +79,7 @@ type chatRoute struct {
 	pricing               Pricing
 	pricingByModel        map[string]Pricing
 	http                  *http.Client
+	streamHTTP            *http.Client // DoStream：不限总长
 }
 
 // NewChat 构造 OpenAI 兼容的 chat adapter（§9.3 子集：仅声明的模型、纯文本消息、非流式）。
@@ -96,7 +101,7 @@ func NewChat(cfg ChatConfig) Adapter {
 	}
 	a := &chatAdapter{cfg: cfg, allowed: allowed, http: defaultClient(cfg.HTTP, DefaultModelMaxBody), strictOK: len(cfg.Fallbacks) > 0}
 	a.routes = append(a.routes, chatRoute{name: cfg.PrimaryName, baseURL: cfg.BaseURL, apiKey: cfg.APIKey,
-		protocol: llmproto.ProtocolOpenAI, http: a.http})
+		protocol: llmproto.ProtocolOpenAI, http: a.http, streamHTTP: defaultClient(cfg.StreamHTTP, 0)})
 	for _, r := range cfg.Fallbacks {
 		proto, version := llmproto.ProtocolOpenAI, ""
 		if r.Protocol == llmproto.ProtocolAnthropic {
@@ -107,7 +112,7 @@ func NewChat(cfg ChatConfig) Adapter {
 		}
 		a.routes = append(a.routes, chatRoute{name: r.Name, baseURL: strings.TrimRight(r.BaseURL, "/"), apiKey: r.APIKey,
 			protocol: proto, anthropicVersion: version, models: r.Models, pricing: r.Pricing, pricingByModel: r.PricingByModel,
-			http: defaultClient(r.HTTP, DefaultModelMaxBody)})
+			http: defaultClient(r.HTTP, DefaultModelMaxBody), streamHTTP: defaultClient(r.StreamHTTP, 0)})
 	}
 	return a
 }
@@ -337,7 +342,7 @@ func (a *chatAdapter) EstimateOn(route int, resolved []byte) (int64, error) {
 		return 0, e
 	}
 	p := a.PricingOn(route, model)
-	ci, err := mulCeil(in, p.EstimateInputPrice(), microPerMillionTokens) // 设置了更高的缓存写入单价时按它估算
+	ci, err := mulCeil(in, p.EstimateInputPrice(), microPerMillionTokens) // 输入、缓存读取、缓存写入单价中最高者
 	if err != nil {
 		return 0, err
 	}
@@ -345,6 +350,7 @@ func (a *chatAdapter) EstimateOn(route int, resolved []byte) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	ci += p.roundingAllowance() // 设置了缓存单价时输入分多段向上取整：每多一段补 1 微美元
 	if ci > (1<<63-1)-co {
 		return 0, errors.New("估算溢出")
 	}
@@ -355,12 +361,22 @@ type chatReply struct {
 	ID      string          `json:"id"`
 	Choices json.RawMessage `json:"choices"` // 只在链模式下检查（非空数组）
 	Usage   *struct {
-		PromptTokens        int64 `json:"prompt_tokens"`
-		CompletionTokens    int64 `json:"completion_tokens"`
-		PromptTokensDetails *struct {
-			CachedTokens int64 `json:"cached_tokens"`
-		} `json:"prompt_tokens_details"`
+		PromptTokens     int64 `json:"prompt_tokens"`
+		CompletionTokens int64 `json:"completion_tokens"`
+		// PromptTokensDetails 宽松解析（cachedTokens）：形状不符时忽略，不使整个回复无法解析。
+		PromptTokensDetails json.RawMessage `json:"prompt_tokens_details"`
 	} `json:"usage"`
+}
+
+// cachedTokens 宽松地取 prompt_tokens_details.cached_tokens：不是对象、没有该字段或不是整数时为 0。
+func cachedTokens(raw json.RawMessage) int64 {
+	var d struct {
+		CachedTokens int64 `json:"cached_tokens"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &d) != nil || d.CachedTokens < 0 {
+		return 0
+	}
+	return d.CachedTokens
 }
 
 // Do 发出非流式请求。2xx 且可解析 → ok（Body 为上游原文）；上游未返回 usage 时按保守估算计量
@@ -414,8 +430,8 @@ func (a *chatAdapter) DoOn(ctx context.Context, route int, resolved []byte) (Res
 	usage := Usage{Requests: 1, ResponseBytes: int64(len(r.body)), InputTokens: in, OutputTokens: maxTok}
 	if reply.Usage != nil {
 		usage.InputTokens, usage.OutputTokens = reply.Usage.PromptTokens, reply.Usage.CompletionTokens
-		if d := reply.Usage.PromptTokensDetails; d != nil && d.CachedTokens > 0 && d.CachedTokens <= usage.InputTokens {
-			usage.CacheReadTokens = d.CachedTokens // 只在设置了缓存读取单价时单独计价（Pricing.ChatCost）
+		if n := cachedTokens(reply.Usage.PromptTokensDetails); n > 0 && n <= usage.InputTokens {
+			usage.CacheReadTokens = n // 只在设置了缓存读取单价时单独计价（Pricing.ChatCost）
 		}
 	}
 	id := r.resp.Header.Get("X-Request-Id")

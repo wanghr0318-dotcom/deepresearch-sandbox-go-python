@@ -45,7 +45,9 @@ type ChatAdapter interface {
 	ProtocolRouter
 	// DoStream 在路由上发出流式请求。body 是 proto 格式的请求（model 为逻辑模型名）：与路由格式相同时原样转发
 	// （只换模型名、打开流式与用量报告），不同时经 llmproto 转换（被丢弃的字段由 StreamInfo 报告）。返回时第一个
-	// 事件已经到达。
+	// 内容事件（首 token）已经到达：之前的 message_start、ping 与空的块被缓存，由 Next 重放；之前的失败（含错误
+	// 事件）以 *Error 返回，调用方可换供应商。流使用不限总长的 HTTP 客户端（单个事件仍受 llmproto 的上限约束），
+	// 总时长由调用方的 ctx 约束。
 	DoStream(ctx context.Context, route int, body []byte, proto llmproto.Protocol) (Stream, *Error)
 }
 
@@ -77,24 +79,50 @@ func (a *chatAdapter) DoStream(ctx context.Context, route int, body []byte, prot
 		return nil, e
 	}
 	sctx, cancel := context.WithCancel(ctx)
-	resp, e := streamTrip(sctx, rt.http, req)
+	resp, e := streamTrip(sctx, rt.streamHTTP, req)
 	if e != nil {
 		cancel()
 		return nil, e
 	}
 	st := &eventStream{body: resp.Body, cancel: cancel, rd: llmproto.NewEventReader(resp.Body, rt.protocol),
 		dropped: dropped, converted: proto != rt.protocol}
-	first, err := st.rd.Next()
-	if err != nil {
+	if e := st.prefetch(ctx); e != nil {
 		_ = st.Close()
-		return nil, firstEventError(ctx, err)
+		return nil, e
 	}
-	if first.Type == llmproto.EventError {
-		_ = st.Close()
-		return nil, streamErrorEvent(first.Err)
-	}
-	st.first = &first
 	return st, nil
+}
+
+// prefetch 读到第一个内容事件（首 token）为止：message_start、只有角色或内容为空的块开始等前导事件先缓存，由
+// Next 依次交付。期间的读失败与 Do 同样归类；内容之前到达的错误事件按 StreamEventError 归类（可换供应商）。
+func (s *eventStream) prefetch(ctx context.Context) *Error {
+	for {
+		ev, err := s.rd.Next()
+		if err != nil {
+			return firstEventError(ctx, err)
+		}
+		if ev.Type == llmproto.EventError {
+			return StreamEventError(ev.Err)
+		}
+		s.pending = append(s.pending, ev)
+		if isContent(ev) {
+			return nil
+		}
+	}
+}
+
+// isContent 报告事件是否为首 token：非空的文本、参数或签名片段，工具调用的开始（带名字），或者结束类事件
+// （模型没有输出任何内容就停止，也是一个确定的回复）。
+func isContent(ev llmproto.Event) bool {
+	switch ev.Type {
+	case llmproto.EventBlockDelta:
+		return ev.Text != "" || ev.Arguments != "" || ev.Signature != ""
+	case llmproto.EventBlockStart:
+		return ev.Block == llmproto.BlockToolCall
+	case llmproto.EventMessageDelta, llmproto.EventMessageStop:
+		return true
+	}
+	return false
 }
 
 // streamBody 把 proto 格式的请求转为发往路由的流式请求体。
@@ -208,40 +236,72 @@ func isDecodeError(err error) bool {
 	return errors.As(err, &ir) || errors.As(err, &se) || errors.As(err, &te)
 }
 
-// streamErrorEvent 归类作为第一个事件到达的错误事件（还没有任何内容）：限流、过载与服务端错误为 retryable，
-// 其余为 fatal。
-func streamErrorEvent(info *llmproto.ErrorInfo) *Error {
-	if info == nil {
-		return newErr(OutcomeRetryable, http.StatusBadGateway, CodeUpstreamUnavailable, errors.New("上游流以错误事件开始"))
-	}
-	err := fmt.Errorf("上游流以错误事件开始: %s", info.Class)
-	switch info.Class {
-	case llmproto.ClassRateLimit:
-		return newErr(OutcomeRetryable, http.StatusTooManyRequests, CodeUpstreamRateLimited, err)
-	case llmproto.ClassModelDegraded, llmproto.ClassUpstream, llmproto.ClassInternal:
-		return newErr(OutcomeRetryable, http.StatusServiceUnavailable, CodeUpstreamUnavailable, err)
-	}
-	return newErr(OutcomeFatal, info.Class.Status(), CodeUpstreamRejected, err)
+// providerErrorStatus 是供应商在流中给出的错误类型对应的 HTTP 状态（Anthropic 的 error.type 与 OpenAI 常见的
+// error.type / code）；未知类型为 0。
+var providerErrorStatus = map[string]int{
+	"invalid_request_error": http.StatusBadRequest, "authentication_error": http.StatusUnauthorized,
+	"invalid_api_key": http.StatusUnauthorized, "permission_error": http.StatusForbidden,
+	"not_found_error": http.StatusNotFound, "model_not_found": http.StatusNotFound,
+	"request_too_large": http.StatusRequestEntityTooLarge, "rate_limit_error": http.StatusTooManyRequests,
+	"rate_limit_exceeded": http.StatusTooManyRequests, "insufficient_quota": http.StatusTooManyRequests,
+	"api_error": http.StatusInternalServerError, "server_error": http.StatusInternalServerError,
+	"overloaded_error": 529, "service_unavailable": http.StatusServiceUnavailable,
 }
 
-// eventStream 是 DoStream 的流：第一个事件已预读。
+// StreamEventError 把流中第一个内容之前到达的错误事件归为 *Error，与同一错误以 HTTP 状态返回时相同
+// （classifyStatus）：429 与 5xx（含 Anthropic 的 overloaded_error）为 retryable，可换供应商；其余为 fatal
+// （401、403、404 计入熔断，同 HTTP）。供应商类型未知时按 llmproto 的错误类别。内容之后的错误事件不能换供应商，
+// 由 Stream.Next 交付。
+func StreamEventError(info *llmproto.ErrorInfo) *Error {
+	status := http.StatusBadGateway
+	if info != nil {
+		if st, ok := providerErrorStatus[info.ProviderType]; ok {
+			status = st
+		} else {
+			status = info.Class.Status()
+		}
+	}
+	class := "unknown"
+	if info != nil {
+		class = string(info.Class)
+		if info.ProviderType != "" {
+			class = info.ProviderType
+		}
+	}
+	err := fmt.Errorf("上游流在内容之前发出错误事件: %s", class)
+	switch {
+	case status == http.StatusTooManyRequests:
+		return newErr(OutcomeRetryable, status, CodeUpstreamRateLimited, err)
+	case status >= 500:
+		return newErr(OutcomeRetryable, status, CodeUpstreamUnavailable, err)
+	}
+	return newErr(OutcomeFatal, status, CodeUpstreamRejected, err)
+}
+
+// eventStream 是 DoStream 的流：首 token 及其之前的事件已预读（pending）。
 type eventStream struct {
 	body      io.ReadCloser
 	cancel    context.CancelFunc
 	rd        *llmproto.EventReader
-	first     *llmproto.Event
+	pending   []llmproto.Event
 	dropped   []string
 	converted bool
 	closeOnce sync.Once
 }
 
+// Next 先重放预读的事件，再读流。流结束为 io.EOF；其他读失败（连接切断、超过单个事件的上限、格式错误）都包装为
+// io.ErrUnexpectedEOF（errors.Is 可判断，原因保留在文本中）。
 func (s *eventStream) Next() (llmproto.Event, error) {
-	if s.first != nil {
-		ev := *s.first
-		s.first = nil
+	if len(s.pending) > 0 {
+		ev := s.pending[0]
+		s.pending = s.pending[1:]
 		return ev, nil
 	}
-	return s.rd.Next()
+	ev, err := s.rd.Next()
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		err = fmt.Errorf("%w: %w", io.ErrUnexpectedEOF, err)
+	}
+	return ev, err
 }
 
 func (s *eventStream) Usage() (llmproto.Usage, bool) { return s.rd.Usage() }

@@ -163,8 +163,17 @@ func (p Pricing) cacheWrite() int64 {
 	return p.InputMicroPerMTok
 }
 
-// EstimateInputPrice 是估算输入 token 时用的单价：输入单价与缓存写入单价中较高者（预留须保守）。
-func (p Pricing) EstimateInputPrice() int64 { return max(p.InputMicroPerMTok, p.cacheWrite()) }
+// EstimateInputPrice 是估算输入 token 时用的单价：输入、缓存读取与缓存写入单价中最高者（预留须保守：不论输入
+// 如何分为缓存与非缓存部分，费用都不超过按它估算的值）。没有缓存单价时就是输入单价。
+func (p Pricing) EstimateInputPrice() int64 {
+	return max(p.InputMicroPerMTok, p.cacheRead(), p.cacheWrite())
+}
+
+// roundingAllowance 是估算的取整余量：ChatCost 对每个单独计价的部分向上取整，设置了缓存单价时输入多出一或两段，
+// 每段至多多出 1 微美元。没有缓存单价时为 0（估算与之前相同）。
+func (p Pricing) roundingAllowance() int64 {
+	return boolInt(p.CacheReadMicroPerMTok > 0) + boolInt(p.CacheWriteMicroPerMTok > 0)
+}
 
 // ChatCost 由用量计算模型调用的费用（微美元，每项向上取整）：非缓存输入 × 输入单价 + 缓存读取 × 缓存读取单价 +
 // 缓存写入 × 缓存写入单价 + 输出 × 输出单价。未设置的缓存单价不单列（并入输入），因此没有缓存单价的价格表与
