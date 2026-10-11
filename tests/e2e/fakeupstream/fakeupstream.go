@@ -87,9 +87,11 @@ type Action struct {
 	// Disconnect 为真时发出 200 响应头与部分正文后切断连接（Content-Length 声明的长度不足）。
 	Disconnect bool
 	// FailAfterChunks 大于零时，流式回复发出这么多个 SSE 事件后失败：FailWithError 为假时切断连接，
-	// 为真时发出该格式的错误事件后结束。非流式请求不受影响（正常回复）。
+	// 为真时发出该格式的错误事件后结束。非流式请求不受影响（正常回复）。FailMidLine 为真时切断前先发出
+	// 下一个事件的前半行（真实的网络中断多半落在一行中间）。
 	FailAfterChunks int
 	FailWithError   bool
+	FailMidLine     bool
 }
 
 func (a Action) String() string {
@@ -100,6 +102,8 @@ func (a Action) String() string {
 		return "disconnect"
 	case a.FailAfterChunks > 0 && a.FailWithError:
 		return fmt.Sprintf("error after %d chunks", a.FailAfterChunks)
+	case a.FailAfterChunks > 0 && a.FailMidLine:
+		return fmt.Sprintf("cut mid-line after %d chunks", a.FailAfterChunks)
 	case a.FailAfterChunks > 0:
 		return fmt.Sprintf("cut after %d chunks", a.FailAfterChunks)
 	case a.Status != 0 && a.RetryAfter != "":

@@ -20,7 +20,7 @@
 // 以上各选项的 kind 都可以是 messages。
 //   - -anthropic-key-env NAME：/v1/messages 要求 x-api-key 等于环境变量 NAME 的值（Key 不出现在命令行）。
 //   - -fail-after chat:2:5,messages:1:3:error：该类第 N 次流式请求发出 K 个 SSE 事件后切断连接（加 :error 时
-//     改为发出错误事件）。
+//     改为发出错误事件，加 :midline 时在下一个事件的一行中间切断）。
 //   - -chunk-delay chat=50ms：流式回复相邻事件之间的延迟（首字延迟测量）。
 //   - -cache-usage 300:20：模型回复用量带缓存读取 300、缓存写入 20 个 token。
 package main
@@ -190,16 +190,20 @@ func configureStreams(fu *fakeupstream.Server, keyEnv, failAfter, chunkDelay, ca
 			continue
 		}
 		parts := strings.Split(item, ":")
-		if len(parts) == 3 || (len(parts) == 4 && parts[3] == "error") {
+		if len(parts) == 3 || (len(parts) == 4 && (parts[3] == "error" || parts[3] == "midline")) {
 			kind, known := kinds[parts[0]]
 			n, nerr := strconv.Atoi(parts[1])
 			k, kerr := strconv.Atoi(parts[2])
 			if known && nerr == nil && kerr == nil && n >= 1 && k >= 1 {
-				fu.Inject(kind, n, fakeupstream.Action{FailAfterChunks: k, FailWithError: len(parts) == 4})
+				mode := ""
+				if len(parts) == 4 {
+					mode = parts[3]
+				}
+				fu.Inject(kind, n, fakeupstream.Action{FailAfterChunks: k, FailWithError: mode == "error", FailMidLine: mode == "midline"})
 				continue
 			}
 		}
-		return fmt.Errorf("-fail-after %q: 须为 kind:N:K 或 kind:N:K:error（N、K ≥ 1）", item)
+		return fmt.Errorf("-fail-after %q: 须为 kind:N:K、kind:N:K:error 或 kind:N:K:midline（N、K ≥ 1）", item)
 	}
 	for _, item := range strings.Split(chunkDelay, ",") {
 		if item = strings.TrimSpace(item); item == "" {

@@ -209,6 +209,16 @@ func TestStreamFaults(t *testing.T) {
 		t.Fatalf("injected status: %d %s", resp.StatusCode, b)
 	}
 
+	// 在一行中间切断：llmproto 读到 io.ErrUnexpectedEOF（审查 F6）。
+	s.Inject(Messages, 3, Action{FailAfterChunks: 2, FailMidLine: true})
+	resp = post(t, s.URL()+"/v1/messages", stream, "anthropic-version", "2023-06-01")
+	if _, _, err := collect(t, resp, llmproto.ProtocolAnthropic); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("mid-line cut: %v", err)
+	}
+	if rec := s.Requests(Messages)[2]; rec.Outcome != OutcomeDisconnected || rec.Action.String() != "cut mid-line after 2 chunks" {
+		t.Fatalf("record = %+v", rec)
+	}
+
 	// 非流式请求不受 FailAfterChunks 影响。
 	s.Inject(Chat, 2, Action{FailAfterChunks: 1})
 	resp = post(t, s.ModelBaseURL()+"/chat/completions", `{"model":"m","messages":[{"role":"user","content":"x"}]}`)

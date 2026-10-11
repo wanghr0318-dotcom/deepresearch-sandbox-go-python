@@ -100,6 +100,10 @@ func (st *sseStream) send(event string, data string) bool {
 			st.s.setOutcome(st.rec, OutcomeStreamError)
 			return false
 		}
+		if a.FailMidLine { // the first half of the next event's data line
+			line := "data: " + data
+			_, _ = fmt.Fprint(st.w, line[:len(line)/2])
+		}
 		st.flush()
 		st.s.setOutcome(st.rec, OutcomeDisconnected)
 		panic(http.ErrAbortHandler)
