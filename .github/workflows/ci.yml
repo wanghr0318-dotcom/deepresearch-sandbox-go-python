@@ -173,7 +173,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           version: "0.11.14"
       - name: SDK 兼容性测试（锁文件必须最新）
@@ -192,7 +192,7 @@ jobs:
         working-directory: worker
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           version: "0.11.14"
       - name: 安装依赖（锁文件必须最新）
