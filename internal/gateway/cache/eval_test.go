@@ -47,3 +47,22 @@ func TestRedisEval(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestPoolWaitIsPoolBusy（复审 F9）：取不到连接许可的超时是 ErrPoolBusy（同时仍是期限错误）；线路上的
+// 超时不是。
+func TestPoolWaitIsPoolBusy(t *testing.T) {
+	r := NewRedis(RedisConfig{Addr: silentServer(t), ReadTimeout: 200 * time.Millisecond, PoolSize: 1})
+	t.Cleanup(func() { _ = r.Close() })
+	first := make(chan error, 1)
+	go func() { _, _, err := r.Get(context.Background(), "k"); first <- err }()
+	time.Sleep(50 * time.Millisecond) // 第一个操作占住唯一的许可，阻塞在不回复的服务上
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, _, err := r.Get(ctx, "k")
+	if !errors.Is(err, ErrPoolBusy) {
+		t.Fatalf("等待许可超时应为 ErrPoolBusy，得到 %v", err)
+	}
+	if err := <-first; err == nil || errors.Is(err, ErrPoolBusy) {
+		t.Fatalf("线路上的超时不是 ErrPoolBusy：%v", err)
+	}
+}

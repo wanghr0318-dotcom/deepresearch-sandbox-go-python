@@ -19,9 +19,10 @@ type Concurrency struct {
 func NewConcurrency() *Concurrency { return &Concurrency{n: map[string]int64{}} }
 
 // Acquire takes one unit of every slot, or none: when a slot is full it returns ok false and that slot. The returned
-// release function gives the units back; it is idempotent.
+// release function gives the units back; it is idempotent. A scope listed more than once counts once, against the
+// smallest of its limits.
 func (c *Concurrency) Acquire(slots []Slot) (release func(), full Slot, ok bool) {
-	slots = append([]Slot(nil), slots...)
+	slots = dedupe(slots)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, s := range slots {
@@ -51,4 +52,19 @@ func (c *Concurrency) InUse(scope string) int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.n[scope]
+}
+
+// dedupe copies slots with each scope once (the smallest limit wins), so a scope listed twice counts one unit.
+func dedupe(slots []Slot) []Slot {
+	out := make([]Slot, 0, len(slots))
+	at := make(map[string]int, len(slots))
+	for _, s := range slots {
+		if i, ok := at[s.Scope]; ok {
+			out[i].Limit = min(out[i].Limit, s.Limit)
+			continue
+		}
+		at[s.Scope] = len(out)
+		out = append(out, s)
+	}
+	return out
 }

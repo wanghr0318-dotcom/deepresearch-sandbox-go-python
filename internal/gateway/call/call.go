@@ -203,6 +203,8 @@ type Result struct {
 	BlobSHA256 string
 	Status     int
 	Code       string
+	// Message 是面向 Worker 的说明（目前只有 insufficient_quota：本月配额已用尽及层级）；空时为 HTTP 状态文字。
+	Message    string
 	// ToolBudget 是搜索与抓取在任务有上限时的工具调用额度（X-Agentbox-Tool-Budget），含 429 与重放；其余为 nil。
 	ToolBudget *ToolBudget
 	// source 是成功结果的来源（只供可观测性）：空为上游，ResultCacheHit 或 ResultCoalesced。
@@ -1076,7 +1078,11 @@ func (c *Coordinator) execute(j *job, rec CallRecord) (Result, error) {
 				if rej.Code == persistence.CodeCallInProgress {
 					return reject(rej.Code), nil
 				}
-				return c.giveUp(j, state, rej.Code)
+				r, err := c.giveUp(j, state, rej.Code)
+				if rej.Code == persistence.CodeInsufficientQuota {
+					r.Message = persistence.QuotaMessageOf(rej.Detail) // 复审 F13：说明是月度配额且指明层级
+				}
+				return r, err
 			}
 			if _, ferr := c.giveUp(j, state, CodeStoreUnavailable); ferr != nil {
 				c.log.Warn("gateway: Tx2 失败后无法把调用置为 failed", "task_id", in.TaskID, "call_id", in.CallID, "err", ferr)

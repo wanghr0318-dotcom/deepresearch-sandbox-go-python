@@ -32,13 +32,15 @@ const (
 	quotaSweepBatch     = 500
 	sandboxGatePoll     = 2 * time.Second
 	sandboxGateQueryMax = 5 * time.Second
+	// limiterRedisPool 是限流器的 Redis 连接数：大于缓存的默认 8，减少并发请求等待连接（复审 F9）。
+	limiterRedisPool = 32
 )
 
 // newRateLimiter 构造运行时 API 的限流器：配置了 Redis 时用 Redis（独立的连接池），否则只用进程内桶。
 func (s *server) newRateLimiter() *ratelimit.Fallback {
 	var ev ratelimit.Evaler
 	if s.cfg.RedisAddr != "" {
-		r := cache.NewRedis(cache.RedisConfig{Addr: s.cfg.RedisAddr})
+		r := cache.NewRedis(cache.RedisConfig{Addr: s.cfg.RedisAddr, PoolSize: limiterRedisPool})
 		s.limiterRedis = r
 		ev = r
 	}

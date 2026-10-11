@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -197,7 +198,9 @@ func (f *Fallback) Take(ctx context.Context, buckets []Bucket, n int64) (Decisio
 		if ctx.Err() != nil {
 			return Decision{}, ctx.Err() // the caller gave up: not a Redis failure
 		}
-		f.failed(err)
+		if !poolBusy(err) { // 复审 F9：本地连接池满不是 Redis 故障：这一次在进程内决定，不标记 Redis 不可用
+			f.failed(err)
+		}
 	}
 	if f.ev != nil {
 		f.fallbacks.Add(1)
@@ -207,7 +210,8 @@ func (f *Fallback) Take(ctx context.Context, buckets []Bucket, n int64) (Decisio
 	return d, err
 }
 
-// Refund implements Limiter. A refund that cannot reach Redis is dropped (it only ever makes limits stricter).
+// Refund implements Limiter. A refund that cannot reach Redis is applied to the in-process buckets instead (the Redis
+// bucket then stays stricter than it should, never looser).
 func (f *Fallback) Refund(ctx context.Context, buckets []Bucket, n int64) {
 	if validate(buckets, n) != nil || len(buckets) == 0 || n == 0 {
 		return
@@ -219,9 +223,16 @@ func (f *Fallback) Refund(ctx context.Context, buckets []Bucket, n int64) {
 		if err == nil {
 			return
 		}
-		if ctx.Err() == nil {
+		if ctx.Err() == nil && !poolBusy(err) {
 			f.failed(err)
 		}
 	}
 	f.local.Refund(ctx, buckets, n)
+}
+
+// poolBusy reports whether err is the Redis client's local connection pool being full (not a Redis failure): the
+// error has a Busy() bool method (cache.ErrPoolBusy) that returns true.
+func poolBusy(err error) bool {
+	var b interface{ Busy() bool }
+	return errors.As(err, &b) && b.Busy()
 }

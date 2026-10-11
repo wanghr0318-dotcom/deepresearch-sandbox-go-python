@@ -7,6 +7,7 @@ package persistence
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 var (
@@ -113,4 +114,16 @@ func (e *CommitUnknownError) Unwrap() error { return e.Err }
 // CountsTowardFailureThreshold 报告该错误是否计入 Store 故障阈值（规格 §14.5）。
 func CountsTowardFailureThreshold(err error) bool {
 	return errors.Is(err, ErrUnavailable) || errors.Is(err, ErrCommitUnknown)
+}
+
+// QuotaExhaustedMessage 是月度预算不足（insufficient_quota）面向 Worker 的说明，指明用尽的层级（org、user 或 key）。
+// RejectedError.Detail 以它开头，其后的括号内为细节（层级 ID 与金额，不交给 Worker）。
+func QuotaExhaustedMessage(level string) string { return "本月配额已用尽（" + level + "）" }
+
+// QuotaMessageOf 从 insufficient_quota 的 Detail 中取出面向 Worker 的说明（QuotaExhaustedMessage 的部分）。
+func QuotaMessageOf(detail string) string {
+	if i := strings.Index(detail, "）"); i >= 0 && strings.HasPrefix(detail, "本月配额已用尽（") {
+		return detail[:i+len("）")]
+	}
+	return "本月配额已用尽"
 }

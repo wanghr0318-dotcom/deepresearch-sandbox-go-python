@@ -825,7 +825,7 @@ func (t *target) invoke(w http.ResponseWriter, r *http.Request, tc *trackedConn,
 // writeResult 写出计费调用或 exec 的结果：拒绝与失败为错误体（Status/Code 原样）；成功时带结果 blob 与重放头。
 func (t *target) writeResult(w http.ResponseWriter, callID string, res call.Result) {
 	if res.Status != 0 && res.Code != "" {
-		t.writeError(w, res.Status, res.Code, http.StatusText(res.Status))
+		t.writeError(w, res.Status, res.Code, resultMessage(res))
 		return
 	}
 	h := w.Header()
@@ -854,7 +854,7 @@ func (t *target) access(w http.ResponseWriter, r *http.Request, subrunID string)
 		return false
 	}
 	if res.Status != 0 && res.Code != "" {
-		t.writeError(w, res.Status, res.Code, http.StatusText(res.Status))
+		t.writeError(w, res.Status, res.Code, resultMessage(res))
 		return false
 	}
 	return true
@@ -1221,4 +1221,12 @@ func (c *trackedConn) Close() error {
 		c.l.remove(c)
 	})
 	return c.err
+}
+
+// resultMessage 是拒绝与失败的错误体消息：Result 给出说明时用它（月度配额用尽），否则为 HTTP 状态文字。
+func resultMessage(res call.Result) string {
+	if res.Message != "" {
+		return res.Message
+	}
+	return http.StatusText(res.Status)
 }

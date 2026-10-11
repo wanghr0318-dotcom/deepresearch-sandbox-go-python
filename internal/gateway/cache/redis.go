@@ -44,7 +44,17 @@ var (
 	ErrProtocol = errors.New("cache: RESP protocol error")
 	// ErrClosed：客户端已关闭。
 	ErrClosed = errors.New("cache: redis client closed")
+	// ErrPoolBusy：在期限内没有取到连接许可（本地连接池满，不是 Redis 本身的故障）；同时满足 os.ErrDeadlineExceeded。
+	// 它实现 Busy() bool，供不导入本包的调用方（internal/ratelimit）以 errors.As 识别。
+	ErrPoolBusy error = poolBusyError{}
 )
+
+type poolBusyError struct{}
+
+func (poolBusyError) Error() string { return "cache: redis connection pool busy" }
+
+// Busy 标记这是本地连接池满，而不是 Redis 的错误或线路上的超时。
+func (poolBusyError) Busy() bool { return true }
 
 // RedisError 是 Redis 的错误回复（"-ERR ..."）。收到它时连接仍然可用。
 type RedisError struct{ Msg string }
@@ -209,9 +219,12 @@ func (r *Redis) do(ctx context.Context, timeout time.Duration, args ...any) (rep
 	select {
 	case r.slots <- struct{}{}:
 	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) { // 期限内没有取到许可：同样是连接池满（复审 F9）
+			return reply{}, fmt.Errorf("cache: redis %s: 等待连接: %w: %w", cmd, ErrPoolBusy, ctx.Err())
+		}
 		return reply{}, ctx.Err()
 	case <-timer.C:
-		return reply{}, fmt.Errorf("cache: redis %s: 等待连接: %w", cmd, os.ErrDeadlineExceeded)
+		return reply{}, fmt.Errorf("cache: redis %s: 等待连接: %w: %w", cmd, ErrPoolBusy, os.ErrDeadlineExceeded)
 	}
 	defer func() { <-r.slots }()
 

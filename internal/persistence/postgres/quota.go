@@ -218,8 +218,8 @@ func settleHoldTx(ctx context.Context, tx pgx.Tx, id, state string, charged int6
 func insufficientRejection(err error) error {
 	var ie *quota.InsufficientError
 	if errors.As(err, &ie) {
-		return rejectf(persistence.CodeInsufficientQuota, "%s 级月度预算不足（%s %s：可用 %d / 上限 %d，本次需要 %d）", ie.Level, ie.Level,
-			ie.ID, ie.Available, ie.Limit, ie.Amount)
+		return rejectf(persistence.CodeInsufficientQuota, "%s（%s %s：可用 %d / 上限 %d，本次需要 %d）", persistence.QuotaExhaustedMessage(string(ie.Level)),
+			ie.Level, ie.ID, ie.Available, ie.Limit, ie.Amount)
 	}
 	return err
 }
@@ -421,45 +421,47 @@ func (q *QuotaStore) LimitsFor(ctx context.Context, s quota.Scope) (map[quota.Le
 	return out, err
 }
 
-// GetBudget 实现 quota.Store。
+// periodArg 把 period 转为 SQL 参数：零值为 nil，即数据库时间所在的月份（与 hold 相同，见 periodNow）。
+func periodArg(period time.Time) *time.Time {
+	if period.IsZero() {
+		return nil
+	}
+	p := quota.Period(period)
+	return &p
+}
+
+// GetBudget 实现 quota.Store；period 为零值时取数据库时间所在的月份。
 func (q *QuotaStore) GetBudget(ctx context.Context, t quota.Target, period time.Time) (quota.Budget, error) {
-	period = quota.Period(period)
-	b := quota.Budget{Level: t.Level, ID: t.ID, Period: period}
+	p := periodArg(period)
+	var b quota.Budget
 	err := q.s.read(ctx, "GetBudget", func(ctx context.Context, db queryer) error {
-		rows, err := db.Query(ctx, `SELECT scope_kind, scope_id, period, limit_micro, reserved_micro, spent_micro, unknown_micro
-			FROM quota_budgets WHERE scope_kind = $1 AND scope_id = $2 AND period = $3`, string(t.Level), t.ID, period)
+		b = quota.Budget{Level: t.Level, ID: t.ID}
+		var cur time.Time
+		err := db.QueryRow(ctx, `WITH p AS (SELECT COALESCE($3::date, `+periodNow+`) AS period)
+			SELECT p.period, CASE WHEN b.scope_kind IS NOT NULL THEN b.limit_micro ELSE (SELECT e.limit_micro FROM quota_budgets e
+					WHERE e.scope_kind = $1 AND e.scope_id = $2 AND e.period < p.period ORDER BY e.period DESC LIMIT 1) END,
+				COALESCE(b.reserved_micro, 0), COALESCE(b.spent_micro, 0), COALESCE(b.unknown_micro, 0)
+			FROM p LEFT JOIN quota_budgets b ON b.scope_kind = $1 AND b.scope_id = $2 AND b.period = p.period`,
+			string(t.Level), t.ID, p).Scan(&cur, &b.LimitMicro, &b.ReservedMicro, &b.SpentMicro, &b.UnknownMicro)
 		if err != nil {
 			return err
 		}
-		got, err := pgx.CollectRows(rows, scanBudget)
-		if err != nil {
-			return err
-		}
-		if len(got) == 1 {
-			b = got[0]
-			return nil
-		}
-		b = quota.Budget{Level: t.Level, ID: t.ID, Period: period}
-		err = db.QueryRow(ctx, `SELECT limit_micro FROM quota_budgets WHERE scope_kind = $1 AND scope_id = $2 AND period < $3
-			ORDER BY period DESC LIMIT 1`, string(t.Level), t.ID, period).Scan(&b.LimitMicro)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
-		}
-		return err
+		b.Period = cur.UTC()
+		return nil
 	})
 	return b, err
 }
 
-// PutBudget 实现 quota.Store：锁住（缺失时创建）period 的行，新上限低于当月已用为 *quota.BelowUsageError；
-// 否则改为新上限。之后的月份（懒创建时）沿用它；已存在的更晚月份的行不变（它们有各自的已用额）。
+// PutBudget 实现 quota.Store（period 为零值时取数据库时间所在的月份）：锁住（缺失时创建）该月的行，新上限低于当月已用为
+// *quota.BelowUsageError；否则改为新上限。之后的月份（懒创建时）沿用它；已存在的更晚月份的行不变（它们有各自的已用额）。
 func (q *QuotaStore) PutBudget(ctx context.Context, t quota.Target, period time.Time, limit *int64) (quota.Budget, error) {
 	if limit != nil && *limit < 0 {
 		return quota.Budget{}, invalidf("预算上限不能为负")
 	}
-	period = quota.Period(period)
+	p := periodArg(period)
 	var out quota.Budget
 	err := q.s.run(ctx, "PutBudget", string(t.Level)+":"+t.ID, func(ctx context.Context, tx pgx.Tx) error {
-		bs, err := lockQuotaBudgetsTx(ctx, tx, []quota.Target{t}, &period)
+		bs, err := lockQuotaBudgetsTx(ctx, tx, []quota.Target{t}, p)
 		if err != nil {
 			return err
 		}
@@ -467,7 +469,7 @@ func (q *QuotaStore) PutBudget(ctx context.Context, t quota.Target, period time.
 			return &quota.BelowUsageError{Used: bs[0].Used(), Limit: *limit}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE quota_budgets SET limit_micro = $4 WHERE scope_kind = $1 AND scope_id = $2 AND period = $3`,
-			string(t.Level), t.ID, period, limit); err != nil {
+			string(t.Level), t.ID, bs[0].Period, limit); err != nil {
 			return err
 		}
 		out = bs[0]
@@ -516,7 +518,7 @@ func convertTaskHoldsTx(ctx context.Context, tx pgx.Tx) error {
 			JOIN reservations r ON r.reservation_id = q.hold_id
 			WHERE q.state = 'held' AND q.source = 'task_call' AND r.state = 'held'),
 		lv AS (SELECT 'org' AS k, org_id::text AS i, period, amount_micro AS a FROM h
-			UNION ALL SELECT 'user', user_id::text, period, amount_micro FROM h WHERE user_id IS NOT NULL
+			UNION ALL SELECT 'user', org_id::text || '/' || user_id::text, period, amount_micro FROM h WHERE user_id IS NOT NULL
 			UNION ALL SELECT 'key', key_id, period, amount_micro FROM h WHERE key_id IS NOT NULL),
 		agg AS (SELECT k, i, period, sum(a) AS total FROM lv GROUP BY k, i, period)
 		UPDATE quota_budgets b SET reserved_micro = b.reserved_micro - agg.total, unknown_micro = b.unknown_micro + agg.total

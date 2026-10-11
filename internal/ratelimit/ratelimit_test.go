@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -380,5 +381,52 @@ func TestConcurrency(t *testing.T) {
 	rel2()
 	if c.InUse(org.Scope) != 0 {
 		t.Fatal("all released")
+	}
+}
+
+// TestConcurrencyDuplicateScope (review F14): a scope listed twice takes one unit and is checked against the smaller
+// limit.
+func TestConcurrencyDuplicateScope(t *testing.T) {
+	c := NewConcurrency()
+	s := Slot{Scope: "org:1:streams", Limit: 2}
+	rel, _, ok := c.Acquire([]Slot{s, s})
+	if !ok || c.InUse(s.Scope) != 1 {
+		t.Fatalf("one unit expected: ok=%v in use %d", ok, c.InUse(s.Scope))
+	}
+	if _, _, ok := c.Acquire([]Slot{s, {Scope: s.Scope, Limit: 1}}); ok {
+		t.Fatal("the smaller limit (1) applies")
+	}
+	rel()
+	if c.InUse(s.Scope) != 0 {
+		t.Fatal("released")
+	}
+}
+
+// busyEvaler answers like a Redis client whose connection pool is full.
+type busyEvaler struct{}
+
+func (busyEvaler) EvalSHA(context.Context, string, []string, ...string) ([]byte, error) {
+	return nil, fmt.Errorf("cache: redis EVALSHA: 等待连接: %w", cache.ErrPoolBusy)
+}
+func (busyEvaler) Eval(context.Context, string, []string, ...string) ([]byte, error) {
+	return nil, fmt.Errorf("cache: redis EVAL: 等待连接: %w", cache.ErrPoolBusy)
+}
+
+// TestPoolBusyIsNotARedisFailure (review F9): waiting for a free connection decides in process for that request but
+// neither counts a Redis failure nor marks the limiter degraded.
+func TestPoolBusyIsNotARedisFailure(t *testing.T) {
+	f := NewFallback(busyEvaler{}, FallbackOptions{})
+	b := []Bucket{{Scope: "key:k", Kind: "rpm", Limit: 1, Window: time.Minute}}
+	if d := take(t, f, b, 1); !d.Allowed {
+		t.Fatalf("%+v", d)
+	}
+	if d := take(t, f, b, 1); d.Allowed {
+		t.Fatalf("still enforced in process: %+v", d)
+	}
+	if fb, fails := f.Stats(); f.Degraded() || fails != 0 || fb != 2 {
+		t.Fatalf("degraded=%v failures=%d fallbacks=%d", f.Degraded(), fails, fb)
+	}
+	if !errors.Is(cache.ErrPoolBusy, cache.ErrPoolBusy) {
+		t.Fatal("sentinel")
 	}
 }

@@ -199,8 +199,8 @@ class Agent:
         except CallAbandoned:  # 宿主请求暂停时放弃了在途调用：回到锚点后停止
             paused = await self._stop(rollback=True)
             return LoopOutcome("paused", checkpoint_id=paused.checkpoint_id)
-        except BudgetExhausted:
-            return await self._cost_budget_exhausted()
+        except BudgetExhausted as exc:
+            return await self._cost_budget_exhausted(exc)
 
     async def commit(self, step_id: str) -> Paused | None:
         """压缩状态 → 写 checkpoint；之后宿主已请求暂停时返回 Paused。"""
@@ -667,8 +667,15 @@ class Agent:
         report = {"artifact_id": ref.artifact_id, "version": ref.version, "title": title}
         return LoopOutcome("report", text=markdown, reply=reply, memo=summary, report=report)
 
-    async def _cost_budget_exhausted(self) -> LoopOutcome:
-        """费用预算耗尽（402）：有完成的子主题时用其摘要写部分报告，否则失败。"""
+    async def _cost_budget_exhausted(self, exc: BudgetExhausted) -> LoopOutcome:
+        """费用预算耗尽（402）：有完成的子主题时用其摘要写部分报告，否则失败。
+
+        org / user / key 的月度配额用尽（insufficient_quota）时，说明换成 Gateway 给出的"本月配额已用尽（层级）"；
+        处理不变。
+        """
+        quota = exc.code == "insufficient_quota"
+        reason = (exc.message or "本月配额已用尽") if quota else "费用预算已用尽"
+        note = f"{reason}，部分结果" if quota else COST_BUDGET_NOTE
         st = self.state
         done = [
             (item, st.subtopics[item.id])
@@ -676,10 +683,10 @@ class Agent:
             if item.id in st.subtopics and st.subtopics[item.id].status == "done"
         ]
         if not done:
-            raise WorkerFailure("budget_exhausted", "费用预算已用尽，本轮未能完成")
+            raise WorkerFailure("budget_exhausted", f"{reason}，本轮未能完成")
         st.partial = True
-        if COST_BUDGET_NOTE not in st.notes:
-            st.notes.append(COST_BUDGET_NOTE)
+        if note not in st.notes:
+            st.notes.append(note)
         body = "\n\n".join(f"## {item.title}\n\n{sub.summary or ''}" for item, sub in done)
         return await self._report(f"# {self.cfg.text}\n\n{body}")
 

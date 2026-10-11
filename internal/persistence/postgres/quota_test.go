@@ -116,7 +116,7 @@ func (w quotaWorld) target(l quota.Level) quota.Target {
 	case quota.LevelOrg:
 		return quota.Target{Level: l, ID: strconv.FormatInt(w.org, 10)}
 	case quota.LevelUser:
-		return quota.Target{Level: l, ID: strconv.FormatInt(w.user, 10)}
+		return quota.Target{Level: l, ID: quota.UserTargetID(w.org, w.user)}
 	}
 	return quota.Target{Level: l, ID: w.key}
 }
@@ -579,4 +579,33 @@ func TestQuotaOvershootReportedSeparately(t *testing.T) {
 	if vs := quotaViolations(t, w.s); len(vs) != 2 { // G1（spent ≠ Σ）与 G2（扣除超额后仍超出）
 		t.Fatalf("篡改后应有 G1、G2 违反：%v", vs)
 	}
+}
+
+// TestQuotaUserRowsAreScopedToOrg（复审 F5）：用户层级的限额与预算按 (org, user) 记：同一用户在另一个 org 中使用全新的
+// 用户层级行，原 org 的上限不跟随他，原 org 的花费也留在原 org 的行上。
+func TestQuotaUserRowsAreScopedToOrg(t *testing.T) {
+	ctx := context.Background()
+	w := newQuotaWorld(t)
+	w.setBudget(t, quota.LevelUser, i64(10)) // alice 在 acme 的用户层级
+	h, err := w.q.Reserve(ctx, quota.Scope{OrgID: w.org, UserID: w.user}, quota.SourceModelRequest, "a", 10, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.q.Settle(ctx, h, 10, false); err != nil {
+		t.Fatal(err)
+	}
+	other, err := w.s.TenancyStore().CreateOrg(ctx, "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 同一用户 ID 在另一个 org：acme 的上限 10 与已用 10 都不影响它。
+	if _, err := w.q.Reserve(ctx, quota.Scope{OrgID: other.ID, UserID: w.user}, quota.SourceModelRequest, "b", 500, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("另一个 org 中的用户层级应是全新的：%v", err)
+	}
+	b, err := w.q.GetBudget(ctx, quota.Target{Level: quota.LevelUser, ID: quota.UserTargetID(other.ID, w.user)}, time.Time{})
+	if err != nil || b.LimitMicro != nil || b.ReservedMicro != 500 || b.SpentMicro != 0 {
+		t.Fatalf("beta 中的用户层级 = %+v, %v", b, err)
+	}
+	expectUsage(t, w.budget(t, quota.LevelUser), 0, 10, 0)
+	checkQuota(t, w.s)
 }
