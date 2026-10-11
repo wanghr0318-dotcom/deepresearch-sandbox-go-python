@@ -1035,6 +1035,41 @@ paths:
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/Unavailable'}
   /v1/orgs/members:
+    get:
+      operationId: listMembers
+      summary: Members of the caller's org with their roles (owners; the operator with `?org=`)
+      description: |
+        Owners list their own org. The operator must name the org. Members get 403 `forbidden`; API keys 403
+        `permission_denied`. Another org is the same 404 as a missing one.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: org
+          in: query
+          required: false
+          description: The org name (required for the operator)
+          schema: {type: string}
+      responses:
+        '200':
+          description: The members, owners first
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MemberList'}
+        '400':
+          description: '`invalid_request` (the operator did not name an org)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/KeyUnauthorized'}
+        '403': {$ref: '#/components/responses/KeyForbidden'}
+        '404':
+          description: '`org_not_found`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
     post:
       operationId: addMember
       summary: Move a user into an org or change their role (operator only; users join through invites)
@@ -1340,6 +1375,88 @@ paths:
               schema: {$ref: '#/components/schemas/Error'}
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/QuotaUnavailable'}
+  /v1/usage:
+    get:
+      operationId: getUsage
+      summary: Daily usage (requests, tokens, known and unknown cost) grouped by day, model, key, user, org or source
+      description: |
+        Read from `usage_daily`, which a periodic rollup fills from settled budget holds (`as_of` is the time of the
+        last rollup). Cost is in micro-USD: `cost_micro` is known cost, `unknown_micro` was charged at the estimate
+        because the outcome was unknown. Source `model_api` is `/v1/chat/completions` and `/v1/messages`; source
+        `runtime` is the calls made by sandboxes (tokens are not recorded for them). Members see only their own
+        usage, owners their org's, the operator every org (or the one in `?org=`). API keys get 403
+        `permission_denied`. An org, user or key the caller cannot see is the same 404 as a missing one.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - {name: from, in: query, required: false, description: 'First UTC day, `YYYY-MM-DD` (default the first day of this month)', schema: {type: string}}
+        - {name: to, in: query, required: false, description: 'Last UTC day, inclusive (default today); at most 366 days after `from`', schema: {type: string}}
+        - {name: group_by, in: query, required: false, description: 'Comma-separated dimensions among `day`, `model`, `key`, `user`, `org`, `source` (default `day`)', schema: {type: string}}
+        - {name: org, in: query, required: false, description: The org name (the operator; others may only name their own), schema: {type: string}}
+        - {name: user, in: query, required: false, description: 'A username of the org, or a former member with usage in it (members may only name themselves)', schema: {type: string}}
+        - {name: key, in: query, required: false, description: An API key id the caller can see, schema: {type: string}}
+      responses:
+        '200':
+          description: The grouped rows and their total
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Usage'}
+        '400':
+          description: '`invalid_request` (dates, range or group_by)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/KeyUnauthorized'}
+        '403': {$ref: '#/components/responses/KeyForbidden'}
+        '404':
+          description: '`org_not_found`, `user_not_found` or `key_not_found` (also one the caller cannot see)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/UsageUnavailable'}
+  /v1/bills/{month}:
+    parameters:
+      - name: month
+        in: path
+        required: true
+        description: 'The UTC month, `YYYY-MM`'
+        schema: {type: string}
+    get:
+      operationId: getBill
+      summary: A month's bill for an org (a member's own share for members) with per-model tokens and cost
+      description: |
+        The month's `usage_daily` rows summed per model and per source, with known and unknown cost apart. Owners get
+        their org's bill and members their own share (`username` is set); the operator must name the org with
+        `?org=`. Same authorization as `GET /v1/usage`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - {name: org, in: query, required: false, description: The org name (required for the operator), schema: {type: string}}
+        - {name: user, in: query, required: false, description: Only this user's usage (owners and the operator), schema: {type: string}}
+        - {name: key, in: query, required: false, description: Only this key's usage, schema: {type: string}}
+      responses:
+        '200':
+          description: The bill
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Bill'}
+        '400':
+          description: '`invalid_request` (month, or the operator did not name an org)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/KeyUnauthorized'}
+        '403': {$ref: '#/components/responses/KeyForbidden'}
+        '404':
+          description: '`org_not_found`, `user_not_found` or `key_not_found` (also one the caller cannot see)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/UsageUnavailable'}
   /v1/chat/completions:
     post:
       operationId: createChatCompletion
@@ -1546,6 +1663,11 @@ components:
           schema: {$ref: '#/components/schemas/Error'}
     QuotaNotFound:
       description: '`org_not_found`, `user_not_found` or `key_not_found` (also a level of another org)'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    UsageUnavailable:
+      description: '`usage_unavailable` (usage accounting is not enabled), or as for every operation'
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
@@ -1847,6 +1969,102 @@ components:
       properties:
         name: {type: string}
         owner: {type: string, description: A username still alone in their personal org}
+    UsageTotals:
+      type: object
+      required: [requests, prompt_tokens, completion_tokens, cost_micro, unknown_micro]
+      properties:
+        requests: {type: integer}
+        prompt_tokens: {type: integer}
+        completion_tokens: {type: integer}
+        cost_micro: {type: integer, description: Known cost in micro-USD (settled)}
+        unknown_micro: {type: integer, description: Cost charged at the estimate because the outcome was unknown}
+    UsageRow:
+      allOf:
+        - {$ref: '#/components/schemas/UsageTotals'}
+        - type: object
+          description: The dimensions that were grouped by are present
+          properties:
+            day: {type: string, description: '`YYYY-MM-DD` (UTC)'}
+            org_id: {type: integer, format: int64}
+            org: {type: string}
+            username: {type: string}
+            key_id: {type: string}
+            key_name: {type: string}
+            model: {type: string, description: Empty when the request's record is missing}
+            source: {type: string, enum: [runtime, model_api]}
+    Usage:
+      type: object
+      required: [from, to, group_by, rows, total, as_of, filter]
+      properties:
+        from: {type: string}
+        to: {type: string}
+        group_by:
+          type: array
+          items: {type: string, enum: [day, org, user, key, model, source]}
+        rows:
+          type: array
+          items: {$ref: '#/components/schemas/UsageRow'}
+        total: {$ref: '#/components/schemas/UsageTotals'}
+        as_of: {type: string, format: date-time, nullable: true, description: Time of the last rollup (null before the first)}
+        filter: {$ref: '#/components/schemas/UsageFilter'}
+    UsageFilter:
+      type: object
+      description: The filters that were applied (the caller's visibility and the query parameters)
+      properties:
+        org: {type: string, description: Absent when every org is included (operator)}
+        username: {type: string, description: Only this user's usage (a member's own, or `?user=`)}
+        key_id: {type: string, description: Only this key's usage (`?key=`)}
+    BillLine:
+      allOf:
+        - {$ref: '#/components/schemas/UsageTotals'}
+        - type: object
+          required: [model, total_micro]
+          properties:
+            model: {type: string}
+            total_micro: {type: integer, description: cost_micro + unknown_micro}
+    BillSource:
+      allOf:
+        - {$ref: '#/components/schemas/UsageTotals'}
+        - type: object
+          required: [source, total_micro]
+          properties:
+            source: {type: string, enum: [runtime, model_api]}
+            total_micro: {type: integer}
+    Bill:
+      type: object
+      required: [month, org, models, sources, total, as_of, filter]
+      properties:
+        month: {type: string}
+        org:
+          type: object
+          required: [id, name]
+          properties:
+            id: {type: integer, format: int64}
+            name: {type: string}
+        username: {type: string, description: 'Only this user''s share: a member''s own bill, or `?user=`'}
+        key_id: {type: string, description: 'Only this key''s share (`?key=`)'}
+        models:
+          type: array
+          items: {$ref: '#/components/schemas/BillLine'}
+        sources:
+          type: array
+          items: {$ref: '#/components/schemas/BillSource'}
+        total: {$ref: '#/components/schemas/BillLine'}
+        as_of: {type: string, format: date-time, nullable: true}
+        filter: {$ref: '#/components/schemas/UsageFilter'}
+    MemberList:
+      type: object
+      required: [org, members]
+      properties:
+        org:
+          type: object
+          required: [id, name]
+          properties:
+            id: {type: integer, format: int64}
+            name: {type: string}
+        members:
+          type: array
+          items: {$ref: '#/components/schemas/Membership'}
     Membership:
       type: object
       required: [org_id, org, username, role]

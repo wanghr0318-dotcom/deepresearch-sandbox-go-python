@@ -12,6 +12,9 @@
       <nav class="topbar-nav" aria-label="页面">
         <a :href="homeHref()" :class="{ on: route.name === 'chat' }" data-testid="nav-chat">对话</a>
         <a :href="legacyHref()" :class="{ on: route.name === 'legacy' || route.name === 'research' }" data-testid="nav-legacy">早期研究</a>
+        <a :href="keysHref()" :class="{ on: route.name === 'keys' }" data-testid="nav-keys">API 密钥</a>
+        <a :href="usageHref()" :class="{ on: route.name === 'usage' }" data-testid="nav-usage">用量</a>
+        <a :href="orgHref()" :class="{ on: route.name === 'org' }" data-testid="nav-org">成员</a>
       </nav>
       <span class="spacer"></span>
       <span class="topbar-user" data-testid="username">{{ user.username }}</span>
@@ -29,6 +32,9 @@
         <ChatView v-if="route.name === 'chat'" :session-id="route.id" @unauthorized="signedOut" />
         <ResearchDetailView v-else-if="route.name === 'research'" :id="route.id" :key="route.id" @unauthorized="signedOut" />
         <AssistantView v-else-if="route.name === 'legacy'" @unauthorized="signedOut" />
+        <KeysView v-else-if="route.name === 'keys'" @unauthorized="signedOut" />
+        <UsageView v-else-if="route.name === 'usage'" @unauthorized="signedOut" />
+        <OrgView v-else-if="route.name === 'org'" @unauthorized="signedOut" />
       </template>
     </main>
   </div>
@@ -40,14 +46,17 @@ import AdminApp from "./AdminApp.vue";
 import type { User } from "./api/client";
 import BrandMark from "./components/BrandMark.vue";
 import { userErrorMessage } from "./lib/userErrors";
-import { homeHref, isAdminRoute, legacyHref, loginHref, navigate, needsSession, useHashRoute } from "./lib/router";
+import { homeHref, isAdminRoute, keysHref, legacyHref, loginHref, navigate, needsSession, orgHref, usageHref, useHashRoute } from "./lib/router";
 import { clearReportCache } from "./lib/useReport";
 import { useUserServices } from "./lib/userServices";
 import AssistantView from "./views/AssistantView.vue";
 import ChatView from "./views/ChatView.vue";
+import KeysView from "./views/KeysView.vue";
 import LoginView from "./views/LoginView.vue";
+import OrgView from "./views/OrgView.vue";
 import RegisterView from "./views/RegisterView.vue";
 import ResearchDetailView from "./views/ResearchDetailView.vue";
+import UsageView from "./views/UsageView.vue";
 
 const route = useHashRoute();
 const { api } = useUserServices();
@@ -192,6 +201,11 @@ watch(
   }
   .topbar-nav {
     margin-left: 0;
+    min-width: 0;
+    overflow-x: auto;
+  }
+  .topbar-nav a {
+    white-space: nowrap;
   }
 }
 /* 对话页占满视口高度：页面本身不滚动，各栏各自滚动。 */

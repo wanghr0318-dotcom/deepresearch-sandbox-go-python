@@ -53,6 +53,7 @@ Browser (Vue 3) / CLI ── REST + SSE ──► Go control plane
 | **Tenancy and platform API keys** | Org → user → key: every user belongs to one org (a personal org at sign-up) whose owners invite members; a user moves only by accepting, and personal orgs take no one else. Platform keys `abx_live_…` are stored only as an HMAC under a pepper file (its fingerprint is recorded in the database and a mismatch refuses to start), carry scopes (`runtime` / `models`), expiry and revocation, and call the runtime API as `Authorization: Bearer` or `x-api-key`. Verified keys are cached for 30 s; revocation reaches every server at once through PostgreSQL `NOTIFY`. A key can never mint keys or manage members. Tasks and sessions record their org and key. [Design](docs/design/2026-10-11-model-gateway-design.md). |
 | **Model API** | `--model-api` serves OpenAI `/v1/chat/completions` and Anthropic `/v1/messages` (streaming and tool calls) and `/v1/models` to platform keys with the `models` scope, through the Gateway's model routes (weights, breakers, failover before the first byte) to OpenAI- or Anthropic-format providers: same format is passed through, the other is converted by `internal/llmproto`. Each request takes rpm, tpm and a stream slot at the key, user and org level, reserves its worst-case cost as a hold in the monthly budgets and settles the actual cost afterwards (unknown usage is charged in full as unknown); PostgreSQL down means 503; `routing.primary_models` in the fallback file restricts the primary to its own models. Requests and every try are recorded in `model_requests` (partitioned by month); metrics include time to first token, stream completeness and rejections by reason. Compatibility tests with the official `openai` and `anthropic` Python SDKs run in CI. |
 | **Limits and monthly budgets** | Requests-per-minute limits at the org, user and key level (one Redis Lua script checks every level atomically; when Redis fails or takes over 50 ms the limiter falls back to in-process buckets, requests keep working and a metric reports the degradation); an org's concurrent sandboxes are counted in PostgreSQL at admission. Budgets per UTC month: every Gateway call of a sandbox places a hold at each level in the same transaction as its task reservation and is refused when any level is short; holds follow the call's settlement, and a sweep charges expired ones in full as unknown. `/v1/limits` and `/v1/budgets` endpoints (owners manage their org's users and keys, never above the org's own limit) and `agentbox limits` / `agentbox budget`; `verify-invariants` checks G1 and G2. |
+| **Usage, bills and reconciliation** | Every minute, settled budget holds are rolled up into `usage_daily` per day, org, user, key, model and source (model API / runtime), incrementally from a watermark and idempotently (servers serialise on an advisory lock). `GET /v1/usage` (grouped by day, model, key, user) and `GET /v1/bills/{month}` (per-model tokens and cost, known and unknown apart): members see their own, owners their org's, the operator everything. `agentbox bill reconcile` recomputes a month from the raw holds and model requests, compares it with `usage_daily` and `quota_budgets`, and exits 1 on any difference. The web app gains API keys, usage and members pages. |
 | **Observability** | OpenTelemetry tracing with one trace per user action: API request → task actor → attempt → worker start, handshake and checkpoints → **into the sandbox** (the W3C `traceparent` is handed to the worker over the protocol; the stdlib-only Python SDK forwards it) → every model, search, fetch and exec call and each retry at the Gateway. Prometheus metrics (outcomes, start and stop latency, upstream latency and errors, cost, tool calls, sandboxes and slots); JSON logs carry `trace_id`. Off by default; `deploy/observability` runs Collector, Tempo, Prometheus, Loki and Grafana locally ([design](docs/design/2026-10-10-observability-design.md), [demo run](docs/evidence/2026-10-10-observability.md)). |
 
 ## Evidence
@@ -139,6 +140,21 @@ The compatibility tests need no model key and no root (both SDKs × fakeupstream
 ```bash
 AGENTBOX_TEST_DATABASE_URL='postgres://agentbox:agentbox@127.0.0.1:5432/agentbox?sslmode=disable' bash scripts/sdk-compat.sh
 ```
+
+### Usage, bills and the web pages
+
+The server rolls settled budgets up into daily usage every minute; the operator can print a bill and reconcile a month from the command line (see "用量、账单与对账" in the [usage reference](docs/usage.zh-CN.md)):
+
+```bash
+sudo AGENTBOX_DATABASE_URL=... agentbox bill show 2026-10 --org acme
+sudo AGENTBOX_DATABASE_URL=... agentbox bill reconcile 2026-10   # exits 1 on a difference
+```
+
+Signed-in users get three more pages in the top bar (described in words; no screenshots):
+
+- **API keys**: a table of keys (name, scopes, created, last used, expires, status). Creating one takes "model API / runtime" checkboxes and an expiry; the full key appears exactly once, in a dialog with a copy button and a yellow warning. Revoking asks for a second click.
+- **Usage**: four number tiles (cost, of which unknown, requests, tokens), two purple bar charts side by side (daily cost, daily tokens), tables by model and by key, budget bars for the org, the user and each key (purple spent, orange unknown, light purple reserved, with remaining and limit), and this month's bill.
+- **Members**: received invites (accept, decline), your org and "leave org"; owners also get the member table (removal asks for confirmation), an invite form and pending invites.
 
 ## Repository layout
 

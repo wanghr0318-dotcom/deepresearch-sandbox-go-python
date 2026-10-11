@@ -25,6 +25,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/local"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/sandbox"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/usage"
 )
 
 // scanOnlyStarter 是只供扫描的 provider/local 的启动器：local.New 要求非空的 EnvStarter，而 Scan 不使用它。
@@ -43,6 +44,7 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	cgroupRoot := fs.String("cgroup-root", defaultCgroupRoot, "cgroup v2 挂载点")
 	quiescent := fs.Bool("quiescent", false, "另检查 Q 类（实验结束、清理完成后成立的不变量）")
 	timeout := fs.Duration("timeout", 2*time.Minute, "整体期限")
+	usageMonth := fs.String("usage-month", "", "另对账该月（YYYY-MM）的用量：从原始 hold 与模型请求重算，与 usage_daily 和 quota_budgets 比较（只读，不先汇总）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -50,7 +52,16 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agentbox verify-invariants: 需要 --data-dir 与 --database-url（或环境变量 "+databaseURLEnv+"）")
 		return 2
 	}
-	vs, notes, err := verify(*dataDir, *dsn, *cgroupRoot, *quiescent, *timeout)
+	var month time.Time
+	if *usageMonth != "" {
+		m, err := usage.ParseMonth(*usageMonth)
+		if err != nil {
+			fmt.Fprintln(stderr, "agentbox verify-invariants: --usage-month", err)
+			return 2
+		}
+		month = m
+	}
+	vs, notes, err := verify(*dataDir, *dsn, *cgroupRoot, *quiescent, *timeout, month)
 	if err != nil {
 		fmt.Fprintln(stderr, "agentbox verify-invariants:", err)
 		return 2
@@ -69,7 +80,7 @@ func runVerify(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func verify(dataDir, dsn, cgroupRoot string, quiescent bool, timeout time.Duration) ([]invariants.Violation, []string, error) {
+func verify(dataDir, dsn, cgroupRoot string, quiescent bool, timeout time.Duration, usageMonth time.Time) ([]invariants.Violation, []string, error) {
 	dir, err := filepath.Abs(dataDir)
 	if err != nil {
 		return nil, nil, err
@@ -101,5 +112,16 @@ func verify(dataDir, dsn, cgroupRoot string, quiescent bool, timeout time.Durati
 		return nil, nil, err
 	}
 	notes, err := store.QuotaOvershoots(ctx)
-	return vs, notes, err
+	if err != nil || usageMonth.IsZero() {
+		return vs, notes, err
+	}
+	// 用量对账（G5，可选）：只读，不先汇总——当月在 server 下次汇总之前可能有尚未汇总的差异。
+	rep, err := store.UsageStore().Reconcile(ctx, usageMonth, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, l := range rep.Lines() {
+		vs = append(vs, invariants.Violation{ID: "U1", Class: "对账", Detail: rep.Month + " " + l})
+	}
+	return vs, notes, nil
 }

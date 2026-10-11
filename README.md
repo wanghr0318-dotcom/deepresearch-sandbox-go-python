@@ -53,6 +53,7 @@
 | **多租户与平台 API key** | org → 用户 → key：每个用户属于一个 org（注册时建个人 org），owner 邀请成员、用户接受后才迁入，个人 org 不接受他人；平台 key `abx_live_…` 只存 HMAC（pepper 文件，指纹登记在库中，不一致时拒绝启动），可设 scope（`runtime` / `models`）、过期与吊销，以 `Authorization: Bearer` 或 `x-api-key` 调用运行时 API；校验结果缓存 30 s，吊销经 PostgreSQL `NOTIFY` 立即通知各 server；key 永远不能创建 key 或管理成员。任务与会话记录所属 org 与 key。[设计](docs/design/2026-10-11-model-gateway-design.md)。 |
 | **模型 API** | `--model-api` 打开 OpenAI `/v1/chat/completions` 与 Anthropic `/v1/messages`（含流式与工具调用）以及 `/v1/models`，以 `models` scope 的平台 key 调用，经 Gateway 的模型路由（权重、熔断、首字之前换供应商）发往 OpenAI 或 Anthropic 格式的供应商：同格式原样转发，不同格式由 `internal/llmproto` 转换。每个请求按 key、用户、org 扣 rpm、tpm 与并发流名额，按最坏费用在月度预算中放 hold、结束后按实际用量结算（用量未知时按估算全额记为 unknown），PostgreSQL 不可用时 503；降级链文件的 `routing.primary_models` 可把主供应商限制在它自己的模型上；请求与每次尝试记入按月分区的 `model_requests`；指标含首字时间、流完整性与按原因的拒绝。官方 `openai` 与 `anthropic` Python SDK 的兼容性测试在 CI 中运行。 |
 | **限额与月度预算** | org、用户、key 三级的每分钟请求数限额（Redis 中一个 Lua 脚本原子地检查所有层级；Redis 不可用或超过 50 ms 时退化为进程内桶，请求照常、指标报告退化），org 的并发沙箱上限在准入时按 PostgreSQL 中的存活环境计数；按 UTC 月的预算：沙箱的每个 Gateway 调用在预留任务预算的同一事务中于各层级放一个 hold，任一层级不足即拒绝，hold 随调用结算转换、超时由 sweep 按全额记为未知。`/v1/limits`、`/v1/budgets` 端点（owner 管理本 org 的用户与 key，不能超过 org 的上限）与 `agentbox limits` / `agentbox budget`；`verify-invariants` 核对 G1、G2。 |
+| **用量、账单与对账** | 每分钟把已结算的预算 hold 汇总为按日、org、用户、key、模型与来源（模型 API / 运行时）的 `usage_daily`（按 watermark 增量、幂等，多 server 经 advisory lock 串行）；`GET /v1/usage`（按日、模型、key、用户分组）与 `GET /v1/bills/{月}`（按模型的 token 与费用，已知与未知分开），成员只看自己、owner 看本 org、运维看全部；`agentbox bill reconcile` 从原始 hold 与模型请求重算一个月，与 `usage_daily` 和 `quota_budgets` 逐项比较，有差异时退出码 1。网页新增 API 密钥、用量与成员三页。 |
 | **可观测性** | OpenTelemetry 追踪：一次用户操作一条 trace，从 API 请求经任务 actor、attempt、Worker 启动与握手、checkpoint，**进入沙箱**（W3C `traceparent` 经协议交给 Worker，Python SDK 只用标准库转发）再回到 Gateway 的每个模型、搜索、抓取与 exec 调用及其每次重试；Prometheus 指标（结果、启动与停止延迟、上游延迟与错误、费用、工具调用、沙箱与槽位）；JSON 日志带 `trace_id`。默认关闭；`deploy/observability` 提供 Collector、Tempo、Prometheus、Loki、Grafana 本地栈（[设计](docs/design/2026-10-10-observability-design.md)、[演示记录](docs/evidence/2026-10-10-observability.md)）。 |
 
 ## 证据
@@ -140,6 +141,21 @@ anthropic.Anthropic(base_url="http://127.0.0.1:8080", api_key=KEY).messages.crea
 ```bash
 AGENTBOX_TEST_DATABASE_URL='postgres://agentbox:agentbox@127.0.0.1:5432/agentbox?sslmode=disable' bash scripts/sdk-compat.sh
 ```
+
+### 用量、账单与网页
+
+server 每分钟把已结算的预算汇总为按日用量；运维可在命令行查看账单并对账（[使用参考](docs/usage.zh-CN.md)中的"用量、账单与对账"）：
+
+```bash
+sudo AGENTBOX_DATABASE_URL=... agentbox bill show 2026-10 --org acme
+sudo AGENTBOX_DATABASE_URL=... agentbox bill reconcile 2026-10   # 有差异时退出码 1
+```
+
+登录后顶部导航多了三页（文字描述，没有截图）：
+
+- **API 密钥**：密钥表格（名称、权限范围、创建、最近使用、过期、状态）；新建时勾选"模型 API / 运行时"并选择有效期，完整密钥只在一个带复制按钮和黄色警示框的对话框中出现一次；吊销要再点一次确认。
+- **用量**：顶部四个数字卡片（费用、其中未知、请求、token），下面并排两张紫色柱状图（每日费用、每日 token），再是按模型与按密钥的表格、组织/本人/每个密钥的预算进度条（紫色已花费、橙色未知、浅紫预留中，右侧显示剩余与上限），最后是本月账单。
+- **成员**：收到的邀请（接受、拒绝）、我的组织与"离开组织"；owner 另有成员表（移出需确认）、邀请表单与待接受的邀请。
 
 ## 目录
 

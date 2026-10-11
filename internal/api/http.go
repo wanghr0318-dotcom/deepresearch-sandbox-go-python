@@ -32,6 +32,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/quota"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/ratelimit"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/tenant"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/usage"
 )
 
 // Mode 是服务的运行模式（规格 §15.1 `/status`）。
@@ -131,6 +132,9 @@ type Config struct {
 	// 模型网关 G3）。认证（平台 key 需要 models scope、运维 token、会话 cookie）与认证错误由本包以调用方的格式处理，
 	// 之后交给 ModelAPI（internal/modelapi），调用者以 tenant.FromContext 取得。nil 时这些路径与今天一样是 404。
 	ModelAPI http.Handler
+	// Usage 可选（需要 Tenancy）：GET /v1/usage 与 GET /v1/bills/{month} 的存储（模型网关 G5）；nil 时这些端点为
+	// 503 usage_unavailable。
+	Usage usage.Store
 }
 
 // KeyVerifier 校验并生成平台 API key（*apikey.Verifier 满足）。
