@@ -51,6 +51,7 @@
 | **轨迹诊断** | `agentbox doctor-traces`：读评测运行目录或运行中 server 的一个时间窗口，找出失败与慢的任务，用确定性规则归因（模型 try 挂起、熔断、供应商错误、搜索/抓取被调用期限截断、预算耗尽、exec 超时、退避、对冲浪费、沙箱启动/排队/停止慢），每条附证据（任务与调用 ID、各供应商 try 的计数与延迟分位、延迟占比；观测栈在运行时加上 Tempo 中的 trace 与按 span 汇总的耗时、Loki 中带 trace ID 的失败日志）；在白名单与上下界内提出 server flag 修改，写成补丁与一份实验配置（从不修改运行中的 server）；可选的有预算模型总结。[设计](docs/design/2026-10-10-trace-doctor-design.md)、[记录](docs/evidence/2026-10-10-trace-doctor.md)。 |
 | **产品层** | 账号（PBKDF2、`HttpOnly` 会话、登录限速）；用户隔离（他人的数据一律 404）；费用、模型与内部 ID 在服务端脱敏；CSP 与 Markdown 安全渲染。 |
 | **多租户与平台 API key** | org → 用户 → key：每个用户属于一个 org（注册时建个人 org），owner 邀请成员、用户接受后才迁入，个人 org 不接受他人；平台 key `abx_live_…` 只存 HMAC（pepper 文件，指纹登记在库中，不一致时拒绝启动），可设 scope（`runtime` / `models`）、过期与吊销，以 `Authorization: Bearer` 或 `x-api-key` 调用运行时 API；校验结果缓存 30 s，吊销经 PostgreSQL `NOTIFY` 立即通知各 server；key 永远不能创建 key 或管理成员。任务与会话记录所属 org 与 key。[设计](docs/design/2026-10-11-model-gateway-design.md)。 |
+| **模型 API** | `--model-api` 打开 OpenAI `/v1/chat/completions` 与 Anthropic `/v1/messages`（含流式与工具调用）以及 `/v1/models`，以 `models` scope 的平台 key 调用，经 Gateway 的模型路由（权重、熔断、首字之前换供应商）发往 OpenAI 或 Anthropic 格式的供应商：同格式原样转发，不同格式由 `internal/llmproto` 转换。每个请求按 key、用户、org 扣 rpm、tpm 与并发流名额，按最坏费用在月度预算中放 hold、结束后按实际用量结算（用量未知时按估算全额记为 unknown），PostgreSQL 不可用时 503；请求与每次尝试记入按月分区的 `model_requests`；指标含首字时间、流完整性与按原因的拒绝。官方 `openai` 与 `anthropic` Python SDK 的兼容性测试在 CI 中运行。 |
 | **限额与月度预算** | org、用户、key 三级的每分钟请求数限额（Redis 中一个 Lua 脚本原子地检查所有层级；Redis 不可用或超过 50 ms 时退化为进程内桶，请求照常、指标报告退化），org 的并发沙箱上限在准入时按 PostgreSQL 中的存活环境计数；按 UTC 月的预算：沙箱的每个 Gateway 调用在预留任务预算的同一事务中于各层级放一个 hold，任一层级不足即拒绝，hold 随调用结算转换、超时由 sweep 按全额记为未知。`/v1/limits`、`/v1/budgets` 端点（owner 管理本 org 的用户与 key，不能超过 org 的上限）与 `agentbox limits` / `agentbox budget`；`verify-invariants` 核对 G1、G2。 |
 | **可观测性** | OpenTelemetry 追踪：一次用户操作一条 trace，从 API 请求经任务 actor、attempt、Worker 启动与握手、checkpoint，**进入沙箱**（W3C `traceparent` 经协议交给 Worker，Python SDK 只用标准库转发）再回到 Gateway 的每个模型、搜索、抓取与 exec 调用及其每次重试；Prometheus 指标（结果、启动与停止延迟、上游延迟与错误、费用、工具调用、沙箱与槽位）；JSON 日志带 `trace_id`。默认关闭；`deploy/observability` 提供 Collector、Tempo、Prometheus、Loki、Grafana 本地栈（[设计](docs/design/2026-10-10-observability-design.md)、[演示记录](docs/evidence/2026-10-10-observability.md)）。 |
 
@@ -115,6 +116,29 @@ CI=true go test -count=1 ./internal/persistence/postgres/ ./tests/e2e/...
 [运行记录](docs/evidence/2026-10-05-m1-demo-run.md)。
 
 **运行完整助手**（沙箱、Gateway、真实模型、对话界面）需要一个模型 Key 和一个搜索 Key。逐步命令与全部 server 标志见[使用参考](docs/usage.zh-CN.md)；演示服务器所用 unit 的模板是 [`deploy/systemd/agentbox-demo.service.example`](deploy/systemd/agentbox-demo.service.example)（复制到 `/etc/systemd/system/`，并在 `/etc/agentbox/agentbox.env` 中设置 `AGENTBOX_PUBLIC_HOST`）。
+
+### 模型 API
+
+`agentbox server` 加 `--model-api` 后，用 `models` scope 的平台 key 以 OpenAI 或 Anthropic 格式调用（[使用参考](docs/usage.zh-CN.md)中的"模型 API"）：
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"kimi-k3","messages":[{"role":"user","content":"你好"}],"max_tokens":200}'
+```
+
+```python
+import anthropic, openai
+openai.OpenAI(base_url="http://127.0.0.1:8080/v1", api_key=KEY).chat.completions.create(
+    model="kimi-k3", messages=[{"role": "user", "content": "你好"}], max_tokens=200)
+anthropic.Anthropic(base_url="http://127.0.0.1:8080", api_key=KEY).messages.create(
+    model="kimi-k3", max_tokens=200, messages=[{"role": "user", "content": "你好"}])
+```
+
+不需要模型 Key 与 root 的兼容性测试（两个 SDK × fake upstream 的 OpenAI 与 Anthropic 两种格式）：
+
+```bash
+AGENTBOX_TEST_DATABASE_URL='postgres://agentbox:agentbox@127.0.0.1:5432/agentbox?sslmode=disable' bash scripts/sdk-compat.sh
+```
 
 ## 目录
 

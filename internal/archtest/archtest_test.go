@@ -37,6 +37,7 @@ func TestConsumersDoNotDependOnPostgres(t *testing.T) {
 		"internal/ownership", "internal/persistence", "internal/datadir", "internal/blob",
 		"internal/gateway/call", "internal/gateway/edge", "internal/gateway/upstream", "internal/gateway/cache",
 		"internal/gateway/workspace", "internal/gateway/mcp", "internal/tenant", "internal/apikey", "internal/quota", "internal/ratelimit",
+		"internal/modelapi",
 	} {
 		forbid(t, pkg, forbidden)
 	}

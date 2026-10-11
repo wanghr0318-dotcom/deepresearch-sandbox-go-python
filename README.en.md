@@ -51,6 +51,7 @@ Browser (Vue 3) / CLI ── REST + SSE ──► Go control plane
 | **Trace doctor** | `agentbox doctor-traces` reads an eval run directory or a time window of a running server, finds failed and slow tasks, and attributes them to root causes with deterministic rules (hung model tries, open breakers, provider errors, search/fetch calls cut by the call deadline, budget exhaustion, exec timeouts, backoff, hedge waste, slow sandbox start / queueing / stops), each with evidence (task and call ids, per-provider try counts and latency percentiles, latency shares; with the observability stack also the Tempo trace and per-span time, and failed-try log lines with trace ids from Loki). It proposes changes to an allowlist of server flags with bounds as a patch and an experiment config — it never touches a running server; an optional budgeted model writes a summary. [Design](docs/design/2026-10-10-trace-doctor-design.md), [record](docs/evidence/2026-10-10-trace-doctor.md). |
 | **Product** | Accounts (PBKDF2, `HttpOnly` sessions, rate-limited login), per-user isolation (other users' data always returns 404), server-side redaction of costs, models and internal IDs, a CSP and sanitized Markdown rendering. |
 | **Tenancy and platform API keys** | Org → user → key: every user belongs to one org (a personal org at sign-up) whose owners invite members; a user moves only by accepting, and personal orgs take no one else. Platform keys `abx_live_…` are stored only as an HMAC under a pepper file (its fingerprint is recorded in the database and a mismatch refuses to start), carry scopes (`runtime` / `models`), expiry and revocation, and call the runtime API as `Authorization: Bearer` or `x-api-key`. Verified keys are cached for 30 s; revocation reaches every server at once through PostgreSQL `NOTIFY`. A key can never mint keys or manage members. Tasks and sessions record their org and key. [Design](docs/design/2026-10-11-model-gateway-design.md). |
+| **Model API** | `--model-api` serves OpenAI `/v1/chat/completions` and Anthropic `/v1/messages` (streaming and tool calls) and `/v1/models` to platform keys with the `models` scope, through the Gateway's model routes (weights, breakers, failover before the first byte) to OpenAI- or Anthropic-format providers: same format is passed through, the other is converted by `internal/llmproto`. Each request takes rpm, tpm and a stream slot at the key, user and org level, reserves its worst-case cost as a hold in the monthly budgets and settles the actual cost afterwards (unknown usage is charged in full as unknown); PostgreSQL down means 503. Requests and every try are recorded in `model_requests` (partitioned by month); metrics include time to first token, stream completeness and rejections by reason. Compatibility tests with the official `openai` and `anthropic` Python SDKs run in CI. |
 | **Limits and monthly budgets** | Requests-per-minute limits at the org, user and key level (one Redis Lua script checks every level atomically; when Redis fails or takes over 50 ms the limiter falls back to in-process buckets, requests keep working and a metric reports the degradation); an org's concurrent sandboxes are counted in PostgreSQL at admission. Budgets per UTC month: every Gateway call of a sandbox places a hold at each level in the same transaction as its task reservation and is refused when any level is short; holds follow the call's settlement, and a sweep charges expired ones in full as unknown. `/v1/limits` and `/v1/budgets` endpoints (owners manage their org's users and keys, never above the org's own limit) and `agentbox limits` / `agentbox budget`; `verify-invariants` checks G1 and G2. |
 | **Observability** | OpenTelemetry tracing with one trace per user action: API request → task actor → attempt → worker start, handshake and checkpoints → **into the sandbox** (the W3C `traceparent` is handed to the worker over the protocol; the stdlib-only Python SDK forwards it) → every model, search, fetch and exec call and each retry at the Gateway. Prometheus metrics (outcomes, start and stop latency, upstream latency and errors, cost, tool calls, sandboxes and slots); JSON logs carry `trace_id`. Off by default; `deploy/observability` runs Collector, Tempo, Prometheus, Loki and Grafana locally ([design](docs/design/2026-10-10-observability-design.md), [demo run](docs/evidence/2026-10-10-observability.md)). |
 
@@ -115,6 +116,28 @@ CI=true go test -count=1 ./internal/persistence/postgres/ ./tests/e2e/...
 [Recorded output](docs/evidence/2026-10-05-m1-demo-run.md).
 
 **Running the full assistant** (sandbox, Gateway, real models, chat UI) takes a model key and a search key. Step-by-step commands and every server flag are in the [usage reference](docs/usage.zh-CN.md). [`deploy/systemd/agentbox-demo.service.example`](deploy/systemd/agentbox-demo.service.example) is a template of the unit the demo server runs (copy it to `/etc/systemd/system/` and set `AGENTBOX_PUBLIC_HOST` in `/etc/agentbox/agentbox.env`).
+
+### Model API
+
+Start `agentbox server` with `--model-api` and call it in OpenAI or Anthropic format with a platform key that has the `models` scope (see "模型 API" in the [usage reference](docs/usage.zh-CN.md)):
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json'   -d '{"model":"kimi-k3","messages":[{"role":"user","content":"hello"}],"max_tokens":200}'
+```
+
+```python
+import anthropic, openai
+openai.OpenAI(base_url="http://127.0.0.1:8080/v1", api_key=KEY).chat.completions.create(
+    model="kimi-k3", messages=[{"role": "user", "content": "hello"}], max_tokens=200)
+anthropic.Anthropic(base_url="http://127.0.0.1:8080", api_key=KEY).messages.create(
+    model="kimi-k3", max_tokens=200, messages=[{"role": "user", "content": "hello"}])
+```
+
+The compatibility tests need no model key and no root (both SDKs × fakeupstream in OpenAI and in Anthropic mode):
+
+```bash
+AGENTBOX_TEST_DATABASE_URL='postgres://agentbox:agentbox@127.0.0.1:5432/agentbox?sslmode=disable' bash scripts/sdk-compat.sh
+```
 
 ## Repository layout
 

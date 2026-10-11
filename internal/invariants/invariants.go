@@ -9,7 +9,8 @@
 // I13——completed 的 sub-run 出现在已提交 checkpoint 中且 result_ref 一致、sub-run 终态不回退、各 sub-run 账本之和每桶
 // 不超过 task 账本、终态任务没有未终态的 sub-run；模型网关 G1：G4——未吊销 API key 的 org 等于其用户的 org，G5——带 key_id
 // 的任务与会话属于该 key 的 org；G2：G1——每个月度预算行的 reserved / spent / unknown 等于其 hold 之和，G2——有上限的层级
-// 已用不超过上限，hold 结算超出预留造成的超出单独报告而不算违反）。
+// 已用不超过上限，hold 结算超出预留造成的超出单独报告而不算违反；G3：G3——每个 model_requests 行恰好对应一个 hold，且该 hold
+// 已不是 held）。
 //
 // 资源类检查独立扫描实际资源（provider.Scan、UID 范围文件属主）与 BlobStore 内容，不只从数据库推导。每条违反带类别：
 // [A] 始终成立、[B] 期限内成立、[Q] 静止时成立；Q 类只在 quiescent 为真时检查。
