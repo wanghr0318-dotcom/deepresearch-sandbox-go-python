@@ -201,7 +201,9 @@ func (m *metrics) ModelStream(protocol string, complete bool) {
 	m.modelStreams.WithLabelValues(protocol, strconv.FormatBool(complete)).Inc()
 }
 
-func (m *metrics) ModelRejected(protocol, reason string) { m.modelRejects.WithLabelValues(protocol, reason).Inc() }
+func (m *metrics) ModelRejected(protocol, reason string) {
+	m.modelRejects.WithLabelValues(protocol, reason).Inc()
+}
 
 func (m *metrics) ModelDropped(field string) { m.modelDrops.WithLabelValues(field).Inc() }
 

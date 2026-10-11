@@ -708,10 +708,10 @@ type server struct {
 	calls     *call.Coordinator // Gateway 的记账与 journal 所有者
 	// modelRoutes 是模型 API（--model-api）的路由视图，Gateway 装配后设置。
 	modelRoutes modelRoutes
-	edge      *edge.Edge        // Gateway 的每 attempt 入口（task.Access）
-	blobs     blob.Store        // runner、Gateway 与 API 产物下载共用的 BlobStore
-	sessions  *sessionRuntime   // 会话：session Scheduler（启动执行时建立）与会话 turn 的执行
-	sessDeps  session.Deps      // session actor 的依赖（启用会话时）
+	edge        *edge.Edge      // Gateway 的每 attempt 入口（task.Access）
+	blobs       blob.Store      // runner、Gateway 与 API 产物下载共用的 BlobStore
+	sessions    *sessionRuntime // 会话：session Scheduler（启动执行时建立）与会话 turn 的执行
+	sessDeps    session.Deps    // session actor 的依赖（启用会话时）
 
 	execGate   *admission.ExecGate // exec slots（启用 exec 时；nil 表示关闭）
 	execDigest string              // exec 模板摘要（指纹的 image_digest）

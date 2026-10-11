@@ -18,7 +18,9 @@ type modelRequestStorer interface {
 
 // modelRoutes 是模型 API 使用的 Gateway 模型路由：Gateway 装配完成后设置一次（API 可能先于执行以诊断模式启动，
 // 此前模型 API 回答 503）。
-type modelRoutes struct{ p atomic.Pointer[call.ModelRouting] }
+type modelRoutes struct {
+	p atomic.Pointer[call.ModelRouting]
+}
 
 func (m *modelRoutes) get() *call.ModelRouting { return m.p.Load() }
 

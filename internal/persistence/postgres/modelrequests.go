@@ -28,7 +28,9 @@ type ModelRequestStore struct {
 }
 
 // ModelRequests 以 modelapi.Store 接口返回模型请求记录用例（装配以接口持有，不导入本包）。
-func (s *Store) ModelRequests() modelapi.Store { return &ModelRequestStore{s: s, parts: map[string]bool{}} }
+func (s *Store) ModelRequests() modelapi.Store {
+	return &ModelRequestStore{s: s, parts: map[string]bool{}}
+}
 
 // RecordModelRequest 实现 modelapi.Store：同一 ID 重复写入为空操作（提交结果未知时重跑）。OrgID 为 0（运维）时取保留
 // org operator。
