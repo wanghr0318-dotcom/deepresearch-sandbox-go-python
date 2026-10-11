@@ -350,8 +350,25 @@ curl -sN http://127.0.0.1:8080/v1/messages -H "x-api-key: $KEY" -H 'anthropic-ve
 - 原样转发时回复中的 `model` 是供应商的模型名（例如 `kimi-k3`、`claude-x`），不改写为逻辑模型名；转换时为逻辑模型名或供应商在 message_start 中给出的名字。
 - 原样转发的流中，供应商在内容之后发出的错误事件按原文转发给客户端（同一格式，可能含供应商的错误消息）；其余错误一律由 Gateway 生成，不回显供应商的错误正文。
 - 非流式请求由供应商的流组装：同格式时回复也经过重新编码（不是逐字节转发），`logprobs` 只支持流式请求；`n` 只能为 1。
-- 输入 token 按字节数估算（÷ 3），只用于限流与预留，结算按供应商报告的实际用量。
+- 输入 token 按字节数估算（÷ 2 + 1024），只用于限流与预留，结算按供应商报告的实际用量。
 - 在 hold 之前就被拒绝的请求（认证、限流、预算）不写 `model_requests`，只计入指标。
+- 每个请求在预留与结算时各锁一次 org 的月度预算行：同一个 org 的吞吐受这把锁限制（负载测试中单个 org 的吞吐只有分散到 16 个 org 时的一小部分，见 [证据](evidence/2026-10-12-model-gateway.md)）。分片计数与预分配预算片是后续工作。
+- Anthropic 请求的内容块只接受 Anthropic API 文档中的字段：把 SDK 回复对象 `model_dump()` 之后原样放回（新版 SDK 会带 `caller: null` 等字段）得到 `400 unsupported field`；按文档直接放回 `response.content` 可以。
+
+#### 演示、负载测试与故障注入（本机，零模型费用，不需要 root）
+
+三个脚本共用 `scripts/lib/gateway.sh`：以 docker 中的 PostgreSQL（新建自己的库）、`tests/e2e/fakeupstream` 作为 OpenAI 与 Anthropic 格式的供应商、带 `--model-api` 的 `agentbox server`（`--exec-slots 0`，不运行沙箱）。工作目录默认 `/tmp/agentbox-<名字>`（须在 Linux 文件系统上：数据目录的 `api.token` 须为 0600），二进制默认构建到 `bin/`。
+
+```bash
+bash scripts/demo-gateway.sh        # 多租户、两个 SDK 的四条路径（流式、工具调用）、加权路由、429 限流与预算、吊销 401、对账、指标（约 1 分钟）
+bash scripts/fault-gateway.sh       # kill -9 中途崩溃（约 6 分钟，等 hold 期限）、首字节后供应商失败、流中吊销 key、熔断与恢复
+bash scripts/loadtest-gateway.sh    # 网关开销、最大 RPS、限流精度、并发预算超支、org 预算行锁等待、运行中停止 Redis
+AGENTBOX_LT_REPEAT=3 bash scripts/loadtest-gateway.sh latency ladder budget lockwait   # 重复关键场景
+```
+
+- `demo-gateway.sh` 需要 uv（按 `tests/sdk` 的锁文件安装官方 `openai` 与 `anthropic` SDK）；WSL2 中可用 Windows 的 uv：`AGENTBOX_DEMO_UV=/mnt/c/.../uv.exe`。
+- `loadtest-gateway.sh` 另启动一个专用 Redis 容器 `agentbox-loadtest-redis`（127.0.0.1:6390，结束时删除），`redis` 场景停止并重新启动的是它。结果写入工作目录的 `results.jsonl`（每次运行一行 JSON）与 `summary.md`。负载工具也可单独使用：`go run ./cmd/agentbox-loadtest <latency|ladder|ratelimit|budget|steady|lockwait> -h`。
+- 测量方法、数字与它们不能证明什么见 [docs/evidence/2026-10-12-model-gateway.md](evidence/2026-10-12-model-gateway.md)。Grafana 仪表盘 "Agentbox model gateway"（`deploy/observability/grafana/dashboards/agentbox-model-gateway.json`）随观测栈加载。
 
 ### 代码执行沙箱
 
