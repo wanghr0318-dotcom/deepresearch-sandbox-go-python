@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 )
 
-// --- encoding ---
+// OpenAI request encoding and response decoding/encoding; request decoding is in openai_request.go.
 
 type openAIRequestOut struct {
 	Model             string             `json:"model,omitempty"`

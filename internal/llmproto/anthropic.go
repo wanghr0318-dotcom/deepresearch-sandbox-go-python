@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// --- encoding ---
+// Anthropic request encoding and response decoding/encoding; request decoding is in anthropic_request.go.
 
 type anthropicRequestOut struct {
 	Model         string                `json:"model,omitempty"`
