@@ -50,6 +50,7 @@ type Store struct {
 	pool  *pgxpool.Pool
 	opt   Options
 	hooks hooks
+	qc    *quotaCache // 已确认存在的本月预算行与任务的计费主体（模型网关 G2，复审 F6）
 }
 
 // hooks 只供本包测试注入故障，生产代码中恒为零值。
@@ -75,7 +76,7 @@ func Open(ctx context.Context, opt Options) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("postgres: 连接池: %w", err)
 	}
-	return &Store{pool: pool, opt: opt}, nil
+	return &Store{pool: pool, opt: opt, qc: newQuotaCache()}, nil
 }
 
 // Close 关闭连接池。

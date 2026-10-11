@@ -94,7 +94,7 @@ var accountRoutes = []route{
 	{"POST", "/auth/login", accessWrite, audienceAnyone, []int{200, 400, 401, 403, 429, 500, 503}, (*Handler).login},
 	{"POST", "/auth/logout", accessWrite, audienceCookie, []int{204, 401, 403, 500, 503}, (*Handler).logout},
 	{"GET", "/auth/me", accessRead, audienceUser, []int{200, 401, 403, 500, 503}, (*Handler).me},
-	{"POST", "/research", accessWrite, audienceUser, []int{202, 400, 401, 403, 409, 500, 503}, (*Handler).createResearch},
+	{"POST", "/research", accessWrite, audienceUser, []int{202, 400, 401, 403, 409, 429, 500, 503}, (*Handler).createResearch},
 }
 
 // allRoutes 是全部可能注册的操作（openapi.yaml 描述的全集）。

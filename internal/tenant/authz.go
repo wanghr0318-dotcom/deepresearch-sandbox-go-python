@@ -69,3 +69,22 @@ func CanSeeInvite(p Principal, inv Invite) bool {
 
 // CanCreateOrg reports whether the caller may create orgs: the operator only.
 func CanCreateOrg(p Principal) bool { return CanManage(p) && p.Operator }
+
+// CanReadLimits reports whether the caller may read the limits and budgets of a level that belongs to targetOrg
+// (the org itself, or one of its users or keys): the org's owners and the operator (design §8).
+func CanReadLimits(p Principal, targetOrg int64) bool {
+	return CanManage(p) && (p.Operator || (p.Role == Owner && p.OrgID == targetOrg))
+}
+
+// CanWriteLimits reports whether the caller may set the limits and budgets of a level in targetOrg: the operator for
+// every level; owners for the users and keys of their org but not for the org itself (an owner cannot raise the
+// org's own limit).
+func CanWriteLimits(p Principal, orgLevel bool, targetOrg int64) bool {
+	switch {
+	case !CanManage(p):
+		return false
+	case p.Operator:
+		return true
+	}
+	return !orgLevel && p.Role == Owner && p.OrgID == targetOrg
+}

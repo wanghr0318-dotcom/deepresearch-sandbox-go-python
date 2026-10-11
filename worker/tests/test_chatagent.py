@@ -2419,3 +2419,19 @@ def test_stop_summary_past_deadline_writes_fallback_card_and_resume_does_not_div
     assert code3 == 0, errors(events3)
     assert not gw.rejections
     assert result(events3)["outputs"] == ["report"]
+
+
+def test_monthly_quota_exhausted_names_the_level():
+    """月度配额用尽（402 insufficient_quota）：处理同费用预算耗尽，说明指明本月配额与层级。"""
+
+    def inject(c: Any) -> Exception | None:
+        if c.kind == "chat" and c.subrun is None:
+            return BudgetExhausted(402, "insufficient_quota", "本月配额已用尽（org）")
+        return None
+
+    code, events, _, _ = par_run(par_model(), inject=inject)
+    errors = of_type(events, "error")
+    assert errors, events
+    err = errors[-1]
+    assert err["code"] == "budget_exhausted"
+    assert "本月配额已用尽（org）" in err["message"]

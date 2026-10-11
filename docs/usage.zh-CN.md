@@ -232,6 +232,39 @@ curl -s -H "x-api-key: $KEY" -H 'Content-Type: application/json' \
 
 `agentbox verify-invariants` 另核对 G4（每个未吊销 key 的 org 等于其用户的 org）与 G5（带 key 的任务与会话属于该 key 的 org）。
 
+### 限额与月度预算（org、用户、key）
+
+启用账号（多租户）时，每个 org、用户与 key 都可以设**限额**与**月度预算**；一次请求必须同时通过它存在的每个层级。值为 null（或 CLI 的 `none`）表示该层级不限，默认全部不限。
+
+- **限额**（`limits` 表）：`rpm`（每分钟请求数）、`tpm`（每分钟 token 数，留给模型 API）、`max_sandboxes`（org 的并发沙箱数）、`max_streams`（并发模型流，留给模型 API）。目前生效的是：
+  - `rpm`：作用于运行时 API 中新建 turn 或启动沙箱的端点 `POST /sessions`、`POST /research`、`POST /sessions/{id}/messages`、`POST /sessions/{id}/wake`、`POST /turns/{id}/restore`、`/continue`、`/finish`、`/answer`，对 API key 与登录用户按 key、用户、org 三级的令牌桶同时扣减（任一级不足则都不扣），运维 token 不受限。超出时返回 `429 rate_limit_exceeded`（错误体仍为 `{code, message}`），带 `Retry-After`（秒）与 `x-ratelimit-limit-requests`、`x-ratelimit-remaining-requests`、`x-ratelimit-reset-requests`。配置了 `--redis-addr` 时桶在 Redis 中（一个 Lua 脚本原子地检查全部层级），各 server 共享；Redis 出错或超过 50 ms 时退化为每个 server 各自的进程内桶，请求不受影响，指标 `agentbox_ratelimit_degraded` 为 1，5 s 后再试 Redis（本地连接池暂时占满不算 Redis 故障）。
+  - `max_sandboxes`（只能设在 org 层级，用户与 key 层级为 `400 unsupported_limit`）：任务申请运行槽位时检查。没有上限的 org 不做任何计数；有上限时按 PostgreSQL 中该 org 存活的任务与会话环境（加上本 server 已准入、尚未建出环境的任务）计数，达到上限的任务按 org 严格先来先到排队（保持 `queued`，指标 `agentbox_org_sandbox_waiting`），本 server 有沙箱归还时立即唤醒队首。已有存活环境的会话 turn 不新增沙箱，不受影响。
+- **月度预算**（`quota_budgets`，按 UTC 月）：沙箱经 Gateway 发出的每个模型、搜索、抓取（以及 MCP）调用，在预留任务预算的同一事务中，于任务所属 org、用户与 key 各层级放一个 hold（`quota_holds`）；任一层级不足时调用被拒绝（`402 insufficient_quota`，Worker 按预算耗尽处理），任务预算照常生效且优先判定。hold 随调用的结算同步转换：成功按实际费用计入 spent，可重试/致命失败释放，结果未知按预留全额计入 unknown（重启时的账本转换同样处理）。结算失败（例如对冲中另一条腿的结算出错）而仍为 held 的预留，在调用期限过去 2 分钟后由每分钟一次的任务按重启时账本转换的同一路径转为 unknown（在途的 try 不受影响）。月度预算不足时 Worker 收到的说明是"本月配额已用尽（org/user/key）"。用户层级按 (org, 用户) 记：用户换到另一个 org 后在新 org 中是全新的用户层级，原 org 的行与花费留在原 org。没有配置预算时只多写这些 hold 行。设置的上限从当月起生效，之后的月份沿用；上限不能低于当月已用（含预留）。
+
+**HTTP 端点**：`GET/PUT /v1/limits/{kind}/{id}` 与 `GET/PUT /v1/budgets/{kind}/{id}`，`kind` 为 `org`、`user`、`key`，`id` 分别为 org 名称、用户名、key ID；`GET /v1/budgets/...` 可带 `?period=YYYY-MM`。org 的 owner 可读本 org、读写本 org 的用户与 key（不能超过 org 自己的上限，否则 `400 exceeds_org_limit`）；org 层级只有运维能改；成员不能管理（`403 forbidden`），API key 永远不能（`403 permission_denied`），其他 org 的对象为 404。
+
+```bash
+# 运维：给 org acme 设 rpm 与并发沙箱数、月度预算 50 美元
+curl -s -X PUT -H "Authorization: Bearer $(cat <data>/api.token)" -H 'Content-Type: application/json' \
+  -d '{"rpm":60,"max_sandboxes":4}' http://127.0.0.1:8080/v1/limits/org/acme
+curl -s -X PUT -H "Authorization: Bearer $(cat <data>/api.token)" -H 'Content-Type: application/json' \
+  -d '{"limit_micro":50000000}' http://127.0.0.1:8080/v1/budgets/org/acme
+curl -s -H "Authorization: Bearer $(cat <data>/api.token)" http://127.0.0.1:8080/v1/budgets/org/acme
+```
+
+**运维 CLI**（直接连接数据库；`limits set` 只改给出的字段，`none` 清除该字段）：
+
+```bash
+sudo AGENTBOX_DATABASE_URL=... agentbox limits set org acme --rpm 60 --max-sandboxes 4
+sudo AGENTBOX_DATABASE_URL=... agentbox limits set key <key id> --rpm 10
+sudo AGENTBOX_DATABASE_URL=... agentbox limits show user bob
+sudo AGENTBOX_DATABASE_URL=... agentbox budget set org acme --usd 50
+sudo AGENTBOX_DATABASE_URL=... agentbox budget set user bob --limit-micro none
+sudo AGENTBOX_DATABASE_URL=... agentbox budget show org acme --period 2026-10
+```
+
+`agentbox verify-invariants` 另核对 G1（每个预算行的 reserved / spent / unknown 等于其 hold 之和）与 G2（有上限的层级已用不超过上限）；hold 以高于预留的实际费用结算造成的超出单独列为 `G2 [超额，非违反]`，不算违反。
+
 ### 代码执行沙箱
 
 编排 Worker 经 Gateway 的 `POST /v1/exec` 请求运行一段 Python（SDK：`ctx.gateway.exec(step_id, code, inputs=[(sha256, path)], wall_ms=...)`；对话 Agent 以工具 `run_python` 调用它）。server 为**每次**调用新建一个 exec 环境，运行 `python3 -I -B /in/.agentbox/main.py`（cwd `/out`），收集 `/out` 后销毁环境。

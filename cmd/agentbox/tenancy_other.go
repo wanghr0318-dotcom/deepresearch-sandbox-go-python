@@ -18,3 +18,13 @@ func runKey(_ []string, _, stderr io.Writer) int {
 	fmt.Fprintln(stderr, "agentbox key 仅在 Linux 上可用")
 	return 1
 }
+
+func runLimits(_ []string, _, stderr io.Writer) int {
+	fmt.Fprintln(stderr, "agentbox limits 仅在 Linux 上可用")
+	return 1
+}
+
+func runBudget(_ []string, _, stderr io.Writer) int {
+	fmt.Fprintln(stderr, "agentbox budget 仅在 Linux 上可用")
+	return 1
+}

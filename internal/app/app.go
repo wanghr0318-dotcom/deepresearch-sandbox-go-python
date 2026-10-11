@@ -43,6 +43,8 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/ownership"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/quota"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/ratelimit"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/reconcile"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/recovery"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/resource"
@@ -704,6 +706,10 @@ type server struct {
 
 	cache *cache.Source // Gateway 的共享缓存；nil 表示关闭
 	redis *cache.Redis
+	// 模型网关 G2（启用账号时）：限流器的 Redis 连接（配置了 --redis-addr 时）与 org 并发沙箱闸门。
+	limiterRedis *cache.Redis
+	sandboxGate  *sandboxGate
+	inflight     *inflightTries // 本进程在途的 Gateway try（复审 F7；启用账号时）
 
 	workspaces *workspace.Manager // --workspace-tools；nil 表示关闭
 	mcpHub     *mcp.Hub           // --mcp-config；nil 表示关闭
@@ -858,9 +864,20 @@ func (s *server) assemble() error {
 			},
 		}
 	}
+	// 模型网关 G2：启用账号（多租户）时，org 的并发沙箱上限在准入时检查。
+	if sb, ok := s.store.(orgSandboxer); ok && s.cfg.Accounts {
+		s.sandboxGate = newSandboxGate(sb, s.log)
+		if obs.Metrics() {
+			g := s.sandboxGate
+			obs.M().RegisterGauges(func() []obs.Gauge {
+				return []obs.Gauge{{Name: "org_sandbox_waiting", Help: "Tasks waiting for their org's max_sandboxes (queued, FIFO per org).",
+					Value: float64(g.Waiting())}}
+			})
+		}
+	}
 	s.taskDeps = task.Deps{
 		Store:     s.store,
-		Admission: admissionAdapter{a: s.adm, cfg: s.cfg},
+		Admission: admissionAdapter{a: s.adm, cfg: s.cfg, gate: s.sandboxGate},
 		Env:       envAdapter{c: s.coord, cfg: s.cfg, dataDir: s.d.DataDir},
 		Runner:    runnerAdapter{r: run, cfg: s.cfg, dataDir: s.d.DataDir, sess: s.sessions, subruns: subruns},
 		Access:    access,
@@ -911,7 +928,12 @@ func (s *server) assembleGateway(blobs blob.Store) error {
 	} else if ad != nil {
 		adapters = append(adapters, ad)
 	}
-	cfg := call.Config{Store: s.store, Adapters: adapters, Pricing: pricing, ChatPricing: chatPricing,
+	var callStore call.Store = s.store
+	if s.cfg.Accounts { // 复审 F7：登记在途 try，结算失败而仍为 held 的预留由周期任务转换
+		s.inflight = newInflightTries()
+		callStore = trackingCallStore{Store: s.store, t: s.inflight}
+	}
+	cfg := call.Config{Store: callStore, Adapters: adapters, Pricing: pricing, ChatPricing: chatPricing,
 		Blobs: blobs, Events: hostEvents{s: s.store}, Limits: s.cfg.Gateway, Logger: s.log, Routing: s.cfg.Model.Routing}
 	if n := len(s.cfg.Model.Fallbacks); n > 0 {
 		names := []string{PrimaryRoute}
@@ -1378,6 +1400,8 @@ func (s *server) startAPI() error {
 	var accounts api.Accounts // 未启用时保持 nil 接口（api 以 nil 判定）
 	var tenancy tenant.Store
 	var keys api.KeyVerifier
+	var quotas quota.Store
+	var limiter ratelimit.Limiter
 	if s.cfg.Accounts {
 		accounts = notifyingAccounts{Accounts: s.store, n: store}
 		// 平台 API key（G1）：pepper 已在迁移之后核对（EnsurePepper）。
@@ -1388,6 +1412,22 @@ func (s *server) startAPI() error {
 			v.Watch(s.apiCtx, s.store.APIKeys(), s.log) // 关闭 API 时 apiCtx 取消
 		}()
 		tenancy, keys = s.store.Tenancy(), v
+		if qs, ok := s.store.(quotaStorer); ok { // 模型网关 G2：限额与预算端点、运行时 API 限流、hold sweep
+			q := qs.Quota()
+			quotas, limiter = q, s.newRateLimiter()
+			s.bg.Add(1)
+			go func() {
+				defer s.bg.Done()
+				s.sweepQuota(s.apiCtx, q)
+			}()
+			if st, ok := s.store.(staleLedgerStore); ok && s.inflight != nil {
+				s.bg.Add(1)
+				go func() {
+					defer s.bg.Done()
+					s.convertStaleLedger(s.apiCtx, st)
+				}()
+			}
+		}
 	}
 	var sessions api.Sessions // 未启用会话时保持 nil 接口：会话端点 503 sessions_unavailable
 	if s.cfg.sessionsEnabled() {
@@ -1401,7 +1441,7 @@ func (s *server) startAPI() error {
 		EffectiveLimits: s.cfg.effectiveLimits, CacheMetrics: s.cacheMetrics,
 		Accounts: accounts, ResearchSpec: s.cfg.researchSpec, SecureCookies: tlsCfg != nil,
 		Sessions: sessions, TurnSpec: s.cfg.turnSpec, ServerInfo: s.serverInfo,
-		Tenancy: tenancy, APIKeys: keys,
+		Tenancy: tenancy, APIKeys: keys, Quota: quotas, RateLimiter: limiter,
 	})
 	if err != nil {
 		_ = ln.Close()
@@ -1477,6 +1517,11 @@ func (s *server) shutdown(reason error) error {
 		waitOrTimeout(ctx, s.cache.Close, func() { s.log.Error("等待缓存异步写入超时") })
 		if err := s.redis.Close(); err != nil {
 			s.log.Error("关闭 Redis 连接失败", "error", err.Error())
+		}
+	}
+	if s.limiterRedis != nil {
+		if err := s.limiterRedis.Close(); err != nil {
+			s.log.Error("关闭限流器的 Redis 连接失败", "error", err.Error())
 		}
 	}
 	return reason

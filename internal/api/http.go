@@ -28,6 +28,8 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/quota"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/ratelimit"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/tenant"
 )
 
@@ -119,6 +121,11 @@ type Config struct {
 	// abx_ 开头的 Bearer 与今天一样按运维 token 判定。
 	Tenancy tenant.Store
 	APIKeys KeyVerifier
+	// Quota 可选（需要 Tenancy）：/v1/limits 与 /v1/budgets 的存储；nil 时这些端点为 503 quota_unavailable。
+	// RateLimiter 与 Quota 都非 nil 时，运行时创建端点（POST /sessions、/research、/sessions/{id}/messages）对 API key 与
+	// cookie 调用者按 key、user、org 的 rpm 限额限流（模型网关 G2）。
+	Quota       quota.Store
+	RateLimiter ratelimit.Limiter
 }
 
 // KeyVerifier 校验并生成平台 API key（*apikey.Verifier 满足）。
@@ -264,6 +271,9 @@ func New(cfg Config) (*Handler, error) {
 	if cfg.Tenancy != nil && apikey.LooksLikeKey(cfg.Token) {
 		return nil, errors.New("api: 启用多租户时运维 token 不能以 abx_ 开头（该前缀保留给平台 API key）")
 	}
+	if (cfg.Quota != nil || cfg.RateLimiter != nil) && cfg.Tenancy == nil {
+		return nil, errors.New("api: 限额与预算（Quota、RateLimiter）需要多租户（Tenancy）")
+	}
 	active := routes
 	if cfg.Accounts != nil {
 		if cfg.ResearchSpec == nil {
@@ -280,6 +290,7 @@ func New(cfg Config) (*Handler, error) {
 	for _, rt := range active {
 		seg, _, _ := strings.Cut(strings.TrimPrefix(rt.path, "/"), "/")
 		h.prefixes[seg] = true
+		limited := cfg.Accounts != nil && cfg.Quota != nil && cfg.RateLimiter != nil && rateLimitedRoutes[rt.method+" "+rt.path]
 		h.mux.HandleFunc(rt.method+" "+rt.path, func(w http.ResponseWriter, r *http.Request) {
 			setRoute(r, rt.path)
 			if h.cfg.Accounts != nil {
@@ -293,6 +304,9 @@ func New(cfg Config) (*Handler, error) {
 				return
 			}
 			if h.cfg.Accounts != nil && rt.audience == audienceTask && !h.ownsTask(w, r) {
+				return
+			}
+			if limited && !h.rateLimit(w, r) {
 				return
 			}
 			rt.handle(h, w, r)

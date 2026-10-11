@@ -164,8 +164,9 @@ func (c Config) envLimits(l taskLimits) provider.Limits {
 // ---- admission.Grant ↔ task.SlotGrant ----
 
 type admissionAdapter struct {
-	a   *admission.Admission
-	cfg Config
+	a    *admission.Admission
+	cfg  Config
+	gate *sandboxGate // org 的并发沙箱上限（模型网关 G2，启用账号时）；nil 表示不检查
 }
 
 var _ task.Admission = admissionAdapter{}
@@ -179,14 +180,25 @@ func (x admissionAdapter) Acquire(ctx context.Context, r task.SlotRequest) (task
 	if r.SessionID != "" { // 会话 turn 只占 run slot：incarnation 的内存由 session actor 以 MemoryOnly 授予持有
 		mem = 0
 	}
+	if x.gate != nil {
+		if err := x.gate.admit(ctx, r.TaskID); err != nil {
+			return task.SlotGrant{}, err
+		}
+	}
 	g, err := x.a.Acquire(ctx, admission.Request{TaskID: r.TaskID, MemoryBytes: mem})
 	if err != nil {
+		if x.gate != nil {
+			x.gate.release(r.TaskID)
+		}
 		return task.SlotGrant{}, err
 	}
 	return task.SlotGrant{ID: g.ID, TaskID: g.TaskID, MemoryBytes: g.MemoryBytes}, nil
 }
 
 func (x admissionAdapter) Release(g task.SlotGrant) {
+	if x.gate != nil {
+		x.gate.release(g.TaskID)
+	}
 	x.a.Release(admission.Grant{ID: g.ID, TaskID: g.TaskID, MemoryBytes: g.MemoryBytes})
 }
 
