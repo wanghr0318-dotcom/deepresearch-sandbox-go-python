@@ -15,6 +15,7 @@ import (
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/breaker"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/llmproto"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 )
 
@@ -26,6 +27,8 @@ const (
 	SkipCircuitOpen    = "circuit_open"
 	SkipTried          = "tried"
 	SkipModelNotServed = "model_not_served"
+	// SkipProtocol：请求用了只有 OpenAI 格式才有的字段，不能转到该（Anthropic 格式的）路由。
+	SkipProtocol = "unsupported_protocol"
 )
 
 // RoutingConfig 配置模型降级链。零值字段取默认值；只对多路由的 adapter 生效。
@@ -37,6 +40,11 @@ type RoutingConfig struct {
 	TryTimeout time.Duration
 	// HedgeDelay > 0 时启用对冲：try 发出后这么久仍未结束、且另有就绪路由时，向它并发发出同一请求（hedge.go）。
 	HedgeDelay time.Duration
+	// Mode 是路由模式（balance.go）：空时没有权重为 ordered（与引入路由模式之前相同），有权重为 weighted。
+	// 零值不进入 JSON（配置摘要与之前相同）。
+	Mode RoutingMode `json:",omitempty"`
+	// Weights 是路由名 → 权重（≥ 1；缺省 1），用于 weighted 与 latency 模式。
+	Weights map[string]int `json:",omitempty"`
 
 	// breakerNow 是熔断器的时钟（测试注入；nil 时用 Coordinator 的时钟）。
 	breakerNow func() time.Time
@@ -61,8 +69,10 @@ func (r RoutingConfig) withDefaults() RoutingConfig {
 // routeSet 是一个类别的路由与各自的熔断器。
 type routeSet struct {
 	router   upstream.Router
+	proto    upstream.ProtocolRouter // 路由有线路格式时非 nil
 	names    []string
 	breakers []*breaker.Breaker
+	bal      *balancer // weighted 与 latency 模式；ordered 为 nil
 }
 
 // RouteState 是一个路由的熔断器状态（RouteStates；供指标与诊断使用）。
@@ -79,6 +89,10 @@ func (c *Coordinator) newRouteSet(a upstream.Adapter) *routeSet {
 		return nil
 	}
 	rs := &routeSet{router: r, names: r.Routes()}
+	rs.proto, _ = a.(upstream.ProtocolRouter)
+	if m := c.routing.effectiveMode(); m != RoutingOrdered {
+		rs.bal = newBalancer(m, rs.names, c.routing.Weights)
+	}
 	for _, name := range rs.names {
 		name, kind := name, a.Kind()
 		rs.breakers = append(rs.breakers, breaker.New(breaker.Config{
@@ -130,15 +144,43 @@ type pick struct {
 	anyTried bool // 有路由因本轮已失败而被跳过（没有可放行的路由时：本轮结束，而不是降级）
 }
 
-// pick 按顺序选第一个提供 model、不在 tried 中且熔断器放行的路由，并给出估算。估算失败的路由按未提供处理。
+// convertible 报告规范化请求能否在路由 i 上执行：OpenAI 格式的路由总能（不解析请求体）；其他格式的路由须能转换。
+func (rs *routeSet) convertible(i int, resolved []byte) bool {
+	if rs.proto == nil || rs.proto.RouteProtocol(i) == llmproto.ProtocolOpenAI {
+		return true
+	}
+	return rs.proto.Convertible(i, resolved)
+}
+
+// eligible 报告路由 i 能否执行本调用（提供该模型、格式可用），不看熔断器。
+func (rs *routeSet) eligible(j *job, i int) bool {
+	return rs.router.Serves(i, j.model) && rs.convertible(i, j.resolved)
+}
+
+// planOrder 在调用开始时算出本调用的路由顺序（ordered 为配置顺序）。
+func (rs *routeSet) planOrder(j *job) {
+	j.order = rs.order(func(i int) bool { return rs.eligible(j, i) })
+}
+
+// pick 按本调用的路由顺序（j.order；未算出时为配置顺序）选第一个提供 model、格式可用、不在 tried 中且熔断器放行的
+// 路由，并给出估算。估算失败的路由按未提供处理。
 func (rs *routeSet) pick(j *job, tried map[int]bool) pick {
 	var skipped []string
 	var p pick
-	for i, name := range rs.names {
+	order := j.order
+	if order == nil {
+		for i := range rs.names {
+			order = append(order, i)
+		}
+	}
+	for _, i := range order {
+		name := rs.names[i]
 		reason := ""
 		switch {
 		case !rs.router.Serves(i, j.model):
 			reason = SkipModelNotServed
+		case !rs.convertible(i, j.resolved):
+			reason = SkipProtocol
 		case tried[i]:
 			reason, p.anyTried = SkipTried, true
 		case !rs.breakers[i].Allow():
@@ -160,11 +202,11 @@ func (rs *routeSet) pick(j *job, tried map[int]bool) pick {
 	return p
 }
 
-// ready 报告除 tried 之外是否还有提供 model 且熔断器就绪的路由（不改变熔断器状态）：决定失败之后是立即换路由
+// ready 报告除 tried 之外是否还有能执行本调用且熔断器就绪的路由（不改变熔断器状态）：决定失败之后是立即换路由
 // 还是退避。
-func (rs *routeSet) ready(model string, tried map[int]bool) bool {
+func (rs *routeSet) ready(j *job, tried map[int]bool) bool {
 	for i := range rs.names {
-		if !tried[i] && rs.router.Serves(i, model) && rs.breakers[i].Ready() {
+		if !tried[i] && rs.eligible(j, i) && rs.breakers[i].Ready() {
 			return true
 		}
 	}
@@ -206,6 +248,13 @@ func providerFault(e *upstream.Error) bool {
 		return true
 	}
 	return e.Status == 401 || e.Status == 403 || e.Status == 404
+}
+
+// observe 把一次 ok 的 try 的延迟记入该路由的 EWMA（latency 模式；其余模式与单供应商为空操作）。
+func (rs *routeSet) observe(l leg, uerr *upstream.Error, d time.Duration) {
+	if rs != nil && l.route >= 0 && uerr == nil {
+		rs.bal.observe(l.route, d)
+	}
 }
 
 // release 结束一个已放行但没有发出的路由（预留被拒、槽位等待被取消）：熔断器中止。
