@@ -11,7 +11,8 @@
 # 恢复后的任务、用户、blob 计数与 manifest 一致。任何一步失败即退出，不覆盖已有数据。
 #
 # 恢复后需另行提供（备份中没有的机密）：<data>/api.token（新生成即可）、模型/搜索 Key 与数据库连接串所在的
-# env 文件、TLS 私钥。<data>/cache.key 由 server 启动时自动生成（缓存条目随之失效，属预期）。
+# env 文件、TLS 私钥、<data>/apikey.pepper（不提供时 server 生成新的 pepper，已发放的平台 API key 全部失效）。
+# <data>/cache.key 由 server 启动时自动生成（缓存条目随之失效，属预期）。
 #
 # 环境变量：
 #   AGENTBOX_BACKUP_PASSPHRASE_FILE  必填：口令文件
