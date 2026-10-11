@@ -118,7 +118,7 @@ func NewChat(cfg ChatConfig) Adapter {
 		a.routes = append(a.routes, chatRoute{name: r.Name, baseURL: strings.TrimRight(r.BaseURL, "/"), apiKey: r.APIKey,
 			protocol: proto, anthropicVersion: version, models: r.Models, restricted: len(r.Models) > 0, pricing: r.Pricing,
 			pricingByModel: r.PricingByModel,
-			http: defaultClient(r.HTTP, DefaultModelMaxBody), streamHTTP: defaultClient(r.StreamHTTP, 0)})
+			http:           defaultClient(r.HTTP, DefaultModelMaxBody), streamHTTP: defaultClient(r.StreamHTTP, 0)})
 	}
 	return a
 }

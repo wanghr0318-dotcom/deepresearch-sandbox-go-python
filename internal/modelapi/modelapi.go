@@ -76,9 +76,9 @@ type Config struct {
 	MaxBody int64
 	// BodyTimeout bounds reading the request body (default 30 s).
 	BodyTimeout time.Duration
-	Logger  *slog.Logger
-	Now     func() time.Time
-	NewID   func() string
+	Logger      *slog.Logger
+	Now         func() time.Time
+	NewID       func() string
 }
 
 // Handler serves the model API. internal/api routes the three paths to it after authentication.
