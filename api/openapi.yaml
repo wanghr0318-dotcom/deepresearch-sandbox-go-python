@@ -48,11 +48,22 @@ info:
     operator does not chat as a user). A user's `GET /tasks` does not list turns. When the server has no
     session worker configured, every session operation answers 503 `sessions_unavailable`. All 4xx/5xx
     bodies are `Error`; the session-specific codes are listed in `SessionErrorCode`.
+
+    Tenancy and API keys (model gateway design 2026-10-11 §5, §8): with accounts enabled every user belongs
+    to exactly one org (at sign-up a personal org `user-<id>` with the user as owner). Platform API keys
+    `abx_live_<id>_<secret>` are accepted as `Authorization: Bearer abx_live_...` or `x-api-key`; a Bearer
+    value that does not start with `abx_` is still the operator token. A key acts as its user: with the
+    `runtime` scope it may call every operation a user session may call (sessions, turns, research, own
+    tasks), except `POST /auth/logout`; without it those answer 403 `permission_denied`. A key never
+    manages keys, members or orgs (403 `permission_denied`) and never reaches operator operations. An
+    invalid, revoked or expired key is 401 `invalid_api_key` (never a fallback to the cookie). Verified
+    keys are cached for 30 s; revocation is pushed to every server at once (PostgreSQL NOTIFY).
 servers:
   - url: http://127.0.0.1:8080
 security:
   - bearerAuth: []
   - cookieAuth: []
+  - apiKeyAuth: []
 paths:
   /auth/register:
     post:
@@ -879,6 +890,219 @@ paths:
               schema: {$ref: '#/components/schemas/Error'}
         '500': {$ref: '#/components/responses/BlobUnavailable'}
         '503': {$ref: '#/components/responses/SessionsUnavailable'}
+  /v1/me:
+    get:
+      operationId: getMe
+      summary: The authenticated caller (operator, user session or API key of any scope)
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+        - apiKeyAuth: []
+      responses:
+        '200':
+          description: The caller's principal
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Me'}
+        '401': {$ref: '#/components/responses/KeyUnauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/keys:
+    post:
+      operationId: createKey
+      summary: Create a platform API key (the full key is returned once)
+      description: |
+        A user session creates keys for itself only, in its current org; the operator must name the user
+        (`username`). API keys can never create keys (403 `permission_denied`). Only the HMAC of the secret is
+        stored; the full `abx_live_<id>_<secret>` key appears in this response and nowhere else.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateKeyRequest'}
+      responses:
+        '201':
+          description: The key, including the full secret (shown once)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CreatedKey'}
+        '400':
+          description: '`invalid_request` (name, expires_at in the past, operator without username) or `invalid_scopes`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/KeyUnauthorized'}
+        '403': {$ref: '#/components/responses/KeyForbidden'}
+        '404':
+          description: '`user_not_found`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    get:
+      operationId: listKeys
+      summary: List keys (members their own, owners their org's, the operator all), newest first
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        '200':
+          description: The keys (never the secrets)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/KeyList'}
+        '401': {$ref: '#/components/responses/KeyUnauthorized'}
+        '403': {$ref: '#/components/responses/KeyForbidden'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/keys/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string, pattern: '^k_[a-z2-7]{16}$'}
+    delete:
+      operationId: revokeKey
+      summary: Revoke a key (idempotent; effective on every server at once via NOTIFY apikey_changed)
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        '200':
+          description: The revoked key
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ApiKey'}
+        '401': {$ref: '#/components/responses/KeyUnauthorized'}
+        '403': {$ref: '#/components/responses/KeyForbidden'}
+        '404':
+          description: '`key_not_found` (also a key the caller may not manage)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/orgs:
+    post:
+      operationId: createOrg
+      summary: Create an org (operator only), optionally moving a user in as its owner
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateOrgRequest'}
+      responses:
+        '201':
+          description: The org
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Org'}
+        '400':
+          description: '`invalid_request` or `invalid_org_name` (2–63 of a-z 0-9 . _ -; `operator` and `user-<n>` are reserved)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/KeyUnauthorized'}
+        '403': {$ref: '#/components/responses/KeyForbidden'}
+        '404':
+          description: '`user_not_found` (owner)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: '`org_exists`; or `user_in_other_org`: the owner is no longer in their personal org'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/orgs/members:
+    post:
+      operationId: addMember
+      summary: Add a user to an org or change their role (owners for their org; the operator names the org)
+      description: |
+        A user belongs to exactly one org. A user who is still alone in their personal org `user-<id>` moves
+        into the org; their keys in the old org are revoked in the same transaction. A user in any other org is
+        409 `user_in_other_org`. Demoting the last owner is 409 `last_owner`.
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AddMemberRequest'}
+      responses:
+        '200':
+          description: The membership
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Membership'}
+        '400':
+          description: '`invalid_request` (role, operator without org, the reserved org `operator`)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/KeyUnauthorized'}
+        '403': {$ref: '#/components/responses/KeyForbidden'}
+        '404':
+          description: '`user_not_found` or `org_not_found`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: '`user_in_other_org` or `last_owner`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /v1/orgs/members/{user}:
+    parameters:
+      - name: user
+        in: path
+        required: true
+        schema: {type: string}
+      - name: org
+        in: query
+        required: false
+        description: The org name (required for the operator; an owner defaults to their own org)
+        schema: {type: string}
+    delete:
+      operationId: removeMember
+      summary: Remove a member; they return to their personal org and their keys in this org are revoked
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      responses:
+        '204':
+          description: Removed
+        '400':
+          description: '`invalid_request` (operator without org)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/KeyUnauthorized'}
+        '403': {$ref: '#/components/responses/KeyForbidden'}
+        '404':
+          description: '`member_not_found`, `user_not_found` or `org_not_found`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: '`last_owner` or `personal_org` (a user cannot leave their personal org)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {$ref: '#/components/responses/Internal'}
+        '503': {$ref: '#/components/responses/Unavailable'}
 components:
   securitySchemes:
     bearerAuth:
@@ -890,6 +1114,11 @@ components:
       in: cookie
       name: agentbox_session
       description: A user session (accounts enabled), set by `/auth/register` and `/auth/login`. Ignored when an `Authorization` header is present.
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: 'A platform API key `abx_live_<id>_<secret>` (tenancy enabled). The same key is also accepted as `Authorization: Bearer abx_live_...`.'
   parameters:
     TaskID:
       name: id
@@ -924,6 +1153,16 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/SessionWriteRequest'}
   responses:
+    KeyUnauthorized:
+      description: '`unauthorized` (no valid session or Bearer token); or `invalid_api_key`: the API key is malformed, unknown, revoked or expired, or its user or org is disabled'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    KeyForbidden:
+      description: '`forbidden` (not open to this caller, or not the caller''s key or org); or `permission_denied`: API keys can never manage keys, members or orgs'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
     SessionNotFound:
       description: '`session_not_found` (also another user''s session, an unowned one, and for a user a `closed` one)'
       content:
@@ -1042,6 +1281,97 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
   schemas:
+    Me:
+      type: object
+      required: [operator, scopes]
+      properties:
+        operator: {type: boolean}
+        username: {type: string, description: Absent for the operator}
+        org:
+          type: object
+          properties:
+            id: {type: integer, format: int64}
+            name: {type: string}
+        role: {type: string, enum: [owner, member]}
+        scopes:
+          type: array
+          items: {type: string, enum: [runtime, models]}
+        key_id: {type: string, description: Present when the caller authenticated with an API key}
+    ApiKey:
+      type: object
+      required: [id, name, org_id, username, scopes, created_at]
+      properties:
+        id: {type: string, pattern: '^k_[a-z2-7]{16}$'}
+        name: {type: string}
+        org_id: {type: integer, format: int64}
+        username: {type: string}
+        scopes:
+          type: array
+          items: {type: string, enum: [runtime, models]}
+        created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+        revoked_at: {type: string, format: date-time}
+        last_used_at: {type: string, format: date-time, description: Updated at most once a minute}
+    CreatedKey:
+      allOf:
+        - {$ref: '#/components/schemas/ApiKey'}
+        - type: object
+          required: [key]
+          properties:
+            key: {type: string, description: 'The full key `abx_live_<id>_<secret>`, returned only here'}
+    KeyList:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items: {$ref: '#/components/schemas/ApiKey'}
+    CreateKeyRequest:
+      type: object
+      additionalProperties: false
+      required: [name, scopes]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 64}
+        scopes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: {type: string, enum: [runtime, models]}
+        expires_at: {type: string, format: date-time}
+        username: {type: string, description: 'Operator only: the user the key is for'}
+    Org:
+      type: object
+      required: [id, name, disabled, created_at, members]
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string}
+        disabled: {type: boolean}
+        created_at: {type: string, format: date-time}
+        members: {type: integer, format: int64}
+        owner: {$ref: '#/components/schemas/Membership'}
+    CreateOrgRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string}
+        owner: {type: string, description: A username still alone in their personal org}
+    Membership:
+      type: object
+      required: [org_id, org, username, role]
+      properties:
+        org_id: {type: integer, format: int64}
+        org: {type: string}
+        username: {type: string}
+        role: {type: string, enum: [owner, member]}
+    AddMemberRequest:
+      type: object
+      additionalProperties: false
+      required: [username, role]
+      properties:
+        username: {type: string}
+        role: {type: string, enum: [owner, member]}
+        org: {type: string, description: 'The org name; required for the operator, an owner defaults to their own org'}
     Error:
       type: object
       required: [code, message]

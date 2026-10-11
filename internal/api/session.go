@@ -228,7 +228,7 @@ func (h *Handler) createSession(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	v, _, err := h.cfg.Sessions.CreateSession(ctx, CreateSessionRequest{RequestID: body.RequestID, BodyHash: hash,
-		SessionID: h.cfg.NewSessionID(), OwnerUserID: p.user.ID, Title: title})
+		SessionID: h.cfg.NewSessionID(), OwnerUserID: p.user.ID, Title: title, KeyID: p.key})
 	if errors.Is(err, persistence.ErrCommitUnknown) {
 		if id, ok := resolveUnknown(ctx, h.cfg.Store, body.RequestID, hash, decodeSessionID); ok {
 			v, err = h.cfg.Sessions.GetSession(ctx, id)
@@ -520,7 +520,7 @@ func (h *Handler) createTurn(w http.ResponseWriter, r *http.Request, req CreateT
 		writeError(w, http.StatusInternalServerError, "internal", "内部错误")
 		return
 	}
-	req.TaskID, req.OwnerUserID = h.cfg.NewTaskID(), caller(r).user.ID
+	req.TaskID, req.OwnerUserID, req.KeyID = h.cfg.NewTaskID(), caller(r).user.ID, caller(r).key
 	req.Spec, req.ConfigVersion, req.MaxFaultRetries = mustCanonical(spec), h.cfg.ConfigVersion, h.cfg.MaxFaultRetries
 	if len(limits) > 0 {
 		req.Limits = mustCanonical(limits)

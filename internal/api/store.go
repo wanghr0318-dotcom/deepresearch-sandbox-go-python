@@ -17,6 +17,9 @@ type User struct {
 	Role      string    `json:"role"`
 	Disabled  bool      `json:"disabled"`
 	CreatedAt time.Time `json:"created_at"`
+	// OrgID 与 OrgRole 是用户当前的 org 与角色（SessionUser 填写；模型网关设计 §5 的 Principal）。
+	OrgID   int64  `json:"-"`
+	OrgRole string `json:"-"`
 }
 
 // Accounts 是账号与会话的存储（postgres 实现）。
@@ -196,6 +199,8 @@ type CreateTaskRequest struct {
 	ConfigVersion   string
 	Limits          json.RawMessage
 	MaxFaultRetries int64
+	// KeyID 是创建任务的平台 API key（cookie 与运维为空）；任务的 org 取该 key 的 org。
+	KeyID string
 }
 
 // CreateTaskResult 是创建任务的结果。Replayed 表示返回的是同一请求先前提交的结果。

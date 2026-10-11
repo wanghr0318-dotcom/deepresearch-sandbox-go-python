@@ -51,6 +51,12 @@ type Listener interface {
 	ListenKeyChanges(ctx context.Context, ready func(), onChange func(payload string)) error
 }
 
+// Source is a Store that can also deliver change notifications (the PostgreSQL implementation).
+type Source interface {
+	Store
+	Listener
+}
+
 // Identity is a verified key: its principal plus the username (for the user-facing runtime endpoints).
 type Identity struct {
 	Principal tenant.Principal

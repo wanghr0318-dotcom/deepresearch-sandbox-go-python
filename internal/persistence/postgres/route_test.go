@@ -228,7 +228,7 @@ func TestMigration0011(t *testing.T) {
 	beginCall(t, s, "t1", "c1")
 	tr := mustReserve(t, s, "t1", "c1", 100)
 	settle(t, s, call.Settlement{Try: tr, Outcome: "retryable", Error: "upstream_unavailable"})
-	if _, err := s.pool.Exec(ctx, undo0011); err != nil {
+	if _, err := s.pool.Exec(ctx, undo0012+undo0011); err != nil {
 		t.Fatal(err)
 	}
 	if n := count(t, s, "SELECT count(*) FROM schema_migrations WHERE version >= 11"); n != 0 {

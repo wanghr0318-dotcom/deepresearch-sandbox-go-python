@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/apikey"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/task"
 )
 
@@ -34,6 +35,9 @@ func (s *Store) CreateUser(ctx context.Context, display, key, passwordHash strin
 		var err error
 		u, err = scanUser(tx.QueryRow(ctx, `INSERT INTO users AS u (username, username_key, password_hash) VALUES ($1, $2, $3)
 			ON CONFLICT (username_key) DO NOTHING RETURNING `+userColumns, display, key, passwordHash))
+		if err == nil {
+			return ensurePersonalOrg(ctx, tx, u.ID) // 每个用户一个个人 org user-<id>，自己是 owner（0012）
+		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
@@ -87,12 +91,16 @@ func (s *Store) CreateSession(ctx context.Context, idHash []byte, userID int64, 
 func (s *Store) SessionUser(ctx context.Context, idHash []byte) (api.User, error) {
 	var u api.User
 	err := s.read(ctx, "SessionUser", func(ctx context.Context, q queryer) error {
+		var orgID int64
+		var role string
 		var err error
-		u, err = scanUser(q.QueryRow(ctx, "SELECT "+userColumns+` FROM auth_sessions s JOIN users u ON u.id = s.user_id
-			WHERE s.id_hash = $1 AND s.expires_at > now() AND NOT u.disabled`, idHash))
+		u, err = scanUser(q.QueryRow(ctx, "SELECT "+userColumns+`, COALESCE(m.org_id, 0), COALESCE(m.role, '')
+			FROM auth_sessions s JOIN users u ON u.id = s.user_id LEFT JOIN org_members m ON m.user_id = u.id
+			WHERE s.id_hash = $1 AND s.expires_at > now() AND NOT u.disabled`, idHash), &orgID, &role)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return notFoundf("会话")
 		}
+		u.OrgID, u.OrgRole = orgID, role
 		return err
 	})
 	if err != nil {
@@ -109,7 +117,8 @@ func (s *Store) DeleteSession(ctx context.Context, idHash []byte) error {
 	})
 }
 
-// SetDisabled 设置用户的停用状态（实现 api.Accounts）；停用时在同一事务中删除其全部会话。
+// SetDisabled 设置用户的停用状态（实现 api.Accounts）；停用时在同一事务中删除其全部会话，并 NOTIFY apikey_changed "*"
+// 使各 server 立即驱逐缓存的 key（其 key 随即校验失败）。
 func (s *Store) SetDisabled(ctx context.Context, key string, disabled bool) error {
 	return s.run(ctx, "SetDisabled", key, func(ctx context.Context, tx pgx.Tx) error {
 		var id int64
@@ -117,8 +126,14 @@ func (s *Store) SetDisabled(ctx context.Context, key string, disabled bool) erro
 		if errors.Is(err, pgx.ErrNoRows) {
 			return notFoundf("用户 %s", key)
 		}
-		if err != nil || !disabled {
+		if err != nil {
 			return err
+		}
+		if err := notifyKeyChanged(ctx, tx, apikey.EvictAllPayload); err != nil {
+			return err
+		}
+		if !disabled {
+			return nil
 		}
 		_, err = tx.Exec(ctx, "DELETE FROM auth_sessions WHERE user_id = $1", id)
 		return err

@@ -24,9 +24,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/account"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/apikey"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/jcs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/obs"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/tenant"
 )
 
 // Mode 是服务的运行模式（规格 §15.1 `/status`）。
@@ -111,6 +113,19 @@ type Config struct {
 	// ServerInfo 可选：GET /server-info（运维专用）中构建信息之外的非机密配置（模型、搜索供应商、Worker 命令、
 	// exec 模板摘要等），供评测的 run manifest 固定被评测的服务端。不得含 Key、token 或价格。
 	ServerInfo func() map[string]any
+
+	// 多租户（模型网关设计 2026-10-11 §5、§8）：Tenancy 非 nil 时注册 /v1/me、/v1/keys、/v1/orgs… 并接受平台 API key
+	// （Authorization: Bearer abx_live_… 或 x-api-key: abx_live_…）；需要启用账号（Accounts）与 APIKeys。nil 时不注册，
+	// abx_ 开头的 Bearer 与今天一样按运维 token 判定。
+	Tenancy tenant.Store
+	APIKeys KeyVerifier
+}
+
+// KeyVerifier 校验并生成平台 API key（*apikey.Verifier 满足）。
+type KeyVerifier interface {
+	// Verify 校验完整的 key；无效、已吊销或已过期为 apikey.ErrInvalidKey，其余错误为存储故障。
+	Verify(ctx context.Context, raw string) (apikey.Identity, error)
+	Generate() (apikey.Generated, error)
 }
 
 // Handler 实现 api/openapi.yaml 描述的 REST 与 SSE 接口。
@@ -243,12 +258,18 @@ func New(cfg Config) (*Handler, error) {
 	if cfg.Sessions != nil && (cfg.Accounts == nil || cfg.TurnSpec == nil) {
 		return nil, errors.New("api: 会话（Sessions）需要启用账号（Accounts）与 TurnSpec")
 	}
+	if cfg.Tenancy != nil && (cfg.Accounts == nil || cfg.APIKeys == nil) {
+		return nil, errors.New("api: 多租户（Tenancy）需要启用账号（Accounts）与 APIKeys")
+	}
 	active := routes
 	if cfg.Accounts != nil {
 		if cfg.ResearchSpec == nil {
 			return nil, errors.New("api: 启用账号（Accounts）需要 ResearchSpec")
 		}
-		active = allRoutes()
+		active = append(append(append([]route{}, routes...), accountRoutes...), sessionRoutes...)
+		if cfg.Tenancy != nil {
+			active = append(active, tenantRoutes...)
+		}
 		h.registerLimit = account.NewLimiter(registerPerMinute, h.now)
 		h.loginLimit = account.NewLimiter(loginPerMinute, h.now)
 	}
@@ -427,6 +448,11 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.cfg.Accounts == nil {
 		if !h.checkBearer(w, r, true) { // 只有运维 token：配置了 token 时每个请求都须携带
+			return
+		}
+	} else if raw, isKey := h.keyCredential(r); isKey {
+		var ok bool
+		if r, ok = h.authenticateKey(w, r, raw); !ok {
 			return
 		}
 	} else if _, present := r.Header["Authorization"]; present {

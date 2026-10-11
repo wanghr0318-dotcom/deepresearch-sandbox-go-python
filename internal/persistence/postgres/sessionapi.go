@@ -124,8 +124,9 @@ func (a *SessionAPI) CreateSession(ctx context.Context, req api.CreateSessionReq
 		if req.Title != "" {
 			source = "user"
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO sessions (session_id, owner_user_id, title, title_source, status)
-			VALUES ($1, NULLIF($2::bigint, 0), $3, $4, 'creating')`, req.SessionID, req.OwnerUserID, req.Title, source); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO sessions (session_id, owner_user_id, title, title_source, status, key_id)
+			VALUES ($1, NULLIF($2::bigint, 0), $3, $4, 'creating', NULLIF($5, ''))`, req.SessionID, req.OwnerUserID, req.Title, source,
+			req.KeyID); err != nil {
 			return err
 		}
 		for _, q := range []string{
@@ -451,7 +452,7 @@ func (a *SessionAPI) CreateTurn(ctx context.Context, req api.CreateTurnRequest) 
 		return api.CreateTurnResult{}, invalidf("CreateTurn 缺少 session_id")
 	}
 	taskReq := api.CreateTaskRequest{RequestID: req.RequestID, BodyHash: req.BodyHash, TaskID: req.TaskID, Spec: req.Spec,
-		ConfigVersion: req.ConfigVersion, Limits: req.Limits, MaxFaultRetries: req.MaxFaultRetries}
+		ConfigVersion: req.ConfigVersion, Limits: req.Limits, MaxFaultRetries: req.MaxFaultRetries, KeyID: req.KeyID}
 	budget, err := createTaskBudget("CreateTurn", taskReq)
 	if err != nil {
 		return api.CreateTurnResult{}, err
