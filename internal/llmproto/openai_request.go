@@ -312,7 +312,9 @@ func decodeOpenAIMessages(req *Request, raw json.RawMessage) error {
 			return err
 		}
 	}
-	if len(req.Messages) == 0 { // only system messages: valid for OpenAI, Anthropic needs a message
+	// Only system messages, or only empty assistant turns (which are left out for Anthropic): valid for
+	// OpenAI, but the Anthropic encoding would have no message.
+	if !slices.ContainsFunc(req.Messages, func(m Message) bool { return m.Role != RoleAssistant || len(m.Blocks) > 0 }) {
 		req.feature("messages", FeatureUnsupported)
 	}
 	return nil

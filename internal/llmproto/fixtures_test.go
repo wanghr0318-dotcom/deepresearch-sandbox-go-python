@@ -412,6 +412,7 @@ func text(r Response, skipThinking bool) string {
 	return b.String()
 }
 
+// toolCalls lists the tool calls of r; ids are compared as an Anthropic client sees them (AnthropicToolID).
 func toolCalls(r Response) string {
 	var b strings.Builder
 	for _, bl := range r.Blocks {
@@ -419,7 +420,7 @@ func toolCalls(r Response) string {
 			var v any
 			_ = json.Unmarshal([]byte(bl.Arguments), &v)
 			args, _ := json.Marshal(v)
-			b.WriteString(bl.ID + "/" + bl.Name + "/" + string(args) + "|")
+			b.WriteString(AnthropicToolID(bl.ID) + "/" + bl.Name + "/" + string(args) + "|")
 		}
 	}
 	return b.String()

@@ -2,6 +2,7 @@ package llmproto
 
 import (
 	"errors"
+	"io"
 	"net/http"
 )
 
@@ -108,8 +109,8 @@ func (c ErrorClass) info() classInfo {
 }
 
 // ClassOf returns the class of a codec error: ClassUnsupportedField for *UnsupportedFieldError,
-// ClassInvalidRequest for *InvalidRequestError, ClassUpstream for *BadResponseError and ErrBadStream
-// (the provider's fault), ClassInternal otherwise.
+// ClassInvalidRequest for *InvalidRequestError, ClassUpstream for the provider's faults (*BadResponseError,
+// ErrBadStream, a cut stream io.ErrUnexpectedEOF, ErrSSETooLarge), ClassInternal otherwise.
 func ClassOf(err error) ErrorClass {
 	var u *UnsupportedFieldError
 	var i *InvalidRequestError
@@ -119,7 +120,7 @@ func ClassOf(err error) ErrorClass {
 		return ClassUnsupportedField
 	case errors.As(err, &i):
 		return ClassInvalidRequest
-	case errors.As(err, &b), errors.Is(err, ErrBadStream):
+	case errors.As(err, &b), errors.Is(err, ErrBadStream), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, ErrSSETooLarge):
 		return ClassUpstream
 	}
 	return ClassInternal

@@ -327,7 +327,7 @@ func (e *anthropicStreamEncoder) blockStart(ev Event) []byte {
 	case ev.Block == BlockThinking && e.opts.Source != ProtocolOpenAI:
 		cb = map[string]any{"type": "thinking", "thinking": "", "signature": ""}
 	case ev.Block == BlockToolCall:
-		cb = map[string]any{"type": "tool_use", "id": ev.ToolID, "name": ev.ToolName, "input": map[string]any{}}
+		cb = map[string]any{"type": "tool_use", "id": AnthropicToolID(ev.ToolID), "name": ev.ToolName, "input": map[string]any{}}
 	default:
 		return nil
 	}

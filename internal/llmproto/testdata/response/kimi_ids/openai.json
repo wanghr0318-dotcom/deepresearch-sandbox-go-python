@@ -1,0 +1,39 @@
+{
+  "id": "chatcmpl-k1",
+  "object": "chat.completion",
+  "created": 1700000010,
+  "model": "kimi-k3",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "functions.web_search:0",
+            "type": "function",
+            "function": {
+              "name": "web_search",
+              "arguments": "{\"q\":\"a\"}"
+            }
+          },
+          {
+            "id": "functions.fetch:1",
+            "type": "function",
+            "function": {
+              "name": "fetch",
+              "arguments": "{\"url\":\"https://example.com\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 20,
+    "completion_tokens": 10,
+    "total_tokens": 30
+  }
+}

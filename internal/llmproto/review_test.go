@@ -253,3 +253,100 @@ func TestStreamEncoderFallbacks(t *testing.T) {
 		t.Fatalf("anthropic: %v %s", err, a)
 	}
 }
+
+// R1: a Kimi-style tool id reaches an Anthropic client already mapped (non-stream and stream), and the full
+// loop works: the client echoes it back as tool_use / tool_result, Anthropic → Anthropic passes it through
+// unchanged, and it is valid for Anthropic.
+func TestToolIDLoopToAnthropicClient(t *testing.T) {
+	valid := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	body := `{"id":"c","model":"kimi","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[` +
+		`{"id":"functions.web_search:0","type":"function","function":{"name":"web_search","arguments":"{\"q\":\"a\"}"}}]},` +
+		`"finish_reason":"tool_calls"}]}`
+	resp, err := DecodeOpenAIResponse([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := EncodeAnthropicResponse(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var msg struct {
+		Content []json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(out, &msg); err != nil {
+		t.Fatal(err)
+	}
+	var tu struct{ ID string }
+	_ = json.Unmarshal(msg.Content[0], &tu)
+	if !valid.MatchString(tu.ID) || tu.ID != AnthropicToolID("functions.web_search:0") {
+		t.Fatalf("response id = %q", tu.ID)
+	}
+	// The stream path gives the same id.
+	sse := "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"functions.web_search:0\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+		"data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"
+	evs, err := readAll(t, sse, ProtocolOpenAI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc := NewAnthropicStreamEncoder(AnthropicStreamOptions{Source: ProtocolOpenAI})
+	var stream []byte
+	for _, ev := range evs {
+		b, _ := enc.Encode(ev)
+		stream = append(stream, b...)
+	}
+	back, err := readAll(t, string(stream), ProtocolAnthropic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var col Collector
+	for _, ev := range back {
+		col.Add(ev)
+	}
+	if id := col.Response().Blocks[0].ID; id != tu.ID {
+		t.Fatalf("stream id = %q, want %q", id, tu.ID)
+	}
+	// The client's next turn echoes the id; Anthropic → Anthropic keeps it, and it is valid.
+	next := `{"model":"claude","max_tokens":50,"messages":[{"role":"user","content":"q"},` +
+		`{"role":"assistant","content":[` + string(msg.Content[0]) + `]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + tu.ID + `","content":"r"}]}]}`
+	req, err := DecodeAnthropicRequest([]byte(next))
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc2, err := EncodeRequest(req, ProtocolAnthropic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(enc2.Body), `"`+tu.ID+`"`) != 2 {
+		t.Fatalf("pass-through lost the id: %s", enc2.Body)
+	}
+	// Sent on to an OpenAI provider instead, the mapped id still pairs.
+	oa, err := EncodeOpenAIRequest(req)
+	if err != nil || strings.Count(string(oa), `"`+tu.ID+`"`) != 2 {
+		t.Fatalf("to openai: %v %s", err, oa)
+	}
+}
+
+// R2: stream cuts and oversize events are the provider's fault.
+func TestStreamFailuresAreUpstream(t *testing.T) {
+	for _, err := range []error{io.ErrUnexpectedEOF, ErrSSETooLarge} {
+		if ClassOf(err) != ClassUpstream {
+			t.Errorf("ClassOf(%v) = %s", err, ClassOf(err))
+		}
+	}
+}
+
+// R3: a request whose only messages are empty assistant turns cannot be encoded for Anthropic.
+func TestOnlyEmptyAssistant(t *testing.T) {
+	req, err := DecodeOpenAIRequest([]byte(`{"max_tokens":5,"messages":[{"role":"assistant","content":""}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var u *UnsupportedFieldError
+	if err := req.CanConvertTo(ProtocolAnthropic); !errors.As(err, &u) || u.Field != "messages" {
+		t.Fatalf("CanConvertTo = %v", err)
+	}
+	if _, err := EncodeOpenAIRequest(req); err != nil {
+		t.Fatal(err)
+	}
+}
