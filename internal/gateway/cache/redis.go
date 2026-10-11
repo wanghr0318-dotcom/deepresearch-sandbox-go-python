@@ -1,7 +1,7 @@
 // Package cache 实现 Gateway 的搜索/抓取结果缓存（规格 §11）。
 //
 // Redis 只是可丢弃的加速层：它不保存任务状态、预算、恢复依据或锁，任何 Redis 错误都视为未命中（§11.1、§11.5）。
-// 本文件是只用标准库实现的最小 RESP2 客户端（PING、GET、SET key val PX ms、DEL），带连接池，
+// 本文件是只用标准库实现的最小 RESP2 客户端（PING、GET、SET key val PX ms、DEL，以及供限流使用的 EVAL/EVALSHA），带连接池，
 // 每次操作有独立期限：读（GET、PING）默认 50 ms，写（SET、DEL）默认 100 ms，期限覆盖取连接、拨号、写请求与读回复。
 // 本包不导入 persistence、gateway/call 与 net/http。
 package cache
@@ -144,6 +144,39 @@ func (r *Redis) Del(ctx context.Context, key string) error {
 		return fmt.Errorf("%w: DEL 回复类型 %q", ErrProtocol, rep.kind)
 	}
 	return nil
+}
+
+// EvalSHA 以脚本的 SHA1 执行已缓存的 Lua 脚本（读期限，供 internal/ratelimit 使用）：脚本须返回批量字符串或整数，
+// 结果以字节返回（整数为其十进制文本）。脚本未缓存时为 *RedisError（消息以 NOSCRIPT 开头），调用方改用 Eval。
+func (r *Redis) EvalSHA(ctx context.Context, sha string, keys []string, args ...string) ([]byte, error) {
+	return r.eval(ctx, "EVALSHA", sha, keys, args)
+}
+
+// Eval 执行 Lua 脚本（读期限），同时把脚本缓存到服务端；回复约定同 EvalSHA。
+func (r *Redis) Eval(ctx context.Context, script string, keys []string, args ...string) ([]byte, error) {
+	return r.eval(ctx, "EVAL", script, keys, args)
+}
+
+func (r *Redis) eval(ctx context.Context, cmd, body string, keys, args []string) ([]byte, error) {
+	argv := make([]any, 0, 3+len(keys)+len(args))
+	argv = append(argv, cmd, body, strconv.Itoa(len(keys)))
+	for _, k := range keys {
+		argv = append(argv, k)
+	}
+	for _, a := range args {
+		argv = append(argv, a)
+	}
+	rep, err := r.do(ctx, r.cfg.ReadTimeout, argv...)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case rep.kind == '$' && !rep.null:
+		return rep.bulk, nil
+	case rep.kind == ':':
+		return []byte(strconv.FormatInt(rep.n, 10)), nil
+	}
+	return nil, fmt.Errorf("%w: %s 回复类型 %q", ErrProtocol, cmd, rep.kind)
 }
 
 // Close 关闭空闲连接；之后的操作返回 ErrClosed，进行中的操作结束后关闭其连接。
