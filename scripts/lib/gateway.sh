@@ -184,5 +184,5 @@ gw_json() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 
 gw_verify() { "$GW_BIN/agentbox" verify-invariants --data-dir "$GW_DATA" "$@"; }
 
-# gw_has_bill：agentbox 是否有 bill 子命令（G5：用量、账单与对账）。
-gw_has_bill() { "$GW_BIN/agentbox" bill 2>&1 | grep -q 'reconcile'; }
+# gw_reconcile：重新汇总并对账本月（usage_daily、model_requests、quota_holds 与 quota_budgets）；有差异时非零。
+gw_reconcile() { "$GW_BIN/agentbox" bill reconcile "$(date -u +%Y-%m)"; }

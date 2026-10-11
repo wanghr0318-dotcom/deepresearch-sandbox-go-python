@@ -6,8 +6,9 @@
 > 数字含噪声，关键场景各跑 3 次。数字说明的是"网关自身花了多少时间、在这台机器上能做多少、限额与预算在并发下
 > 是否守住"，**不是**生产环境的容量结论。
 
-- 设计：[2026-10-11-model-gateway-design.md](../design/2026-10-11-model-gateway-design.md) §10。分支 `g6-evidence`，基于
-  main 4275b5c（G1、G2、B1、B2、G3 已合并；用量、账单与对账 G5 尚未合并，因此 `bill reconcile` 在本记录中被跳过）。
+- 设计：[2026-10-11-model-gateway-design.md](../design/2026-10-11-model-gateway-design.md) §10。分支 `g6-evidence`。负载测试与
+  第一次故障注入在 main 4275b5c（G1、G2、B1、B2、G3）上运行；G5（用量、账单与对账）合并后，在 main f2ce941 上重新运行了
+  故障注入、演示与一次 budget + lockwait，加上 `bill reconcile`（第 4、5、7、8 节）。
 - 环境：Windows 11 主机上的 WSL2（内核 6.6.87.2-microsoft-standard-WSL2，镜像网络），x86_64，24 个逻辑 CPU（Intel
   Core Ultra 9 275HX），15 GiB；Go 1.27.1；PostgreSQL 16 与 Redis 7 在 Docker Desktop 中，经 127.0.0.1 访问。从 WSL2
   到 PostgreSQL 的一次 `SELECT 1` 往返 p50 0.21–0.23 ms、p99 0.42–0.91 ms。server 的连接池为 pgx 默认的 24 个连接。
@@ -40,7 +41,7 @@
 | 并发下的预算超支（并发 64，3 次） | **0 µUSD**；每 100 ms 的快照中 0 次超限，最高用量 / 限额 0.9998 | 含 15% 首字后被客户端放弃的流（`charged_unknown`） |
 | 运行中停止 Redis（并发 8，45 s） | 20 749 个请求 **0 错误**；Redis 重启后约 4 s 恢复 | 修复连接池问题之前，恢复要等到池中失效连接逐个试完（见下文） |
 | 同一 org 的预算行锁（并发 64，16 个 key） | 1 个 org：134–139 RPS，P99 1.18–1.27 s；16 个 org：1027–1058 RPS，P99 81–86 ms | 设计 §6.2 预见的热点行；锁等待的后端平均 21.8 个（共约 23 个活动连接） |
-| 故障注入（4 个场景，26 项检查） | 全部 PASS | kill -9、首字节后失败、流中吊销、熔断与恢复 |
+| 故障注入（4 个场景） | 两次运行全部 PASS（26 项与 29 项检查） | kill -9、首字节后失败、流中吊销、熔断与恢复；第二次每个场景后另跑 `bill reconcile` |
 | 真实供应商（Moonshot，6 次调用） | 全部 200；四条路径各一次，加两个流 | 经 Windows 侧的本机转发；共约 260 个 token |
 
 ## 1. 网关开销与首字开销
@@ -129,6 +130,11 @@ key 本月的预算行，检查 `spent + reserved + unknown ≤ limit`；运行�
 结束时 `reserved` 在每一级都是 0；key 级预算同样没有超出（结束时 98 846–99 729 / 100 000）。第一个
 `insufficient_quota` 出现在 12.5–12.9 s。
 
+G5 合并之后又跑了一次（同样的参数，数据库比前三次慢，见第 5 节）：251 个快照中 0 次超限，最高 0.9998，结束时超支 0；另有
+9 个请求得到 503（`service_unavailable` 7 个、Anthropic 格式的 `api_error` 2 个）——预留在 2 s 的存储期限内没有拿到行锁，
+按设计失败关闭。随后 `bill reconcile 2026-10` 一致：从 13 338 个请求重算 $1.579598（已知 $1.230708，未知 $0.348890），
+与 `usage_daily` 和 `quota_budgets` 都相符；`verify-invariants` 通过。
+
 ## 5. 同一 org 的预算行锁
 
 方法：`agentbox-loadtest lockwait --concurrency 64 --keys 16 --org-counts 1,4,16`。同样的闭环负载（oa>oa 非流式，每个 org
@@ -142,6 +148,10 @@ key 本月的预算行，检查 `spent + reserved + unknown ≤ limit`；运行�
 | 16 | 1027.1 / 1048.1 / 1058.0 | 59–61 | 81–86 | 2.3–2.5 | 74–78% |
 
 `synchronous_commit=off`（1 次）：1 / 4 / 16 个 org 为 358 / 1089 / 1661 RPS。
+
+G5 合并后的一次运行中数据库明显变慢（同一时段 `TestQuotaMonthStartBurst`——180 个并发预留与结算同一个 org——在
+origin/main 上也以存储超时失败，CI 中通过）：1 个 org 81.2 RPS、P50 563 ms、P99 2.34 s，其中 5 个请求 503；4 个 org
+277 RPS、P99 420 ms、0 错误。热点行上的排队时间随提交延迟放大，超过 2 s 的存储期限后变成客户端可见的 503。
 
 读法：每个请求在预留与结算两个事务中锁 org 的预算行，一个 org 的吞吐上限约为 1 ÷（持锁时间 × 2），持锁时间里有一次
 提交落盘，所以关掉同步提交后上限约提高 2.7 倍。这是设计 §6.2 记下的已知限制：一个 org 在这台机器上约 135 RPS。
@@ -168,7 +178,8 @@ org 各一个 key，每个 key 的 rpm 为 1 000 000（每个请求都经过 Red
 1. **流进行中 `kill -9` server。** fake upstream 每个事件间隔 1 s；收到第一个内容事件后 SIGKILL server。客户端的流没有
    `[DONE]`；hold 仍是 `held`（1135 µUSD），没有 `model_requests` 行。以同样的参数重启（`--model-api-max-duration 10s`，hold
    期限 = 开始 + 10 s + 5 min）：重启后 331 s，sweep 把它转为 `charged_unknown`，`charged_micro = amount_micro = 1135`；
-   org 预算行 `reserved 0, unknown 1135`；`verify-invariants` 通过。`bill reconcile` 在 G5 合并之后补测。
+   org 预算行 `reserved 0, unknown 1135`；`verify-invariants` 通过。G5 合并后的第二次运行：重启后 333 s 转换，
+   `verify-invariants` 与 `bill reconcile 2026-10` 都通过（对账把这个 hold 计入未知费用）。
 2. **首字节之后供应商失败。** 四条路径各一个流：
    - oa>oa 原样转发：供应商的错误对象原样转发；
    - an>oa 转换：供应商断开，网关发出 Anthropic 的 `event: error`（`api_error`）；
@@ -184,7 +195,7 @@ org 各一个 key，每个 key 的 rpm 为 1 000 000（每个请求都经过 Red
    回到主供应商（`primary/ok/200`）。主供应商的 fake upstream 一共只收到 5 个请求（3 个 503 + 2 个成功）；指标
    `agentbox_breaker_transitions_total{route="primary"}` 的 `open`、`half_open`、`closed` 各 1。
 
-## 8. 演示（`scripts/demo-gateway.sh`，7 步全部通过，构建之后不到 1 分钟）
+## 8. 演示（`scripts/demo-gateway.sh`，7 步全部通过，构建之后约 11 s）
 
 - 租户：alice、bob 注册；运维建 org `acme`（alice 为 owner）；alice 邀请，bob 接受；各自创建 models scope 的 key。
 - 未修改的官方 SDK（openai 3.29.0、anthropic 1.13.0，`uv` 按 `tests/sdk/uv.lock` 安装）：2 个 SDK × 2 种供应商格式 ×
@@ -193,7 +204,10 @@ org 各一个 key，每个 key 的 rpm 为 1 000 000（每个请求都经过 Red
 - 限流：owner 给 bob 的 key 设 `rpm 3`，第 4 个请求 `429 rate_limit_exceeded`，`Retry-After: 20`、
   `X-Ratelimit-Limit-Requests: 3`；key 预算 6000 µUSD 时第 7 个请求 `429 insufficient_quota`（"the monthly budget at the key
   level is exhausted"），同一个 key 以 Anthropic 格式调用得到 `rate_limit_error` 形状的同一消息。
-- 吊销 key 后 `401 invalid_api_key`；`verify-invariants` 通过；指标：成功率 33/33（到达路由的请求），平均首字 6.7 ms，流完整
+- 吊销 key 后 `401 invalid_api_key`。
+- 用量与账单（G5 合并后）：`agentbox usage --org acme --group-by model,key --rollup` 按 key 与模型列出 33 个请求、
+  1691 + 363 token、$0.006617；`bill show 2026-10 --org acme` 按模型给出同样的合计；`bill reconcile 2026-10` 一致；
+  `verify-invariants` 通过；指标：成功率 33/33（到达路由的请求），平均首字 6.7 ms，流完整
   4/4，拒绝 `auth 1, quota 2, rate_limit 1`。
 
 演示中发现一个兼容性限制：Anthropic SDK 1.13.0 的回复对象经 `model_dump()` 后带 `caller: null` 字段，原样放回下一个请求得到
@@ -229,8 +243,7 @@ Moonshot 的 Anthropic 兼容端点接受这个 Key。6 行 `model_requests` 都
 - **数据库在 Docker Desktop 中。** 提交落盘偏慢，决定了开销与 org 热点行的上限；没有在原生 PostgreSQL 或云数据库上测。
 - **预算超支为 0 只覆盖这里的结局组合**（完整、流式、客户端放弃、数据库超时）；供应商报告的用量超过预留时按实际结算，
   超出由 `verify-invariants` 的 G2 单独报告（设计 §9），这里的 fake 用量远低于预留，没有触发。
-- **kill -9 只测了一次、一个流**；hold 的转换依赖期限（这里 5 min 10 s）与 30 s 的 sweep 周期。
-- `bill reconcile` 尚未运行（G5 合并后补测）。
+- **kill -9 每次只测了一个流**（两次运行）；hold 的转换依赖期限（这里 5 min 10 s）与 30 s 的 sweep 周期。
 
 ## 原始数据
 

@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.4.0 — 2026-10-12
+
+Multi-tenant model gateway release: orgs and platform API keys, rate limits and monthly budgets, an OpenAI and Anthropic model API with conversion in both directions, usage, bills and reconciliation, and the load-test, fault-injection and demo evidence for them.
 
 - **Model gateway evidence (G6):** `cmd/agentbox-loadtest` (scenarios `latency`, `ladder`, `ratelimit`, `budget`, `steady`, `lockwait`; seeded, JSON-lines results) with `scripts/loadtest-gateway.sh`, which runs it against a local server, `fakeupstream` providers and a disposable Redis; `scripts/fault-gateway.sh` (server killed mid-stream → `charged_unknown` by the sweep, provider failure after the first byte, key revoked mid-stream, breaker open and recovery); `scripts/demo-gateway.sh` (orgs, invite, keys, both official SDKs on all four paths with streaming and tool calls, weighted routing, 429 rate limit and `insufficient_quota`, revocation, metrics), sharing `scripts/lib/gateway.sh`; Grafana dashboard "Agentbox model gateway"; `fakeupstream -tool-calls`. Results in `docs/evidence/2026-10-12-model-gateway.md`.
 - **Fix: Redis connection pool after a Redis restart.** An I/O error that means the server closed the connection (EOF, reset, broken pipe) now drops every idle pooled connection. Before, each operation took one dead pooled connection and failed again, so the rate limiter (which retries Redis once per 5 s cool-off) stayed degraded for up to "idle connections × 5 s" after Redis came back (seen in the load test).

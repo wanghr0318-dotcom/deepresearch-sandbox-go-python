@@ -17,7 +17,7 @@
 #      加权路由（同一个逻辑模型按 3:1 分给两个供应商）
 #   4. 限流 429（带 x-ratelimit-* 头），然后预算用尽 429 insufficient_quota
 #   5. 吊销 key → 401
-#   6. 用量、账单与对账（有 usage / bill 子命令时；否则打印 model_requests 汇总）与 verify-invariants
+#   6. 用量、账单与对账（agentbox usage、bill show、bill reconcile）与 verify-invariants
 #   7. Prometheus 指标：成功率、首字时间、流完整性、按原因的拒绝数
 #
 # 环境变量另见 scripts/lib/gateway.sh；AGENTBOX_DEMO_UV 为 uv 可执行文件（默认 uv）。
@@ -161,15 +161,10 @@ ok "下一个请求：401 $(cat "$GW_WORK/last.json")"
 
 step "用量、账单与对账"
 month=$(date -u +%Y-%m)
-if gw_has_bill; then
-  "$GW_BIN/agentbox" usage --org acme --group-by model,key --rollup | sed 's/^/     /'
-  "$GW_BIN/agentbox" bill show "$month" --org acme | sed 's/^/     /'
-  "$GW_BIN/agentbox" bill reconcile "$month" | sed 's/^/     /'
-  ok "bill reconcile $month：usage_daily、model_requests、quota_holds 与 quota_budgets 一致"
-else
-  info "此版本没有 usage / bill 子命令（G5），改为直接汇总 model_requests："
-  gw_sql "SELECT u.username || ' · ' || r.model || ': ' || count(*) || ' 个请求，' || sum(r.prompt_tokens) || '+' || sum(r.completion_tokens) || ' token，' || sum(r.cost_micro) || ' µUSD' FROM model_requests r JOIN users u ON u.id = r.user_id GROUP BY u.username, r.model ORDER BY 1" | sed 's/^/     /'
-fi
+"$GW_BIN/agentbox" usage --org acme --group-by model,key --rollup | sed 's/^/     /'
+"$GW_BIN/agentbox" bill show "$month" --org acme | sed 's/^/     /'
+"$GW_BIN/agentbox" bill reconcile "$month" | sed 's/^/     /'
+ok "bill reconcile $month：usage_daily、model_requests、quota_holds 与 quota_budgets 一致"
 gw_verify | sed 's/^/     /'
 ok "verify-invariants：预算行与 hold 一致（G1）、未超限额（G2）、每个 model_requests 行恰有一个已结算的 hold（G3）"
 

@@ -9,7 +9,7 @@
 #
 # 场景：latency（网关开销与首字开销）、ladder（最大 RPS）、ratelimit（限流精度，60 s）、budget（并发下的超支，
 # 期间每 5 s 运行一次 verify-invariants）、lockwait（同一 org 的预算行锁等待）、redis（运行中停止 Redis：
-# 限流器降级，客户端没有错误；之后重新启动 Redis）。结束时运行 verify-invariants，有 bill 子命令时运行
+# 限流器降级，客户端没有错误；之后重新启动 Redis）。结束时运行 verify-invariants 与
 # bill reconcile。每个场景不超过约 2 分钟。
 #
 # 环境变量（另见 scripts/lib/gateway.sh）：
@@ -145,11 +145,7 @@ gw_say "== 结束检查"
   echo
   echo '```'
   gw_verify 2>&1 || echo "verify-invariants 退出码 $?"
-  if gw_has_bill; then
-    "$GW_BIN/agentbox" bill reconcile "$(date -u +%Y-%m)" 2>&1 || echo "bill reconcile 退出码 $?"
-  else
-    echo "bill reconcile：此版本没有 bill 子命令（G5），跳过"
-  fi
+  "$GW_BIN/agentbox" bill reconcile "$(date -u +%Y-%m)" 2>&1 || echo "bill reconcile 退出码 $?"
   echo '```'
   echo
   echo "model_requests：$(gw_sql "SELECT sum(n) || ' 行，状态 ' || string_agg(s || '×' || n, ' ') FROM (SELECT status::text s, count(*) n FROM model_requests GROUP BY 1 ORDER BY 1) x")"

@@ -3,7 +3,7 @@
 # （不访问外网，没有模型费用）、带 --model-api 的 agentbox server 运行四个故障场景，逐项检查并打印 PASS/FAIL：
 #
 #   1. kill -9：流进行中 server 被 SIGKILL，重启后 hold 在期限（--model-api-max-duration + 5 min）之后由 sweep 转为
-#      charged_unknown；verify-invariants 通过（有 bill 子命令时 bill reconcile 也通过）。约 6 分钟（等待期限）。
+#      charged_unknown；verify-invariants 通过，bill reconcile 也通过（每个场景结束时都运行两者）。约 6 分钟（等待期限）。
 #   2. 首字节之后供应商失败：客户端收到其格式的错误事件，model_requests.stream_complete = false。四条路径。
 #   3. 流进行中吊销 key：这个流正常结束，下一个请求 401 invalid_api_key。
 #   4. 熔断：主供应商连续 503 → 换后备供应商；熔断打开期间跳过主供应商（circuit_open）；打开时长过后半开试探
@@ -138,11 +138,7 @@ scenario_1() {
   note "hold：$(gw_sql "SELECT 'state=' || state || ' amount_micro=' || amount_micro || ' charged_micro=' || charged_micro FROM quota_holds WHERE ref = '$rid'")"
   note "org 预算行：$(gw_sql "SELECT 'reserved=' || reserved_micro || ' spent=' || spent_micro || ' unknown=' || unknown_micro FROM quota_budgets b JOIN org_members m ON b.scope_kind = 'org' AND b.scope_id = m.org_id::text JOIN users u ON u.id = m.user_id WHERE u.username = '$USER_NAME'")"
   check "verify-invariants 通过" gw_verify
-  if gw_has_bill; then
-    check "bill reconcile $(date -u +%Y-%m) 通过" "$GW_BIN/agentbox" bill reconcile "$(date -u +%Y-%m)"
-  else
-    note "bill reconcile：此版本没有 bill 子命令（G5），跳过"
-  fi
+  check "bill reconcile $(date -u +%Y-%m) 通过" gw_reconcile
   gw_stop_server
 }
 
@@ -174,6 +170,7 @@ scenario_2() {
     note "    错误事件：$(grep -m1 -A1 -E '^(event: error|data: \{"error")' "$out" | tr '\n' ' ' | cut -c1-200)"
   done
   check "verify-invariants 通过" gw_verify
+  check "bill reconcile $(date -u +%Y-%m) 通过" gw_reconcile
   gw_stop_server
 }
 
@@ -199,6 +196,7 @@ scenario_3() {
   check "下一个请求 401 invalid_api_key：$(cat "$GW_WORK/f3-next.code") $(cat "$GW_WORK/f3-next.out")" \
     bash -c "[ \"\$(cat '$GW_WORK/f3-next.code')\" = 401 ] && grep -q invalid_api_key '$GW_WORK/f3-next.out'"
   check "verify-invariants 通过" gw_verify
+  check "bill reconcile $(date -u +%Y-%m) 通过" gw_reconcile
   gw_stop_server
 }
 
@@ -248,6 +246,7 @@ EOF
   curl -fsS "http://$GW_METRICS/metrics" | grep -E '^agentbox_(breaker_transitions_total|model_requests_total)' | tee -a "$REPORT" || true
   note '```'
   check "verify-invariants 通过" gw_verify
+  check "bill reconcile $(date -u +%Y-%m) 通过" gw_reconcile
   gw_stop_server
 }
 
