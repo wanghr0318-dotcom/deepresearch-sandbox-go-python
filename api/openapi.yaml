@@ -1340,6 +1340,97 @@ paths:
               schema: {$ref: '#/components/schemas/Error'}
         '500': {$ref: '#/components/responses/Internal'}
         '503': {$ref: '#/components/responses/QuotaUnavailable'}
+  /v1/chat/completions:
+    post:
+      operationId: createChatCompletion
+      summary: OpenAI-format chat completion (model API, `--model-api`)
+      description: |
+        The OpenAI Chat Completions API in front of the configured model routes (model gateway design §7). The
+        provider may be OpenAI-compatible (the body is forwarded with only `model` rewritten; streams are forwarded
+        event by event) or Anthropic (the request and reply are converted). `stream: true` answers with server-sent
+        events. Requires the `models` scope. Rate limits (requests and estimated tokens per minute, concurrent
+        streams) and the monthly budget of the key, user and org apply; errors use the OpenAI error object
+        (`{"error":{"message","type","param","code"}}`). Not available when the server runs without `--model-api`.
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChatCompletionRequest'}
+      responses:
+        '200':
+          description: The completion (JSON), or the stream (`text/event-stream`) when `stream` is true. An error after the stream started is a final `data:` event with an error object.
+          headers:
+            x-request-id: {schema: {type: string}, description: The model request id (`model_requests.id`)}
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+            text/event-stream:
+              schema: {type: string}
+        '400': {$ref: '#/components/responses/ModelBadRequest'}
+        '401': {$ref: '#/components/responses/ModelError'}
+        '403': {$ref: '#/components/responses/ModelError'}
+        '404': {$ref: '#/components/responses/ModelError'}
+        '429': {$ref: '#/components/responses/ModelTooMany'}
+        '500': {$ref: '#/components/responses/ModelError'}
+        '502': {$ref: '#/components/responses/ModelError'}
+        '503': {$ref: '#/components/responses/ModelError'}
+  /v1/messages:
+    post:
+      operationId: createMessage
+      summary: Anthropic-format message (model API, `--model-api`)
+      description: |
+        The Anthropic Messages API in front of the same model routes; the `anthropic-version` header is accepted and
+        echoed. Same rules as `/v1/chat/completions`; errors use the Anthropic error object
+        (`{"type":"error","error":{"type","message"}}`).
+      security:
+        - apiKeyAuth: []
+        - bearerAuth: []
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MessagesRequest'}
+      responses:
+        '200':
+          description: 'The message (JSON), or the event stream when `stream` is true. An error after the stream started is a final `event: error`.'
+          headers:
+            x-request-id: {schema: {type: string}, description: The model request id (`model_requests.id`)}
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+            text/event-stream:
+              schema: {type: string}
+        '400': {$ref: '#/components/responses/ModelBadRequest'}
+        '401': {$ref: '#/components/responses/ModelError'}
+        '403': {$ref: '#/components/responses/ModelError'}
+        '404': {$ref: '#/components/responses/ModelError'}
+        '429': {$ref: '#/components/responses/ModelTooMany'}
+        '500': {$ref: '#/components/responses/ModelError'}
+        '502': {$ref: '#/components/responses/ModelError'}
+        '503': {$ref: '#/components/responses/ModelError'}
+  /v1/models:
+    get:
+      operationId: listModels
+      summary: The logical models (model API, `--model-api`)
+      description: The configured logical models some route serves, in OpenAI list format, or in Anthropic format when the `anthropic-version` header is present.
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+        - cookieAuth: []
+      responses:
+        '200':
+          description: The model list
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ModelList'}
+        '401': {$ref: '#/components/responses/ModelError'}
+        '403': {$ref: '#/components/responses/ModelError'}
+        '503': {$ref: '#/components/responses/ModelError'}
 components:
   securitySchemes:
     bearerAuth:
@@ -1401,6 +1492,36 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/SessionWriteRequest'}
   responses:
+    ModelError:
+      description: |
+        A model API error in the caller's format (design §7.5): `invalid_api_key` (401), `permission_denied` (403, the
+        key lacks the `models` scope), `model_not_found` (404), `internal_error` (500), `upstream_error` (502: the
+        provider failed), `model_degraded` (503: every provider of the model is unavailable) or `service_unavailable`
+        (503: PostgreSQL is unavailable; no model call runs without a budget hold).
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ModelErrorBody'}
+    ModelBadRequest:
+      description: '`invalid_request_error`, or `unsupported_field` naming the field (a feature no provider serving the model can express, `n` other than 1, or `logprobs` without `stream`)'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ModelErrorBody'}
+    ModelTooMany:
+      description: |
+        `rate_limit_exceeded` (requests or tokens per minute, or concurrent streams, of the caller's key, user or org)
+        or `insufficient_quota` (the monthly budget of a level is used up; the message names the level). Anthropic
+        callers get `rate_limit_error` for both.
+      headers:
+        Retry-After: {schema: {type: integer}, description: Seconds until a request can succeed (rate limits)}
+        x-ratelimit-limit-requests: {schema: {type: integer}, description: The most constrained level's request limit per minute}
+        x-ratelimit-remaining-requests: {schema: {type: integer}, description: Requests left at that level}
+        x-ratelimit-reset-requests: {schema: {type: string}, description: 'Time until that level is full again, e.g. `12s`'}
+        x-ratelimit-limit-tokens: {schema: {type: integer}, description: The most constrained level's token limit per minute}
+        x-ratelimit-remaining-tokens: {schema: {type: integer}, description: Tokens left at that level}
+        x-ratelimit-reset-tokens: {schema: {type: string}, description: Time until that level is full again}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ModelErrorBody'}
     RuntimeRateLimited:
       description: |
         `rate_limit_exceeded`: the requests-per-minute limit of the caller's key, user or org is used up (API key and
@@ -1561,6 +1682,60 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
   schemas:
+    ChatCompletionRequest:
+      type: object
+      description: An OpenAI Chat Completions request (see the OpenAI API reference); `model` is a logical model of this server.
+      required: [model, messages]
+      additionalProperties: true
+      properties:
+        model: {type: string}
+        messages: {type: array, items: {type: object, additionalProperties: true}}
+        stream: {type: boolean}
+        max_tokens: {type: integer}
+        tools: {type: array, items: {type: object, additionalProperties: true}}
+    MessagesRequest:
+      type: object
+      description: An Anthropic Messages request (see the Anthropic API reference); `model` is a logical model of this server.
+      required: [model, messages, max_tokens]
+      additionalProperties: true
+      properties:
+        model: {type: string}
+        max_tokens: {type: integer}
+        messages: {type: array, items: {type: object, additionalProperties: true}}
+        system: {}
+        stream: {type: boolean}
+        tools: {type: array, items: {type: object, additionalProperties: true}}
+    ModelErrorBody:
+      description: 'OpenAI: `{"error":{"message","type","param","code"}}`; Anthropic: `{"type":"error","error":{"type","message"}}`'
+      type: object
+      additionalProperties: true
+      properties:
+        type: {type: string}
+        error:
+          type: object
+          additionalProperties: true
+          properties:
+            message: {type: string}
+            type: {type: string}
+            code: {type: string}
+            param: {type: string, nullable: true}
+    ModelList:
+      type: object
+      description: 'OpenAI: `{"object":"list","data":[{"id","object":"model","created","owned_by"}]}`; Anthropic: `{"data":[{"type":"model","id","display_name","created_at"}],"has_more","first_id","last_id"}`'
+      required: [data]
+      additionalProperties: true
+      properties:
+        object: {type: string}
+        data:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              id: {type: string}
+              object: {type: string}
+              type: {type: string}
+        has_more: {type: boolean}
     LimitsRequest:
       type: object
       additionalProperties: false

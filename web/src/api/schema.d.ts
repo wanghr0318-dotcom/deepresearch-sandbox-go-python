@@ -920,10 +920,134 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/completions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * OpenAI-format chat completion (model API, `--model-api`)
+         * @description The OpenAI Chat Completions API in front of the configured model routes (model gateway design §7). The
+         *     provider may be OpenAI-compatible (the body is forwarded with only `model` rewritten; streams are forwarded
+         *     event by event) or Anthropic (the request and reply are converted). `stream: true` answers with server-sent
+         *     events. Requires the `models` scope. Rate limits (requests and estimated tokens per minute, concurrent
+         *     streams) and the monthly budget of the key, user and org apply; errors use the OpenAI error object
+         *     (`{"error":{"message","type","param","code"}}`). Not available when the server runs without `--model-api`.
+         */
+        post: operations["createChatCompletion"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/messages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Anthropic-format message (model API, `--model-api`)
+         * @description The Anthropic Messages API in front of the same model routes; the `anthropic-version` header is accepted and
+         *     echoed. Same rules as `/v1/chat/completions`; errors use the Anthropic error object
+         *     (`{"type":"error","error":{"type","message"}}`).
+         */
+        post: operations["createMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The logical models (model API, `--model-api`)
+         * @description The configured logical models some route serves, in OpenAI list format, or in Anthropic format when the `anthropic-version` header is present.
+         */
+        get: operations["listModels"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description An OpenAI Chat Completions request (see the OpenAI API reference); `model` is a logical model of this server. */
+        ChatCompletionRequest: {
+            model: string;
+            messages: {
+                [key: string]: unknown;
+            }[];
+            stream?: boolean;
+            max_tokens?: number;
+            tools?: {
+                [key: string]: unknown;
+            }[];
+        } & {
+            [key: string]: unknown;
+        };
+        /** @description An Anthropic Messages request (see the Anthropic API reference); `model` is a logical model of this server. */
+        MessagesRequest: {
+            model: string;
+            max_tokens: number;
+            messages: {
+                [key: string]: unknown;
+            }[];
+            system?: unknown;
+            stream?: boolean;
+            tools?: {
+                [key: string]: unknown;
+            }[];
+        } & {
+            [key: string]: unknown;
+        };
+        /** @description OpenAI: `{"error":{"message","type","param","code"}}`; Anthropic: `{"type":"error","error":{"type","message"}}` */
+        ModelErrorBody: {
+            type?: string;
+            error?: {
+                message?: string;
+                type?: string;
+                code?: string;
+                param?: string | null;
+            } & {
+                [key: string]: unknown;
+            };
+        } & {
+            [key: string]: unknown;
+        };
+        /** @description OpenAI: `{"object":"list","data":[{"id","object":"model","created","owned_by"}]}`; Anthropic: `{"data":[{"type":"model","id","display_name","created_at"}],"has_more","first_id","last_id"}` */
+        ModelList: {
+            object?: string;
+            data: ({
+                id?: string;
+                object?: string;
+                type?: string;
+            } & {
+                [key: string]: unknown;
+            })[];
+            has_more?: boolean;
+        } & {
+            [key: string]: unknown;
+        };
         LimitsRequest: {
             /** @description Requests per minute */
             rpm?: number | null;
@@ -1886,6 +2010,56 @@ export interface components {
         };
     };
     responses: {
+        /**
+         * @description A model API error in the caller's format (design §7.5): `invalid_api_key` (401), `permission_denied` (403, the
+         *     key lacks the `models` scope), `model_not_found` (404), `internal_error` (500), `upstream_error` (502: the
+         *     provider failed), `model_degraded` (503: every provider of the model is unavailable) or `service_unavailable`
+         *     (503: PostgreSQL is unavailable; no model call runs without a budget hold).
+         */
+        ModelError: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ModelErrorBody"];
+            };
+        };
+        /** @description `invalid_request_error`, or `unsupported_field` naming the field (a feature no provider serving the model can express, `n` other than 1, or `logprobs` without `stream`) */
+        ModelBadRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ModelErrorBody"];
+            };
+        };
+        /**
+         * @description `rate_limit_exceeded` (requests or tokens per minute, or concurrent streams, of the caller's key, user or org)
+         *     or `insufficient_quota` (the monthly budget of a level is used up; the message names the level). Anthropic
+         *     callers get `rate_limit_error` for both.
+         */
+        ModelTooMany: {
+            headers: {
+                /** @description Seconds until a request can succeed (rate limits) */
+                "Retry-After"?: number;
+                /** @description The most constrained level's request limit per minute */
+                "x-ratelimit-limit-requests"?: number;
+                /** @description Requests left at that level */
+                "x-ratelimit-remaining-requests"?: number;
+                /** @description Time until that level is full again, e.g. `12s` */
+                "x-ratelimit-reset-requests"?: string;
+                /** @description The most constrained level's token limit per minute */
+                "x-ratelimit-limit-tokens"?: number;
+                /** @description Tokens left at that level */
+                "x-ratelimit-remaining-tokens"?: number;
+                /** @description Time until that level is full again */
+                "x-ratelimit-reset-tokens"?: string;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ModelErrorBody"];
+            };
+        };
         /**
          * @description `rate_limit_exceeded`: the requests-per-minute limit of the caller's key, user or org is used up (API key and
          *     session callers; the operator is never limited). Retry after `Retry-After` seconds.
@@ -3820,6 +3994,103 @@ export interface operations {
             };
             500: components["responses"]["Internal"];
             503: components["responses"]["QuotaUnavailable"];
+        };
+    };
+    createChatCompletion: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatCompletionRequest"];
+            };
+        };
+        responses: {
+            /** @description The completion (JSON), or the stream (`text/event-stream`) when `stream` is true. An error after the stream started is a final `data:` event with an error object. */
+            200: {
+                headers: {
+                    /** @description The model request id (`model_requests.id`) */
+                    "x-request-id"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                    "text/event-stream": string;
+                };
+            };
+            400: components["responses"]["ModelBadRequest"];
+            401: components["responses"]["ModelError"];
+            403: components["responses"]["ModelError"];
+            404: components["responses"]["ModelError"];
+            429: components["responses"]["ModelTooMany"];
+            500: components["responses"]["ModelError"];
+            502: components["responses"]["ModelError"];
+            503: components["responses"]["ModelError"];
+        };
+    };
+    createMessage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MessagesRequest"];
+            };
+        };
+        responses: {
+            /** @description The message (JSON), or the event stream when `stream` is true. An error after the stream started is a final `event: error`. */
+            200: {
+                headers: {
+                    /** @description The model request id (`model_requests.id`) */
+                    "x-request-id"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                    "text/event-stream": string;
+                };
+            };
+            400: components["responses"]["ModelBadRequest"];
+            401: components["responses"]["ModelError"];
+            403: components["responses"]["ModelError"];
+            404: components["responses"]["ModelError"];
+            429: components["responses"]["ModelTooMany"];
+            500: components["responses"]["ModelError"];
+            502: components["responses"]["ModelError"];
+            503: components["responses"]["ModelError"];
+        };
+    };
+    listModels: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The model list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelList"];
+                };
+            };
+            401: components["responses"]["ModelError"];
+            403: components["responses"]["ModelError"];
+            503: components["responses"]["ModelError"];
         };
     };
 }

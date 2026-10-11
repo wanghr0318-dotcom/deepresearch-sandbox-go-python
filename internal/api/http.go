@@ -126,6 +126,10 @@ type Config struct {
 	// cookie 调用者按 key、user、org 的 rpm 限额限流（模型网关 G2）。
 	Quota       quota.Store
 	RateLimiter ratelimit.Limiter
+	// ModelAPI 可选（需要 Tenancy）：非 nil 时注册模型 API（POST /v1/chat/completions、POST /v1/messages、GET /v1/models，
+	// 模型网关 G3）。认证（平台 key 需要 models scope、运维 token、会话 cookie）与认证错误由本包以调用方的格式处理，
+	// 之后交给 ModelAPI（internal/modelapi），调用者以 tenant.FromContext 取得。nil 时这些路径与今天一样是 404。
+	ModelAPI http.Handler
 }
 
 // KeyVerifier 校验并生成平台 API key（*apikey.Verifier 满足）。
@@ -271,6 +275,9 @@ func New(cfg Config) (*Handler, error) {
 	if cfg.Tenancy != nil && apikey.LooksLikeKey(cfg.Token) {
 		return nil, errors.New("api: 启用多租户时运维 token 不能以 abx_ 开头（该前缀保留给平台 API key）")
 	}
+	if cfg.ModelAPI != nil && cfg.Tenancy == nil {
+		return nil, errors.New("api: 模型 API（ModelAPI）需要多租户（Tenancy）")
+	}
 	if (cfg.Quota != nil || cfg.RateLimiter != nil) && cfg.Tenancy == nil {
 		return nil, errors.New("api: 限额与预算（Quota、RateLimiter）需要多租户（Tenancy）")
 	}
@@ -283,6 +290,9 @@ func New(cfg Config) (*Handler, error) {
 		if cfg.Tenancy != nil {
 			active = append(active, tenantRoutes...)
 		}
+		if cfg.ModelAPI != nil {
+			active = append(active, modelRoutes...)
+		}
 		h.registerLimit = account.NewLimiter(registerPerMinute, h.now)
 		h.loginLimit = account.NewLimiter(loginPerMinute, h.now)
 	}
@@ -293,6 +303,10 @@ func New(cfg Config) (*Handler, error) {
 		limited := cfg.Accounts != nil && cfg.Quota != nil && cfg.RateLimiter != nil && rateLimitedRoutes[rt.method+" "+rt.path]
 		h.mux.HandleFunc(rt.method+" "+rt.path, func(w http.ResponseWriter, r *http.Request) {
 			setRoute(r, rt.path)
+			if rt.audience == audienceModels { // 认证、运行模式与错误格式由 serveModelAPI 处理
+				rt.handle(h, w, r)
+				return
+			}
 			if h.cfg.Accounts != nil {
 				var ok bool
 				if r, ok = h.authorize(w, r, rt.audience); !ok {
@@ -462,6 +476,10 @@ func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+	}
+	if h.isModelPath(r) { // 模型 API 以调用方的格式认证（serveModelAPI）
+		h.mux.ServeHTTP(w, r)
+		return
 	}
 	if h.cfg.Accounts == nil {
 		if !h.checkBearer(w, r, true) { // 只有运维 token：配置了 token 时每个请求都须携带
