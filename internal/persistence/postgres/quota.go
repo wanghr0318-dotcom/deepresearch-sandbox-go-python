@@ -321,10 +321,6 @@ func (q *QuotaStore) Sweep(ctx context.Context, limit int) (int, error) {
 	if limit <= 0 {
 		limit = 500
 	}
-	// 复审 F6：每月最后一天预先建好下个月有上限的层级的行。
-	if _, err := q.precreateNextMonth(ctx, nil); err != nil {
-		return 0, err
-	}
 	var ids []string
 	err := q.s.read(ctx, "QuotaSweepScan", func(ctx context.Context, db queryer) error {
 		rows, err := db.Query(ctx, `SELECT h.hold_id FROM quota_holds h WHERE h.state = 'held' AND h.deadline_at < now()
@@ -523,13 +519,22 @@ func (s *Store) OrgLiveSandboxes(ctx context.Context, orgID int64, taskID string
 // convertTaskHoldsTx 是账本转换（convertLedgerTx；ids 为 nil 时全部）的月度预算部分：reservation 仍为 held 的运行时调用 hold 按全额
 // 转为 charged_unknown，各层级 reserved -= 金额、unknown += 金额（不变量 G1 保持）。须在 reservations 转换之前执行。
 func convertTaskHoldsTx(ctx context.Context, tx pgx.Tx, ids []string) error {
-	if _, err := tx.Exec(ctx, `WITH h AS (SELECT q.org_id, q.user_id, q.key_id, q.period, q.amount_micro FROM quota_holds q
+	const agg = `WITH h AS (SELECT q.org_id, q.user_id, q.key_id, q.period, q.amount_micro FROM quota_holds q
 			JOIN reservations r ON r.reservation_id = q.hold_id
 			WHERE q.state = 'held' AND q.source = 'task_call' AND r.state = 'held' AND ($1::text[] IS NULL OR r.reservation_id = ANY($1))),
 		lv AS (SELECT 'org' AS k, org_id::text AS i, period, amount_micro AS a FROM h
 			UNION ALL SELECT 'user', org_id::text || '/' || user_id::text, period, amount_micro FROM h WHERE user_id IS NOT NULL
 			UNION ALL SELECT 'key', key_id, period, amount_micro FROM h WHERE key_id IS NOT NULL),
-		agg AS (SELECT k, i, period, sum(a) AS total FROM lv GROUP BY k, i, period)
+		agg AS (SELECT k, i, period, sum(a) AS total FROM lv GROUP BY k, i, period)`
+	// 复审第 2 轮 R2：先按与 ReserveTry / SettleTry 相同的固定顺序（每个月份内 org → user → key）锁住要改的预算行，
+	// 周期任务与正常的预留并发时不会因加锁顺序不同而死锁。
+	if _, err := tx.Exec(ctx, agg+`
+		SELECT 1 FROM quota_budgets b JOIN agg ON b.scope_kind = agg.k AND b.scope_id = agg.i AND b.period = agg.period
+		ORDER BY b.period, CASE b.scope_kind WHEN 'org' THEN 0 WHEN 'user' THEN 1 ELSE 2 END, b.scope_id
+		FOR UPDATE OF b`, ids); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, agg+`
 		UPDATE quota_budgets b SET reserved_micro = b.reserved_micro - agg.total, unknown_micro = b.unknown_micro + agg.total
 		FROM agg WHERE b.scope_kind = agg.k AND b.scope_id = agg.i AND b.period = agg.period`, ids); err != nil {
 		return err
@@ -646,22 +651,4 @@ func (s *Store) taskQuotaScope(ctx context.Context, taskID string) (quota.Scope,
 	s.qc.scopes[taskID] = sc
 	s.qc.mu.Unlock()
 	return sc, true
-}
-
-// precreateNextMonth 在每月最后一天（数据库时间，asOf 为 nil 时取 now()）为本月有上限的层级预先建好下个月的行（沿用
-// 本月的上限），使零点之后的第一批预留不必创建行。
-func (q *QuotaStore) precreateNextMonth(ctx context.Context, asOf *time.Time) (int, error) {
-	var n int
-	err := q.s.run(ctx, "QuotaPrecreate", "next-month", func(ctx context.Context, tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `WITH t AS (SELECT COALESCE($1::timestamptz, now()) AT TIME ZONE 'UTC' AS ts),
-				p AS (SELECT date_trunc('month', ts)::date AS cur, (date_trunc('month', ts) + interval '1 month')::date AS next, ts FROM t)
-			INSERT INTO quota_budgets (scope_kind, scope_id, period, limit_micro)
-			SELECT b.scope_kind, b.scope_id, p.next, b.limit_micro FROM quota_budgets b, p
-			WHERE b.period = p.cur AND b.limit_micro IS NOT NULL AND p.ts >= p.next - interval '1 day'
-			ORDER BY b.scope_kind, b.scope_id
-			ON CONFLICT DO NOTHING`, asOf)
-		n = int(tag.RowsAffected())
-		return err
-	})
-	return n, err
 }

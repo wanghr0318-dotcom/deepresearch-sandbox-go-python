@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
@@ -731,34 +733,41 @@ func TestQuotaMonthStartBurst(t *testing.T) {
 	checkQuota(t, w.s)
 }
 
-// TestQuotaPrecreateNextMonth（复审 F6）：每月最后一天，本月有上限的层级预先建好下个月的行（沿用上限）；其他日子与不限的
-// 层级不建。
-func TestQuotaPrecreateNextMonth(t *testing.T) {
+// TestG2RPrecreateThenLower（复审第 2 轮 R1 的回归测试）：月末把预算调低后，下个月沿用的是调低后的上限。下个月的行不预先
+// 创建（sweep 不建），而是在下个月第一次用到时按最近一个月份的上限懒创建，所以月内最后一次 PUT 总会生效。
+func TestG2RPrecreateThenLower(t *testing.T) {
 	ctx := context.Background()
 	w := newQuotaWorld(t)
 	w.setBudget(t, quota.LevelOrg, i64(700))
-	if _, err := w.q.Reserve(ctx, w.scope(), quota.SourceModelRequest, "x", 1, time.Now().Add(time.Hour)); err != nil { // user、key 行不限
+	if _, err := w.q.Reserve(ctx, w.scope(), quota.SourceModelRequest, "x", 1, time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := w.q.Sweep(ctx, 0); err != nil { // 月末也照常运行的 sweep
+		t.Fatal(err)
+	}
+	w.setBudget(t, quota.LevelOrg, i64(100)) // 管理员在月末调低
 	var cur time.Time
 	if err := w.s.pool.QueryRow(ctx, "SELECT "+periodNow).Scan(&cur); err != nil {
 		t.Fatal(err)
 	}
-	mid := cur.AddDate(0, 0, 10)
-	if n, err := w.q.precreateNextMonth(ctx, &mid); err != nil || n != 0 {
-		t.Fatalf("月中不预建：%d, %v", n, err)
-	}
-	last := cur.AddDate(0, 1, 0).Add(-3 * time.Hour)
-	if n, err := w.q.precreateNextMonth(ctx, &last); err != nil || n != 1 {
-		t.Fatalf("最后一天预建有上限的 org 行：%d, %v", n, err)
-	}
 	next := cur.AddDate(0, 1, 0)
-	if b, err := w.q.GetBudget(ctx, w.target(quota.LevelOrg), next); err != nil || b.LimitMicro == nil || *b.LimitMicro != 700 ||
-		count(t, w.s, "SELECT count(*) FROM quota_budgets WHERE period = $1", next) != 1 {
-		t.Fatalf("下个月的行 = %+v, %v", b, err)
+	if n := count(t, w.s, "SELECT count(*) FROM quota_budgets WHERE period = $1", next); n != 0 {
+		t.Fatalf("下个月的行不应预先创建：%d", n)
 	}
-	if n, _ := w.q.precreateNextMonth(ctx, &last); n != 0 {
-		t.Fatal("幂等")
+	b, err := w.q.GetBudget(ctx, w.target(quota.LevelOrg), next)
+	if err != nil || b.LimitMicro == nil || *b.LimitMicro != 100 {
+		t.Fatalf("下个月应沿用调低后的 100：%+v, %v", b, err)
+	}
+	// 下个月第一次用到时（加锁的预留事务里懒创建）行的上限是调低后的 100。
+	err = w.s.run(ctx, "test", "next", func(ctx context.Context, tx pgx.Tx) error {
+		bs, err := lockQuotaBudgetsTx(ctx, tx, []quota.Target{w.target(quota.LevelOrg)}, &next)
+		if err == nil && (bs[0].LimitMicro == nil || *bs[0].LimitMicro != 100) {
+			t.Errorf("懒创建的下个月行 = %+v", bs[0])
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 	checkQuota(t, w.s)
 }
