@@ -303,6 +303,36 @@ sudo -E ./bin/agentbox server --data-dir /var/lib/agentbox --web-dir web/dist \
 - `price` 必填，`model_prices` 按逻辑模型覆盖；单位与 `--model-price` 相同（每百万 token 的微美元）。转到后备供应商的 try 按它的价格预留与结算。
 - 后备供应商的地址同样经出网防护；私有地址须在 `--upstream-allow-private` 中。
 
+#### Anthropic 格式的供应商与路由模式（可选字段）
+
+设计见 [2026-10-11-model-gateway-design.md](design/2026-10-11-model-gateway-design.md) §7.6。下面的字段都可省略；没有它们的旧文件仍然有效，行为与之前完全相同（顺序尝试，指纹与配置摘要不变）。
+
+```json
+{"providers": [
+  {"name": "claude", "protocol": "anthropic", "base_url": "https://api.anthropic.com",
+   "key_env": "AGENTBOX_MODEL_CLAUDE_API_KEY", "anthropic_version": "2023-06-01", "weight": 1,
+   "models": {"kimi-k3": "claude-model-id"},
+   "price": {"in": 3000000, "out": 15000000, "cache_read": 300000, "cache_write": 3750000}},
+  {"name": "backup", "base_url": "https://api.example.com/v1", "key_env": "AGENTBOX_MODEL_BACKUP_API_KEY",
+   "weight": 3, "price": {"in": 2000000, "out": 8000000}}
+],
+ "routing": {"mode": "weighted", "primary_weight": 2}}
+```
+
+| 字段 | 默认 | 含义 |
+|---|---|---|
+| `protocol` | `openai` | 供应商的线路格式。`openai`：请求发往 `base_url + /chat/completions`，Key 放在 `Authorization: Bearer`。`anthropic`：请求发往 `base_url + /v1/messages`（`base_url` 不含 `/v1`），Key 放在 `x-api-key`，并带 `anthropic-version`。 |
+| `anthropic_version` | `2023-06-01` | `anthropic-version` 头；只用于 `protocol: anthropic`。 |
+| `weight` | 1 | 路由权重（至少 1），用于 `weighted` 与 `latency` 模式。 |
+| `price.cache_read`、`price.cache_write` | 按 `in` 计 | 缓存读取、缓存写入的输入单价（每百万 token 的微美元；`model_prices` 中同样可用）。预留按 `in` 与 `cache_write` 中较高者估算。 |
+| `routing.mode` | 有权重时 `weighted`，否则 `ordered` | `ordered`：按文件顺序（主供应商在前），与之前相同。`weighted`：在提供该模型、熔断器关闭的供应商中按平滑加权轮询（nginx 算法）选第一个，其余按权重从高到低作为后备。`latency`：同 `weighted`，有效权重为权重 ÷ 首 token 时间的 EWMA，不低于最快供应商的 5%，慢的供应商仍有少量探测流量。 |
+| `routing.primary_weight` | 1 | 主供应商（`--model-base-url`）的权重。 |
+
+- 沙箱里的 Worker 仍发送 OpenAI 格式的请求。转到 Anthropic 供应商时，Gateway 把请求转换为 Anthropic 格式，再把回复转回 OpenAI 格式，Worker 看到的结构与 OpenAI 供应商相同（`choices[0].message`、`tool_calls`、`finish_reason`、`usage.prompt_tokens`）。之前轮次 assistant 消息中的 `reasoning_content` 不发给 Anthropic 供应商。journal、重放、指纹、预留与结算的规则不变；结算按该供应商的价格，缓存 token 按缓存单价计。
+- 只有 OpenAI 格式才有的请求字段（例如 `response_format` 为 `json_schema`）不能转换：这样的请求跳过 Anthropic 供应商，跳过原因为 `unsupported_protocol`。
+- 熔断、每 try 超时与对冲的语义不变；每次调用的供应商顺序在调用开始时确定，同一调用内的换供应商与对冲沿用它。
+- 校验失败（未知的 `protocol` 或 `routing.mode`、`anthropic_version` 用于 openai 供应商、权重小于 1、负的缓存单价）时 `agentbox server` 以退出码 2 拒绝启动。
+
 在上文的 `agentbox server` 命令后加：
 
 ```bash
@@ -334,12 +364,14 @@ sudo -E ./bin/agentbox server ... --model-fallback-file /etc/agentbox/model-fall
 ./bin/agentbox task inspect <task_id> --format text   # "MODEL CALL" 表：TRY、PROVIDER、LATENCY、OUTCOME、HEDGE、SKIPPED
 ```
 
-`GET /tasks/{id}/inspect` 的 `calls[].tries[]` 带 `provider`、`skipped`（`name:reason`，原因为 `circuit_open`、`tried`、`model_not_served`）、`hedge` 与 `hedge_lost`；单供应商配置下这些字段省略。Gateway 日志的 `gateway: try` 行另带 `route`、`route_skipped`、`hedge`、`breaker`；熔断状态变化记为 `gateway: breaker`（`route`、`from`、`to`），降级记为 `gateway: degraded`。
+`GET /tasks/{id}/inspect` 的 `calls[].tries[]` 带 `provider`、`skipped`（`name:reason`，原因为 `circuit_open`、`tried`、`model_not_served`、`unsupported_protocol`）、`hedge` 与 `hedge_lost`；单供应商配置下这些字段省略。Gateway 日志的 `gateway: try` 行另带 `route`、`route_skipped`、`hedge`、`breaker`；熔断状态变化记为 `gateway: breaker`（`route`、`from`、`to`），降级记为 `gateway: degraded`。
 
 混沌测试（fake upstream，零费用；测量有无降级链时一次模型调用的延迟，结果见[证据](evidence/2026-10-10-model-fallback.md)；只在设置 `AGENTBOX_CHAOS_RUNS` 时运行，平时由确定性的 `TestRoute*`/`TestHedge*` 覆盖）：
 
 ```bash
 AGENTBOX_CHAOS_RUNS=5 go test ./internal/gateway/call -run TestChaos -v
+```
+
 ### Kubernetes provider（`--provider k8s`，可选）
 
 默认的 `--provider local` 不变。`--provider k8s` 把每个环境放进一个 Kubernetes Pod（设计见 [k8s provider 设计](design/2026-10-10-k8s-provider-design.md)，测量见[证据](evidence/2026-10-10-k8s-provider.md)）：

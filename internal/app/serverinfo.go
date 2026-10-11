@@ -12,6 +12,7 @@ import (
 	"sort"
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/llmproto"
 )
 
 func (s *server) serverInfo() map[string]any {
@@ -61,10 +62,17 @@ func upstreamFingerprint(c Config) string {
 		Models         map[string]string
 		Pricing        any
 		PricingByModel []string
+		// 线路格式与 anthropic-version 只在非默认时出现：只用 OpenAI 兼容供应商的配置摘要与之前相同。
+		Protocol         string `json:",omitempty"`
+		AnthropicVersion string `json:",omitempty"`
 	}
 	fbs := make([]fallback, 0, len(c.Model.Fallbacks))
 	for _, fb := range c.Model.Fallbacks { // 不含 APIKey
-		fbs = append(fbs, fallback{fb.Name, fb.BaseURL, fb.Models, fb.Pricing, sortedPricing(fb.PricingByModel)})
+		proto := string(fb.Protocol)
+		if proto == string(llmproto.ProtocolOpenAI) {
+			proto = ""
+		}
+		fbs = append(fbs, fallback{fb.Name, fb.BaseURL, fb.Models, fb.Pricing, sortedPricing(fb.PricingByModel), proto, fb.AnthropicVersion})
 	}
 	b, _ := json.Marshal(struct {
 		BaseURL, Name     string

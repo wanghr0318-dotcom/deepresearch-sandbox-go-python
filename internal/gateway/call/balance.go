@@ -41,8 +41,8 @@ const (
 	minLatency = time.Millisecond
 )
 
-// effectiveMode 是生效的模式：未设置时有权重为 weighted，否则 ordered。
-func (r RoutingConfig) effectiveMode() RoutingMode {
+// EffectiveMode 是生效的模式：未设置时有权重为 weighted，否则 ordered。
+func (r RoutingConfig) EffectiveMode() RoutingMode {
 	if r.Mode != "" {
 		return r.Mode
 	}

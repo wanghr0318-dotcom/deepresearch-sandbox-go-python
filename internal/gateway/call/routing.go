@@ -90,7 +90,7 @@ func (c *Coordinator) newRouteSet(a upstream.Adapter) *routeSet {
 	}
 	rs := &routeSet{router: r, names: r.Routes()}
 	rs.proto, _ = a.(upstream.ProtocolRouter)
-	if m := c.routing.effectiveMode(); m != RoutingOrdered {
+	if m := c.routing.EffectiveMode(); m != RoutingOrdered {
 		rs.bal = newBalancer(m, rs.names, c.routing.Weights)
 	}
 	for _, name := range rs.names {
