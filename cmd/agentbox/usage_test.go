@@ -97,22 +97,56 @@ func TestUsageAndBillCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = conn.Close(ctx) }()
+	// Today is not final yet: without a rollup, a change to today's rows is not compared (review M3) — the report says so.
 	if _, err := conn.Exec(ctx, `UPDATE usage_daily SET unknown_micro = unknown_micro + 7`); err != nil {
 		t.Fatal(err)
 	}
-	code, out, errb := run(runBill, "reconcile", month, "--no-rollup")
-	if code != 1 || !strings.Contains(out, "差异 usage_daily") || !strings.Contains(out, "org=acme user=alice") ||
+	if code, out, errb := run(runBill, "reconcile", month, "--no-rollup"); code != 0 || !strings.Contains(out, "未比较") {
+		t.Fatalf("not-final days without a rollup = %d %q %q", code, out, errb)
+	}
+	// The default rollup first recomputes today's rows, which repairs it.
+	if code, out, errb := run(runBill, "reconcile", month); code != 0 {
+		t.Fatalf("reconcile after rollup = %d %q %q", code, out, errb)
+	}
+
+	// A past, final day (2020-01-15): rolled up with --rollup --from, then tampered with. Reconcile reports it with
+	// and without a rollup (days before the watermark are never recomputed automatically); `usage --rollup --from`
+	// repairs it (review M2).
+	for _, q := range []string{
+		`INSERT INTO quota_holds (hold_id, org_id, user_id, period, source, ref, amount_micro, state, charged_micro, deadline_at, created_at)
+			VALUES ('h_2020', $1, $2, '2020-01-01', 'model_request', 'mr_2020', 900, 'settled', 800, '2020-01-15 13:00+00', '2020-01-15 12:00+00')`,
+		`INSERT INTO quota_budgets (scope_kind, scope_id, period, spent_micro) VALUES ('org', $1::bigint::text, '2020-01-01', 800),
+			('user', $1::bigint::text || '/' || $2::bigint::text, '2020-01-01', 800)`,
+	} {
+		if _, err := conn.Exec(ctx, q, m.OrgID, m.UserID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if code, out, errb := run(runUsage, "--rollup", "--from", "2020-01-01", "--to", "2020-01-31", "--org", "acme"); code != 0 ||
+		!strings.Contains(out, "2020-01-15") || !strings.Contains(out, "$0.000800") {
+		t.Fatalf("usage --rollup --from = %d %q %q", code, out, errb)
+	}
+	if code, out, errb := run(runBill, "reconcile", "2020-01", "--no-rollup"); code != 0 || strings.Contains(out, "未比较") {
+		t.Fatalf("2020-01 = %d %q %q", code, out, errb)
+	}
+	if _, err := conn.Exec(ctx, `UPDATE usage_daily SET unknown_micro = unknown_micro + 7 WHERE day = '2020-01-15'`); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errb := run(runBill, "reconcile", "2020-01")
+	if code != 1 || !strings.Contains(out, "差异 usage_daily 2020-01-15") || !strings.Contains(out, "org=acme user=alice") ||
 		!strings.Contains(errb, "1 处差异") {
 		t.Fatalf("injected difference = %d %q %q", code, out, errb)
 	}
-	code, out, _ = run(runBill, "reconcile", month, "--no-rollup", "--json")
+	code, out, _ = run(runBill, "reconcile", "2020-01", "--no-rollup", "--json")
 	var rep usage.Report
-	if err := json.Unmarshal([]byte(out), &rep); code != 1 || err != nil || len(rep.Usage) != 1 || rep.Usage[0].Rollup.UnknownMicro != 500_007 {
+	if err := json.Unmarshal([]byte(out), &rep); code != 1 || err != nil || len(rep.Usage) != 1 || rep.Usage[0].Rollup.UnknownMicro != 7 {
 		t.Fatalf("json report = %d %v %s", code, err, out)
 	}
-	// The default rollup first recomputes today's rows, which repairs the injected difference.
-	if code, out, errb := run(runBill, "reconcile", month); code != 0 {
-		t.Fatalf("reconcile after rollup = %d %q %q", code, out, errb)
+	if code, _, errb := run(runUsage, "--rollup", "--from", "2020-01-15", "--to", "2020-01-15"); code != 0 {
+		t.Fatalf("repair = %d %q", code, errb)
+	}
+	if code, out, errb := run(runBill, "reconcile", "2020-01"); code != 0 {
+		t.Fatalf("after the repair = %d %q %q", code, out, errb)
 	}
 	if _, err := conn.Exec(ctx, `UPDATE quota_budgets SET spent_micro = spent_micro + 1 WHERE scope_kind = 'org'`); err != nil {
 		t.Fatal(err)

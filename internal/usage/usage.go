@@ -154,6 +154,8 @@ type Store interface {
 	Reconcile(ctx context.Context, month time.Time, rollupFirst bool) (Report, error)
 	// Status returns the rollup state.
 	Status(ctx context.Context) (Status, error)
+	// UserHasUsage reports whether userID has any usage_daily row in orgID (a former member's history stays the org's).
+	UserHasUsage(ctx context.Context, orgID, userID int64) (bool, error)
 }
 
 // Month returns the first day of t's UTC month.

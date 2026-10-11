@@ -1239,6 +1239,16 @@ export interface components {
              * @description Time of the last rollup (null before the first)
              */
             as_of: string | null;
+            filter: components["schemas"]["UsageFilter"];
+        };
+        /** @description The filters that were applied (the caller's visibility and the query parameters) */
+        UsageFilter: {
+            /** @description Absent when every org is included (operator) */
+            org?: string;
+            /** @description Only this user's usage (a member's own */
+            username?: string;
+            /** @description Only this key's usage (`?key=`) */
+            key_id?: string;
         };
         BillLine: components["schemas"]["UsageTotals"] & {
             model: string;
@@ -1257,13 +1267,16 @@ export interface components {
                 id: number;
                 name: string;
             };
-            /** @description Set on a member's bill (their own share) */
+            /** @description Only this user's share: a member's own bill, or `?user=` */
             username?: string;
+            /** @description Only this key's share (`?key=`) */
+            key_id?: string;
             models: components["schemas"]["BillLine"][];
             sources: components["schemas"]["BillSource"][];
             total: components["schemas"]["BillLine"];
             /** Format: date-time */
             as_of: string | null;
+            filter: components["schemas"]["UsageFilter"];
         };
         MemberList: {
             org: {
@@ -4184,7 +4197,7 @@ export interface operations {
                 group_by?: string;
                 /** @description The org name (the operator; others may only name their own) */
                 org?: string;
-                /** @description A username of the org (members may only name themselves) */
+                /** @description A username of the org, or a former member with usage in it (members may only name themselves) */
                 user?: string;
                 /** @description An API key id the caller can see */
                 key?: string;

@@ -30,10 +30,25 @@ const (
 	// 汇总与对账扫描一个月的数据，比普通用例的期限长。
 	usageOpTimeout        = 2 * time.Minute
 	usageStatementTimeout = time.Minute
-	// usageWatermarkLag：watermark 至多推进到这么久之前所在的一天，覆盖 hold 结算后才写入的 model_requests 行
-	// 与跨零点提交的事务。
+	// usageWatermarkLag：watermark 至多推进到这么久之前所在的一天（跨零点提交的事务）。
 	usageWatermarkLag = "1 hour"
+	// usageRecordGrace：期限过去这么久之内的 hold 仍可能变化（期限到时 sweep 每 30 s 一次转为 charged_unknown）。
+	usageRecordGrace = "2 minutes"
+	// usageRowGrace：已结算的模型 API hold 还没有 model_requests 行时，其一天在期限之后最多再保持这么久（G3 先结算 hold、
+	// 再写行，写行有重试；hold 没有结算时间列，期限是结算时间的上界，所以"期限之后 10 分钟"覆盖"结算之后 10 分钟"）。
+	usageRowGrace = "10 minutes"
 )
+
+// usageOpenSQL 是仍可能变化的最早时刻（复审 M1）：held 的 hold；期限未过（含 usageRecordGrace）的 hold——结算与之后写入的
+// model_requests 行都在期限之内；已结算却还没有 model_requests 行、期限过去不到 usageRowGrace 的模型 API hold。
+// 至多为一小时前。结果所在的 UTC 日即新的 watermark。
+const usageOpenSQL = `SELECT (LEAST(
+		(SELECT min(created_at) FROM quota_holds WHERE state = 'held'),
+		(SELECT min(created_at) FROM quota_holds WHERE deadline_at > now() - interval '` + usageRecordGrace + `'),
+		(SELECT min(q.created_at) FROM quota_holds q WHERE q.source = 'model_request' AND q.state IN ('settled', 'charged_unknown')
+			AND q.deadline_at > now() - interval '` + usageRowGrace + `'
+			AND NOT EXISTS (SELECT 1 FROM model_requests m WHERE m.hold_id = q.hold_id)),
+		now() - interval '` + usageWatermarkLag + `') AT TIME ZONE 'UTC')::date`
 
 // UsageStore 实现 usage.Store。
 type UsageStore struct{ s *Store }
@@ -143,7 +158,7 @@ func utcDay(t time.Time) time.Time {
 }
 
 // rollupTx 删除并重算 usage_daily 中从起始日到今天的各天，然后移动 watermark。起始日是 watermark 与 from（非零时）
-// 中较早的一个；从未汇总过时为最早的 hold 所在的一天。
+// 中较早的一个；从未汇总过时为最早的 hold 所在的一天（与 from 中较早的一个）。
 func rollupTx(ctx context.Context, tx pgx.Tx, from time.Time) (usage.RollupResult, error) {
 	var wm *time.Time
 	if err := tx.QueryRow(ctx, `SELECT watermark FROM usage_rollup_state WHERE id FOR UPDATE`).Scan(&wm); err != nil {
@@ -161,6 +176,15 @@ func rollupTx(ctx context.Context, tx pgx.Tx, from time.Time) (usage.RollupResul
 		}
 		low = utcDay(low)
 	}
+	if wm == nil && !from.IsZero() { // 复审 N4：从未汇总过时，给出的起始日不能跳过更早的历史
+		var first time.Time
+		if err := tx.QueryRow(ctx, `SELECT COALESCE((SELECT min(created_at) FROM quota_holds), $1::timestamptz)`, low).Scan(&first); err != nil {
+			return usage.RollupResult{}, err
+		}
+		if first = utcDay(first); first.Before(low) {
+			low = first
+		}
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM usage_daily WHERE day >= $1::date`, low); err != nil {
 		return usage.RollupResult{}, err
 	}
@@ -170,8 +194,7 @@ func rollupTx(ctx context.Context, tx pgx.Tx, from time.Time) (usage.RollupResul
 		return usage.RollupResult{}, err
 	}
 	var next time.Time
-	if err := tx.QueryRow(ctx, `SELECT (LEAST(COALESCE((SELECT min(created_at) FROM quota_holds WHERE state = 'held'), now()),
-			now() - interval '`+usageWatermarkLag+`') AT TIME ZONE 'UTC')::date`).Scan(&next); err != nil {
+	if err := tx.QueryRow(ctx, usageOpenSQL).Scan(&next); err != nil {
 		return usage.RollupResult{}, err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE usage_rollup_state SET watermark = $1, last_run_at = now() WHERE id`, next); err != nil {
@@ -197,6 +220,15 @@ func (u *UsageStore) Status(ctx context.Context) (usage.Status, error) {
 		return nil
 	})
 	return st, err
+}
+
+// UserHasUsage 实现 usage.Store。
+func (u *UsageStore) UserHasUsage(ctx context.Context, orgID, userID int64) (bool, error) {
+	var ok bool
+	err := u.s.read(ctx, "UserHasUsage", func(ctx context.Context, q queryer) error {
+		return q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM usage_daily WHERE org_id = $1 AND user_id = $2)`, orgID, userID).Scan(&ok)
+	})
+	return ok, err
 }
 
 // usageDimSQL 是各维度的选择表达式（分组时）与不分组时的占位值；列顺序固定为 day、org、user、key、model、source。
@@ -294,16 +326,27 @@ func scanUsageRows(rows pgx.Rows) ([]usage.Row, error) {
 }
 
 // Reconcile 实现 usage.Store：同一快照中（rollupFirst 时先汇总）重算该月、读 usage_daily 与 quota_budgets 并比较。
+// 不先汇总时（复审 M3）只比较 watermark 之前的日子（它们已是终值；之后的日子要等下次汇总），预算总是比较。
 func (u *UsageStore) Reconcile(ctx context.Context, month time.Time, rollupFirst bool) (usage.Report, error) {
 	from := usage.Month(month)
 	to := from.AddDate(0, 1, 0)
 	var raw, daily []usage.Row
 	var budgets []usage.BudgetRow
 	orgs, users := map[int64]string{}, map[int64]string{}
+	cutoff := "" // 空：比较全部日子
 	err := u.snapshot(ctx, "UsageReconcile", rollupFirst, func(ctx context.Context, tx pgx.Tx) error {
 		if rollupFirst {
 			if _, err := rollupTx(ctx, tx, time.Time{}); err != nil {
 				return fmt.Errorf("汇总: %w", err)
+			}
+		} else {
+			var wm *time.Time
+			if err := tx.QueryRow(ctx, `SELECT watermark FROM usage_rollup_state WHERE id`).Scan(&wm); err != nil {
+				return err
+			}
+			cutoff = "0000-01-01" // 从未汇总过：没有终值的日子
+			if wm != nil {
+				cutoff = utcDay(*wm).Format("2006-01-02")
 			}
 		}
 		rows, err := tx.Query(ctx, rawUsageSQL, from, to)
@@ -341,7 +384,7 @@ func (u *UsageStore) Reconcile(ctx context.Context, month time.Time, rollupFirst
 	if err != nil {
 		return usage.Report{}, err
 	}
-	rep := usage.Compare(from, raw, daily, budgets)
+	rep := usage.CompareBefore(from, raw, daily, budgets, cutoff)
 	rep.OrgNames, rep.Usernames = orgs, users
 	return rep, nil
 }

@@ -14,7 +14,7 @@ import (
 )
 
 // undo0015 把库还原为只应用了 0014 的形状（undo0014 先执行它）。
-const undo0015 = `DROP TABLE usage_daily, usage_rollup_state; DROP INDEX quota_holds_created, quota_holds_held_created;
+const undo0015 = `DROP TABLE usage_daily, usage_rollup_state; DROP INDEX quota_holds_created, quota_holds_held_created, quota_holds_deadline;
 	DELETE FROM schema_migrations WHERE version >= 15;
 `
 
@@ -178,6 +178,8 @@ func TestUsageWatermark(t *testing.T) {
 	// A marker row before the watermark is left alone by incremental runs.
 	mustExec(t, w.s, `INSERT INTO usage_daily (day, org_id, source, requests) VALUES ('2020-01-01', $1, 'runtime', 1)`, w.org)
 	mustNil(t, w.q.Settle(ctx, hold, 40, false))
+	// Its deadline (and the grace for a late model_requests row) has passed: the day is final.
+	mustExec(t, w.s, `UPDATE quota_holds SET deadline_at = now() - interval '1 hour' WHERE hold_id = $1`, string(hold))
 	if res, err = us.Rollup(ctx, time.Time{}); err != nil || !res.From.Equal(held) || res.Rows != 1 {
 		t.Fatalf("rollup after settling = %+v %v", res, err)
 	}
@@ -365,5 +367,127 @@ func TestListMembers(t *testing.T) {
 	}
 	if ms, err := w.s.TenancyStore().ListMembers(context.Background(), 999999); err != nil || len(ms) != 0 {
 		t.Fatalf("unknown org = %+v %v", ms, err)
+	}
+}
+
+// Review M1: a model API hold settles before its model_requests row is written. A rollup between the two must not
+// close the day: the day stays open until the hold's deadline (plus grace) has passed, so the late row is picked up
+// (settle → rollup → record → rollup), and the month reconciles.
+func TestUsageLateRecord(t *testing.T) {
+	ctx := context.Background()
+	w := newQuotaWorld(t)
+	us := w.s.UsageStore()
+	hold, err := w.q.Reserve(ctx, w.scope(), quota.SourceModelRequest, "mr_late", 100, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A long request: it started yesterday (moved back one day; its deadline is still ahead).
+	mustExec(t, w.s, `UPDATE quota_holds SET created_at = created_at - interval '1 day' WHERE hold_id = $1`, string(hold))
+	yesterday := today().AddDate(0, 0, -1)
+	mustNil(t, w.q.Settle(ctx, hold, 50, false))
+	res, err := us.Rollup(ctx, time.Time{})
+	if err != nil || !res.Watermark.Equal(yesterday) {
+		t.Fatalf("rollup after settle = %+v %v (the day must stay open until the deadline)", res, err)
+	}
+	var at time.Time
+	if err := w.s.pool.QueryRow(ctx, `SELECT created_at FROM quota_holds WHERE hold_id = $1`, string(hold)).Scan(&at); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.s.ModelRequests().RecordModelRequest(ctx, modelRecord(w, "mr_late", hold, at.Add(-time.Millisecond))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := us.Rollup(ctx, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	got := usageBy(t, w, usage.Query{From: yesterday, To: yesterday, GroupBy: []usage.Dim{usage.DimModel}})
+	if len(got) != 1 || got["||||smart|"] != (usage.Totals{Requests: 1, PromptTokens: 13, CompletionTokens: 5, CostMicro: 50}) {
+		t.Fatalf("late record not rolled up: %+v", got)
+	}
+	// (Budgets are not checked here: the hold was moved to another day, possibly another month.)
+	if rep, err := us.Reconcile(ctx, yesterday, true); err != nil || len(rep.Usage) != 0 {
+		t.Fatalf("reconcile = %+v %v", rep, err)
+	}
+
+	// A settled model API hold without its row keeps the day open for 10 minutes after the deadline, then closes it.
+	h2, err := w.q.Reserve(ctx, w.scope(), quota.SourceModelRequest, "mr_norow", 100, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustNil(t, w.q.Settle(ctx, h2, 10, false))
+	mustExec(t, w.s, `UPDATE quota_holds SET deadline_at = now() - interval '5 minutes' WHERE hold_id = $1`, string(hold))
+	mustExec(t, w.s, `UPDATE quota_holds SET created_at = created_at - interval '3 days', deadline_at = now() - interval '5 minutes'
+		WHERE hold_id = $1`, string(h2))
+	if res, err := us.Rollup(ctx, time.Time{}); err != nil || !res.Watermark.Equal(today().AddDate(0, 0, -3)) {
+		t.Fatalf("missing row within 10 min of the deadline = %+v %v", res, err)
+	}
+	mustExec(t, w.s, `UPDATE quota_holds SET deadline_at = now() - interval '20 minutes' WHERE hold_id IN ($1, $2)`, string(hold), string(h2))
+	if res, err := us.Rollup(ctx, time.Time{}); err != nil || !res.Watermark.Equal(utcDay(time.Now().Add(-time.Hour))) {
+		t.Fatalf("after the grace = %+v %v", res, err)
+	}
+}
+
+// Review N4: the first rollup with an explicit from still starts at the oldest hold.
+func TestUsageFirstRollupWithFrom(t *testing.T) {
+	ctx := context.Background()
+	w := newQuotaWorld(t)
+	hold, err := w.q.Reserve(ctx, w.scope(), quota.SourceModelRequest, "mr_old", 100, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustNil(t, w.q.Settle(ctx, hold, 30, false))
+	mustExec(t, w.s, `UPDATE quota_holds SET created_at = created_at - interval '3 days', deadline_at = now() - interval '1 hour'
+		WHERE hold_id = $1`, string(hold))
+	res, err := w.s.UsageStore().Rollup(ctx, today())
+	if err != nil || !res.From.Equal(today().AddDate(0, 0, -3)) || res.Rows != 1 {
+		t.Fatalf("first rollup from today = %+v %v", res, err)
+	}
+}
+
+// Review M3: without a rollup, usage_daily is compared only before the watermark (later days are not final yet), but
+// budgets are always compared.
+func TestUsageReconcileWithoutRollup(t *testing.T) {
+	ctx := context.Background()
+	w := usageWorld(t)
+	us := w.s.UsageStore()
+	rep, err := us.Reconcile(ctx, today(), false)
+	if err != nil || !rep.OK() || rep.SkippedFrom == "" {
+		t.Fatalf("never rolled up: %+v %v", rep, err)
+	}
+	if _, err := us.Rollup(ctx, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, w.s, `UPDATE usage_daily SET cost_micro = cost_micro + 1`) // today: not final, not compared
+	rep, err = us.Reconcile(ctx, today(), false)
+	if err != nil || !rep.OK() || rep.SkippedFrom > today().Format("2006-01-02") {
+		t.Fatalf("today's rows are not compared without a rollup: %+v %v", rep, err)
+	}
+	var sb strings.Builder
+	usage.WriteReport(&sb, rep)
+	if !strings.Contains(sb.String(), "未比较") {
+		t.Fatalf("report does not say what was skipped:\n%s", sb.String())
+	}
+	if rep, _ := us.Reconcile(ctx, today(), true); !rep.OK() { // a rollup recomputes today
+		t.Fatalf("with rollup: %+v", rep)
+	}
+	mustExec(t, w.s, `UPDATE quota_budgets SET spent_micro = spent_micro + 1 WHERE scope_kind = 'org'`)
+	if rep, _ := us.Reconcile(ctx, today(), false); len(rep.Budgets) != 1 || len(rep.Usage) != 0 {
+		t.Fatalf("budgets are always compared: %+v", rep)
+	}
+}
+
+func TestUserHasUsage(t *testing.T) {
+	ctx := context.Background()
+	w := usageWorld(t)
+	us := w.s.UsageStore()
+	if _, err := us.Rollup(ctx, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		org, user int64
+		want      bool
+	}{{w.org, w.user, true}, {w.org, w.other, false}, {w.org + 1000, w.user, false}} {
+		if got, err := us.UserHasUsage(ctx, c.org, c.user); err != nil || got != c.want {
+			t.Fatalf("UserHasUsage(%d, %d) = %v %v", c.org, c.user, got, err)
+		}
 	}
 }

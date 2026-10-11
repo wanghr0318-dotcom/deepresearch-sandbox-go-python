@@ -57,6 +57,9 @@ type Report struct {
 	Raw     Totals       `json:"raw"`    // the month recomputed from the raw holds
 	Rollup  Totals       `json:"rollup"` // the month in usage_daily
 	Usage   []Diff       `json:"usage_differences"`
+	// SkippedFrom is the first day whose usage_daily rows were not compared (not final yet: on or after the rollup
+	// watermark, when reconciling without a rollup); empty when every day was compared.
+	SkippedFrom string `json:"skipped_from,omitempty"`
 	Budgets []BudgetDiff `json:"budget_differences"`
 	// Names for printing (filled by the store).
 	OrgNames  map[int64]string `json:"-"`
@@ -74,7 +77,16 @@ func keyLess(a, b Key) int {
 // Compare reconciles a month: raw (recomputed) rows against the stored usage_daily rows, and the raw rows summed per
 // budget level against the month's budget rows.
 func Compare(month time.Time, raw, daily []Row, budgets []BudgetRow) Report {
+	return CompareBefore(month, raw, daily, budgets, "")
+}
+
+// CompareBefore is Compare, but usage_daily is compared only for days before the day `before` (YYYY-MM-DD; "" compares
+// every day). Budgets are always compared in full: raw holds against quota_budgets is exact in any snapshot.
+func CompareBefore(month time.Time, raw, daily []Row, budgets []BudgetRow, before string) Report {
 	rep := Report{Month: Month(month).Format("2006-01"), Usage: []Diff{}, Budgets: []BudgetDiff{}}
+	if first, last := MonthRange(month); before != "" && before <= last.Format("2006-01-02") {
+		rep.SkippedFrom = max(before, first.Format("2006-01-02"))
+	}
 	byKey := map[Key]*Diff{}
 	get := func(k Key) *Diff {
 		d := byKey[k]
@@ -115,7 +127,7 @@ func Compare(month time.Time, raw, daily []Row, budgets []BudgetRow) Report {
 		rep.Rollup.Add(r.Totals)
 	}
 	for _, d := range byKey {
-		if d.Raw != d.Rollup {
+		if d.Raw != d.Rollup && (before == "" || d.Day < before) {
 			rep.Usage = append(rep.Usage, *d)
 		}
 	}
@@ -192,6 +204,9 @@ func WriteReport(w io.Writer, r Report) {
 		USD(r.Raw.CostMicro), USD(r.Raw.UnknownMicro), r.Raw.Requests, USD(r.Rollup.TotalMicro()))
 	for _, l := range r.Lines() {
 		fmt.Fprintln(w, "差异 "+l)
+	}
+	if r.SkippedFrom != "" {
+		fmt.Fprintf(w, "未比较 %s 起的 usage_daily（尚未汇总为终值；去掉 --no-rollup 可先汇总再比较）\n", r.SkippedFrom)
 	}
 	if r.OK() {
 		fmt.Fprintln(w, "一致：usage_daily 与 quota_budgets 都与原始记录相符")

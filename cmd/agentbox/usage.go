@@ -53,12 +53,13 @@ func usageFilter(ctx context.Context, s *postgres.Store, org, user, key string, 
 	return nil
 }
 
-// rollupFirst 在 --rollup 时先汇总一次。
-func rollupFirst(ctx context.Context, s *postgres.Store, on bool, stderr io.Writer, cmd string) bool {
+// rollupFirst 在 --rollup 时先汇总一次：from 为零时从 watermark 起；非零时（usage --rollup --from）另从该日起重算，
+// 用于修复对账报告的已汇总日子（复审 M2）。
+func rollupFirst(ctx context.Context, s *postgres.Store, on bool, from time.Time, stderr io.Writer, cmd string) bool {
 	if !on {
 		return true
 	}
-	if _, err := s.UsageStore().Rollup(ctx, time.Time{}); err != nil {
+	if _, err := s.UsageStore().Rollup(ctx, from); err != nil {
 		fmt.Fprintf(stderr, "agentbox %s: 汇总: %v\n", cmd, err)
 		return false
 	}
@@ -87,7 +88,7 @@ func runUsage(args []string, stdout, stderr io.Writer) int {
 	from := fs.String("from", usage.Month(now).Format("2006-01-02"), "第一天 YYYY-MM-DD（UTC）")
 	to := fs.String("to", now.Format("2006-01-02"), "最后一天 YYYY-MM-DD（UTC，含）")
 	groupBy := fs.String("group-by", "day", "分组维度：day、model、key、user、org、source（逗号分隔）")
-	rollup := fs.Bool("rollup", false, "查询前先汇总一次")
+	rollup := fs.Bool("rollup", false, "查询前先汇总一次（同时给出 --from 时从该日起重算，用于修复对账差异）")
 	pos, ok := cliArgs(fs, args)
 	if !ok {
 		return 2
@@ -122,7 +123,13 @@ func runUsage(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agentbox usage:", err)
 		return 1
 	}
-	if !rollupFirst(ctx, s, *rollup, stderr, "usage") {
+	var repairFrom time.Time // 只有显式给出 --from 时才从该日起重算
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "from" {
+			repairFrom = q.From
+		}
+	})
+	if !rollupFirst(ctx, s, *rollup, repairFrom, stderr, "usage") {
 		return 1
 	}
 	rows, err := s.UsageStore().Usage(ctx, q)
@@ -237,7 +244,7 @@ func showBills(ctx context.Context, s *postgres.Store, month time.Time, org stri
 		fmt.Fprintln(stderr, "agentbox bill:", err)
 		return 1
 	}
-	if !rollupFirst(ctx, s, rollup, stderr, "bill") {
+	if !rollupFirst(ctx, s, rollup, time.Time{}, stderr, "bill") {
 		return 1
 	}
 	rows, err := s.UsageStore().Usage(ctx, q)

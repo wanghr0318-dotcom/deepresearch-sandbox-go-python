@@ -33,11 +33,23 @@ type memberLister interface {
 
 // usageScope 是一次用量查询可见的范围：org 0 为全部 org（只有运维），user 0、key "" 为不限。
 type usageScope struct {
-	org     int64
-	orgName string
-	user    int64
-	key     string
-	member  string // 成员（非 owner）查询时为其用户名：只看自己
+	org      int64
+	orgName  string
+	user     int64
+	key      string
+	member   string // 成员（非 owner）查询时为其用户名：只看自己
+	userName string // 生效的用户过滤（成员本人或 ?user=）
+}
+
+// usageFilterJSON 回显生效的过滤条件（复审 N1）：按用户或 key 过滤的账单与整个 org 的账单可以区分。
+type usageFilterJSON struct {
+	Org      string `json:"org,omitempty"`
+	Username string `json:"username,omitempty"`
+	KeyID    string `json:"key_id,omitempty"`
+}
+
+func (sc usageScope) filter() usageFilterJSON {
+	return usageFilterJSON{Org: sc.orgName, Username: sc.userName, KeyID: sc.key}
 }
 
 // resolveUsageScope 按调用者与 ?org=、?user=、?key= 确定范围；失败时已写出响应。
@@ -63,7 +75,7 @@ func (h *Handler) resolveUsageScope(w http.ResponseWriter, r *http.Request) (usa
 		}
 		sc.org, sc.orgName = m.OrgID, m.OrgName
 		if m.Role != tenant.Owner {
-			sc.user, sc.member = m.UserID, m.Username
+			sc.user, sc.member, sc.userName = m.UserID, m.Username, m.Username
 		}
 	}
 	if name := qv.Get("org"); name != "" {
@@ -81,14 +93,26 @@ func (h *Handler) resolveUsageScope(w http.ResponseWriter, r *http.Request) (usa
 	}
 	if name := qv.Get("user"); name != "" {
 		m, err := h.memberOf(r, name)
-		if err == nil && ((sc.org != 0 && m.OrgID != sc.org) || (sc.member != "" && m.UserID != sc.user)) {
+		switch {
+		case err != nil:
+		case sc.member != "" && m.UserID != sc.user: // 成员只能看自己
 			err = persistence.ErrNotFound
+		case sc.org != 0 && m.OrgID != sc.org:
+			// 复审 N2：已离开的成员在本 org 的历史用量仍属于本 org：有用量行即可按其过滤，否则与不存在相同。
+			ok, herr := h.cfg.Usage.UserHasUsage(ctx, sc.org, m.UserID)
+			if herr != nil {
+				writeStoreError(w, herr)
+				return sc, false
+			}
+			if !ok {
+				err = persistence.ErrNotFound
+			}
 		}
 		if err != nil {
 			writeTenancyError(w, err, "user_not_found", "用户不存在")
 			return sc, false
 		}
-		sc.user = m.UserID
+		sc.user, sc.userName = m.UserID, m.Username
 	}
 	if id := qv.Get("key"); id != "" {
 		var k tenant.Key
@@ -109,12 +133,13 @@ func (h *Handler) resolveUsageScope(w http.ResponseWriter, r *http.Request) (usa
 }
 
 type usageJSON struct {
-	From    string        `json:"from"`
-	To      string        `json:"to"`
-	GroupBy []usage.Dim   `json:"group_by"`
-	Rows    []usage.Group `json:"rows"`
-	Total   usage.Totals  `json:"total"`
-	AsOf    *time.Time    `json:"as_of"` // 上次汇总的时间；从未汇总时为 null
+	From    string          `json:"from"`
+	To      string          `json:"to"`
+	GroupBy []usage.Dim     `json:"group_by"`
+	Rows    []usage.Group   `json:"rows"`
+	Total   usage.Totals    `json:"total"`
+	AsOf    *time.Time      `json:"as_of"` // 上次汇总的时间；从未汇总时为 null
+	Filter  usageFilterJSON `json:"filter"`
 }
 
 // asOf 返回上次汇总的时间（从未汇总为 nil）。
@@ -167,7 +192,7 @@ func (h *Handler) getUsage(w http.ResponseWriter, r *http.Request) {
 	if rows == nil {
 		rows = []usage.Group{}
 	}
-	out := usageJSON{From: from.Format("2006-01-02"), To: to.Format("2006-01-02"), GroupBy: dims, Rows: rows}
+	out := usageJSON{From: from.Format("2006-01-02"), To: to.Format("2006-01-02"), GroupBy: dims, Rows: rows, Filter: sc.filter()}
 	for _, g := range rows {
 		out.Total.Add(g.Totals)
 	}
@@ -180,9 +205,11 @@ func (h *Handler) getUsage(w http.ResponseWriter, r *http.Request) {
 
 type billJSON struct {
 	usage.Bill
-	Org      orgRefJSON `json:"org"`
-	Username string     `json:"username,omitempty"` // 成员的账单：只含本人的用量
-	AsOf     *time.Time `json:"as_of"`
+	Org      orgRefJSON      `json:"org"`
+	Username string          `json:"username,omitempty"` // 只含该用户的用量（成员的账单，或 ?user=）
+	KeyID    string          `json:"key_id,omitempty"`   // 只含该 key 的用量（?key=）
+	AsOf     *time.Time      `json:"as_of"`
+	Filter   usageFilterJSON `json:"filter"`
 }
 
 // getBill：一个月（UTC）的账单，按模型列出 token 与费用（已知与未知分开），另按来源汇总。
@@ -207,7 +234,8 @@ func (h *Handler) getBill(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	out := billJSON{Bill: usage.NewBill(month, rows), Org: orgRefJSON{ID: sc.org, Name: sc.orgName}, Username: sc.member}
+	out := billJSON{Bill: usage.NewBill(month, rows), Org: orgRefJSON{ID: sc.org, Name: sc.orgName}, Username: sc.userName,
+		KeyID: sc.key, Filter: sc.filter()}
 	if out.AsOf, err = h.asOf(r); err != nil {
 		writeStoreError(w, err)
 		return

@@ -269,11 +269,11 @@ sudo AGENTBOX_DATABASE_URL=... agentbox budget show org acme --period 2026-10
 
 启用账号时，server 每分钟把**已结算的预算 hold** 汇总进按日的 `usage_daily`（迁移 0015）：每行是一个 UTC 日、org、用户、key、模型与来源的请求数、输入与输出 token、已知费用（`cost_micro`，settled 的 hold）与未知费用（`unknown_micro`，`charged_unknown` 的 hold，即结果未知时按估算全额计入的部分）。来源 `model_api` 是模型 API 的请求（模型与 token 取自 `model_requests`）；来源 `runtime` 是沙箱经 Gateway 的调用（模型取自调用；搜索、抓取等记为端点名 `search`、`fetch`；运行时调用不记录 token，token 为 0）。被释放（没有发出、或可重试失败）的 hold 不算用量。日期取 hold 的创建时间，与 hold 计入的预算月份一致，所以一个月的用量与该月 `quota_budgets` 的 `spent_micro` / `unknown_micro` 逐分相等。
 
-汇总按 watermark 增量：每次从仍有 held hold 的最早一天（至多一小时前所在的一天）起删除并重算，重跑结果相同；多个 server 的汇总经 PostgreSQL advisory lock 串行，并与对账在同一快照中进行。用量页与账单至多落后一分钟（响应中的 `as_of` 是上次汇总的时间）。
+汇总按 watermark 增量：每次从其 hold 仍可能变化的最早一天起删除并重算——仍为 held 的 hold、期限未过（另加 2 分钟）的 hold，以及已结算却还没有 `model_requests` 行、期限过去不到 10 分钟的模型 API hold 所在的日子，至多为一小时前所在的一天；所以结算之后才写入的 `model_requests` 行，即使请求持续很久，也会在下一次汇总中计入。重跑结果相同；多个 server 的汇总经 PostgreSQL advisory lock 串行，并与对账在同一快照中进行。用量页与账单至多落后一分钟（响应中的 `as_of` 是上次汇总的时间）。
 
 **HTTP 端点**（登录会话或运维 token；API key 一律 `403 permission_denied`）：
 
-- `GET /v1/usage?from=YYYY-MM-DD&to=YYYY-MM-DD&group_by=day,model,key,user,org,source`：默认本月 1 日到今天（UTC，至多 366 天）、按日分组；另可 `?user=`、`?key=` 过滤。成员只看到自己的用量，owner 看到本 org 的，运维看到全部 org（`?org=` 选一个）。看不到的 org、用户、key 与不存在的一样是 404。
+- `GET /v1/usage?from=YYYY-MM-DD&to=YYYY-MM-DD&group_by=day,model,key,user,org,source`：默认本月 1 日到今天（UTC，至多 366 天）、按日分组；另可 `?user=`、`?key=` 过滤（owner 也可以按已离开、但在本 org 有用量的用户过滤）；响应的 `filter` 字段回显生效的 org、用户与 key 过滤。成员只看到自己的用量，owner 看到本 org 的，运维看到全部 org（`?org=` 选一个）。看不到的 org、用户、key 与不存在的一样是 404。
 - `GET /v1/bills/YYYY-MM`：该月账单，按模型列出请求、输入与输出 token、已知与未知费用及合计，另按来源汇总；owner 为本 org 的账单，成员为自己在 org 中的部分（`username` 字段），运维须加 `?org=`。
 - `GET /v1/orgs/members`：org 的成员与角色（owner；运维须加 `?org=`），供"成员"页使用。
 
@@ -290,7 +290,16 @@ sudo AGENTBOX_DATABASE_URL=... agentbox bill show 2026-10 --org acme
 sudo AGENTBOX_DATABASE_URL=... agentbox bill reconcile 2026-10
 ```
 
-`agentbox bill reconcile <YYYY-MM>` 在同一快照中先汇总，再从原始的 `quota_holds`、`model_requests` 与调用记录重算该月，与 `usage_daily`（逐日、org、用户、key、模型、来源）和 `quota_budgets`（每个层级的 spent 与 unknown）比较；一致时退出码 0，有差异时逐条打印（指明 org、用户、key 与模型）并以退出码 1 结束（`--json` 输出报告，`--no-rollup` 比较现有的 `usage_daily`）。已汇总过的历史日期不会被自动重算，所以其中被改动的数据会作为差异报告出来。`agentbox verify-invariants --usage-month YYYY-MM` 把同样的比较作为 `U1 [对账]` 项加入检查（只读，不先汇总，所以当月可能有尚未汇总的差异）。
+`agentbox bill reconcile <YYYY-MM>` 在同一快照中先汇总，再从原始的 `quota_holds`、`model_requests` 与调用记录重算该月，与 `usage_daily`（逐日、org、用户、key、模型、来源）和 `quota_budgets`（每个层级的 spent 与 unknown）比较；一致时退出码 0，有差异时逐条打印（指明 org、用户、key 与模型）并以退出码 1 结束（`--json` 输出报告）。已汇总过的历史日期不会被自动重算，所以其中被改动的数据会作为差异报告出来。
+
+不先汇总的对账（`bill reconcile --no-rollup`，以及 `agentbox verify-invariants --usage-month YYYY-MM`，后者把差异作为 `U1 [对账]` 项加入检查，只读）只比较 watermark 之前的日子的 `usage_daily`——这些日子已是终值；watermark 及之后的日子要等下次汇总，报告中注明"未比较 … 起的 usage_daily"。预算总是比较（原始 hold 与 `quota_budgets` 在任何快照中都精确相等）。所以在运行中的系统上，它不会因为尚未汇总的新用量报警。
+
+**修复对账差异**：先找出原因（例如手工改过的 hold，或部分恢复的数据库），然后从报告中最早的那一天起重算，再对账确认：
+
+```bash
+sudo AGENTBOX_DATABASE_URL=... agentbox usage --rollup --from 2026-10-03   # 从该日起删除并重算 usage_daily
+sudo AGENTBOX_DATABASE_URL=... agentbox bill reconcile 2026-10             # 退出码 0 即已修复
+```
 
 **网页**：登录后顶部导航有三页：
 
@@ -302,7 +311,7 @@ sudo AGENTBOX_DATABASE_URL=... agentbox bill reconcile 2026-10
 
 - 用量来自已结算的 hold，进行中的请求（hold 仍为 held）在结算后的下一次汇总才出现；hold 结算失败而由 sweep 转为未知的模型请求没有 `model_requests` 行，记为模型"（未记录）"。
 - 运行时调用不记录 token，只有请求数与费用。
-- 对账只能在一个快照中比较：`--no-rollup` 或 `verify-invariants --usage-month` 对当月会报告尚未汇总的新用量。
+- 不先汇总的对账不检查 watermark 及之后的日子（它们会在下次汇总时重算）。
 
 ### 模型 API（`--model-api`，可选，默认关闭）
 

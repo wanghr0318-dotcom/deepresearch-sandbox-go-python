@@ -1394,7 +1394,7 @@ paths:
         - {name: to, in: query, required: false, description: 'Last UTC day, inclusive (default today); at most 366 days after `from`', schema: {type: string}}
         - {name: group_by, in: query, required: false, description: 'Comma-separated dimensions among `day`, `model`, `key`, `user`, `org`, `source` (default `day`)', schema: {type: string}}
         - {name: org, in: query, required: false, description: The org name (the operator; others may only name their own), schema: {type: string}}
-        - {name: user, in: query, required: false, description: A username of the org (members may only name themselves), schema: {type: string}}
+        - {name: user, in: query, required: false, description: 'A username of the org, or a former member with usage in it (members may only name themselves)', schema: {type: string}}
         - {name: key, in: query, required: false, description: An API key id the caller can see, schema: {type: string}}
       responses:
         '200':
@@ -1994,7 +1994,7 @@ components:
             source: {type: string, enum: [runtime, model_api]}
     Usage:
       type: object
-      required: [from, to, group_by, rows, total, as_of]
+      required: [from, to, group_by, rows, total, as_of, filter]
       properties:
         from: {type: string}
         to: {type: string}
@@ -2006,6 +2006,14 @@ components:
           items: {$ref: '#/components/schemas/UsageRow'}
         total: {$ref: '#/components/schemas/UsageTotals'}
         as_of: {type: string, format: date-time, nullable: true, description: Time of the last rollup (null before the first)}
+        filter: {$ref: '#/components/schemas/UsageFilter'}
+    UsageFilter:
+      type: object
+      description: The filters that were applied (the caller's visibility and the query parameters)
+      properties:
+        org: {type: string, description: Absent when every org is included (operator)}
+        username: {type: string, description: Only this user's usage (a member's own, or `?user=`)}
+        key_id: {type: string, description: Only this key's usage (`?key=`)}
     BillLine:
       allOf:
         - {$ref: '#/components/schemas/UsageTotals'}
@@ -2024,7 +2032,7 @@ components:
             total_micro: {type: integer}
     Bill:
       type: object
-      required: [month, org, models, sources, total, as_of]
+      required: [month, org, models, sources, total, as_of, filter]
       properties:
         month: {type: string}
         org:
@@ -2033,7 +2041,8 @@ components:
           properties:
             id: {type: integer, format: int64}
             name: {type: string}
-        username: {type: string, description: Set on a member's bill (their own share)}
+        username: {type: string, description: 'Only this user''s share: a member''s own bill, or `?user=`'}
+        key_id: {type: string, description: 'Only this key''s share (`?key=`)'}
         models:
           type: array
           items: {$ref: '#/components/schemas/BillLine'}
@@ -2042,6 +2051,7 @@ components:
           items: {$ref: '#/components/schemas/BillSource'}
         total: {$ref: '#/components/schemas/BillLine'}
         as_of: {type: string, format: date-time, nullable: true}
+        filter: {$ref: '#/components/schemas/UsageFilter'}
     MemberList:
       type: object
       required: [org, members]

@@ -34,6 +34,7 @@ type fakeUsage struct {
 	queries []usage.Query
 	rows    []usage.Group
 	lastRun time.Time
+	history map[[2]int64]bool // (org, user) pairs with usage rows
 }
 
 func (f *fakeUsage) Rollup(context.Context, time.Time) (usage.RollupResult, error) {
@@ -49,6 +50,12 @@ func (f *fakeUsage) Usage(_ context.Context, q usage.Query) ([]usage.Group, erro
 
 func (f *fakeUsage) Reconcile(context.Context, time.Time, bool) (usage.Report, error) {
 	return usage.Report{}, nil
+}
+
+func (f *fakeUsage) UserHasUsage(_ context.Context, org, user int64) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.history[[2]int64{org, user}], nil
 }
 
 func (f *fakeUsage) Status(context.Context) (usage.Status, error) {
@@ -236,5 +243,60 @@ func TestUsageResponses(t *testing.T) {
 	for _, p := range []string{"/v1/usage", "/v1/bills/2026-10"} {
 		st, body, _ := off.do("GET", p, "", session(a2))
 		expect(t, st, body, 503, "usage_unavailable")
+	}
+}
+
+// Review N1 and N2: the effective filters are echoed (a filtered bill is distinguishable from the org's), and owners
+// may filter by a former member who has usage in the org; members still cannot name anyone else.
+func TestUsageFiltersAndFormerMembers(t *testing.T) {
+	fu := &fakeUsage{history: map[[2]int64]bool{}}
+	ts := newUsageServer(t, fu)
+	alice, bob, _, org := acmeOrg(t, ts)
+	_, bobKey := ts.mintKey(t, bob, "runtime")
+	bobID := ts.ten.members[ts.acc.users["bob"].u.ID].UserID
+
+	st, body, _ := ts.do("GET", "/v1/bills/2026-10?user=bob", "", session(alice))
+	expect(t, st, body, 200, "")
+	var b billJSON
+	decodeJSONBody(t, body, &b)
+	if b.Username != "bob" || b.Filter.Username != "bob" || b.Filter.Org != "acme" || b.KeyID != "" {
+		t.Fatalf("filtered bill = %s", body)
+	}
+	st, body, _ = ts.do("GET", "/v1/bills/2026-10?key="+bobKey, "", session(alice))
+	expect(t, st, body, 200, "")
+	b = billJSON{}
+	decodeJSONBody(t, body, &b)
+	if b.KeyID != bobKey || b.Filter.KeyID != bobKey || b.Username != "" {
+		t.Fatalf("key bill = %s", body)
+	}
+	st, body, _ = ts.do("GET", "/v1/usage", "", session(alice))
+	expect(t, st, body, 200, "")
+	var u usageJSON
+	decodeJSONBody(t, body, &u)
+	if u.Filter != (usageFilterJSON{Org: "acme"}) {
+		t.Fatalf("owner filter = %s", body)
+	}
+	st, body, _ = ts.do("GET", "/v1/usage", "", session(bob))
+	expect(t, st, body, 200, "")
+	u = usageJSON{}
+	decodeJSONBody(t, body, &u)
+	if u.Filter != (usageFilterJSON{Org: "acme", Username: "bob"}) {
+		t.Fatalf("member filter = %s", body)
+	}
+
+	// bob leaves acme.
+	st, body, _ = ts.do("DELETE", "/v1/orgs/members/bob", "", session(bob))
+	expect(t, st, body, 204, "")
+	st, body, _ = ts.do("GET", "/v1/usage?user=bob", "", session(alice))
+	expect(t, st, body, 404, "user_not_found") // no rows in acme: same as a stranger
+	fu.history[[2]int64{org, bobID}] = true
+	st, body, _ = ts.do("GET", "/v1/usage?user=bob", "", session(alice))
+	expect(t, st, body, 200, "")
+	if q := fu.last(t); q.OrgID != org || q.UserID != bobID {
+		t.Fatalf("former member query = %+v", q)
+	}
+	decodeJSONBody(t, body, &u)
+	if u.Filter.Username != "bob" {
+		t.Fatalf("former member filter = %s", body)
 	}
 }
