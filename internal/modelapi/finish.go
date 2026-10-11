@@ -15,17 +15,21 @@ import (
 // settleAttempts bounds the settlement retries; a hold left held is swept to charged_unknown at its deadline.
 const settleAttempts = 3
 
-// finish is §7.7 step 8: settle the hold with the actual cost (unknown outcomes conservatively, charged_unknown),
-// refund unused tokens, release the stream slot, record the request and its tries, and update the metrics. It runs
-// on a context of its own: a client that left does not stop the accounting.
+// finish is §7.7 step 8: release the stream slot, settle the hold with the actual cost (unknown outcomes
+// conservatively, charged_unknown), refund unused tokens, record the request and its tries, and update the metrics. It
+// runs on a context of its own: a client that left does not stop the accounting.
+//
+// The stream slot is released first: the stream is over when finish runs, and the accounting may take a while
+// (PostgreSQL round trips and retries). Holding the slot until then made the caller's next stream a spurious 429, and
+// made "the request is recorded" an unreliable sign that its slot is free.
 func (h *Handler) finish(x *exchange, pr tenant.Principal, lim *taken, hold quota.HoldID, est int64) {
 	if x.finished { // idempotent: the panic guard may run it after a normal call failed half-way
 		return
 	}
 	x.finished = true
+	lim.releaseSlot()
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(x.r.Context()), finishTimeout)
 	defer cancel()
-	defer lim.releaseSlot()
 
 	charged, unknown := x.unknownCost, x.anyUnknown
 	var okCost int64
