@@ -10,7 +10,6 @@ package call
 import (
 	"context"
 	"errors"
-	"math"
 	"strings"
 	"time"
 
@@ -250,11 +249,9 @@ func (c *Coordinator) costOn(j *job, rs *routeSet, l leg, u upstream.Usage) int6
 	if rs == nil || l.route <= 0 {
 		return c.cost(j.in.Kind, j.model, u, l.est)
 	}
-	p := rs.router.PricingOn(l.route, j.model)
-	in, ok1 := mulCeil(u.InputTokens, p.InputMicroPerMTok, 1_000_000)
-	out, ok2 := mulCeil(u.OutputTokens, p.OutputMicroPerMTok, 1_000_000)
-	if !ok1 || !ok2 || in > math.MaxInt64-out {
+	v, ok := rs.router.PricingOn(l.route, j.model).ChatCost(u)
+	if !ok {
 		return l.est
 	}
-	return in + out
+	return v
 }

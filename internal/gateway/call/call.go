@@ -1323,8 +1323,11 @@ func (c *Coordinator) cost(kind upstream.Kind, model string, u upstream.Usage, e
 	}
 	switch kind {
 	case upstream.KindChat:
-		add(u.InputTokens, p.InputMicroPerMTok, 1_000_000)
-		add(u.OutputTokens, p.OutputMicroPerMTok, 1_000_000)
+		v, ok := p.ChatCost(u) // 含缓存读取、写入单价（未设置时与输入单价合并，结果与之前相同）
+		if !ok {
+			return est
+		}
+		return v
 	case upstream.KindSearch:
 		add(int64(u.Requests), p.SearchMicroPerRequest, 1)
 	case upstream.KindFetch:
