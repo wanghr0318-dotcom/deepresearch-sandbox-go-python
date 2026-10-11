@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ApiError } from "../api/client";
 import type { ApiKey, Bill, Budget, GatewayApiLike, Invite, Me, Usage } from "../api/gateway";
 import { flushAll } from "../components/testkit";
-import { budgetBar, dailySeries, isPersonalOrg, usd } from "../lib/gateway";
+import { budgetBar, dailySeries, isPersonalOrg, remainingText, usd, usdExact } from "../lib/gateway";
 import { gatewayServicesKey } from "../lib/gatewayServices";
 import type { GatewayServices } from "../lib/gatewayServices";
 import { parseHash } from "../lib/router";
@@ -40,11 +40,11 @@ function invite(over: Partial<Invite> = {}): Invite {
 const ZERO = { requests: 0, prompt_tokens: 0, completion_tokens: 0, cost_micro: 0, unknown_micro: 0 };
 
 function emptyUsage(): Usage {
-  return { from: "2026-10-01", to: "2026-10-12", group_by: ["day"], rows: [], total: { ...ZERO }, as_of: null };
+  return { from: "2026-10-01", to: "2026-10-12", group_by: ["day"], rows: [], total: { ...ZERO }, as_of: null, filter: { org: "acme" } };
 }
 
 function emptyBill(): Bill {
-  return { month: "2026-10", org: { id: 7, name: "acme" }, models: [], sources: [], total: { ...ZERO, model: "", total_micro: 0 }, as_of: null };
+  return { month: "2026-10", org: { id: 7, name: "acme" }, models: [], sources: [], total: { ...ZERO, model: "", total_micro: 0 }, as_of: null, filter: { org: "acme" } };
 }
 
 function budget(over: Partial<Budget> = {}): Budget {
@@ -102,8 +102,12 @@ describe("gateway routes and helpers", () => {
     expect(parseHash("#/usage/")).toEqual({ name: "usage" });
     expect(parseHash("#/org")).toEqual({ name: "org" });
     expect(usd(1_234_567)).toBe("$1.23");
-    expect(usd(1_234)).toBe("$0.001234");
+    expect(usd(1_234)).toBe("<$0.01");
     expect(usd(0)).toBe("$0.00");
+    expect(usd(-500_000)).toBe("-$0.50");
+    expect(usdExact(1_234)).toBe("$0.001234");
+    expect(remainingText(-500_000)).toBe("超出 $0.50");
+    expect(remainingText(4_500_000)).toBe("剩余 $4.50");
     expect(isPersonalOrg("user-12")).toBe(true);
     expect(isPersonalOrg("acme")).toBe(false);
   });
@@ -120,6 +124,7 @@ describe("gateway routes and helpers", () => {
     expect(budgetBar(budget({ limit_micro: null, available_micro: null })).unlimited).toBe(true);
     const over = budgetBar(budget({ limit_micro: 100, spent_micro: 150, reserved_micro: 0, unknown_micro: 50, available_micro: -100 }));
     expect(over.over).toBe(true);
+    expect([over.used, over.usedClamped]).toEqual([200, 100]);
     expect(over.spentPct + over.unknownPct + over.reservedPct).toBeCloseTo(100);
   });
 });
@@ -174,6 +179,31 @@ describe("KeysView", () => {
     await w.get('[data-action="close-secret"]').trigger("click");
     expect(w.find('[data-testid="secret-dialog"]').exists()).toBe(false);
     expect(w.html()).not.toContain(SECRET);
+    await flushAll();
+    expect(document.activeElement).toBe(w.get('[data-action="new-key"]').element); // focus returns
+    w.unmount();
+  });
+
+  it("keeps focus inside the secret dialog and closes it with Esc from anywhere", async () => {
+    const k = kit();
+    const w = mount(KeysView, { global: k.global, attachTo: document.body });
+    await flushAll();
+    await w.get('[data-action="new-key"]').trigger("click");
+    await w.get('[name="key-name"]').setValue("x");
+    await w.get('[data-testid="key-form"]').trigger("submit");
+    await flushAll();
+    const close = w.get('[data-action="close-secret"]').element as HTMLElement;
+    const copyBtn = w.get('[data-action="copy"]').element as HTMLElement;
+    close.focus();
+    await w.get('[data-testid="secret-dialog"]').trigger("keydown", { key: "Tab" });
+    expect(document.activeElement).toBe(copyBtn); // wraps to the first control
+    copyBtn.focus();
+    await w.get('[data-testid="secret-dialog"]').trigger("keydown", { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(close);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await flushAll();
+    expect(w.find('[data-testid="secret-dialog"]').exists()).toBe(false);
+    expect(document.activeElement).toBe(w.get('[data-action="new-key"]').element);
     w.unmount();
   });
 
@@ -282,6 +312,34 @@ describe("UsageView", () => {
     expect(w.get('[data-testid="by-key"]').text()).toContain("ci");
     expect(w.get('[data-testid="bill-total"]').text()).toBe("$2.00");
     expect(w.find('[data-testid="as-of"]').exists()).toBe(true);
+  });
+
+  it("shows loading states, overshoot and the effective filter", async () => {
+    let resolveBill: (b: Bill) => void = () => {};
+    const k = kit({
+      me: async () => MEMBER,
+      bill: () => new Promise<Bill>((r) => (resolveBill = r)),
+      budget: async (kind, id) => budget({ kind, id, limit_micro: 1_000_000, spent_micro: 1_200_000, unknown_micro: 0, reserved_micro: 300_000, available_micro: -500_000 }),
+      usage: async () => ({ ...emptyUsage(), filter: { org: "acme", username: "bob" } }),
+    });
+    const w = mount(UsageView, { global: k.global });
+    expect(w.find('[data-testid="bill-loading"]').exists()).toBe(true);
+    expect(w.find('[data-testid="budgets-loading"]').exists()).toBe(true);
+    await flushAll();
+    expect(w.find('[data-testid="budgets-loading"]').exists()).toBe(false);
+    expect(w.get('[data-testid="usage-filter"]').text()).toBe("范围：组织 acme · 用户 bob");
+    const org = w.get('[data-budget="org:acme"]');
+    expect(org.get('[data-testid="remaining"]').text()).toContain("超出 $0.50");
+    const meter = org.get('[role="meter"]');
+    expect(meter.attributes("aria-valuenow")).toBe("1000000");
+    expect(meter.attributes("aria-valuemax")).toBe("1000000");
+    expect(meter.attributes("aria-valuetext")).toContain("已超出上限");
+    expect(org.text()).toContain("已超出上限");
+    expect(org.get(".money").attributes("title")).toMatch(/^\$\d+\.\d{6}$/);
+    resolveBill({ ...emptyBill(), username: "bob", filter: { org: "acme", username: "bob" } });
+    await flushAll();
+    expect(w.find('[data-testid="bill-loading"]').exists()).toBe(false);
+    expect(w.get('[data-testid="bill-filter"]').text()).toContain("bob");
   });
 
   it("explains budgets to members and shows errors", async () => {

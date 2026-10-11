@@ -35,12 +35,28 @@ export function isUnauthorized(e: unknown): boolean {
   return e instanceof ApiError && e.status === 401;
 }
 
-/** 微美元 → "$1.23"（小额保留更多位）。 */
+/** 微美元 → 显示用的 "$1.23"：一律两位小数（复审 N3），不足一美分的非零金额为 "<$0.01"，负数为 "-$0.50"。 */
 export function usd(micro: number | null | undefined): string {
-  const v = Number(micro ?? 0) / 1_000_000;
-  if (!Number.isFinite(v)) return "—";
-  if (v !== 0 && Math.abs(v) < 0.01) return `$${v.toFixed(6)}`;
-  return `$${v.toFixed(2)}`;
+  const m = Number(micro ?? 0);
+  if (!Number.isFinite(m)) return "—";
+  const sign = m < 0 ? "-" : "";
+  const v = Math.abs(m) / 1_000_000;
+  if (v > 0 && v < 0.005) return `${sign}<$0.01`;
+  return `${sign}$${v.toFixed(2)}`;
+}
+
+/** 微美元 → 精确值 "$0.001234"（六位小数，用于 title 提示）。 */
+export function usdExact(micro: number | null | undefined): string {
+  const m = Number(micro ?? 0);
+  if (!Number.isFinite(m)) return "—";
+  const sign = m < 0 ? "-" : "";
+  return `${sign}$${(Math.abs(m) / 1_000_000).toFixed(6)}`;
+}
+
+/** 预算剩余：负数（超出上限）显示为 "超出 $0.50"。 */
+export function remainingText(micro: number | null | undefined): string {
+  const m = Number(micro ?? 0);
+  return m < 0 ? `超出 ${usd(-m)}` : `剩余 ${usd(m)}`;
 }
 
 export function formatNumber(n: number | null | undefined): string {
@@ -105,6 +121,9 @@ export function dailySeries(rows: UsageRow[], from: string, to: string): DayPoin
 
 export interface BudgetBar {
   unlimited: boolean;
+  /** 已用（花费 + 未知 + 预留），截断到上限，供 aria-valuenow。 */
+  used: number;
+  usedClamped: number;
   spentPct: number;
   unknownPct: number;
   reservedPct: number;
@@ -116,7 +135,8 @@ export interface BudgetBar {
 export function budgetBar(b: Budget): BudgetBar {
   const limit = b.limit_micro;
   if (limit === null || limit === undefined) {
-    return { unlimited: true, spentPct: 0, unknownPct: 0, reservedPct: 0, remaining: null, over: false };
+    const used = b.spent_micro + b.unknown_micro + b.reserved_micro;
+    return { unlimited: true, used, usedClamped: used, spentPct: 0, unknownPct: 0, reservedPct: 0, remaining: null, over: false };
   }
   const used = b.spent_micro + b.unknown_micro + b.reserved_micro;
   const pct = (v: number) => (limit > 0 ? (v / limit) * 100 : v > 0 ? 100 : 0);
@@ -129,7 +149,16 @@ export function budgetBar(b: Budget): BudgetBar {
     unknownPct = (unknownPct / sum) * 100;
     reservedPct = (reservedPct / sum) * 100;
   }
-  return { unlimited: false, spentPct, unknownPct, reservedPct, remaining: b.available_micro ?? limit - used, over: used > limit };
+  return {
+    unlimited: false,
+    used,
+    usedClamped: Math.min(used, limit),
+    spentPct,
+    unknownPct,
+    reservedPct,
+    remaining: b.available_micro ?? limit - used,
+    over: used > limit,
+  };
 }
 
 /** 个人组织（user-<id>）不能邀请成员，也不能离开。 */

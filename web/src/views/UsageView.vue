@@ -4,7 +4,7 @@
       <div>
         <h1 class="gw-title">用量</h1>
         <p class="gw-sub">
-          {{ scopeText }}的模型 API 与运行时（会话、研究）调用的请求数、token 与费用（美元，UTC 日期）。
+          {{ scopeText }}的模型 API 与运行时（会话、研究）调用的请求数、token 与费用（美元，UTC 日期；悬停金额可看精确值）。
           <span v-if="asOf" data-testid="as-of">截至 {{ formatDateTime(asOf) }} 的汇总。</span>
           <span v-else-if="loaded">尚未汇总（服务端每分钟汇总一次）。</span>
         </p>
@@ -17,15 +17,16 @@
       <button class="btn" type="submit" :disabled="loading">{{ loading ? "加载中…" : "查询" }}</button>
     </form>
 
+    <div v-if="filterText" class="muted filter" data-testid="usage-filter">范围：{{ filterText }}</div>
     <div v-if="error" class="user-error" role="alert" data-testid="usage-error">{{ error }}</div>
 
     <template v-if="loaded && !error">
       <section class="tiles" aria-label="区间合计">
         <div class="tile">
-          <span class="t-label">费用</span><span class="t-value" data-testid="total-cost">{{ usd(totalCost) }}</span>
+          <span class="t-label">费用</span><span class="t-value" data-testid="total-cost"><MoneyAmount :micro="totalCost" /></span>
         </div>
         <div class="tile">
-          <span class="t-label">其中未知</span><span class="t-value">{{ usd(total.unknown_micro) }}</span>
+          <span class="t-label">其中未知</span><span class="t-value"><MoneyAmount :micro="total.unknown_micro" /></span>
           <span class="t-hint">结果未知时按预估全额计入</span>
         </div>
         <div class="tile"><span class="t-label">请求</span><span class="t-value">{{ formatNumber(total.requests) }}</span></div>
@@ -57,7 +58,7 @@
                 <td>{{ SOURCE_LABELS[r.source ?? ""] ?? r.source }}</td>
                 <td class="num">{{ formatNumber(r.requests) }}</td>
                 <td class="num">{{ formatNumber(r.prompt_tokens + r.completion_tokens) }}</td>
-                <td class="num">{{ usd(r.cost_micro + r.unknown_micro) }}</td>
+                <td class="num"><MoneyAmount :micro="r.cost_micro + r.unknown_micro" /></td>
               </tr>
             </tbody>
           </table>
@@ -74,7 +75,7 @@
                 </td>
                 <td class="num">{{ formatNumber(r.requests) }}</td>
                 <td class="num">{{ formatNumber(r.prompt_tokens + r.completion_tokens) }}</td>
-                <td class="num">{{ usd(r.cost_micro + r.unknown_micro) }}</td>
+                <td class="num"><MoneyAmount :micro="r.cost_micro + r.unknown_micro" /></td>
               </tr>
             </tbody>
           </table>
@@ -84,14 +85,15 @@
 
     <section class="panel">
       <h2 class="panel-title">本月预算</h2>
-      <div v-if="budgetNote" class="muted" data-testid="budget-note">{{ budgetNote }}</div>
+      <div v-if="budgetsLoading" class="muted" role="status" data-testid="budgets-loading">加载中…</div>
+      <div v-else-if="budgetNote" class="muted" data-testid="budget-note">{{ budgetNote }}</div>
       <ul v-else class="budgets">
         <li v-for="b in budgets" :key="`${b.kind}:${b.id}`" class="budget" :data-budget="`${b.kind}:${b.id}`">
           <div class="b-head">
             <span class="b-name">{{ KIND_LABELS[b.kind] }} {{ b.label }}</span>
             <span class="spacer"></span>
-            <span v-if="bar(b).unlimited" class="muted">不限额 · 已用 {{ usd(b.spent_micro + b.unknown_micro) }}</span>
-            <span v-else :class="{ over: bar(b).over }">剩余 {{ usd(bar(b).remaining) }} / 上限 {{ usd(b.limit_micro) }}</span>
+            <span v-if="bar(b).unlimited" class="muted">不限额 · 已用 <MoneyAmount :micro="b.spent_micro + b.unknown_micro" /></span>
+            <span v-else :class="{ over: bar(b).over }" data-testid="remaining"><span :title="usdExact(bar(b).remaining)">{{ remainingText(bar(b).remaining) }}</span> / 上限 <MoneyAmount :micro="b.limit_micro" /></span>
           </div>
           <div
             v-if="!bar(b).unlimited"
@@ -100,27 +102,32 @@
             :aria-label="`${KIND_LABELS[b.kind]} ${b.label} 的预算用量`"
             aria-valuemin="0"
             :aria-valuemax="b.limit_micro ?? 0"
-            :aria-valuenow="b.spent_micro + b.unknown_micro + b.reserved_micro"
+            :aria-valuenow="bar(b).usedClamped"
+            :aria-valuetext="bar(b).over ? `已超出上限：已用 ${usd(bar(b).used)}，上限 ${usd(b.limit_micro)}` : `已用 ${usd(bar(b).used)}，上限 ${usd(b.limit_micro)}`"
           >
             <span class="seg spent" :style="{ width: `${bar(b).spentPct}%` }"></span>
             <span class="seg unknown" :style="{ width: `${bar(b).unknownPct}%` }"></span>
             <span class="seg reserved" :style="{ width: `${bar(b).reservedPct}%` }"></span>
           </div>
           <div class="b-legend muted">
-            已花费 {{ usd(b.spent_micro) }} · 未知 {{ usd(b.unknown_micro) }} · 预留中 {{ usd(b.reserved_micro) }}
+            已花费 <MoneyAmount :micro="b.spent_micro" /> · 未知 <MoneyAmount :micro="b.unknown_micro" /> · 预留中 <MoneyAmount :micro="b.reserved_micro" />
+            <strong v-if="bar(b).over" class="over">· 已超出上限</strong>
           </div>
         </li>
       </ul>
     </section>
 
     <section class="panel" data-testid="bill">
-      <h2 class="panel-title">本月账单 {{ bill?.month ?? "" }}<span v-if="bill?.username" class="muted">（你在组织中的部分）</span></h2>
-      <div v-if="billError" class="user-error" role="alert">{{ billError }}</div>
+      <h2 class="panel-title">
+        本月账单 {{ bill?.month ?? "" }}<span v-if="bill?.username" class="muted" data-testid="bill-filter">（只含 {{ bill.username }} 的用量）</span>
+      </h2>
+      <div v-if="billLoading" class="muted" role="status" data-testid="bill-loading">加载中…</div>
+      <div v-else-if="billError" class="user-error" role="alert">{{ billError }}</div>
       <div v-else-if="bill && bill.total.requests === 0" class="muted">本月还没有费用。</div>
       <template v-else-if="bill">
         <p class="bill-total">
-          合计 <strong data-testid="bill-total">{{ usd(bill.total.total_micro) }}</strong>
-          <span class="muted">（已知 {{ usd(bill.total.cost_micro) }}，未知 {{ usd(bill.total.unknown_micro) }}，{{ formatNumber(bill.total.requests) }} 次请求）</span>
+          合计 <strong data-testid="bill-total"><MoneyAmount :micro="bill.total.total_micro" /></strong>
+          <span class="muted">（已知 <MoneyAmount :micro="bill.total.cost_micro" />，未知 <MoneyAmount :micro="bill.total.unknown_micro" />，{{ formatNumber(bill.total.requests) }} 次请求）</span>
         </p>
         <table class="data-table">
           <thead><tr><th>模型</th><th class="num">输入 token</th><th class="num">输出 token</th><th class="num">已知</th><th class="num">未知</th><th class="num">合计</th></tr></thead>
@@ -129,9 +136,9 @@
               <td>{{ modelLabel(l.model) }}</td>
               <td class="num">{{ formatNumber(l.prompt_tokens) }}</td>
               <td class="num">{{ formatNumber(l.completion_tokens) }}</td>
-              <td class="num">{{ usd(l.cost_micro) }}</td>
-              <td class="num">{{ usd(l.unknown_micro) }}</td>
-              <td class="num">{{ usd(l.total_micro) }}</td>
+              <td class="num"><MoneyAmount :micro="l.cost_micro" /></td>
+              <td class="num"><MoneyAmount :micro="l.unknown_micro" /></td>
+              <td class="num"><MoneyAmount :micro="l.total_micro" /></td>
             </tr>
           </tbody>
         </table>
@@ -143,8 +150,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { ApiError } from "../api/client";
-import type { Bill, Budget, BudgetKind, Me, UsageRow, UsageTotals } from "../api/gateway";
+import type { Bill, Budget, BudgetKind, Me, Usage, UsageRow, UsageTotals } from "../api/gateway";
 import BarChart from "../components/BarChart.vue";
+import MoneyAmount from "../components/MoneyAmount.vue";
 import {
   SOURCE_LABELS,
   budgetBar,
@@ -154,7 +162,9 @@ import {
   gatewayErrorMessage,
   isUnauthorized,
   modelLabel,
+  remainingText,
   usd,
+  usdExact,
   utcDay,
   utcMonth,
 } from "../lib/gateway";
@@ -183,11 +193,24 @@ const budgets = ref<LabeledBudget[]>([]);
 const budgetNote = ref("");
 const bill = ref<Bill | null>(null);
 const billError = ref("");
+const billLoading = ref(true);
+const budgetsLoading = ref(true);
+const filter = ref<Usage["filter"] | null>(null);
 
 const totalCost = computed(() => total.value.cost_micro + total.value.unknown_micro);
 const series = computed(() => dailySeries(daily.value, from.value, to.value));
 const costPoints = computed(() => series.value.map((p) => ({ label: p.day, value: p.cost, accent: p.unknown > 0 && p.unknown === p.cost })));
 const tokenPoints = computed(() => series.value.map((p) => ({ label: p.day, value: p.tokens })));
+// 复审 N1：服务端回显的生效过滤（组织、用户、key）。
+const filterText = computed(() => {
+  const f = filter.value;
+  if (!f) return "";
+  const parts: string[] = [];
+  if (f.org) parts.push(`组织 ${f.org}`);
+  if (f.username) parts.push(`用户 ${f.username}`);
+  if (f.key_id) parts.push(`密钥 ${f.key_id}`);
+  return parts.join(" · ");
+});
 const scopeText = computed(() => {
   if (!me.value) return "";
   return me.value.role === "owner" ? `组织 ${me.value.org?.name ?? ""} ` : "你";
@@ -220,6 +243,7 @@ async function loadUsage(): Promise<void> {
     byKey.value = [...k.rows].sort((a, b) => b.cost_micro + b.unknown_micro - (a.cost_micro + a.unknown_micro));
     total.value = d.total;
     asOf.value = d.as_of;
+    filter.value = d.filter;
     error.value = "";
     loaded.value = true;
   } catch (e) {
@@ -230,6 +254,14 @@ async function loadUsage(): Promise<void> {
 }
 
 async function loadBudgets(): Promise<void> {
+  try {
+    await loadBudgetsInner();
+  } finally {
+    budgetsLoading.value = false;
+  }
+}
+
+async function loadBudgetsInner(): Promise<void> {
   const m = me.value;
   if (!m?.username) return;
   const targets: { kind: BudgetKind; id: string; label: string }[] = [];
@@ -256,6 +288,8 @@ async function loadBill(): Promise<void> {
     billError.value = "";
   } catch (e) {
     billError.value = fail(e);
+  } finally {
+    billLoading.value = false;
   }
 }
 
@@ -268,6 +302,7 @@ onMounted(async () => {
     me.value = await api.me();
   } catch (e) {
     error.value = fail(e);
+    billLoading.value = budgetsLoading.value = false;
     return;
   }
   await Promise.all([loadUsage(), loadBudgets(), loadBill()]);
@@ -356,6 +391,9 @@ onMounted(async () => {
 .over {
   color: #b91c1c;
   font-weight: 700;
+}
+.filter {
+  font-size: 0.82rem;
 }
 .bill-total {
   margin: 0 0 10px;

@@ -6,7 +6,7 @@
         <p class="gw-sub">用 API 密钥从程序调用运行时 API 或模型 API（OpenAI / Anthropic 格式）。密钥只代表你本人，不能管理密钥、成员或预算。</p>
       </div>
       <span class="spacer"></span>
-      <button class="btn primary" type="button" data-action="new-key" @click="openForm">新建密钥</button>
+      <button ref="newKeyButton" class="btn primary" type="button" data-action="new-key" @click="openForm">新建密钥</button>
     </header>
 
     <div v-if="invites > 0" class="notice" data-testid="invite-banner">
@@ -97,7 +97,7 @@
         aria-labelledby="key-dialog-title"
         tabindex="-1"
         data-testid="secret-dialog"
-        @keydown.esc="closeSecret"
+        @keydown.tab="trapFocus"
       >
         <h2 id="key-dialog-title" class="d-title">密钥「{{ created.name }}」已创建</h2>
         <p class="warn" role="alert">
@@ -116,7 +116,7 @@
 </template>
 
 <script setup lang="ts">
-import { nextTick, onMounted, ref } from "vue";
+import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { ApiKey, Me, Scope } from "../api/gateway";
 import { SCOPE_LABELS, formatDateTime, gatewayErrorMessage, isUnauthorized } from "../lib/gateway";
 import { useGatewayServices } from "../lib/gatewayServices";
@@ -146,6 +146,42 @@ const created = ref<{ name: string; key: string } | null>(null);
 const copied = ref(false);
 const copyError = ref("");
 const dialog = ref<HTMLElement | null>(null);
+const newKeyButton = ref<HTMLButtonElement | null>(null);
+
+// 复审 N3：对话框打开时 Esc 在任何位置都关闭它；Tab 只在对话框内循环；关闭后焦点回到「新建密钥」。
+function onWindowKey(e: KeyboardEvent): void {
+  if (e.key === "Escape" && created.value) {
+    e.preventDefault();
+    closeSecret();
+  }
+}
+
+function trapFocus(e: KeyboardEvent): void {
+  const root = dialog.value;
+  if (!root) return;
+  const items = Array.from(root.querySelectorAll<HTMLElement>("button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex='-1'])"));
+  if (items.length === 0) return;
+  const first = items[0]!;
+  const last = items[items.length - 1]!;
+  const active = document.activeElement;
+  if (e.shiftKey && (active === first || active === root)) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && active === last) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+watch(
+  () => created.value !== null,
+  (open) => {
+    if (open) window.addEventListener("keydown", onWindowKey);
+    else window.removeEventListener("keydown", onWindowKey);
+  },
+);
+
+onBeforeUnmount(() => window.removeEventListener("keydown", onWindowKey));
 
 function fail(e: unknown): string {
   if (isUnauthorized(e)) emit("unauthorized");
@@ -236,6 +272,7 @@ async function copySecret(): Promise<void> {
 function closeSecret(): void {
   created.value = null;
   copied.value = false;
+  void nextTick(() => newKeyButton.value?.focus());
 }
 
 async function revoke(id: string): Promise<void> {
