@@ -1,0 +1,45 @@
+{
+  "model": "m",
+  "max_tokens": 64,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Weather in Paris?"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "signature": "sig",
+          "thinking": "hmm",
+          "type": "thinking"
+        },
+        {
+          "citations": null,
+          "text": "Checking.",
+          "type": "text"
+        },
+        {
+          "id": "toolu_1",
+          "caller": null,
+          "input": {
+            "city": "Paris"
+          },
+          "name": "get_weather",
+          "type": "tool_use",
+          "toolset_name": null
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_1",
+          "content": "18C"
+        }
+      ]
+    }
+  ]
+}

@@ -242,7 +242,7 @@ func decodeAnthropicMessage(req *Request, raw json.RawMessage, field string) (Me
 	if err != nil {
 		return Message{}, err
 	}
-	if err := checkAllowed(m, field, "role", "content"); err != nil {
+	if err := checkAllowedDump(m, field, "role", "content"); err != nil {
 		return Message{}, err
 	}
 	roleS, err := str(m["role"], field+".role")
@@ -319,7 +319,7 @@ func decodeAnthropicBlock(req *Request, raw json.RawMessage, field string, role 
 }
 
 func anthropicTextBlock(req *Request, obj map[string]json.RawMessage, field string) (Block, error) {
-	if err := checkAllowed(obj, field, "type", "text", "cache_control", "citations"); err != nil {
+	if err := checkAllowedDump(obj, field, "type", "text", "cache_control", "citations"); err != nil {
 		return Block{}, err
 	}
 	text, err := str(obj["text"], field+".text")
@@ -333,7 +333,7 @@ func anthropicTextBlock(req *Request, obj map[string]json.RawMessage, field stri
 }
 
 func anthropicToolUseBlock(obj map[string]json.RawMessage, field string) (Block, error) {
-	if err := checkAllowed(obj, field, "type", "id", "name", "input", "cache_control"); err != nil {
+	if err := checkAllowedDump(obj, field, "type", "id", "name", "input", "cache_control"); err != nil {
 		return Block{}, err
 	}
 	b := Block{Type: BlockToolCall}
@@ -356,7 +356,7 @@ func anthropicToolUseBlock(obj map[string]json.RawMessage, field string) (Block,
 // anthropicToolResultBlock decodes a tool result. One with images or documents in its content is kept as
 // an opaque block (unsupported when converting).
 func anthropicToolResultBlock(req *Request, obj map[string]json.RawMessage, raw json.RawMessage, field string) (Block, error) {
-	if err := checkAllowed(obj, field, "type", "tool_use_id", "content", "is_error", "cache_control"); err != nil {
+	if err := checkAllowedDump(obj, field, "type", "tool_use_id", "content", "is_error", "cache_control"); err != nil {
 		return Block{}, err
 	}
 	b := Block{Type: BlockToolResult}
@@ -382,7 +382,7 @@ func anthropicToolResultBlock(req *Request, obj map[string]json.RawMessage, raw 
 }
 
 func anthropicThinkingBlock(obj map[string]json.RawMessage, field string) (Block, error) {
-	if err := checkAllowed(obj, field, "type", "thinking", "signature"); err != nil {
+	if err := checkAllowedDump(obj, field, "type", "thinking", "signature"); err != nil {
 		return Block{}, err
 	}
 	text, err := str(obj["thinking"], field+".thinking")

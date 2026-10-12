@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -57,6 +58,20 @@ func checkAllowed(obj map[string]json.RawMessage, prefix string, allowed ...stri
 		}
 	}
 	return unsupported(join(prefix, minName), "unknown field")
+}
+
+// checkAllowedDump is checkAllowed for messages and content blocks, which clients often send back as an SDK
+// model_dump() of a previous response: an unknown field whose value is null or empty ("", [], {}) is
+// ignored (anthropic 1.x adds caller: null and toolset_name: null to tool_use blocks, openai adds
+// parsed: null to messages). An unknown field with a value is still an *UnsupportedFieldError.
+func checkAllowedDump(obj map[string]json.RawMessage, prefix string, allowed ...string) error {
+	known := make(map[string]json.RawMessage, len(obj))
+	for k, v := range obj {
+		if slices.Contains(allowed, k) || !(isNull(v) || isEmptyJSON(v)) {
+			known[k] = v
+		}
+	}
+	return checkAllowed(known, prefix, allowed...)
 }
 
 func join(prefix, name string) string {

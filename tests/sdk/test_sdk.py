@@ -279,3 +279,27 @@ def test_system_prompt(harness, provider):
         messages=[{"role": "user", "content": "hello"}],
     )
     assert m.content[0].text == "Bonjour"
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_model_dump_history(harness, provider):
+    """A previous response sent back with plain model_dump() (null fields included, e.g. anthropic caller: null,
+    openai parsed / refusal / annotations: null) is accepted in both formats."""
+    oc = openai_client(harness, provider)
+    messages = [{"role": "user", "content": "What is the weather in Paris?"}]
+    r = oc.chat.completions.create(model=harness["model"], messages=messages, tools=[WEATHER_OPENAI], max_tokens=64)
+    call = r.choices[0].message.tool_calls[0]
+    messages += [r.choices[0].message.model_dump(), {"role": "tool", "tool_call_id": call.id, "content": "sunny"}]
+    r = oc.chat.completions.create(model=harness["model"], messages=messages, tools=[WEATHER_OPENAI], max_tokens=64)
+    assert r.choices[0].finish_reason == "stop" and r.choices[0].message.content
+
+    ac = anthropic_client(harness, provider)
+    messages = [{"role": "user", "content": "What is the weather in Paris?"}]
+    m = ac.messages.create(model=harness["model"], max_tokens=64, tools=[WEATHER_ANTHROPIC], messages=messages)
+    use = next(b for b in m.content if b.type == "tool_use")
+    messages += [
+        {"role": "assistant", "content": [b.model_dump() for b in m.content]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use.id, "content": "sunny"}]},
+    ]
+    m = ac.messages.create(model=harness["model"], max_tokens=64, tools=[WEATHER_ANTHROPIC], messages=messages)
+    assert m.stop_reason == "end_turn" and m.content[0].text

@@ -1,0 +1,47 @@
+{
+  "model": "m",
+  "max_tokens": 64,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Weather in Paris?"
+    },
+    {
+      "content": null,
+      "refusal": null,
+      "role": "assistant",
+      "annotations": null,
+      "audio": null,
+      "function_call": null,
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "function": {
+            "arguments": "{\"city\":\"Paris\"}",
+            "name": "get_weather"
+          },
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "18C"
+    },
+    {
+      "content": "Sunny.",
+      "refusal": null,
+      "role": "assistant",
+      "annotations": null,
+      "audio": null,
+      "function_call": null,
+      "tool_calls": null,
+      "parsed": null
+    },
+    {
+      "role": "user",
+      "content": "thanks"
+    }
+  ]
+}
