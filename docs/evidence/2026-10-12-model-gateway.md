@@ -32,7 +32,7 @@
   bash scripts/demo-gateway.sh
   ```
 
-  负载命令的退出码都是 0；每次结束时 `verify-invariants` 都通过（`不变量检查通过`）。
+  负载命令的检查全部 PASS；第一轮有一次运行虽然所有检查都 PASS，却以退出码 1 结束（当时脚本的一个问题，已修复，第二轮的退出码为 0）；每次结束时 `verify-invariants` 都通过（`不变量检查通过`）。
 
 **限流器是否在路径上。** 只有给某一级设了 `rpm` 或 `tpm` 时，请求才经过 Redis 上的 Lua 限流脚本；没有限额时网关仍从
 PostgreSQL 读取限额，但不调用限流器。第一批的 latency、ladder 与 lockwait **没有设限额，限流器不在路径上**；
