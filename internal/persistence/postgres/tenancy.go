@@ -134,7 +134,8 @@ func (t *TenancyStore) OrgByName(ctx context.Context, name string) (tenant.Org, 
 
 // ---- 成员 ----
 //
-// 锁顺序（避免死锁）：先锁用户行（users FOR UPDATE；同一用户的成员变更、接受邀请与建 key 在此串行化），再按 id
+// 锁顺序（避免死锁）：用户行 → org 行 → 邀请行。先锁用户行（users FOR UPDATE；同一用户的成员变更、接受邀请与建 key 在此
+// 串行化；建邀请取被邀请者与邀请人的 FOR SHARE），再按 id
 // 升序锁涉及的 org 行（orgs FOR NO KEY UPDATE；同一 org 的人数、"至少一个 owner"与邀请人权限的检查在此串行化）。
 // 用 NO KEY UPDATE 而不是 UPDATE：它与外键插入取的 FOR KEY SHARE 不冲突，成员变更不会阻塞向该 org 写任务、会话、
 // key 与成员的事务（它们只引用 org 行，不改它）。建 key 取 users FOR SHARE 再取成员行，与之一致。
@@ -449,6 +450,12 @@ func (t *TenancyStore) CreateInvite(ctx context.Context, orgID int64, usernameKe
 		if err != nil {
 			return err
 		}
+		// 锁顺序：先以 FOR SHARE 锁被邀请者与邀请人的用户行（按 id 升序），再写邀请行。否则 upsert 持有邀请行锁后，外键
+		// 检查的 KEY SHARE 会等待持有 users FOR UPDATE 的成员变更，而后者又在等这条邀请行（dropSentInvites），形成互等。
+		if _, err := tx.Exec(ctx, "SELECT id FROM users WHERE id = ANY($1::bigint[]) ORDER BY id FOR SHARE",
+			[]int64{userID, invitedBy}); err != nil {
+			return err
+		}
 		var orgName string
 		err = tx.QueryRow(ctx, "SELECT name FROM orgs WHERE id = $1", orgID).Scan(&orgName)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -538,9 +545,11 @@ func (t *TenancyStore) acceptInvite(ctx context.Context, id string, userID int64
 		if err != nil {
 			return err
 		}
+		// 先只读邀请（不加行锁），按锁顺序锁定 org（placeMember）之后才删除它：邀请行锁在 org 行锁之后取，与降级、移出时
+		// dropSentInvites 的顺序（users → orgs → 邀请）一致，避免互等。
 		var orgID, invitedBy int64
 		var role string
-		err = tx.QueryRow(ctx, `DELETE FROM org_invites WHERE id = $1 AND user_id = $2 AND expires_at > now() RETURNING org_id, role, invited_by`,
+		err = tx.QueryRow(ctx, `SELECT org_id, role, invited_by FROM org_invites WHERE id = $1 AND user_id = $2 AND expires_at > now()`,
 			id, userID).Scan(&orgID, &role, &invitedBy)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return notFoundf("邀请 %s", id)
@@ -550,6 +559,14 @@ func (t *TenancyStore) acceptInvite(ctx context.Context, id string, userID int64
 		}
 		if out, err = placeMember(ctx, tx, orgID, userID, tenant.Role(role)); err != nil {
 			return err
+		}
+		tag, err := tx.Exec(ctx, `DELETE FROM org_invites WHERE id = $1 AND user_id = $2 AND org_id = $3 AND role = $4 AND invited_by = $5
+			AND expires_at > now()`, id, userID, orgID, role, invitedBy)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 { // 读取之后被撤销、拒绝或续期（续期改了角色或邀请人）：回滚迁入
+			return notFoundf("邀请 %s", id)
 		}
 		var owner bool
 		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM org_members WHERE org_id = $1 AND user_id = $2 AND role = 'owner')",
