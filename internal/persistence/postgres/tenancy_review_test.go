@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/account"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/apikey"
@@ -485,4 +487,74 @@ func TestAcceptStaleInviter(t *testing.T) {
 		t.Fatal("a removed owner's invites must be deleted")
 	}
 	expectNoDBViolations(t, s)
+}
+
+// TestInviteLockOrder: invite rows are locked only after the user and org rows (users → orgs → invites), the order
+// member changes use when they drop a demoted or removed owner's sent invites. Before the fix AcceptInvite locked
+// the invite before the org, forming a cycle with a concurrent member change that surfaced as a lock timeout (the
+// TestRRStress flake). The drop below runs with a lock timeout under PostgreSQL's 1 s deadlock_timeout, so a cycle
+// fails the test instead of being resolved by the deadlock detector and a retry.
+func TestInviteLockOrder(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, Options{LockTimeout: 5 * time.Second, OpDeadline: 20 * time.Second})
+	ten := s.TenancyStore()
+	alice, _ := s.CreateUser(ctx, "alice", "alice", "h")
+	bob, _ := s.CreateUser(ctx, "bob", "bob", "h")
+	acme, _, err := ten.CreateOrgWithOwner(ctx, "acme", "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// memberChange starts what AddMember/RemoveMember of alice does: users FOR UPDATE, then the org row.
+	memberChange := func() pgx.Tx {
+		tx, err := s.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, "SELECT id FROM users WHERE id = $1 FOR UPDATE", alice.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, "SELECT name FROM orgs WHERE id = $1 FOR NO KEY UPDATE", acme.ID); err != nil {
+			t.Fatal(err)
+		}
+		return tx
+	}
+	dropSent := func(tx pgx.Tx) {
+		t.Helper()
+		if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '500ms'"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM org_invites WHERE invited_by = $1 AND org_id = $2", alice.ID, acme.ID); err != nil {
+			rollback(tx) // release the locks so the waiting accept can finish
+			t.Fatalf("dropping the sent invites waits on a lock the invite operation holds: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("accept", func(t *testing.T) {
+		inv, err := ten.CreateInvite(ctx, acme.ID, "bob", tenant.Member, alice.ID, time.Now().Add(time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx := memberChange()
+		done := make(chan error, 1)
+		go func() { _, err := ten.AcceptInvite(ctx, inv.ID, bob.ID); done <- err }()
+		time.Sleep(300 * time.Millisecond) // AcceptInvite now waits for the org row
+		var acceptErr error
+		received := false
+		defer func() { // never leave the accept running past the test
+			if !received {
+				<-done
+			}
+		}()
+		dropSent(tx)
+		acceptErr, received = <-done, true
+		if err := acceptErr; !errors.Is(err, persistence.ErrNotFound) {
+			t.Fatalf("the invite was dropped while the accept waited: %v", err)
+		}
+		if m, _ := ten.MemberByName(ctx, "bob"); m.OrgName != tenant.PersonalOrgName(bob.ID) {
+			t.Fatalf("bob must not have moved: %+v", m)
+		}
+	})
 }
