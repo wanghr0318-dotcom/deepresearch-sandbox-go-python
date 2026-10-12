@@ -98,6 +98,36 @@ func (e env) setKeyRPM(ctx context.Context, keyID string, rpm int64) error {
 	return e.store.Quota().PutLimits(ctx, quota.Target{Level: quota.LevelKey, ID: keyID}, quota.Limits{RPM: &rpm})
 }
 
+// setAllLimits sets rpm and tpm (0 = leave unset) at every level of every key of f: the org, the user (scoped to
+// the org) and the key. With any limit set, each request takes from the Redis Lua buckets of all three levels.
+func (e env) setAllLimits(ctx context.Context, f *fixture, rpm, tpm int64) error {
+	if rpm <= 0 && tpm <= 0 {
+		return nil
+	}
+	var l quota.Limits
+	if rpm > 0 {
+		l.RPM = &rpm
+	}
+	if tpm > 0 {
+		l.TPM = &tpm
+	}
+	q := e.store.Quota()
+	for _, o := range f.Orgs {
+		if err := q.PutLimits(ctx, quota.Target{Level: quota.LevelOrg, ID: strconv.FormatInt(o.ID, 10)}, l); err != nil {
+			return err
+		}
+		for _, u := range o.Users {
+			if err := q.PutLimits(ctx, quota.Target{Level: quota.LevelUser, ID: quota.UserTargetID(o.ID, u.ID)}, l); err != nil {
+				return err
+			}
+			if err := q.PutLimits(ctx, quota.Target{Level: quota.LevelKey, ID: u.KeyID}, l); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // setOrgBudget sets an org's monthly budget for the current month.
 func (e env) setOrgBudget(ctx context.Context, orgID, limitMicro int64) error {
 	_, err := e.store.Quota().PutBudget(ctx, quota.Target{Level: quota.LevelOrg, ID: strconv.FormatInt(orgID, 10)}, time.Time{}, &limitMicro)

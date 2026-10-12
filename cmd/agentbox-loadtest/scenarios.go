@@ -142,9 +142,12 @@ func dbRTT(ctx context.Context, conn *pgx.Conn, n int) (dist, error) {
 
 // latency measures each path through the gateway and the same request sent straight to the fake provider in the
 // provider's format; the difference of the percentiles is the gateway's overhead.
-func latency(ctx context.Context, c config, e env, conc int, dur, warmup time.Duration, paths []path, modes []bool) (any, error) {
+func latency(ctx context.Context, c config, e env, conc int, dur, warmup time.Duration, paths []path, modes []bool, lim limits) (any, error) {
 	f, err := e.newFixture(ctx, c.prefix, 1, 1)
 	if err != nil {
+		return nil, err
+	}
+	if err := e.setAllLimits(ctx, f, lim.RPM, lim.TPM); err != nil {
 		return nil, err
 	}
 	key := f.Orgs[0].Users[0].Key
@@ -212,11 +215,24 @@ func latency(ctx context.Context, c config, e env, conc int, dur, warmup time.Du
 			f2(r.Gateway.Total.P50), f2(r.Gateway.Total.P95), f2(r.Gateway.Total.P99),
 			f2(r.Direct.Total.P50), f2(r.Direct.Total.P99), f2(r.OverP50), f2(r.OverP95), f2(r.OverP99), ttft, f1(r.XactsReq), r.Gateway.outcomesString()})
 	}
-	c.printf("latency: concurrency %d, %s per row (warm-up %s), max_tokens %d, prompt %d B; database round trip (SELECT 1) p50 %.3f ms, p99 %.3f ms\n",
-		conc, dur, warmup, c.maxTokens, c.promptBytes, rtt.P50, rtt.P99)
+	c.printf("latency: concurrency %d, %s per row (warm-up %s), max_tokens %d, prompt %d B; %s; database round trip (SELECT 1) p50 %.3f ms, p99 %.3f ms\n",
+		conc, dur, warmup, c.maxTokens, c.promptBytes, lim, rtt.P50, rtt.P99)
 	c.printf("%s", table([]string{"path", "stream", "n", "rps", "gw p50", "gw p95", "gw p99", "direct p50", "direct p99",
 		"overhead p50", "overhead p95", "overhead p99", "TTFT p50 / p99 ms", "db tx/req", "outcomes"}, t))
-	return map[string]any{"concurrency": conc, "seconds_per_row": dur.Seconds(), "db_rtt": rtt, "rows": rows}, nil
+	return map[string]any{"concurrency": conc, "seconds_per_row": dur.Seconds(), "limits": lim, "db_rtt": rtt, "rows": rows}, nil
+}
+
+// limits are the rpm and tpm set at the org, user and key level of every fixture key (0 = not set).
+type limits struct {
+	RPM int64 `json:"rpm"`
+	TPM int64 `json:"tpm"`
+}
+
+func (l limits) String() string {
+	if l.RPM <= 0 && l.TPM <= 0 {
+		return "no rpm/tpm limits (the rate limiter is not on the path; limits are still read from PostgreSQL)"
+	}
+	return fmt.Sprintf("rpm %d, tpm %d at org, user and key (every request takes from the Redis Lua buckets; none is refused)", l.RPM, l.TPM)
 }
 
 // ---- ladder: maximum requests per second ----
@@ -228,9 +244,12 @@ type ladderRow struct {
 
 // ladder raises the concurrency step by step until the error rate passes 1 % or the throughput stops growing
 // (less than +5 % over the best level for two levels in a row: the knee).
-func ladder(ctx context.Context, c config, e env, levels []int, step time.Duration, p path, stream bool, orgs int) (any, error) {
+func ladder(ctx context.Context, c config, e env, levels []int, step time.Duration, p path, stream bool, orgs int, lim limits) (any, error) {
 	f, err := e.newFixture(ctx, c.prefix, orgs, 1)
 	if err != nil {
+		return nil, err
+	}
+	if err := e.setAllLimits(ctx, f, lim.RPM, lim.TPM); err != nil {
 		return nil, err
 	}
 	keys := f.keys()
@@ -276,10 +295,10 @@ func ladder(ctx context.Context, c config, e env, levels []int, step time.Durati
 	if stop == "" {
 		stop = "last level reached"
 	}
-	c.printf("ladder: path %s, stream %v, %d orgs × 1 key, %s per level; stop: %s\n", p, stream, orgs, step, stop)
+	c.printf("ladder: path %s, stream %v, %d orgs × 1 key, %s per level; %s; stop: %s\n", p, stream, orgs, step, lim, stop)
 	c.printf("%s", table([]string{"concurrency", "rps", "p50 ms", "p95 ms", "p99 ms", "error %", "outcomes"}, t))
 	c.printf("max: %.1f rps at concurrency %d\n", maxRPS, at)
-	return map[string]any{"path": p.String(), "stream": stream, "orgs": orgs, "seconds_per_level": step.Seconds(),
+	return map[string]any{"path": p.String(), "stream": stream, "orgs": orgs, "seconds_per_level": step.Seconds(), "limits": lim,
 		"levels": rows, "max_rps": maxRPS, "max_rps_concurrency": at, "stop": stop}, nil
 }
 

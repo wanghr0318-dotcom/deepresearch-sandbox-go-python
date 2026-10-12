@@ -17,7 +17,8 @@
 //     （disconnect）中途断开：故障速率固定的不稳定供应商（trace doctor 演示）。
 //
 // 模型网关（2026-10-11 设计 §10）：类别 messages 是 Anthropic 的 /v1/messages（base_url 为打印的 url）；
-// 以上各选项的 kind 都可以是 messages。
+// 以上各选项的 kind 都可以是 messages。退出时在 counts 行之后另打印一行 `usage chat=<输入>+<输出> messages=…`：
+// 回复中报告的 token 合计（负载测试据此独立核对网关记录的用量）。
 //   - -anthropic-key-env NAME：/v1/messages 要求 x-api-key 等于环境变量 NAME 的值（Key 不出现在命令行）。
 //   - -fail-after chat:2:5,messages:1:3:error：该类第 N 次流式请求发出 K 个 SSE 事件后切断连接（加 :error 时
 //     改为发出错误事件，加 :midline 时在下一个事件的一行中间切断）。
@@ -113,6 +114,7 @@ func main() {
 		fu.Count(fakeupstream.Chat), fu.Count(fakeupstream.Search), fu.Count(fakeupstream.Fetch),
 		fu.StageCount(fakeupstream.StagePlan), fu.StageCount(fakeupstream.StageSummarize), fu.StageCount(fakeupstream.StageReport),
 		fu.StageCount(fakeupstream.StageCode), fu.Count(fakeupstream.Messages))
+	fmt.Printf("usage chat=%s messages=%s\n", usageSum(fu, fakeupstream.Chat), usageSum(fu, fakeupstream.Messages))
 	fu.Close()
 }
 
@@ -288,4 +290,14 @@ func installToolCalls(fu *fakeupstream.Server) {
 		b, _ := json.Marshal([]map[string]any{{"type": "tool_use", "id": "toolu_1", "name": name, "input": map[string]string{"city": "Paris"}}})
 		return b
 	})
+}
+
+// usageSum 返回该类请求在回复中报告的用量合计，形如 "<输入>+<输出>"。
+func usageSum(fu *fakeupstream.Server, kind fakeupstream.Kind) string {
+	var p, c int64
+	for _, r := range fu.Requests(kind) {
+		p += r.PromptTokens
+		c += r.CompletionTokens
+	}
+	return fmt.Sprintf("%d+%d", p, c)
 }

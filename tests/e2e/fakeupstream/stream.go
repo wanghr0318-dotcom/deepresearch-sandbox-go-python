@@ -418,6 +418,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request, rec *Request, 
 	}
 	usage := anthropicUsage{InputTokens: int64(len(body)+3) / 4, OutputTokens: int64(len(content)+3) / 4,
 		CacheCreationInputTokens: write, CacheReadInputTokens: read}
+	s.setUsage(rec, usage.InputTokens+usage.CacheReadInputTokens+usage.CacheCreationInputTokens, usage.OutputTokens)
 	id := fmt.Sprintf("msg_fake_%d", rec.Seq)
 	if req.Stream {
 		s.streamMessages(w, r, rec, id, req.Model, blocks, stop, usage)

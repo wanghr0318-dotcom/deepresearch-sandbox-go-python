@@ -147,3 +147,11 @@ func TestRunUsage(t *testing.T) {
 		t.Errorf("missing flags: %d %q", code, errb.String())
 	}
 }
+
+func TestRedactArgs(t *testing.T) {
+	got := redactArgs([]string{"--database-url", "postgres://u:secret@h:5432/db?sslmode=disable", "--database-url=postgres://u:pw@h/db", "--seed", "1"})
+	if strings.Contains(strings.Join(got, " "), "secret") || strings.Contains(strings.Join(got, " "), ":pw@") ||
+		got[1] != "postgres://u:xxxxx@h:5432/db?sslmode=disable" || got[2] != "--database-url=postgres://u:xxxxx@h/db" || got[4] != "1" {
+		t.Errorf("redactArgs = %q", got)
+	}
+}

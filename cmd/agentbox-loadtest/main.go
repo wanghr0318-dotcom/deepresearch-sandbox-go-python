@@ -25,6 +25,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
@@ -80,7 +81,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	keyBudgetUSD := fs.Float64("key-budget-usd", 0.25, "budget: the first key's monthly budget in USD")
 	pStream := fs.Float64("p-stream", 0.25, "budget: share of complete streams")
 	pAbandon := fs.Float64("p-abandon", 0.15, "budget: share of streams abandoned after the first token (charged_unknown)")
-	rpm := fs.Int64("rpm", 1_000_000, "steady: rpm limit on every key (so the limiter is consulted)")
+	rpm := fs.Int64("rpm", 0, "latency, ladder: rpm at the org, user and key level (0 = none); steady: rpm on every key (default 1000000)")
+	tpm := fs.Int64("tpm", 0, "latency, ladder: tpm at the org, user and key level (0 = none)")
 	var hooks []hook
 	fs.Func("hook", "steady: DURATION=COMMAND run with sh -c at that time (repeatable)", func(s string) error {
 		h, err := parseHook(s)
@@ -126,7 +128,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "agentbox-loadtest latency: --paths, --stream, --fake-openai and --fake-anthropic must be valid", perr, merr)
 			return 2
 		}
-		res, err = latency(ctx, c, e, *conc, *dur, *warmup, ps, modes)
+		res, err = latency(ctx, c, e, *conc, *dur, *warmup, ps, modes, limits{*rpm, *tpm})
 	case "ladder":
 		ls, lerr := ints(*levels, "1,2,4,8,16,32,64,128,256")
 		p, perr := parsePaths(*pth)
@@ -134,7 +136,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "agentbox-loadtest ladder: invalid --levels, --path or --stream")
 			return 2
 		}
-		res, err = ladder(ctx, c, e, ls, *dur, p[0], *streams == "on", *orgs)
+		res, err = ladder(ctx, c, e, ls, *dur, p[0], *streams == "on", *orgs, limits{*rpm, *tpm})
 	case "ratelimit":
 		ls, lerr := ints(*levels, "60,600,3000")
 		if lerr != nil {
@@ -149,7 +151,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "budget":
 		res, err = budget(ctx, c, e, *conc, *users, *dur, usd(*budgetUSD), usd(*keyBudgetUSD), *pStream, *pAbandon)
 	case "steady":
-		res, err = steady(ctx, c, e, *conc, *dur, *rpm, hooks, *metrics)
+		steadyRPM := *rpm
+		if steadyRPM <= 0 {
+			steadyRPM = 1_000_000
+		}
+		res, err = steady(ctx, c, e, *conc, *dur, steadyRPM, hooks, *metrics)
 	case "lockwait":
 		oc, oerr := ints(*orgCounts, "1,16")
 		if oerr != nil {
@@ -167,13 +173,33 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	if *out != "" {
 		rec := map[string]any{"scenario": name, "label": *label, "at": time.Now().UTC().Format(time.RFC3339),
-			"go": runtime.Version(), "cpus": runtime.NumCPU(), "params": params, "args": args[1:], "result": res}
+			"go": runtime.Version(), "cpus": runtime.NumCPU(), "params": params, "args": redactArgs(args[1:]), "result": res}
 		if err := appendJSON(*out, rec); err != nil {
 			fmt.Fprintln(stderr, "agentbox-loadtest:", err)
 			return 1
 		}
 	}
 	return 0
+}
+
+// redactArgs replaces the password of any URL argument (the database URL) with "xxxxx".
+func redactArgs(args []string) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = a
+		if u, err := url.Parse(a); err == nil && u.User != nil {
+			if _, ok := u.User.Password(); ok {
+				u.User = url.UserPassword(u.User.Username(), "xxxxx")
+				out[i] = u.String()
+			}
+		}
+		if k, v, ok := strings.Cut(a, "="); ok && strings.HasPrefix(k, "-") {
+			if r := redactArgs([]string{v}); r[0] != v {
+				out[i] = k + "=" + r[0]
+			}
+		}
+	}
+	return out
 }
 
 // ints parses a comma-separated list of positive integers (def when s is empty).
