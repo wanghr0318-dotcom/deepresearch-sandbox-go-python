@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 模型网关演示（docs/design/2026-10-11-model-gateway-design.md §10）：多租户、平台 API key、OpenAI ⇄ Anthropic
 # 双向转换、加权路由、限流与月度预算、吊销、用量与账单、Prometheus 指标。供应商是本机的 fake upstream（不访问
-# 外网，没有模型费用）；不需要 root。可重复运行（每次重建演示库与数据目录），构建之后约 1 分钟。
+# 外网，没有模型费用）；不需要 root。可重复运行（每次重建演示库与数据目录），约 10–30 s（含增量构建）。
 #
 #   bash scripts/demo-gateway.sh
 #
@@ -62,12 +62,9 @@ header() { tr -d '\r' <"$GW_WORK/last.h" | grep -i "^$1:" | head -n1; }
 # ---------------------------------------------------------------------------
 
 step "启动 PostgreSQL/Redis、两个 fake upstream 与 agentbox server"
-for c in curl python3; do command -v "$c" >/dev/null || gw_fail "需要 $c"; done
 command -v "$UV" >/dev/null 2>&1 || [ -x "$UV" ] || gw_fail "需要 uv（或 AGENTBOX_DEMO_UV 指向 uv 可执行文件）"
-rm -rf "$GW_WORK"
-mkdir -p "$GW_WORK"
-gw_detect_docker
-gw_compose up -d --wait postgres redis >"$GW_WORK/compose.log" 2>&1 || { cat "$GW_WORK/compose.log" >&2; gw_fail "docker compose up 失败"; }
+gw_reset_work
+gw_prepare postgres redis
 ok "PostgreSQL 127.0.0.1:5432、Redis 127.0.0.1:6379（deploy/docker-compose.yml）"
 gw_build
 gw_fresh_db agentbox_demo_gateway
@@ -194,4 +191,4 @@ for line in open(sys.argv[1], encoding="utf-8"):
 print(f"   ✓ 成功率 {ok:.0f}/{tot:.0f}（到达路由的请求）；平均首字时间 {1000 * ttft_sum / max(ttft_n, 1):.1f} ms（{ttft_n:.0f} 个）；"
       f"流完整 {complete:.0f}/{streams:.0f}；拒绝 {', '.join(f'{k} {v:.0f}' for k, v in sorted(rej.items()))}")
 EOF
-info "Grafana 面板：deploy/observability（bash scripts/demo-observability.sh 启动观测栈）的 "Agentbox model gateway" 仪表盘（deploy/observability/grafana/dashboards/agentbox-model-gateway.json）"
+info "Grafana：观测栈（deploy/observability）提供「Agentbox model gateway」仪表盘；它需要 Prometheus 抓取一个长期运行的 server，本演示结束时 server 已停止，仪表盘还没有用真实数据验证过"

@@ -12,7 +12,8 @@
 #   bash scripts/fault-gateway.sh            # 全部场景
 #   bash scripts/fault-gateway.sh 2 3 4      # 指定场景
 #
-# 不需要 root。环境变量见 scripts/lib/gateway.sh。结果写入工作目录的 faults.md。
+# 不需要 root。需要：docker（未设置 AGENTBOX_DATABASE_URL 时以 deploy/docker-compose.yml 启动 PostgreSQL）、Go、python3、
+# curl。环境变量见 scripts/lib/gateway.sh。结果写入工作目录的 faults.md。
 set -euo pipefail
 
 GW_NAME=fault
@@ -46,10 +47,9 @@ on_exit() {
 }
 trap on_exit EXIT
 
-rm -rf "$GW_WORK"
-mkdir -p "$GW_WORK"
+gw_reset_work
 echo "# 模型网关故障注入 $(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$REPORT"
-gw_detect_docker
+gw_prepare
 gw_build
 gw_fresh_db agentbox_fault
 gw_new_data_dir

@@ -481,8 +481,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "rate(agentbox_ratelimit_fallback_decisions[$__rate_interval])",
-          "legendFormat": "fallback decisions/s"
+          "expr": "deriv(agentbox_ratelimit_fallback_decisions[$__rate_interval])",
+          "legendFormat": "fallback decisions/s (deriv of a gauge)"
         }
       ],
       "options": {

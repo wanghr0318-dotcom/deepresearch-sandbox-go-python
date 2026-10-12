@@ -5,8 +5,9 @@
 # 启动，这些脚本不运行沙箱任务）。由调用者 source；调用者先设置 GW_NAME（用于库名、目录名与容器名）。
 #
 # 环境变量（三个脚本共用）：
-#   AGENTBOX_DATABASE_URL     PostgreSQL 管理连接串（默认 postgres://agentbox:agentbox@127.0.0.1:5432/agentbox?sslmode=disable；
-#                             脚本在其中新建并重建自己的库）
+#   AGENTBOX_DATABASE_URL     PostgreSQL 管理连接串（默认 postgres://agentbox:agentbox@127.0.0.1:5432/agentbox?sslmode=disable，
+#                             此时脚本先以 deploy/docker-compose.yml 启动 postgres；脚本在其中新建并重建自己的库）
+# 依赖：docker（WSL2 中可用 Docker Desktop）、python3、curl、Go（AGENTBOX_GW_SKIP_BUILD=1 时不需要）；演示另需 uv。
 #   AGENTBOX_GW_BIN           二进制目录（默认 <仓库>/bin）；AGENTBOX_GW_SKIP_BUILD=1 时不重新构建
 #   AGENTBOX_GW_WORK          工作目录（数据目录、日志、结果；默认 /tmp/agentbox-<GW_NAME>，每次清空；须在 Linux 文件系统上，
 #                             因为 server 要求数据目录中的 api.token 为 0600）
@@ -57,6 +58,7 @@ gw_compose() { "$GW_DOCKER" compose -f "$(gw_hostpath "$GW_REPO/deploy/docker-co
 
 # ---- PostgreSQL ----
 
+gw_db_user() { python3 -c "import sys,urllib.parse as u; print(u.urlparse(sys.argv[1]).username or 'agentbox')" "$GW_PG_ADMIN_URL"; }
 gw_db_url() { python3 -c "import sys,urllib.parse as u; p=u.urlparse(sys.argv[1]); print(u.urlunparse(p._replace(path='/'+sys.argv[2])))" "$GW_PG_ADMIN_URL" "$1"; }
 
 # gw_psql DB SQL：以 -At 执行，打印结果（psql 不存在时经 compose 的 postgres 服务执行）。
@@ -65,7 +67,7 @@ gw_psql() {
   if command -v psql >/dev/null 2>&1; then
     psql -v ON_ERROR_STOP=1 -At "$(gw_db_url "$db")" -c "$sql"
   else
-    gw_compose exec -T postgres psql -v ON_ERROR_STOP=1 -U agentbox -d "$db" -At -c "$sql"
+    gw_compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "$(gw_db_user)" -d "$db" -At -c "$sql"
   fi
 }
 
@@ -79,6 +81,44 @@ gw_fresh_db() {
 }
 
 gw_sql() { gw_psql "$GW_DB" "$1"; }
+
+# ---- 准备 ----
+
+# gw_prepare [compose 服务…]：检查依赖（docker、python3、curl；不跳过构建时还有 Go），未设置 AGENTBOX_DATABASE_URL 时
+# 以 deploy/docker-compose.yml 启动本地服务（默认 postgres；已在运行时不变），然后确认 PostgreSQL 可达。
+gw_prepare() {
+  local c
+  for c in python3 curl; do command -v "$c" >/dev/null 2>&1 || gw_fail "需要 $c"; done
+  if [ "${AGENTBOX_GW_SKIP_BUILD:-}" != 1 ]; then
+    command -v go >/dev/null 2>&1 || gw_fail "需要 Go（构建 server、fake upstream 与 agentbox-loadtest；或 AGENTBOX_GW_SKIP_BUILD=1）"
+  fi
+  gw_detect_docker
+  if [ -z "${AGENTBOX_DATABASE_URL:-}" ]; then
+    [ $# -gt 0 ] || set -- postgres
+    gw_compose up -d --wait "$@" >"$GW_WORK/compose.log" 2>&1 || { cat "$GW_WORK/compose.log" >&2; gw_fail "docker compose up $* 失败"; }
+  fi
+  local hp
+  hp=$(python3 -c "import sys,urllib.parse as u; p=u.urlparse(sys.argv[1]); print(f'{p.hostname} {p.port or 5432}')" "$GW_PG_ADMIN_URL")
+  timeout 3 bash -c "exec 3<>/dev/tcp/${hp% *}/${hp#* }" 2>/dev/null ||
+    gw_fail "PostgreSQL ${hp% *}:${hp#* } 不可达（docker compose -f deploy/docker-compose.yml up -d --wait，或设置 AGENTBOX_DATABASE_URL）"
+}
+
+# gw_reset_work：清空并重建工作目录。只删除本脚本建立过的目录（带标记文件）或 /tmp/agentbox-* 下的目录，
+# 拒绝空路径、/ 与 $HOME。
+gw_reset_work() {
+  case "$GW_WORK" in
+    "" | / | "$HOME" | "$HOME/") gw_fail "拒绝清空工作目录 '$GW_WORK'" ;;
+  esac
+  if [ -e "$GW_WORK" ]; then
+    case "$GW_WORK" in
+      /tmp/agentbox-*) ;;
+      *) [ -e "$GW_WORK/.agentbox-gw-work" ] || gw_fail "$GW_WORK 已存在且不是本脚本建立的工作目录（缺少 .agentbox-gw-work）；换一个 AGENTBOX_GW_WORK" ;;
+    esac
+    rm -rf "$GW_WORK"
+  fi
+  mkdir -p "$GW_WORK"
+  : >"$GW_WORK/.agentbox-gw-work"
+}
 
 # ---- 构建 ----
 
