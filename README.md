@@ -26,7 +26,7 @@
    ▼
 Go 控制面
  ├─ 认证与租户：org → 用户 → key、scope、过期与吊销（PostgreSQL NOTIFY）
- ├─ 限流：rpm、tpm、并发流（key / 用户 / org；Redis Lua，不可用时退化为进程内）
+ ├─ 限流：rpm、tpm（key / 用户 / org；Redis Lua，不可用时退化为进程内）；并发流在每个 server 进程内计数
  ├─ 月度预算：每个请求或沙箱调用在各层级放一个 hold，结束后按实际费用结算
  ├─ 运行时 API：任务与会话状态机、准入、调度、checkpoint、崩溃恢复、事件续传（Last-Event-ID）
  ├─ 模型 API（--model-api）：/v1/chat/completions、/v1/messages、/v1/models
@@ -82,7 +82,7 @@ Go 控制面
   - lint 与复杂度报告。
 - **真实验收**：在 4 vCPU / 8 GiB 的 Linux 云主机（腾讯云上海）上，使用真实模型（Moonshot：`kimi-k3` 主导、`kimi-k2.6` 执行）与经 Serper 的 Google 搜索结果。记录：[对话助手](docs/evidence/2026-10-06-m4-chat-acceptance.md)、[exec 沙箱](docs/evidence/2026-10-06-m4-exec-hardening.md)、[账号](docs/evidence/2026-10-06-m3-accounts.md)、[备份与恢复](docs/evidence/2026-10-06-backup-restore.md)。
 - **模型降级链**（[记录](docs/evidence/2026-10-10-model-fallback.md)，fake upstream、零费用）：主供应商持续 503 时，无降级链的调用 3.7–5.1 s 后失败（3 次 try 加退避），有降级链时约 51 ms 由后备供应商完成（与健康供应商相同）；全部熔断时约 40 µs 返回 `model_degraded`。
-- **模型网关**（[记录](docs/evidence/2026-10-12-model-gateway.md)，WSL2 单机 + fake upstream、零费用，关键场景各 3 次）：网关开销 P50 约 16 ms、P99 约 25–27 ms（四条路径相同，约三分之二是每个请求约 4 次提交的落盘），流式首字约 6.5 ms；16 个 org 时约 1050 RPS（并发 32）；限流放行 / 配置 1.000–1.001；并发 64 下预算超支 0（每 100 ms 快照无一超限）；运行中停止 Redis 0 个客户端错误；负载之后 `bill reconcile` 一致。同一 org 的预算行是热点：单个 org 约 135 RPS，数据库变慢时排队超过 2 s 的存储期限会返回 503（失败关闭）。四个故障场景（kill -9、首字节后失败、流中吊销、熔断）全部通过；经 Moonshot 的 6 次真实调用覆盖四条路径（含 Anthropic 兼容端点）。
+- **模型网关**（[记录](docs/evidence/2026-10-12-model-gateway.md)，2026-10-12；fake upstream、零费用；单机 WSL2、CPU 与其他任务共享、PostgreSQL 在 Docker Desktop 中（提交落盘偏慢）、只有一个 server，所以跨 server 的 Redis 全局限流没有测；关键场景各 3 次）：非流式网关开销 P50 约 16 ms、P99 约 25–27 ms（四条路径相同；流式 P99 24.5–35 ms，首字约 6.5 ms；约三分之二是每个请求约 4 次提交的落盘），这些数字没有设限额、限流器不在路径上——三级都设 rpm 与 tpm 时 P50 多约 1–2 ms；16 个 org 约 1050 RPS（并发 32，数据库较空闲时；数据库变慢的一次运行中为 440 RPS，吞吐随提交延迟变化），限流器在路径上时没有可见差别；限流放行 / 配置 1.000–1.002；并发 64 下预算超支 0，且 fake upstream 自己的计数与网关的 try、hold、token 完全一致；运行中停止 Redis 0 个客户端错误；负载之后 `bill reconcile` 一致。同一 org 的预算行是热点：单个 org 约 135 RPS，数据库变慢时排队超过 2 s 的存储期限会返回 503（失败关闭）。四个故障场景（kill -9、首字节后失败、流中吊销、熔断）全部通过；经 Moonshot 的 6 次真实调用覆盖四条路径（含 Anthropic 兼容端点）。
 - **Kubernetes provider**（[记录](docs/evidence/2026-10-10-k8s-provider.md)，kind 单节点，每组 20 次）：环境就绪 P50 冷启动 978 ms、预热池 11 ms；到 Python 首行输出 1051 ms / 78 ms；契约一致性测试在 fake clientset（CI）与 kind 上均 11/11 通过；`scripts/demo-k8s.sh` 演示 Gateway、取消与 server 崩溃恢复。
 - **评测平台**（[记录](docs/evidence/2026-10-10-eval-platform.md)，fake upstream、零模型费用）：真实沙箱中 15 个任务的参考解 15/15 通过；fake 模型 9/15，6 个故意错误的回答全部失败（`wrong_exit_code`×5、`check_timeout`×1），其中两个在导入时 `exit 0` 的奖励作弊也失败——解答在独立进程中运行，检查器须打印随机完成令牌才算通过；并发 1 → 4 墙钟 18.5 s → 10.5 s。
 - **轨迹诊断闭环**（[记录](docs/evidence/2026-10-10-trace-doctor.md)，真实沙箱 + fake upstream、零模型费用，每次运行 N = 64）：故意错误配置的 server（主供应商每第 4 个 chat 挂起而没有每 try 超时；调用期限 1 s 短于 1.5 s 的抓取）成功率 56.2%（Wilson 95% [44.1%, 67.7%]）、P95 90.2 s；`doctor-traces` 只读轨迹就把 28 个失败全部归因到两条规则，提出 `--model-try-timeout 2s` 与 `--call-deadline 10s`；以它写出的实验配置重跑同一 suite：100%（[94.3%, 100%]）、P95 15.1 s。故障按每第 4 个请求的确定性节奏注入，Wilson 区间只是保守的核对；更强的证据是脚本两次完整运行得到相同结果。
@@ -147,7 +147,7 @@ anthropic.Anthropic(base_url="http://127.0.0.1:8080", api_key=KEY).messages.crea
     model="kimi-k3", max_tokens=200, messages=[{"role": "user", "content": "你好"}])
 ```
 
-不需要模型 Key 与 root（fake upstream 作为 OpenAI 与 Anthropic 格式的供应商，需要 docker 与 uv）：
+不需要模型 Key 与 root（fake upstream 作为 OpenAI 与 Anthropic 格式的供应商；需要 docker、Go、python3、curl，`sdk-compat.sh` 与演示另需 uv；未设置 `AGENTBOX_DATABASE_URL` 时脚本自己以 `deploy/docker-compose.yml` 启动 PostgreSQL）：
 
 ```bash
 AGENTBOX_TEST_DATABASE_URL='postgres://agentbox:agentbox@127.0.0.1:5432/agentbox?sslmode=disable' bash scripts/sdk-compat.sh  # 两个 SDK × 两种供应商格式
@@ -204,8 +204,8 @@ sudo AGENTBOX_DATABASE_URL=... agentbox bill reconcile 2026-10   # 有差异时�
 - **单执行主机。** 没有跨主机故障接管；Kubernetes provider 的 workspace 与 Gateway socket 经节点本地目录共享，目前也只支持单节点。
 - **不保证 exactly-once。** 外部调用不保证 exactly-once；结果未知时按保守方式计费，预算可能略有超出。
 - **Workspace 不回滚。** workspace 不随 checkpoint 回滚。
-- **同一 org 的预算行是热点。** 每个模型请求在预留与结算时各锁一次 org 的月度预算行：测试机上单个 org 约 135 RPS（分散到 16 个 org 约 1050 RPS）；数据库变慢时排队超过存储期限的请求得到 503（失败关闭，不会超支）。分片计数与预分配的预算片是后续工作。
-- **Redis 不可用时限流按 server 生效。** 预算在 PostgreSQL 中，不受影响；PostgreSQL 不可用时模型 API 返回 503。
+- **同一 org 的预算行是热点。** 每个模型请求在预留与结算时各锁一次 org 的月度预算行：测试机上单个 org 约 135 RPS（分散到 16 个 org 约 1050 RPS；都是数据库较空闲时，吞吐随提交延迟变化）；数据库变慢时排队超过存储期限的请求得到 503（失败关闭，不会超支）。分片计数与预分配的预算片是后续工作。
+- **Redis 不可用时限流按 server 生效；并发流（`max_streams`）总是按 server 计数**（N 个 server 时实际上限为 N 倍）。预算在 PostgreSQL 中，不受影响；PostgreSQL 不可用时模型 API 返回 503。
 - **模型网关的范围。** 每个用户只属于一个 org；主供应商（`--model-base-url`）总是 OpenAI 格式，Anthropic 格式的供应商只能作为后备；没有支付、SSO、多区域，也不支持用户自带供应商 Key。
 
 ## 致谢

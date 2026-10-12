@@ -349,7 +349,7 @@ The existing `--model-fallback-file` gains optional fields (old files stay valid
   4. revoke a key and get `401`;
   5. show the bill and run reconcile;
   6. Grafana panels: success rate, time to first token, stream completeness, rejections by reason.
-- **Evidence** goes to `docs/evidence/2026-10-11-model-gateway.md`.
+- **Evidence** goes to `docs/evidence/2026-10-12-model-gateway.md`.
 - **Real providers:** no Anthropic key is available, so the Anthropic provider path is verified against `fakeupstream` only. If Moonshot's Anthropic-compatible endpoint accepts the existing key, one cheap real call per direction is recorded.
 
 ## 11. Delivery
