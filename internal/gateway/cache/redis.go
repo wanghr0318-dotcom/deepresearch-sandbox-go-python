@@ -17,6 +17,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -247,6 +248,9 @@ func (r *Redis) do(ctx context.Context, timeout time.Duration, args ...any) (rep
 		r.put(c)
 	} else {
 		_ = c.nc.Close() // 连接已作废；关闭错误无可补救
+		if !cancelled && deadConn(err) {
+			r.dropIdle() // 服务端关闭了连接（例如 Redis 重启）：池中其余空闲连接多半同样失效
+		}
 	}
 	if cancelled && err != nil {
 		return reply{}, fmt.Errorf("cache: redis %s: %w", cmd, ctx.Err())
@@ -395,4 +399,22 @@ func readLine(br *bufio.Reader) ([]byte, error) {
 		return nil, fmt.Errorf("%w: 行缺少 CR", ErrProtocol)
 	}
 	return line[:len(line)-2], nil
+}
+
+// deadConn 报告 err 是否表示服务端已关闭连接（EOF、连接被重置、管道断开），而不是超时或协议错误。
+func deadConn(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, net.ErrClosed)
+}
+
+// dropIdle 关闭并丢弃全部空闲连接：下一次操作重新拨号。Redis 重启之后池中的连接都已失效；不丢弃时，每次操作
+// 取出一个失效连接再失败一次，限流器（每 5 s 冷却才试一次 Redis）的恢复会推迟"空闲连接数 × 5 s"。
+func (r *Redis) dropIdle() {
+	r.mu.Lock()
+	idle := r.idle
+	r.idle = nil
+	r.mu.Unlock()
+	for _, c := range idle {
+		_ = c.nc.Close() // 已失效的连接；关闭错误无可补救
+	}
 }

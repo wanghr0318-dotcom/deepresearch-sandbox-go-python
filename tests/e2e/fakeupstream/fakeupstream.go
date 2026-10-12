@@ -138,6 +138,9 @@ type Request struct {
 	Action        Action    // 注入的动作
 	At            time.Time // 到达时间
 	Outcome       string    // 结局；处理中为空
+	// PromptTokens 与 CompletionTokens 是回复中报告的用量（OpenAI 的 prompt_tokens 含缓存读取；Anthropic 为
+	// input_tokens 加缓存读写）；没有模型回复时为 0。负载测试据此核对网关记录的用量。
+	PromptTokens, CompletionTokens int64
 }
 
 // Server 是进程内 fake upstream。并发安全。
@@ -541,6 +544,13 @@ func (s *Server) finishHang(rec *Request, outcome string) {
 	}
 }
 
+// setUsage 记录回复中报告的用量。
+func (s *Server) setUsage(rec *Request, prompt, completion int64) {
+	s.mu.Lock()
+	rec.PromptTokens, rec.CompletionTokens = prompt, completion
+	s.mu.Unlock()
+}
+
 func (s *Server) setOutcome(rec *Request, outcome string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -638,15 +648,15 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request, rec *Request, body
 			if json.Unmarshal(msg, &m) == nil && len(m.ToolCalls) > 0 {
 				finish = "tool_calls"
 			}
-			prompt := int64(len(body)+3) / 4
-			completion := int64(len(msg)+3) / 4
+			usage := s.chatUsage(int64(len(body)+3)/4, int64(len(msg)+3)/4)
+			s.setUsage(rec, usage.PromptTokens, usage.CompletionTokens)
 			if req.Stream {
-				s.streamChat(w, r, rec, req, msg, finish, s.chatUsage(prompt, completion))
+				s.streamChat(w, r, rec, req, msg, finish, usage)
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"id": fmt.Sprintf("chatcmpl-fake-%d", rec.Seq), "object": "chat.completion",
 				"model": req.Model, "choices": []map[string]any{{"index": 0, "message": msg, "finish_reason": finish}},
-				"usage": s.chatUsage(prompt, completion)})
+				"usage": usage})
 			s.setOutcome(rec, OutcomeOK)
 			return
 		}
@@ -667,21 +677,21 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request, rec *Request, body
 		}
 	}
 	s.mu.Unlock()
-	prompt := int64(len(body)+3) / 4
-	completion := int64(len(content)+3) / 4
+	usage := s.chatUsage(int64(len(body)+3)/4, int64(len(content)+3)/4)
+	s.setUsage(rec, usage.PromptTokens, usage.CompletionTokens)
 	w.Header().Set("X-Request-Id", fmt.Sprintf("fake-req-%d", rec.Seq))
 	if req.Stream {
 		msg, err := json.Marshal(ChatMessage{Role: "assistant", Content: content})
 		if err != nil {
 			panic(err) // 只编码本包的结构体
 		}
-		s.streamChat(w, r, rec, req, msg, "stop", s.chatUsage(prompt, completion))
+		s.streamChat(w, r, rec, req, msg, "stop", usage)
 		return
 	}
 	writeJSON(w, http.StatusOK, ChatReply{
 		ID: fmt.Sprintf("chatcmpl-fake-%d", rec.Seq), Object: "chat.completion", Model: req.Model,
 		Choices: []ChatChoice{{Message: ChatMessage{Role: "assistant", Content: content}, FinishReason: "stop"}},
-		Usage:   s.chatUsage(prompt, completion),
+		Usage:   usage,
 	})
 	s.setOutcome(rec, OutcomeOK)
 }

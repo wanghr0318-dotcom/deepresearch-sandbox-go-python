@@ -17,21 +17,25 @@
 //     （disconnect）中途断开：故障速率固定的不稳定供应商（trace doctor 演示）。
 //
 // 模型网关（2026-10-11 设计 §10）：类别 messages 是 Anthropic 的 /v1/messages（base_url 为打印的 url）；
-// 以上各选项的 kind 都可以是 messages。
+// 以上各选项的 kind 都可以是 messages。退出时在 counts 行之后另打印一行 `usage chat=<输入>+<输出> messages=…`：
+// 回复中报告的 token 合计（负载测试据此独立核对网关记录的用量）。
 //   - -anthropic-key-env NAME：/v1/messages 要求 x-api-key 等于环境变量 NAME 的值（Key 不出现在命令行）。
 //   - -fail-after chat:2:5,messages:1:3:error：该类第 N 次流式请求发出 K 个 SSE 事件后切断连接（加 :error 时
 //     改为发出错误事件，加 :midline 时在下一个事件的一行中间切断）。
 //   - -chunk-delay chat=50ms：流式回复相邻事件之间的延迟（首字延迟测量）。
 //   - -cache-usage 300:20：模型回复用量带缓存读取 300、缓存写入 20 个 token。
+//   - -tool-calls：带 tools 且还没有工具结果的请求以调用第一个工具的 tool call 回复（scripts/demo-gateway.sh）。
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -55,6 +59,7 @@ func main() {
 	failAfter := flag.String("fail-after", "", "流式故障，逗号分隔的 kind:N:K[:error]（第 N 次该类请求发出 K 个事件后切断或发出错误事件）")
 	chunkDelay := flag.String("chunk-delay", "", "流式回复相邻事件之间的延迟，逗号分隔的 kind=duration")
 	cacheUsage := flag.String("cache-usage", "", "模型回复用量中的缓存 token，read:write")
+	toolCalls := flag.Bool("tool-calls", false, "带 tools 且还没有工具结果的请求以调用第一个工具的 tool call 回复（参数 {\"city\":\"Paris\"}）")
 	flag.Parse()
 
 	fu := fakeupstream.New()
@@ -82,6 +87,9 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "fakeupstream: %d scripted code replies from %s\n", n, *suitePath)
 	}
+	if *toolCalls {
+		installToolCalls(fu)
+	}
 	if *hold {
 		fu.Inject(fakeupstream.Chat, 1, fakeupstream.Action{Hang: true})
 	}
@@ -106,6 +114,7 @@ func main() {
 		fu.Count(fakeupstream.Chat), fu.Count(fakeupstream.Search), fu.Count(fakeupstream.Fetch),
 		fu.StageCount(fakeupstream.StagePlan), fu.StageCount(fakeupstream.StageSummarize), fu.StageCount(fakeupstream.StageReport),
 		fu.StageCount(fakeupstream.StageCode), fu.Count(fakeupstream.Messages))
+	fmt.Printf("usage chat=%s messages=%s\n", usageSum(fu, fakeupstream.Chat), usageSum(fu, fakeupstream.Messages))
 	fu.Close()
 }
 
@@ -227,4 +236,68 @@ func configureStreams(fu *fakeupstream.Server, keyEnv, failAfter, chunkDelay, ca
 		fu.SetCacheUsage(read, write)
 	}
 	return nil
+}
+
+// installToolCalls 安装 chat 与 messages 的脚本：请求带 tools 且还没有工具结果时，以调用第一个工具（参数
+// {"city":"Paris"}）的 tool call 回复；其余请求按默认的占位文本回复。
+func installToolCalls(fu *fakeupstream.Server) {
+	var req struct {
+		Tools []struct {
+			Name     string `json:"name"`
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	firstTool := func(body []byte) (string, bool) {
+		req.Tools, req.Messages = nil, nil
+		if json.Unmarshal(body, &req) != nil || len(req.Tools) == 0 {
+			return "", false
+		}
+		for _, m := range req.Messages {
+			if m.Role == "tool" || strings.Contains(string(m.Content), `"tool_result"`) {
+				return "", false // 已有工具结果：按占位文本回复
+			}
+		}
+		if req.Tools[0].Function.Name != "" {
+			return req.Tools[0].Function.Name, true
+		}
+		return req.Tools[0].Name, req.Tools[0].Name != ""
+	}
+	var mu sync.Mutex
+	fu.SetChatHook(func(body []byte) json.RawMessage {
+		mu.Lock()
+		defer mu.Unlock()
+		name, ok := firstTool(body)
+		if !ok {
+			return nil
+		}
+		b, _ := json.Marshal(map[string]any{"role": "assistant", "content": nil, "tool_calls": []map[string]any{{"id": "call_1",
+			"type": "function", "function": map[string]string{"name": name, "arguments": `{"city":"Paris"}`}}}})
+		return b
+	})
+	fu.SetMessagesHook(func(body []byte) json.RawMessage {
+		mu.Lock()
+		defer mu.Unlock()
+		name, ok := firstTool(body)
+		if !ok {
+			return nil
+		}
+		b, _ := json.Marshal([]map[string]any{{"type": "tool_use", "id": "toolu_1", "name": name, "input": map[string]string{"city": "Paris"}}})
+		return b
+	})
+}
+
+// usageSum 返回该类请求在回复中报告的用量合计，形如 "<输入>+<输出>"。
+func usageSum(fu *fakeupstream.Server, kind fakeupstream.Kind) string {
+	var p, c int64
+	for _, r := range fu.Requests(kind) {
+		p += r.PromptTokens
+		c += r.CompletionTokens
+	}
+	return fmt.Sprintf("%d+%d", p, c)
 }
