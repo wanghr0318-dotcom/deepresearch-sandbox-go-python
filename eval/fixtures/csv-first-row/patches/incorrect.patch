@@ -1,0 +1,10 @@
+diff --git a/records.py b/records.py
+--- a/records.py
++++ b/records.py
+@@ -5,4 +5,3 @@
+ def read_records(source: str) -> list[dict[str, str]]:
+-    reader = csv.DictReader(StringIO(source))
+-    next(reader, None)
+-    return list(reader)
++    header, *rows = source.splitlines()
++    return [dict(zip(header.split(","), row.split(","))) for row in rows]
