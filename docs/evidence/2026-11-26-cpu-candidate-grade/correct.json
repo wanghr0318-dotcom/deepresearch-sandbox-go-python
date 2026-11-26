@@ -1,0 +1,18 @@
+{
+  "scenario": "correct",
+  "producer_task": "task_e5e11a3a21e551c20ff27d5081757a57",
+  "producer_call": "root/correct/workspace_exec/1",
+  "producer_result": "8483e16f6c9645cd2b405286aa4eaddcd6f255c3032fd1a3ef860a9597e53437",
+  "candidate_sha256": "1b35e2b8fa0f2a85d5aa4efcf30aed6bd12e87139a0cb17c3a735c7aa1c13b64",
+  "size": 162,
+  "grader_task": "task_63bd10d784760af1d38ce86b5ba58c5a",
+  "grader_result": "40b89298c7307c8032410ef7a6d2abe0c71aabd14cc7f824b1c6a932e6e97368",
+  "graded_sha256": "1b35e2b8fa0f2a85d5aa4efcf30aed6bd12e87139a0cb17c3a735c7aa1c13b64",
+  "cases": {
+    "single_row": true,
+    "ordered_rows": true,
+    "header_only": true,
+    "quoted_comma": true
+  },
+  "wall_ms": 47
+}

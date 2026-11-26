@@ -1,0 +1,18 @@
+{
+  "scenario": "incorrect",
+  "producer_task": "task_e5e11a3a21e551c20ff27d5081757a57",
+  "producer_call": "root/incorrect/workspace_exec/1",
+  "producer_result": "558668f82441a2cc6b69250b140404a273eb6efc4e151e19fa2fd8d0f117bfbd",
+  "candidate_sha256": "5f759293254cea5d630e2b6778b094047d0d7c507cc4ccd22a4e8fca4619d576",
+  "size": 206,
+  "grader_task": "task_14e1ac1527de0426ad48833b460c27d1",
+  "grader_result": "0600cdb2d5a5cd085c184702428b16f64723b5627d7fd60cd4320b3bc15ea5ff",
+  "graded_sha256": "5f759293254cea5d630e2b6778b094047d0d7c507cc4ccd22a4e8fca4619d576",
+  "cases": {
+    "single_row": true,
+    "ordered_rows": true,
+    "header_only": true,
+    "quoted_comma": false
+  },
+  "wall_ms": 50
+}
