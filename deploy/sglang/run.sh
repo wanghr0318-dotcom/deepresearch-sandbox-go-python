@@ -17,6 +17,7 @@ run_autodl() {
   local venv=${1:?$usage} model_dir=${2:?$usage} evidence=${3:?$usage}
   local python="$venv/bin/python" pid sampler attempt
   local -a args=("${launch_args[@]}" --host 127.0.0.1 --model-path "$model_dir" --context-length 24576)
+  export PATH="$venv/bin:/usr/local/cuda/bin:$PATH"
   test -r "$model_dir/config.json"
   test -r "$model_dir/tokenizer_config.json"
   if curl -sS --connect-timeout 1 --max-time 2 http://127.0.0.1:30000/v1/models >/dev/null 2>&1; then
