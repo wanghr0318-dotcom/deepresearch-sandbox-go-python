@@ -1,0 +1,1 @@
+{"model":"Qwen/Qwen3-8B","messages":[{"role":"user","content":"Reply with the single word ready."}],"temperature":0.5,"top_p":0.8,"top_k":20,"max_tokens":4,"stream":false}

@@ -1,0 +1,8 @@
+# Sensor readings are added without converting units
+
+Read `records.py` and the unit conversion contract in `units.py`. Fix
+`sensor_totals` in `records.py` to return each sensor's total in volts,
+summing negative and positive readings. Preserve rejection of unsupported
+units as a `ValueError`. Leave the conversion helper unchanged.
+
+The contents of repo/ are already staged at the workspace root. The tool path for the target is exactly records.py. Use read_file on records.py first, write your change to records.py, then run a public smoke test with exec_shell.

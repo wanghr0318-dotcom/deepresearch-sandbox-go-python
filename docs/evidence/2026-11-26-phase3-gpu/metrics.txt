@@ -1,0 +1,16 @@
+sglang:prompt_tokens_total{engine_type="unified",is_streaming="false",model_name="Qwen/Qwen3-8B"} 385000.0
+sglang:prompt_tokens_total{engine_type="unified",is_streaming="true",model_name="Qwen/Qwen3-8B"} 583874.0
+sglang:generation_tokens_total{engine_type="unified",is_streaming="false",model_name="Qwen/Qwen3-8B"} 9207.0
+sglang:generation_tokens_total{engine_type="unified",is_streaming="true",model_name="Qwen/Qwen3-8B"} 9955.0
+sglang:num_requests_total{engine_type="unified",is_streaming="false",model_name="Qwen/Qwen3-8B"} 118.0
+sglang:num_requests_total{engine_type="unified",is_streaming="true",model_name="Qwen/Qwen3-8B"} 623.0
+sglang:cached_tokens_total{cache_source="device",engine_type="unified",model_name="Qwen/Qwen3-8B"} 916623.0
+sglang:prefill_effective_tokens_total{engine_type="unified",mode="input",model_name="Qwen/Qwen3-8B",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 52251.0
+sglang:prefill_effective_tokens_total{engine_type="unified",mode="device_hit",model_name="Qwen/Qwen3-8B",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 916623.0
+sglang:prefill_effective_tokens_total{engine_type="unified",mode="host_hit",model_name="Qwen/Qwen3-8B",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 0.0
+sglang:prefill_effective_tokens_total{engine_type="unified",mode="storage_hit",model_name="Qwen/Qwen3-8B",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 0.0
+sglang:queue_time_seconds_sum{engine_type="unified",model_name="Qwen/Qwen3-8B",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 18.530386213213205
+sglang:queue_time_seconds_count{engine_type="unified",model_name="Qwen/Qwen3-8B",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 741.0
+sglang:max_total_num_tokens{engine_type="unified",model_name="Qwen/Qwen3-8B",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 393289.0
+sglang:kv_cache_memory_usage_gb{engine_type="unified",model_name="Qwen/Qwen3-8B",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 54.010162353515625
+sglang:num_queue_reqs{engine_type="unified",model_name="Qwen/Qwen3-8B",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 0.0

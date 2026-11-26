@@ -1,0 +1,7 @@
+# Rolling averages omit the final complete window
+
+Fix `moving_averages` in `records.py`. For positive `width`, return the
+arithmetic mean of every contiguous complete window, including the final one.
+Return an empty list if the input has no complete window.
+
+The contents of repo/ are already staged at the workspace root. The tool path for the target is exactly records.py. Use read_file on records.py first, write your change to records.py, then run a public smoke test with exec_shell.

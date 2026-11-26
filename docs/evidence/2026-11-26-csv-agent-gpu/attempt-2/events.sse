@@ -1,0 +1,27 @@
+id: 1
+event: turn_created
+data: {"seq":1,"turn_id":"task_a8c243d84ba105939917d04e1b588b92","type":"turn_created","ts":"2026-11-26T18:02:13.160709+08:00","data":{"deep_research":false,"text":"# CSV 首条记录丢失\n\n`read_records(\"name,city\\nAda,London\\n\")` 应返回一条包含 Ada 和 London 的记录，目前返回空列表。修复 `records.py`，保留 CSV 的字段解析与记录顺序。只有表头时应返回空列表。\n\n任务工作区从 `repo/` 创建。验收测试由评测端保管。\n\nUse the existing workspace tools. First read records.py. Modify records.py and run a public smoke test with exec_shell after writing it, before your final reply.","turn_index":0},"internal":{"source":"host","type":"task_created","task_seq":1,"payload":{"text":"# CSV 首条记录丢失\n\n`read_records(\"name,city\\nAda,London\\n\")` 应返回一条包含 Ada 和 London 的记录，目前返回空列表。修复 `records.py`，保留 CSV 的字段解析与记录顺序。只有表头时应返回空列表。\n\n任务工作区从 `repo/` 创建。验收测试由评测端保管。\n\nUse the existing workspace tools. First read records.py. Modify records.py and run a public smoke test with exec_shell after writing it, before your final reply.","turn_index":0,"deep_research":false}}}
+
+id: 2
+event: turn_status
+data: {"seq":2,"turn_id":"task_a8c243d84ba105939917d04e1b588b92","type":"turn_status","ts":"2026-11-26T18:02:13.17008+08:00","data":{"status":"queued"},"internal":{"source":"host","type":"control_applied","task_seq":2,"payload":{"status":"queued","control_version":1}}}
+
+id: 3
+event: session_state
+data: {"seq":3,"type":"session_state","ts":"2026-11-26T18:02:14.962422+08:00","data":{"state":"idle"},"internal":{"source":"session","type":"session_state","payload":{"state":"idle"}}}
+
+id: 4
+event: internal
+data: {"seq":4,"turn_id":"task_a8c243d84ba105939917d04e1b588b92","type":"internal","ts":"2026-11-26T18:02:14.966537+08:00","data":{},"internal":{"source":"host","type":"attempt_created","attempt_id":"1a2ee5684dc33571e55c3d856e925e6b","task_seq":3,"payload":{"env_id":"2ffa1956e94014886a823b6d38cc9f01","attempt_no":1}}}
+
+id: 5
+event: internal
+data: {"seq":5,"turn_id":"task_a8c243d84ba105939917d04e1b588b92","type":"internal","ts":"2026-11-26T18:02:14.974991+08:00","data":{},"internal":{"source":"worker","type":"task_accepted","attempt_id":"1a2ee5684dc33571e55c3d856e925e6b","task_seq":4,"payload":{"v":1,"ts":"2026-11-26T10:02:14.974Z","seq":2,"type":"task_accepted","attempt_id":"1a2ee5684dc33571e55c3d856e925e6b"}}}
+
+id: 6
+event: internal
+data: {"seq":6,"turn_id":"task_a8c243d84ba105939917d04e1b588b92","type":"internal","ts":"2026-11-26T18:02:33.823665+08:00","data":{},"internal":{"source":"worker","type":"error","attempt_id":"1a2ee5684dc33571e55c3d856e925e6b","task_seq":5,"payload":{"v":1,"ts":"2026-11-26T10:02:33.823Z","seq":3,"code":"model_unavailable","type":"error","message":"模型服务暂时不可用，请重试","retryable":false,"attempt_id":"1a2ee5684dc33571e55c3d856e925e6b"}}}
+
+id: 7
+event: turn_status
+data: {"seq":7,"turn_id":"task_a8c243d84ba105939917d04e1b588b92","type":"turn_status","ts":"2026-11-26T18:02:33.868471+08:00","data":{"reason":"worker_error","status":"failed","user_message":"模型服务暂时不可用，请重试"},"internal":{"source":"host","type":"task_terminal","attempt_id":"1a2ee5684dc33571e55c3d856e925e6b","task_seq":6,"payload":{"attempt_id":"1a2ee5684dc33571e55c3d856e925e6b","task_status":"failed","outcome_class":"worker_error","status_reason":"worker_error","platform_killed":false,"output_incomplete":false}}}

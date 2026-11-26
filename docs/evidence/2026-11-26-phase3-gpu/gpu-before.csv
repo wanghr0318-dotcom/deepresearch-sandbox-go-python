@@ -1,0 +1,2 @@
+name, driver_version, memory.total [MiB], memory.used [MiB]
+NVIDIA A800-SXM4-80GB, 580.126.09, 81920 MiB, 0 MiB

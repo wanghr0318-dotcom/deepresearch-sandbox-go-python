@@ -1,0 +1,14 @@
+namespace/agentbox-csv-8b119006ed created
+namespace "agentbox-csv-8b119006ed" deleted
+Traceback (most recent call last):
+  File "/home/ubuntu/agentbox-stage2/suite/scripts/run-cloud-agent-csv.py", line 390, in <module>
+    main()
+  File "/home/ubuntu/agentbox-stage2/suite/scripts/run-cloud-agent-csv.py", line 366, in main
+    report = run_acceptance(args, source, state, url, namespace)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/agentbox-stage2/suite/scripts/run-cloud-agent-csv.py", line 162, in run_acceptance
+    solved = wait_task(args.agentbox, url, turn, operator, args.timeout)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/agentbox-stage2/suite/scripts/run-cloud-agent-csv.py", line 113, in wait_task
+    raise TimeoutError(f"task {task} timed out")
+TimeoutError: task task_025b0538467d3a60608c140dd2dda5e1 timed out

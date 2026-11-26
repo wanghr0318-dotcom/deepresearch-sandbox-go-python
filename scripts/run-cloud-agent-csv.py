@@ -150,8 +150,12 @@ def run_acceptance(args, source, data_dir, url, namespace):
     try:
         start = time.monotonic()
         prompt = fixture.joinpath("task.md").read_text(encoding="utf-8")
-        prompt += ("\nUse the existing workspace tools. First read records.py. Modify records.py "
-                   "and run a public smoke test with exec_shell after writing it, before your final reply.")
+        prompt += ("\nThe contents of repo/ are already staged at the workspace root. The tool path "
+                   "for the target is exactly records.py. Use read_file on records.py first, write "
+                   "your change to records.py, then run a public smoke test with exec_shell.")
+        prompt = prompt.strip()
+        report["prompt_sha256"] = digest(prompt.encode())
+        (results / "prompt.txt").write_bytes(prompt.encode())
         turn = api("POST", f"/sessions/{session}/messages",
                    {"request_id": "solve", "deep_research": False, "text": prompt})["turn_id"]
         report["turn_id"] = turn
@@ -194,7 +198,8 @@ def run_acceptance(args, source, data_dir, url, namespace):
         tool_ok = {e["tool_call_id"]: e["ok"] for e in tool_results}
         required = ["read_file", "write_file", "exec_shell"]
         for entry in tool_calls:
-            if required and required[0] == entry["tool"] and tool_ok.get(entry["tool_call_id"]):
+            target_ok = entry["tool"] == "exec_shell" or entry["input"].get("path") == "records.py"
+            if required and required[0] == entry["tool"] and target_ok and tool_ok.get(entry["tool_call_id"]):
                 required.pop(0)
         report["public_workflow_ok"] = not required
         call, outcome = last_exec(solved, data_dir)

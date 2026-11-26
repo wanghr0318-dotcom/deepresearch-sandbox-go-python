@@ -1,0 +1,14 @@
+LICENSE	11343
+README.md	16660
+config.json	728
+generation_config.json	239
+merges.txt	1671853
+model-00001-of-00005.safetensors	3996250744
+model-00002-of-00005.safetensors	3993160032
+model-00003-of-00005.safetensors	3959604768
+model-00004-of-00005.safetensors	3187841392
+model-00005-of-00005.safetensors	1244659840
+model.safetensors.index.json	32878
+tokenizer.json	11422654
+tokenizer_config.json	9732
+vocab.json	2776833

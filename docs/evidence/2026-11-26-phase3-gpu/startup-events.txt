@@ -1,0 +1,2 @@
+[2026-11-26 18:04:01] KV Cache is allocated. dtype: torch.bfloat16, #tokens: 393289, K size: 27.01 GB, V size: 27.01 GB
+[2026-11-26 18:04:02] Engine startup timings (s): load_weight=2.94, kv_cache_allocation=0.41, scheduler_e2e=6.85, cuda_graph={prefill=0.00, decode=0.00, target_verify=0.00, draft_prefill=0.00, draft_decode=0.00, draft_extend=0.00}, tokenizer_e2e=18.09

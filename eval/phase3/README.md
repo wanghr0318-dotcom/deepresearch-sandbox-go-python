@@ -31,10 +31,11 @@ TTFT 是从提交到首个有效内容 SSE 事件的时间，空消息与 usage 
 
 ## 完整 Agent · 任务回放与评分
 
-阶段 2 的真实 CSV 自主读、改、测及独立判分通过后，从 CVM A 运行同一入口。这个最小批量驱动每题启动独立会话和 Gateway，串行占用同一个 relay 监听地址，因此完整任务层的结果用于单槽基线。
+阶段 2 的真实 CSV 自主读、改、测及独立判分通过后，从 CVM A 运行同一入口。批量驱动每题启动独立会话和 Gateway，串行占用同一个 relay 监听地址。使用短绝对路径放置实验数据，Linux 的 AF_UNIX 路径还需容纳每题目录和 Gateway socket 文件名。
 
 ```bash
-python3 -B eval/phase3/run-suite.py --evidence evidence/phase3/agent-c1 --repeat 3 -- \
+run_dir=$(mktemp -d /tmp/abx-XXXXXX)
+python3 -B eval/phase3/run-suite.py --evidence "$run_dir/e" --repeat 3 -- \
   --agentbox "$AGENTBOX_BIN" --worker-image "$PINNED_WORKER_IMAGE" \
   --relay-listen "$RELAY_LISTEN" --model Qwen/Qwen3-8B --model-url "$DIRECT_BASE_URL"
 ```

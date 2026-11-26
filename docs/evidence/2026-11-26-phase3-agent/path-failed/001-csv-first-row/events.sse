@@ -1,0 +1,111 @@
+id: 1
+event: turn_created
+data: {"seq":1,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"turn_created","ts":"2026-11-26T18:19:45.058256+08:00","data":{"deep_research":false,"text":"# CSV 首条记录丢失\n\n`read_records(\"name,city\\nAda,London\\n\")` 应返回一条包含 Ada 和 London 的记录，目前返回空列表。修复 `records.py`，保留 CSV 的字段解析与记录顺序。只有表头时应返回空列表。\n\n任务工作区从 `repo/` 创建。验收测试由评测端保管。\n\nThe contents of repo/ are already staged at the workspace root. The tool path for the target is exactly records.py. Use read_file on records.py first, write your change to records.py, then run a public smoke test with exec_shell.","turn_index":0},"internal":{"source":"host","type":"task_created","task_seq":1,"payload":{"text":"# CSV 首条记录丢失\n\n`read_records(\"name,city\\nAda,London\\n\")` 应返回一条包含 Ada 和 London 的记录，目前返回空列表。修复 `records.py`，保留 CSV 的字段解析与记录顺序。只有表头时应返回空列表。\n\n任务工作区从 `repo/` 创建。验收测试由评测端保管。\n\nThe contents of repo/ are already staged at the workspace root. The tool path for the target is exactly records.py. Use read_file on records.py first, write your change to records.py, then run a public smoke test with exec_shell.","turn_index":0,"deep_research":false}}}
+
+id: 2
+event: turn_status
+data: {"seq":2,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"turn_status","ts":"2026-11-26T18:19:45.066746+08:00","data":{"status":"queued"},"internal":{"source":"host","type":"control_applied","task_seq":2,"payload":{"status":"queued","control_version":1}}}
+
+id: 3
+event: session_state
+data: {"seq":3,"type":"session_state","ts":"2026-11-26T18:19:46.19506+08:00","data":{"state":"idle"},"internal":{"source":"session","type":"session_state","payload":{"state":"idle"}}}
+
+id: 4
+event: internal
+data: {"seq":4,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"internal","ts":"2026-11-26T18:19:46.198526+08:00","data":{},"internal":{"source":"host","type":"attempt_created","attempt_id":"eab679ed3534d73a570ff00d9ae3ad9a","task_seq":3,"payload":{"env_id":"9f90a1645fe8990e865bb8c3677f89f1","attempt_no":1}}}
+
+id: 5
+event: internal
+data: {"seq":5,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"internal","ts":"2026-11-26T18:19:46.209481+08:00","data":{},"internal":{"source":"worker","type":"task_accepted","attempt_id":"eab679ed3534d73a570ff00d9ae3ad9a","task_seq":4,"payload":{"v":1,"ts":"2026-11-26T10:19:46.209Z","seq":2,"type":"task_accepted","attempt_id":"eab679ed3534d73a570ff00d9ae3ad9a"}}}
+
+id: 6
+event: internal
+data: {"seq":6,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"internal","ts":"2026-11-26T18:19:46.214213+08:00","data":{},"internal":{"source":"worker","type":"error","attempt_id":"eab679ed3534d73a570ff00d9ae3ad9a","task_seq":5,"payload":{"v":1,"ts":"2026-11-26T10:19:46.213Z","seq":3,"code":"internal_error","type":"error","message":"GatewayError: 502 http_502","retryable":true,"attempt_id":"eab679ed3534d73a570ff00d9ae3ad9a"}}}
+
+id: 7
+event: turn_status
+data: {"seq":7,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"turn_status","ts":"2026-11-26T18:19:46.255802+08:00","data":{"reason":"worker_error","status":"queued"},"internal":{"source":"host","type":"attempt_ended","attempt_id":"eab679ed3534d73a570ff00d9ae3ad9a","task_seq":6,"payload":{"attempt_id":"eab679ed3534d73a570ff00d9ae3ad9a","task_status":"queued","outcome_class":"worker_error","status_reason":"worker_error","platform_killed":false,"output_incomplete":false}}}
+
+id: 8
+event: session_state
+data: {"seq":8,"type":"session_state","ts":"2026-11-26T18:19:48.928963+08:00","data":{"state":"evicted"},"internal":{"source":"session","type":"session_state","payload":{"state":"evicted"}}}
+
+id: 9
+event: session_state
+data: {"seq":9,"type":"session_state","ts":"2026-11-26T18:19:48.934779+08:00","data":{"state":"restoring"},"internal":{"source":"session","type":"session_state","payload":{"state":"restoring"}}}
+
+id: 10
+event: session_state
+data: {"seq":10,"type":"session_state","ts":"2026-11-26T18:19:50.187233+08:00","data":{"state":"idle"},"internal":{"source":"session","type":"session_state","payload":{"state":"idle"}}}
+
+id: 11
+event: internal
+data: {"seq":11,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"internal","ts":"2026-11-26T18:19:50.189439+08:00","data":{},"internal":{"source":"host","type":"attempt_created","attempt_id":"30a2a7df438a2792552f8fbe3bb7ce9c","task_seq":7,"payload":{"env_id":"90d74908a0a1c271a68df0aa3af70870","attempt_no":2}}}
+
+id: 12
+event: internal
+data: {"seq":12,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"internal","ts":"2026-11-26T18:19:50.200141+08:00","data":{},"internal":{"source":"worker","type":"task_accepted","attempt_id":"30a2a7df438a2792552f8fbe3bb7ce9c","task_seq":8,"payload":{"v":1,"ts":"2026-11-26T10:19:50.199Z","seq":2,"type":"task_accepted","attempt_id":"30a2a7df438a2792552f8fbe3bb7ce9c"}}}
+
+id: 13
+event: internal
+data: {"seq":13,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"internal","ts":"2026-11-26T18:19:50.204554+08:00","data":{},"internal":{"source":"worker","type":"error","attempt_id":"30a2a7df438a2792552f8fbe3bb7ce9c","task_seq":9,"payload":{"v":1,"ts":"2026-11-26T10:19:50.204Z","seq":3,"code":"internal_error","type":"error","message":"GatewayError: 502 http_502","retryable":true,"attempt_id":"30a2a7df438a2792552f8fbe3bb7ce9c"}}}
+
+id: 14
+event: turn_status
+data: {"seq":14,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"turn_status","ts":"2026-11-26T18:19:50.249197+08:00","data":{"reason":"worker_error","status":"queued"},"internal":{"source":"host","type":"attempt_ended","attempt_id":"30a2a7df438a2792552f8fbe3bb7ce9c","task_seq":10,"payload":{"attempt_id":"30a2a7df438a2792552f8fbe3bb7ce9c","task_status":"queued","outcome_class":"worker_error","status_reason":"worker_error","platform_killed":false,"output_incomplete":false}}}
+
+id: 15
+event: session_state
+data: {"seq":15,"type":"session_state","ts":"2026-11-26T18:19:52.956253+08:00","data":{"state":"evicted"},"internal":{"source":"session","type":"session_state","payload":{"state":"evicted"}}}
+
+id: 16
+event: session_state
+data: {"seq":16,"type":"session_state","ts":"2026-11-26T18:19:53.521792+08:00","data":{"state":"restoring"},"internal":{"source":"session","type":"session_state","payload":{"state":"restoring"}}}
+
+id: 17
+event: session_state
+data: {"seq":17,"type":"session_state","ts":"2026-11-26T18:19:55.227831+08:00","data":{"state":"idle"},"internal":{"source":"session","type":"session_state","payload":{"state":"idle"}}}
+
+id: 18
+event: internal
+data: {"seq":18,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"internal","ts":"2026-11-26T18:19:55.22985+08:00","data":{},"internal":{"source":"host","type":"attempt_created","attempt_id":"b460a774799f509620d7e20c889a66b1","task_seq":11,"payload":{"env_id":"d9ea96acde81fe4e75b1950b897eb83d","attempt_no":3}}}
+
+id: 19
+event: internal
+data: {"seq":19,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"internal","ts":"2026-11-26T18:19:55.235475+08:00","data":{},"internal":{"source":"worker","type":"task_accepted","attempt_id":"b460a774799f509620d7e20c889a66b1","task_seq":12,"payload":{"v":1,"ts":"2026-11-26T10:19:55.235Z","seq":2,"type":"task_accepted","attempt_id":"b460a774799f509620d7e20c889a66b1"}}}
+
+id: 20
+event: internal
+data: {"seq":20,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"internal","ts":"2026-11-26T18:19:55.24013+08:00","data":{},"internal":{"source":"worker","type":"error","attempt_id":"b460a774799f509620d7e20c889a66b1","task_seq":13,"payload":{"v":1,"ts":"2026-11-26T10:19:55.239Z","seq":3,"code":"internal_error","type":"error","message":"GatewayError: 502 http_502","retryable":true,"attempt_id":"b460a774799f509620d7e20c889a66b1"}}}
+
+id: 21
+event: turn_status
+data: {"seq":21,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"turn_status","ts":"2026-11-26T18:19:55.282009+08:00","data":{"reason":"worker_error","status":"queued"},"internal":{"source":"host","type":"attempt_ended","attempt_id":"b460a774799f509620d7e20c889a66b1","task_seq":14,"payload":{"attempt_id":"b460a774799f509620d7e20c889a66b1","task_status":"queued","outcome_class":"worker_error","status_reason":"worker_error","platform_killed":false,"output_incomplete":false}}}
+
+id: 22
+event: session_state
+data: {"seq":22,"type":"session_state","ts":"2026-11-26T18:19:57.957358+08:00","data":{"state":"evicted"},"internal":{"source":"session","type":"session_state","payload":{"state":"evicted"}}}
+
+id: 23
+event: session_state
+data: {"seq":23,"type":"session_state","ts":"2026-11-26T18:20:01.680843+08:00","data":{"state":"restoring"},"internal":{"source":"session","type":"session_state","payload":{"state":"restoring"}}}
+
+id: 24
+event: session_state
+data: {"seq":24,"type":"session_state","ts":"2026-11-26T18:20:03.244453+08:00","data":{"state":"idle"},"internal":{"source":"session","type":"session_state","payload":{"state":"idle"}}}
+
+id: 25
+event: internal
+data: {"seq":25,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"internal","ts":"2026-11-26T18:20:03.246482+08:00","data":{},"internal":{"source":"host","type":"attempt_created","attempt_id":"7d89e2a86bbdb45a5752caadf96ddaa0","task_seq":15,"payload":{"env_id":"514299887f97f62cc340158b6830aaa9","attempt_no":4}}}
+
+id: 26
+event: internal
+data: {"seq":26,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"internal","ts":"2026-11-26T18:20:03.251599+08:00","data":{},"internal":{"source":"worker","type":"task_accepted","attempt_id":"7d89e2a86bbdb45a5752caadf96ddaa0","task_seq":16,"payload":{"v":1,"ts":"2026-11-26T10:20:03.251Z","seq":2,"type":"task_accepted","attempt_id":"7d89e2a86bbdb45a5752caadf96ddaa0"}}}
+
+id: 27
+event: internal
+data: {"seq":27,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"internal","ts":"2026-11-26T18:20:03.256422+08:00","data":{},"internal":{"source":"worker","type":"error","attempt_id":"7d89e2a86bbdb45a5752caadf96ddaa0","task_seq":17,"payload":{"v":1,"ts":"2026-11-26T10:20:03.256Z","seq":3,"code":"internal_error","type":"error","message":"GatewayError: 502 http_502","retryable":true,"attempt_id":"7d89e2a86bbdb45a5752caadf96ddaa0"}}}
+
+id: 28
+event: turn_status
+data: {"seq":28,"turn_id":"task_19b0d74f4b13f0b551fb0be4c7f30d7b","type":"turn_status","ts":"2026-11-26T18:20:03.296997+08:00","data":{"reason":"worker_error","status":"failed","user_message":"模型服务暂时不可用，请重试"},"internal":{"source":"host","type":"task_terminal","attempt_id":"7d89e2a86bbdb45a5752caadf96ddaa0","task_seq":18,"payload":{"attempt_id":"7d89e2a86bbdb45a5752caadf96ddaa0","task_status":"failed","outcome_class":"worker_error","status_reason":"worker_error","platform_killed":false,"output_incomplete":false}}}

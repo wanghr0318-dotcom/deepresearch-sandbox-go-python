@@ -1,0 +1,8 @@
+# Inventory summary misclassifies product labels
+
+A daily import sometimes contains labels such as `" TEA "` or `"Pens"`.
+They should aggregate into the same groups as `"tea"` and `"pens"`. Read
+`records.py` and the catalogue contract in `catalog.py`, then update
+`records.py`. Preserve the catalogue mapping, fallback group, and quantities.
+
+The contents of repo/ are already staged at the workspace root. The tool path for the target is exactly records.py. Use read_file on records.py first, write your change to records.py, then run a public smoke test with exec_shell.

@@ -1,0 +1,13 @@
+{
+  "submitted": 18,
+  "scored": 17,
+  "counts": {
+    "infra_abort": 0,
+    "other_abort": 1,
+    "parse_abort": 0,
+    "scored_unsolved": 8,
+    "solved": 9
+  },
+  "wall_seconds_including_setup_and_grading": 671.183,
+  "scored_per_wall_hour_including_setup_and_grading": 91.182
+}

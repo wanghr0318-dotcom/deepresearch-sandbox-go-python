@@ -1,0 +1,917 @@
+{
+  "pods": [
+    {
+      "uid": "c81535e3-bd8b-4275-8fff-3cd526469d2a",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "30af410e-95ea-40f3-8523-522525314b7a",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 2.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "4c57252a-a786-415b-8929-7bdd71f11fc4",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 2.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "e2554686-ada9-4d81-8119-20eeb25aa9f5",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "0d4158c6-7912-46c4-befc-5f7d0ba719be",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 2,
+      "memory_samples": 2,
+      "cpu_s_through_last_sample": 0.778238,
+      "memory_interval_s": 18.0,
+      "observed_memory_gib_s": 0.23105621337890625
+    },
+    {
+      "uid": "3293dd09-0cec-4439-aa4d-3874fba65ffc",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 2.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "0fa1c924-d3ba-4f85-8e20-38f0d916f2b7",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 2.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "dd73cff5-99b2-493a-b6a7-58d7bb5541bb",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "43b7b1cb-875b-4de6-9f65-4c119be26a98",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 2.0,
+      "cpu_samples": 2,
+      "memory_samples": 2,
+      "cpu_s_through_last_sample": 0.632137,
+      "memory_interval_s": 13.0,
+      "observed_memory_gib_s": 0.16414642333984375
+    },
+    {
+      "uid": "8add174a-68a4-4f1c-a469-7478c97941b5",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "f9e435ae-d9f0-4b25-bdf7-9c97a0a78346",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "f490d6ef-1bd0-4dbf-9a6a-026aaf052c81",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "618fc079-6571-4d5d-b49d-1e0c23e67d65",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 2.0,
+      "cpu_samples": 2,
+      "memory_samples": 2,
+      "cpu_s_through_last_sample": 0.683265,
+      "memory_interval_s": 13.0,
+      "observed_memory_gib_s": 0.1665019989013672
+    },
+    {
+      "uid": "140874de-891a-4064-a259-26d4833c7758",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 2.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "3df8aa8f-4fb2-4190-9d2d-8aa0f11fbf88",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 2.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "5908591e-2441-4276-8a2d-4b038a9b85cc",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "ebee33ee-45c2-4862-a290-083687bc394c",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 2.0,
+      "cpu_samples": 2,
+      "memory_samples": 2,
+      "cpu_s_through_last_sample": 0.76106,
+      "memory_interval_s": 20.0,
+      "observed_memory_gib_s": 0.25238037109375
+    },
+    {
+      "uid": "94e06054-7f0f-44bf-8a60-3fc6ae6a3c97",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 2.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "fb4d0e00-7731-46c9-a8e6-6b0650da154b",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "df49ee98-9519-4b33-8115-441c38d484cc",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "953f6989-f9bd-4a7f-8421-7808f729113c",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 2,
+      "memory_samples": 2,
+      "cpu_s_through_last_sample": 0.699334,
+      "memory_interval_s": 16.0,
+      "observed_memory_gib_s": 0.204315185546875
+    },
+    {
+      "uid": "91322dd5-ca3f-48ea-bdbe-89e2d3ecb104",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "2f37ab7b-1e74-4ca3-aa61-564ad81bf16a",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "b0692572-58b5-43ad-adbb-ad00016a6ab2",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "9c536370-544f-4823-9d84-df8ac345e8b0",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 2,
+      "memory_samples": 2,
+      "cpu_s_through_last_sample": 0.763039,
+      "memory_interval_s": 18.0,
+      "observed_memory_gib_s": 0.22666168212890625
+    },
+    {
+      "uid": "848bb91f-f9d7-4d7e-95d4-3e1ebd04cacf",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "204f8981-c115-4bb8-bc41-4d0db3252db0",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "7cbec099-5e07-4ca5-aa03-e19283a234b4",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 0.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "62fe6143-ba98-4439-bbc3-83156779a5fa",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 2,
+      "memory_samples": 2,
+      "cpu_s_through_last_sample": 0.637511,
+      "memory_interval_s": 13.0,
+      "observed_memory_gib_s": 0.19687652587890625
+    },
+    {
+      "uid": "b94e6890-33df-4c97-91ed-d46048c296de",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "ad048c7e-51e8-4e11-814c-2847a4938add",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "6fce8280-e21e-402a-92a5-8091ea1e62a2",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "53960ab7-f737-4ff7-ae5e-2784c21e2d7f",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 2,
+      "memory_samples": 2,
+      "cpu_s_through_last_sample": 0.638786,
+      "memory_interval_s": 13.0,
+      "observed_memory_gib_s": 0.16588211059570312
+    },
+    {
+      "uid": "d07d3ca8-027c-41b4-a597-b6030449ff9d",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "bae59dd2-0f7a-45cc-b1a3-b63595373ea9",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "c28bcf1f-c638-4cb5-bd81-2c699624cad5",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "7d5e7e57-3214-4ed1-8f83-baca6c50838a",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 2,
+      "memory_samples": 2,
+      "cpu_s_through_last_sample": 0.684318,
+      "memory_interval_s": 14.0,
+      "observed_memory_gib_s": 0.17917633056640625
+    },
+    {
+      "uid": "81c33775-c550-4d9d-88e3-32d1f325eed5",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "f02a108a-f892-413b-9f33-ddcc1c4bd3ac",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "98dc2a90-c2ed-4f26-8aaa-5d4da1c6d95b",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "ea7a229c-ae6f-46ae-834f-e7c4ee2f625e",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 2,
+      "memory_samples": 2,
+      "cpu_s_through_last_sample": 0.757057,
+      "memory_interval_s": 15.0,
+      "observed_memory_gib_s": 0.18831253051757812
+    },
+    {
+      "uid": "c49ea29a-3953-41ec-8691-8fb86b6adade",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 0.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "aca3c443-0743-4aa5-94be-5ddc08f1c7db",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "80afeac4-9320-4514-9250-e1c320d0f826",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 0.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "876d454e-cab7-4e6e-ab62-e69cd78213ef",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 4,
+      "memory_samples": 4,
+      "cpu_s_through_last_sample": 1.229169,
+      "memory_interval_s": 40.0,
+      "observed_memory_gib_s": 0.9203014373779297
+    },
+    {
+      "uid": "7bb1c833-a8e8-4d68-b750-30d1ff1f6084",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "9d5906c6-58e4-44dd-87e6-f0d88094fa65",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "6390cbdd-c7ce-49c9-92eb-1bb83a393397",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "211c6530-570e-4b2b-8faf-69a4f3a47677",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "5d5c1656-e11c-4ee2-bb18-f91753540906",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "a3383287-7b71-41ce-aa1c-1932b374b8f3",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 2.0,
+      "cpu_samples": 2,
+      "memory_samples": 2,
+      "cpu_s_through_last_sample": 0.652861,
+      "memory_interval_s": 14.0,
+      "observed_memory_gib_s": 0.17626571655273438
+    },
+    {
+      "uid": "87e33ea9-875c-459e-a273-ff2572298bab",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "2a980831-abaf-429c-a384-ba83f724e140",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "551847fb-6b7b-49f6-bded-2e51cda4005d",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "e4184693-39cd-4c38-a694-314881b3fe4d",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 2,
+      "memory_samples": 2,
+      "cpu_s_through_last_sample": 0.773228,
+      "memory_interval_s": 16.0,
+      "observed_memory_gib_s": 0.2049560546875
+    },
+    {
+      "uid": "30b7d5be-84b7-4838-9141-b5cdc348d38e",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "6ace5fce-94a7-4333-a43d-ae1b1df7669f",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "11423275-2f17-409b-b750-2b9d6cbc7da2",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 0.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "1e958827-420a-46d9-a280-f5024ed24fa1",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 2,
+      "memory_samples": 2,
+      "cpu_s_through_last_sample": 0.676291,
+      "memory_interval_s": 15.0,
+      "observed_memory_gib_s": 0.1897144317626953
+    },
+    {
+      "uid": "1d870c83-7264-4a2c-a4dc-d2bb2087d787",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "6dbd5df1-e4a0-499b-b5cf-3984db8c7f3a",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "79472ecd-6036-4901-8049-2d231eb70b0e",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "837d7dec-bacc-41e4-bb50-11f42828c4f8",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 2,
+      "memory_samples": 2,
+      "cpu_s_through_last_sample": 0.689559,
+      "memory_interval_s": 16.0,
+      "observed_memory_gib_s": 0.20196533203125
+    },
+    {
+      "uid": "73d7bae7-7b11-4820-a621-6376f180e1d3",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "1e7964fa-f88d-4ef9-894e-717ddb75901a",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "0e14b8cc-79cb-4e49-95cb-68d631e8667e",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "70dd038e-07ca-422b-965d-a048c96a1e3a",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 2,
+      "memory_samples": 2,
+      "cpu_s_through_last_sample": 0.777127,
+      "memory_interval_s": 19.0,
+      "observed_memory_gib_s": 0.24309539794921875
+    },
+    {
+      "uid": "e9c1f2e5-6a57-4f1c-ac86-d938bad477fc",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "9909a7c2-62c1-4028-9144-60f26e19c015",
+      "containers": [
+        "sandbox",
+        "gateway-relay"
+      ],
+      "ready_s": 2.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    },
+    {
+      "uid": "019ae3de-4346-4463-98f9-fa99b6481fef",
+      "containers": [
+        "sandbox",
+        "workspace-transfer"
+      ],
+      "ready_s": 1.0,
+      "cpu_samples": 1,
+      "memory_samples": 1,
+      "cpu_s_through_last_sample": 0.0,
+      "memory_interval_s": 0,
+      "observed_memory_gib_s": null
+    }
+  ],
+  "expected_pods": 70,
+  "pods_with_cpu": 70,
+  "pods_with_memory_interval": 16
+}
