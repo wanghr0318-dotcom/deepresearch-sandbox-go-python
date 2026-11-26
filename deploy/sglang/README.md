@@ -22,6 +22,25 @@ docker logs -f agentbox-sglang
 
 跨云实验通过本地 SSH 转发连接。工作站向 AutoDL 做本地转发（工作站回环端口 → GPU 回环端口 30000），再向 CVM 做远程转发（CVM 回环端口 → 工作站回环端口）。Gateway 只配置这个 CVM 回环上游；工作站须保持在线。CVM 测得的直连耗时包含这两段隧道。
 
+在 AutoDL 有卡且 SSH 可达后，用既有虚拟环境和已下载的模型目录启动。先把首次验收的权重 SHA-256 记录复制到 GPU 主机，再核对重用的分片。创建一个新的证据目录来保存本次记录。
+
+```bash
+sed -nE 's|^model/([^ ]+) ([0-9a-f]{64})$|\2  \1|p' "$MODEL_HASH_RECORD" \
+  | (cd "$MODEL_DIR" && sha256sum -c -)
+bash deploy/sglang/run.sh --autodl "$SGLANG_VENV" "$MODEL_DIR" "$EVIDENCE_DIR"
+```
+
+脚本在启动前确认端口空闲，并在模型加载之前开始每秒采样。证据目录保存启动参数、包版本、显卡信息、SGLang 日志、模型应答和两个进程 PID。完成末次请求并下载记录后，结束本轮采样与推理进程。记录采样点最大显存，注明采样可能遗漏瞬时峰值。
+
+在 Windows 工作站另开一个 PowerShell 窗口。使用已确认的两个 SSH 主机和本地密钥文件。窗口需要在探针和任务运行期间持续打开。
+
+```powershell
+.\deploy\sglang\bridge.ps1 -GpuHostname $GpuHost -GpuSshPort $GpuSshPort -GpuKey $GpuKey `
+    -CvmHostname $CvmHost -CvmKey $CvmKey
+```
+
+桥脚本分别确认本地转发与 CVM 回环地址的 `/v1/models` 返回预期模型。CVM Gateway 继续以 `http://127.0.0.1:33562/v1` 为唯一上游，`--upstream-allow-private` 只包含 `127.0.0.1:33562`。在正式探针前记录已脱敏的实际进程参数，并核对 `--model-fallback-file` 未配置。
+
 ## 三条探针
 
 1. 在 CVM A 直连 GPU 私网的 `http://<GPU_PRIVATE_IP>:30000/v1`。同一脚本要求首轮返回 `read_file`，验证函数参数，并携带真实返回的 `tool_call_id` 回传测试字符串。第二轮必须消费该字符串。报告记录完整的测试请求、响应和耗时。
