@@ -41,3 +41,15 @@ python3 -B eval/phase3/run-suite.py --evidence "$run_dir/e" --repeat 3 -- \
 ```
 
 每次提交一条 trajectories.jsonl 记录。solved 要求判题结果覆盖本题全部固定用例。scored_unsolved 接受完整布尔评分或已完成的独立判题所记录的候选代码异常，异常须有非零退出码及判题产物引用。runner 报告 infrastructure_abort 时计为 infra_abort。parse_abort 采用 runner 明确提供的事件分类，缺证据归 other_abort。此批的可评分轨迹/h 含每题部署、关闭和独立评分。单题 runtime_ms 和调用事件留在原始记录。GPU 队列和显存、Pod 时间、CPU 秒和 GiB·秒由独立采样收集。
+
+## DeepSearch 同会话多轮评测
+
+研究语料沿用 eval/suites/demo.yaml 中的三个研究主题。每个主题新建一个独立会话，顺序发送初次调研、限定范围的追问、带证据的复核或修订。仅发送当前用户消息，沿用服务返回的 session_id，使宿主负责跨轮记忆。评审标准保存在 research-dialogues.json 的 review 字段，用户请求不携带该字段。
+
+在已启用研究工具、配置自托管模型的 Gateway 上使用有会话读写权限的用户 API key 设置环境变量 AGENTBOX_RESEARCH_TOKEN，然后运行：
+
+```bash
+python3 eval/phase3/research-dialogues.py --base "$GATEWAY_URL" --out "/tmp/deepsearch-$(date +%s)"
+```
+
+每轮 JSONL 保存用户输入、独立 turn_id、工具与报告事件、状态和用时。评审时逐轮打开报告并复核引文原文，分别记录检索/抓取是否成功、引用能否支撑判断、追问是否继承上一轮对象与限制。报告引用或正文不可获取时标记缺证；succeeded 仅计流程完成。对开放网络记录检索时间与来源版本。该套件新增于原阶段 3 基线之后，600 次请求与 18 条修复轨迹不计入这组结果。
