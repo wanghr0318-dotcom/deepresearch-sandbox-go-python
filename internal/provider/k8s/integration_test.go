@@ -83,7 +83,7 @@ func TestConformanceOnRealCluster(t *testing.T) {
 	var install string
 	h := harness(func(t *testing.T) *Provider {
 		install = randomInstall()
-		return newRealProvider(t, install, nil)
+		return newRealProvider(t, install, func(o *Options) { o.ExecStagingDir = t.TempDir() })
 	}, func() string { return install }, []string{"sh", "-c", "echo hello; exit 3"}, []string{"sleep", "100000"})
 	providertest.Run(t, h)
 }

@@ -45,8 +45,13 @@ type RemoteExecutor struct {
 
 // Stream implements Executor.
 func (e *RemoteExecutor) Stream(ctx context.Context, namespace, pod string, cmd []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	return e.StreamContainer(ctx, namespace, pod, containerName, cmd, stdin, stdout, stderr)
+}
+
+// StreamContainer selects a specific container in the Pod using the same exec transport.
+func (e *RemoteExecutor) StreamContainer(ctx context.Context, namespace, pod, container string, cmd []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	req := e.Client.CoreV1().RESTClient().Post().Resource("pods").Namespace(namespace).Name(pod).SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{Container: containerName, Command: cmd, Stdin: stdin != nil, Stdout: true, Stderr: true},
+		VersionedParams(&corev1.PodExecOptions{Container: container, Command: cmd, Stdin: stdin != nil, Stdout: true, Stderr: true},
 			scheme.ParameterCodec)
 	spdy, err := remotecommand.NewSPDYExecutor(e.Config, "POST", req.URL())
 	if err != nil {

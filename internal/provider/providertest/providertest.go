@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +34,8 @@ type Harness struct {
 	// ExecSpec 返回 exec 环境的 spec（Mounts.In 为空，由 provider 建立 InDir）。为 nil 时（实现不支持 exec 环境）
 	// 不运行 exec 环境的用例。
 	ExecSpec func(envID string) provider.EnvSpec
+	// ExecWorkspace runs against /in/input.txt and writes /out/output.txt and /out/z-extra.txt.
+	ExecWorkspace func(exitCode int) provider.ExecSpec
 }
 
 const wait = 10 * time.Second
@@ -226,6 +230,80 @@ func Run(t *testing.T, h Harness) {
 			}
 			stopDestroy(t, p, "env-x")
 		})
+	}
+	if h.ExecWorkspace != nil {
+		t.Run("exec workspace contract", func(t *testing.T) {
+			p := h.New(t)
+			for _, tc := range []struct {
+				env, input string
+				exitCode   int
+			}{
+				{env: "exec-ok", input: "one", exitCode: 0},
+				{env: "exec-nonzero", input: "two", exitCode: 7},
+			} {
+				t.Run(tc.env, func(t *testing.T) {
+					t.Parallel()
+					checkExecWorkspace(t, p, h, tc.env, tc.input, tc.exitCode)
+				})
+			}
+		})
+		t.Run("exec running command stops and cleanup repeats", func(t *testing.T) {
+			p, ctx := h.New(t), context.Background()
+			const envID = "exec-timeout"
+			create(t, p, h.ExecSpec(envID))
+			handle, err := p.StartExec(ctx, envID, h.Sleep)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = handle.Stdin().Close()
+			drain(handle)
+			stopDestroy(t, p, envID)
+			waitDone(t, handle)
+			stopDestroy(t, p, envID)
+			if info := find(t, p, envID); info != nil {
+				t.Fatalf("cleanup left an environment: %+v", info)
+			}
+		})
+	}
+}
+
+func checkExecWorkspace(t *testing.T, p provider.Provider, h Harness, envID, input string, exitCode int) {
+	t.Helper()
+	ctx := context.Background()
+	info := create(t, p, h.ExecSpec(envID))
+	if err := os.WriteFile(filepath.Join(info.InDir, "input.txt"), []byte(input), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	_, status := run(t, p, envID, h.ExecWorkspace(exitCode))
+	if status.Code != exitCode || status.Signal != 0 {
+		t.Fatalf("exit status %+v, want %d", status, exitCode)
+	}
+	if err := p.Stop(ctx, envID); err != nil {
+		t.Fatal(err)
+	}
+	files, skipped, err := p.OpenOutputs(ctx, envID, 1)
+	var got []byte
+	var readErr error
+	for _, file := range files {
+		if file.Path == "output.txt" {
+			got, readErr = io.ReadAll(file.File)
+		}
+		if closeErr := file.File.Close(); closeErr != nil {
+			t.Error(closeErr)
+		}
+	}
+	if err != nil || len(files) != 1 || files[0].Path != "output.txt" {
+		t.Fatalf("OpenOutputs returned %+v, %v", files, err)
+	}
+	if len(skipped) != 1 || skipped[0] != (provider.SkippedOutput{Path: "z-extra.txt", Reason: provider.SkipTooMany}) {
+		t.Fatalf("output cap returned %+v", skipped)
+	}
+	if readErr != nil || string(got) != input {
+		t.Fatalf("collected input %q, want %q: %v", got, input, readErr)
+	}
+	stopDestroy(t, p, envID)
+	if info := find(t, p, envID); info != nil {
+		t.Fatalf("cleanup left an environment: %+v", info)
 	}
 }
 

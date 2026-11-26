@@ -46,7 +46,7 @@ var validID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: agentbox-podagent init|exec|kill|status|freeze|thaw|procs|diag|shutdown")
+		fmt.Fprintln(stderr, "usage: agentbox-podagent init|exec|kill|status|freeze|thaw|procs|diag|stage-input|collect-output|gateway-relay|shutdown")
 		return 2
 	}
 	cmd, rest := args[0], args[1:]
@@ -68,6 +68,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		err = runProcs(stdout)
 	case "diag":
 		err = runDiag(stdout)
+	case "stage-input":
+		err = stageInput("/in", stdin)
+	case "collect-output":
+		err = runCollectOutput(rest, stdout)
+	case "read-artifact":
+		err = readArtifact(rest, stdout)
+	case "gateway-relay":
+		err = runGatewayRelay(rest)
 	case "shutdown":
 		// Ask PID 1 (init) to kill every process and exit, so the container ends now.
 		err = syscall.Kill(1, syscall.SIGTERM)

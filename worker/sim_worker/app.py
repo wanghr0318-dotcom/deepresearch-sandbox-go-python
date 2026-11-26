@@ -281,6 +281,16 @@ async def _exec(ctx: TaskContext, op: Op, index: int, held: Held) -> None:
         )
 
 
+async def _workspace_exec(ctx: TaskContext, op: Op, index: int, held: Held) -> None:
+    gw = _gw(ctx, op, held)
+    for path, content in op.get("files", {}).items():
+        await asyncio.to_thread(gw.workspace, "write", {"path": path, "content": content})
+    await _gateway_call(
+        ctx, op, held,
+        lambda: gw.workspace_exec(op["step_id"], op["command"], timeout_ms=op.get("wall_ms")),
+    )
+
+
 # ---- sub-run（M4 Plan 14 Task 11）----
 
 
@@ -361,6 +371,7 @@ _HANDLERS: dict[str, Handler] = {
     "search": _search,
     "fetch": _fetch,
     "exec": _exec,
+    "workspace_exec": _workspace_exec,
     "subrun_start": _subrun_start,
     "subrun_end": _subrun_end,
     "subrun_cancel": _subrun_cancel,

@@ -53,7 +53,7 @@ func TestShellHappyPath(t *testing.T) {
 	if !equalStrings(spec.Argv, ShellArgv()) || spec.Dir != "/out" || !equalStrings(spec.Env, ShellEnviron()) {
 		t.Fatalf("ExecSpec = %+v", spec)
 	}
-	if spec.Argv[0] != "/bin/bash" || !strings.Contains(spec.Argv[4], "cp -R --preserve=mode /in/ws/. /out/") ||
+	if spec.Argv[0] != "/bin/bash" || !strings.Contains(spec.Argv[4], `cp -R --preserve=mode -- "${inputs[@]}" /out/`) ||
 		!strings.Contains(spec.Argv[4], "/in/.agentbox/cmd.sh") {
 		t.Fatalf("wrapper argv = %q", spec.Argv)
 	}

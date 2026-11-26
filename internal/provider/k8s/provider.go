@@ -40,6 +40,15 @@ type Options struct {
 	// seen by the node (default: SlotHostDir). Empty disables workspace/Gateway mounts (Create then rejects
 	// specs that need them).
 	SlotHostDir, SlotNodeDir string
+	// GatewayListen enables Pod-local workspaces and the TLS Gateway relay on
+	// a private IP:port. It cannot be combined with legacy slots or warm Pods.
+	GatewayListen string
+	// ExecStagingDir enables isolated execution Pods. It stores controller-side
+	// input and output files and is never mounted into a Pod.
+	ExecStagingDir string
+	// ExecPodLifetime bounds the entire exec Pod lifecycle, including setup
+	// and output collection (default 10 minutes).
+	ExecPodLifetime time.Duration
 	// WarmPool is the number of warm Pods kept for WarmProfile (0 disables the pool).
 	WarmPool    int
 	WarmProfile provider.Limits
@@ -60,13 +69,15 @@ type Options struct {
 
 // Provider implements provider.Provider on Kubernetes.
 type Provider struct {
-	opt    Options
-	client kubernetes.Interface
-	exec   Executor
-	slots  slots
-	log    *slog.Logger
-	pool   *pool
-	stats  *stats
+	opt      Options
+	client   kubernetes.Interface
+	exec     Executor
+	transfer containerExecutor
+	relay    *gatewayRelay
+	slots    slots
+	log      *slog.Logger
+	pool     *pool
+	stats    *stats
 
 	ctx    context.Context // provider lifetime: exec streams and the pool loop
 	cancel context.CancelFunc
@@ -75,16 +86,18 @@ type Provider struct {
 	// beforeSend is a test hook: called by StartExec after registering the in-flight start.
 	beforeSend func(envID string)
 
-	mu   sync.Mutex
-	envs map[string]*envState // environments created by this process (gates are not rebuilt after a restart)
+	mu     sync.Mutex
+	envs   map[string]*envState // environments created by this process (gates are not rebuilt after a restart)
+	grants map[string]func()    // revoke by Pod name, including before the Pod becomes ready
 }
 
 type envState struct {
-	kind   provider.EnvKind
-	pod    string
-	gate   *gate
-	ws     string // host workspace path bound to the Pod's slot
-	limits provider.Limits
+	kind      provider.EnvKind
+	pod       string
+	gate      *gate
+	ws        string // host workspace path bound to the Pod's slot
+	limits    provider.Limits
+	workspace *execWorkspace
 }
 
 var _ provider.Provider = (*Provider)(nil)
@@ -98,6 +111,8 @@ func New(ctx context.Context, opt Options) (*Provider, error) {
 		return nil, errors.New("k8s: Options need InstallID")
 	case opt.Image == "":
 		return nil, errors.New("k8s: Options need a pinned Image")
+	case opt.GatewayListen != "" && (opt.SlotHostDir != "" || opt.SlotNodeDir != "" || opt.WarmPool > 0):
+		return nil, errors.New("k8s: Gateway relay cannot use legacy slots or warm Pods")
 	}
 	if r, err := ParseImageRef(opt.Image); err != nil {
 		return nil, err
@@ -115,6 +130,9 @@ func New(ctx context.Context, opt Options) (*Provider, error) {
 	}
 	if opt.WarmReadyTimeout <= 0 {
 		opt.WarmReadyTimeout = 3 * time.Minute
+	}
+	if opt.ExecPodLifetime <= 0 {
+		opt.ExecPodLifetime = 10 * time.Minute
 	}
 	if opt.SlotGCInterval <= 0 {
 		opt.SlotGCInterval = time.Minute
@@ -134,16 +152,31 @@ func New(ctx context.Context, opt Options) (*Provider, error) {
 		slots: slots{hostRoot: opt.SlotHostDir, nodeRoot: opt.SlotNodeDir, uid: uid},
 		envs:  make(map[string]*envState),
 	}
+	if opt.ExecStagingDir != "" {
+		transfer, ok := opt.Executor.(containerExecutor)
+		if !ok {
+			return nil, errors.New("k8s: exec environments need container-specific execution")
+		}
+		if err := os.MkdirAll(opt.ExecStagingDir, 0o700); err != nil {
+			return nil, fmt.Errorf("k8s: exec staging directory: %w", err)
+		}
+		p.transfer = transfer
+	}
 	if p.slots.enabled() {
 		if err := os.MkdirAll(opt.SlotHostDir, 0o711); err != nil {
 			return nil, fmt.Errorf("k8s: slot directory: %w", err)
 		}
 		p.slots.recoverSwings(p.log) // before any Create: no swing of this process is in progress
 	}
-	if opt.EnsureNetworkPolicy {
+	if opt.EnsureNetworkPolicy || opt.GatewayListen != "" {
 		np := denyAllPolicy(opt.Namespace)
 		if _, err := p.client.NetworkingV1().NetworkPolicies(opt.Namespace).Create(ctx, np, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 			return nil, fmt.Errorf("k8s: NetworkPolicy: %w", err)
+		}
+	}
+	if opt.GatewayListen != "" {
+		if err := p.startGatewayRelay(ctx); err != nil {
+			return nil, err
 		}
 	}
 	p.ctx, p.cancel = context.WithCancel(context.Background())
@@ -200,6 +233,9 @@ func (p *Provider) gcSlots(ctx context.Context) {
 // reused by the next process of the same installation).
 func (p *Provider) Close() {
 	p.cancel()
+	if p.relay != nil {
+		p.relay.close()
+	}
 	p.wg.Wait()
 }
 
@@ -276,11 +312,15 @@ func (p *Provider) Create(ctx context.Context, spec provider.EnvSpec) (provider.
 	if err := spec.Validate(); err != nil {
 		return provider.EnvInfo{}, err
 	}
-	if spec.Kind == provider.KindExec {
+	isExec := spec.Kind == provider.KindExec
+	if isExec && p.transfer == nil {
 		return provider.EnvInfo{}, errors.New("k8s: exec environments are not supported (run the server with --exec-slots 0)")
 	}
 	needSlots := spec.Mounts.Workspace != "" || spec.Mounts.GatewaySocket != "" || spec.Mounts.RestoreDir != ""
-	if needSlots && !p.slots.enabled() {
+	if p.relay != nil && spec.Mounts.RestoreDir != "" {
+		return provider.EnvInfo{}, errors.New("k8s: checkpoint directory restore is unavailable with Pod-local workspaces")
+	}
+	if needSlots && p.relay == nil && !p.slots.enabled() {
 		return provider.EnvInfo{}, errors.New("k8s: workspace/Gateway mounts need a shared slot directory (--k8s-shared-dir)")
 	}
 	ours, o, foreign, err := p.lookup(ctx, spec.EnvID)
@@ -295,7 +335,7 @@ func (p *Provider) Create(ctx context.Context, spec provider.EnvSpec) (provider.
 		return provider.EnvInfo{}, provider.ErrConflict
 	case ours != nil:
 		if st := p.state(spec.EnvID); st != nil && st.pod == ours.Name && st.gate.isOpen() && ready(ours) {
-			return provider.EnvInfo{EnvID: spec.EnvID, Kind: spec.Kind, Complete: true, Running: true}, nil
+			return st.info(spec.EnvID, true, true), nil
 		}
 		return provider.EnvInfo{}, provider.ErrIncomplete
 	}
@@ -309,39 +349,51 @@ func (p *Provider) Create(ctx context.Context, spec provider.EnvSpec) (provider.
 	pr := profileOf(spec.Limits)
 	path := "cold"
 	var pod *corev1.Pod
-	if p.pool != nil && pr == p.pool.profile {
+	var workspace *execWorkspace
+	if !isExec && p.pool != nil && pr == p.pool.profile {
 		pod = p.pool.claim(ctx, own, spec.Mounts.Workspace)
 	}
 	if pod != nil {
 		path = "warm"
+	} else if isExec {
+		pod, workspace, err = p.createExecPod(ctx, pr, &own, spec.Mounts)
+	} else if p.relay != nil {
+		pod, err = p.createWorkspacePod(ctx, pr, &own, spec.Mounts.GatewaySocket)
 	} else {
-		if pod, err = p.createPod(ctx, pr, &own, spec.Mounts.Workspace); err != nil {
-			return provider.EnvInfo{}, err
-		}
+		pod, err = p.createPod(ctx, pr, &own, spec.Mounts.Workspace)
+	}
+	if err != nil {
+		return provider.EnvInfo{}, err
 	}
 	// From here on the Pod carries the owner annotation: any failure leaves residue (ErrIncomplete next time).
-	if needSlots {
+	if needSlots && p.slots.enabled() {
 		if err := p.slots.bind(pod.Name, spec.Mounts); err != nil {
 			return provider.EnvInfo{}, err
 		}
 	}
 	if !ready(pod) {
-		if pod, err = p.waitPod(ctx, pod.Name, func(po *corev1.Pod) (bool, error) {
+		name := pod.Name
+		if pod, err = p.waitPod(ctx, name, func(po *corev1.Pod) (bool, error) {
 			if stopped(po) {
 				return false, fmt.Errorf("k8s: pod %s ended before becoming ready (%s)", po.Name, po.Status.Reason)
 			}
 			return ready(po), nil
 		}); err != nil {
+			p.revokeGateway(name)
+			if workspace != nil {
+				err = errors.Join(err, os.RemoveAll(workspace.dir))
+			}
 			return provider.EnvInfo{}, err
 		}
 	}
 	p.mu.Lock()
-	p.envs[spec.EnvID] = &envState{kind: spec.Kind, pod: pod.Name, gate: &gate{}, ws: spec.Mounts.Workspace, limits: spec.Limits}
+	st := &envState{kind: spec.Kind, pod: pod.Name, gate: &gate{}, ws: spec.Mounts.Workspace, limits: spec.Limits, workspace: workspace}
+	p.envs[spec.EnvID] = st
 	p.mu.Unlock()
 	d := time.Since(start)
 	p.stats.add(path, d)
 	p.log.Info("k8s: environment ready", "env_id", spec.EnvID, "pod", pod.Name, "path", path, "start_ms", d.Milliseconds())
-	return provider.EnvInfo{EnvID: spec.EnvID, Kind: spec.Kind, Complete: true, Running: true}, nil
+	return st.info(spec.EnvID, true, true), nil
 }
 
 // createPod creates a Pod (cold start when o is set, a warm Pod when nil).
@@ -355,14 +407,12 @@ func (p *Provider) createPod(ctx context.Context, pr profile, o *owner, ws strin
 		nodeDir = p.slots.nodeDir(name)
 	}
 	key := poolKey(p.opt.Image, pr, p.opt.RuntimeClass)
-	pod := buildPod(podParams{Name: name, Namespace: p.opt.Namespace, InstallID: p.opt.InstallID, Image: p.opt.Image,
-		RuntimeClass: p.opt.RuntimeClass, PoolKey: key, Profile: pr, SlotNodeDir: nodeDir, Owner: o, Workspace: ws})
-	created, err := p.pods().Create(ctx, pod, metav1.CreateOptions{})
+	created, err := p.createBuiltPod(ctx, podParams{Name: name, PoolKey: key, Profile: pr, SlotNodeDir: nodeDir, Owner: o, Workspace: ws})
 	if err != nil {
 		if p.slots.enabled() {
 			_ = p.slots.remove(name)
 		}
-		return nil, fmt.Errorf("k8s: create pod: %w", err)
+		return nil, err
 	}
 	return created, nil
 }
@@ -449,16 +499,26 @@ func (p *Provider) StartExec(ctx context.Context, envID string, spec provider.Ex
 	if len(spec.Argv) == 0 {
 		return nil, &provider.StartError{Reason: "empty argv"}
 	}
+	if st.workspace != nil {
+		st.workspace.stage.Do(func() { st.workspace.stageErr = p.stageExecInput(ctx, st) })
+		if st.workspace.stageErr != nil {
+			return nil, &provider.StartError{Reason: st.workspace.stageErr.Error()}
+		}
+		if !st.gate.isOpen() {
+			return nil, provider.ErrStopping
+		}
+	}
 	return p.startExec(ctx, st.pod, st.limits.NoFile, st.limits.FSize, spec)
 }
 
-// Stop closes the gate and kills the Pod's containers by setting activeDeadlineSeconds; success means the
-// Pod is gone, terminal, or all its containers have terminated (contract §3: the authoritative check).
+// Stop closes the gate and confirms that Kubernetes has stopped the workload.
+// KindExec keeps its transfer container until output collection and Destroy.
 func (p *Provider) Stop(ctx context.Context, envID string) error {
-	if st := p.state(envID); st != nil {
+	st := p.state(envID)
+	if st != nil {
 		st.gate.close()
 	}
-	ours, _, foreign, err := p.lookup(ctx, envID)
+	ours, owner, foreign, err := p.lookup(ctx, envID)
 	if err != nil {
 		return err
 	}
@@ -466,8 +526,12 @@ func (p *Provider) Stop(ctx context.Context, envID string) error {
 		if foreign {
 			return fmt.Errorf("%w: pod labelled for %s", provider.ErrForeign, envID)
 		}
+		if st != nil {
+			p.revokeGateway(st.pod)
+		}
 		return nil
 	}
+	p.revokeGateway(ours.Name)
 	if _, has := ctx.Deadline(); !has {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, p.opt.StopTimeout)
@@ -481,6 +545,9 @@ func (p *Provider) Stop(ctx context.Context, envID string) error {
 			return nil
 		}
 	}
+	if !stopped(ours) && owner.Kind == provider.KindExec && ours.Spec.NodeName != "" {
+		return p.stopExecSandbox(ctx, ours)
+	}
 	if !stopped(ours) {
 		if ours.Spec.NodeName == "" {
 			// Not scheduled: no containers exist yet. Delete it (UID precondition) so it can never start; if the
@@ -489,11 +556,8 @@ func (p *Provider) Stop(ctx context.Context, envID string) error {
 				return err
 			}
 		} else {
-			if ours.Spec.ActiveDeadlineSeconds == nil || *ours.Spec.ActiveDeadlineSeconds > 1 {
-				patch := []byte(`{"spec":{"activeDeadlineSeconds":1}}`)
-				if _, err := p.pods().Patch(ctx, ours.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil && !apierrors.IsNotFound(err) {
-					return fmt.Errorf("k8s: stop pod %s: %w", ours.Name, err)
-				}
+			if err := p.expirePod(ctx, ours); err != nil {
+				return err
 			}
 			// Fast path: the kubelet acts on the deadline at its next sync (seconds); asking PID 1 to shut down
 			// ends the container at once. Best effort — the deadline is the authoritative kill.
@@ -510,10 +574,21 @@ func (p *Provider) Stop(ctx context.Context, envID string) error {
 			return fmt.Errorf("%w: pod %s: %v", provider.ErrStopUnconfirmed, ours.Name, err)
 		}
 	}
-	if p.slots.enabled() {
+	if owner.Kind != provider.KindExec && p.slots.enabled() {
 		if err := p.slots.unbindRun(ours.Name); err != nil {
 			p.log.Warn("k8s: remove slot links", "pod", ours.Name, "err", err)
 		}
+	}
+	return nil
+}
+
+func (p *Provider) expirePod(ctx context.Context, pod *corev1.Pod) error {
+	if pod.Spec.ActiveDeadlineSeconds != nil && *pod.Spec.ActiveDeadlineSeconds <= 1 {
+		return nil
+	}
+	patch := []byte(`{"spec":{"activeDeadlineSeconds":1}}`)
+	if _, err := p.pods().Patch(ctx, pod.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("k8s: stop pod %s: %w", pod.Name, err)
 	}
 	return nil
 }
@@ -529,10 +604,11 @@ func (p *Provider) deletePod(ctx context.Context, pod *corev1.Pod) error {
 
 // Destroy deletes a stopped environment's Pod and slot and verifies the Pod is gone (contract §3).
 func (p *Provider) Destroy(ctx context.Context, envID string) error {
-	if st := p.state(envID); st != nil {
+	st := p.state(envID)
+	if st != nil {
 		st.gate.close()
 	}
-	ours, _, foreign, err := p.lookup(ctx, envID)
+	ours, owner, foreign, err := p.lookup(ctx, envID)
 	if err != nil {
 		return err
 	}
@@ -540,13 +616,19 @@ func (p *Provider) Destroy(ctx context.Context, envID string) error {
 		return fmt.Errorf("%w: pod labelled for %s", provider.ErrForeign, envID)
 	}
 	if ours != nil {
-		if !stopped(ours) && ours.Spec.NodeName != "" {
+		if !environmentStopped(ours, owner.Kind) && ours.Spec.NodeName != "" {
 			return provider.ErrNotStopped
 		}
+		p.revokeGateway(ours.Name)
 		if _, has := ctx.Deadline(); !has {
 			var cancel context.CancelFunc
 			ctx, cancel = context.WithTimeout(ctx, p.opt.StopTimeout)
 			defer cancel()
+		}
+		if owner.Kind == provider.KindExec {
+			if err := p.removeExecWorkspace(ours.Name); err != nil {
+				return err
+			}
 		}
 		if err := p.deletePod(ctx, ours); err != nil {
 			return err
@@ -554,9 +636,16 @@ func (p *Provider) Destroy(ctx context.Context, envID string) error {
 		if _, err := p.waitPod(ctx, ours.Name, func(*corev1.Pod) (bool, error) { return false, nil }); !errors.Is(err, provider.ErrNotFound) {
 			return fmt.Errorf("k8s: pod %s still present after delete: %v", ours.Name, err)
 		}
-		if p.slots.enabled() {
+		if owner.Kind != provider.KindExec && p.slots.enabled() {
 			if err := p.slots.remove(ours.Name); err != nil {
 				return fmt.Errorf("k8s: remove slot: %w", err)
+			}
+		}
+	} else if st != nil {
+		p.revokeGateway(st.pod)
+		if st.kind == provider.KindExec {
+			if err := p.removeExecWorkspace(st.pod); err != nil {
+				return err
 			}
 		}
 	}
@@ -587,7 +676,12 @@ func (p *Provider) List(ctx context.Context) ([]provider.EnvInfo, error) {
 		}
 		st := p.state(o.EnvID)
 		complete := st != nil && st.pod == pod.Name && st.gate.isOpen() && ready(pod)
-		out = append(out, provider.EnvInfo{EnvID: o.EnvID, Kind: o.Kind, Complete: complete, Running: running(pod)})
+		isRunning := running(pod) && (o.Kind != provider.KindExec || !environmentStopped(pod, o.Kind))
+		info := provider.EnvInfo{EnvID: o.EnvID, Kind: o.Kind, Complete: complete, Running: isRunning}
+		if st != nil && st.pod == pod.Name {
+			info = st.info(o.EnvID, complete, isRunning)
+		}
+		out = append(out, info)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].EnvID < out[j].EnvID })
 	return out, nil
@@ -656,6 +750,12 @@ func (p *Provider) ResourceDiag(ctx context.Context, envID string) (provider.Res
 		d.OOMObserved, d.OOMKillDelta = true, 1
 	}
 	if !ready(pod) {
+		owner, _ := parseOwner(pod)
+		if owner.Kind == provider.KindExec {
+			// Kubernetes can confirm termination, but the sandbox cgroup is
+			// no longer accessible for an authoritative CPU reading.
+			return d, fmt.Errorf("%w: pod %s CPU usage unavailable", provider.ErrControlLost, pod.Name)
+		}
 		return d, nil
 	}
 	out, err := p.helper(ctx, pod.Name, "diag")
@@ -680,14 +780,6 @@ type podDiag = struct {
 }
 
 func jsonUnmarshal(b []byte, v any) error { return json.Unmarshal(b, v) }
-
-// OpenOutputs exists for exec environments, which this provider does not create.
-func (p *Provider) OpenOutputs(ctx context.Context, envID string, _ int) ([]provider.OutputFile, []provider.SkippedOutput, error) {
-	if _, err := p.boundPod(ctx, envID); err != nil {
-		return nil, nil, err
-	}
-	return nil, nil, fmt.Errorf("k8s: %s is not an exec environment (exec environments are not supported)", envID)
-}
 
 // Freeze stops every process in the Pod with SIGSTOP and confirms it (cgroup.freeze is not writable from an
 // unprivileged container). On failure it thaws and returns ErrFreezeUnconfirmed.

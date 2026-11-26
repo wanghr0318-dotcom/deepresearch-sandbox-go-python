@@ -841,6 +841,7 @@ func (inc *Incarnation) runTask(ctx context.Context, a SessionAttempt, controls 
 	att := &sessionRun{processor: newProcessor(inc.r, a.TaskID, a.AttemptID, a.Init.Resume, dir), inc: inc, a: a,
 		abandon: abandon, accepted: make(chan struct{}), proposed: make(chan struct{}), released: make(chan struct{})}
 	att.session, att.pctx = true, pctx
+	att.envID, att.podOut = inc.spec.EnvID, ts.OutDir
 	att.sendFn, att.appendFn = att.sendReply, inc.r.store.AppendSessionWorkerEvents
 	att.ctlFn, att.killFn = att.sendControl, inc.kill
 	if negotiated {

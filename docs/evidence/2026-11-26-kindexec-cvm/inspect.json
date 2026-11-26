@@ -1,0 +1,147 @@
+{
+  "task": {
+    "task_id": "task_e5e11a3a21e551c20ff27d5081757a57",
+    "status": "succeeded",
+    "status_reason": "succeeded",
+    "current_attempt_id": "2fdfeec220c7c56398627add017b0bd8",
+    "desired": "run",
+    "control_version": 1,
+    "applied_control_version": 1,
+    "attempts_total": 1,
+    "created_at": "2026-11-26T02:14:18.221629Z"
+  },
+  "attempts": [
+    {
+      "attempt_id": "2fdfeec220c7c56398627add017b0bd8",
+      "attempt_no": 1,
+      "status": "ended",
+      "outcome_class": "succeeded",
+      "exit_code": 0,
+      "oom_kill_delta": 0,
+      "platform_killed": false,
+      "env_id": "87d153a7147e3b297fc132d241f8929a",
+      "env_status": "creating",
+      "cleanup_state": "none",
+      "cleanup_tries": 0
+    }
+  ],
+  "checkpoints": [],
+  "calls": [
+    {
+      "call_id": "root/baseline/workspace_exec/1",
+      "endpoint": "/v1/exec",
+      "state": "completed",
+      "source": "exec",
+      "first_attempt_id": "2fdfeec220c7c56398627add017b0bd8",
+      "tries_used": 1,
+      "cost_charged_micro": 0,
+      "result_ref": "255b4bd5db0f6094685b4627f8e787b56e034c24b58bf7796ac24468e3c4e20c",
+      "possible_external_duplicate": false,
+      "created_at": "2026-11-26T10:14:19.82418+08:00",
+      "deadline_at": "2026-11-26T10:15:57.82418+08:00",
+      "tries": [
+        {
+          "try_no": 1,
+          "attempt_id": "2fdfeec220c7c56398627add017b0bd8",
+          "env_id": "exec-d8c90b6f1b46f14682d0f543",
+          "state": "settled",
+          "outcome": "ok",
+          "latency_ms": 34,
+          "cost_micro": 0,
+          "queue_ms": 0,
+          "wall_ms": 34,
+          "exec_started_at": "2026-11-26T10:14:20.456599+08:00"
+        }
+      ]
+    },
+    {
+      "call_id": "root/correct/workspace_exec/1",
+      "endpoint": "/v1/exec",
+      "state": "completed",
+      "source": "exec",
+      "first_attempt_id": "2fdfeec220c7c56398627add017b0bd8",
+      "tries_used": 1,
+      "cost_charged_micro": 0,
+      "result_ref": "8483e16f6c9645cd2b405286aa4eaddcd6f255c3032fd1a3ef860a9597e53437",
+      "possible_external_duplicate": false,
+      "created_at": "2026-11-26T10:14:21.587512+08:00",
+      "deadline_at": "2026-11-26T10:15:59.587512+08:00",
+      "tries": [
+        {
+          "try_no": 1,
+          "attempt_id": "2fdfeec220c7c56398627add017b0bd8",
+          "env_id": "exec-c771fb14287556b6fb290a3e",
+          "state": "settled",
+          "outcome": "ok",
+          "latency_ms": 35,
+          "cost_micro": 0,
+          "queue_ms": 0,
+          "wall_ms": 35,
+          "exec_started_at": "2026-11-26T10:14:22.463901+08:00"
+        }
+      ]
+    },
+    {
+      "call_id": "root/incorrect/workspace_exec/1",
+      "endpoint": "/v1/exec",
+      "state": "completed",
+      "source": "exec",
+      "first_attempt_id": "2fdfeec220c7c56398627add017b0bd8",
+      "tries_used": 1,
+      "cost_charged_micro": 0,
+      "result_ref": "558668f82441a2cc6b69250b140404a273eb6efc4e151e19fa2fd8d0f117bfbd",
+      "possible_external_duplicate": false,
+      "created_at": "2026-11-26T10:14:23.576035+08:00",
+      "deadline_at": "2026-11-26T10:16:01.576035+08:00",
+      "tries": [
+        {
+          "try_no": 1,
+          "attempt_id": "2fdfeec220c7c56398627add017b0bd8",
+          "env_id": "exec-45c6fca9d13af46634f59fca",
+          "state": "settled",
+          "outcome": "ok",
+          "latency_ms": 36,
+          "cost_micro": 0,
+          "queue_ms": 0,
+          "wall_ms": 36,
+          "exec_started_at": "2026-11-26T10:14:24.480817+08:00"
+        }
+      ]
+    },
+    {
+      "call_id": "root/timeout/workspace_exec/1",
+      "endpoint": "/v1/exec",
+      "state": "completed",
+      "source": "exec",
+      "first_attempt_id": "2fdfeec220c7c56398627add017b0bd8",
+      "tries_used": 1,
+      "cost_charged_micro": 0,
+      "result_ref": "78cccecfefab90c92c428ca00fab78f1467c11d2a80cafd5065ba149edf81383",
+      "possible_external_duplicate": false,
+      "created_at": "2026-11-26T10:14:25.559742+08:00",
+      "deadline_at": "2026-11-26T10:15:55.959742+08:00",
+      "tries": [
+        {
+          "try_no": 1,
+          "attempt_id": "2fdfeec220c7c56398627add017b0bd8",
+          "env_id": "exec-bb985d3593b2549e9c1ad60f",
+          "state": "settled",
+          "outcome": "ok",
+          "latency_ms": 400,
+          "cost_micro": 0,
+          "queue_ms": 0,
+          "wall_ms": 400,
+          "exec_started_at": "2026-11-26T10:14:26.489074+08:00"
+        }
+      ]
+    }
+  ],
+  "budget": {
+    "limit_micro": 2000000,
+    "reserved_micro": 0,
+    "spent_micro": 0,
+    "unknown_micro": 0,
+    "tool_calls_used": 0
+  },
+  "subruns": []
+}

@@ -1,5 +1,5 @@
 # Namespace and least-privilege RBAC for the Kubernetes provider (docs/design/2026-10-10-k8s-provider-design.md).
-# The server's ServiceAccount can manage Pods, exec into them and create the deny-all NetworkPolicy — only in
+# The server's ServiceAccount can manage Pods, exec into them and create NetworkPolicies and relay grants — only in
 # this namespace. Sandbox Pods themselves get no ServiceAccount token (automountServiceAccountToken: false).
 #
 # Pod Security Standards: the sandbox Pod spec meets "restricted" except for the two hostPath volumes of the
@@ -30,9 +30,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"] # per-environment relay grants owned by their Pods
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
-    verbs: ["create"] # the provider only creates the deny-all policy (AlreadyExists is fine)
+    verbs: ["create", "get"] # deny-all and the relay egress policy
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -134,6 +134,7 @@ type Options struct {
 	ReleaseTimeout    time.Duration // session 模式 T_release：task_outcome 之后到释放核验完成，默认 30 s
 
 	SubrunCancelTimeout time.Duration // T_subrun_cancel：宿主取消 sub-run 后等其 subrun_end，默认 10 s（§13.4）
+	OpenPodArtifact     func(ctx context.Context, envID, outDir, path string, limit int64) (io.ReadCloser, error)
 }
 
 func (o Options) withDefaults() Options {
@@ -238,6 +239,7 @@ func (r *Runner) Run(ctx context.Context, a Attempt, controls <-chan Control) (o
 	at := &attemptRun{processor: newProcessor(r, a.TaskID, a.AttemptID, a.Init.Resume, dir), a: a, h: h,
 		stdin: h.Stdin(), stderr: &tailBuffer{max: r.opt.StderrTail},
 		readyCh: make(chan struct{}), finishing: make(chan struct{})}
+	at.envID, at.podOut = a.EnvID, a.Init.OutDir
 	at.sendFn, at.appendFn = at.sendTask, r.store.AppendWorkerEvents
 	at.ctlFn, at.killFn = at.sendTaskControl, at.kill
 	at.stream.NegotiateExtensions(a.Init.Extensions)
@@ -266,6 +268,7 @@ type processor struct {
 	resumeCheckpointID string // init.resume / task_start.resume 的 checkpoint（paused 检查的候选）
 	session            bool   // session 模式：result 的内容含 session_state
 	dir                *outDir
+	envID, podOut      string
 	out                Outcome
 	pctx               context.Context // 处理器的 ctx：屏障 B 超时或 attempt 结束后取消
 
@@ -982,7 +985,16 @@ func (at *processor) storeArtifact(ctx context.Context, m *protocol.Artifact) (b
 	if m.DeclaredSize > limit {
 		return blob.Ref{}, 0, &artifactError{code: codeArtifactTooLarge, err: errors.New("声明大小超限")}
 	}
-	f, size, err := at.dir.open(m.Path)
+	sctx, cancel := context.WithTimeout(ctx, at.r.opt.SaveTimeout)
+	defer cancel()
+	var f io.ReadCloser
+	var size int64
+	var err error
+	if open := at.r.opt.OpenPodArtifact; open != nil {
+		f, err = open(sctx, at.envID, at.podOut, m.Path, limit+1)
+	} else {
+		f, size, err = at.dir.open(m.Path)
+	}
 	if err != nil {
 		var ae *artifactError
 		if errors.As(err, &ae) {
@@ -994,8 +1006,6 @@ func (at *processor) storeArtifact(ctx context.Context, m *protocol.Artifact) (b
 	if size > limit {
 		return blob.Ref{}, 0, &artifactError{code: codeArtifactTooLarge, err: fmt.Errorf("%d 字节", size)}
 	}
-	sctx, cancel := context.WithTimeout(ctx, at.r.opt.SaveTimeout)
-	defer cancel()
 	// 保存超时与 blob/Store 的暂时故障都答复 save_timeout（§5.4 中表示"未保存、可重试"的码）；
 	// attempt 正在结束（ctx 已取消）时答复 cancelled。
 	failed := func(err error) *artifactError {

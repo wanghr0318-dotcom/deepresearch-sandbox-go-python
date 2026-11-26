@@ -48,8 +48,10 @@ const ShellWorkspaceDir = "ws"
 
 // shellWrapper is the fixed program run by bash -c (not caller-controlled). Staging failures exit 125 with a
 // message on stderr so they are distinguishable from the command's own exit codes.
-const shellWrapper = `if [ -d /in/ws ]; then
-  cp -R --preserve=mode /in/ws/. /out/ && chmod -R u+w /out || { echo "agentbox: workspace staging failed" >&2; exit 125; }
+const shellWrapper = `shopt -s dotglob nullglob
+inputs=(/in/ws/*)
+if ((${#inputs[@]})); then
+  cp -R --preserve=mode -- "${inputs[@]}" /out/ && chmod -R u+w -- /out/* || { echo "agentbox: workspace staging failed" >&2; exit 125; }
 fi
 cd /out || exit 125
 printf '\000agentbox:staged\n'

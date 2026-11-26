@@ -1,0 +1,42 @@
+{
+  "baseline": {
+    "status": "completed",
+    "wall_ms": 34,
+    "exit_code": 7,
+    "cases": {
+      "single_row": false,
+      "ordered_rows": false,
+      "header_only": true,
+      "quoted_comma": false
+    },
+    "outputs": 3
+  },
+  "correct": {
+    "status": "completed",
+    "wall_ms": 35,
+    "exit_code": 0,
+    "cases": {
+      "single_row": true,
+      "ordered_rows": true,
+      "header_only": true,
+      "quoted_comma": true
+    },
+    "outputs": 3
+  },
+  "incorrect": {
+    "status": "completed",
+    "wall_ms": 36,
+    "exit_code": 7,
+    "cases": {
+      "single_row": true,
+      "ordered_rows": true,
+      "header_only": true,
+      "quoted_comma": false
+    },
+    "outputs": 3
+  },
+  "timeout": {
+    "status": "timed_out",
+    "wall_ms": 400
+  }
+}

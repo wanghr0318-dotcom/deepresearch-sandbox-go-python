@@ -18,12 +18,14 @@ import (
 
 	"k8s.io/klog/v2"
 
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/app"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/k8s"
 )
 
 type k8sFlags struct {
 	kubeconfig, namespace, image, runtimeClass, sharedDir, nodeSharedDir, plainHTTP string
+	gatewayListen                                                                   string
 	strict                                                                          bool
 	warmPool                                                                        int
 }
@@ -37,6 +39,7 @@ func (f *k8sFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.runtimeClass, "k8s-runtime-class", "", "--provider k8s：Pod 的 runtimeClassName（例如 gVisor 的 runsc 对应的 RuntimeClass）；空为集群默认")
 	fs.StringVar(&f.sharedDir, "k8s-shared-dir", "", "--provider k8s：与节点共享的槽位目录（workspace 与 Gateway socket 经它进入 Pod；须与 --data-dir 同一文件系统）；默认 <data-dir>/k8s-slots")
 	fs.StringVar(&f.nodeSharedDir, "k8s-node-shared-dir", "", "--provider k8s：同一目录在节点上的路径（hostPath）；默认与 --k8s-shared-dir 相同")
+	fs.StringVar(&f.gatewayListen, "k8s-gateway-listen", "", "--provider k8s：无 hostPath 的 Gateway TLS relay 私网 IP:端口")
 	fs.IntVar(&f.warmPool, "k8s-warm-pool", 0, "--provider k8s：保持的预热 Pod 数（按默认任务资源规格；0 关闭）")
 }
 
@@ -47,14 +50,14 @@ func k8sWarmProfile(defaultMemory int64) provider.Limits {
 }
 
 // prepareK8s 在取得锁、连接数据库之前固定镜像 digest 并连接集群；返回按 install_id 构造 provider 的函数。
-func prepareK8s(f k8sFlags, dataDir string, defaultMemory int64, stderr io.Writer) (func(string) (provider.Provider, error), error) {
+func prepareK8s(f k8sFlags, dataDir string, defaultMemory int64, exec app.ExecConfig, stderr io.Writer) (func(string) (provider.Provider, error), string, error) {
 	if f.image == "" {
-		return nil, errors.New("--provider k8s 需要 --k8s-image")
+		return nil, "", errors.New("--provider k8s 需要 --k8s-image")
 	}
 	// 槽位目录与 Gateway socket 的硬链接须 chown 到沙箱 UID（10001），只有 root 能做到；否则 Worker 无法
 	// 写 workspace、连接 socket。
-	if os.Geteuid() != 0 {
-		return nil, errors.New("--provider k8s 需要以 root 运行（槽位目录与 Gateway socket 须 chown 到沙箱 UID 10001）")
+	if f.gatewayListen == "" && os.Geteuid() != 0 {
+		return nil, "", errors.New("--provider k8s 的宿主槽位目录模式需要 root")
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	klog.SetSlogLogger(logger) // client-go 的日志（例如 exec 流的错误）进入同一 JSON 日志
@@ -62,25 +65,31 @@ func prepareK8s(f k8sFlags, dataDir string, defaultMemory int64, stderr io.Write
 	defer cancel()
 	ref, err := k8s.PinImage(ctx, f.image, f.strict, splitList(f.plainHTTP), nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	client, ex, err := k8s.Connect(f.kubeconfig)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	shared := f.sharedDir
-	if shared == "" {
+	if shared == "" && f.gatewayListen == "" {
 		shared = filepath.Join(dataDir, "k8s-slots")
+	}
+	var stageDir, digest string
+	if exec.Enabled() {
+		stageDir = filepath.Join(dataDir, "k8s-exec-staging")
+		digest = ref.Digest
 	}
 	fmt.Fprintf(stderr, "agentbox server: provider k8s, namespace %s, image %s\n", f.namespace, ref.Pinned())
 	return func(installID string) (provider.Provider, error) {
 		p, err := k8s.New(context.Background(), k8s.Options{Client: client, Executor: ex, Namespace: f.namespace,
 			InstallID: installID, Image: ref.Pinned(), RuntimeClass: f.runtimeClass, SlotHostDir: shared,
 			SlotNodeDir: f.nodeSharedDir, WarmPool: f.warmPool, WarmProfile: k8sWarmProfile(defaultMemory),
+			GatewayListen: f.gatewayListen, ExecStagingDir: stageDir, ExecPodLifetime: max(10*time.Minute, exec.WallMax+3*time.Minute),
 			EnsureNetworkPolicy: true, Logger: logger})
 		if err != nil {
 			return nil, err
 		}
 		return p, nil
-	}, nil
+	}, digest, nil
 }

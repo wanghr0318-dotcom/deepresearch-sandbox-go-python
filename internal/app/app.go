@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	mrand "math/rand/v2"
 	"net"
@@ -891,7 +892,14 @@ func (s *server) assemble() error {
 		// s.edge 由下方 assembleGateway 设置，cleanup loop 在 assemble 之后才启动。
 		EntryHeld: func(envID string) bool { return s.edge != nil && s.edge.EnvHeld(envID) },
 		Logger:    s.log})
-	run := runner.New(s.store, blobs, prov, prov.ResourceDiag, s.cfg.Runner)
+	runnerOpt := s.cfg.Runner
+	if remote, ok := prov.(interface {
+		UsesPodWorkspace() bool
+		OpenPodArtifact(context.Context, string, string, string, int64) (io.ReadCloser, error)
+	}); ok && remote.UsesPodWorkspace() {
+		runnerOpt.OpenPodArtifact = remote.OpenPodArtifact
+	}
+	run := runner.New(s.store, blobs, prov, prov.ResourceDiag, runnerOpt)
 	if err := s.assembleGateway(blobs); err != nil {
 		return err
 	}

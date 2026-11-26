@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -72,8 +73,18 @@ func newTestProvider(t *testing.T, client kubernetes.Interface, ex Executor, mod
 // target (fake helper or real image) understands.
 func harness(newProv func(t *testing.T) *Provider, install func() string, echo, sleep []string) providertest.Harness {
 	return providertest.Harness{
-		New:        func(t *testing.T) provider.Provider { return newProv(t) },
-		Spec:       func(envID string) provider.EnvSpec { return specFor(install())(envID) },
+		New:  func(t *testing.T) provider.Provider { return newProv(t) },
+		Spec: func(envID string) provider.EnvSpec { return specFor(install())(envID) },
+		ExecSpec: func(envID string) provider.EnvSpec {
+			spec := specFor(install())(envID)
+			spec.Kind, spec.Mounts.OutBytes = provider.KindExec, 1<<20
+			return spec
+		},
+		ExecWorkspace: func(exitCode int) provider.ExecSpec {
+			return provider.ExecSpec{ExecID: "workspace-1", Argv: []string{"sh", "-c",
+				"cat /in/input.txt > /out/output.txt; printf extra > /out/z-extra.txt; exit \"$1\"",
+				"workspace", strconv.Itoa(exitCode)}}
+		},
 		Echo:       provider.ExecSpec{ExecID: "echo-1", Argv: echo},
 		EchoOutput: "hello",
 		EchoCode:   3,
@@ -125,7 +136,7 @@ func harness(newProv func(t *testing.T) *Provider, install func() string, echo, 
 func TestConformanceOnFakeCluster(t *testing.T) {
 	providertest.Run(t, harness(func(t *testing.T) *Provider {
 		c := newFakeCluster(t, 0)
-		return newTestProvider(t, c.client, c.exec, func(o *Options) { o.InstallID = "inst-a" })
+		return newTestProvider(t, c.client, c.exec, func(o *Options) { o.ExecStagingDir = t.TempDir() })
 	}, func() string { return "inst-a" }, []string{"echo", "hello", "3"}, []string{"sleep"}))
 }
 
@@ -173,6 +184,63 @@ func TestPodSpecIsLockedDown(t *testing.T) {
 	if err != nil || len(np.Spec.PolicyTypes) != 2 || len(np.Spec.Egress) != 0 || len(np.Spec.Ingress) != 0 ||
 		np.Spec.PodSelector.MatchLabels[LabelManaged] != "true" {
 		t.Fatalf("deny-all policy: %+v %v", np, err)
+	}
+}
+
+func TestKindExecPodVolumes(t *testing.T) {
+	const outBytes = 8 << 20
+	pod := buildPod(podParams{
+		Name: "exec-test", Namespace: testNS, InstallID: "inst-a", Image: testImage,
+		Profile: profileOf(testLimits()),
+		Owner:   &owner{InstallID: "inst-a", EnvID: "exec-test", Kind: provider.KindExec},
+		// A legacy slot path must never be used by an execution Pod.
+		SlotNodeDir: "/unused-slot", ExecOutBytes: outBytes, ExecDeadlineSeconds: 600,
+	})
+	if len(pod.Spec.Containers) != 2 {
+		t.Fatalf("expected the sandbox and a transfer container, got %d", len(pod.Spec.Containers))
+	}
+	sandbox, transfer := pod.Spec.Containers[0], pod.Spec.Containers[1]
+	for _, volume := range pod.Spec.Volumes {
+		if volume.EmptyDir == nil {
+			t.Errorf("volume %s does not use a Pod-local emptyDir", volume.Name)
+		}
+		if volume.Name == "output" && volume.EmptyDir != nil {
+			if volume.EmptyDir.SizeLimit == nil || volume.EmptyDir.SizeLimit.Value() != outBytes {
+				t.Errorf("incorrect output volume limit: %v", volume.EmptyDir.SizeLimit)
+			}
+		}
+	}
+	for _, tc := range []struct {
+		container corev1.Container
+		path      string
+		readOnly  bool
+	}{
+		{sandbox, "/in", true},
+		{sandbox, "/out", false},
+		{transfer, "/in", false},
+		{transfer, "/out", true},
+	} {
+		found := false
+		for _, mount := range tc.container.VolumeMounts {
+			if mount.MountPath == tc.path && mount.ReadOnly == tc.readOnly {
+				found = true
+			}
+			if mount.MountPath == "/run/agentbox" || mount.MountPath == "/workspace" {
+				t.Errorf("%s inherited a legacy orchestration mount: %s", tc.container.Name, mount.MountPath)
+			}
+		}
+		if !found {
+			t.Errorf("%s missing %s (read-only=%t)", tc.container.Name, tc.path, tc.readOnly)
+		}
+	}
+	if pod.Spec.ShareProcessNamespace != nil && *pod.Spec.ShareProcessNamespace {
+		t.Fatal("sandbox and transfer container must use separate process namespaces")
+	}
+	if pod.Spec.ActiveDeadlineSeconds == nil || *pod.Spec.ActiveDeadlineSeconds != 600 {
+		t.Fatal("execution Pod must have a bounded lifetime")
+	}
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
+		t.Fatal("execution Pod must not receive a service account token")
 	}
 }
 

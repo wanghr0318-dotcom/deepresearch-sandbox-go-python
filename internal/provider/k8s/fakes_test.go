@@ -1,6 +1,7 @@
 package k8s
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -20,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider/k8s/podapi"
 )
 
@@ -72,7 +74,7 @@ func (k *fakeKubelet) sync(ctx context.Context) {
 		k.mu.Unlock()
 		switch {
 		case terminal(pod):
-		case pod.Spec.ActiveDeadlineSeconds != nil && pod.Spec.NodeName != "":
+		case pod.Spec.ActiveDeadlineSeconds != nil && *pod.Spec.ActiveDeadlineSeconds <= 1 && pod.Spec.NodeName != "":
 			k.exec.killPod(pod.Name)
 			k.patch(ctx, pod.Name, map[string]any{"status": map[string]any{
 				"phase": corev1.PodFailed, "reason": "DeadlineExceeded",
@@ -87,11 +89,16 @@ func (k *fakeKubelet) sync(ctx context.Context) {
 			k.mu.Lock()
 			k.started++
 			k.mu.Unlock()
+			statuses := make([]corev1.ContainerStatus, 0, len(pod.Spec.Containers))
+			for _, container := range pod.Spec.Containers {
+				statuses = append(statuses, corev1.ContainerStatus{Name: container.Name, Ready: true,
+					State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}})
+			}
 			k.patch(ctx, pod.Name, map[string]any{"status": map[string]any{
 				"phase":             corev1.PodRunning,
 				"startTime":         metav1.NewTime(now),
 				"conditions":        []map[string]any{{"type": "Ready", "status": "True"}},
-				"containerStatuses": []map[string]any{{"name": containerName, "ready": true, "state": map[string]any{"running": map[string]any{}}}},
+				"containerStatuses": statuses,
 			}})
 		}
 	}
@@ -106,11 +113,13 @@ type fakeExec struct {
 	client kubernetes.Interface
 	ns     string
 
-	mu     sync.Mutex
-	procs  map[string]map[string]*fakeProc // pod → exec id → process
-	status map[string]podapi.Status        // pod/id → status
-	frozen map[string]bool
-	nextID int
+	mu      sync.Mutex
+	procs   map[string]map[string]*fakeProc // pod → exec id → process
+	status  map[string]podapi.Status        // pod/id → status
+	frozen  map[string]bool
+	inputs  map[string]string
+	outputs map[string]string
+	nextID  int
 }
 
 type fakeProc struct {
@@ -127,7 +136,8 @@ var errStreamBroken = errors.New("fake: container terminated, stream closed")
 
 func newFakeExec(client kubernetes.Interface, ns string) *fakeExec {
 	return &fakeExec{client: client, ns: ns, procs: map[string]map[string]*fakeProc{},
-		status: map[string]podapi.Status{}, frozen: map[string]bool{}, nextID: 100}
+		status: map[string]podapi.Status{}, frozen: map[string]bool{}, inputs: map[string]string{},
+		outputs: map[string]string{}, nextID: 100}
 }
 
 func (f *fakeExec) killPod(pod string) {
@@ -143,14 +153,30 @@ func (f *fakeExec) killPod(pod string) {
 }
 
 func (f *fakeExec) Stream(ctx context.Context, ns, pod string, cmd []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	return f.StreamContainer(ctx, ns, pod, containerName, cmd, stdin, stdout, stderr)
+}
+
+func (f *fakeExec) StreamContainer(ctx context.Context, ns, pod, container string, cmd []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	po, err := f.client.CoreV1().Pods(ns).Get(ctx, pod, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) || (err == nil && !ready(po)) {
+	if apierrors.IsNotFound(err) {
 		return fmt.Errorf("fake: container not running in pod %s", pod)
 	} else if err != nil {
 		return err
 	}
+	running := false
+	for _, status := range po.Status.ContainerStatuses {
+		if status.Name == container {
+			running = status.State.Running != nil
+		}
+	}
+	if !running {
+		return fmt.Errorf("fake: container %s not running in pod %s", container, pod)
+	}
 	if len(cmd) < 2 || cmd[0] != podapi.Binary {
 		return fmt.Errorf("fake: unexpected command %q", cmd)
+	}
+	if container == transferContainerName {
+		return f.transfer(pod, cmd[1:], stdin, stdout)
 	}
 	fs := flag.NewFlagSet(cmd[1], flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -203,13 +229,80 @@ func (f *fakeExec) Stream(ctx context.Context, ns, pod string, cmd []string, std
 	case "diag":
 		return json.NewEncoder(stdout).Encode(podapi.Diag{CPUUsageUsec: 4242})
 	case "shutdown":
+		if o, ok := parseOwner(po); ok && o.Kind == provider.KindExec {
+			f.killPod(pod)
+			for i := range po.Status.ContainerStatuses {
+				status := &po.Status.ContainerStatuses[i]
+				if status.Name == containerName {
+					status.State = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{}}
+					status.Ready = false
+				}
+			}
+			_, err := f.client.CoreV1().Pods(ns).UpdateStatus(ctx, po, metav1.UpdateOptions{})
+			return err
+		}
 		return nil // the fake kubelet acts on activeDeadlineSeconds
 	}
 	return fmt.Errorf("fake: unknown subcommand %q", cmd[1])
 }
 
+func (f *fakeExec) transfer(pod string, args []string, stdin io.Reader, stdout io.Writer) error {
+	switch args[0] {
+	case "stage-input":
+		r := tar.NewReader(stdin)
+		for {
+			h, err := r.Next()
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if h.Name == "input.txt" {
+				b, err := io.ReadAll(r)
+				if err != nil {
+					return err
+				}
+				f.mu.Lock()
+				f.inputs[pod] = string(b)
+				f.mu.Unlock()
+			}
+		}
+	case "collect-output":
+		fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
+		maxFiles := fs.Int("max", 0, "")
+		fs.Int64("bytes", 0, "")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		f.mu.Lock()
+		data, ok := f.outputs[pod]
+		f.mu.Unlock()
+		w := tar.NewWriter(stdout)
+		if ok {
+			for i, file := range []struct{ name, data string }{{"output.txt", data}, {"z-extra.txt", "extra"}} {
+				h := &tar.Header{Name: file.name, Size: int64(len(file.data)), Mode: 0o444, Typeflag: tar.TypeReg}
+				if i >= *maxFiles {
+					file.data, h.Size = "", 0
+					h.PAXRecords = map[string]string{"AGENTBOX.skip": "too_many"}
+				}
+				if err := w.WriteHeader(h); err != nil {
+					return err
+				}
+				if _, err := io.WriteString(w, file.data); err != nil {
+					return err
+				}
+			}
+		}
+		return w.Close()
+	default:
+		return fmt.Errorf("fake: unexpected transfer command %q", args)
+	}
+}
+
 func (f *fakeExec) run(ctx context.Context, pod, id string, argv []string, stdin io.Reader, stdout io.Writer) error {
-	if len(argv) == 0 || (argv[0] != "echo" && argv[0] != "sleep" && argv[0] != "cat") {
+	workspace := len(argv) == 5 && argv[0] == "sh" && argv[3] == "workspace"
+	if len(argv) == 0 || (!workspace && argv[0] != "echo" && argv[0] != "sleep" && argv[0] != "cat") {
 		fmt.Fprintf(stdout, "%sfake: %q not found\n", podapi.AckStartErr, argv)
 		return exitErr(podapi.StartErrCode)
 	}
@@ -235,6 +328,19 @@ func (f *fakeExec) run(ctx context.Context, pod, id string, argv []string, stdin
 		return nil
 	}
 	fmt.Fprintf(stdout, "%s%d\n", podapi.AckStarted, p.pid)
+	if workspace {
+		f.mu.Lock()
+		input, ok := f.inputs[pod]
+		if ok {
+			f.outputs[pod] = input
+		}
+		f.mu.Unlock()
+		if !ok {
+			return finish(podapi.Status{Code: 1})
+		}
+		code, _ := strconv.Atoi(argv[4])
+		return finish(podapi.Status{Code: code})
+	}
 	switch argv[0] {
 	case "echo":
 		code, _ := strconv.Atoi(argv[2])

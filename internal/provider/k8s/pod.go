@@ -33,7 +33,8 @@ const (
 	StateWarm     = "warm"
 	StateAssigned = "assigned"
 
-	containerName = "sandbox"
+	containerName         = "sandbox"
+	transferContainerName = "workspace-transfer"
 	// SandboxUID is the fixed non-root user of every sandbox Pod.
 	SandboxUID int64 = 10001
 	// NetworkPolicyName is the namespace's deny-all policy for sandbox Pods.
@@ -116,8 +117,13 @@ type podParams struct {
 	// SlotNodeDir is the Pod's slot directory as seen by the node (hostPath); empty for no shared mounts.
 	SlotNodeDir string
 	// Owner and EnvLabel are set for a cold (directly bound) Pod and empty for a warm one.
-	Owner     *owner
-	Workspace string
+	Owner        *owner
+	Workspace    string
+	ExecOutBytes int64
+	// ExecDeadlineSeconds covers setup, execution, and output collection.
+	ExecDeadlineSeconds int64
+	PodWorkspace        bool
+	RelaySecret         string
 }
 
 func ptr[T any](v T) *T { return &v }
@@ -158,7 +164,8 @@ func buildPod(pp podParams) *corev1.Pod {
 		{Name: "tmp", MountPath: "/tmp"},
 		{Name: "exec", MountPath: podapi.ExecDir},
 	}
-	if pp.SlotNodeDir != "" {
+	isExec := pp.Owner != nil && pp.Owner.Kind == provider.KindExec
+	if !isExec && pp.SlotNodeDir != "" {
 		dir := corev1.HostPathDirectory
 		volumes = append(volumes,
 			corev1.Volume{Name: "workspace", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
@@ -200,10 +207,40 @@ func buildPod(pp podParams) *corev1.Pod {
 			Volumes: volumes,
 		},
 	}
+	if pp.PodWorkspace {
+		buildPodWorkspace(pod, pp.RelaySecret, memDir)
+	}
+	if isExec {
+		pod.Spec.ActiveDeadlineSeconds = ptr(pp.ExecDeadlineSeconds)
+		pod.Spec.SecurityContext.FSGroup = ptr(SandboxUID)
+		pod.Spec.Volumes = append(pod.Spec.Volumes,
+			corev1.Volume{Name: "input", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+			corev1.Volume{Name: "output", VolumeSource: memDir(pp.ExecOutBytes)})
+		input := corev1.VolumeMount{Name: "input", MountPath: "/in"}
+		output := corev1.VolumeMount{Name: "output", MountPath: "/out"}
+		sandbox := &pod.Spec.Containers[0]
+		sandbox.VolumeMounts = append(sandbox.VolumeMounts,
+			corev1.VolumeMount{Name: input.Name, MountPath: input.MountPath, ReadOnly: true}, output)
+		output.ReadOnly = true
+		pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
+			Name: transferContainerName, Image: pp.Image, ImagePullPolicy: corev1.PullIfNotPresent,
+			Command: []string{"sleep", "infinity"}, WorkingDir: "/",
+			SecurityContext: sandbox.SecurityContext.DeepCopy(),
+			VolumeMounts:    []corev1.VolumeMount{input, output},
+			Resources:       sidecarResources(),
+		})
+	}
 	if pp.RuntimeClass != "" {
 		pod.Spec.RuntimeClassName = ptr(pp.RuntimeClass)
 	}
 	return pod
+}
+
+func sidecarResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10m"), corev1.ResourceMemory: resource.MustParse("16Mi")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("250m"), corev1.ResourceMemory: resource.MustParse("128Mi")},
+	}
 }
 
 // denyAllPolicy selects every sandbox Pod and allows no ingress and no egress.
