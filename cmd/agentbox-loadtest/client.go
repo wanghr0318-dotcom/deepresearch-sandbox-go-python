@@ -28,6 +28,7 @@ type reqSpec struct {
 	Stream      bool
 	MaxTokens   int
 	Prompt      string
+	Temperature *float64
 	Key         string // platform key; empty for a direct request to the fake provider
 	CancelAfter bool   // cancel right after the first content event (a client that goes away mid-stream)
 }
@@ -46,6 +47,9 @@ func (s reqSpec) body() []byte {
 	}
 	if s.Stream {
 		v["stream"] = true
+	}
+	if s.Temperature != nil {
+		v["temperature"] = *s.Temperature
 	}
 	b, _ := json.Marshal(v)
 	return b
@@ -88,13 +92,17 @@ var keptHeaders = []string{"Retry-After", "X-Ratelimit-Limit-Requests", "X-Ratel
 
 // send performs one request and measures it. A deadline on ctx ends the request; such a result has Status 0.
 func send(ctx context.Context, hc *http.Client, t target, s reqSpec) result {
+	return sendBody(ctx, hc, t, s, s.body())
+}
+
+func sendBody(ctx context.Context, hc *http.Client, t target, s reqSpec, payload []byte) result {
 	url := t.OpenAIURL
 	if s.Proto == Anthropic {
 		url = t.AnthropicURL
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(s.body()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	r := result{Stream: s.Stream}
 	if err != nil {
 		r.Code = "transport"
@@ -208,6 +216,7 @@ func classifyLine(proto Protocol, line string, event *string, r *result) lineKin
 		return lineOther
 	}
 	var chunk struct {
+		Usage   *openAIUsage `json:"usage"`
 		Choices []struct {
 			Delta struct {
 				Content   string            `json:"content"`
@@ -216,6 +225,9 @@ func classifyLine(proto Protocol, line string, event *string, r *result) lineKin
 		} `json:"choices"`
 	}
 	if json.Unmarshal([]byte(data), &chunk) == nil {
+		if chunk.Usage != nil {
+			r.Usage = chunk.Usage
+		}
 		for _, c := range chunk.Choices {
 			if c.Delta.Content != "" || len(c.Delta.ToolCalls) > 0 {
 				return lineContent

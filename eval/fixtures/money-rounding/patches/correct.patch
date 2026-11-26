@@ -1,0 +1,12 @@
+diff --git a/records.py b/records.py
+--- a/records.py
++++ b/records.py
+@@ -1,6 +1,6 @@
+-from decimal import Decimal
++from decimal import Decimal, ROUND_HALF_UP
+
+
+ def invoice_total(amounts):
+     total = sum((Decimal(amount) for amount in amounts), Decimal("0"))
+-    return str(total.quantize(Decimal("0.01")))
++    return str(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))

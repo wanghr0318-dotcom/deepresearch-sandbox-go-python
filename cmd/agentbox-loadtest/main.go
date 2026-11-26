@@ -36,7 +36,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence/postgres"
 )
 
-const usage = `usage: agentbox-loadtest <latency|ladder|ratelimit|budget|steady|lockwait> [flags]
+const usage = `usage: agentbox-loadtest <latency|ladder|ratelimit|budget|steady|lockwait|replay> [flags]
 run "agentbox-loadtest <scenario> -h" for the flags`
 
 func main() {
@@ -49,6 +49,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	name := args[0]
+	if name == "replay" {
+		if err := runReplay(args[1:], stdout, stderr); err != nil {
+			if err == flag.ErrHelp {
+				return 0
+			}
+			fmt.Fprintln(stderr, "agentbox-loadtest replay:", err)
+			return 1
+		}
+		return 0
+	}
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	c := config{stdout: stdout}

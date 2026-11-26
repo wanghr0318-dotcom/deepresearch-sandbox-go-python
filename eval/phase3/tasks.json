@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "order": [
+    {"id": "csv-first-row", "group": "single-file"},
+    {"id": "money-rounding", "group": "single-file"},
+    {"id": "cursor-tie", "group": "single-file"},
+    {"id": "window-end", "group": "single-file"},
+    {"id": "catalog-alias", "group": "cross-file"},
+    {"id": "reading-units", "group": "cross-file"}
+  ]
+}

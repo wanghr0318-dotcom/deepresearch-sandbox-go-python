@@ -23,6 +23,12 @@ type result struct {
 	ErrEvent bool // stream carried an error event
 	Canceled bool // the client cancelled the request on purpose (after the first content)
 	Header   map[string]string
+	Usage    *openAIUsage
+}
+
+type openAIUsage struct {
+	Prompt     int `json:"prompt_tokens"`
+	Completion int `json:"completion_tokens"`
 }
 
 // ok reports a 200 whose stream (if any) completed or was cancelled on purpose.

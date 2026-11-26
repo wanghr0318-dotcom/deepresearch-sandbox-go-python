@@ -67,6 +67,8 @@ func TestErrorInfo(t *testing.T) {
 func fakeSSE(t *testing.T, body string) string {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
+		w.(http.Flusher).Flush()
+		time.Sleep(20 * time.Millisecond)
 		fmt.Fprint(w, body)
 	}))
 	t.Cleanup(srv.Close)

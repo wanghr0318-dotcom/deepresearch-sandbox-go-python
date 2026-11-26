@@ -1,0 +1,14 @@
+diff --git a/records.py b/records.py
+--- a/records.py
++++ b/records.py
+@@ -1,9 +1,9 @@
+ from catalog import group_for
+
+
+ def count_groups(rows):
+     counts = {}
+     for row in rows:
+-        group = group_for(row["label"])
++        group = group_for(row["label"].strip().lower())
+         counts[group] = counts.get(group, 0) + row["quantity"]
+     return counts
