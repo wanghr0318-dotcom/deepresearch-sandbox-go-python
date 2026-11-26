@@ -10,7 +10,7 @@
 
 ## 已验证的起点和约束
 
-- 远端阶段 1 为 ccdf6f9。真实 K8s 契约 17 项通过、0 跳过；CSV 为脚本化 Worker。阶段 2 部署文件、探针和原始证据目前在工作树。
+- 远端阶段 1 为 ccdf6f9。真实 K8s 契约 17 项通过、0 跳过；CSV 为脚本化 Worker。阶段 2 部署文件、探针和原始证据已推送为 8028fe9，CPU 候选取件复评已推送为 f128cf4。
 - 查看 docs/evidence/2026-11-26-sglang-a800/ 内的 direct.json、direct-from-cvm.json、gateway.json、events.sse 和 agent-calls.csv。前三份验证协议；后两份串起真实会话。现有显存记录 71646 MiB 为采样点。
 - 冻结权重 revision b968826d9c46dd6066d109eabc6255188de91218、qwen25、thinking 关闭、24576 上下文、服务并发 1。AutoDL 使用 Python 安装路径；另存实际包清单及启动配置。保持零 hostPath。复用已有 workspace API、验证用例与负载客户端。
 - 本轮并行任务是审阅与规划。下列是执行时的写入归属。主 agent 整合原计划、调度云机、串行发起正式测量、审查脱敏证据并提交。并发审阅不意味着并发占用同一 GPU。
@@ -26,10 +26,10 @@
 ## B　provider_lifecycle · 一道真实修复题、独立评分
 
 **归属** eval/fixtures/csv-first-row/、本轮任务证据；优先复用 worker/agentbox_worker/tools/workspace.py、既有 chatagent session、阶段 1 工具执行通道。用 eval/fixtures/csv-first-row/verify.py 的四组 CASES 作为唯一评分依据。
-- [ ] CPU 预检运行 py -3.13 -B eval/fixtures/csv-first-row/verify.py（Linux 用 Python 3.10+）。预期 baseline 1/4、correct 4/4、incorrect 3/4；三组自检整体退出 0。
-- [ ] 用参考候选在独立 KindExec 路径复现同样三组 verdict。评分端只接收候选 records.py 与固定 checker。记录候选 SHA-256、各用例 verdict、Pod UID、退出状态。已知模板不需要新增评分框架。
+- [x] CPU 预检运行 py -3.13 -B eval/fixtures/csv-first-row/verify.py（Linux 用 Python 3.10+）。预期 baseline 1/4、correct 4/4、incorrect 3/4；三组自检整体退出 0。
+- [x] 阶段 1 独立工具 Pod 得到基线、正确、错误三组 verdict。随后在新评分任务中按摘要取回正确和错误候选并重判，分别得到 4/4 和 3/4。评分端只接收候选 records.py 与固定 checker。记录候选 SHA-256、各用例 verdict、Pod UID、退出状态。已知模板不需要新增评分框架。
 - [ ] 新建普通 chatagent 会话，通过验收入口使用现有 gateway.workspace 写入 repo/records.py 并核对初始摘要，然后调用原 chatagent.app.run。只在验收入口做 fixture 初始化，模型收到的第一步仍是读取原文件，向 POST /sessions/{id}/messages 发送 task.md 的题意。参考补丁、独立用例及期望输出留在评测端。公开冒烟测试可根据题面单行示例执行。
-- [ ] 从事件中核实模型读原文件、写修改、调用 exec_shell 测试、消费结果。结束前用 exec_shell 执行 base64 -w0 records.py，并取得同一版本的 sha256sum。由 tool_result.raw.response_ref 定位 GET /turns/{turn_id}/raw/{sha256}，解码完整 stdout 并校验文件摘要；若输出截断，本次标为取件失败。由独立执行 Pod 在干净目录重跑评分并核对导出摘要。模型自报“成功”只作为会话输出保留。
+- [ ] 从事件中核实模型读原文件、写修改、调用 exec_shell 测试、消费结果。用最后一次 exec_shell 调用的 result_ref 读取原始结果，按 outputs 中 records.py 的摘要和大小从 BlobStore 取原始字节并校验。此路径已在 CPU 参考候选验收。由独立执行 Pod 在干净目录重跑评分并核对导出摘要。模型自报“成功”只作为会话输出保留。
 - [ ] 各次都归档会话与 turn ID、工具与 Pod 记录、候选、上游调用及四项判定。目标是一条真实解对、一条正常结束但评分失败的轨迹；预先登记试跑上限（建议首批 3 次），全部通过或全部失败均照实报告缺项。参考错误补丁只用于验证评分器。
 - [ ] 主 agent 审查 B 的证据链及 A 的实际路由；经脱敏检查后分别固定部署/探针与 CSV 验收的提交。阶段 2 关闭后才能发布正式 Agent 基线。
 
