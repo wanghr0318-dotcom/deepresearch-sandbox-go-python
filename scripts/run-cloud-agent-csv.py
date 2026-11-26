@@ -28,12 +28,15 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def seed_command(files):
+def seed_command(files, setup=""):
     # A test entry point in the existing worker image. Base64 keeps argv free of commas.
     payload = f"""import asyncio
 from agentbox_worker import main_session
 from chatagent.app import run
+{setup}
 async def seeded(ctx):
+    if ctx.resume is not None:
+        return await run(ctx)
     for path, content, sha in {[(p, s, digest(s.encode())) for p, s in files.items()]!r}:
         result = await asyncio.to_thread(ctx.gateway.workspace, 'write', {{'path': path, 'content': content}})
         if result['sha256'] != sha:
@@ -126,7 +129,7 @@ def wait_http(url, gateway):
     raise TimeoutError("Gateway startup timed out")
 
 
-def run_acceptance(args, source, data_dir, url, namespace):
+def run_acceptance(args, source, data_dir, url, namespace, after_submit=None):
     results = args.evidence
     owner = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
     operator = (data_dir / "api.token").read_text().strip()
@@ -159,6 +162,8 @@ def run_acceptance(args, source, data_dir, url, namespace):
         turn = api("POST", f"/sessions/{session}/messages",
                    {"request_id": "solve", "deep_research": False, "text": prompt})["turn_id"]
         report["turn_id"] = turn
+        if after_submit is not None:
+            after_submit(args, url, turn, operator, namespace)
         solved = wait_task(args.agentbox, url, turn, operator, args.timeout)
         report["runtime_ms"] = round((time.monotonic() - start) * 1000)
         (results / "solve-inspect.json").write_bytes(encode(solved))
@@ -302,7 +307,7 @@ def summarize_pods(path):
     return list(pods.values())
 
 
-def main():
+def main(worker_command=seed_command, after_submit=None):
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--fixture", type=Path, required=True)
     cli.add_argument("--agentbox", type=Path, required=True)
@@ -349,7 +354,7 @@ def main():
         "--k8s-image", args.worker_image, "--k8s-gateway-listen", args.relay_listen,
         "--workspace-tools", "--run-slots", "1", "--exec-slots", "1", "--exec-per-task", "1",
         "--default-memory-bytes", "268435456", "--memory-bytes", "1073741824",
-        "--worker-argv", "python3,-m,sim_worker", "--session-worker-argv", seed_command(source),
+        "--worker-argv", "python3,-m,sim_worker", "--session-worker-argv", worker_command(source),
         "--model-base-url", args.model_url, "--upstream-allow-private", urlsplit(args.model_url).netloc,
         "--model-name", args.model, "--user-orchestrator-model", args.model, "--user-worker-model", args.model,
     ]
@@ -363,7 +368,7 @@ def main():
             report = None
             try:
                 wait_http(url, gateway)
-                report = run_acceptance(args, source, state, url, namespace)
+                report = run_acceptance(args, source, state, url, namespace, after_submit)
                 remaining_cmd = kubectl + ["-n", namespace, "get", "pods,secret",
                                            "-l", "agentbox.io/managed=true", "-o", "name"]
                 for _ in range(12):
@@ -384,6 +389,7 @@ def main():
                 report["worker_image"] = args.worker_image
                 (args.evidence / "result.json").write_bytes(encode(report) + b"\n")
                 print(json.dumps(report, ensure_ascii=False))
+    return args.evidence
 
 
 if __name__ == "__main__":
