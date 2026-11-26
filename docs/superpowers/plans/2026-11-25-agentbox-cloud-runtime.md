@@ -48,6 +48,8 @@ GitHub main 的 7153fc531c8af570c4b96ffdda27fcc9ee7459ba 已包含 K8s Provider�
 
 ## 阶段 4　节点失联后的 Agent 状态恢复
 
+[阶段 4 详细计划与三个 subagent 的分工](2026-11-26-agentbox-phase4-recovery.md)
+
 - [ ] CVM B 加入 A 所在集群，控制面和 PG 留在 A。先证明正常任务确实调度到 B。沿用阶段 1 的 Pod 内 Gateway 代理。目标节点上的新 Pod 建立新 attempt 的入口，经私网访问控制面，预热 Pod 领取后同样绑定本次身份。单独验证迁到 A 后 socket 重绑、旧身份失效。
 - [ ] checkpoint 关联 Agent 消息、步骤、预算、稳定调用 ID 和工作区 manifest 摘要。候选 blob 先写 COS，校验大小与摘要，再用 PG 事务条件提交 checkpoint 指针。上传中断或事务未提交时恢复最后一个完整版本。
 - [ ] 在任务归属中实现租约、续租和 attempt 条件写。使用数据库时钟判断到期；过期执行者无法提交 checkpoint、变更共享工作区指针或发布最终结果。调用 journal 区分已完成、未发出、结果未知；外部副作用结果未知时按工具语义核对或停止，不盲目重放。
