@@ -1,0 +1,44 @@
+id: 1
+event: turn_created
+data: {"seq":1,"turn_id":"task_09f13acab7c786650e42b0b310d3bff6","type":"turn_created","ts":"2026-11-26T15:44:04.785317+08:00","data":{"deep_research":false,"text":"Use write_file to write A800-proof-1795679042 to probe.txt, then use read_file on probe.txt. Reply with the exact text returned by read_file.","turn_index":0}}
+
+id: 2
+event: turn_status
+data: {"seq":2,"turn_id":"task_09f13acab7c786650e42b0b310d3bff6","type":"turn_status","ts":"2026-11-26T15:44:04.795113+08:00","data":{"status":"queued"}}
+
+id: 3
+event: session_state
+data: {"seq":3,"type":"session_state","ts":"2026-11-26T15:44:06.042101+08:00","data":{"state":"idle"}}
+
+id: 6
+event: tool_call
+data: {"seq":6,"turn_id":"task_09f13acab7c786650e42b0b310d3bff6","type":"tool_call","ts":"2026-11-26T15:45:19.420497+08:00","data":{"input":{"content":"A800-proof-1795679042","path":"probe.txt"},"step_id":"orch","tool":"write_file","tool_call_id":"orch:1"}}
+
+id: 7
+event: tool_result
+data: {"seq":7,"turn_id":"task_09f13acab7c786650e42b0b310d3bff6","type":"tool_result","ts":"2026-11-26T15:45:19.434535+08:00","data":{"ok":true,"preview":{"kind":"text","text":"已新建 probe.txt（21 字节）。工作区：1 个文件，21 字节"},"step_id":"orch","tool":"write_file","tool_call_id":"orch:1"}}
+
+id: 10
+event: tool_call
+data: {"seq":10,"turn_id":"task_09f13acab7c786650e42b0b310d3bff6","type":"tool_call","ts":"2026-11-26T15:45:20.885462+08:00","data":{"input":{"path":"probe.txt"},"step_id":"orch","tool":"read_file","tool_call_id":"orch:2"}}
+
+id: 11
+event: tool_result
+data: {"seq":11,"turn_id":"task_09f13acab7c786650e42b0b310d3bff6","type":"tool_result","ts":"2026-11-26T15:45:20.887822+08:00","data":{"ok":true,"preview":{"kind":"text","text":"A800-proof-1795679042"},"step_id":"orch","tool":"read_file","tool_call_id":"orch:2"}}
+
+id: 14
+event: route
+data: {"seq":14,"turn_id":"task_09f13acab7c786650e42b0b310d3bff6","type":"route","ts":"2026-11-26T15:45:21.92957+08:00","data":{"forced":false,"route":"answer"}}
+
+id: 15
+event: assistant_delta
+data: {"seq":15,"turn_id":"task_09f13acab7c786650e42b0b310d3bff6","type":"assistant_delta","ts":"2026-11-26T15:45:21.92957+08:00","data":{"final":true,"message_id":"task_09f13acab7c786650e42b0b310d3bff6-reply","text":"A800-proof-1795679042"}}
+
+id: 16
+event: turn_result
+data: {"seq":16,"turn_id":"task_09f13acab7c786650e42b0b310d3bff6","type":"turn_result","ts":"2026-11-26T15:45:21.931611+08:00","data":{"outputs":[],"summary":"A800-proof-1795679042"}}
+
+id: 17
+event: turn_status
+data: {"seq":17,"turn_id":"task_09f13acab7c786650e42b0b310d3bff6","type":"turn_status","ts":"2026-11-26T15:45:21.971059+08:00","data":{"reason":"succeeded","status":"succeeded"}}
+

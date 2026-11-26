@@ -1,0 +1,10 @@
+model/model-00001-of-00005.safetensors 31d6a825ae35f11fb85b195b4c42c146c051e446433125a215336abdf95cbf5f
+model/model-00002-of-00005.safetensors 5991236cea6fe21f3d43cab0f0e84448734fbbe0789816202989f2ddc9d18282
+model/model-00003-of-00005.safetensors c5185c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836
+model/model-00004-of-00005.safetensors b5ee7de71fbf17db3d5704e0c8f2bc7d005ca9e1d7ca2aeb19827b0cfcaa917a
+model/model-00005-of-00005.safetensors 20c2d6366ab85c90786ccdd829cd2b9e7d30ef3b2ebbb998280e7e4014b542ff
+model/tokenizer.json aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4
+[2026-11-26 15:22:16] Engine startup timings (s): load_weight=2.98, kv_cache_allocation=0.38, scheduler_e2e=9.43, cuda_graph={prefill=0.00, decode=0.00, target_verify=0.00, draft_prefill=0.00, draft_decode=0.00, draft_extend=0.00}, tokenizer_e2e=20.12
+name, driver_version, memory.total [MiB], memory.used [MiB]
+NVIDIA A800-SXM4-80GB, 580.126.09, 81920 MiB, 71646 MiB
+2026-11-26T15:30:40+08:00

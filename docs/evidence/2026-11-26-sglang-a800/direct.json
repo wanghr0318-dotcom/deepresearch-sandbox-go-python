@@ -1,0 +1,175 @@
+[
+  {
+    "request": {
+      "model": "Qwen/Qwen3-8B",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call read_file with path probe.txt. Copy the returned string verbatim as your entire final answer. No introduction, quotes, Markdown, or code fences."
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 512,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "description": "Read a workspace file.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "response": {
+      "id": "b4f2bef83ff441ea8c8299221a1236e6",
+      "object": "chat.completion",
+      "created": 1795677927,
+      "model": "Qwen/Qwen3-8B",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": null,
+            "tool_calls": [
+              {
+                "id": "call_dac50265d0e74106aa0e8b86",
+                "index": 0,
+                "type": "function",
+                "function": {
+                  "name": "read_file",
+                  "arguments": "{\"path\": \"probe.txt\"}"
+                }
+              }
+            ]
+          },
+          "logprobs": null,
+          "finish_reason": "tool_calls",
+          "matched_stop": null
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 185,
+        "total_tokens": 206,
+        "completion_tokens": 21,
+        "prompt_tokens_details": null,
+        "reasoning_tokens": 0,
+        "completion_tokens_details": null
+      },
+      "metadata": {
+        "weight_version": "default",
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 21
+          }
+        ]
+      }
+    },
+    "elapsed_ms": 698
+  },
+  {
+    "request": {
+      "model": "Qwen/Qwen3-8B",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call read_file with path probe.txt. Copy the returned string verbatim as your entire final answer. No introduction, quotes, Markdown, or code fences."
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_dac50265d0e74106aa0e8b86",
+              "index": 0,
+              "type": "function",
+              "function": {
+                "name": "read_file",
+                "arguments": "{\"path\": \"probe.txt\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_dac50265d0e74106aa0e8b86",
+          "content": "agentbox-stage2-proof-47c3"
+        }
+      ],
+      "temperature": 0,
+      "max_tokens": 512,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "description": "Read a workspace file.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "response": {
+      "id": "af8c09a4183c40fa945f8b9cbe28b045",
+      "object": "chat.completion",
+      "created": 1795677928,
+      "model": "Qwen/Qwen3-8B",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "agentbox-stage2-proof-47c3",
+            "reasoning_content": null
+          },
+          "logprobs": null,
+          "finish_reason": "stop",
+          "matched_stop": 151645
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 229,
+        "total_tokens": 240,
+        "completion_tokens": 11,
+        "prompt_tokens_details": null,
+        "reasoning_tokens": 0,
+        "completion_tokens_details": null
+      },
+      "metadata": {
+        "weight_version": "default",
+        "weight_versions": [
+          {
+            "version": "default",
+            "start": 0,
+            "end": 11
+          }
+        ]
+      }
+    },
+    "elapsed_ms": 317
+  }
+]

@@ -32,6 +32,8 @@ GitHub main 的 7153fc531c8af570c4b96ffdda27fcc9ee7459ba 已包含 K8s Provider�
 
 ## 阶段 2　自部署 SGLang，完成第一条任务
 
+[部署配置与探针](../../../deploy/sglang/README.md)固定首轮镜像、权重和工具请求。2026-11-26 上海按量选购页的 A10 单卡 PNV4.7XLARGE116 与 A100 单卡 GT4.4XLARGE96 均售罄，随后使用北京 AutoDL 单卡 A800，完成 SGLang 直连、腾讯云 Gateway 转发和真实 Agent 多轮工具探针。CSV 自主修复与独立评分仍待验收。详见[下一阶段实施计划](2026-11-26-agentbox-csv-acceptance.md)。
+
 - [ ] CPU 侧工具和判题通过后，再开单张 24 GB 级 GPU。固定 Qwen3-8B 权重提交、SGLang 镜像、dtype、聊天模板和工具解析器。单请求逐档增加输入并预留输出空间，记录截断、OOM、可用上下文和显存，再在目标并发下复测。
 - [ ] 显式开启工作区工具。按 worker/chatagent/model.py 和 loop.py 的 tools/tool_calls 契约跑三探针：直连端点请求读文件；原请求经 Go Gateway；Python Agent 将工具结果带回模型完成第二轮。保存规范化前后的脱敏数据、参数校验和实际路由。验收禁用 Kimi 回退。
 - [ ] 两天仍未接通则做分层诊断。直连格式错先修模板/parser；网关前后字段不一致先修适配；显存不足或当前权重无兼容路径再切小模型，重新登记版本。格式正确但不会解题时先减少任务难度，保留失败记录。

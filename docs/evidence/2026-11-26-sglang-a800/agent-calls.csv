@@ -1,0 +1,4 @@
+call_id,endpoint,state,result_ref,latency_ms,outcome
+root/orch/chat/1,/v1/chat/completions,completed,f5ce81440b73e3b9287c685661211e5c2ae33962283885377f46e8b68d4c60f9,73341,ok
+root/orch/chat/2,/v1/chat/completions,completed,eb7dba6aef9fcee7370f678c08ddde9677b8f33ec9e5fd8e351bae1c901be29f,1427,ok
+root/orch/chat/3,/v1/chat/completions,completed,73dbe84d053a4900d863debea8e082f9750a83d9e72a224babd5e4384921c4a6,1019,ok
