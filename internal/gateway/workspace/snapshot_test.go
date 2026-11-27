@@ -3,10 +3,14 @@ package workspace
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/blob"
 )
@@ -98,6 +102,14 @@ func TestPortableWorkspaceSnapshot(t *testing.T) {
 	if err := dst.m.Restore(ctx, "t1", c2); err != nil {
 		t.Fatal(err)
 	}
+	if got := dst.blobs.m[digestBytes([]byte("hello"))]; string(got) != "hello" {
+		t.Fatalf("missing historic output: %q", got)
+	}
+	fresh := newH(t)
+	fresh.m.cfg.Archive = a
+	if err := fresh.m.Restore(ctx, "t1", c2); err != nil || string(fresh.blobs.m[digestBytes([]byte("hello"))]) != "hello" {
+		t.Fatalf("cold restore lost superseded output: %v", err)
+	}
 	if err := dst.m.ResetUncommitted(ctx, "t1"); err != nil {
 		t.Fatal(err)
 	}
@@ -116,4 +128,76 @@ func TestSnapshotDetectsCorruptLocalBlob(t *testing.T) {
 	if _, err := h.m.Snapshot(t.Context(), "t1"); err == nil || len(a.objects) != 0 {
 		t.Fatal("corrupt local object was uploaded")
 	}
+}
+
+type meteredArchive struct {
+	SnapshotArchive
+	uploaded int64
+	puts     int
+}
+
+func (a *meteredArchive) Put(ctx context.Context, sha string, r io.Reader, size int64) error {
+	err := a.SnapshotArchive.Put(ctx, sha, r, size)
+	if err == nil {
+		a.uploaded += size
+		a.puts++
+	}
+	return err
+}
+
+func verifyLargeWorkspaceTransfer(t *testing.T, backend SnapshotArchive) {
+	t.Helper()
+	const files = 64
+	const fileBytes = 512 << 10
+	a := &meteredArchive{SnapshotArchive: backend}
+	src, dst := newH(t), newH(t)
+	src.m.cfg.Archive, dst.m.cfg.Archive = a, a
+	src.m.cfg.MaxBytes, src.m.cfg.MaxFiles = DefaultMaxBytes, DefaultMaxFiles
+	// Unique per run so a retained cloud prefix cannot warm the initial transfer.
+	nonce := strconv.FormatInt(time.Now().UnixNano(), 10)
+	write := func(index int, revision string) {
+		label := fmt.Sprintf("%s-%d-%s", nonce, index, revision)
+		content := label + strings.Repeat("x", fileBytes-len(label))
+		request, _ := json.Marshal(map[string]string{"path": fmt.Sprintf("data/%d", index), "content": content})
+		res, _ := do(t, src.m.Write, req(string(request)))
+		if res.Status != 200 {
+			t.Fatalf("write %d: %d %s", index, res.Status, res.Code)
+		}
+	}
+	for i := 0; i < files; i++ {
+		write(i, "initial")
+	}
+	start := time.Now()
+	c1, err := src.m.Snapshot(t.Context(), "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullTime, fullBytes := time.Since(start), a.uploaded
+	if a.puts != files+1 {
+		t.Fatalf("full upload object count %d", a.puts)
+	}
+	write(0, "changed")
+	start = time.Now()
+	c2, err := src.m.Snapshot(t.Context(), "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deltaTime, deltaBytes := time.Since(start), a.uploaded-fullBytes
+	if c1 == c2 || a.puts != files+3 || deltaBytes < fileBytes || deltaBytes >= 2*fileBytes {
+		t.Fatalf("incremental sha=%s puts=%d bytes=%d", c2, a.puts, deltaBytes)
+	}
+	start = time.Now()
+	if err := dst.m.Restore(t.Context(), "t1", c2); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := readState(dst.m.path("t1"), "t1")
+	if err != nil || restored.Version != src.m.get("t1").st.Version || len(restored.Files) != files {
+		t.Fatalf("restored manifest mismatch: %v", err)
+	}
+	t.Logf("files=%d workspace_bytes=%d full_put_bytes=%d delta_put_bytes=%d full=%s delta=%s restore=%s",
+		files, files*fileBytes, fullBytes, deltaBytes, fullTime, deltaTime, time.Since(start))
+}
+
+func TestLargeWorkspaceIncrementalTransfer(t *testing.T) {
+	verifyLargeWorkspaceTransfer(t, &memoryArchive{objects: map[string][]byte{}})
 }

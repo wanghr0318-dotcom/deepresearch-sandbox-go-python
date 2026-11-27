@@ -17,6 +17,7 @@ func TestCOSPortableWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	verifyLargeWorkspaceTransfer(t, archive)
 	src, dst := newH(t), newH(t)
 	src.m.cfg.Archive, dst.m.cfg.Archive = archive, archive
 	do(t, src.m.Write, req(`{"path":"probe.txt","content":"round-trip via COS"}`))

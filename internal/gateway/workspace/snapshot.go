@@ -25,17 +25,38 @@ func digestBytes(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (s *state) snapshotObjects() map[string]int64 {
+// transferSnapshotObjects includes still-replayable exec outputs, even if a newer command
+// later deleted or changed those paths. The request SHA is only a fingerprint, not an object.
+func (m *Manager) transferSnapshotObjects(s *state, transfer func(string, int64) error) error {
 	objects := make(map[string]int64)
-	for _, op := range s.Applied {
-		// Length is not stored on the replay records; their digest covers the complete body.
-		objects[op.ResponseSHA256] = -1
-		objects[op.ResultSHA256] = -1
+	for _, receipt := range s.Applied {
+		if err := transfer(receipt.ResultSHA256, -1); err != nil {
+			return err
+		}
+		body, err := m.cfg.Blobs.Open(receipt.ResultSHA256)
+		if err != nil {
+			return err
+		}
+		var result execResult
+		err = json.NewDecoder(body).Decode(&result)
+		body.Close()
+		if err != nil {
+			return fmt.Errorf("workspace: decode applied result %s: %w", receipt.ResultSHA256, err)
+		}
+		objects[receipt.ResponseSHA256] = -1
+		for _, output := range result.Outputs {
+			objects[output.SHA256] = output.Size
+		}
 	}
 	for _, file := range s.Files {
 		objects[file.SHA256] = file.Size
 	}
-	return objects
+	for sha, size := range objects {
+		if err := transfer(sha, size); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // verifyRemote checks the stored bytes themselves; multipart ETags are not content hashes.
@@ -103,10 +124,11 @@ func (m *Manager) Snapshot(ctx context.Context, taskID string) (string, error) {
 	if snapshot.State != StateActive {
 		return "", fmt.Errorf("workspace: cannot snapshot state %q", snapshot.State)
 	}
-	for sha, size := range snapshot.snapshotObjects() {
-		if err := m.saveObject(ctx, sha, size, func() (io.ReadCloser, error) { return m.cfg.Blobs.Open(sha) }); err != nil {
-			return "", err
-		}
+	err = m.transferSnapshotObjects(snapshot, func(sha string, size int64) error {
+		return m.saveObject(ctx, sha, size, func() (io.ReadCloser, error) { return m.cfg.Blobs.Open(sha) })
+	})
+	if err != nil {
+		return "", err
 	}
 	// Reads update UsedAt solely for local expiry. Exclude it from the portable identity.
 	snapshot.UsedAt = time.Time{}
@@ -155,7 +177,7 @@ func (m *Manager) Restore(ctx context.Context, taskID, digest string) error {
 	if st.State != StateActive {
 		return fmt.Errorf("workspace: inactive snapshot state %q", st.State)
 	}
-	for sha, size := range st.snapshotObjects() {
+	err = m.transferSnapshotObjects(st, func(sha string, size int64) error {
 		body, err := m.cfg.Archive.Get(ctx, sha)
 		if err != nil {
 			return err
@@ -168,6 +190,10 @@ func (m *Manager) Restore(ctx context.Context, taskID, digest string) error {
 		if ref.SHA256 != sha || (size >= 0 && ref.Size != size) {
 			return fmt.Errorf("workspace: restored object mismatch for %s", sha)
 		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	return m.installRecovered(w, st)
 }
