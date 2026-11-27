@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/session"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -193,5 +195,55 @@ func TestLeaseBoundaryOnDatabaseClock(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// Hold a real renewal immediately before COMMIT: a competing owner cannot
+// lock the row, and losing the commit acknowledgement never creates a new owner.
+func TestRenewalInFlightAndLostReply(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s := newStore(t, Options{AttemptLeaseTTL: time.Minute})
+	fixture(t, s, "t1")
+	acquired, release := make(chan struct{}), make(chan struct{})
+	var once, lost atomic.Bool
+	s.hooks.beforeCommit = func(op string) error {
+		if op == "RenewAttemptLease" && once.CompareAndSwap(false, true) {
+			close(acquired)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+	s.hooks.afterCommit = func(op string) error {
+		if op == "RenewAttemptLease" && lost.CompareAndSwap(false, true) {
+			return errors.New("commit reply lost")
+		}
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.RenewAttemptLease(ctx, "t1", "att-t1") }()
+	select {
+	case <-acquired:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	var owner string
+	err := s.pool.QueryRow(ctx, "SELECT current_attempt_id FROM tasks WHERE task_id='t1' FOR UPDATE NOWAIT").Scan(&owner)
+	close(release)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("competing lock %v", err)
+	}
+	if err := <-done; err != nil || !lost.Load() {
+		t.Fatalf("renewal reply lost=%v: %v", lost.Load(), err)
+	}
+	var valid bool
+	err = s.pool.QueryRow(ctx, `SELECT current_attempt_id,lease_expires_at>clock_timestamp() FROM tasks WHERE task_id='t1'`).Scan(&owner, &valid)
+	if err != nil || owner != "att-t1" || !valid {
+		t.Fatalf("grant %s live=%v: %v", owner, valid, err)
 	}
 }
