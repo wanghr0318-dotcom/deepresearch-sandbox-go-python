@@ -25,7 +25,7 @@ func (s *Store) LoadTask(ctx context.Context, taskID string) (task.TaskState, er
 		err := q.QueryRow(ctx, `SELECT t.status, t.status_reason, COALESCE(t.current_attempt_id, ''), t.spec_json, t.limits_json,
 				t.config_version, c.desired, c.control_version, t.applied_control_version, t.attempts_total,
 				t.fault_retries_used, t.max_fault_retries, t.oom_retries_used, t.run_time_ms, t.not_before,
-				cp.checkpoint_id, cp.step_id, cp.state_inline, cp.state_ref, cp.refs_json,
+				cp.checkpoint_id, cp.step_id, cp.state_inline, cp.state_ref, cp.refs_json,COALESCE(cp.workspace_manifest_sha256,''),
 				t.session_id, t.base_session_checkpoint_id, t.restored_from_task_id, t.turn_index, t.resume_directive,
 				scp.checkpoint_id, scp.step_id, scp.state_inline, scp.state_ref, scp.refs_json
 			FROM tasks t JOIN task_control c USING (task_id) JOIN task_progress p USING (task_id)
@@ -36,7 +36,7 @@ func (s *Store) LoadTask(ctx context.Context, taskID string) (task.TaskState, er
 			WHERE t.task_id = $1`, taskID).Scan(&st.Status, &st.StatusReason, &st.CurrentAttemptID, &st.Spec, &st.Limits,
 			&st.ConfigVersion, &st.Desired, &st.ControlVersion, &st.AppliedControlVersion, &st.AttemptsTotal,
 			&st.FaultRetriesUsed, &st.MaxFaultRetries, &st.OOMRetriesUsed, &st.RunTimeMs, &st.NotBefore,
-			&cp.id, &cp.step, &cp.state, &cp.stateRef, &cp.refs,
+			&cp.id, &cp.step, &cp.state, &cp.stateRef, &cp.refs, &cp.manifest,
 			&sessionID, &base, &restored, &turnIndex, &st.Directive,
 			&scp.id, &scp.step, &scp.state, &scp.stateRef, &scp.refs)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -76,6 +76,7 @@ func selectSubrunStates(ctx context.Context, q queryer, taskID string) ([]task.S
 
 // checkpointCols 是 LEFT JOIN 读出的一行 checkpoint（不存在时 id 为 nil）。
 type checkpointCols struct {
+	manifest           string
 	id, step, stateRef *string
 	state, refs        []byte
 }
@@ -84,7 +85,7 @@ func (c checkpointCols) latest() (*task.LatestCheckpoint, error) {
 	if c.id == nil {
 		return nil, nil
 	}
-	l := &task.LatestCheckpoint{CheckpointID: *c.id, StepID: *c.step, State: c.state, StateRef: strOr(c.stateRef, "")}
+	l := &task.LatestCheckpoint{WorkspaceManifestSHA256: c.manifest, CheckpointID: *c.id, StepID: *c.step, State: c.state, StateRef: strOr(c.stateRef, "")}
 	if err := json.Unmarshal(c.refs, &l.Refs); err != nil {
 		return nil, err
 	}

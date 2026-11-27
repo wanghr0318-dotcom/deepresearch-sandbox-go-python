@@ -58,11 +58,12 @@ const (
 
 // PlatformKill 取值：平台主动终止执行的原因（空表示没有主动终止）。
 const (
-	KillCancel           = "cancel"            // cancel 的 grace 到期，或 cancel 无法送达
-	KillPause            = "pause"             // pause 的 grace 到期，或 pause 无法送达
-	KillTimeout          = "timeout"           // 累计运行时限超限（ctx 的 cause 为 ErrRunTimeExceeded 或 deadline）
-	KillExitGrace        = "exit_grace"        // 终态提议（或违规、stdout 关闭）后 exit_grace 内未退出
-	KillReadyTimeout     = "ready_timeout"     // T_ready 内没有 ready
+	KillCancel           = "cancel"        // cancel 的 grace 到期，或 cancel 无法送达
+	KillPause            = "pause"         // pause 的 grace 到期，或 pause 无法送达
+	KillTimeout          = "timeout"       // 累计运行时限超限（ctx 的 cause 为 ErrRunTimeExceeded 或 deadline）
+	KillExitGrace        = "exit_grace"    // 终态提议（或违规、stdout 关闭）后 exit_grace 内未退出
+	KillReadyTimeout     = "ready_timeout" // T_ready 内没有 ready
+	KillLeaseExpired     = "attempt_lease_expired"
 	KillStoreUnavailable = "store_unavailable" // Store 连续失败达阈值（§14.5）
 	KillShutdown         = "shutdown"          // 调用方取消 ctx（服务停止）：执行随本进程丢失
 	KillStdinBroken      = "stdin_broken"      // stdin 部分写出：控制流损坏（§5.5 第 8 条）
@@ -107,6 +108,8 @@ func Classify(in ClassifyInput) (class string, retry string) {
 		return ClassProtocolViolation, RetryNone
 	}
 	switch in.PlatformKill {
+	case KillLeaseExpired:
+		return ClassControlLost, RetryOf(ClassControlLost)
 	case KillTimeout:
 		return ClassDeadlineExceeded, RetryNone
 	case KillStoreUnavailable:

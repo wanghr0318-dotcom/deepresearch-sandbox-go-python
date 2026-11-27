@@ -40,6 +40,7 @@ const (
 	CodeNotPaused          = "not_paused"           // resume 要求任务处于 paused
 	CodeNotRunnable        = "not_runnable"         // 创建 attempt 要求 queued 且 desired = run
 	CodePreviousNotStopped = "previous_not_stopped" // 旧执行的环境尚未确认停止
+	CodeLeaseExpired       = "lease_expired"        // same owner, lease elapsed before result adjudication
 	CodeStaleAttempt       = "stale_attempt"        // 提交者不是任务的当前 attempt，或其访问已撤销
 	CodeControlChanged     = "control_changed"      // 判决依据的控制版本已不是最新
 	CodeRefNotAuthorized   = "ref_not_authorized"   // 引用的 blob 不存在或未授权到当前 scope

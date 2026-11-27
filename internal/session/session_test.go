@@ -713,14 +713,15 @@ func (m *fkStore) incarnation(id string) Incarnation {
 
 // fkEnv 记录环境操作；StopEnv 在 Store 中记录 stopped_at。
 type fkEnv struct {
-	mu         sync.Mutex
-	log        *fkLog
-	st         *fkStore
-	freezeErr  error
-	freezeGate chan struct{} // 非 nil 时 FreezeEnv 等它关闭
-	thawErr    error
-	createErr  []error
-	stops      []StopReport
+	mu           sync.Mutex
+	log          *fkLog
+	st           *fkStore
+	freezeErr    error
+	freezeGate   chan struct{} // 非 nil 时 FreezeEnv 等它关闭
+	thawErr      error
+	createErr    []error
+	stops        []StopReport
+	fenceAllowed bool
 }
 
 func (f *fkEnv) CreateIncarnationEnv(_ context.Context, s IncarnationEnv) error {
@@ -772,6 +773,13 @@ func (f *fkEnv) StopEnv(_ context.Context, envID string) (StopReport, error) {
 	f.st.mu.Unlock()
 	f.log.add("stop:%s recorded=true", envID)
 	return StopReport{Stopped: true, Recorded: true}, nil
+}
+
+func (f *fkEnv) FenceExpiredSession(_ context.Context, envID, attemptID string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.log.add("fence:%s:%s", envID, attemptID)
+	return f.fenceAllowed, nil
 }
 
 func (f *fkEnv) StageRestore(_ context.Context, sessionID, envID, sha string) (string, error) {
@@ -1448,4 +1456,25 @@ func TestSchedulerStartDestroysOrphans(t *testing.T) {
 		t.Errorf("end_reason = %q", inc.EndReason)
 	}
 	h.before("stop:old-env", "end_incarnation:old")
+}
+
+func TestFencedHandoffDoesNotReportPhysicalStop(t *testing.T) {
+	h := newHarness(t)
+	h.st.addSession("s1", "t1")
+	g := h.grant("s1", "t1")
+	h.st.startTurn(t, "s1", "t1", g)
+	h.st.verdict("s1", "t1", "queued")
+	h.env.mu.Lock()
+	h.env.stops = []StopReport{{Blocked: true}}
+	h.env.fenceAllowed = true
+	h.env.mu.Unlock()
+	r := h.handoff("s1", Handoff{TaskID: "t1", AttemptID: "a1", EnvID: g.EnvID, Destroy: true})
+	if !r.Fenced || r.Stopped || r.Recorded {
+		t.Fatalf("handoff %+v", r)
+	}
+	h.before("stop:"+g.EnvID, "fence:"+g.EnvID)
+	h.before("fence:"+g.EnvID, "end_incarnation:"+g.IncarnationID+":lease_fenced")
+	if got := h.grant("s1", "t1"); got.EnvID == g.EnvID {
+		t.Fatal("retired environment reused")
+	}
 }

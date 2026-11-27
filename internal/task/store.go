@@ -163,8 +163,9 @@ type TaskState struct {
 
 // LatestCheckpoint 是最新已提交 checkpoint 的完整内容（init.resume 所需）。
 type LatestCheckpoint struct {
-	CheckpointID, StepID string
-	State                json.RawMessage
-	StateRef             string
-	Refs                 []string
+	WorkspaceManifestSHA256 string
+	CheckpointID, StepID    string
+	State                   json.RawMessage
+	StateRef                string
+	Refs                    []string
 }

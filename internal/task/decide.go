@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
 )
 
 // 规格 §19 的默认参数。
@@ -606,6 +608,10 @@ func (d *decider) storeFailed(e StoreFailed) error {
 		a := d.current(e.AttemptID)
 		if a == nil || a.Status != "finishing" || a.Verdict == nil || a.Verdict.ControlVersion != e.ControlVersion {
 			return nil // 已被更新的判决取代
+		}
+		var rejected *persistence.RejectedError
+		if errors.As(e.Err, &rejected) && rejected.Code == persistence.CodeLeaseExpired {
+			a.Outcome = &Outcome{Class: "control_lost", Retry: RetryFault}
 		}
 		a.Verdict = nil // 下一次 Tick 按最新控制重算
 		d.emit(WakeAt{Time: d.s.Now.Add(RetryBackoff(0, d.s.Jitter))})

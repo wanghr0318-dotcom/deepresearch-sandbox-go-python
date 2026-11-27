@@ -34,6 +34,14 @@ func (s *Store) AppendWorkerEvents(ctx context.Context, attemptID string, events
 		if err != nil {
 			return err
 		}
+		if s.opt.AttemptLeaseTTL > 0 {
+			if err := lockTaskShared(ctx, tx, taskID); err != nil {
+				return err
+			}
+			if err := fenceAttempt(ctx, tx, taskID, attemptID); err != nil {
+				return err
+			}
+		}
 		if err := lockEventSeq(ctx, tx, taskID); err != nil {
 			return err
 		}
@@ -68,6 +76,14 @@ func (s *Store) AppendSessionWorkerEvents(ctx context.Context, attemptID string,
 		}
 		if err != nil {
 			return err
+		}
+		if s.opt.AttemptLeaseTTL > 0 {
+			if err := lockTaskShared(ctx, tx, taskID); err != nil {
+				return err
+			}
+			if err := fenceAttempt(ctx, tx, taskID, attemptID); err != nil {
+				return err
+			}
 		}
 		if err := lockEventSeq(ctx, tx, taskID); err != nil {
 			return err
@@ -115,6 +131,9 @@ func (s *Store) WorkerEventWatermark(ctx context.Context, attemptID string) (run
 // 带 subruns[] 时其 JSON 作为第 6 段参与哈希；没有时公式与 M4 之前相同（已有 checkpoint 的重放仍是同一内容）。
 func checkpointHash(c runner.Checkpoint) []byte {
 	parts := [][]byte{[]byte(c.AttemptID), []byte(c.StepID), c.State, []byte(c.StateRef), []byte(strings.Join(c.Refs, "\n"))}
+	if c.WorkspaceManifestSHA256 != "" {
+		parts = append(parts, []byte("workspace:"+c.WorkspaceManifestSHA256))
+	}
 	if len(c.Subruns) > 0 {
 		parts = append(parts, subrunsJSON(c.Subruns))
 	}
@@ -147,7 +166,7 @@ func (s *Store) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runn
 		return runner.CommittedCheckpoint{}, invalidf("checkpoint 缺少字段，或 state 与 state_ref 未恰好提供一个")
 	}
 	hash := checkpointHash(c)
-	out := runner.CommittedCheckpoint{Scope: c.Scope, CheckpointID: c.CheckpointID, ContentHash: hash}
+	out := runner.CommittedCheckpoint{Scope: c.Scope, CheckpointID: c.CheckpointID, ContentHash: hash, WorkspaceManifestSHA256: c.WorkspaceManifestSHA256}
 	err := s.run(ctx, "CommitCheckpoint", c.CheckpointID, func(ctx context.Context, tx pgx.Tx) error {
 		if err := lockTask(ctx, tx, c.Scope.ID); err != nil {
 			return err
@@ -159,6 +178,11 @@ func (s *Store) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runn
 		existing, err := selectCheckpoint(ctx, tx, c.Scope, c.CheckpointID)
 		switch {
 		case err == nil && bytes.Equal(existing.ContentHash, hash):
+			if s.opt.AttemptLeaseTTL > 0 {
+				if err := fenceAttempt(ctx, tx, c.Scope.ID, c.AttemptID); err != nil {
+					return err
+				}
+			}
 			out = existing
 			return nil
 		case err == nil:
@@ -174,10 +198,10 @@ func (s *Store) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runn
 		}
 		refs, _ := json.Marshal(nonNil(c.Refs))
 		if _, err := tx.Exec(ctx, `INSERT INTO checkpoints (scope_kind, scope_id, checkpoint_id, commit_seq, attempt_id, step_id,
-				content_hash, state_inline, state_ref, refs_json, subruns_json)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10, $11)`,
+				content_hash, state_inline, state_ref, refs_json, subruns_json,workspace_manifest_sha256)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10, $11,NULLIF($12,''))`,
 			c.Scope.Kind, c.Scope.ID, c.CheckpointID, latest+1, c.AttemptID, c.StepID, hash, nullJSON(c.State), c.StateRef, refs,
-			subrunsJSON(c.Subruns)); err != nil {
+			subrunsJSON(c.Subruns), c.WorkspaceManifestSHA256); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, "UPDATE task_progress SET latest_checkpoint_id = $2, latest_commit_seq = $3 WHERE task_id = $1",
@@ -208,19 +232,19 @@ func (s *Store) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runn
 func fenceAttempt(ctx context.Context, tx pgx.Tx, taskID, attemptID string) error {
 	var current *string
 	var access string
-	var decided bool
-	err := tx.QueryRow(ctx, `SELECT t.current_attempt_id, COALESCE(aa.state, ''), COALESCE(a.verdict_hash IS NOT NULL, false)
+	var decided, alive bool
+	err := tx.QueryRow(ctx, `SELECT t.current_attempt_id, COALESCE(aa.state, ''), COALESCE(a.verdict_hash IS NOT NULL, false), (t.lease_expires_at IS NULL OR t.lease_expires_at > clock_timestamp())
 		FROM tasks t
 		LEFT JOIN attempt_access aa ON aa.task_id = t.task_id AND aa.attempt_id = $2
 		LEFT JOIN attempts a ON a.task_id = t.task_id AND a.attempt_id = $2
-		WHERE t.task_id = $1`, taskID, attemptID).Scan(&current, &access, &decided)
+		WHERE t.task_id = $1`, taskID, attemptID).Scan(&current, &access, &decided, &alive)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return notFoundf("任务 %s", taskID)
 	}
 	if err != nil {
 		return err
 	}
-	if current == nil || *current != attemptID || access != "active" || decided {
+	if current == nil || *current != attemptID || access != "active" || decided || !alive {
 		return rejectf(persistence.CodeStaleAttempt, "attempt %s 不是任务 %s 的当前 attempt、访问已撤销或已有判决", attemptID, taskID)
 	}
 	return nil
@@ -276,8 +300,8 @@ func (s *Store) QueryCheckpoint(ctx context.Context, scope runner.Scope, checkpo
 
 func selectCheckpoint(ctx context.Context, q queryer, scope runner.Scope, checkpointID string) (runner.CommittedCheckpoint, error) {
 	c := runner.CommittedCheckpoint{Scope: scope, CheckpointID: checkpointID}
-	err := q.QueryRow(ctx, "SELECT commit_seq, content_hash FROM checkpoints WHERE scope_kind = $1 AND scope_id = $2 AND checkpoint_id = $3",
-		scope.Kind, scope.ID, checkpointID).Scan(&c.CommitSeq, &c.ContentHash)
+	err := q.QueryRow(ctx, "SELECT commit_seq, content_hash,COALESCE(workspace_manifest_sha256,'') FROM checkpoints WHERE scope_kind = $1 AND scope_id = $2 AND checkpoint_id = $3",
+		scope.Kind, scope.ID, checkpointID).Scan(&c.CommitSeq, &c.ContentHash, &c.WorkspaceManifestSHA256)
 	return c, err
 }
 
@@ -302,6 +326,9 @@ func (s *Store) RegisterArtifact(ctx context.Context, a runner.Artifact) (runner
 		err := tx.QueryRow(ctx, "SELECT version FROM artifacts WHERE task_id = $1 AND artifact_id = $2 AND sha256 = $3",
 			a.TaskID, a.ArtifactID, a.SHA256).Scan(&out.Version)
 		if err == nil {
+			if s.opt.AttemptLeaseTTL > 0 {
+				return fenceAttempt(ctx, tx, a.TaskID, a.AttemptID)
+			}
 			return nil
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
@@ -406,19 +433,35 @@ func (s *Store) RecordTerminalProposal(ctx context.Context, p runner.TerminalPro
 	hash := proposalHash(p)
 	var out runner.TerminalProposal
 	err := s.run(ctx, "RecordTerminalProposal", p.AttemptID, func(ctx context.Context, tx pgx.Tx) error {
+		var taskID string
+		if err := tx.QueryRow(ctx, "SELECT task_id FROM attempts WHERE attempt_id = $1", p.AttemptID).Scan(&taskID); errors.Is(err, pgx.ErrNoRows) {
+			return notFoundf("attempt %s", p.AttemptID)
+		} else if err != nil {
+			return err
+		}
+		if err := lockTaskShared(ctx, tx, taskID); err != nil {
+			return err
+		}
 		existing, existingHash, err := selectProposal(ctx, tx, p.AttemptID, true)
 		if err != nil {
 			return err
 		}
 		switch {
 		case existingHash != nil && bytes.Equal(existingHash, hash):
+			if s.opt.AttemptLeaseTTL > 0 {
+				if err := fenceAttempt(ctx, tx, taskID, p.AttemptID); err != nil {
+					return err
+				}
+			}
 			out = existing
 			return nil
 		case existingHash != nil:
 			return conflictf("attempt %s 已有不同的终态提议 %s", p.AttemptID, existing.Kind)
 		}
 		var decided bool
-		if err := tx.QueryRow(ctx, "SELECT verdict_hash IS NOT NULL FROM attempts WHERE attempt_id = $1", p.AttemptID).Scan(&decided); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT a.verdict_hash IS NOT NULL OR t.current_attempt_id IS DISTINCT FROM a.attempt_id
+			OR (t.lease_expires_at IS NOT NULL AND t.lease_expires_at<=clock_timestamp())
+			FROM attempts a JOIN tasks t ON t.task_id=a.task_id WHERE a.attempt_id=$1`, p.AttemptID).Scan(&decided); err != nil {
 			return err
 		}
 		if decided { // 判决已提交（例如无提议即退出）后，迟到的提议不再记录

@@ -327,13 +327,13 @@ func (s *Store) GetEnvironment(ctx context.Context, envID string) (resource.Envi
 }
 
 func selectEnvironment(ctx context.Context, q queryer, envID string, forUpdate bool) (resource.Environment, error) {
-	sql := `SELECT env_id, kind, COALESCE(attempt_id, ''), status, stopped_at, cleanup_state, cleanup_tries, cleanup_error, next_retry_at
+	sql := `SELECT env_id, kind, COALESCE(attempt_id, ''), status, stopped_at, fenced_at, cleanup_state, cleanup_tries, cleanup_error, next_retry_at
 		FROM environments WHERE env_id = $1`
 	if forUpdate {
 		sql += " FOR UPDATE"
 	}
 	var e resource.Environment
-	err := q.QueryRow(ctx, sql, envID).Scan(&e.EnvID, &e.Kind, &e.AttemptID, &e.Status, &e.StoppedAt,
+	err := q.QueryRow(ctx, sql, envID).Scan(&e.EnvID, &e.Kind, &e.AttemptID, &e.Status, &e.StoppedAt, &e.FencedAt,
 		&e.CleanupState, &e.CleanupTries, &e.CleanupError, &e.NextRetryAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return e, notFoundf("环境 %s", envID)
@@ -357,7 +357,7 @@ func (s *Store) EnvironmentStats(ctx context.Context) (running map[string]int64,
 	err = s.read(ctx, "EnvironmentStats", func(ctx context.Context, q queryer) error {
 		rows, err := q.Query(ctx, `SELECT kind,
 			count(*) FILTER (WHERE stopped_at IS NULL),
-			count(*) FILTER (WHERE stopped_at IS NOT NULL AND cleanup_state <> 'done')
+			count(*) FILTER (WHERE (stopped_at IS NOT NULL OR fenced_at IS NOT NULL) AND cleanup_state <> 'done')
 			FROM environments GROUP BY kind`)
 		if err != nil {
 			return err

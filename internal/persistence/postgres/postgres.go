@@ -36,6 +36,7 @@ const (
 
 // Options 配置 Store。零值字段取默认值。
 type Options struct {
+	AttemptLeaseTTL  time.Duration // zero disables expiring leases for new attempts
 	DSN              string
 	OpDeadline       time.Duration // 每个操作的整体 deadline，覆盖连接池获取、事务与全部重跑
 	LockTimeout      time.Duration // SET LOCAL lock_timeout
@@ -63,6 +64,9 @@ type hooks struct {
 
 // Open 连接数据库并返回 Store。
 func Open(ctx context.Context, opt Options) (*Store, error) {
+	if opt.AttemptLeaseTTL != 0 && opt.AttemptLeaseTTL < time.Microsecond {
+		return nil, errors.New("attempt lease TTL must be zero or at least one microsecond")
+	}
 	if opt.OpDeadline == 0 {
 		opt.OpDeadline = DefaultOpDeadline
 	}

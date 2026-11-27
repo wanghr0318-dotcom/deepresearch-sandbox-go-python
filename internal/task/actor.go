@@ -100,8 +100,8 @@ type EnvSpec struct {
 // 环境已停止并归还容量**；Stopped 而未 Recorded 表示停止已确认、stopped_at 尚未持久化，Blocked 表示
 // 无法确认停止（stop_blocked）。
 type StopReport struct {
-	Stopped, Recorded, Blocked bool
-	At                         time.Time
+	Stopped, Recorded, Blocked, Fenced bool
+	At                                 time.Time
 }
 
 // EnvController 是 actor 使用的 resource coordinator 子集。CreateEnv 失败时返回 error 与适配器经
@@ -705,7 +705,7 @@ func (a *Actor) stopEnv(f StopEnvironment) {
 		ctx, span := obs.Start(obs.Carry(ctx, sctx), name, obs.Str("env.id", f.EnvID))
 		defer func() {
 			if r, ok := res.(stopDone); ok {
-				span.SetAttrs(obs.Bool("stopped", r.report.Stopped), obs.Bool("recorded", r.report.Recorded))
+				span.SetAttrs(obs.Bool("stopped", r.report.Stopped), obs.Bool("recorded", r.report.Recorded), obs.Bool("fenced", r.report.Fenced))
 				if r.err != nil {
 					span.Fail("stop_unconfirmed")
 				}
@@ -898,7 +898,7 @@ func (a *Actor) handleStop(r stopDone) {
 			a.stopAt[r.envID] = r.report.At
 		}
 	}
-	if r.err == nil && r.report.Recorded {
+	if r.err == nil && (r.report.Recorded || (r.report.Fenced && r.attemptID != a.accountAttempt)) {
 		if r.attemptID != "" && r.attemptID == a.accountAttempt {
 			// 恢复交来的 attempt：未记账区间在判决之前计入（Store 队列保证排在 Finalize 之前）。
 			a.accountAttempt = ""

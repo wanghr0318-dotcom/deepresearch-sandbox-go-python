@@ -68,6 +68,18 @@ func (c *Coordinator) cleanupPass(ctx context.Context) error {
 // cleanupEnv 在 envID 的串行执行者内清理一个环境。Destroy 失败已记入 cleanup 列（退避重试），不作为错误返回。
 // 被 HoldEnv 持有的环境本轮跳过（仍是候选，释放之后的轮次处理）。
 func (c *Coordinator) cleanupEnv(ctx context.Context, e Environment) error {
+	if e.StoppedAt == nil && e.FencedAt != nil {
+		stop, err := c.StopEnv(ctx, e.EnvID)
+		if err != nil || !stop.Recorded {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			next := c.opt.Now().Add(c.opt.Backoff(int(e.CleanupTries)))
+			_, persistErr := c.store.UpdateCleanup(ctx, CleanupUpdate{EnvID: e.EnvID, ExpectedTries: e.CleanupTries, State: CleanupPending, Error: "awaiting physical stop", NextRetryAt: &next})
+			return errors.Join(err, persistErr)
+		}
+		e.StoppedAt = &stop.At
+	}
 	_, err := c.cleanupOne(ctx, e, true)
 	return err
 }

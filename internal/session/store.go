@@ -63,6 +63,7 @@ type Incarnation struct {
 
 // State 是 LoadSession 一次读取的会话事实（Decide 的输入）。
 type State struct {
+	PendingFencedStop                        bool // retired sandbox still occupies its Pod and UID
 	SessionID, Status                        string
 	OwnerUserID                              int64
 	UIDRangeID                               string

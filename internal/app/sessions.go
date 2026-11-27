@@ -206,6 +206,16 @@ func (x sessionEnv) FreezeEnv(ctx context.Context, envID string) error {
 }
 func (x sessionEnv) ThawEnv(ctx context.Context, envID string) error { return x.c.ThawEnv(ctx, envID) }
 
+func (x sessionEnv) FenceExpiredSession(ctx context.Context, envID, attemptID string) (bool, error) {
+	fence, ok := x.c.(interface {
+		FenceExpiredSession(context.Context, string, string) (bool, error)
+	})
+	if !ok {
+		return false, nil
+	}
+	return fence.FenceExpiredSession(ctx, envID, attemptID)
+}
+
 // StopEnv 原样转换 coordinator 的事实。从未创建的环境（CreateIncarnation 已登记）同样以 provider.Stop 的空操作
 // 停止并记录 stopped_at（Recorded）。
 func (x sessionEnv) StopEnv(ctx context.Context, envID string) (session.StopReport, error) {
@@ -511,7 +521,7 @@ func (x sessionGate) Handoff(ctx context.Context, sessionID string, h task.Sessi
 	}
 	r, err := sch.Handoff(ctx, sessionID, session.Handoff{TaskID: h.TaskID, AttemptID: h.AttemptID, EnvID: h.EnvID,
 		Verdict: h.Verdict, CommittedSessionCheckpointID: h.CommittedSessionCheckpointID, Destroy: h.Destroy})
-	return task.StopReport{Stopped: r.Stopped, Recorded: r.Recorded, Blocked: r.Blocked}, err
+	return task.StopReport{Stopped: r.Stopped, Recorded: r.Recorded, Blocked: r.Blocked, Fenced: r.Fenced}, err
 }
 
 // runTurn 在授予的 incarnation 中执行会话 turn 的 attempt：Attach 入口 → RunTask（task_start 带续跑指令、恢复

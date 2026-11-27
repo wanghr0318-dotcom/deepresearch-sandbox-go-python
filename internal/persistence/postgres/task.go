@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -60,7 +61,7 @@ func (s *Store) CreateAttempt(ctx context.Context, a task.NewAttempt) (task.Atte
 		if err != nil {
 			return err
 		}
-		if err := startTaskAttempt(ctx, tx, a, l.turn); err != nil {
+		if err := startTaskAttempt(ctx, tx, a, l.turn, s.opt.AttemptLeaseTTL); err != nil {
 			return err
 		}
 		out = task.Attempt{AttemptID: a.AttemptID, TaskID: a.TaskID, AttemptNo: a.AttemptNo, EnvID: a.EnvID, Status: "starting"}
@@ -178,12 +179,13 @@ func insertAttemptRows(ctx context.Context, tx pgx.Tx, a task.NewAttempt, turn *
 }
 
 // startTaskAttempt 把任务推进到 running（重试计数随之递增）、启动会话 turn，并追加 attempt_created。
-func startTaskAttempt(ctx context.Context, tx pgx.Tx, a task.NewAttempt, turn *sessionTurn) error {
+func startTaskAttempt(ctx context.Context, tx pgx.Tx, a task.NewAttempt, turn *sessionTurn, ttl time.Duration) error {
 	// 重试计数只在新建 attempt 的同一事务中递增；重放走上面的身份分支，不重复递增（规格 §14.2）。
-	tag, err := tx.Exec(ctx, `UPDATE tasks SET current_attempt_id = $2, attempts_total = attempts_total + 1, status = 'running',
+	tag, err := tx.Exec(ctx, `UPDATE tasks SET current_attempt_id = $2,
+ lease_expires_at = clock_timestamp() + NULLIF($4::bigint, 0) * interval '1 microsecond', attempts_total = attempts_total + 1, status = 'running',
 			fault_retries_used = fault_retries_used + CASE WHEN $3 = 'fault' THEN 1 ELSE 0 END,
 			oom_retries_used = oom_retries_used + CASE WHEN $3 = 'oom' THEN 1 ELSE 0 END,
-			row_version = row_version + 1 WHERE task_id = $1 AND status = 'queued'`, a.TaskID, a.AttemptID, string(a.Retry))
+			row_version = row_version + 1 WHERE task_id = $1 AND status = 'queued'`, a.TaskID, a.AttemptID, string(a.Retry), ttl.Microseconds())
 	if err != nil {
 		return err
 	}
@@ -219,7 +221,7 @@ func admitAttempt(ctx context.Context, tx pgx.Tx, taskID, status, desired, sessi
 	var running int
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM attempts a JOIN environments e
 			ON e.attempt_id = a.attempt_id OR (e.kind = 'session' AND e.env_id = a.env_id)
-		WHERE a.task_id = $1 AND e.stopped_at IS NULL AND e.env_id <> $2`, taskID, sessionEnv).Scan(&running); err != nil {
+		WHERE a.task_id = $1 AND e.stopped_at IS NULL AND e.fenced_at IS NULL AND e.env_id <> $2`, taskID, sessionEnv).Scan(&running); err != nil {
 		return err
 	}
 	if running > 0 {
@@ -442,6 +444,7 @@ func validateVerdict(v task.Verdict) error {
 
 // verdictLocks 是 FinalizeAttempt 按锁顺序取得的行与读到的状态。
 type verdictLocks struct {
+	leaseExpired   bool
 	turn           *turnVerdict // 会话 turn；普通任务为 nil
 	current, base  *string      // tasks.current_attempt_id、base_session_checkpoint_id
 	status         string
@@ -471,8 +474,8 @@ func lockForVerdict(ctx context.Context, tx pgx.Tx, v task.Verdict) (verdictLock
 	case l.turn != nil && v.TaskStatus == "succeeded" && v.SessionState == nil:
 		return l, invalidf("会话 turn %s 的成功裁决须提交 session_state", v.TaskID)
 	}
-	err = tx.QueryRow(ctx, "SELECT current_attempt_id, status, base_session_checkpoint_id FROM tasks WHERE task_id = $1 FOR UPDATE",
-		v.TaskID).Scan(&l.current, &l.status, &l.base)
+	err = tx.QueryRow(ctx, "SELECT current_attempt_id, status, base_session_checkpoint_id, COALESCE(lease_expires_at <= clock_timestamp(),false) FROM tasks WHERE task_id = $1 FOR UPDATE",
+		v.TaskID).Scan(&l.current, &l.status, &l.base, &l.leaseExpired)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return l, notFoundf("任务 %s", v.TaskID)
 	}
@@ -510,6 +513,8 @@ func checkVerdict(a task.Attempt, v task.Verdict, hash []byte, l verdictLocks) (
 		return false, conflictf("attempt %s 已有不同的判决", v.AttemptID)
 	case l.current == nil || *l.current != v.AttemptID:
 		return false, rejectf(persistence.CodeStaleAttempt, "attempt %s 不是任务 %s 的当前 attempt", v.AttemptID, v.TaskID)
+	case l.leaseExpired && (v.TaskStatus == "succeeded" || v.TaskStatusReason == task.ReasonAwaitingInput || len(v.Result) > 0 || v.SessionState != nil):
+		return false, rejectf(persistence.CodeLeaseExpired, "attempt %s lease expired before its result was committed", v.AttemptID)
 	case l.status != "running" && l.status != "pausing" && l.status != "cancelling":
 		return false, rejectf(persistence.CodeStaleAttempt, "任务 %s 处于 %s，不接受判决", v.TaskID, l.status)
 	case l.controlVersion != v.ControlVersion:

@@ -46,7 +46,8 @@ func loadSessionState(ctx context.Context, q queryer, sessionID string) (session
 			s.idle_since, s.frozen_since, s.last_active_at, s.row_version,
 			c.desired, c.control_version, c.wake_requested_version, c.applied_wake_version,
 			cp.checkpoint_id, cp.commit_seq, cp.state_inline, cp.state_ref, cp.refs_json,
-			i.incarnation_id, i.env_id, i.status, i.started_at, i.ended_at, i.end_reason
+			i.incarnation_id, i.env_id, i.status, i.started_at, i.ended_at, i.end_reason,
+            EXISTS (SELECT 1 FROM environments e WHERE e.session_id=s.session_id AND e.fenced_at IS NOT NULL AND e.stopped_at IS NULL)
 		FROM sessions s JOIN session_control c USING (session_id) JOIN session_progress p USING (session_id)
 		LEFT JOIN checkpoints cp ON cp.scope_kind = 'session' AND cp.scope_id = s.session_id AND cp.checkpoint_id = p.latest_checkpoint_id
 		LEFT JOIN incarnations i ON i.incarnation_id = s.current_incarnation_id
@@ -55,7 +56,7 @@ func loadSessionState(ctx context.Context, q queryer, sessionID string) (session
 		&st.IdleSince, &st.FrozenSince, &st.LastActiveAt, &st.RowVersion,
 		&st.Desired, &st.ControlVersion, &st.WakeRequestedVersion, &st.AppliedWakeVersion,
 		&cpID, &cpSeq, &state, &stateRef, &refs,
-		&incID, &incEnv, &incStatus, &incStarted, &incEnded, &incReason)
+		&incID, &incEnv, &incStatus, &incStarted, &incEnded, &incReason, &st.PendingFencedStop)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return st, notFoundf("会话 %s", sessionID)
 	}

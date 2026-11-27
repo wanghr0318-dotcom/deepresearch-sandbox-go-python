@@ -108,6 +108,7 @@ type Environment struct {
 	AttemptID    string
 	Status       string
 	StoppedAt    *time.Time
+	FencedAt     *time.Time
 	CleanupState string
 	CleanupTries int64
 	CleanupError string

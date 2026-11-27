@@ -2449,3 +2449,15 @@ func TestActorSessionUnavailableFailsTurn(t *testing.T) {
 }
 
 // ==== M4 Plan 12 Task 7 段结束 ====
+
+func TestExpiredResultAdjudicatesControlLoss(t *testing.T) {
+	s := base()
+	s.TaskStatus, s.Attempt, s.SlotHeld = "running", att("a1", "active"), true
+	s, _ = run(t, s, AttemptFinished{AttemptID: "a1", EnvID: "env-a1", Outcome: success()},
+		StoreFailed{Op: OpFinalize, AttemptID: "a1", ControlVersion: 1, Err: &persistence.RejectedError{Code: persistence.CodeLeaseExpired}})
+	_, fx := run(t, s, Tick{})
+	v := finalizeOf(t, fx)
+	if v.TaskStatus != "queued" || v.OutcomeClass != "control_lost" || len(v.Result) > 0 {
+		t.Fatalf("expired result re-proposed: %+v", v)
+	}
+}

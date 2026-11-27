@@ -62,13 +62,14 @@ type Scope struct {
 
 // Checkpoint 是待提交的 checkpoint；State 与 StateRef 必须且只能提供一个。
 type Checkpoint struct {
-	Scope        Scope
-	CheckpointID string
-	AttemptID    string
-	StepID       string
-	State        json.RawMessage
-	StateRef     string
-	Refs         []string
+	WorkspaceManifestSHA256 string
+	Scope                   Scope
+	CheckpointID            string
+	AttemptID               string
+	StepID                  string
+	State                   json.RawMessage
+	StateRef                string
+	Refs                    []string
 	// Subruns 是 checkpoint 的 subruns[]（sub-run 扩展，规格 §5.5 规则 2、6）：与 checkpoint 在同一事务中按状态机转换，
 	// 不允许的转换以 invalid_transition 拒绝整个 checkpoint（指针不变，E41）；参与内容哈希。
 	Subruns []protocol.CheckpointSubrun
@@ -76,10 +77,11 @@ type Checkpoint struct {
 
 // CommittedCheckpoint 是已提交的 checkpoint。
 type CommittedCheckpoint struct {
-	Scope        Scope
-	CheckpointID string
-	CommitSeq    int64
-	ContentHash  []byte
+	WorkspaceManifestSHA256 string
+	Scope                   Scope
+	CheckpointID            string
+	CommitSeq               int64
+	ContentHash             []byte
 }
 
 // Artifact 是待登记的产物；对应的 blob 必须已写入 BlobStore。

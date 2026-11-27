@@ -19,10 +19,10 @@ func (s *Store) ListCleanupCandidates(ctx context.Context, now time.Time, limit 
 	}
 	var out []resource.Environment
 	err := s.read(ctx, "ListCleanupCandidates", func(ctx context.Context, q queryer) error {
-		rows, err := q.Query(ctx, `SELECT e.env_id, e.kind, COALESCE(e.attempt_id, ''), e.status, e.stopped_at, e.cleanup_state,
+		rows, err := q.Query(ctx, `SELECT e.env_id, e.kind, COALESCE(e.attempt_id, ''), e.status, e.stopped_at, e.fenced_at, e.cleanup_state,
 				e.cleanup_tries, e.cleanup_error, e.next_retry_at
 			FROM environments e LEFT JOIN attempts a ON a.attempt_id = e.attempt_id
-			WHERE e.stopped_at IS NOT NULL AND e.cleanup_state <> 'done'
+			WHERE (e.stopped_at IS NOT NULL OR e.fenced_at IS NOT NULL) AND e.cleanup_state <> 'done'
 				AND (a.verdict_hash IS NOT NULL OR e.kind = 'exec' OR (e.kind = 'session' AND e.attempt_id IS NULL
 					AND NOT EXISTS (SELECT 1 FROM incarnations i WHERE i.env_id = e.env_id AND i.status <> 'ended')))
 				AND (e.next_retry_at IS NULL OR e.next_retry_at <= $1)
@@ -32,7 +32,7 @@ func (s *Store) ListCleanupCandidates(ctx context.Context, now time.Time, limit 
 		}
 		out, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (resource.Environment, error) {
 			var e resource.Environment
-			err := r.Scan(&e.EnvID, &e.Kind, &e.AttemptID, &e.Status, &e.StoppedAt, &e.CleanupState,
+			err := r.Scan(&e.EnvID, &e.Kind, &e.AttemptID, &e.Status, &e.StoppedAt, &e.FencedAt, &e.CleanupState,
 				&e.CleanupTries, &e.CleanupError, &e.NextRetryAt)
 			return e, err
 		})

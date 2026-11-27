@@ -91,7 +91,7 @@ type IncarnationEnv struct {
 
 // StopReport 是停止报告的事实。**Recorded 为真表示执行已确认结束**：环境停止且 stopped_at 已记录；Handoff 中
 // Release 成功（incarnation 回到 idle）同样报告 Recorded（task actor 据此归还 run slot、允许替代执行）。
-type StopReport struct{ Stopped, Recorded, Blocked bool }
+type StopReport struct{ Stopped, Recorded, Blocked, Fenced bool }
 
 // Workers 是 runner 的会话子集。
 type Workers interface {
@@ -710,12 +710,22 @@ func (a *Actor) opDestroy(ctx context.Context, f DestroyIncarnation, handleID st
 		return r
 	}
 	rep, err := a.d.Env.StopEnv(ctx, f.EnvID)
-	if err == nil && !rep.Recorded {
+	if err == nil && rep.Blocked && f.AttemptID != "" {
+		if fence, ok := a.d.Env.(interface {
+			FenceExpiredSession(context.Context, string, string) (bool, error)
+		}); ok {
+			rep.Fenced, err = fence.FenceExpiredSession(ctx, f.EnvID, f.AttemptID)
+		}
+	}
+	if err == nil && !rep.Recorded && !rep.Fenced {
 		err = fmt.Errorf("环境 %s 的停止未确认（stopped=%v blocked=%v）", f.EnvID, rep.Stopped, rep.Blocked)
 	}
 	if err != nil {
 		r.done.Err = err
 		return r
+	}
+	if rep.Fenced {
+		f.Reason = "lease_fenced"
 	}
 	if _, err := retry(ctx, a.d, func(ctx context.Context) (Incarnation, error) {
 		inc, err := a.d.Store.EndIncarnation(ctx, f.IncarnationID, f.Reason)
@@ -723,6 +733,9 @@ func (a *Actor) opDestroy(ctx context.Context, f DestroyIncarnation, handleID st
 	}); err != nil {
 		a.storeErr(&r.done, err)
 		return r
+	}
+	if rep.Fenced {
+		r.done.FencedEnv = f.EnvID
 	}
 	_ = a.d.Env.UnstageRestore(ctx, f.EnvID) // 未卸载的暂存（启动中断）在环境停止之后删除
 	if f.IncarnationID == handleID {

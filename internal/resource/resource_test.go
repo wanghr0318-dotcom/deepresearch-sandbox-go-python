@@ -1573,3 +1573,32 @@ func TestOwnerRangeCheckedOnSessionClose(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestFencedPodCleanupWaitsForPhysicalStop(t *testing.T) {
+	f := newFixture(t, true)
+	ctx := context.Background()
+	f.store.addEnv("fenced-env", true)
+	if _, err := f.c.CreateEnv(ctx, req("fenced-env")); err != nil {
+		t.Fatal(err)
+	}
+	at := f.clock.now()
+	f.store.mu.Lock()
+	f.store.envs["fenced-env"].FencedAt = &at
+	f.store.mu.Unlock()
+	f.prov.FailStop("fenced-env", provider.ErrStopUnconfirmed)
+	if err := f.c.cleanupEnv(ctx, f.store.env("fenced-env")); err != nil {
+		t.Fatal(err)
+	}
+	e := f.store.env("fenced-env")
+	if e.StoppedAt != nil || e.CleanupState != CleanupPending || e.NextRetryAt == nil || f.rec.count("Destroy") != 0 {
+		t.Fatalf("pending stop %+v", e)
+	}
+	f.prov.FailStop("fenced-env", nil)
+	if err := f.c.cleanupEnv(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	e = f.store.env("fenced-env")
+	if e.StoppedAt == nil || e.CleanupState != CleanupDone {
+		t.Fatalf("physical stop and cleanup %+v", e)
+	}
+}

@@ -148,6 +148,7 @@ const (
 // thaw 失败、启动失败、释放核验失败），由 Decide 按状态机处理。State 是操作之后重新读取的会话事实（读取失败为
 // nil）。
 type OpDone struct {
+	FencedEnv     string
 	Op            OpKind
 	To            string // OpTransition 的目标状态
 	Err           error
@@ -212,7 +213,7 @@ type ReleaseIncarnation struct{ Handoff Handoff }
 type CloseIncarnation struct{ IncarnationID string }
 
 // DestroyIncarnation：撤销 Gateway 入口 → StopEnv（须 Recorded）→ EndIncarnation(Reason) → 删除暂存 → 归还内存。
-type DestroyIncarnation struct{ IncarnationID, EnvID, Reason string }
+type DestroyIncarnation struct{ IncarnationID, EnvID, Reason, AttemptID string }
 
 // FinishCloseOp：DeleteWorkspace → ReleaseUID → Store.FinishClose（E32：只在全部环境停止之后）。
 type FinishCloseOp struct{ FromRowVersion int64 }
@@ -450,6 +451,17 @@ func (d *decider) opDone(e OpDone) error {
 	case OpClose:
 		d.s.CloseSent = true
 	case OpDestroy:
+		if e.FencedEnv != "" {
+			pending := slices.Clone(d.s.Handoffs)
+			d.s.Handoffs = nil
+			for _, h := range pending {
+				if h.EnvID == e.FencedEnv {
+					d.emit(ReplyHandoff{Handoff: h, Report: StopReport{Fenced: true}})
+				} else {
+					d.s.Handoffs = append(d.s.Handoffs, h)
+				}
+			}
+		}
 		if e.IncarnationID == d.s.HandleInc {
 			d.s.HandleInc = ""
 			d.s.Exited, d.s.Quiesced, d.s.CloseSent, d.s.ThawFail = false, false, false, false
@@ -560,7 +572,7 @@ func (d *decider) step() {
 		case s.RelFail:
 			d.destroy(inc, EndReleaseTimeout)
 		case h.Destroy:
-			d.destroy(inc, EndTaskDestroyed)
+			d.op(DestroyIncarnation{IncarnationID: inc.IncarnationID, EnvID: inc.EnvID, Reason: EndTaskDestroyed, AttemptID: h.AttemptID})
 		case s.Exited || s.HandleInc != inc.IncarnationID:
 			d.destroy(inc, EndWorkerExited)
 		default:
@@ -641,7 +653,9 @@ func (d *decider) stepClosing(inc *Incarnation) {
 		d.destroy(inc, EndClosed)
 		return
 	}
-	d.op(FinishCloseOp{FromRowVersion: st.RowVersion})
+	if !st.PendingFencedStop {
+		d.op(FinishCloseOp{FromRowVersion: st.RowVersion})
+	}
 }
 
 // stepStarting：creating 与 restoring 新建 incarnation（restoring 以 Latest 恢复）；成功后 → idle，两次失败 → evicted。

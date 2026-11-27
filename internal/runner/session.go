@@ -881,10 +881,15 @@ func (inc *Incarnation) wait(ctx context.Context, att *sessionRun, controls <-ch
 		graceT             timer
 		killed             bool
 	)
+	leaseLost, stopProbe := opt.watchLease(ctx, att.a.Attempt)
+	defer stopProbe()
 	defer acceptT.stop()
 	defer graceT.stop()
 	for {
 		select {
+		case <-leaseLost:
+			inc.kill(KillLeaseExpired)
+			return inc.finishRun(ctx, att, ctrl, false)
 		case <-accepted:
 			accepted = nil
 			acceptT.stop()
@@ -996,7 +1001,10 @@ func (inc *Incarnation) finishRun(ctx context.Context, att *sessionRun, ctrl str
 	if att.subs != nil {
 		att.subs.stop() // 结果已交给调用方：之后到期的 sub-run 定时器不再处理（定时器本身由 stop 失效）
 	}
-	if inc.r.diag != nil {
+	inc.killMu.Lock()
+	leaseExpired := inc.killReason == KillLeaseExpired
+	inc.killMu.Unlock()
+	if inc.r.diag != nil && !leaseExpired {
 		if d, err := inc.r.diag(context.WithoutCancel(ctx), inc.spec.EnvID); err == nil {
 			out.Diag = d
 		}

@@ -65,7 +65,8 @@ type StopResult struct {
 
 // Options 配置 coordinator。零值字段取规格 §19 的默认值。
 type Options struct {
-	InstallID string
+	AllowSessionLeaseFence bool // isolated K8s session Pods with attested gateway-only egress
+	InstallID              string
 
 	// UID 范围池：UIDCount > 0 时，首次创建前幂等地登记 UIDCount 段 [UIDBase+i*UIDSize, ...)；
 	// UIDCount 为 0 表示范围池已由他处登记。UIDSize 默认 4096。
@@ -527,4 +528,19 @@ func (c *Coordinator) persist(ctx context.Context, op func(context.Context) erro
 func transient(err error) bool {
 	return errors.Is(err, persistence.ErrUnavailable) || errors.Is(err, persistence.ErrCommitUnknown) ||
 		errors.Is(err, persistence.ErrContention)
+}
+
+// FenceExpiredSession is called by the session actor after gateway revocation
+// and a failed physical stop. Other providers keep their original stop barrier.
+func (c *Coordinator) FenceExpiredSession(ctx context.Context, envID, attemptID string) (bool, error) {
+	if !c.opt.AllowSessionLeaseFence {
+		return false, nil
+	}
+	store, ok := c.store.(interface {
+		FenceExpiredSession(context.Context, string, string) (bool, error)
+	})
+	if !ok {
+		return false, errors.New("resource: session fencing requires lease-aware storage")
+	}
+	return store.FenceExpiredSession(ctx, envID, attemptID)
 }

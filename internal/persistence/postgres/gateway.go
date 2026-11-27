@@ -75,15 +75,13 @@ func admitAccess(f call.AccessFacts) error {
 // 以共享锁读取该 sub-run（lockSubrunForCallTx），阻止并发的取消请求与收尾在本事务提交前改变其状态。
 func checkAccessTx(ctx context.Context, tx pgx.Tx, taskID, attemptID, subrunID string) error {
 	f := call.AccessFacts{TaskID: taskID, AttemptID: attemptID, SubrunID: subrunID}
-	var current *string
-	err := tx.QueryRow(ctx, "SELECT current_attempt_id FROM tasks WHERE task_id = $1 FOR SHARE", taskID).Scan(&current)
+	err := tx.QueryRow(ctx, "SELECT COALESCE(current_attempt_id = $2,false) AND (lease_expires_at IS NULL OR lease_expires_at > clock_timestamp()) FROM tasks WHERE task_id = $1 FOR SHARE", taskID, attemptID).Scan(&f.Current)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return notFoundf("任务 %s", taskID)
 	}
 	if err != nil {
 		return err
 	}
-	f.Current = current != nil && *current == attemptID
 	if err := tx.QueryRow(ctx, "SELECT desired FROM task_control WHERE task_id = $1 FOR SHARE", taskID).Scan(&f.Desired); err != nil {
 		return err
 	}
@@ -124,7 +122,7 @@ func lockBudget(ctx context.Context, tx pgx.Tx, taskID string) (call.Budget, err
 func (s *Store) CheckAccess(ctx context.Context, taskID, attemptID, subrunID string) (call.AccessFacts, error) {
 	f := call.AccessFacts{TaskID: taskID, AttemptID: attemptID, SubrunID: subrunID}
 	err := s.read(ctx, "CheckAccess", func(ctx context.Context, q queryer) error {
-		err := q.QueryRow(ctx, `SELECT COALESCE(t.current_attempt_id = $2, false), c.desired,
+		err := q.QueryRow(ctx, `SELECT COALESCE(t.current_attempt_id = $2, false) AND (t.lease_expires_at IS NULL OR t.lease_expires_at > clock_timestamp()), c.desired,
 				COALESCE((SELECT a.state = 'active' FROM attempt_access a WHERE a.attempt_id = $2 AND a.task_id = t.task_id), false),
 				$3 <> '' AND COALESCE((SELECT r.status = 'started' AND r.bound_attempt_id = $2 FROM subruns r
 					WHERE r.task_id = t.task_id AND r.subrun_id = $3), false)

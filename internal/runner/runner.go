@@ -113,13 +113,15 @@ const (
 
 // Options 配置 Runner。零值字段取默认值（规格 §5.7、§5.10、§14.5、§19）。
 type Options struct {
-	ReadyTimeout       time.Duration // T_ready，默认 30 s
-	ExitGrace          time.Duration // 终态提议后须退出的期限，默认 10 s
-	DrainTimeout       time.Duration // 屏障 A：进程退出后管道收尾，默认 5 s
-	FinalizeTimeout    time.Duration // 屏障 B：处理全部已接收事件，默认 120 s
-	ControlGrace       time.Duration // Control.GraceMs ≤ 0 时 cancel/pause 的 grace，默认 10 s
-	StoreFailureCount  int           // Store 故障阈值：连续失败次数，默认 5
-	StoreFailureWindow time.Duration // Store 故障阈值：连续失败持续时间，默认 30 s
+	AttemptLeaseProbe         func(context.Context, string, string, string) error
+	AttemptLeaseProbeInterval time.Duration
+	ReadyTimeout              time.Duration // T_ready，默认 30 s
+	ExitGrace                 time.Duration // 终态提议后须退出的期限，默认 10 s
+	DrainTimeout              time.Duration // 屏障 A：进程退出后管道收尾，默认 5 s
+	FinalizeTimeout           time.Duration // 屏障 B：处理全部已接收事件，默认 120 s
+	ControlGrace              time.Duration // Control.GraceMs ≤ 0 时 cancel/pause 的 grace，默认 10 s
+	StoreFailureCount         int           // Store 故障阈值：连续失败次数，默认 5
+	StoreFailureWindow        time.Duration // Store 故障阈值：连续失败持续时间，默认 30 s
 
 	EventQueue       int           // stdout 行的有界队列容量，默认 256
 	EventBatch       int           // AppendWorkerEvents 每批最多事件数，默认 64
@@ -450,8 +452,13 @@ func (at *attemptRun) run(ctx context.Context, initLine []byte, controls <-chan 
 			exitGraceT = newTimer(opt.ExitGrace)
 		}
 	}
+	leaseLost, stopProbe := opt.watchLease(ctx, at.a)
+	defer stopProbe()
 	for exit == nil || !isProcessed {
 		select {
+		case <-leaseLost:
+			leaseLost = nil
+			at.kill(KillLeaseExpired)
 		case <-processed:
 			isProcessed, processed = true, nil
 		case <-readerDone:
