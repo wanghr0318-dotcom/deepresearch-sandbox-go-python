@@ -324,11 +324,12 @@ type attemptRunner interface {
 }
 
 type runnerAdapter struct {
-	r       attemptRunner
-	cfg     Config
-	dataDir string
-	sess    *sessionRuntime   // 会话 turn 在授予的 incarnation 中执行（nil：没有会话 turn）
-	subruns runner.SubrunHost // sub-run 扩展的宿主实现（subruns.go）
+	portable portableWorkspace
+	r        attemptRunner
+	cfg      Config
+	dataDir  string
+	sess     *sessionRuntime   // 会话 turn 在授予的 incarnation 中执行（nil：没有会话 turn）
+	subruns  runner.SubrunHost // sub-run 扩展的宿主实现（subruns.go）
 }
 
 var _ task.AttemptRunner = runnerAdapter{}
@@ -338,6 +339,9 @@ var _ task.AttemptRunner = runnerAdapter{}
 func (x runnerAdapter) Run(ctx context.Context, s task.RunSpec, controls <-chan task.Control) task.Outcome {
 	if s.StartErr != nil {
 		return startFailure(ctx, s.StartErr)
+	}
+	if err := restoreAttemptWorkspace(ctx, x.portable, s); err != nil {
+		return startFailure(ctx, err)
 	}
 	if s.Task.SessionID != "" {
 		if x.sess == nil {

@@ -167,7 +167,10 @@ type Config struct {
 
 	// 工作区工具与 MCP（设计 2026-10-10-shell-file-mcp；tools.go）。默认关闭，关闭时 turn spec 与端点均不变。
 	// WorkspaceTools 打开 /v1/workspace/* 与对话 Agent 的 exec_shell、read_file、write_file、list_dir（需要 exec）。
-	WorkspaceTools bool
+	WorkspaceTools         bool
+	AllowSessionLeaseFence bool
+	WorkspaceArchive       workspace.SnapshotArchive
+	AttemptLeaseTTL        time.Duration
 	// WorkspaceIdleTimeout 是工作区的空闲过期时限（--workspace-idle-timeout，默认 2 h）。
 	WorkspaceIdleTimeout time.Duration
 	// MCP 是 --mcp-config 的内容；nil 表示关闭（/v1/mcp/* 为 404）。
@@ -881,7 +884,7 @@ func (s *server) assemble() error {
 	}
 	s.blobs = blobs
 	s.adm = admission.New(s.cfg.Capacity)
-	s.coord = resource.NewCoordinator(s.store, prov, resource.Options{InstallID: s.installID,
+	s.coord = resource.NewCoordinator(s.store, prov, resource.Options{InstallID: s.installID, AllowSessionLeaseFence: s.cfg.AllowSessionLeaseFence,
 		UIDBase: s.cfg.UIDBase, UIDCount: s.cfg.UIDCount, Backoff: s.cfg.RetryBackoff,
 		// 隔离报警（cleanup 与启动核对的 UID 范围隔离）写到服务日志，字段与启动恢复的报警相同。
 		Alert: func(q resource.Quarantine) {
@@ -893,16 +896,30 @@ func (s *server) assemble() error {
 		EntryHeld: func(envID string) bool { return s.edge != nil && s.edge.EnvHeld(envID) },
 		Logger:    s.log})
 	runnerOpt := s.cfg.Runner
+	if ttl := s.cfg.AttemptLeaseTTL; ttl > 0 {
+		leases, ok := s.store.(attemptLeases)
+		if !ok {
+			return errors.New("attempt leases require a lease-aware store")
+		}
+		runnerOpt.AttemptLeaseProbeInterval = ttl / 3
+		runnerOpt.AttemptLeaseProbe = leaseProbe(leases, s.coord.EnvProcs, ttl/3)
+	}
 	if remote, ok := prov.(interface {
 		UsesPodWorkspace() bool
 		OpenPodArtifact(context.Context, string, string, string, int64) (io.ReadCloser, error)
 	}); ok && remote.UsesPodWorkspace() {
 		runnerOpt.OpenPodArtifact = remote.OpenPodArtifact
 	}
-	run := runner.New(s.store, blobs, prov, prov.ResourceDiag, runnerOpt)
 	if err := s.assembleGateway(blobs); err != nil {
 		return err
 	}
+	var checkpointStore runner.Store = s.store
+	var portable portableWorkspace
+	if s.cfg.WorkspaceArchive != nil {
+		portable = s.workspaces
+		checkpointStore = snapshotStore{Store: s.store, workspace: portable}
+	}
+	run := runner.New(checkpointStore, blobs, prov, prov.ResourceDiag, runnerOpt)
 	access := newAccessRouter(s.edge, s.cfg.Runner.ReleaseTimeout)
 	subruns := subrunHost{store: s.store, calls: s.calls}
 	s.sessions = &sessionRuntime{access: access, facts: s.store, blobs: blobs, log: s.log, subruns: subruns}
@@ -942,7 +959,7 @@ func (s *server) assemble() error {
 		Store:     s.store,
 		Admission: admissionAdapter{a: s.adm, cfg: s.cfg, gate: s.sandboxGate},
 		Env:       envAdapter{c: s.coord, cfg: s.cfg, dataDir: s.d.DataDir},
-		Runner:    runnerAdapter{r: run, cfg: s.cfg, dataDir: s.d.DataDir, sess: s.sessions, subruns: subruns},
+		Runner:    runnerAdapter{r: run, portable: portable, cfg: s.cfg, dataDir: s.d.DataDir, sess: s.sessions, subruns: subruns},
 		Access:    access,
 		Session:   sessionGate{rt: s.sessions},
 		Clock:     s.d.Clock,
@@ -1016,6 +1033,7 @@ func (s *server) assembleGateway(blobs blob.Store) error {
 		s.execGate = admission.NewExecGate(admission.ExecCapacity{Slots: s.cfg.Exec.Slots, PerTask: s.cfg.Exec.PerTask})
 		cfg.Exec = s.cfg.Exec.callConfig(s.store, execEnvAdapter{c: s.coord, p: s.prov, cfg: s.cfg.Exec},
 			execSlots{g: s.execGate}, s.execDigest)
+		cfg.Exec.HoldUnknown = s.cfg.AllowSessionLeaseFence
 		s.log.Info("exec 已启用", "slots", s.cfg.Exec.Slots, "per_task", s.cfg.Exec.PerTask,
 			"memory_max", s.cfg.Exec.MemoryMax, "image_digest", s.execDigest)
 	}

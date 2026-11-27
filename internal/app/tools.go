@@ -32,6 +32,15 @@ func workspacesDir(dataDir string) string { return filepath.Join(dataDir, "tool-
 
 // validateTools 校验工作区与 MCP 配置（withDefaults 之后）。
 func (c Config) validateTools() error {
+	if c.AllowSessionLeaseFence && (c.AttemptLeaseTTL <= 0 || c.WorkspaceArchive == nil) {
+		return errors.New("session lease fencing requires a positive lease TTL and a portable workspace archive")
+	}
+	if c.AttemptLeaseTTL < 0 || (c.AttemptLeaseTTL > 0 && c.AttemptLeaseTTL/3 == 0) {
+		return errors.New("attempt lease duration cannot support three probe intervals")
+	}
+	if c.WorkspaceArchive != nil && !c.WorkspaceTools {
+		return errors.New("workspace archive requires workspace tools")
+	}
 	if c.WorkspaceTools && !c.Exec.Enabled() {
 		return errors.New("app: --workspace-tools 需要 exec（--exec-slots > 0）：工作区命令在 exec 环境中运行")
 	}
@@ -82,7 +91,7 @@ func (s *server) assembleWorkspaces(blobs blob.Store) error {
 	if !s.cfg.WorkspaceTools {
 		return nil
 	}
-	m, err := workspace.New(workspace.Config{Dir: workspacesDir(s.d.DataDir), Exec: s.calls, Access: s.calls, Blobs: blobs,
+	m, err := workspace.New(workspace.Config{Dir: workspacesDir(s.d.DataDir), Archive: s.cfg.WorkspaceArchive, Exec: s.calls, Access: s.calls, Blobs: blobs,
 		Tasks: taskTerminal{s: s.store}, IdleTimeout: s.cfg.WorkspaceIdleTimeout, MaxFiles: workspace.DefaultMaxFiles,
 		MaxBytes: workspaceMaxBytes(s.cfg.Exec.OutBytes), Logger: s.log})
 	if err != nil {

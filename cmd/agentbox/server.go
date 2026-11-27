@@ -23,6 +23,7 @@ import (
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/api"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/apikey"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/app"
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/blob"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/call"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/mcp"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/gateway/upstream"
@@ -77,62 +78,64 @@ func prepareIsolation(exec bool) (local.EnvStarter, string, error) {
 
 // serverFlags 是解析后的 `agentbox server` 标志。
 type serverFlags struct {
-	dataDir             *string
-	dsn                 *string
-	listen              *string
-	cgroupRoot          *string
-	runSlots            *int
-	memory              *int64
-	defaultMemory       *int64
-	defaultRunTime      *time.Duration
-	runTimeCap          *time.Duration
-	allowedHost         *string
-	allowedOrigin       *string
-	webDir              *string
-	tlsCert             *string
-	tlsKey              *string
-	workerArgv          *string
-	workerEnv           *string
-	defaultBudget       *int64
-	budgetCap           *int64
-	modelBaseURL        *string
-	modelName           *string
-	models              *string
-	priceIn             *int64
-	priceOut            *int64
-	searchBaseURL       *string
-	searchProvider      *string
-	fallbackFile        *string
-	breakerFailures     *int
-	breakerOpen         *time.Duration
-	tryTimeout          *time.Duration
-	hedgeDelay          *time.Duration
-	maxTokensCap        *int
-	allowPrivate        *string
-	redisAddr           *string
-	cacheMode           *string
-	callDeadline        *time.Duration
-	modelCallDeadline   *time.Duration
-	userOrchestrator    *string
-	userWorker          *string
-	turnToolBudget      *int
-	sessionIdleFreeze   *time.Duration
-	sessionEvictAfter   *time.Duration
-	sessionWorkerArgv   *string
-	workerSubruns       *bool
-	subrunCancelTimeout *time.Duration
-	workspaceTools      *bool
-	modelAPI            *bool
-	modelAPIMaxDuration *time.Duration
-	modelAPIMaxBody     *int64
-	workspaceIdle       *time.Duration
-	mcpConfig           *string
-	logFile             *string
-	providerName        *string
-	modelPrices         listFlag
-	ex                  app.ExecConfig
-	tel                 telemetry.Config
-	kf                  k8sFlags
+	allowSessionLeaseFence *bool
+	attemptLeaseTTL        *time.Duration
+	dataDir                *string
+	dsn                    *string
+	listen                 *string
+	cgroupRoot             *string
+	runSlots               *int
+	memory                 *int64
+	defaultMemory          *int64
+	defaultRunTime         *time.Duration
+	runTimeCap             *time.Duration
+	allowedHost            *string
+	allowedOrigin          *string
+	webDir                 *string
+	tlsCert                *string
+	tlsKey                 *string
+	workerArgv             *string
+	workerEnv              *string
+	defaultBudget          *int64
+	budgetCap              *int64
+	modelBaseURL           *string
+	modelName              *string
+	models                 *string
+	priceIn                *int64
+	priceOut               *int64
+	searchBaseURL          *string
+	searchProvider         *string
+	fallbackFile           *string
+	breakerFailures        *int
+	breakerOpen            *time.Duration
+	tryTimeout             *time.Duration
+	hedgeDelay             *time.Duration
+	maxTokensCap           *int
+	allowPrivate           *string
+	redisAddr              *string
+	cacheMode              *string
+	callDeadline           *time.Duration
+	modelCallDeadline      *time.Duration
+	userOrchestrator       *string
+	userWorker             *string
+	turnToolBudget         *int
+	sessionIdleFreeze      *time.Duration
+	sessionEvictAfter      *time.Duration
+	sessionWorkerArgv      *string
+	workerSubruns          *bool
+	subrunCancelTimeout    *time.Duration
+	workspaceTools         *bool
+	modelAPI               *bool
+	modelAPIMaxDuration    *time.Duration
+	modelAPIMaxBody        *int64
+	workspaceIdle          *time.Duration
+	mcpConfig              *string
+	logFile                *string
+	providerName           *string
+	modelPrices            listFlag
+	ex                     app.ExecConfig
+	tel                    telemetry.Config
+	kf                     k8sFlags
 }
 
 // newServerFlags 在 fs 上注册 `agentbox server` 的全部标志。
@@ -183,6 +186,8 @@ func newServerFlags(fs *flag.FlagSet) *serverFlags {
 	f.sessionWorkerArgv = fs.String("session-worker-argv", "", "会话 incarnation 内启动 Worker 的命令（逗号分隔的 argv，例如 python3,-m,chatagent）；为空时不启用会话（会话端点 503 sessions_unavailable），非空时需要 --model-base-url")
 	f.workerSubruns = fs.Bool("worker-subruns", true, "在 init 中请求 sub-run 扩展（init.extensions = [\"subruns\"]；Worker 的 ready 须回 subruns: 1，否则以 extension_mismatch 拒绝）")
 	f.subrunCancelTimeout = fs.Duration("subrun-cancel-timeout", subrun.DefaultCancelTimeout, "宿主取消 sub-run 后等待其 subrun_end 的时限 T_subrun_cancel（须 > 0；超时终止整个 attempt，会话模式终止 incarnation）")
+	f.allowSessionLeaseFence = fs.Bool("allow-session-lease-fence", false, "enable expired session takeover on managed K8s pods with verified relay-only egress")
+	f.attemptLeaseTTL = fs.Duration("attempt-lease-ttl", 0, "execution lease duration (0 disables expiry)")
 	f.workspaceTools = fs.Bool("workspace-tools", false, "为对话 Agent 打开工作区工具 exec_shell、read_file、write_file、list_dir（/v1/workspace/*；每条命令在独立 exec 环境中运行、按 exec 配额记账；需要 --exec-slots > 0）")
 	f.modelAPI = fs.Bool("model-api", false, "打开模型 API：POST /v1/chat/completions（OpenAI 格式）、POST /v1/messages（Anthropic 格式）、GET /v1/models，以平台 API key（models scope）调用，经 Gateway 的模型路由，按 key、user、org 限流与计费（需要 --model-base-url）")
 	f.modelAPIMaxDuration = fs.Duration("model-api-max-duration", 10*time.Minute, "模型 API 一个请求（含流式回复）的总时长上限（须 > 0）；超过时流以错误事件结束")
@@ -235,6 +240,24 @@ func runServer(args []string, stderr io.Writer) int {
 		return code
 	}
 	cfg := f.appConfig(st)
+	cfg.AttemptLeaseTTL = *f.attemptLeaseTTL
+	cfg.AllowSessionLeaseFence = *f.allowSessionLeaseFence
+	if cfg.AllowSessionLeaseFence && (*f.providerName != "k8s" || f.kf.gatewayListen == "") {
+		fmt.Fprintln(stderr, "agentbox server: --allow-session-lease-fence requires --provider k8s with a private relay listener")
+		return 2
+	}
+	if endpoint := os.Getenv("AGENTBOX_COS_BUCKET_URL"); endpoint != "" {
+		if !cfg.WorkspaceTools {
+			fmt.Fprintln(stderr, "agentbox server: COS workspace recovery requires --workspace-tools")
+			return 2
+		}
+		cfg.WorkspaceArchive, err = blob.NewCOSArchive(endpoint, os.Getenv("AGENTBOX_COS_PREFIX"),
+			blob.COSCredentials{CVMRole: os.Getenv("AGENTBOX_COS_CVM_ROLE"), SecretID: os.Getenv("TENCENTCLOUD_SECRET_ID"), SecretKey: os.Getenv("TENCENTCLOUD_SECRET_KEY"), SessionToken: os.Getenv("TENCENTCLOUD_SESSION_TOKEN")})
+		if err != nil {
+			fmt.Fprintln(stderr, "agentbox server:", err)
+			return 2
+		}
+	}
 	if _, err := os.Stat(filepath.Join(dir, api.TokenFile)); err == nil {
 		if cfg.APIToken, err = api.LoadToken(dir); err != nil {
 			fmt.Fprintln(stderr, "agentbox server:", err)
@@ -246,7 +269,7 @@ func runServer(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agentbox server: "+api.TokenFile+" 不能以 abx_ 开头（该前缀保留给平台 API key）")
 		return 2
 	}
-	return f.serve(cfg, serverDeps(dir, *f.dsn, execDigest, newProvider), stderr)
+	return f.serve(cfg, serverDeps(dir, *f.dsn, execDigest, newProvider, cfg.AttemptLeaseTTL), stderr)
 }
 
 // serverSettings 是 settings 在取得任何资源之前由标志推出的配置。
@@ -450,7 +473,7 @@ func (f *serverFlags) appConfig(st serverSettings) app.Config {
 }
 
 // serverDeps 装配具体实现：PostgreSQL 所有权与 Store、provider。
-func serverDeps(dir, dsn, execDigest string, newProvider func(string) (provider.Provider, error)) app.Deps {
+func serverDeps(dir, dsn, execDigest string, newProvider func(string) (provider.Provider, error), leaseTTL time.Duration) app.Deps {
 	return app.Deps{
 		DataDir:         dir,
 		ExecImageDigest: func() (string, error) { return execDigest, nil }, // prepareIsolation 已检查并计算
@@ -466,7 +489,7 @@ func serverDeps(dir, dsn, execDigest string, newProvider func(string) (provider.
 			if !ok {
 				return nil, errors.New("所有权不是 PostgreSQL advisory lock")
 			}
-			s, err := postgres.Open(ctx, postgres.Options{DSN: dsn, Ownership: o})
+			s, err := postgres.Open(ctx, postgres.Options{DSN: dsn, Ownership: o, AttemptLeaseTTL: leaseTTL})
 			if err != nil {
 				return nil, err
 			}

@@ -109,6 +109,8 @@ type ExecLimits struct{ WallMs, MemoryBytes int64 }
 
 // ExecConfig 装配 exec 调度；零值字段取 §19 补充的默认值。Store、Envs、Slots、ImageDigest 必填。
 type ExecConfig struct {
+	HoldUnknown bool // An opaque command may already have produced an external effect.
+
 	Store        ExecStore
 	Envs         ExecEnvs
 	Slots        ExecSlots
@@ -535,6 +537,9 @@ func (c *Coordinator) runExec(j *execJob) (Result, error) {
 		case StateResolving, StateInFlight:
 			return reject(persistence.CodeCallInProgress), nil
 		case StateUnknown:
+			if x.HoldUnknown {
+				return reject(CodeExecUnknown), nil
+			}
 			// 重跑：ReserveExec 确认此前 try 的环境均已 stopped_at（§10.1）。
 		case StateFailed:
 			if !in.Retry || !retryableReason(rec.FailReason) || rec.TriesUsed >= c.limits.MaxTries {
