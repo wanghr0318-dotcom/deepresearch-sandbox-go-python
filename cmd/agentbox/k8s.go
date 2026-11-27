@@ -25,7 +25,7 @@ import (
 
 type k8sFlags struct {
 	kubeconfig, namespace, image, runtimeClass, sharedDir, nodeSharedDir, plainHTTP string
-	gatewayListen                                                                   string
+	gatewayListen, preferredNode                                                    string
 	strict                                                                          bool
 	warmPool                                                                        int
 }
@@ -33,6 +33,7 @@ type k8sFlags struct {
 func (f *k8sFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.kubeconfig, "k8s-kubeconfig", "", "--provider k8s：kubeconfig 路径（空时使用 in-cluster 配置）")
 	fs.StringVar(&f.namespace, "k8s-namespace", "agentbox-sandbox", "--provider k8s：沙箱 Pod 所在的命名空间（须已存在）")
+	fs.StringVar(&f.preferredNode, "k8s-preferred-node", "", "prefer this kubernetes.io/hostname for sandbox Pods; other nodes remain eligible")
 	fs.StringVar(&f.image, "k8s-image", "", "--provider k8s：worker 镜像（repo@sha256:… 或 repo:tag；tag 在启动时解析为 digest 并固定）")
 	fs.BoolVar(&f.strict, "k8s-image-strict", false, "--provider k8s：拒绝可变的 tag，--k8s-image 须为 repo@sha256:…")
 	fs.StringVar(&f.plainHTTP, "k8s-registry-plain-http", "", "--provider k8s：以 HTTP（而非 HTTPS）解析 tag 的镜像仓库 host:port（逗号分隔，例如本地 kind-registry:5000）")
@@ -83,7 +84,7 @@ func prepareK8s(f k8sFlags, dataDir string, defaultMemory int64, exec app.ExecCo
 	fmt.Fprintf(stderr, "agentbox server: provider k8s, namespace %s, image %s\n", f.namespace, ref.Pinned())
 	return func(installID string) (provider.Provider, error) {
 		p, err := k8s.New(context.Background(), k8s.Options{Client: client, Executor: ex, Namespace: f.namespace,
-			InstallID: installID, Image: ref.Pinned(), RuntimeClass: f.runtimeClass, SlotHostDir: shared,
+			InstallID: installID, Image: ref.Pinned(), RuntimeClass: f.runtimeClass, PreferredNode: f.preferredNode, SlotHostDir: shared,
 			SlotNodeDir: f.nodeSharedDir, WarmPool: f.warmPool, WarmProfile: k8sWarmProfile(defaultMemory),
 			GatewayListen: f.gatewayListen, ExecStagingDir: stageDir, ExecPodLifetime: max(10*time.Minute, exec.WallMax+3*time.Minute),
 			EnsureNetworkPolicy: true, Logger: logger})

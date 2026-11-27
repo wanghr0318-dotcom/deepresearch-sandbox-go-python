@@ -28,18 +28,19 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def seed_command(files, setup=""):
+def seed_command(files, setup="", select_files=None):
     # A test entry point in the existing worker image. Base64 keeps argv free of commas.
     payload = f"""import asyncio
+import hashlib
 from agentbox_worker import main_session
 from chatagent.app import run
 {setup}
 async def seeded(ctx):
     if ctx.resume is not None:
         return await run(ctx)
-    for path, content, sha in {[(p, s, digest(s.encode())) for p, s in files.items()]!r}:
+    for path, content in {select_files or repr(files)}.items():
         result = await asyncio.to_thread(ctx.gateway.workspace, 'write', {{'path': path, 'content': content}})
-        if result['sha256'] != sha:
+        if result['sha256'] != hashlib.sha256(content.encode()).hexdigest():
             raise ValueError(f'fixture checksum mismatch: {{path}}')
     return await run(ctx)
 main_session(seeded, name='chatagent', version='0.1.0')
@@ -48,17 +49,24 @@ main_session(seeded, name='chatagent', version='0.1.0')
     return f"python3,-c,exec(__import__('base64').b64decode('{source}'))"
 
 
-def scripted_upstream(original):
+def csv_steps(original):
     repair = original.replace("    next(reader, None)\n", "")
-    steps = [
+    return [
         ("read_file", {"path": "records.py"}),
         ("write_file", {"path": "records.py", "content": repair}),
         ("exec_shell", {"command": "python3 -I -c 'import runpy; assert len(runpy.run_path(\"records.py\")[\"read_records\"](\"name,city\\nAda,London\\n\")) == 1'"}),
     ]
 
+
+def scripted_upstream(original):
+    return tool_upstream(lambda body: csv_steps(original))
+
+
+def tool_upstream(steps_for):
     class Model(BaseHTTPRequestHandler):
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            steps = steps_for(body)
             tool_ids = [m["tool_call_id"] for m in body["messages"] if m["role"] == "tool"]
             step = len(tool_ids)
             valid = tool_ids == [f"cpu-{i}" for i in range(step)] and step <= len(steps)
@@ -129,7 +137,7 @@ def wait_http(url, gateway):
     raise TimeoutError("Gateway startup timed out")
 
 
-def run_acceptance(args, source, data_dir, url, namespace, after_submit=None):
+def run_acceptance(args, source, data_dir, url, namespace, after_submit=None, *, capture_files=()):
     results = args.evidence
     owner = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
     operator = (data_dir / "api.token").read_text().strip()
@@ -240,9 +248,16 @@ def run_acceptance(args, source, data_dir, url, namespace, after_submit=None):
         oracle = runpy.run_path(str(fixture / "verify.py"))
         checker = oracle["CHECKER"].replace("cases = json.load(sys.stdin)",
                                            "cases = " + repr(oracle["CASES"]))
+        grading_files = {**source, "records.py": candidate.decode()}
+        if capture_files:
+            report["captured_files"] = {}
+        for path in capture_files:
+            item = next(o for o in outcome["outputs"] if o["path"] == path)
+            grading_files[path] = read_blob(data_dir, item["sha256"]).decode()
+            report["captured_files"][path] = item["sha256"]
         spec = {"steps": [
             {"op": "workspace_exec", "step_id": "grade", "command": "python3 -I checker.py",
-             "wall_ms": 8000, "files": {**source, "records.py": candidate.decode(), "checker.py": checker}},
+             "wall_ms": 8000, "files": {**grading_files, "checker.py": checker}},
             {"op": "artifact", "artifact_id": "report", "path": "report.txt", "content": "Graded candidate."}],
             "outputs": ["report"], "summary": "Independent CSV candidate grading"}
         spec_path = results / "grade-spec.json"
@@ -307,7 +322,8 @@ def summarize_pods(path):
     return list(pods.values())
 
 
-def main(worker_command=seed_command, after_submit=None):
+def main(worker_command=seed_command, after_submit=None, *, acceptance=run_acceptance,
+         upstream=None, run_slots=1, gateway_flags=()):
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--fixture", type=Path, required=True)
     cli.add_argument("--agentbox", type=Path, required=True)
@@ -325,7 +341,7 @@ def main(worker_command=seed_command, after_submit=None):
     args.evidence.mkdir(mode=0o700)
     source = {p.relative_to(args.fixture / "repo").as_posix(): p.read_bytes().decode()
               for p in sorted(args.fixture.joinpath("repo").rglob("*.py"))}
-    model = scripted_upstream(source["records.py"]) if args.scripted else None
+    model = (upstream() if upstream else scripted_upstream(source["records.py"])) if args.scripted else None
     if model:
         threading.Thread(target=model.serve_forever, daemon=True).start()
         args.model_url = f"http://127.0.0.1:{model.server_port}/v1"
@@ -352,12 +368,13 @@ def main(worker_command=seed_command, after_submit=None):
         "--data-dir", str(state), "--listen", address, "--provider", "k8s",
         "--k8s-kubeconfig", "/etc/rancher/k3s/k3s.yaml", "--k8s-namespace", namespace,
         "--k8s-image", args.worker_image, "--k8s-gateway-listen", args.relay_listen,
-        "--workspace-tools", "--run-slots", "1", "--exec-slots", "1", "--exec-per-task", "1",
-        "--default-memory-bytes", "268435456", "--memory-bytes", "1073741824",
+        "--workspace-tools", "--run-slots", str(run_slots), "--exec-slots", str(run_slots), "--exec-per-task", "1",
+        "--default-memory-bytes", "268435456", "--memory-bytes", str(max(1073741824, run_slots * 2 * 268435456)),
         "--worker-argv", "python3,-m,sim_worker", "--session-worker-argv", worker_command(source),
         "--model-base-url", args.model_url, "--upstream-allow-private", urlsplit(args.model_url).netloc,
         "--model-name", args.model, "--user-orchestrator-model", args.model, "--user-worker-model", args.model,
     ]
+    args_for_gateway.extend(gateway_flags)
     with (args.evidence / "gateway.log").open("wb") as log:
         gateway = subprocess.Popen([str(args.agentbox), "server", *args_for_gateway],
                                    env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -368,7 +385,7 @@ def main(worker_command=seed_command, after_submit=None):
             report = None
             try:
                 wait_http(url, gateway)
-                report = run_acceptance(args, source, state, url, namespace, after_submit)
+                report = acceptance(args, source, state, url, namespace, after_submit)
                 remaining_cmd = kubectl + ["-n", namespace, "get", "pods,secret",
                                            "-l", "agentbox.io/managed=true", "-o", "name"]
                 for _ in range(12):

@@ -148,6 +148,28 @@ func TestNewRequiresPinnedImage(t *testing.T) {
 	}
 }
 
+func TestPreferredNodeAllowsFallback(t *testing.T) {
+	c := newFakeCluster(t, 0)
+	p := newTestProvider(t, c.client, c.exec, func(o *Options) { o.PreferredNode = "worker-b" })
+	ctx := context.Background()
+	if _, err := p.Create(ctx, specFor("inst-a")("env-pref")); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := p.boundPod(ctx, "env-pref")
+	if err != nil {
+		t.Fatal(err)
+	}
+	affinity := pod.Spec.Affinity.NodeAffinity
+	if affinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+		t.Fatal("node must remain optional")
+	}
+	term := affinity.PreferredDuringSchedulingIgnoredDuringExecution[0]
+	expr := term.Preference.MatchExpressions[0]
+	if term.Weight != 100 || expr.Key != corev1.LabelHostname || expr.Operator != corev1.NodeSelectorOpIn || expr.Values[0] != "worker-b" {
+		t.Fatalf("unexpected preferred node: %+v", term)
+	}
+}
+
 func TestPodSpecIsLockedDown(t *testing.T) {
 	c := newFakeCluster(t, 0)
 	p := newTestProvider(t, c.client, c.exec, func(o *Options) { o.RuntimeClass = "gvisor"; o.EnsureNetworkPolicy = true })

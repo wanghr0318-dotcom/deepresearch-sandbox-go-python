@@ -51,7 +51,19 @@ func (st *envState) info(envID string, complete, running bool) provider.EnvInfo 
 func (p *Provider) createBuiltPod(ctx context.Context, params podParams) (*corev1.Pod, error) {
 	params.Namespace, params.InstallID, params.Image = p.opt.Namespace, p.opt.InstallID, p.opt.Image
 	params.RuntimeClass = p.opt.RuntimeClass
-	pod, err := p.pods().Create(ctx, buildPod(params), metav1.CreateOptions{})
+	candidate := buildPod(params)
+	if name := p.opt.PreferredNode; name != "" {
+		candidate.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{{
+				Weight: 100, Preference: corev1.NodeSelectorTerm{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key: corev1.LabelHostname, Operator: corev1.NodeSelectorOpIn, Values: []string{name},
+					}},
+				},
+			}},
+		}}
+	}
+	pod, err := p.pods().Create(ctx, candidate, metav1.CreateOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("k8s: create pod: %w", err)
 	}

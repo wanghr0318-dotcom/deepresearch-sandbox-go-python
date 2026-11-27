@@ -34,8 +34,9 @@ type Options struct {
 	Namespace string // default "agentbox-sandbox"
 	InstallID string
 	// Image is the pinned worker image (repo@sha256:…; see PinImage).
-	Image        string
-	RuntimeClass string // optional runtimeClassName, e.g. "gvisor"
+	Image         string
+	PreferredNode string // optional hostname scheduling preference for sandbox Pods
+	RuntimeClass  string // optional runtimeClassName, e.g. "gvisor"
 	// SlotHostDir is the shared slot directory as seen by this process; SlotNodeDir the same directory as
 	// seen by the node (default: SlotHostDir). Empty disables workspace/Gateway mounts (Create then rejects
 	// specs that need them).
