@@ -1,0 +1,30 @@
+=== RUN   TestAttemptLeaseAndPortableCheckpoint
+--- PASS: TestAttemptLeaseAndPortableCheckpoint (0.88s)
+=== RUN   TestFencedSessionCanMoveBeforePhysicalCleanup
+--- PASS: TestFencedSessionCanMoveBeforePhysicalCleanup (0.97s)
+=== RUN   TestLeaseBoundaryOnDatabaseClock
+=== RUN   TestLeaseBoundaryOnDatabaseClock/half
+=== RUN   TestLeaseBoundaryOnDatabaseClock/edge
+=== RUN   TestLeaseBoundaryOnDatabaseClock/after
+--- PASS: TestLeaseBoundaryOnDatabaseClock (0.81s)
+    --- PASS: TestLeaseBoundaryOnDatabaseClock/half (0.02s)
+    --- PASS: TestLeaseBoundaryOnDatabaseClock/edge (0.01s)
+    --- PASS: TestLeaseBoundaryOnDatabaseClock/after (0.01s)
+PASS
+ok  	github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence/postgres	2.838s
+=== RUN   TestExpiredResultAdjudicatesControlLoss
+--- PASS: TestExpiredResultAdjudicatesControlLoss (0.00s)
+PASS
+ok  	github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/task	0.580s
+=== RUN   TestLeaseWatchRequiresDefinitiveExpiry
+--- PASS: TestLeaseWatchRequiresDefinitiveExpiry (0.00s)
+PASS
+ok  	github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/runner	0.144s
+=== RUN   TestFencedHandoffDoesNotReportPhysicalStop
+--- PASS: TestFencedHandoffDoesNotReportPhysicalStop (0.00s)
+PASS
+ok  	github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/session	0.435s
+=== RUN   TestFencedPodCleanupWaitsForPhysicalStop
+--- PASS: TestFencedPodCleanupWaitsForPhysicalStop (0.00s)
+PASS
+ok  	github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/resource	0.311s
