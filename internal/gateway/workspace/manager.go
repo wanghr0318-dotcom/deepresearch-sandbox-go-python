@@ -93,6 +93,7 @@ type Config struct {
 	Exec            Execer
 	Access          Access
 	Blobs           Blobs
+	Archive         SnapshotArchive // optional portable checkpoint storage
 	Tasks           Tasks
 	IdleTimeout     time.Duration // default 2 h
 	MaxFiles        int           // default 256 (= exec /out collection cap)
@@ -264,12 +265,13 @@ func okJSON(v any) (call.Result, error) {
 // begin does the access check, locks and loads the workspace, and rejects expired/lost/destroyed ones. Every
 // accepted operation (reads included) refreshes the idle clock. On success the caller must call the returned unlock.
 func (m *Manager) begin(ctx context.Context, r Request) (*ws, *state, func(), call.Result, error) {
-	res, err := m.cfg.Access.CheckAccess(ctx, r.TaskID, r.AttemptID, r.SubrunID)
-	if err != nil || res.Code != "" {
-		return nil, nil, nil, res, err
-	}
 	w := m.get(r.TaskID)
 	w.mu.Lock()
+	res, err := m.cfg.Access.CheckAccess(ctx, r.TaskID, r.AttemptID, r.SubrunID)
+	if err != nil || res.Code != "" {
+		w.mu.Unlock()
+		return nil, nil, nil, res, err
+	}
 	if w.gone {
 		w.mu.Unlock()
 		return nil, nil, nil, fail(http.StatusGone, CodeWorkspaceDestroyed), nil

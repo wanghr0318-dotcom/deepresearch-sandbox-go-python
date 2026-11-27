@@ -123,6 +123,10 @@ func readState(path, taskID string) (*state, error) {
 	if err != nil {
 		return nil, fmt.Errorf("workspace: read state: %w", err)
 	}
+	return decodeState(b, taskID)
+}
+
+func decodeState(b []byte, taskID string) (*state, error) {
 	var s state
 	if err := json.Unmarshal(b, &s); err != nil {
 		return nil, fmt.Errorf("%w: %v", errCorrupt, err)
