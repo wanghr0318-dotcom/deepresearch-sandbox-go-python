@@ -32,3 +32,13 @@ The reference pass releases each checkpoint barrier on B. The node-loss pass ena
 Read summary.json, batch.json, node-samples.jsonl and the per-task result.json, solve-inspect.json and event stream. Cross-check old/new Pod UID, nodeName, checkpoint ID, message hash, successor attempt, successful tool journal and independent checker cases. Compare tasks submitted, tasks affected, tasks recovered and grading checks separately. One B shutdown affecting five sessions contributes one injection. Node samples measure the whole A node. The count of unscheduled Pods applies to the experiment namespace. Keep raw data/ and the Kubernetes watch private because they may contain tokens or Pod launch configuration. Review and redact evidence before publishing.
 
 The B shutdown takes place after a committed checkpoint. For a missing checkpoint upload, a pre-commit failure or a lost acknowledgement, independently record the affected component, the last durable checkpoint and the result of replay. Because the Gateway, PG and COS writer run outside B, shutting down B alone cannot guarantee a particular COS-to-PG timing window. An application injection must be reported separately from a CVM outage. A second takeover and old-worker revocation require additional trials. Confirm B rejoins on its own instance ID and check remaining Pods and authorization after B returns.
+
+## Local checkpoint chain
+
+On Linux with a disposable PostgreSQL admin DSN in AGENTBOX_TEST_DATABASE_URL, run the command below. The PostgreSQL test fixture creates its own short-lived database. The test uses real coordinator authorization, real workspace reads/writes, real PG head selection and separate empty local blob stores. The archive is a filesystem test implementation that interrupts a selected upload after one byte. The checkpoint state contains a deterministic tool cursor. The batch records the complete Agent message hash separately.
+
+```bash
+go test ./internal/persistence/postgres -run '^TestColdWorkspaceCheckpointChain$' -v -count=1
+```
+
+One case exercises two cold restorations. After C1, C2 and C3 complete, a partial C4 upload causes attempt 2 to load C3 from PG and read C3 from the restored file. Attempt 2 successfully publishes C4. After a second simulated fault, attempt 3 loads C4 and its first read returns C4. The [local run log](../../docs/evidence/2026-11-27-phase4-local/cold-chain.log) records these assertions. Cross-node Pod scheduling, real COS and cloud outage timing are measured by their respective cloud trials.

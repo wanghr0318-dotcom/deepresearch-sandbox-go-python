@@ -1,0 +1,6 @@
+=== RUN   TestColdWorkspaceCheckpointChain
+    recovery_chain_test.go:115: C1,C2,C3 committed; C4 upload interrupted after reading one byte
+    recovery_chain_test.go:152: attempt=2 pg_head=C3 next_read=C3
+    recovery_chain_test.go:152: attempt=3 pg_head=C4 next_read=C4
+--- PASS: TestColdWorkspaceCheckpointChain (1.22s)
+PASS
