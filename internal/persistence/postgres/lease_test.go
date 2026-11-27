@@ -207,6 +207,7 @@ func TestRenewalInFlightAndLostReply(t *testing.T) {
 	fixture(t, s, "t1")
 	acquired, release := make(chan struct{}), make(chan struct{})
 	var once, lost atomic.Bool
+	var committedUntil, finalUntil time.Time
 	s.hooks.beforeCommit = func(op string) error {
 		if op == "RenewAttemptLease" && once.CompareAndSwap(false, true) {
 			close(acquired)
@@ -220,6 +221,9 @@ func TestRenewalInFlightAndLostReply(t *testing.T) {
 	}
 	s.hooks.afterCommit = func(op string) error {
 		if op == "RenewAttemptLease" && lost.CompareAndSwap(false, true) {
+			if err := s.pool.QueryRow(ctx, "SELECT lease_expires_at FROM tasks WHERE task_id='t1'").Scan(&committedUntil); err != nil {
+				return err
+			}
 			return errors.New("commit reply lost")
 		}
 		return nil
@@ -242,8 +246,8 @@ func TestRenewalInFlightAndLostReply(t *testing.T) {
 		t.Fatalf("renewal reply lost=%v: %v", lost.Load(), err)
 	}
 	var valid bool
-	err = s.pool.QueryRow(ctx, `SELECT current_attempt_id,lease_expires_at>clock_timestamp() FROM tasks WHERE task_id='t1'`).Scan(&owner, &valid)
-	if err != nil || owner != "att-t1" || !valid {
-		t.Fatalf("grant %s live=%v: %v", owner, valid, err)
+	err = s.pool.QueryRow(ctx, `SELECT current_attempt_id,lease_expires_at>clock_timestamp(),lease_expires_at FROM tasks WHERE task_id='t1'`).Scan(&owner, &valid, &finalUntil)
+	if err != nil || owner != "att-t1" || !valid || !finalUntil.Equal(committedUntil) {
+		t.Fatalf("grant %s live=%v expiry %s after retry %s: %v", owner, valid, committedUntil, finalUntil, err)
 	}
 }

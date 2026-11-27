@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/persistence"
@@ -10,21 +11,26 @@ import (
 
 // RenewAttemptLease extends only the live current grant. An expired owner cannot resurrect itself.
 func (s *Store) RenewAttemptLease(ctx context.Context, taskID, attemptID string) error {
+	// Keep the same expiry when this probe's transaction is retried after an
+	// unknown commit. Only a subsequent live-worker probe earns more time.
+	var until *time.Time
 	return s.run(ctx, "RenewAttemptLease", attemptID, func(ctx context.Context, tx pgx.Tx) error {
 		if err := lockTask(ctx, tx, taskID); err != nil {
 			return err
 		}
-		tag, err := tx.Exec(ctx, `UPDATE tasks t SET lease_expires_at = clock_timestamp() + $3::bigint * interval '1 microsecond'
-   WHERE t.task_id=$1 AND t.current_attempt_id=$2 AND t.lease_expires_at>clock_timestamp()
-   AND $3::bigint > 0 AND EXISTS (SELECT 1 FROM attempt_access aa WHERE aa.attempt_id=$2 AND aa.state='active')
-   AND t.status IN ('running','pausing','cancelling')`, taskID, attemptID, s.opt.AttemptLeaseTTL.Microseconds())
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() != 1 {
+		var confirmed time.Time
+		err := tx.QueryRow(ctx, `UPDATE tasks t
+			SET lease_expires_at=GREATEST(t.lease_expires_at, COALESCE($4::timestamptz,clock_timestamp()+$3::bigint*interval '1 microsecond'))
+			WHERE t.task_id=$1 AND t.current_attempt_id=$2 AND t.lease_expires_at>clock_timestamp()
+			AND $3::bigint>0 AND EXISTS (SELECT 1 FROM attempt_access aa WHERE aa.attempt_id=$2 AND aa.state='active')
+			AND t.status IN ('running','pausing','cancelling') RETURNING lease_expires_at`, taskID, attemptID, s.opt.AttemptLeaseTTL.Microseconds(), until).Scan(&confirmed)
+		if errors.Is(err, pgx.ErrNoRows) {
 			return rejectf(persistence.CodeStaleAttempt, "cannot renew lease for attempt %s", attemptID)
 		}
-		return nil
+		if err == nil {
+			until = &confirmed
+		}
+		return err
 	})
 }
 
