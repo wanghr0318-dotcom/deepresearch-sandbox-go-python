@@ -19,7 +19,23 @@ type COSArchive struct {
 	prefix string
 }
 
-func NewCOSArchive(bucketURL, prefix, secretID, secretKey, sessionToken string) (*COSArchive, error) {
+// COSCredentials selects one signing identity. A named CVM role uses SDK-managed
+// temporary credentials and takes precedence over keys inherited by the process.
+type COSCredentials struct {
+	CVMRole, SecretID, SecretKey, SessionToken string
+}
+
+func (c COSCredentials) transport() (http.RoundTripper, error) {
+	if c.CVMRole != "" {
+		return &cos.CVMCredentialTransport{RoleName: c.CVMRole}, nil
+	}
+	if c.SecretID == "" || c.SecretKey == "" {
+		return nil, fmt.Errorf("COS archive requires a CVM role or credentials")
+	}
+	return &cos.AuthorizationTransport{SecretID: c.SecretID, SecretKey: c.SecretKey, SessionToken: c.SessionToken}, nil
+}
+
+func NewCOSArchive(bucketURL, prefix string, credentials COSCredentials) (*COSArchive, error) {
 	u, err := url.Parse(bucketURL)
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
 		return nil, fmt.Errorf("COS archive requires an HTTPS bucket URL")
@@ -28,12 +44,11 @@ func NewCOSArchive(bucketURL, prefix, secretID, secretKey, sessionToken string) 
 	if prefix == "" || path.Clean(prefix) != prefix || prefix == "." || prefix == ".." || strings.HasPrefix(prefix, "../") {
 		return nil, fmt.Errorf("COS archive requires a valid bucket prefix")
 	}
-	if secretID == "" || secretKey == "" {
-		return nil, fmt.Errorf("COS archive credentials missing")
+	transport, err := credentials.transport()
+	if err != nil {
+		return nil, err
 	}
-	httpClient := &http.Client{Transport: &cos.AuthorizationTransport{
-		SecretID: secretID, SecretKey: secretKey, SessionToken: sessionToken,
-	}}
+	httpClient := &http.Client{Transport: transport}
 	return &COSArchive{client: cos.NewClient(&cos.BaseURL{BucketURL: u}, httpClient), prefix: prefix}, nil
 }
 

@@ -13,7 +13,7 @@ import (
 // Supply a dedicated experiment prefix; the immutable checkpoint is retained there.
 func TestCOSPortableWorkspace(t *testing.T) {
 	archive, err := blob.NewCOSArchive(os.Getenv("AGENTBOX_COS_BUCKET_URL"), os.Getenv("AGENTBOX_COS_PREFIX"),
-		os.Getenv("TENCENTCLOUD_SECRET_ID"), os.Getenv("TENCENTCLOUD_SECRET_KEY"), os.Getenv("TENCENTCLOUD_SESSION_TOKEN"))
+		blob.COSCredentials{CVMRole: os.Getenv("AGENTBOX_COS_CVM_ROLE"), SecretID: os.Getenv("TENCENTCLOUD_SECRET_ID"), SecretKey: os.Getenv("TENCENTCLOUD_SECRET_KEY"), SessionToken: os.Getenv("TENCENTCLOUD_SESSION_TOKEN")})
 	if err != nil {
 		t.Fatal(err)
 	}

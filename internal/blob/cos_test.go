@@ -57,3 +57,21 @@ func TestCOSArchiveObjectRoundTrip(t *testing.T) {
 		t.Fatalf("GET: %q, %v", data, err)
 	}
 }
+
+func TestCOSSigningIdentity(t *testing.T) {
+	for _, creds := range []COSCredentials{{CVMRole: "checkpoint-worker"}, {CVMRole: "checkpoint-worker", SecretID: "unused", SecretKey: "unused"}} {
+		transport, err := creds.transport()
+		role, ok := transport.(*cos.CVMCredentialTransport)
+		if err != nil || !ok || role.RoleName != "checkpoint-worker" {
+			t.Fatalf("role identity selection: %T %v", transport, err)
+		}
+	}
+	transport, err := (COSCredentials{SecretID: "id", SecretKey: "secret", SessionToken: "token"}).transport()
+	keys, ok := transport.(*cos.AuthorizationTransport)
+	if err != nil || !ok || keys.SecretID != "id" || keys.SecretKey != "secret" || keys.SessionToken != "token" {
+		t.Fatalf("explicit identity selection: %T %v", transport, err)
+	}
+	if _, err := (COSCredentials{SecretID: "incomplete"}).transport(); err == nil {
+		t.Fatal("incomplete key credentials accepted")
+	}
+}
