@@ -150,7 +150,7 @@ def grant_snapshot(args, ns, turn):
     return json.loads(subprocess.check_output(cmd,input=sql,text=True,timeout=15))
 
 def main():
-    parser=argparse.ArgumentParser(add_help=False)
+    parser=argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     for key in ["source-node","target-node","instance-id"]:
         parser.add_argument("--"+key,required=True)
     opts,remaining=parser.parse_known_args()
