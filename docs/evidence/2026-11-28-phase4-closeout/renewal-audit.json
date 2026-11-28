@@ -1,0 +1,329 @@
+{
+  "lease_s": 120,
+  "clock_origin": "Last observed successful renewal of original attempt in PostgreSQL",
+  "attempted_preflights": 10,
+  "actual_injections": 9,
+  "source_witness_sha256": "a6b6c9b5d6e9e1724e343aadef1083db85de7fde15c5aa15cf85f6b7cc2c5881",
+  "rounds": [
+    {
+      "round": "01-60",
+      "target_seconds": 60,
+      "cut_after_anchor_s": 0.111,
+      "restore_after_last_renewal_s": 59.973,
+      "actual_cut_s": 59.862,
+      "revoke_after_last_renewal_s": 58.024,
+      "successor_after_last_renewal_s": 62.017,
+      "alive_at_restore": true,
+      "alive_at_handoff": false,
+      "grant_overlap_s": 0,
+      "old_worker_results_after_revoke": 0,
+      "old_checkpoints_after_revoke": 0,
+      "score": [
+        4,
+        4
+      ],
+      "dual_write_count": null,
+      "harmful_false_takeover": null,
+      "old_outcome": "control_lost",
+      "renewed_again": false,
+      "pg_clock_sample_rtt_ms": 87.84,
+      "successor_nodes": [
+        "B"
+      ],
+      "old_environment_fenced_s": null,
+      "old_environment_stopped_s": 60.772,
+      "original_identity_bound": true,
+      "source_sha256": {
+        "boundary.json": "ea10bfed7673f5ef03fc8fd27710b92f2fe579f67d158fb5e7bdaa9665f2b43f",
+        "durable-writes.json": "18065c4ac2336e182585023f8c2de13b9f08ec10b0c8526c11436de97759ca48",
+        "placement-score.json": "4d22a944028a02f88eda86e79ed492d006cc6e03b1c3b754c926a334de49040d",
+        "pg.jsonl": "b82b40f284a332b17e68928c4b517d33d6f57ca898f228873332e23989a75d3b"
+      }
+    },
+    {
+      "round": "02-120",
+      "target_seconds": 120,
+      "cut_after_anchor_s": 0.165,
+      "restore_after_last_renewal_s": 119.97,
+      "actual_cut_s": 119.804,
+      "revoke_after_last_renewal_s": 55.835,
+      "successor_after_last_renewal_s": 122.547,
+      "alive_at_restore": false,
+      "alive_at_handoff": false,
+      "grant_overlap_s": 0,
+      "old_worker_results_after_revoke": 0,
+      "old_checkpoints_after_revoke": 0,
+      "score": [
+        4,
+        4
+      ],
+      "dual_write_count": null,
+      "harmful_false_takeover": null,
+      "old_outcome": "control_lost",
+      "renewed_again": false,
+      "pg_clock_sample_rtt_ms": 91.28,
+      "successor_nodes": [
+        "A"
+      ],
+      "old_environment_fenced_s": null,
+      "old_environment_stopped_s": 120.851,
+      "original_identity_bound": true,
+      "source_sha256": {
+        "boundary.json": "c312ee1fefab23538de4434c30d4f2740a8c9aae1788770121e6ab4690801652",
+        "durable-writes.json": "727855185e5b2eb262f4e3a113465f289404a3e9d06d9bce5ce50d9845070255",
+        "placement-score.json": "d5d557169e8b13c56639f59f379fe3d74d96f677ee9d0b8947462086a41f1e76",
+        "pg.jsonl": "e91636fd58c85aee53adfe957e593d2c450331cb8c76cb1ce2ef2df87b81734e"
+      }
+    },
+    {
+      "round": "03-180",
+      "target_seconds": 180,
+      "cut_after_anchor_s": 0.12,
+      "restore_after_last_renewal_s": 179.972,
+      "actual_cut_s": 179.853,
+      "revoke_after_last_renewal_s": 56.527,
+      "successor_after_last_renewal_s": 149.662,
+      "alive_at_restore": false,
+      "alive_at_handoff": false,
+      "grant_overlap_s": 0,
+      "old_worker_results_after_revoke": 0,
+      "old_checkpoints_after_revoke": 0,
+      "score": [
+        4,
+        4
+      ],
+      "dual_write_count": null,
+      "harmful_false_takeover": null,
+      "old_outcome": "control_lost",
+      "renewed_again": false,
+      "pg_clock_sample_rtt_ms": 87.72,
+      "successor_nodes": [
+        "A"
+      ],
+      "old_environment_fenced_s": 148.547,
+      "old_environment_stopped_s": 181.831,
+      "original_identity_bound": true,
+      "source_sha256": {
+        "boundary.json": "aac90aff6db7126f3f45319697f6fbcebda5caf919f8cde66807329d19f68cd7",
+        "durable-writes.json": "71f8110906e7568d3682f4ce80cd048f56246e2053a93092a585e726257ee1c6",
+        "placement-score.json": "6c280a5c23cffb2b5a06b834d0623903fe446dcd2b12e9e97637c41ca535fce0",
+        "pg.jsonl": "c749b855428921f1e36ddf24b4409cf12ad035a9eb4679a6d3684ee488ac6063"
+      }
+    },
+    {
+      "round": "04-60-retry1",
+      "target_seconds": 60,
+      "cut_after_anchor_s": 0.063,
+      "restore_after_last_renewal_s": 59.971,
+      "actual_cut_s": 59.908,
+      "revoke_after_last_renewal_s": 58.507,
+      "successor_after_last_renewal_s": 62.675,
+      "alive_at_restore": true,
+      "alive_at_handoff": false,
+      "grant_overlap_s": 0,
+      "old_worker_results_after_revoke": 0,
+      "old_checkpoints_after_revoke": 0,
+      "score": [
+        4,
+        4
+      ],
+      "dual_write_count": null,
+      "harmful_false_takeover": null,
+      "old_outcome": "control_lost",
+      "renewed_again": false,
+      "pg_clock_sample_rtt_ms": 88.35,
+      "successor_nodes": [
+        "A"
+      ],
+      "old_environment_fenced_s": null,
+      "old_environment_stopped_s": 60.81,
+      "original_identity_bound": true,
+      "source_sha256": {
+        "boundary.json": "932c6c9651a4a5119757862bad3e8a976a970cc0b7b5e9db8dbda197a22832fc",
+        "durable-writes.json": "371e2c69f4ffaa0e81a75176129bb7649c41c054b39819fb3f42df9f0a13b906",
+        "placement-score.json": "66c33d6106e78783903aa708febab52ba413e14bfcdd8a6ae8313c22310a16b9",
+        "pg.jsonl": "a0878c9c97a1dc90bcea3bfdd393ddabbfdc488e841b36d012e7cc6d6188a9ff"
+      }
+    },
+    {
+      "round": "05-120",
+      "target_seconds": 120,
+      "cut_after_anchor_s": 0.039,
+      "restore_after_last_renewal_s": 119.971,
+      "actual_cut_s": 119.931,
+      "revoke_after_last_renewal_s": 56.288,
+      "successor_after_last_renewal_s": 122.767,
+      "alive_at_restore": false,
+      "alive_at_handoff": false,
+      "grant_overlap_s": 0,
+      "old_worker_results_after_revoke": 0,
+      "old_checkpoints_after_revoke": 0,
+      "score": [
+        4,
+        4
+      ],
+      "dual_write_count": null,
+      "harmful_false_takeover": null,
+      "old_outcome": "control_lost",
+      "renewed_again": false,
+      "pg_clock_sample_rtt_ms": 97.28,
+      "successor_nodes": [
+        "A"
+      ],
+      "old_environment_fenced_s": null,
+      "old_environment_stopped_s": 120.865,
+      "original_identity_bound": true,
+      "source_sha256": {
+        "boundary.json": "65d6211f65e5ed863ce63bb01e5216c7048b3d75b5ba4a3a5722b8a455ff9622",
+        "durable-writes.json": "31eb814f91c6a56a08203eb4a6cc3ac49fe1f00610bb712431a18f409eaba8b9",
+        "placement-score.json": "2e1fd66c527c377c6ce219d40b8aa25cb7bfdbc107925b5d367210ee95b02e89",
+        "pg.jsonl": "19897b8cc638105939ebb5a37d48b77c4d814570cee5da6f918a6c8af4fc5e39"
+      }
+    },
+    {
+      "round": "06-180",
+      "target_seconds": 180,
+      "cut_after_anchor_s": 0.178,
+      "restore_after_last_renewal_s": 179.976,
+      "actual_cut_s": 179.799,
+      "revoke_after_last_renewal_s": 56.167,
+      "successor_after_last_renewal_s": 149.835,
+      "alive_at_restore": false,
+      "alive_at_handoff": false,
+      "grant_overlap_s": 0,
+      "old_worker_results_after_revoke": 0,
+      "old_checkpoints_after_revoke": 0,
+      "score": [
+        4,
+        4
+      ],
+      "dual_write_count": null,
+      "harmful_false_takeover": null,
+      "old_outcome": "control_lost",
+      "renewed_again": false,
+      "pg_clock_sample_rtt_ms": 88.18,
+      "successor_nodes": [
+        "A"
+      ],
+      "old_environment_fenced_s": 148.191,
+      "old_environment_stopped_s": 181.236,
+      "original_identity_bound": true,
+      "source_sha256": {
+        "boundary.json": "8ca4aa769d313316d7762de719d4d0713c2f19cd49659b164b5663de0457c840",
+        "durable-writes.json": "d745b9a7523bb66b5b2d9348e8cb696f0bd44ae6a64d246edae195d828f5e21a",
+        "placement-score.json": "f1175aa1abc1f86d0d0b5743be1f62e4b53ada9fb1f41ba419d524869054b484",
+        "pg.jsonl": "9d17978b6cc76d83e951faff4d08470c9e8dc1babb50ef14ff10fb27e070aee8"
+      }
+    },
+    {
+      "round": "07-60",
+      "target_seconds": 60,
+      "cut_after_anchor_s": 0.183,
+      "restore_after_last_renewal_s": 59.965,
+      "actual_cut_s": 59.782,
+      "revoke_after_last_renewal_s": 59.845,
+      "successor_after_last_renewal_s": 63.795,
+      "alive_at_restore": true,
+      "alive_at_handoff": false,
+      "grant_overlap_s": 0,
+      "old_worker_results_after_revoke": 0,
+      "old_checkpoints_after_revoke": 0,
+      "score": [
+        4,
+        4
+      ],
+      "dual_write_count": null,
+      "harmful_false_takeover": null,
+      "old_outcome": "control_lost",
+      "renewed_again": false,
+      "pg_clock_sample_rtt_ms": 102.78,
+      "successor_nodes": [
+        "A"
+      ],
+      "old_environment_fenced_s": null,
+      "old_environment_stopped_s": 60.825,
+      "original_identity_bound": true,
+      "source_sha256": {
+        "boundary.json": "d150a9ef92fb9f407aa2d075adcce7a2203ac51884419b5285d5df149f3307ef",
+        "durable-writes.json": "380d3ac2e9e7f8e59e5cdf728a14e67f7c61200c54e2fa6edc6d91b229cb53dd",
+        "placement-score.json": "a6c7ba3842202eaab34806fc5dbea28ad90a146954cd6611e21abe1fd21779f8",
+        "pg.jsonl": "2460564cf9f274cce0929b8d0208f88edaebe05b1c9649e0f6b4212950b2bd48"
+      }
+    },
+    {
+      "round": "08-120",
+      "target_seconds": 120,
+      "cut_after_anchor_s": 0.071,
+      "restore_after_last_renewal_s": 119.972,
+      "actual_cut_s": 119.901,
+      "revoke_after_last_renewal_s": 57.619,
+      "successor_after_last_renewal_s": 121.927,
+      "alive_at_restore": false,
+      "alive_at_handoff": false,
+      "grant_overlap_s": 0,
+      "old_worker_results_after_revoke": 0,
+      "old_checkpoints_after_revoke": 0,
+      "score": [
+        4,
+        4
+      ],
+      "dual_write_count": null,
+      "harmful_false_takeover": null,
+      "old_outcome": "control_lost",
+      "renewed_again": false,
+      "pg_clock_sample_rtt_ms": 87.36,
+      "successor_nodes": [
+        "A"
+      ],
+      "old_environment_fenced_s": null,
+      "old_environment_stopped_s": 120.854,
+      "original_identity_bound": true,
+      "source_sha256": {
+        "boundary.json": "d93276976d0196e51bceba1b40580f977b4ba7fe900af909fc69b3488b15f68e",
+        "durable-writes.json": "4d1dc6d048c6bf080eb0dab4f42109a2b95b821fa927b339668d4ea76539972a",
+        "placement-score.json": "1f69862af99411bb3606286c5656026bad261bda3a93507d2f348fe21ecee191",
+        "pg.jsonl": "a792573da796e96f95846609511d234cfc498dfe8445193b216cad5c11c10b10"
+      }
+    },
+    {
+      "round": "09-180",
+      "target_seconds": 180,
+      "cut_after_anchor_s": 0.014,
+      "restore_after_last_renewal_s": 179.971,
+      "actual_cut_s": 179.957,
+      "revoke_after_last_renewal_s": 59.286,
+      "successor_after_last_renewal_s": 121.983,
+      "alive_at_restore": false,
+      "alive_at_handoff": false,
+      "grant_overlap_s": 0,
+      "old_worker_results_after_revoke": 0,
+      "old_checkpoints_after_revoke": 0,
+      "score": [
+        4,
+        4
+      ],
+      "dual_write_count": null,
+      "harmful_false_takeover": null,
+      "old_outcome": "control_lost",
+      "renewed_again": false,
+      "pg_clock_sample_rtt_ms": 89.03,
+      "successor_nodes": [
+        "A"
+      ],
+      "old_environment_fenced_s": 120.303,
+      "old_environment_stopped_s": null,
+      "original_identity_bound": true,
+      "source_sha256": {
+        "boundary.json": "f309042d79765160f5aa153cae7ffce4c90b2fe4335a3d4bc65042fb25bf4f74",
+        "durable-writes.json": "7d22e90fce72d79cec77d010d95a04db61d2ac01e8fec50334a72f84105764a3",
+        "placement-score.json": "b2d1e6aabc7b8da9ae15ae115a14275f754574a31a4659009a3dc88c152a9fca",
+        "pg.jsonl": "2934bf599845b845635bd8ea0c0e8446db87dc745deebb4acdf833c6b7717121"
+      }
+    }
+  ],
+  "excluded_preflight": {
+    "round": "04-60",
+    "injected": false,
+    "reason": "Outbound isolation preflight failed before injection; preserved separately."
+  }
+}

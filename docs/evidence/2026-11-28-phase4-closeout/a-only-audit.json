@@ -1,0 +1,50 @@
+{
+  "a-regression": {
+    "gateway_sha256": "9d1b28edb950d5e9329b7f582c026612fa660b4ed97c0a409c5422f2aaad50e8",
+    "runtime_ms": 10213,
+    "new_attempt_s": 4.666,
+    "successor_exec_ok_s": 7.291,
+    "changed_pod_uid": true,
+    "message_hash_unchanged": true,
+    "prior_tool_ids": [
+      "cpu-0",
+      "cpu-1"
+    ],
+    "cases": {
+      "single_row": true,
+      "ordered_rows": true,
+      "header_only": true,
+      "quoted_comma": true
+    },
+    "residual_resources": [],
+    "evidence_sha256": {
+      "fault.json": "47c6b3edf4fdf93fa1068016f6c25998ef8c5c674a9a89f7dc0da0eed69f18ae",
+      "result.json": "2b61c94f594455f22a1f3b3e3fc8a082e36059fc4cd0b04ae68e684d6e51c895",
+      "events.sse": "b62ec7d57ccbd32beede0fdfa7418771f27cc77f919ee28867a0e2293121ed26"
+    }
+  },
+  "final-regression": {
+    "gateway_sha256": "0c21636184b9a3c130ae455cefd2b8ee320f1bc594810506650cdf09586d5efb",
+    "runtime_ms": 8338,
+    "new_attempt_s": 3.759,
+    "successor_exec_ok_s": 6.432,
+    "changed_pod_uid": true,
+    "message_hash_unchanged": true,
+    "prior_tool_ids": [
+      "cpu-0",
+      "cpu-1"
+    ],
+    "cases": {
+      "single_row": true,
+      "ordered_rows": true,
+      "header_only": true,
+      "quoted_comma": true
+    },
+    "residual_resources": [],
+    "evidence_sha256": {
+      "fault.json": "15edfd9f4d718e0846784970a53e9f2c32bae079dc7adc6f4f7727667dcc9b12",
+      "result.json": "12caa4a3a7206f348857e4a9fea97b81060286bbf070023a13f8d0b255bd2345",
+      "events.sse": "16c9741c77e2a86c9538004aceeacfc7b355142edd40f54d3cacfd4b9df62a23"
+    }
+  }
+}

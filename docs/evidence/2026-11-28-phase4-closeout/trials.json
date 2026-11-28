@@ -1,0 +1,836 @@
+{
+  "lease_s": 120,
+  "control_scan_by_cut": [
+    {
+      "round": "01-20",
+      "actual_s": 20.015,
+      "reason": "same",
+      "timeout_s": null,
+      "revoke_s": 31.323,
+      "grant_s": null,
+      "old_expiry_s": 118.167,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": true,
+      "old_alive_at_grant": null,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 0,
+        "harmful_false_takeover": 0
+      }
+    },
+    {
+      "round": "02-40",
+      "actual_s": 40.007,
+      "reason": "same",
+      "timeout_s": null,
+      "revoke_s": 62.172,
+      "grant_s": null,
+      "old_expiry_s": 117.98,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": true,
+      "old_alive_at_grant": null,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 0,
+        "harmful_false_takeover": 0
+      }
+    },
+    {
+      "round": "03-45",
+      "actual_s": 45.01,
+      "reason": "same",
+      "timeout_s": null,
+      "revoke_s": 57.408,
+      "grant_s": null,
+      "old_expiry_s": 118.267,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": true,
+      "old_alive_at_grant": null,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 0,
+        "harmful_false_takeover": 0
+      }
+    },
+    {
+      "round": "04-50",
+      "actual_s": 50.01,
+      "reason": "same",
+      "timeout_s": null,
+      "revoke_s": 59.476,
+      "grant_s": null,
+      "old_expiry_s": 118.277,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": true,
+      "old_alive_at_grant": null,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 0,
+        "harmful_false_takeover": 0
+      }
+    },
+    {
+      "round": "05-70",
+      "actual_s": 70.011,
+      "reason": "control_early",
+      "timeout_s": 57.738,
+      "revoke_s": 57.746,
+      "grant_s": 73.682,
+      "old_expiry_s": 118.279,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": false,
+      "old_alive_at_grant": false,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 1,
+        "harmful_false_takeover": null
+      }
+    },
+    {
+      "round": "06-90",
+      "actual_s": 90.01,
+      "reason": "lease_fenced",
+      "timeout_s": 59.715,
+      "revoke_s": 59.725,
+      "grant_s": 127.355,
+      "old_expiry_s": 118.184,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": false,
+      "old_alive_at_grant": false,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 1,
+        "control_early_takeover": 0,
+        "harmful_false_takeover": null
+      }
+    },
+    {
+      "round": "07-20",
+      "actual_s": 20.008,
+      "reason": "same",
+      "timeout_s": null,
+      "revoke_s": 33.006,
+      "grant_s": null,
+      "old_expiry_s": 117.944,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": true,
+      "old_alive_at_grant": null,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 0,
+        "harmful_false_takeover": 0
+      }
+    },
+    {
+      "round": "08-40",
+      "actual_s": 40.008,
+      "reason": "same",
+      "timeout_s": null,
+      "revoke_s": 60.169,
+      "grant_s": null,
+      "old_expiry_s": 118.018,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": true,
+      "old_alive_at_grant": null,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 0,
+        "harmful_false_takeover": 0
+      }
+    },
+    {
+      "round": "09-45",
+      "actual_s": 45.011,
+      "reason": "same",
+      "timeout_s": null,
+      "revoke_s": 59.069,
+      "grant_s": null,
+      "old_expiry_s": 117.88,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": true,
+      "old_alive_at_grant": null,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 0,
+        "harmful_false_takeover": 0
+      }
+    },
+    {
+      "round": "10-50",
+      "actual_s": 50.014,
+      "reason": "same",
+      "timeout_s": null,
+      "revoke_s": 56.411,
+      "grant_s": null,
+      "old_expiry_s": 173.151,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": true,
+      "old_alive_at_grant": null,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 0,
+        "harmful_false_takeover": 0
+      }
+    },
+    {
+      "round": "11-70",
+      "actual_s": 70.01,
+      "reason": "control_early",
+      "timeout_s": 58.125,
+      "revoke_s": 58.132,
+      "grant_s": 83.469,
+      "old_expiry_s": 118.375,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": false,
+      "old_alive_at_grant": false,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 1,
+        "harmful_false_takeover": null
+      }
+    },
+    {
+      "round": "12-90",
+      "actual_s": 90.01,
+      "reason": "lease_fenced",
+      "timeout_s": 59.691,
+      "revoke_s": 59.719,
+      "grant_s": 144.072,
+      "old_expiry_s": 117.987,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": false,
+      "old_alive_at_grant": false,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 1,
+        "control_early_takeover": 0,
+        "harmful_false_takeover": null
+      }
+    },
+    {
+      "round": "13-20",
+      "actual_s": 20.009,
+      "reason": "same",
+      "timeout_s": null,
+      "revoke_s": 30.132,
+      "grant_s": null,
+      "old_expiry_s": 118.009,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": true,
+      "old_alive_at_grant": null,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 0,
+        "harmful_false_takeover": 0
+      }
+    },
+    {
+      "round": "14-40",
+      "actual_s": 40.009,
+      "reason": "same",
+      "timeout_s": null,
+      "revoke_s": 61.4,
+      "grant_s": null,
+      "old_expiry_s": 118.161,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": true,
+      "old_alive_at_grant": null,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 0,
+        "harmful_false_takeover": 0
+      }
+    },
+    {
+      "round": "15-45",
+      "actual_s": 45.011,
+      "reason": "same",
+      "timeout_s": null,
+      "revoke_s": 58.138,
+      "grant_s": null,
+      "old_expiry_s": 118.027,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": true,
+      "old_alive_at_grant": null,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 0,
+        "harmful_false_takeover": 0
+      }
+    },
+    {
+      "round": "16-50",
+      "actual_s": 50.01,
+      "reason": "same",
+      "timeout_s": null,
+      "revoke_s": 60.422,
+      "grant_s": null,
+      "old_expiry_s": 118.237,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": true,
+      "old_alive_at_grant": null,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 0,
+        "harmful_false_takeover": 0
+      }
+    },
+    {
+      "round": "17-70",
+      "actual_s": 70.009,
+      "reason": "control_early",
+      "timeout_s": 56.692,
+      "revoke_s": 56.699,
+      "grant_s": 73.175,
+      "old_expiry_s": 117.98,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": false,
+      "old_alive_at_grant": false,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 1,
+        "harmful_false_takeover": null
+      }
+    },
+    {
+      "round": "18-90",
+      "actual_s": 90.012,
+      "reason": "control_early",
+      "timeout_s": 58.96,
+      "revoke_s": 58.967,
+      "grant_s": 107.442,
+      "old_expiry_s": 118.181,
+      "old_alive_at_revoke": true,
+      "old_alive_at_restore": false,
+      "old_alive_at_grant": false,
+      "passed_total_cases": [
+        4,
+        4
+      ],
+      "recorded_grant_overlap_s": 0,
+      "counters": {
+        "lease_expiry_takeover": 0,
+        "control_early_takeover": 1,
+        "harmful_false_takeover": null
+      }
+    }
+  ],
+  "lease_boundary_by_cut": [
+    {
+      "round": "01-60",
+      "grant_s_from_cut": 62.13,
+      "false_takeovers": null,
+      "dual_writes": null,
+      "old_access_revoke_s_from_cut": 57.791,
+      "score": [
+        {
+          "directory": "01-csv-first-row",
+          "verdict": "solved",
+          "cases": {
+            "single_row": true,
+            "ordered_rows": true,
+            "header_only": true,
+            "quoted_comma": true
+          },
+          "source_intact": true
+        }
+      ],
+      "windows": [
+        {
+          "duration_s": 60.014,
+          "old_alive_at_restore": true,
+          "control_failed": true
+        }
+      ]
+    },
+    {
+      "round": "02-108",
+      "grant_s_from_cut": 159.152,
+      "false_takeovers": null,
+      "dual_writes": null,
+      "old_access_revoke_s_from_cut": 58.679,
+      "score": [
+        {
+          "directory": "01-csv-first-row",
+          "verdict": "solved",
+          "cases": {
+            "single_row": true,
+            "ordered_rows": true,
+            "header_only": true,
+            "quoted_comma": true
+          },
+          "source_intact": true
+        }
+      ],
+      "windows": [
+        {
+          "duration_s": 108.014,
+          "old_alive_at_restore": false,
+          "control_failed": true
+        }
+      ]
+    },
+    {
+      "round": "03-132",
+      "grant_s_from_cut": 134.106,
+      "false_takeovers": null,
+      "dual_writes": null,
+      "old_access_revoke_s_from_cut": 56.255,
+      "score": [
+        {
+          "directory": "01-csv-first-row",
+          "verdict": "infrastructure_abort",
+          "cases": null,
+          "source_intact": true
+        }
+      ],
+      "windows": [
+        {
+          "duration_s": 132.01,
+          "old_alive_at_restore": false,
+          "control_failed": true
+        }
+      ]
+    },
+    {
+      "round": "04-jitter",
+      "grant_s_from_cut": null,
+      "false_takeovers": 0,
+      "dual_writes": null,
+      "old_access_revoke_s_from_cut": 111.962,
+      "score": [
+        {
+          "directory": "01-csv-first-row",
+          "verdict": "solved",
+          "cases": {
+            "single_row": true,
+            "ordered_rows": true,
+            "header_only": true,
+            "quoted_comma": true
+          },
+          "source_intact": true
+        }
+      ],
+      "windows": [
+        {
+          "duration_s": 10.008,
+          "old_alive_at_restore": true,
+          "control_failed": true
+        },
+        {
+          "duration_s": 15.011,
+          "old_alive_at_restore": true,
+          "control_failed": true
+        },
+        {
+          "duration_s": 20.009,
+          "old_alive_at_restore": true,
+          "control_failed": true
+        }
+      ]
+    },
+    {
+      "round": "05-60",
+      "grant_s_from_cut": 62.558,
+      "false_takeovers": null,
+      "dual_writes": null,
+      "old_access_revoke_s_from_cut": 55.968,
+      "score": [
+        {
+          "directory": "01-csv-first-row",
+          "verdict": "solved",
+          "cases": {
+            "single_row": true,
+            "ordered_rows": true,
+            "header_only": true,
+            "quoted_comma": true
+          },
+          "source_intact": true
+        }
+      ],
+      "windows": [
+        {
+          "duration_s": 60.011,
+          "old_alive_at_restore": true,
+          "control_failed": true
+        }
+      ]
+    },
+    {
+      "round": "06-108",
+      "grant_s_from_cut": 110.579,
+      "false_takeovers": null,
+      "dual_writes": null,
+      "old_access_revoke_s_from_cut": 58.851,
+      "score": [
+        {
+          "directory": "01-csv-first-row",
+          "verdict": "solved",
+          "cases": {
+            "single_row": true,
+            "ordered_rows": true,
+            "header_only": true,
+            "quoted_comma": true
+          },
+          "source_intact": true
+        }
+      ],
+      "windows": [
+        {
+          "duration_s": 108.011,
+          "old_alive_at_restore": false,
+          "control_failed": true
+        }
+      ]
+    },
+    {
+      "round": "07-132",
+      "grant_s_from_cut": 149.636,
+      "false_takeovers": null,
+      "dual_writes": null,
+      "old_access_revoke_s_from_cut": 55.897,
+      "score": [
+        {
+          "directory": "01-csv-first-row",
+          "verdict": "other",
+          "cases": null,
+          "source_intact": true
+        }
+      ],
+      "windows": [
+        {
+          "duration_s": 132.01,
+          "old_alive_at_restore": false,
+          "control_failed": true
+        }
+      ]
+    },
+    {
+      "round": "08-jitter",
+      "grant_s_from_cut": null,
+      "false_takeovers": 0,
+      "dual_writes": null,
+      "old_access_revoke_s_from_cut": 112.76,
+      "score": [
+        {
+          "directory": "01-csv-first-row",
+          "verdict": "solved",
+          "cases": {
+            "single_row": true,
+            "ordered_rows": true,
+            "header_only": true,
+            "quoted_comma": true
+          },
+          "source_intact": true
+        }
+      ],
+      "windows": [
+        {
+          "duration_s": 10.012,
+          "old_alive_at_restore": true,
+          "control_failed": true
+        },
+        {
+          "duration_s": 15.014,
+          "old_alive_at_restore": true,
+          "control_failed": true
+        },
+        {
+          "duration_s": 20.016,
+          "old_alive_at_restore": true,
+          "control_failed": true
+        }
+      ]
+    },
+    {
+      "round": "09-60",
+      "grant_s_from_cut": 62.322,
+      "false_takeovers": null,
+      "dual_writes": null,
+      "old_access_revoke_s_from_cut": 55.242,
+      "score": [
+        {
+          "directory": "01-csv-first-row",
+          "verdict": "solved",
+          "cases": {
+            "single_row": true,
+            "ordered_rows": true,
+            "header_only": true,
+            "quoted_comma": true
+          },
+          "source_intact": true
+        }
+      ],
+      "windows": [
+        {
+          "duration_s": 60.008,
+          "old_alive_at_restore": true,
+          "control_failed": true
+        }
+      ]
+    },
+    {
+      "round": "10-108",
+      "grant_s_from_cut": 121.774,
+      "false_takeovers": null,
+      "dual_writes": null,
+      "old_access_revoke_s_from_cut": 59.538,
+      "score": [
+        {
+          "directory": "01-csv-first-row",
+          "verdict": "solved",
+          "cases": {
+            "single_row": true,
+            "ordered_rows": true,
+            "header_only": true,
+            "quoted_comma": true
+          },
+          "source_intact": true
+        }
+      ],
+      "windows": [
+        {
+          "duration_s": 108.011,
+          "old_alive_at_restore": false,
+          "control_failed": true
+        }
+      ]
+    },
+    {
+      "round": "11-132",
+      "grant_s_from_cut": 148.651,
+      "false_takeovers": null,
+      "dual_writes": null,
+      "old_access_revoke_s_from_cut": 55.166,
+      "score": [
+        {
+          "directory": "01-csv-first-row",
+          "verdict": "solved",
+          "cases": {
+            "single_row": true,
+            "ordered_rows": true,
+            "header_only": true,
+            "quoted_comma": true
+          },
+          "source_intact": true
+        }
+      ],
+      "windows": [
+        {
+          "duration_s": 132.017,
+          "old_alive_at_restore": false,
+          "control_failed": true
+        }
+      ]
+    },
+    {
+      "round": "12-jitter",
+      "grant_s_from_cut": null,
+      "false_takeovers": 0,
+      "dual_writes": null,
+      "old_access_revoke_s_from_cut": 112.202,
+      "score": [
+        {
+          "directory": "01-csv-first-row",
+          "verdict": "solved",
+          "cases": {
+            "single_row": true,
+            "ordered_rows": true,
+            "header_only": true,
+            "quoted_comma": true
+          },
+          "source_intact": true
+        }
+      ],
+      "windows": [
+        {
+          "duration_s": 10.01,
+          "old_alive_at_restore": true,
+          "control_failed": true
+        },
+        {
+          "duration_s": 15.01,
+          "old_alive_at_restore": true,
+          "control_failed": true
+        },
+        {
+          "duration_s": 20.011,
+          "old_alive_at_restore": true,
+          "control_failed": true
+        }
+      ]
+    }
+  ],
+  "slow_model": [
+    {
+      "round": "test-1",
+      "elapsed_s": 145.0006,
+      "pg_samples_in_wait": 35,
+      "distinct_lease_expiries": 4,
+      "worker_events_in_http_wait": [],
+      "attempts": 1,
+      "pg_owners_in_wait": 1,
+      "answer_marker_seen": true,
+      "result": "succeeded"
+    },
+    {
+      "round": "test-2",
+      "elapsed_s": 145.0006,
+      "pg_samples_in_wait": 35,
+      "distinct_lease_expiries": 4,
+      "worker_events_in_http_wait": [],
+      "attempts": 1,
+      "pg_owners_in_wait": 1,
+      "answer_marker_seen": true,
+      "result": "succeeded"
+    },
+    {
+      "round": "test-3",
+      "elapsed_s": 145.0007,
+      "pg_samples_in_wait": 35,
+      "distinct_lease_expiries": 4,
+      "worker_events_in_http_wait": [],
+      "attempts": 1,
+      "pg_owners_in_wait": 1,
+      "answer_marker_seen": true,
+      "result": "succeeded"
+    }
+  ],
+  "independent_writer": {
+    "operation_counts": {
+      "renew": {
+        "attempts": 2,
+        "connection_failures": 1,
+        "entry_rejections": 0,
+        "pg_rejections": 1,
+        "accepted": 0,
+        "unknown": 0,
+        "reconnected_attempts": 1,
+        "reconnect_denial_verified": true
+      },
+      "checkpoint": {
+        "attempts": 2,
+        "connection_failures": 1,
+        "entry_rejections": 0,
+        "pg_rejections": 1,
+        "accepted": 0,
+        "unknown": 0,
+        "reconnected_attempts": 1,
+        "reconnect_denial_verified": true
+      },
+      "file_head": {
+        "attempts": 2,
+        "connection_failures": 1,
+        "entry_rejections": 1,
+        "pg_rejections": 0,
+        "accepted": 0,
+        "unknown": 0,
+        "reconnected_attempts": 1,
+        "reconnect_denial_verified": true
+      },
+      "final_result": {
+        "attempts": 2,
+        "connection_failures": 1,
+        "entry_rejections": 0,
+        "pg_rejections": 1,
+        "accepted": 0,
+        "unknown": 0,
+        "reconnected_attempts": 1,
+        "reconnect_denial_verified": true
+      }
+    },
+    "successor_unchanged": {
+      "owner": "att2-fence-one",
+      "checkpoint": "current",
+      "head": "98d296823acb68184eaebdb78e9282b63e1aec3b4d469ef576fb2952893a9d10",
+      "content_sha256": "548e56fceb6ba189d7cd154c1a0af13de44f8cbfdb454a98ee9ebf3c10d30479",
+      "result_ref": "successor-result",
+      "lease_expiry": "2026-11-28T04:49:19.099542Z"
+    },
+    "heartbeat_samples": 111,
+    "elapsed_last_renew_to_successor_s": 120.168884
+  }
+}

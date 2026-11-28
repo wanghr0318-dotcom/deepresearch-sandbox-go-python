@@ -1,0 +1,48 @@
+{
+  "attempt_node_order": [
+    "B",
+    "A",
+    "B"
+  ],
+  "source_uid_distinct": 3,
+  "three_grants_retired": true,
+  "old_access_revoked_before_next_created": [
+    true,
+    true
+  ],
+  "c4_candidate_uncommitted_at_first_fault": true,
+  "b_ready_without_displacing_a": true,
+  "hop_signatures": [
+    {
+      "checkpoint": "caf14637a1ed4444b171d43e5154807d",
+      "messages": "caab9c6944deb85a243e31a06de87c5221887fd7bb5e6386814f860b63b42fd1",
+      "tool_ids": [
+        "cpu-0",
+        "cpu-1",
+        "cpu-2",
+        "cpu-3"
+      ],
+      "file_sha256": "e0b0adb80bb491174e9fe5676d0d13885b0b07d5ae0b026417f635a9e0c8959f"
+    },
+    {
+      "checkpoint": "35959b4c140a400a99e51c0856657ccf",
+      "messages": "11e0a63f67aea7cb6fc84c65c16a4b7092a5e1e654d56843df42bbe5f9624653",
+      "tool_ids": [
+        "cpu-0",
+        "cpu-1",
+        "cpu-2",
+        "cpu-3",
+        "cpu-4"
+      ],
+      "file_sha256": "70fc50c2cfa35b311191ac1a90d536023a3da8d74a9eb9e4095c6eb8e0cb950e"
+    }
+  ],
+  "remaining_resources": [],
+  "checks": {
+    "single_row": true,
+    "ordered_rows": true,
+    "header_only": true,
+    "quoted_comma": true
+  },
+  "whole_turn_s": 175.962
+}
