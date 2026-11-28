@@ -65,6 +65,16 @@ def summarize(path, witnesses):
         names={v["witness"]["pod"] for v in placement["restore_witnesses"] if v["witness"]["attempt"]==successor_row["attempt_id"]}
         nodes={p["node"] for p in placement["pods"] if p["pod"] in names and p.get("node")}
         new_nodes.append(next(iter(nodes)) if len(nodes)==1 else None)
+    environment=next((e for e in ledger.get("environments",[]) if e["env_id"]==attempts[0]["env_id"]),{})
+    stopped, fenced = environment.get("stopped"), environment.get("fenced")
+    if successor is None:
+        retirement = None
+    elif stopped is not None and stopped <= successor:
+        retirement = "stopped"
+    elif fenced is not None and fenced <= successor:
+        retirement = "fenced"
+    else:
+        retirement = "unverified"
     old_events=[v for v in ledger["events"] if v["attempt_id"]==old and v["source"]=="worker" and v["type"]=="result"]
     overlap=None
     if len(attempts)==1 and ledger["pg"]["status"] in ("succeeded","failed","cancelled"):
@@ -83,6 +93,8 @@ def summarize(path, witnesses):
             "old_outcome":attempts[0].get("outcome_class"),"old_process_identity":ident,
             "alive_at_restore":alive(worker,restore),"alive_at_handoff":alive(worker,successor),
             "old_node":boundary["old"]["node"],"successor_nodes":new_nodes,
+            "old_env_retirement_at_grant":retirement,"old_env_stopped_after_last_renewal_s":since_renewal(stopped),
+            "old_env_fenced_after_last_renewal_s":since_renewal(fenced),
             "grant_overlap_s":overlap,"old_worker_results_after_revoke":sum(v["ts"]>revoked for v in old_events) if revoked else None,
             "old_checkpoints_after_revoke":sum(c["attempt_id"]==old and c["committed"]>revoked for c in ledger["checkpoints"]) if revoked else None,
             "dual_write_count":None,"harmful_false_takeover":None,
