@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -174,7 +175,14 @@ func TestSingleAttemptCloudAdapter(t *testing.T) {
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(fields)
 	})
-	l, err := net.Listen("tcp", "127.0.0.1:19489")
+	port := 19489
+	if value := os.Getenv("AGENTBOX_SINGLE_ATTEMPT_PORT"); value != "" {
+		port, err = strconv.Atoi(value)
+		if err != nil || port < 1 || port > 65535 {
+			t.Fatal("AGENTBOX_SINGLE_ATTEMPT_PORT must be in the range 1..65535")
+		}
+	}
+	l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 	must(err)
 	httpServer := &http.Server{Handler: mux, ReadTimeout: 3 * time.Second, WriteTimeout: 5 * time.Second, MaxHeaderBytes: 8192}
 	go func() { _ = httpServer.Serve(l) }()

@@ -145,7 +145,12 @@ def verify_transport(rows, nodes, writer, result):
                               ("pid", "pid"), ("start_ticks", "start_ticks")):
             if str(witness[field]).lower() != str(writer[0][source]).lower():
                 raise ValueError(f"independent B witness differs on {field}")
-    if any(nodes["nodes"].get(host) != "True" for host in ("vm-0-6-ubuntu", "vm-0-13-ubuntu")):
+    setup_nodes = [r["nodes"] for r in rows if r["event"] == "setup" and isinstance(r.get("nodes"), dict)]
+    if len(setup_nodes) != 1 or len(setup_nodes[0]) != 2:
+        raise ValueError("expected the two experiment node identities in the setup witness")
+    if writer[0]["b_host"].lower() not in {host.lower() for host in setup_nodes[0]}:
+        raise ValueError("B writer does not belong to either setup node")
+    if any(nodes["nodes"].get(host) != "True" for host in setup_nodes[0]):
         raise ValueError("final A/B Ready not verified")
     return dict(final_nodes=nodes["nodes"], restore_authorized_utc=checks[-1]["utc"],
                 pg_successor_confirmed_utc=after["utc"])

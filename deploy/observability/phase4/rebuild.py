@@ -65,6 +65,7 @@ def run(args):
     os.umask(0o077)
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
+    (root/".gitignore").write_text("*\n")
     graf, prom, metrics = local_ports([args.grafana_port, args.prometheus_port, args.metrics_port])
     replay = root / "replay"
     subprocess.run([sys.executable, str(REPO/"eval/phase4/dashboard_archive.py"), "replay",

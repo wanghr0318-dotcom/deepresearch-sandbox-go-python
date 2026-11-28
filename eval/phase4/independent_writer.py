@@ -1,5 +1,6 @@
 """One-round B witness for the isolated phase-four test adapter."""
 
+import argparse
 import datetime
 import json
 import os
@@ -11,14 +12,20 @@ import urllib.request
 import uuid
 
 
-ROOT = pathlib.Path("/var/tmp/abx-reconnect-20261128")
-ENDPOINT = "http://127.0.0.1:19489"
 OPERATIONS = ("renew", "checkpoint", "file_head", "final_result")
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def main():
-    token = (ROOT / "token").read_text().strip()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--state-dir", type=pathlib.Path, default=pathlib.Path("/var/tmp/abx-reconnect-20261128"),
+                        help="Private directory containing token and operator cut.flag")
+    parser.add_argument("--port", type=int, default=19489, help="Local loopback port forwarded to the test adapter")
+    args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be in the range 1..65535")
+    endpoint = f"http://127.0.0.1:{args.port}"
+    token = (args.state_dir / "token").read_text().strip()
     if not token:
         raise ValueError("test binding missing")
     pid = os.getpid()
@@ -40,7 +47,7 @@ def main():
             headers["X-Attempt-ID"] = old
         if op_id:
             headers["X-Operation-ID"] = op_id
-        req = urllib.request.Request(ENDPOINT + path, headers=headers,
+        req = urllib.request.Request(endpoint + path, headers=headers,
                                      method="POST" if op_id else "GET",
                                      data=b"" if op_id else None)
         try:
@@ -91,7 +98,7 @@ def main():
                 return
         elif old and error:
             failures += 1
-            if (ROOT / "cut.flag").exists() and not isolated:
+            if (args.state_dir / "cut.flag").exists() and not isolated:
                 isolated = True
                 record("disconnected", old_attempt=old, error=error)
                 write("isolated")

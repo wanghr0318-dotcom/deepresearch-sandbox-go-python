@@ -23,7 +23,7 @@ On Ubuntu amd64 with Python 3.11+ and dpkg-deb, run the following from the repos
 
 ~~~sh
 python3 deploy/observability/phase4/rebuild.py \
-  --output "$PWD/monitor-rebuild" --archive inputs.jsonl.gz \
+  --output "$HOME/monitor-rebuild" --archive inputs.jsonl.gz \
   --grafana-deb "$GRAFANA_DEB" --grafana-sha256 "$GRAFANA_SHA256" \
   --prometheus-deb "$PROMETHEUS_DEB" --prometheus-sha256 "$PROMETHEUS_SHA256" \
   --node-a node-a.internal.example:9100 --node-b node-b.internal.example:9100
