@@ -1,0 +1,12 @@
+[Unit]
+Description=abx-phase4-grafana
+After=network.target
+[Service]
+DynamicUser=yes
+NoNewPrivileges=yes
+Restart=on-failure
+StateDirectory=abx-grafana
+EnvironmentFile=/opt/agentbox-phase4-monitor/admin-secret
+ExecStart=/opt/agentbox-phase4-monitor/grafana-bin/usr/share/grafana/bin/grafana server --homepath=/opt/agentbox-phase4-monitor/grafana-bin/usr/share/grafana --config=/opt/agentbox-phase4-monitor/grafana.ini
+[Install]
+WantedBy=multi-user.target

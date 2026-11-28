@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 10s
+scrape_configs:
+  - job_name: phase4
+    static_configs:
+      - targets: ['node-a.internal.example:19467']
+  - job_name: node
+    static_configs:
+      - targets: ['node-a.internal.example:9100']
+        labels: {node: A}
+      - targets: ['node-b.internal.example:9100']
+        labels: {node: B}
+  - job_name: phase4-monitor
+    static_configs:
+      - targets: ['127.0.0.1:3000']
+        labels: {component: grafana, node: C}
+      - targets: ['127.0.0.1:9090']
+        labels: {component: prometheus, node: C}
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'process_cpu_seconds_total|process_resident_memory_bytes|process_start_time_seconds'
+        action: keep

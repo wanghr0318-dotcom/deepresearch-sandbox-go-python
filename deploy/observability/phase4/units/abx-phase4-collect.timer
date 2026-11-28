@@ -1,0 +1,8 @@
+[Unit]
+Description=Update phase four metrics
+[Timer]
+OnBootSec=10s
+OnUnitInactiveSec=10s
+AccuracySec=1s
+[Install]
+WantedBy=timers.target

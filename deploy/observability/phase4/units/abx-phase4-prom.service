@@ -1,0 +1,11 @@
+[Unit]
+Description=abx-phase4-prom
+After=network.target
+[Service]
+DynamicUser=yes
+NoNewPrivileges=yes
+Restart=on-failure
+StateDirectory=abx-prom
+ExecStart=/opt/agentbox-phase4-monitor/prom-bin/usr/bin/prometheus --config.file=/opt/agentbox-phase4-monitor/prom.yml --storage.tsdb.path=/var/lib/abx-prom --storage.tsdb.retention.time=3d --web.listen-address=127.0.0.1:9090
+[Install]
+WantedBy=multi-user.target

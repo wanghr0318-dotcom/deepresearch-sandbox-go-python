@@ -1,0 +1,6 @@
+apiVersion: 1
+providers:
+- name: Phase4
+  type: file
+  options:
+    path: /opt/agentbox-phase4-monitor/boards

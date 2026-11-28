@@ -1,0 +1,68 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>阶段四 · 逐任务恢复记录</title><style>body{font:16px system-ui,sans-serif;color:#172c39;background:#f5f7f8;margin:2.5vw}h1{font-size:1.55rem}select,input{font:inherit;padding:.4em;max-width:100%;margin-right:1em}table{border-collapse:collapse;background:white;font-size:.9rem;width:100%}th,td{text-align:left;padding:.6em;border-bottom:1px solid #dce2e4}th{position:sticky;top:0;background:#dbe8eb}p{line-height:1.6}td.num{font-variant-numeric:tabular-nums}main{overflow:auto;max-height:68vh}</style><h1>阶段四 · 逐任务恢复记录</h1><p><span id="source">实时数据 · 每 30 秒更新</span>　<a href="/d/agentbox-phase4/53382cb">打开实时 Grafana</a></p><label>轮次 <select id="round"><option value="">全部</option></select></label><label>任务 <input id="filter" placeholder="任务名或任务 ID"></label><p id="count"></p><main><table><thead><tr><th>轮次<th>任务<th>原节点<th>旧租约期限¹<th>旧主隔离¹<th>新 attempt 创建¹<th>PG 观察到新主¹<th>等恢复槽（秒）<th>获槽到工具成功（秒）<th>首次工具成功¹<th>最终结论<th>用例通过</tr></thead><tbody></tbody></table></main><p>¹ 相对该轮故障注入的秒数。工具成功指恢复后首次成功执行 exec_shell。空白表示没有对应证据或该项不适用。</p><script>
+let data={};const  sel=document.querySelector("#round"), input=document.querySelector("#filter"), body=document.querySelector("tbody");
+Object.keys(data).sort().forEach(k=>sel.add(new Option(k,k)));
+function draw() {
+  body.replaceChildren();
+  let count = 0;
+  for (const [run, tasks] of Object.entries(data)) {
+    if (sel.value && sel.value !== run) continue;
+    for (const [id, task] of Object.entries(tasks)) {
+      if (!(task.task + " " + id).includes(input.value.trim())) continue;
+      count++;
+      const intervals = task.hops?.length ? task.hops : [task];
+      intervals.forEach((r, i) => {
+        const tr = body.insertRow();
+        tr.title = id;
+        const finalRow = i === intervals.length - 1;
+        const name = intervals.length > 1 ? task.task + " · 第 " + (i+1) + " 跳" : task.task;
+        const grade = finalRow && task.total != null ? task.passed + "/" + task.total : "";
+        for (const value of [run,name,r.node ?? task.node,r.expiry,r.fenced,r.new_attempt,
+             r.owner_observed,r.wait,r.recovery,r.exec_ok,finalRow ? task.verdict : "",grade]) {
+          tr.insertCell().textContent = typeof value === "number" ? value.toFixed(3) : value ?? "";
+        }
+      });
+    }
+  }
+  document.querySelector("#count").textContent = count + " 个任务";
+}
+sel.onchange=input.oninput=draw;
+function populate(next) {
+  data=next;
+  const old=sel.value;
+  sel.length=1;
+  Object.keys(data).sort().forEach(k=>sel.add(new Option(k,k)));
+  sel.value=old;
+  draw();
+}
+async function refresh(){
+ try {
+  const expr='{__name__=~"agentbox_phase4_(task_info|event_offset_seconds|duration_seconds|grade_cases)"}';
+  const response=await fetch('/api/datasources/proxy/uid/prometheus/api/v1/query?query='+encodeURIComponent(expr));if(!response.ok)throw Error(response.status);
+  const payload=await response.json();if(payload.status!=='success')throw Error(payload.error);
+  const next={};
+  for (const series of payload.data.result) {
+    const m = series.metric;
+    const tasks = next[m.round] ??= {};
+    const r = tasks[m.turn] ??= {task:m.task, verdict:m.verdict};
+    const key = m.event || m.stage || m.count;
+    if (m.hop) {
+      const hops = r.hops ??= [];
+      const h = hops[Number(m.hop)-1] ??= {node:m.node};
+      if (key) h[key] = Number(series.value[1]);
+    } else {
+      r.node=m.node;
+      if (key) r[key] = Number(series.value[1]);
+    }
+  }
+  populate(next);
+ }catch(e){document.querySelector('#count').textContent='数据刷新失败 · '+e.message;}
+ finally{setTimeout(refresh,30000);}
+}
+const offline = document.getElementById("offline-rows");
+if (offline) {
+  document.getElementById("source").textContent = "离线快照";
+  populate(JSON.parse(offline.textContent));
+} else {
+  refresh();
+}
+</script></html>
