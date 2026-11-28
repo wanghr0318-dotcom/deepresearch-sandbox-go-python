@@ -16,3 +16,19 @@ python3 eval/phase4/dashboard_archive.py replay inputs.jsonl.gz replay --html-te
 ~~~
 
 Open `replay/task-dashboard.html` locally. Offline replay reconstructs task evidence without contacting the cluster. Host resource samples remain in Prometheus. Archives may contain hostnames and task identifiers; keep them with the original experiment evidence.
+
+## Rebuild from packages and a task archive
+
+On Ubuntu amd64 with Python 3.11+ and dpkg-deb, run the following from the repository root. Supply the matching Grafana and Prometheus Debian packages, their independently recorded SHA-256 values, the archive, and the two private node_exporter endpoints. The destination must be new. The experiment hostnames in this example are placeholders.
+
+~~~sh
+python3 deploy/observability/phase4/rebuild.py \
+  --output "$PWD/monitor-rebuild" --archive inputs.jsonl.gz \
+  --grafana-deb "$GRAFANA_DEB" --grafana-sha256 "$GRAFANA_SHA256" \
+  --prometheus-deb "$PROMETHEUS_DEB" --prometheus-sha256 "$PROMETHEUS_SHA256" \
+  --node-a node-a.internal.example:9100 --node-b node-b.internal.example:9100
+~~~
+
+The command extracts both packages, generates a private administrator password, provisions the data source and dashboard, and starts new databases on dynamically selected loopback ports. It checks all five targets, the archived task identities and administrator authentication before shutting down the test processes. Read `monitor-rebuild/proof.json` for the outcome; the administrator credential stays in a separate private file.
+
+For a continuously running stack, append `--serve` and select stable, free ports with `--grafana-port` and `--prometheus-port`. Supply `--task-target controller.internal.example:19467` to read live task records. With the default task source, the installed dashboard serves the replayed archive. Configure the included systemd units separately for machine boot, using the actual installation paths. Historical host-resource samples require a TSDB backup; the task archive restores task events and scores.
