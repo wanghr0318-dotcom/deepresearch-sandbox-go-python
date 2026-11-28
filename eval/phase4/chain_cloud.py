@@ -1,4 +1,24 @@
-"""Exercise two recoveries on one turn, with a verified CVM stop and one test Pod deletion."""
+"""Run from the control-plane host with working k3s, tccli and configured COS credentials.
+
+Supply the two Kubernetes node names and the worker CVM ID. The worker is powered
+off once; the control-plane node stays online. Use a new evidence directory.
+
+Example (shell variables supplied by the operator):
+
+    python3 eval/phase4/chain_cloud.py --source-node "$WORKER_NODE" \
+      --target-node "$CONTROL_NODE" --instance-id "$WORKER_CVM_ID" \
+      --agentbox "$GATEWAY_BIN" --worker-image "$LOCAL_WORKER_IMAGE_DIGEST" \
+      --relay-listen "$CONTROL_PRIVATE_IP:$RELAY_PORT" --model phase4-cpu \
+      --evidence "$NEW_RUN_DIR" --timeout 500
+
+TENCENTCLOUD_REGION and the gateway's configured artifact-store environment
+must be in the runner's environment. The safety check matches CVM private IP
+and ID to the worker, rejects control-plane nodes and polls both nodes plus the
+worker kubelet after restoring power. Rerun just the restoration via:
+
+    python3 eval/phase4/stop_worker.py "$WORKER_CVM_ID" "$WORKER_NODE" \
+      --restore-with-peer "$CONTROL_NODE"
+"""
 import argparse
 import json
 import os
@@ -8,7 +28,7 @@ import sys
 import time
 
 from scenarios import BASE, FIXTURES, SOURCES
-from stop_worker import stop_worker
+from stop_worker import restore_worker, stop_worker
 from verify_chain import verify
 
 WORKER = """
@@ -109,7 +129,8 @@ def inject(opts,args,url,turn,token,ns):
         evidence["before_start"]=verify_owner(c4["attempt"],c4["checkpoint"])
         save()
     finally:
-        subprocess.run([sys.executable,opts.restore_controller,"recover"],check=True,timeout=520)
+        restored=restore_worker(opts.instance_id, opts.source_node, opts.target_node, os.environ["TENCENTCLOUD_REGION"])
+        (args.evidence/"restoration.json").write_bytes(BASE["encode"](restored))
     assert second["uid"]==resumed["uid"] and second["uid"]!=first["uid"]
     evidence["after_b_ready"]=verify_owner(c4["attempt"],c4["checkpoint"])
     pod=json.loads(subprocess.check_output(kube+["get","pod",second["pod"],"-o","json"]))
@@ -130,7 +151,7 @@ def grant_snapshot(args, ns, turn):
 
 def main():
     parser=argparse.ArgumentParser(add_help=False)
-    for key in ["source-node","target-node","instance-id","restore-controller"]:
+    for key in ["source-node","target-node","instance-id"]:
         parser.add_argument("--"+key,required=True)
     opts,remaining=parser.parse_known_args()
     sys.argv=[sys.argv[0],*remaining,"--scripted","--fixture",str(FIXTURES["csv-first-row"])]
