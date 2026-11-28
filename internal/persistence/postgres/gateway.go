@@ -106,6 +106,40 @@ func checkAccessTx(ctx context.Context, tx pgx.Tx, taskID, attemptID, subrunID s
 	return admitAccess(f)
 }
 
+// WithWorkspaceWrite uses a single lock-only transaction. The callback may have changed the
+// filesystem even if its caller loses a reply, so it must never run inside the SQL retry loop.
+func (s *Store) WithWorkspaceWrite(caller context.Context, taskID, attemptID, subrunID string, publish func() error) error {
+	ctx, cancel, err := s.opContext(caller)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return s.final(caller, ctx, "WithWorkspaceWrite", taskID, nil, false, err)
+	}
+	defer rollback(tx) // the transaction has no database writes; releasing the locks is sufficient
+	if _, err = tx.Exec(ctx, "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
+		durationSetting(s.opt.LockTimeout), durationSetting(s.opt.StatementTimeout)); err == nil {
+		err = checkAccessTx(ctx, tx, taskID, attemptID, subrunID)
+	}
+	if err != nil {
+		return s.final(caller, ctx, "WithWorkspaceWrite", taskID, nil, false, err)
+	}
+	// Acquiring control/subrun/access locks may have waited past the lease checked in checkAccessTx.
+	var live bool
+	if err := tx.QueryRow(ctx, "SELECT lease_expires_at IS NULL OR lease_expires_at > clock_timestamp() FROM tasks WHERE task_id=$1", taskID).Scan(&live); err != nil {
+		return s.final(caller, ctx, "WithWorkspaceWrite", taskID, nil, false, err)
+	}
+	if !live {
+		return rejectf(persistence.CodeNotCurrentAttempt, "attempt %s lease expired", attemptID)
+	}
+	if err := ctx.Err(); err != nil {
+		return s.final(caller, ctx, "WithWorkspaceWrite", taskID, nil, false, err)
+	}
+	return publish()
+}
+
 // lockBudget 锁住任务的账本行。
 func lockBudget(ctx context.Context, tx pgx.Tx, taskID string) (call.Budget, error) {
 	var b call.Budget

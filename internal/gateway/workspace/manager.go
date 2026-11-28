@@ -74,6 +74,7 @@ type Execer interface {
 // Access is the §9.2 access check (*call.Coordinator).
 type Access interface {
 	CheckAccess(ctx context.Context, taskID, attemptID, subrunID string) (call.Result, error)
+	PublishWorkspace(ctx context.Context, taskID, attemptID, subrunID string, publish func() error) (call.Result, error)
 }
 
 // Blobs is the BlobStore subset used here.
@@ -238,16 +239,35 @@ func (m *Manager) checkBlobs(st *state) error {
 	return nil
 }
 
-// commit persists next and makes it current (caller holds w.mu). On failure the current state is unchanged.
-func (m *Manager) commit(w *ws, next *state) error {
+// commit stages the complete state before final admission. Only the atomic rename and the
+// in-memory head change run under the store's authorization locks. The caller holds w.mu.
+func (m *Manager) commit(ctx context.Context, r Request, w *ws, next *state) call.Result {
 	next.Version = version(next.Files)
 	next.UsedAt = m.cfg.Now()
 	next.Ops++
-	if err := writeState(m.cfg.Dir, next); err != nil {
-		return err
+	tmp, err := stageState(m.cfg.Dir, next)
+	if err == nil {
+		defer os.Remove(tmp)
+		var res call.Result
+		res, err = m.cfg.Access.PublishWorkspace(ctx, r.TaskID, r.AttemptID, r.SubrunID, func() error {
+			if err := os.Rename(tmp, filepath.Join(m.cfg.Dir, fileName(next.TaskID))); err != nil {
+				return err
+			}
+			w.st, w.savedUse = next, next.UsedAt
+			return nil
+		})
+		if res.Code != "" {
+			return res
+		}
+		if err == nil {
+			err = syncDir(m.cfg.Dir)
+		}
 	}
-	w.st, w.savedUse = next, next.UsedAt
-	return nil
+	if err != nil {
+		m.log.Error("gateway: workspace publication failed", "task_id", r.TaskID, "err", err)
+		return fail(http.StatusServiceUnavailable, CodeStoreUnavailable)
+	}
+	return call.Result{}
 }
 
 func fail(status int, code string) call.Result { return call.Result{Status: status, Code: code} }

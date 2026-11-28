@@ -248,9 +248,8 @@ func (m *Manager) Write(ctx context.Context, r Request) (res call.Result, err er
 	next.Files[q.Path] = entry{SHA256: ref.SHA256, Size: ref.Size, Exec: exec}
 	next.WriteOps++
 	next.WrittenBytes += size
-	if err := m.commit(w, next); err != nil {
-		m.log.Error("gateway: workspace state write failed", "task_id", r.TaskID, "err", err)
-		return fail(http.StatusServiceUnavailable, CodeStoreUnavailable), nil
+	if res := m.commit(ctx, r, w, next); res.Code != "" {
+		return res, nil
 	}
 	return okJSON(writeResp{Path: q.Path, Size: ref.Size, SHA256: ref.SHA256, Created: !exists, Workspace: summarize(next)})
 }
@@ -299,9 +298,8 @@ func (m *Manager) delete(ctx context.Context, r Request, p string) (call.Result,
 	for _, f := range gone {
 		delete(next.Files, f)
 	}
-	if err := m.commit(w, next); err != nil {
-		m.log.Error("gateway: workspace state write failed", "task_id", r.TaskID, "err", err)
-		return fail(http.StatusServiceUnavailable, CodeStoreUnavailable), nil
+	if res := m.commit(ctx, r, w, next); res.Code != "" {
+		return res, nil
 	}
 	return okJSON(writeResp{Path: p, Deleted: gone, Workspace: summarize(next)})
 }

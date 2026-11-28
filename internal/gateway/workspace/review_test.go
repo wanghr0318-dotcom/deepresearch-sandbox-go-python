@@ -171,8 +171,8 @@ func TestReadWindowIsBounded(t *testing.T) {
 	w0.mu.Lock()
 	next := w0.st.clone()
 	next.Files["big.txt"] = entry{SHA256: ref.SHA256, Size: ref.Size}
-	if err := m.commit(w0, next); err != nil {
-		t.Fatal(err)
+	if res := m.commit(t.Context(), req(`{}`), w0, next); res.Code != "" {
+		t.Fatal(res.Code)
 	}
 	w0.mu.Unlock()
 	_, v := do(t, m.Read, req(`{"path":"big.txt","start_line":3,"max_lines":2}`))

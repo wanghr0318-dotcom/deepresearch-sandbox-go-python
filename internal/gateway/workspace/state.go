@@ -157,14 +157,26 @@ func decodeState(b []byte, taskID string) (*state, error) {
 
 // writeState writes the state atomically: temp file, fsync, rename, fsync of the directory.
 func writeState(dir string, s *state) error {
-	b, err := json.Marshal(s)
+	tmp, err := stageState(dir, s)
 	if err != nil {
 		return err
 	}
-	name := filepath.Join(dir, fileName(s.TaskID))
+	defer os.Remove(tmp)
+	if err := os.Rename(tmp, filepath.Join(dir, fileName(s.TaskID))); err != nil {
+		return err
+	}
+	return syncDir(dir)
+}
+
+// stageState serializes and fsyncs before the short authorization-locked rename.
+func stageState(dir string, s *state) (string, error) {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return "", err
+	}
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
-		return err
+		return "", err
 	}
 	_, err = tmp.Write(b)
 	if err == nil {
@@ -173,14 +185,11 @@ func writeState(dir string, s *state) error {
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
-	if err == nil {
-		err = os.Rename(tmp.Name(), name)
-	}
 	if err != nil {
 		_ = os.Remove(tmp.Name()) // best effort; the error that matters is err
-		return err
+		return "", err
 	}
-	return syncDir(dir)
+	return tmp.Name(), nil
 }
 
 func syncDir(dir string) error {

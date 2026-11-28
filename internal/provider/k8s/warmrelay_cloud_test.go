@@ -64,6 +64,13 @@ func (warmFileIdentity) CheckAccess(_ context.Context, task, attempt, subrun str
 	}
 	return call.Result{}, nil
 }
+func (s warmFileIdentity) PublishWorkspace(ctx context.Context, task, attempt, subrun string, publish func() error) (call.Result, error) {
+	res, err := s.CheckAccess(ctx, task, attempt, subrun)
+	if err != nil {
+		return res, err
+	}
+	return res, publish()
+}
 func (warmFileIdentity) TaskTerminal(context.Context, string) (bool, error) { return false, nil }
 func (warmFileIdentity) ExecShell(context.Context, call.ShellInvoke) (call.Result, error) {
 	return call.Result{}, errors.New("unexpected shell call")

@@ -105,9 +105,8 @@ func (m *Manager) Exec(ctx context.Context, r Request) (res call.Result, err err
 		return call.Result{}, err
 	}
 	next.addApplied(applied{CallID: r.CallID, RequestSHA256: fp, ResponseSHA256: ref.SHA256, ResultSHA256: er.BlobSHA256})
-	if err := m.commit(w, next); err != nil {
-		m.log.Error("gateway: workspace state write failed", "task_id", r.TaskID, "err", err)
-		return fail(http.StatusServiceUnavailable, CodeStoreUnavailable), nil
+	if res := m.commit(wctx, r, w, next); res.Code != "" {
+		return res, nil
 	}
 	return call.Result{Status: http.StatusOK, Body: body, BlobSHA256: er.BlobSHA256, Replayed: er.Replayed}, nil
 }

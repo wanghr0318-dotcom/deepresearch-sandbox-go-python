@@ -472,6 +472,16 @@ func (c *Coordinator) CheckAccess(ctx context.Context, taskID, attemptID, subrun
 	return Result{}, nil
 }
 
+// PublishWorkspace performs the final admission check at the point the local head changes.
+func (c *Coordinator) PublishWorkspace(ctx context.Context, taskID, attemptID, subrunID string, publish func() error) (Result, error) {
+	err := c.store.WithWorkspaceWrite(ctx, taskID, attemptID, subrunID, publish)
+	var rej *persistence.RejectedError
+	if errors.As(err, &rej) {
+		return reject(rej.Code), nil
+	}
+	return Result{}, err
+}
+
 // Budget 返回任务账本（/v1/budget）。
 func (c *Coordinator) Budget(ctx context.Context, taskID string) (Budget, error) {
 	return c.store.LoadBudget(ctx, taskID)

@@ -163,6 +163,9 @@ type Store interface {
 	// CheckAccess 在一致快照中读取 §9.2 的事实（attempt_access.state、tasks.current_attempt_id、task_control.desired；
 	// subrunID 非空时另读该 sub-run 是否可用）。
 	CheckAccess(ctx context.Context, taskID, attemptID, subrunID string) (AccessFacts, error)
+	// WithWorkspaceWrite holds the access locks while a prepared local head is atomically
+	// published. publish is invoked at most once and performs no upstream or database calls.
+	WithWorkspaceWrite(ctx context.Context, taskID, attemptID, subrunID string, publish func() error) error
 	// LoadSubrunBudget 读取 sub-run 层账本（/v1/budget 带 X-Agentbox-Subrun）；不存在为 ErrNotFound。
 	LoadSubrunBudget(ctx context.Context, taskID, subrunID string) (SubrunBudget, error)
 	// BeginCall 是 Tx1：复查访问 → 无记录则登记 resolving（created_at、deadline_at = created_at + Deadline）；有记录则返回它（含指纹供比较）；

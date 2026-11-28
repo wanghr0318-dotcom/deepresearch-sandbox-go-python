@@ -64,6 +64,14 @@ func (a *fakeAccess) CheckAccess(context.Context, string, string, string) (call.
 	return call.Result{}, nil
 }
 
+func (a *fakeAccess) PublishWorkspace(ctx context.Context, task, attempt, subrun string, publish func() error) (call.Result, error) {
+	res, err := a.CheckAccess(ctx, task, attempt, subrun)
+	if err != nil || res.Code != "" {
+		return res, err
+	}
+	return res, publish()
+}
+
 type fakeTasks struct {
 	mu       sync.Mutex
 	terminal map[string]bool
@@ -295,8 +303,8 @@ func TestWriteReadList(t *testing.T) {
 	w.mu.Lock()
 	next := w.st.clone()
 	next.Files["bin"] = entry{SHA256: ref.SHA256, Size: 2}
-	if err := h.m.commit(w, next); err != nil {
-		t.Fatal(err)
+	if res := h.m.commit(t.Context(), req(`{}`), w, next); res.Code != "" {
+		t.Fatal(res.Code)
 	}
 	w.mu.Unlock()
 	_, v = do(t, h.m.Read, req(`{"path":"bin"}`))

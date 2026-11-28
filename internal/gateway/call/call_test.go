@@ -121,6 +121,15 @@ func (s *fakeStore) CheckAccess(_ context.Context, taskID, attemptID, subrunID s
 	return s.facts(taskID, attemptID, subrunID), nil
 }
 
+func (s *fakeStore) WithWorkspaceWrite(_ context.Context, taskID, attemptID, subrunID string, publish func() error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if code := admit(s.facts(taskID, attemptID, subrunID)); code != "" {
+		return rejected(code)
+	}
+	return publish()
+}
+
 // closeSubrun 模拟宿主把 sub-run 置为 cancel_requested（之后的访问复查为 subrun_closed）。
 func (s *fakeStore) closeSubrun(taskID, subrunID string) {
 	s.mu.Lock()
