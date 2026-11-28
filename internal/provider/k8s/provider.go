@@ -42,7 +42,7 @@ type Options struct {
 	// specs that need them).
 	SlotHostDir, SlotNodeDir string
 	// GatewayListen enables Pod-local workspaces and the TLS Gateway relay on
-	// a private IP:port. It cannot be combined with legacy slots or warm Pods.
+	// a private IP:port. It cannot be combined with legacy slots.
 	GatewayListen string
 	// ExecStagingDir enables isolated execution Pods. It stores controller-side
 	// input and output files and is never mounted into a Pod.
@@ -89,8 +89,10 @@ type Provider struct {
 
 	mu     sync.Mutex
 	envs   map[string]*envState // environments created by this process (gates are not rebuilt after a restart)
-	grants map[string]func()    // revoke by Pod name, including before the Pod becomes ready
+	grants map[string]*podGrant // pending claim or active grant, revoked by Pod name
 }
+
+type podGrant struct{ revoke func() }
 
 type envState struct {
 	kind      provider.EnvKind
@@ -112,8 +114,8 @@ func New(ctx context.Context, opt Options) (*Provider, error) {
 		return nil, errors.New("k8s: Options need InstallID")
 	case opt.Image == "":
 		return nil, errors.New("k8s: Options need a pinned Image")
-	case opt.GatewayListen != "" && (opt.SlotHostDir != "" || opt.SlotNodeDir != "" || opt.WarmPool > 0):
-		return nil, errors.New("k8s: Gateway relay cannot use legacy slots or warm Pods")
+	case opt.GatewayListen != "" && (opt.SlotHostDir != "" || opt.SlotNodeDir != ""):
+		return nil, errors.New("k8s: Gateway relay cannot use legacy slots")
 	}
 	if r, err := ParseImageRef(opt.Image); err != nil {
 		return nil, err
@@ -187,7 +189,12 @@ func New(ctx context.Context, opt Options) (*Provider, error) {
 	}
 	if opt.WarmPool > 0 {
 		pr := profileOf(opt.WarmProfile)
-		p.pool = &pool{p: p, size: opt.WarmPool, profile: pr, key: poolKey(opt.Image, pr, opt.RuntimeClass), kick: make(chan struct{}, 1)}
+		key := poolKey(opt.Image, pr, opt.RuntimeClass)
+		if p.relay != nil {
+			// A previous relay's sidecars trust its old CA. Replace them on restart.
+			key = pathHash(key + p.relay.caPEM)
+		}
+		p.pool = &pool{p: p, size: opt.WarmPool, profile: pr, key: key, kick: make(chan struct{}, 1)}
 		p.wg.Add(1)
 		go func() { defer p.wg.Done(); p.pool.run(p.ctx) }()
 	}
@@ -352,7 +359,10 @@ func (p *Provider) Create(ctx context.Context, spec provider.EnvSpec) (provider.
 	var pod *corev1.Pod
 	var workspace *execWorkspace
 	if !isExec && p.pool != nil && pr == p.pool.profile {
-		pod = p.pool.claim(ctx, own, spec.Mounts.Workspace)
+		pod, err = p.pool.claim(ctx, own, spec.Mounts.Workspace, spec.Mounts.GatewaySocket)
+		if err != nil {
+			return provider.EnvInfo{}, err
+		}
 	}
 	if pod != nil {
 		path = "warm"
@@ -399,6 +409,9 @@ func (p *Provider) Create(ctx context.Context, spec provider.EnvSpec) (provider.
 
 // createPod creates a Pod (cold start when o is set, a warm Pod when nil).
 func (p *Provider) createPod(ctx context.Context, pr profile, o *owner, ws string) (*corev1.Pod, error) {
+	if o == nil && p.relay != nil {
+		return p.createWorkspacePod(ctx, pr, nil, "")
+	}
 	name := newPodName()
 	nodeDir := ""
 	if p.slots.enabled() {

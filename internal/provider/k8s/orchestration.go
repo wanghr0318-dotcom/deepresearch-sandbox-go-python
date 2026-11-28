@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -63,6 +64,17 @@ func buildPodWorkspace(pod *corev1.Pod, grantSecret string, memDir func(int64) c
 
 func (p *Provider) createWorkspacePod(ctx context.Context, pr profile, own *owner, socketPath string) (*corev1.Pod, error) {
 	params := podParams{Name: newPodName(), Profile: pr, Owner: own, PodWorkspace: true}
+	if own == nil {
+		params.PoolKey, params.RelaySecret = p.pool.key, params.Name
+		pod, err := p.createBuiltPod(ctx, params)
+		if err != nil {
+			return nil, err
+		}
+		if err := p.createRelaySecret(ctx, pod, p.relay.warmGrant(pod.Name, string(pod.UID))); err != nil {
+			return nil, errors.Join(err, p.deletePod(ctx, pod))
+		}
+		return pod, nil
+	}
 	if socketPath == "" {
 		return p.createBuiltPod(ctx, params)
 	}
@@ -71,44 +83,51 @@ func (p *Provider) createWorkspacePod(ctx context.Context, pr profile, own *owne
 		return nil, err
 	}
 	p.mu.Lock()
-	p.grants[params.Name] = revoke
+	p.grants[params.Name] = &podGrant{revoke: revoke}
 	p.mu.Unlock()
 	defer func() {
 		if err != nil {
 			p.revokeGateway(params.Name)
 		}
 	}()
-	payload, err := json.Marshal(grant)
-	if err != nil {
-		return nil, err
-	}
 	params.RelaySecret = params.Name
 	pod, err := p.createBuiltPod(ctx, params)
 	if err != nil {
 		return nil, err
 	}
+	if err = p.createRelaySecret(ctx, pod, grant); err != nil {
+		return nil, err
+	}
+	return pod, nil
+}
+
+func (p *Provider) createRelaySecret(ctx context.Context, pod *corev1.Pod, grant podapi.GatewayGrant) error {
+	payload, err := json.Marshal(grant)
+	if err != nil {
+		return err
+	}
 	// The Pod waits for the mounted Secret; the owner reference ties its
 	// lifetime to its exact Pod UID, including after a controller restart.
 	_, err = p.client.CoreV1().Secrets(p.opt.Namespace).Create(ctx, &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            params.RelaySecret,
+			Name:            pod.Name,
 			OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "Pod", Name: pod.Name, UID: pod.UID}},
 		},
 		Data: map[string][]byte{relayConfigFile: payload},
 	}, metav1.CreateOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("k8s: create Gateway grant for pod %s: %w", pod.Name, err)
+		return fmt.Errorf("k8s: create Gateway grant for pod %s: %w", pod.Name, err)
 	}
-	return pod, nil
+	return nil
 }
 
 func (p *Provider) revokeGateway(pod string) {
 	p.mu.Lock()
-	revoke := p.grants[pod]
+	g := p.grants[pod]
 	delete(p.grants, pod)
 	p.mu.Unlock()
-	if revoke != nil {
-		revoke()
+	if g != nil && g.revoke != nil {
+		g.revoke()
 	}
 }
 
@@ -132,7 +151,7 @@ func (p *Provider) startGatewayRelay(ctx context.Context) error {
 		return fmt.Errorf("k8s: create Gateway relay NetworkPolicy: %w", err)
 	}
 	p.relay = relay
-	p.grants = make(map[string]func())
+	p.grants = make(map[string]*podGrant)
 	return nil
 }
 

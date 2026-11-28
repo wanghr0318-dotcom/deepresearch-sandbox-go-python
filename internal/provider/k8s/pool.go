@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"time"
@@ -10,7 +11,11 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+
+	"github.com/wanghr0318-dotcom/deepresearch-sandbox-go-python/internal/provider"
 )
+
+var errWarmClaimInFlight = errors.New("warm Pod claim already in progress")
 
 // pool keeps `size` warm Pods (pre-started, not bound to an environment) for one pool key (design §2.6).
 type pool struct {
@@ -153,11 +158,11 @@ func waitingReason(pod *corev1.Pod) string {
 // claim binds a ready warm Pod to the environment: the owner annotation, env label and state are written
 // with the listed resourceVersion as precondition, so concurrent claimers never share a Pod. Returns nil if
 // no warm Pod could be claimed (the caller starts a cold Pod).
-func (pl *pool) claim(ctx context.Context, o owner, ws string) *corev1.Pod {
+func (pl *pool) claim(ctx context.Context, o owner, ws, socketPath string) (*corev1.Pod, error) {
 	defer pl.poke()
 	pods, err := pl.warmPods(ctx)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	// Oldest first; ties (timestamps have second resolution) broken by name so every claimer sees one order.
 	sort.Slice(pods, func(i, j int) bool {
@@ -183,14 +188,47 @@ func (pl *pool) claim(ctx context.Context, o owner, ws string) *corev1.Pod {
 		if pl.beforeClaim != nil {
 			pl.beforeClaim(pod.Name)
 		}
-		updated, err := pl.p.pods().Update(ctx, pod, metav1.UpdateOptions{})
-		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+		updated, err := pl.assign(ctx, pod, socketPath)
+		if errors.Is(err, errWarmClaimInFlight) || apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
 			continue
 		}
-		if err != nil {
-			return nil
-		}
-		return updated
+		// An uncertain Update can have assigned the Pod. Do not create a second environment.
+		return updated, err
 	}
-	return nil
+	return nil, nil
+}
+
+func (pl *pool) assign(ctx context.Context, pod *corev1.Pod, socketPath string) (*corev1.Pod, error) {
+	p := pl.p
+	if p.relay == nil || socketPath == "" {
+		return p.pods().Update(ctx, pod, metav1.UpdateOptions{})
+	}
+	// Stop can see the new labels before Update returns. Reserve this Pod without
+	// authorizing its credential. A slow API call must not block other Pod revocations.
+	pending := &podGrant{}
+	p.mu.Lock()
+	if p.grants[pod.Name] != nil {
+		p.mu.Unlock()
+		return nil, errWarmClaimInFlight
+	}
+	p.grants[pod.Name] = pending
+	p.mu.Unlock()
+	claimed, err := p.pods().Update(ctx, pod, metav1.UpdateOptions{})
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.grants[pod.Name] != pending {
+		return nil, provider.ErrIncomplete // Stop already retired this claim.
+	}
+	if err != nil {
+		delete(p.grants, pod.Name)
+		return nil, err
+	}
+	grant := p.relay.warmGrant(claimed.Name, string(claimed.UID))
+	_, revoke, err := p.relay.bindToken(grant.Token, socketPath)
+	if err != nil {
+		delete(p.grants, pod.Name)
+		return nil, err
+	}
+	pending.revoke = revoke
+	return claimed, nil
 }

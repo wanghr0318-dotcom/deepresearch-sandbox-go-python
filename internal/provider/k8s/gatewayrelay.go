@@ -3,9 +3,12 @@ package k8s
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -26,6 +29,7 @@ type gatewayRelay struct {
 	port   int32
 	url    string
 	caPEM  string
+	podKey []byte
 	server *http.Server
 	ctx    context.Context
 	stop   context.CancelFunc
@@ -61,7 +65,7 @@ func newGatewayRelay(addr string) (*gatewayRelay, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &gatewayRelay{
 		ip: ip, port: port, url: "https://" + net.JoinHostPort(host, strconv.Itoa(int(port))),
-		caPEM: caPEM, ctx: ctx, stop: cancel, grants: make(map[string]socketGrant),
+		caPEM: caPEM, podKey: []byte(rand.Text()), ctx: ctx, stop: cancel, grants: make(map[string]socketGrant),
 	}
 	r.server = &http.Server{
 		Handler:           r,
@@ -106,12 +110,23 @@ func newRelayCertificate(ip net.IP) (tls.Certificate, string, error) {
 	return cert, string(caPEM), nil
 }
 
-// bind pairs a one-Pod credential with the host Unix socket already bound by Gateway.
+// warmGrant derives a credential for this relay lifetime and exact Pod. Preparing
+// its Secret grants no access. Only a successful warm claim adds a route.
+func (r *gatewayRelay) warmGrant(name, uid string) podapi.GatewayGrant {
+	mac := hmac.New(sha256.New, r.podKey)
+	mac.Write([]byte(name + "\x00" + uid))
+	return podapi.GatewayGrant{URL: r.url, CAPEM: r.caPEM, Token: base64.RawURLEncoding.EncodeToString(mac.Sum(nil))}
+}
+
+// bind pairs a fresh one-Pod credential with the host Unix socket already bound by Gateway.
 func (r *gatewayRelay) bind(socketPath string) (podapi.GatewayGrant, func(), error) {
+	return r.bindToken(rand.Text(), socketPath)
+}
+
+func (r *gatewayRelay) bindToken(token, socketPath string) (podapi.GatewayGrant, func(), error) {
 	if err := r.ctx.Err(); err != nil {
 		return podapi.GatewayGrant{}, nil, err
 	}
-	token := rand.Text()
 
 	// Keep the existing Unix listener as the source of task identity. The HTTP
 	// relay forwards to this socket regardless of headers or URL sent by the Pod.
