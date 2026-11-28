@@ -61,4 +61,3 @@ if __name__=="__main__":
     p.add_argument("--interval",type=float,default=.075)
     args=p.parse_args()
     run(args.output,args.seconds,args.interval)
-
