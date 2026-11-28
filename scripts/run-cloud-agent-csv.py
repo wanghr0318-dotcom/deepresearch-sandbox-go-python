@@ -50,7 +50,8 @@ main_session(seeded, name='chatagent', version='0.1.0')
 
 
 def csv_steps(original):
-    repair = original.replace("    next(reader, None)\n", "")
+    repair = "".join(line for line in original.splitlines(keepends=True)
+                     if line.rstrip("\r\n") != "    next(reader, None)")
     return [
         ("read_file", {"path": "records.py"}),
         ("write_file", {"path": "records.py", "content": repair}),
@@ -137,7 +138,7 @@ def wait_http(url, gateway):
     raise TimeoutError("Gateway startup timed out")
 
 
-def run_acceptance(args, source, data_dir, url, namespace, after_submit=None, *, capture_files=()):
+def run_acceptance(args, source, data_dir, url, namespace, after_submit=None, *, capture_files=(), before_grade=None):
     results = args.evidence
     owner = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
     operator = (data_dir / "api.token").read_text().strip()
@@ -153,7 +154,7 @@ def run_acceptance(args, source, data_dir, url, namespace, after_submit=None, *,
 
     login = {"username": "csv-" + secrets.token_hex(6), "password": "C" + secrets.token_hex(6) + "9"}
     api("POST", "/auth/register", login)
-    session = api("POST", "/sessions", {"request_id": "create", "title": args.fixture.name})["session_id"]
+    session = api("POST", "/sessions", {"request_id": "create-" + login["username"], "title": args.fixture.name})["session_id"]
     fixture = args.fixture
     report = {"fixture": fixture.name, "namespace": namespace, "session_id": session, "model": args.model,
               "source_sha256": {p: digest(text.encode()) for p, text in source.items()},
@@ -168,7 +169,7 @@ def run_acceptance(args, source, data_dir, url, namespace, after_submit=None, *,
         report["prompt_sha256"] = digest(prompt.encode())
         (results / "prompt.txt").write_bytes(prompt.encode())
         turn = api("POST", f"/sessions/{session}/messages",
-                   {"request_id": "solve", "deep_research": False, "text": prompt})["turn_id"]
+                   {"request_id": "solve-" + session, "deep_research": False, "text": prompt})["turn_id"]
         report["turn_id"] = turn
         if after_submit is not None:
             after_submit(args, url, turn, operator, namespace)
@@ -245,6 +246,10 @@ def run_acceptance(args, source, data_dir, url, namespace, after_submit=None, *,
         (results / "records.py").write_bytes(candidate)
         report.update(candidate_sha256=sha, candidate_bytes=len(candidate), producer_exec=call["call_id"],
                       producer_result=call["result_ref"])
+        if before_grade is not None:
+            api("DELETE", f"/sessions/{session}")
+            session = None
+            before_grade()
         oracle = runpy.run_path(str(fixture / "verify.py"))
         checker = oracle["CHECKER"].replace("cases = json.load(sys.stdin)",
                                            "cases = " + repr(oracle["CASES"]))
@@ -293,7 +298,8 @@ def run_acceptance(args, source, data_dir, url, namespace, after_submit=None, *,
         report["verdict"] = "solved" if all(checks.values()) else "scored_unsolved"
     finally:
         (results / "result.json").write_bytes(encode(report) + b"\n")
-        api("DELETE", f"/sessions/{session}")
+        if session is not None:
+            api("DELETE", f"/sessions/{session}")
     return report
 
 
@@ -396,7 +402,11 @@ def main(worker_command=seed_command, after_submit=None, *, acceptance=run_accep
                 report["remaining_resources"] = remaining
             finally:
                 gateway.terminate()
-                gateway.wait(timeout=30)
+                try:
+                    gateway.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    gateway.kill()
+                    gateway.wait(timeout=10)
                 watch.terminate()
                 watch.wait(timeout=5)
                 subprocess.run(postgres + ["dropdb", "-U", "agentbox", database], check=True)

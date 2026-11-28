@@ -187,24 +187,32 @@ func (p *Provider) startExec(ctx context.Context, pod string, nofile, fsize uint
 // 128+N"); the helper's status file decides, and if it cannot be read (Pod gone) the code is taken as a
 // signal.
 func (p *Provider) exitStatus(pod, execID string, err error) (provider.ExitStatus, error) {
-	if err == nil {
-		return provider.ExitStatus{}, nil
-	}
 	var ec exitCoder
-	if !errors.As(err, &ec) {
+	if err != nil && !errors.As(err, &ec) {
 		return provider.ExitStatus{}, fmt.Errorf("%w: %v", provider.ErrControlLost, err)
 	}
-	code := ec.ExitStatus()
-	if code < 128 {
-		return provider.ExitStatus{Code: code}, nil
+	code := 0
+	if ec != nil {
+		code = ec.ExitStatus()
+		if code > 0 && code < 128 {
+			return provider.ExitStatus{Code: code}, nil
+		}
 	}
 	ctx, cancel := context.WithTimeout(p.ctx, 10*time.Second)
 	defer cancel()
 	if out, serr := p.helper(ctx, pod, "status", "--id", execID); serr == nil {
-		var st podapi.Status
-		if jerr := jsonUnmarshal(out, &st); jerr == nil {
-			return provider.ExitStatus{Code: st.Code, Signal: syscall.Signal(st.Signal)}, nil
+		var st struct {
+			Code   *int `json:"code"`
+			Signal *int `json:"signal"`
 		}
+		if jerr := jsonUnmarshal(out, &st); jerr == nil && st.Code != nil && st.Signal != nil {
+			return provider.ExitStatus{Code: *st.Code, Signal: syscall.Signal(*st.Signal)}, nil
+		}
+	}
+	// A torn-down remotecommand stream can end cleanly during node shutdown.
+	// Only the helper's record confirms that the acknowledged process finished.
+	if code == 0 {
+		return provider.ExitStatus{}, fmt.Errorf("%w: missing exec completion record for %s on %s", provider.ErrControlLost, execID, pod)
 	}
 	if code > 128 && code < 128+65 {
 		return provider.ExitStatus{Signal: syscall.Signal(code - 128)}, nil

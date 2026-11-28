@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
 	"time"
@@ -136,7 +137,10 @@ type Admission interface {
 }
 
 // Grant 是一份内存授予。
-type Grant struct{ ID uint64 }
+type Grant struct {
+	ID       uint64
+	recovery bool
+}
 
 // Clock 是 actor 的时间来源（与 task.Clock 相同的语义）。
 type Clock interface {
@@ -155,16 +159,18 @@ func (systemClock) At(t time.Time) (<-chan time.Time, func()) {
 
 // Deps 是 actor 的依赖。Clock、IDs 为空时取系统时钟与随机 ID。
 type Deps struct {
-	Store     Store
-	Env       Env
-	Workers   Workers
-	Gateway   Gateway
-	Admission Admission
-	Clock     Clock // 同 task.Clock 语义
-	IDs       func() string
-	Config    Config
-	Notify    func(taskID string) // 授予或拒绝后通知 task Scheduler（可选）
-	OnFatal   func(sessionID string, err error)
+	// RecoverySlots limits simultaneously resident restored workers across actors on this gateway.
+	RecoverySlots chan struct{}
+	Store         Store
+	Env           Env
+	Workers       Workers
+	Gateway       Gateway
+	Admission     Admission
+	Clock         Clock // 同 task.Clock 语义
+	IDs           func() string
+	Config        Config
+	Notify        func(taskID string) // 授予或拒绝后通知 task Scheduler（可选）
+	OnFatal       func(sessionID string, err error)
 }
 
 func (d Deps) withDefaults() Deps {
@@ -618,20 +624,42 @@ func quiesce(ctx context.Context, handle IncarnationHandle, handleID, incID stri
 	return handle.Quiesce(qctx, grace)
 }
 
+func (a *Actor) releaseMemory(g Grant) {
+	a.d.Admission.Release(g)
+	if g.recovery {
+		<-a.d.RecoverySlots
+	}
+}
+
 // opStart 新建 incarnation（见 StartIncarnation）。
 func (a *Actor) opStart(ctx context.Context, f StartIncarnation, mem *Grant) opResult {
 	r := opResult{done: OpDone{Op: OpStart}}
 	if mem == nil {
+		recovery := f.Restoring && a.d.RecoverySlots != nil
+		if recovery {
+			start := time.Now()
+			select {
+			case a.d.RecoverySlots <- struct{}{}:
+				slog.Info("recovery_admitted", "session_id", a.id, "queued_ms", start.UnixMilli(), "admitted_ms", time.Now().UnixMilli())
+			case <-ctx.Done():
+				r.done.Failed = ctx.Err()
+				return r
+			}
+		}
 		g, err := a.d.Admission.AcquireMemory(ctx, a.id, a.d.Config.IncarnationMemory)
 		if err != nil {
+			if recovery {
+				<-a.d.RecoverySlots
+			}
 			r.done.Failed = fmt.Errorf("申请 incarnation 内存: %w", err)
 			return r
 		}
+		g.recovery = recovery
 		mem = &g
 		r.mem, r.memSet = mem, true
 	}
 	releaseMem := func() {
-		a.d.Admission.Release(*mem)
+		a.releaseMemory(*mem)
 		r.mem, r.memSet = nil, true
 	}
 	incID, envID := a.d.IDs(), a.d.IDs()
@@ -743,7 +771,7 @@ func (a *Actor) opDestroy(ctx context.Context, f DestroyIncarnation, handleID st
 	}
 	// 会话至多一个存活 incarnation：持有的内存属于它（句柄所属，或启动失败后残留的无句柄 incarnation）。
 	if mem != nil && (f.IncarnationID == handleID || handleID == "") {
-		a.d.Admission.Release(*mem)
+		a.releaseMemory(*mem)
 		r.mem, r.memSet = nil, true
 	}
 	return r

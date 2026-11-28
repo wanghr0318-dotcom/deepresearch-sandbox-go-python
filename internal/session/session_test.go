@@ -240,17 +240,23 @@ func TestDecideTransitionDetails(t *testing.T) {
 	})).(DoTransition); string(tr.T.Event) != `{"quiesced_checkpoint_id":"sc-7","state":"frozen"}` {
 		t.Errorf("frozen 事件须带 quiesced 报告的 checkpoint（I9）= %s", tr.T.Event)
 	}
+	if st := op(t, with(idleState(), func(s *ActorState) {
+		noInc(s)
+		s.Session.Status, s.Session.Latest, s.Waiters = StatusRestoring, nil, []string{"t1"}
+	})).(StartIncarnation); !st.Restoring || st.Resume != nil {
+		t.Fatalf("turn recovery must acquire a slot without a session checkpoint: %+v", st)
+	}
 	cp := &Checkpoint{CheckpointID: "sc-1", StateRef: "ab"}
 	if st := op(t, with(idleState(), func(s *ActorState) {
 		noInc(s)
 		s.Session.Status, s.Session.Latest, s.Waiters = StatusRestoring, cp, []string{"t1"}
-	})).(StartIncarnation); st.Resume != cp {
+	})).(StartIncarnation); !st.Restoring || st.Resume != cp {
 		t.Errorf("冷恢复应以 Latest 恢复：%+v", st)
 	}
 	if st := op(t, with(idleState(), func(s *ActorState) {
 		noInc(s)
 		s.Session.Status, s.Session.Latest, s.Waiters = StatusCreating, cp, []string{"t1"}
-	})).(StartIncarnation); st.Resume != nil {
+	})).(StartIncarnation); st.Restoring || st.Resume != nil {
 		t.Errorf("新会话不恢复：%+v", st)
 	}
 }
@@ -965,6 +971,34 @@ func newHarness(t *testing.T) *harness {
 		}
 	})
 	return h
+}
+
+func TestRestoredWorkerHoldsRecoverySlotUntilDestroyed(t *testing.T) {
+	h := newHarness(t)
+	d := h.sch.d
+	d.RecoverySlots = make(chan struct{}, 1)
+	first, second := Actor{id: "one", d: d}, Actor{id: "two", d: d}
+	h.st.addSession(first.id)
+	h.st.addSession(second.id)
+	restore := StartIncarnation{Restoring: true}
+	r := first.opStart(h.ctx, restore, nil)
+	if r.mem == nil || r.handle == nil || len(d.RecoverySlots) != 1 {
+		t.Fatalf("first restore: %+v", r.done)
+	}
+	ctx, cancel := context.WithCancel(h.ctx)
+	cancel()
+	blocked := second.opStart(ctx, restore, nil)
+	if !errors.Is(blocked.done.Failed, context.Canceled) || h.adm.heldCount() != 1 {
+		t.Fatalf("queued restore: %+v", blocked.done)
+	}
+	stopped := first.opDestroy(h.ctx, DestroyIncarnation{IncarnationID: r.done.IncarnationID, EnvID: r.handleEnv, Reason: EndOrphaned}, r.done.IncarnationID, r.mem)
+	if !stopped.memSet || len(d.RecoverySlots) != 0 {
+		t.Fatalf("destroy: %+v", stopped.done)
+	}
+	next := second.opStart(h.ctx, restore, nil)
+	if next.handle == nil || len(d.RecoverySlots) != 1 {
+		t.Fatalf("second restore: %+v", next.done)
+	}
 }
 
 type grantResult struct {

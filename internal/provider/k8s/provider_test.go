@@ -22,6 +22,32 @@ import (
 
 const testNS = "agentbox-test"
 
+type statusReply string
+
+func (r statusReply) Stream(_ context.Context, _, _ string, cmd []string, _ io.Reader, stdout, _ io.Writer) error {
+	if len(cmd) < 2 || cmd[1] != "status" {
+		return errors.New("unexpected helper command")
+	}
+	_, err := io.WriteString(stdout, string(r))
+	return err
+}
+
+func TestCleanStreamRequiresWorkloadExitRecord(t *testing.T) {
+	for _, tc := range []struct {
+		reply statusReply
+		lost  bool
+		code  int
+	}{
+		{"", true, 0}, {"{}", true, 0}, {`{"code":0,"signal":0}`, false, 0}, {`{"code":7,"signal":0}`, false, 7},
+	} {
+		p := &Provider{ctx: context.Background(), exec: tc.reply}
+		st, err := p.exitStatus("pod", "exec", nil)
+		if errors.Is(err, provider.ErrControlLost) != tc.lost || (!tc.lost && err != nil) || st.Code != tc.code {
+			t.Fatalf("record %q: status=%v err=%v", tc.reply, st, err)
+		}
+	}
+}
+
 var testImage = "kind-registry:5000/agentbox-worker@" + testDigest
 
 func testLimits() provider.Limits {

@@ -169,6 +169,7 @@ type Config struct {
 	// WorkspaceTools 打开 /v1/workspace/* 与对话 Agent 的 exec_shell、read_file、write_file、list_dir（需要 exec）。
 	WorkspaceTools         bool
 	AllowSessionLeaseFence bool
+	SessionRecoverySlots   int
 	WorkspaceArchive       workspace.SnapshotArchive
 	AttemptLeaseTTL        time.Duration
 	// WorkspaceIdleTimeout 是工作区的空闲过期时限（--workspace-idle-timeout，默认 2 h）。
@@ -924,14 +925,19 @@ func (s *server) assemble() error {
 	subruns := subrunHost{store: s.store, calls: s.calls}
 	s.sessions = &sessionRuntime{access: access, facts: s.store, blobs: blobs, log: s.log, subruns: subruns}
 	if s.cfg.sessionsEnabled() {
+		var restores chan struct{}
+		if s.cfg.SessionRecoverySlots > 0 {
+			restores = make(chan struct{}, s.cfg.SessionRecoverySlots)
+		}
 		s.sessDeps = session.Deps{
-			Store:     s.store,
-			Env:       sessionEnv{c: s.coord, store: s.store, blobs: blobs, cfg: s.cfg, dataDir: s.d.DataDir, log: s.log},
-			Workers:   sessionWorkers{r: run, coord: s.coord, access: access, cfg: s.cfg, dataDir: s.d.DataDir, log: s.log},
-			Gateway:   access,
-			Admission: sessionAdmission{a: s.adm},
-			Clock:     s.d.Clock,
-			IDs:       s.d.NewID,
+			RecoverySlots: restores,
+			Store:         s.store,
+			Env:           sessionEnv{c: s.coord, store: s.store, blobs: blobs, cfg: s.cfg, dataDir: s.d.DataDir, log: s.log},
+			Workers:       sessionWorkers{r: run, coord: s.coord, access: access, cfg: s.cfg, dataDir: s.d.DataDir, log: s.log},
+			Gateway:       access,
+			Admission:     sessionAdmission{a: s.adm},
+			Clock:         s.d.Clock,
+			IDs:           s.d.NewID,
 			Config: session.Config{IdleFreeze: s.cfg.SessionIdleFreeze, EvictAfter: s.cfg.SessionEvictAfter,
 				IncarnationMemory: s.cfg.DefaultMemoryBytes},
 			Notify: func(taskID string) {

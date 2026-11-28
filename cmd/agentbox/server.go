@@ -79,6 +79,7 @@ func prepareIsolation(exec bool) (local.EnvStarter, string, error) {
 // serverFlags 是解析后的 `agentbox server` 标志。
 type serverFlags struct {
 	allowSessionLeaseFence *bool
+	sessionRecoverySlots   *int
 	attemptLeaseTTL        *time.Duration
 	dataDir                *string
 	dsn                    *string
@@ -186,6 +187,7 @@ func newServerFlags(fs *flag.FlagSet) *serverFlags {
 	f.sessionWorkerArgv = fs.String("session-worker-argv", "", "会话 incarnation 内启动 Worker 的命令（逗号分隔的 argv，例如 python3,-m,chatagent）；为空时不启用会话（会话端点 503 sessions_unavailable），非空时需要 --model-base-url")
 	f.workerSubruns = fs.Bool("worker-subruns", true, "在 init 中请求 sub-run 扩展（init.extensions = [\"subruns\"]；Worker 的 ready 须回 subruns: 1，否则以 extension_mismatch 拒绝）")
 	f.subrunCancelTimeout = fs.Duration("subrun-cancel-timeout", subrun.DefaultCancelTimeout, "宿主取消 sub-run 后等待其 subrun_end 的时限 T_subrun_cancel（须 > 0；超时终止整个 attempt，会话模式终止 incarnation）")
+	f.sessionRecoverySlots = fs.Int("session-recovery-slots", 0, "maximum resident cold-restored session workers per gateway (0 disables limit)")
 	f.allowSessionLeaseFence = fs.Bool("allow-session-lease-fence", false, "enable expired session takeover on managed K8s pods with verified relay-only egress")
 	f.attemptLeaseTTL = fs.Duration("attempt-lease-ttl", 0, "execution lease duration (0 disables expiry)")
 	f.workspaceTools = fs.Bool("workspace-tools", false, "为对话 Agent 打开工作区工具 exec_shell、read_file、write_file、list_dir（/v1/workspace/*；每条命令在独立 exec 环境中运行、按 exec 配额记账；需要 --exec-slots > 0）")
@@ -242,6 +244,11 @@ func runServer(args []string, stderr io.Writer) int {
 	cfg := f.appConfig(st)
 	cfg.AttemptLeaseTTL = *f.attemptLeaseTTL
 	cfg.AllowSessionLeaseFence = *f.allowSessionLeaseFence
+	cfg.SessionRecoverySlots = *f.sessionRecoverySlots
+	if cfg.SessionRecoverySlots < 0 {
+		fmt.Fprintln(stderr, "session-recovery-slots must be nonnegative")
+		return 2
+	}
 	if cfg.AllowSessionLeaseFence && (*f.providerName != "k8s" || f.kf.gatewayListen == "") {
 		fmt.Fprintln(stderr, "agentbox server: --allow-session-lease-fence requires --provider k8s with a private relay listener")
 		return 2

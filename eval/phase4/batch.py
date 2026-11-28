@@ -2,6 +2,7 @@
 import argparse
 import concurrent.futures
 from copy import copy
+from contextlib import ExitStack
 import json
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +16,7 @@ import threading
 from scenarios import BASE, CAPTURE_FILES, FIXTURES, SOURCES, TITLES, WRITE_INDEX, steps_for
 
 
-def worker_command():
+def worker_command(real_model=False):
     setup = f"""
 import hashlib, json
 from pathlib import Path
@@ -30,14 +31,37 @@ def witness(ctx, messages, checkpoint):
     return {{"turn": ctx.task_id, "attempt": ctx.attempt_id, "checkpoint": checkpoint,
             "messages_sha256": hashlib.sha256(serialized).hexdigest()}}
 """
+    if real_model:
+        setup += """
+from chatagent.events import Emitter
+original_tool_result = Emitter.tool_result
+async def note_write(emitter, step, event_id, name, result, subtopic_id, args=None):
+    await original_tool_result(emitter, step, event_id, name, result, subtopic_id, args)
+    emitter.m1_write_event = event_id if (name == "write_file" and result.ok
+        and (args or {}).get("path") == "records.py") else None
+Emitter.tool_result = note_write
+def injection_point(agent):
+    return getattr(agent.emit, "m1_write_event", None)
+"""
+    else:
+        setup += """
+def injection_point(agent):
+    messages = agent.state.messages
+    expected = f"cpu-{indices[scenario(agent.ctx)]}"
+    return expected if messages and messages[-1].get("tool_call_id") == expected else None
+"""
     setup += """
 original_save = Agent.save
 async def save_and_hold(agent, step):
     cp = await original_save(agent, step)
     state, ctx = agent.state, agent.ctx
-    call_id = f"cpu-{indices[scenario(ctx)]}"
-    if ctx.resume is None and state.messages and state.messages[-1].get("tool_call_id") == call_id:
-        Path("/tmp/fault-ready").write_text(json.dumps(witness(ctx, state.messages, cp)))
+    call_id = injection_point(agent)
+    if ctx.resume is None and call_id:
+        marker = dict(witness(ctx, state.messages, cp), tool_event_id=call_id)
+        path = Path("/tmp/fault-ready")
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(marker))
+        tmp.replace(path)
         while not Path("/tmp/fault-reference").exists():
             await asyncio.sleep(.15)
     return cp
@@ -63,7 +87,7 @@ def collect_markers(kube, marker, turns, expected_node, deadline, seen):
         pods = json.loads(subprocess.check_output(kube + ["get", "pods", "-o", "json"], timeout=15))
         for pod in pods["items"]:
             meta, spec = pod["metadata"], pod["spec"]
-            if spec.get("nodeName") != expected_node or pod["status"]["phase"] != "Running":
+            if (expected_node and spec.get("nodeName") != expected_node) or pod["status"]["phase"] != "Running":
                 continue
             if not any(c["name"] == "gateway-relay" for c in spec["containers"]):
                 continue
@@ -74,7 +98,7 @@ def collect_markers(kube, marker, turns, expected_node, deadline, seen):
             record = json.loads(get.stdout)
             task = record["turn"]
             if task in turns and task not in seen:
-                seen[task] = {**record, "node": expected_node, "pod": meta["name"], "uid": meta["uid"],
+                seen[task] = {**record, "node": spec["nodeName"], "pod": meta["name"], "uid": meta["uid"],
                               "observed_at": time.time()}
         time.sleep(.25)
 
@@ -103,11 +127,13 @@ def accept_batch(opts, args, source, data_dir, url, namespace, unused):
     resume_wait = threading.Event()
     abort = threading.Event()
     cases = list(FIXTURES)
-    batch = {"mode": opts.mode, "namespace": namespace, "injections": 0,
-             "lease_ttl": "30s" if opts.mode == "node-loss" else None,
+    batch = {"mode": opts.mode, "namespace": namespace, "injections": 0, "session_recovery_slots": opts.session_recovery_slots,
+             "lease_ttl": opts.lease_ttl if opts.mode == "node-loss" else None,
              "source_node": opts.source_node, "target_node": opts.target_node,
              "submitted": [], "before": {}, "tasks": []}
     evidence = args.evidence / "batch.json"
+    grading_slot = threading.Lock()
+    solves_finished = threading.Barrier(opts.tasks)
     def save():
         evidence.write_bytes(BASE["encode"](batch))
 
@@ -122,8 +148,21 @@ def accept_batch(opts, args, source, data_dir, url, namespace, unused):
             resume_wait.wait()
             if abort.is_set():
                 raise RuntimeError("batch aborted before recovery observation")
-        result = BASE["run_acceptance"](child, SOURCES[case], data_dir, url, namespace, registered,
-                                        capture_files=CAPTURE_FILES[case])
+        reached_grading = False
+        def before_grade():
+            nonlocal reached_grading
+            reached_grading = True
+            solves_finished.wait(timeout=args.timeout)
+            grading.enter_context(grading_slot)
+        with ExitStack() as grading:
+            try:
+                result = BASE["run_acceptance"](child, SOURCES[case], data_dir, url, namespace, registered,
+                                                capture_files=CAPTURE_FILES[case], before_grade=before_grade)
+            finally:
+                if not resume_wait.is_set() or abort.is_set():
+                    solves_finished.abort()
+                elif not reached_grading:
+                    solves_finished.wait(timeout=args.timeout)
         intact = all(result.get("captured_files", {}).get(name) == BASE["digest"](text.encode())
                      for name, text in SOURCES[case].items() if name != "records.py")
         return {"turn": result["turn_id"], "case": case, "verdict": result["verdict"],
@@ -150,18 +189,30 @@ def accept_batch(opts, args, source, data_dir, url, namespace, unused):
             turns = set(batch["submitted"])
             if len(turns) != opts.tasks:
                 raise RuntimeError("batch reused a task")
-            collect_markers(kube, "fault-ready", turns, opts.source_node, deadline, batch["before"])
+            collect_markers(kube, "fault-ready", turns, None if opts.allow_spillover else opts.source_node,
+                            deadline, batch["before"])
             token = (data_dir / "api.token").read_text().strip()
             for turn, old in batch["before"].items():
                 run_info = BASE["inspect_task"](args.agentbox, url, turn, token)
                 if not any(c["checkpoint_id"] == old["checkpoint"] and c["attempt_id"] == old["attempt"]
                            for c in run_info["checkpoints"]):
                     raise RuntimeError(f"{turn}: uncommitted checkpoint at barrier")
-            if opts.mode == "reference":
-                for old in batch["before"].values():
-                    subprocess.run(kube + ["exec", old["pod"], "-c", "sandbox", "--",
-                                           "touch", "/tmp/fault-reference"], check=True, timeout=10)
-            else:
+                if opts.real_model:
+                    pg = ["k3s", "kubectl", "-n", "agentbox-cvm-acceptance", "exec", "-i", "postgres", "--",
+                          "psql", "-XAt", "-v", "ON_ERROR_STOP=1", "-U", "agentbox", "-d",
+                          "csv_" + namespace.split("-")[-1], "-v", "cp=" + old["checkpoint"],
+                          "-v", "old=" + old["attempt"], "-v", "task=" + turn]
+                    query = """SELECT json_build_object('checkpoint',c.checkpoint_id,'attempt',c.attempt_id,
+                        'turn',c.scope_id,'committed_at',c.committed_at,'verified_at',clock_timestamp(),
+                        'lease_expires_at',t.lease_expires_at) FROM checkpoints c JOIN tasks t
+                        ON t.task_id=c.scope_id AND t.current_attempt_id=c.attempt_id WHERE
+                        c.scope_kind='task' AND c.scope_id=:'task' AND c.checkpoint_id=:'cp'
+                        AND c.attempt_id=:'old' AND t.status='running' AND t.lease_expires_at>now();
+                    """
+                    receipt = subprocess.check_output(pg, input=query, text=True, timeout=15).strip()
+                    old["pg_before_stop"] = json.loads(receipt)
+                    save()
+            if opts.mode == "node-loss" or opts.check_egress:
                 # Check the actual worker network namespace before triggering the real fault.
                 host, port = args.relay_listen.rsplit(":", 1)
                 pg_ip = subprocess.check_output(["k3s", "kubectl", "-n", "agentbox-cvm-acceptance", "get", "pod",
@@ -176,6 +227,13 @@ def accept_batch(opts, args, source, data_dir, url, namespace, unused):
                         " sys.exit('unexpected worker egress to ' + repr(target))", host, port, pg_ip],
                         check=True, timeout=10)
                 batch["worker_egress_probe"] = "relay reachable; CVM metadata TCP/80 and PG TCP/5432 blocked"
+            if opts.mode == "reference":
+                for old in batch["before"].values():
+                    subprocess.run(kube + ["exec", old["pod"], "-c", "sandbox", "--",
+                                           "touch", "/tmp/fault-reference"], check=True, timeout=10)
+            else:
+                if not any(old["node"] == opts.source_node for old in batch["before"].values()):
+                    raise RuntimeError("no checkpoint on the designated fault node")
                 batch["fault_requested_at"] = time.time()
                 save()
                 # Dedicated operator-provided control helper; no shell and no kubectl Pod deletion.
@@ -186,6 +244,11 @@ def accept_batch(opts, args, source, data_dir, url, namespace, unused):
                     batch["power_receipt"].get("state") != "STOPPED"):
                     raise RuntimeError("control plane did not confirm the requested instance stopped")
                 batch["injections"] = 1
+                save()
+                for old in batch["before"].values():
+                    if old["node"] != opts.source_node:
+                        subprocess.run(kube + ["exec", old["pod"], "-c", "sandbox", "--",
+                                               "touch", "/tmp/fault-reference"], check=True, timeout=15)
 
             resume_wait.set()
             for index, future in enumerate(futures):
@@ -209,7 +272,8 @@ def accept_batch(opts, args, source, data_dir, url, namespace, unused):
 
 def verify(evidence):
     batch = json.loads((evidence / "batch.json").read_bytes())
-    recovery = {"injections": batch["injections"], "affected": len(batch["before"]) if batch["injections"] else 0,
+    affected = {t for t, old in batch["before"].items() if old["node"] == batch["source_node"]}
+    recovery = {"injections": batch["injections"], "affected": len(affected) if batch["injections"] else 0,
                 "recovered": 0, "graded_tasks": 0, "passed_checks": 0, "executed_checks": 0, "turns": {}}
     pods = {p["name"]: p for p in json.loads((evidence / "result.json").read_bytes())["pods"]}
     errors = []
@@ -224,7 +288,7 @@ def verify(evidence):
             recovery["executed_checks"] += len(task["cases"])
         if task["verdict"] != "solved" or not task["source_intact"]:
             errors.append(f"{turn}: grading or input integrity failed")
-        if batch["mode"] == "node-loss":
+        if batch["mode"] == "node-loss" and turn in affected:
             old = batch["before"][turn]
             result_dir = evidence / task["directory"]
             result = json.loads((result_dir / "result.json").read_bytes())
@@ -274,23 +338,32 @@ if __name__ == "__main__":
     cli = argparse.ArgumentParser(add_help=False)
     cli.add_argument("--mode", choices=["reference", "node-loss"], required=True)
     cli.add_argument("--tasks", choices=[1, 3, 5, 10], type=int, default=5)
+    cli.add_argument("--session-recovery-slots", type=int, default=0)
     cli.add_argument("--source-node", required=True)
     cli.add_argument("--target-node")
     cli.add_argument("--instance-id")
     cli.add_argument("--stop-instance", type=Path)
+    cli.add_argument("--check-egress", action="store_true", help="verify worker network isolation in a reference run")
+    cli.add_argument("--allow-spillover", action="store_true", help="also count checkpoints on other nodes; only source-node turns are affected")
+    cli.add_argument("--lease-ttl", default="30s", help="attempt lease duration for the node-loss run")
+    cli.add_argument("--real-model", action="store_true", help="use the supplied model URL and a successful workspace write as the M1 checkpoint")
     options, remaining = cli.parse_known_args()
+    if options.real_model and (options.tasks != 1 or not any(s == "--model-url" or s.startswith("--model-url=") for s in remaining)):
+        cli.error("--real-model requires one task and an explicit --model-url")
     if options.mode == "node-loss" and (not options.target_node or options.target_node == options.source_node or
         not options.instance_id or not options.stop_instance or not options.stop_instance.is_absolute()):
         cli.error("node-loss requires distinct nodes, instance ID and absolute control-helper path")
-    flags = ["--k8s-preferred-node", options.source_node]
+    flags = ["--k8s-preferred-node", options.source_node, "--session-recovery-slots", str(options.session_recovery_slots)]
     if options.mode == "node-loss":
         required = ("AGENTBOX_COS_BUCKET_URL", "AGENTBOX_COS_PREFIX", "AGENTBOX_COS_CVM_ROLE")
         missing = [name for name in required if not os.environ.get(name)]
         if missing:
             cli.error("missing COS settings: " + ", ".join(missing))
-        flags += ["--allow-session-lease-fence", "--attempt-lease-ttl", "30s"]
-    sys.argv = [sys.argv[0], *remaining, "--scripted", "--fixture", str(FIXTURES["csv-first-row"])]
-    directory = BASE["main"](worker_command=lambda _: worker_command(),
+        flags += ["--allow-session-lease-fence", "--attempt-lease-ttl", options.lease_ttl]
+    sys.argv = [sys.argv[0], *remaining, "--fixture", str(FIXTURES["csv-first-row"])]
+    if not options.real_model:
+        sys.argv.append("--scripted")
+    directory = BASE["main"](worker_command=lambda _: worker_command(options.real_model),
                              acceptance=lambda *args: accept_batch(options, *args),
                              upstream=lambda: BASE["tool_upstream"](steps_for), run_slots=options.tasks,
                              gateway_flags=flags)

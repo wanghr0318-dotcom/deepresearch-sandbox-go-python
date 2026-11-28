@@ -192,6 +192,7 @@ type DoTransition struct{ T Transition }
 // CreateIncarnationEnv → Workers.Start → UnstageRestore → incarnation idle。Resume 为 nil 表示新会话。失败时已清理
 // 本次创建的资源（环境未确认停止时 incarnation 保持存活，由下一次决策按 EndOrphaned 销毁）。
 type StartIncarnation struct {
+	Restoring      bool // A retried turn can restore its own checkpoint even without a session checkpoint.
 	Resume         *Checkpoint
 	FromRowVersion int64
 }
@@ -685,7 +686,7 @@ func (d *decider) stepStarting(inc *Incarnation) {
 	if st.Status == StatusRestoring {
 		resume = st.Latest
 	}
-	d.op(StartIncarnation{Resume: resume, FromRowVersion: st.RowVersion})
+	d.op(StartIncarnation{Restoring: st.Status == StatusRestoring, Resume: resume, FromRowVersion: st.RowVersion})
 }
 
 func (d *decider) stepRunning(inc *Incarnation) {

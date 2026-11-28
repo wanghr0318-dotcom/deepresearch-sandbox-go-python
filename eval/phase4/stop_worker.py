@@ -15,9 +15,11 @@ def stop_worker(instance_id, node_name, region):
         raise ValueError("refusing the cluster control-plane node")
     addresses = {a["address"] for a in node["status"]["addresses"] if a["type"] == "InternalIP"}
     def call(action, **extra):
-        params = json.dumps({"InstanceIds": [instance_id], **extra})
-        return json.loads(subprocess.check_output(["tccli", "cvm", action, "--region", region,
-                                                  "--cli-input-json", params], timeout=30))["Response"]
+        cmd = ["tccli", "cvm", action, "--region", region, "--InstanceIds", json.dumps([instance_id])]
+        for key, value in extra.items():
+            cmd.extend(["--" + key, value])
+        result = json.loads(subprocess.check_output(cmd, timeout=30))
+        return result.get("Response", result)
 
     def describe():
         row, = call("DescribeInstances")["InstanceSet"]
