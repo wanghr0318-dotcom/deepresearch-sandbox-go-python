@@ -228,14 +228,15 @@ func (s *Store) CommitCheckpoint(ctx context.Context, c runner.Checkpoint) (runn
 
 // fenceAttempt 要求 attemptID 是任务的当前 attempt、其访问仍为 active，且尚无判决：判决提交后
 // 迟到的写入不得改写终态（规格 §5.8）。调用方已持有任务行锁（FinalizeAttempt 需要 FOR UPDATE），
-// 因此检查到提交之间 current_attempt_id 与判决都不会改变。
+// 因此检查到提交之间 current_attempt_id 与判决都不会改变。权限行的共享锁与撤权 UPDATE 互斥，直到事务提交。
 func fenceAttempt(ctx context.Context, tx pgx.Tx, taskID, attemptID string) error {
 	var current *string
 	var access string
 	var decided, alive bool
-	err := tx.QueryRow(ctx, `SELECT t.current_attempt_id, COALESCE(aa.state, ''), COALESCE(a.verdict_hash IS NOT NULL, false), (t.lease_expires_at IS NULL OR t.lease_expires_at > clock_timestamp())
+	err := tx.QueryRow(ctx, `SELECT t.current_attempt_id, COALESCE((
+			SELECT aa.state FROM attempt_access aa WHERE aa.task_id = t.task_id AND aa.attempt_id = $2 FOR SHARE
+		), ''), a.verdict_hash IS NOT NULL, (t.lease_expires_at IS NULL OR t.lease_expires_at > clock_timestamp())
 		FROM tasks t
-		LEFT JOIN attempt_access aa ON aa.task_id = t.task_id AND aa.attempt_id = $2
 		LEFT JOIN attempts a ON a.task_id = t.task_id AND a.attempt_id = $2
 		WHERE t.task_id = $1`, taskID, attemptID).Scan(&current, &access, &decided, &alive)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -458,14 +459,8 @@ func (s *Store) RecordTerminalProposal(ctx context.Context, p runner.TerminalPro
 		case existingHash != nil:
 			return conflictf("attempt %s 已有不同的终态提议 %s", p.AttemptID, existing.Kind)
 		}
-		var decided bool
-		if err := tx.QueryRow(ctx, `SELECT a.verdict_hash IS NOT NULL OR t.current_attempt_id IS DISTINCT FROM a.attempt_id
-			OR (t.lease_expires_at IS NOT NULL AND t.lease_expires_at<=clock_timestamp())
-			FROM attempts a JOIN tasks t ON t.task_id=a.task_id WHERE a.attempt_id=$1`, p.AttemptID).Scan(&decided); err != nil {
+		if err := fenceAttempt(ctx, tx, taskID, p.AttemptID); err != nil {
 			return err
-		}
-		if decided { // 判决已提交（例如无提议即退出）后，迟到的提议不再记录
-			return rejectf(persistence.CodeStaleAttempt, "attempt %s 已有判决，不再接受终态提议", p.AttemptID)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE attempts SET terminal_proposal = $2, terminal_proposal_ref = $3, terminal_proposal_hash = $4
 			WHERE attempt_id = $1`, p.AttemptID, p.Kind, p.Ref, hash); err != nil {
